@@ -97,6 +97,9 @@ type Inst struct {
 
 	targets map[any]*Target
 	vtables map[any]*Vtable
+	// sites lists the keys of targets and vtables in walk order (slot
+	// assignment follows it, so output does not depend on map order).
+	sites []any
 }
 
 // Concrete substitutes the instance's type arguments in t.
@@ -290,6 +293,9 @@ func (p *Plan) walk(in *Inst, f *mir.Func) {
 		}
 		switch op.Const.Kind {
 		case mir.CFn:
+			if _, ok := in.targets[op.Const]; !ok {
+				in.sites = append(in.sites, op.Const)
+			}
 			in.targets[op.Const] = p.resolve(in, op.Const.Fn)
 		case mir.CStatic:
 			p.static(op.Const.Static)
@@ -329,7 +335,11 @@ func (p *Plan) walk(in *Inst, f *mir.Func) {
 				if md, ok := s.Rv.(mir.MakeDyn); ok {
 					concrete := in.Concrete(p, md.Concrete)
 					to := in.Concrete(p, md.To)
-					in.vtables[DynSite{f, bi, si}] = p.vtable(concrete, to.Elem)
+					key := DynSite{f, bi, si}
+					if _, ok := in.vtables[key]; !ok {
+						in.sites = append(in.sites, key)
+					}
+					in.vtables[key] = p.vtable(concrete, to.Elem)
 				}
 			case mir.PushDefer:
 				visitOp(s.Fn)
@@ -600,15 +610,7 @@ func (p *Plan) assignSlots() {
 			continue
 		}
 		rep := g.Rep
-		var keys []any
-		for k := range rep.targets {
-			keys = append(keys, k)
-		}
-		for k := range rep.vtables {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool { return fmt.Sprint(keys[i]) < fmt.Sprint(keys[j]) })
-		for _, k := range keys {
+		for _, k := range rep.sites {
 			differs := false
 			for _, other := range g.Insts[1:] {
 				if t, ok := rep.targets[k]; ok {

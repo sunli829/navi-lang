@@ -1,0 +1,455 @@
+//! The lexer: source bytes to tokens.
+
+use crate::syntax::token::*;
+use crate::syntax::source::{Errors, Pos};
+use crate::util;
+
+pub struct Lexer {
+    src: &str,
+    pub off: usize,
+    base: Pos,
+    errs: &mut Errors,
+    prev: Kind,
+}
+
+/// Lexes a whole source text (the file of errs).
+pub fn tokenize(src: &str, errs: &mut Errors) -> Vec<Token> {
+    let mut l = Lexer::new(src, 0, errs);
+    let mut toks = Vec::new();
+    loop {
+        let t = l.next();
+        let done = t.kind == EOF;
+        toks.push(t);
+        if done { return toks; }
+    }
+}
+
+fn is_ident_start(c: u8) -> bool { (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_' }
+fn is_ident_cont(c: u8) -> bool { is_ident_start(c) || is_digit(c) }
+fn is_digit(c: u8) -> bool { c >= b'0' && c <= b'9' }
+fn is_hex_digit(c: u8) -> bool { is_digit(c) || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F') }
+fn is_octal(c: u8) -> bool { c >= b'0' && c <= b'7' }
+fn is_binary(c: u8) -> bool { c == b'0' || c == b'1' }
+
+impl Lexer {
+    pub fn new(src: &str, base: Pos, errs: &mut Errors) -> Lexer {
+        Lexer { src, off: 0, base, errs, prev: EOF }
+    }
+
+    fn pos(&self, off: usize) -> Pos { self.base + off as Pos }
+
+    fn errorf(&mut self, off: usize, msg: String) {
+        let p = self.pos(off);
+        self.errs.add(p, msg);
+    }
+
+    fn b(&self) -> &[u8] { self.src.as_bytes() }
+
+    fn len(&self) -> usize { self.src.len() }
+
+    fn peek_byte(&self, n: usize) -> u8 {
+        if self.off + n < self.len() { self.b()[self.off + n] } else { 0 }
+    }
+
+    fn at(&self) -> u8 { self.b()[self.off] }
+
+    fn text(&self, start: usize, end: usize) -> &str { &self.src[start..end] }
+
+    fn tok(&self, kind: Kind, start: usize, end: usize, text: &str) -> Token {
+        Token { kind, pos: self.pos(start), end: self.pos(end), text }
+    }
+
+    pub fn next(&mut self) -> Token {
+        let t = self.scan();
+        self.prev = t.kind;
+        t
+    }
+
+    fn simple(&mut self, k: Kind, start: usize, n: usize) -> Token {
+        self.off += n;
+        self.tok(k, start, self.off, "")
+    }
+
+    fn two(&mut self, start: usize, next: u8, k2: Kind, k1: Kind) -> Token {
+        if self.peek_byte(1) == next { self.simple(k2, start, 2) } else { self.simple(k1, start, 1) }
+    }
+
+    pub fn scan(&mut self) -> Token {
+        self.skip_space_and_comments();
+        let start = self.off;
+        if self.off >= self.len() {
+            return self.tok(EOF, start, start, "");
+        }
+        let c = self.at();
+        if c == b'r' && self.peek_byte(1) == b'#' && is_ident_start(self.peek_byte(2)) {
+            return self.raw_ident();
+        }
+        if c == b'r' && (self.peek_byte(1) == b'"' || self.peek_byte(1) == b'#') {
+            return self.raw_string(start, 1, RAW_STRING);
+        }
+        if c == b'b' && self.peek_byte(1) == b'r' && (self.peek_byte(2) == b'"' || self.peek_byte(2) == b'#') {
+            return self.raw_string(start, 2, BYTE_STRING);
+        }
+        if c == b'b' && self.peek_byte(1) == b'\'' {
+            self.off += 1;
+            let mut t = self.char_lit(start);
+            t.kind = BYTE;
+            return t;
+        }
+        if c == b'b' && self.peek_byte(1) == b'"' {
+            self.off += 1;
+            let mut t = self.string_lit(start);
+            t.kind = BYTE_STRING;
+            return t;
+        }
+        if is_ident_start(c) { return self.ident(); }
+        if is_digit(c) { return self.number(); }
+        if c == b'"' { return self.string_lit(start); }
+        if c == b'\'' { return self.quote(); }
+        if c == b'`' { return self.template(); }
+        match c {
+            b'+' => self.two(start, b'=', PLUS_EQ, PLUS),
+            b'-' => {
+                if self.peek_byte(1) == b'>' { return self.simple(R_ARROW, start, 2); }
+                self.two(start, b'=', MINUS_EQ, MINUS)
+            }
+            b'*' => self.two(start, b'=', STAR_EQ, STAR),
+            b'/' => self.two(start, b'=', SLASH_EQ, SLASH),
+            b'%' => self.two(start, b'=', PERCENT_EQ, PERCENT),
+            b'^' => self.two(start, b'=', CARET_EQ, CARET),
+            b'!' => self.two(start, b'=', NE, NOT),
+            b'&' => {
+                let n = self.peek_byte(1);
+                if n == b'&' { return self.simple(AND_AND, start, 2); }
+                if n == b'=' { return self.simple(AND_EQ, start, 2); }
+                self.simple(AND, start, 1)
+            }
+            b'|' => {
+                let n = self.peek_byte(1);
+                if n == b'|' { return self.simple(OR_OR, start, 2); }
+                if n == b'=' { return self.simple(OR_EQ, start, 2); }
+                self.simple(OR, start, 1)
+            }
+            b'<' => {
+                if self.peek_byte(1) == b'<' {
+                    if self.peek_byte(2) == b'=' { return self.simple(SHL_EQ, start, 3); }
+                    return self.simple(SHL, start, 2);
+                }
+                self.two(start, b'=', LE, LT)
+            }
+            b'>' => {
+                if self.peek_byte(1) == b'>' {
+                    if self.peek_byte(2) == b'=' { return self.simple(SHR_EQ, start, 3); }
+                    return self.simple(SHR, start, 2);
+                }
+                self.two(start, b'=', GE, GT)
+            }
+            b'=' => {
+                let n = self.peek_byte(1);
+                if n == b'=' { return self.simple(EQ_EQ, start, 2); }
+                if n == b'>' { return self.simple(FAT_ARROW, start, 2); }
+                self.simple(EQ, start, 1)
+            }
+            b'@' => self.simple(AT, start, 1),
+            b'.' => {
+                if self.peek_byte(1) == b'.' {
+                    if self.peek_byte(2) == b'=' { return self.simple(DOT_DOT_EQ, start, 3); }
+                    return self.simple(DOT_DOT, start, 2);
+                }
+                self.simple(DOT, start, 1)
+            }
+            b',' => self.simple(COMMA, start, 1),
+            b';' => self.simple(SEMI, start, 1),
+            b':' => self.two(start, b':', PATH_SEP, COLON),
+            b'#' => self.simple(POUND, start, 1),
+            b'?' => self.simple(QUESTION, start, 1),
+            b'(' => self.simple(L_PAREN, start, 1),
+            b')' => self.simple(R_PAREN, start, 1),
+            b'[' => self.simple(L_BRACKET, start, 1),
+            b']' => self.simple(R_BRACKET, start, 1),
+            b'{' => self.simple(L_BRACE, start, 1),
+            b'}' => self.simple(R_BRACE, start, 1),
+            _ => {
+                let (r, size) = util::decode_rune(self.b(), self.off);
+                self.errorf(start, `unexpected character ${util::quote_char(r)}`);
+                self.simple(ILLEGAL, start, size)
+            }
+        }
+    }
+
+    fn skip_space_and_comments(&mut self) {
+        while self.off < self.len() {
+            let c = self.at();
+            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+                self.off += 1;
+            } else if c == b'/' && self.peek_byte(1) == b'/' {
+                while self.off < self.len() && self.at() != b'\n' { self.off += 1; }
+            } else if c == b'/' && self.peek_byte(1) == b'*' {
+                let start = self.off;
+                self.off += 2;
+                let mut depth = 1;
+                while depth > 0 {
+                    if self.off >= self.len() {
+                        self.errorf(start, "unterminated block comment".to_string());
+                        return;
+                    }
+                    if self.at() == b'/' && self.peek_byte(1) == b'*' {
+                        depth += 1;
+                        self.off += 2;
+                    } else if self.at() == b'*' && self.peek_byte(1) == b'/' {
+                        depth -= 1;
+                        self.off += 2;
+                    } else {
+                        self.off += 1;
+                    }
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn ident(&mut self) -> Token {
+        let start = self.off;
+        while self.off < self.len() && is_ident_cont(self.at()) { self.off += 1; }
+        let text = self.text(start, self.off);
+        if text == "_" { return self.tok(UNDERSCORE, start, self.off, ""); }
+        let k = keyword(text);
+        if k != IDENT { return self.tok(k, start, self.off, ""); }
+        if is_reserved(text) {
+            self.errorf(start, `${util::quote(text)} is a reserved word`);
+        }
+        self.tok(IDENT, start, self.off, text)
+    }
+
+    fn raw_ident(&mut self) -> Token {
+        let start = self.off;
+        self.off += 2;
+        let name_start = self.off;
+        while self.off < self.len() && is_ident_cont(self.at()) { self.off += 1; }
+        let text = self.text(name_start, self.off);
+        self.tok(IDENT, start, self.off, text)
+    }
+
+    fn digit_ok(&self, radix: u32, c: u8) -> bool {
+        if radix == 16 { is_hex_digit(c) } else if radix == 8 { is_octal(c) } else if radix == 2 { is_binary(c) } else { is_digit(c) }
+    }
+
+    fn number(&mut self) -> Token {
+        let start = self.off;
+        let mut kind = INT;
+        let mut radix = 10;
+        if self.at() == b'0' {
+            let n = self.peek_byte(1);
+            if n == b'x' { radix = 16; self.off += 2; }
+            else if n == b'o' { radix = 8; self.off += 2; }
+            else if n == b'b' { radix = 2; self.off += 2; }
+        }
+        let decimal = radix == 10;
+        let mut n = 0;
+        while self.off < self.len() && (self.digit_ok(radix, self.at()) || self.at() == b'_') {
+            if self.at() != b'_' { n += 1; }
+            self.off += 1;
+        }
+        if n == 0 { self.errorf(start, "missing digits in number".to_string()); }
+        if decimal && self.prev != DOT {
+            if self.peek_byte(0) == b'.' && is_digit(self.peek_byte(1)) {
+                kind = FLOAT;
+                self.off += 1;
+                while self.off < self.len() && (is_digit(self.at()) || self.at() == b'_') { self.off += 1; }
+            }
+            let c = self.peek_byte(0);
+            if c == b'e' || c == b'E' {
+                let save = self.off;
+                self.off += 1;
+                let s = self.peek_byte(0);
+                if s == b'+' || s == b'-' { self.off += 1; }
+                if is_digit(self.peek_byte(0)) {
+                    kind = FLOAT;
+                    while self.off < self.len() && (is_digit(self.at()) || self.at() == b'_') { self.off += 1; }
+                } else {
+                    self.off = save;
+                }
+            }
+        }
+        if self.off < self.len() && is_ident_start(self.at()) {
+            let suf_start = self.off;
+            while self.off < self.len() && is_ident_cont(self.at()) { self.off += 1; }
+            let suf = self.text(suf_start, self.off);
+            if suf == "f32" || suf == "f64" {
+                if decimal { kind = FLOAT; } else { self.errorf(suf_start, "float suffix on a non-decimal literal".to_string()); }
+            } else if suf == "i8" || suf == "i16" || suf == "i32" || suf == "i64" || suf == "isize"
+                || suf == "u8" || suf == "u16" || suf == "u32" || suf == "u64" || suf == "usize" {
+                if kind == FLOAT { self.errorf(suf_start, "integer suffix on a float literal".to_string()); }
+            } else {
+                self.errorf(suf_start, `invalid suffix ${util::quote(suf)} on number`);
+            }
+        }
+        let text = self.text(start, self.off);
+        self.tok(kind, start, self.off, text)
+    }
+
+    // escape scans one escape sequence; off points just past the backslash.
+    fn escape(&mut self, extra: &str) {
+        let start = self.off - 1;
+        if self.off >= self.len() {
+            self.errorf(start, "unterminated escape sequence".to_string());
+            return;
+        }
+        let c = self.at();
+        self.off += 1;
+        if c == b'n' || c == b'r' || c == b't' || c == b'\\' || c == b'0' || c == b'\'' || c == b'"' {
+            return;
+        }
+        if c == b'x' {
+            if !(is_hex_digit(self.peek_byte(0)) && is_hex_digit(self.peek_byte(1))) {
+                self.errorf(start, "\\x escape needs two hex digits".to_string());
+                return;
+            }
+            self.off += 2;
+            return;
+        }
+        if c == b'u' {
+            if self.peek_byte(0) != b'{' {
+                self.errorf(start, "\\u escape must be written \\u{...}".to_string());
+                return;
+            }
+            self.off += 1;
+            let mut n = 0;
+            while is_hex_digit(self.peek_byte(0)) { self.off += 1; n += 1; }
+            if self.peek_byte(0) != b'}' || n == 0 || n > 6 {
+                self.errorf(start, "invalid \\u{...} escape".to_string());
+                return;
+            }
+            self.off += 1;
+            return;
+        }
+        for e in extra.bytes() { if c == e { return; } }
+        self.errorf(start, `unknown escape sequence \\${(c as char)}`);
+    }
+
+    fn string_lit(&mut self, start: usize) -> Token {
+        self.off += 1;
+        loop {
+            if self.off >= self.len() {
+                self.errorf(start, "unterminated string literal".to_string());
+                break;
+            }
+            let c = self.at();
+            self.off += 1;
+            if c == b'"' { break; }
+            if c == b'\\' { self.escape(""); }
+        }
+        let text = self.text(start, self.off);
+        self.tok(STRING, start, self.off, text)
+    }
+
+    fn raw_string(&mut self, start: usize, prefix: usize, kind: Kind) -> Token {
+        self.off += prefix;
+        let mut hashes = 0;
+        while self.peek_byte(0) == b'#' { hashes += 1; self.off += 1; }
+        if self.peek_byte(0) != b'"' {
+            self.errorf(start, "expected '\"' to start raw string".to_string());
+            return self.tok(ILLEGAL, start, self.off, "");
+        }
+        self.off += 1;
+        loop {
+            if self.off >= self.len() {
+                self.errorf(start, "unterminated raw string literal".to_string());
+                break;
+            }
+            let c = self.at();
+            self.off += 1;
+            if c == b'"' {
+                let mut n = 0;
+                while n < hashes && self.peek_byte(0) == b'#' { n += 1; self.off += 1; }
+                if n == hashes { break; }
+            }
+        }
+        let text = self.text(start, self.off);
+        self.tok(kind, start, self.off, text)
+    }
+
+    // quote handles a ' that starts a char literal or a loop label.
+    fn quote(&mut self) -> Token {
+        let start = self.off;
+        if self.peek_byte(1) != b'\\' {
+            let (r, size) = util::decode_rune(self.b(), self.off + 1);
+            let after = self.off + 1 + size;
+            let is_char = after < self.len() && self.b()[after] == b'\'';
+            if !is_char && (r as u32) < 0x80 && is_ident_start(r as u8) {
+                self.off += 1;
+                while self.off < self.len() && is_ident_cont(self.at()) { self.off += 1; }
+                let text = self.text(start + 1, self.off);
+                return self.tok(LIFETIME, start, self.off, text);
+            }
+        }
+        self.char_lit(start)
+    }
+
+    fn char_lit(&mut self, start: usize) -> Token {
+        self.off += 1;
+        if self.off >= self.len() {
+            self.errorf(start, "unterminated char literal".to_string());
+            return self.tok(ILLEGAL, start, self.off, "");
+        }
+        if self.at() == b'\\' {
+            self.off += 1;
+            self.escape("");
+        } else {
+            let (_, size) = util::decode_rune(self.b(), self.off);
+            self.off += size;
+        }
+        if self.peek_byte(0) != b'\'' {
+            self.errorf(start, "unterminated char literal".to_string());
+            return self.tok(ILLEGAL, start, self.off, "");
+        }
+        self.off += 1;
+        let text = self.text(start, self.off);
+        self.tok(CHAR, start, self.off, text)
+    }
+
+    // template scans a whole template string with its ${...} holes (lexed
+    // normally, so braces, strings and nested templates are handled).
+    fn template(&mut self) -> Token {
+        let start = self.off;
+        self.off += 1;
+        loop {
+            if self.off >= self.len() {
+                self.errorf(start, "unterminated template string".to_string());
+                break;
+            }
+            let c = self.at();
+            if c == b'`' {
+                self.off += 1;
+                break;
+            }
+            if c == b'\\' {
+                self.off += 1;
+                self.escape("`$");
+                continue;
+            }
+            if c == b'$' && self.peek_byte(1) == b'{' {
+                let hole_start = self.off;
+                self.off += 2;
+                let mut depth = 1;
+                while depth > 0 {
+                    let t = self.scan();
+                    if t.kind == L_BRACE {
+                        depth += 1;
+                    } else if t.kind == R_BRACE {
+                        depth -= 1;
+                    } else if t.kind == EOF {
+                        self.errorf(hole_start, "unterminated ${ in template string".to_string());
+                        let text = self.text(start, self.off);
+                        return self.tok(TEMPLATE, start, self.off, text);
+                    }
+                }
+                continue;
+            }
+            self.off += 1;
+        }
+        let text = self.text(start, self.off);
+        self.tok(TEMPLATE, start, self.off, text)
+    }
+}

@@ -1,0 +1,575 @@
+//! Renders the AST as the S-expressions of stage0's syntax.Dump (used to
+//! check the port against stage0).
+
+use crate::syntax::ast::*;
+use crate::syntax::token::kind_name;
+use crate::util;
+
+pub fn dump_file(f: &SourceFile) -> String {
+    let mut d = Dumper { b: String::new() };
+    d.w("(file");
+    for it in f.items.iter() {
+        d.w(" ");
+        d.item(it);
+    }
+    d.w(")");
+    d.b
+}
+
+pub fn dump_type(t: &Type) -> String {
+    let mut d = Dumper { b: String::new() };
+    d.typ(t);
+    d.b
+}
+
+struct Dumper { b: String }
+
+fn label(n: Option<&Name>) -> String {
+    match n { Some(l) => ` '${l.value}`, None => String::new() }
+}
+
+impl Dumper {
+    fn w(&mut self, s: &str) { self.b.push_str(s); }
+
+    fn path(&mut self, p: &Path) -> String {
+        let mut b = String::new();
+        if let Some(q) = p.qself {
+            b.push_str("<");
+            b.push_str(dump_type(q.ty).as_str());
+            if let Some(tp) = q.trait_path {
+                b.push_str(" as ");
+                b.push_str(self.path(tp).as_str());
+            }
+            b.push_str(">::");
+        }
+        let mut i = 0;
+        while i < p.segments.len() {
+            let s = p.segments[i];
+            if i > 0 { b.push_str("::"); }
+            b.push_str(s.name.value.as_str());
+            if let Some(a) = s.args { b.push_str(self.generic_args(a).as_str()); }
+            i += 1;
+        }
+        b
+    }
+
+    fn generic_args(&mut self, a: &GenericArgs) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for t in a.args.iter() { parts.push(dump_type(*t)); }
+        for bd in a.bindings.iter() { parts.push(`${bd.name.value}=${dump_type(bd.ty)}`); }
+        `<${parts.join(",")}>`
+    }
+
+    fn paths(&mut self, ps: &Vec<&Path>) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for p in ps.iter() { parts.push(self.path(*p)); }
+        parts.join("+")
+    }
+
+    fn opt_expr(&mut self, x: Option<&Expr>) {
+        match x { Some(e) => self.expr(e), None => self.w("_") }
+    }
+
+    fn opt_type(&mut self, t: Option<&Type>) {
+        match t { Some(x) => self.typ(x), None => self.w("_") }
+    }
+
+    fn typ(&mut self, t: &Type) {
+        match &t.kind {
+            TypeKind::Path(p) => { let s = self.path(*p); self.w(s.as_str()); }
+            TypeKind::Ref { is_mut, elem, .. } => {
+                self.w(if *is_mut { "(&mut " } else { "(& " });
+                self.typ(*elem);
+                self.w(")");
+            }
+            TypeKind::Ptr { is_mut, elem, .. } => {
+                self.w(if *is_mut { "(*mut " } else { "(*const " });
+                self.typ(*elem);
+                self.w(")");
+            }
+            TypeKind::Slice { elem, .. } => { self.w("(slice "); self.typ(*elem); self.w(")"); }
+            TypeKind::Array { elem, len, .. } => {
+                self.w("(array ");
+                self.typ(*elem);
+                self.w(" ");
+                self.expr(*len);
+                self.w(")");
+            }
+            TypeKind::Tuple { elems, .. } => {
+                self.w("(tuple");
+                for e in elems.iter() { self.w(" "); self.typ(*e); }
+                self.w(")");
+            }
+            TypeKind::Fn { abi, params, result, .. } => {
+                self.w(if abi.len() > 0 { "(extern-fn" } else { "(fn" });
+                for p in params.iter() { self.w(" "); self.typ(*p); }
+                self.w(" ");
+                self.opt_type(*result);
+                self.w(")");
+            }
+            TypeKind::Dyn { bounds, .. } => { let s = self.paths(bounds); self.w(&`(dyn ${s})`); }
+            TypeKind::Impl { bounds, .. } => { let s = self.paths(bounds); self.w(&`(impl ${s})`); }
+            TypeKind::Never(_) => self.w("!"),
+            TypeKind::Infer(_) => self.w("_"),
+        }
+    }
+
+    fn list1(&mut self, tag: &str, x: &Expr) {
+        self.w("(");
+        self.w(tag);
+        self.w(" ");
+        self.expr(x);
+        self.w(")");
+    }
+
+    fn list2(&mut self, tag: &str, x: &Expr, y: &Expr) {
+        self.w("(");
+        self.w(tag);
+        self.w(" ");
+        self.expr(x);
+        self.w(" ");
+        self.expr(y);
+        self.w(")");
+    }
+
+    fn exprs(&mut self, tag: &str, xs: &Vec<&Expr>) {
+        self.w("(");
+        self.w(tag);
+        for x in xs.iter() { self.w(" "); self.expr(*x); }
+        self.w(")");
+    }
+
+    fn block(&mut self, b: &Block) {
+        self.w(if b.is_unsafe { "(unsafe" } else { "(block" });
+        for s in b.stmts.iter() { self.w(" "); self.stmt(*s); }
+        if let Some(t) = b.tail { self.w(" "); self.expr(t); }
+        self.w(")");
+    }
+
+    pub fn expr(&mut self, x: &Expr) {
+        match &x.kind {
+            ExprKind::Lit { value, .. } => self.w(value.as_str()),
+            ExprKind::Template { parts, .. } => {
+                self.w("(template");
+                for p in parts.iter() {
+                    match p.x {
+                        None => { self.w(" "); self.w(util::quote(p.text.as_str()).as_str()); }
+                        Some(e) => {
+                            self.w(" ${");
+                            self.expr(e);
+                            if p.spec.len() > 0 { self.w(":"); self.w(p.spec.as_str()); }
+                            self.w("}");
+                        }
+                    }
+                }
+                self.w(")");
+            }
+            ExprKind::Path(p) => { let s = self.path(*p); self.w(s.as_str()); }
+            ExprKind::Unary { op, x, .. } => self.list1(kind_name(*op), *x),
+            ExprKind::Ref { is_mut, x, .. } => self.list1(if *is_mut { "&mut" } else { "&" }, *x),
+            ExprKind::Binary { op, x, y, .. } => self.list2(kind_name(*op), *x, *y),
+            ExprKind::Assign { op, x, y, .. } => self.list2(kind_name(*op), *x, *y),
+            ExprKind::Cast { x, ty, .. } => {
+                self.w("(as ");
+                self.expr(*x);
+                self.w(" ");
+                self.typ(*ty);
+                self.w(")");
+            }
+            ExprKind::Range { lo, hi, inclusive, .. } => {
+                self.w(if *inclusive { "(..= " } else { "(.. " });
+                self.opt_expr(*lo);
+                self.w(" ");
+                self.opt_expr(*hi);
+                self.w(")");
+            }
+            ExprKind::Call { fun, args, .. } => {
+                self.w("(call ");
+                self.expr(*fun);
+                for a in args.iter() { self.w(" "); self.expr(*a); }
+                self.w(")");
+            }
+            ExprKind::MethodCall { recv, name, type_args, args } => {
+                let mut tag = `.${name.value}`;
+                if let Some(ta) = type_args { tag.push_str(self.generic_args(*ta).as_str()); }
+                self.w("(");
+                self.w(tag.as_str());
+                self.w(" ");
+                self.expr(*recv);
+                for a in args.iter() { self.w(" "); self.expr(*a); }
+                self.w(")");
+            }
+            ExprKind::Field { x, name } => self.list1(&`.${name.value}`, *x),
+            ExprKind::Index { x, index, .. } => self.list2("index", *x, *index),
+            ExprKind::Try { x, .. } => self.list1("?", *x),
+            ExprKind::StructLit { path, fields, base } => {
+                let s = self.path(*path);
+                self.w(&`(struct ${s}`);
+                for f in fields.iter() {
+                    self.w(&` ${f.name.value}:`);
+                    self.expr(f.value);
+                }
+                if let Some(b) = base {
+                    self.w(" ..");
+                    self.expr(*b);
+                }
+                self.w(")");
+            }
+            ExprKind::Tuple { elems, .. } => self.exprs("tuple", elems),
+            ExprKind::Paren { x, .. } => self.list1("paren", *x),
+            ExprKind::Array { elems, .. } => self.exprs("array", elems),
+            ExprKind::ArrayRepeat { value, count, .. } => self.list2("repeat", *value, *count),
+            ExprKind::Block(b) => self.block(*b),
+            ExprKind::If { cond, then, els, .. } => {
+                self.w("(if ");
+                self.expr(*cond);
+                self.w(" ");
+                self.expr(*then);
+                if let Some(e) = els {
+                    self.w(" ");
+                    self.expr(*e);
+                }
+                self.w(")");
+            }
+            ExprKind::Let { pat, x, .. } => {
+                self.w("(let ");
+                self.pat(*pat);
+                self.w(" ");
+                self.expr(*x);
+                self.w(")");
+            }
+            ExprKind::Match { x, arms, .. } => {
+                self.w("(match ");
+                self.expr(*x);
+                for a in arms.iter() {
+                    self.w(" (arm ");
+                    self.pat(a.pat);
+                    if let Some(g) = a.guard {
+                        self.w(" ");
+                        self.expr(g);
+                    }
+                    self.w(" ");
+                    self.expr(a.body);
+                    self.w(")");
+                }
+                self.w(")");
+            }
+            ExprKind::Loop { label: l, body, .. } => { let t = `loop${label(*l)}`; self.list1(t.as_str(), *body); }
+            ExprKind::While { label: l, cond, body, .. } => { let t = `while${label(*l)}`; self.list2(t.as_str(), *cond, *body); }
+            ExprKind::For { label: l, pat, iter, body, .. } => {
+                self.w(&`(for${label(*l)} `);
+                self.pat(*pat);
+                self.w(" ");
+                self.expr(*iter);
+                self.w(" ");
+                self.expr(*body);
+                self.w(")");
+            }
+            ExprKind::Break { label: l, value, .. } => match value {
+                Some(v) => { let t = `break${label(*l)}`; self.list1(t.as_str(), *v); }
+                None => self.w(&`(break${label(*l)})`),
+            },
+            ExprKind::Continue { label: l, .. } => self.w(&`(continue${label(*l)})`),
+            ExprKind::Return { value, .. } => match value {
+                Some(v) => self.list1("return", *v),
+                None => self.w("(return)"),
+            },
+            ExprKind::Closure { params, result, body, .. } => {
+                self.w("(closure (");
+                let mut i = 0;
+                while i < params.len() {
+                    if i > 0 { self.w(" "); }
+                    self.pat(params[i].pat);
+                    if let Some(t) = params[i].ty {
+                        self.w(":");
+                        self.typ(t);
+                    }
+                    i += 1;
+                }
+                self.w(")");
+                if let Some(r) = result {
+                    self.w(" -> ");
+                    self.typ(*r);
+                }
+                self.w(" ");
+                self.expr(*body);
+                self.w(")");
+            }
+            ExprKind::Select { arms, .. } => {
+                self.w("(select");
+                for a in arms.iter() {
+                    self.w(" ");
+                    if a.is_default {
+                        self.list1("default", a.body);
+                    } else if let Some(p) = a.pat {
+                        self.w("(recv ");
+                        self.pat(p);
+                        self.w(" ");
+                        self.opt_expr(a.op);
+                        self.w(" ");
+                        self.expr(a.body);
+                        self.w(")");
+                    } else {
+                        self.w("(case ");
+                        self.opt_expr(a.op);
+                        self.w(" ");
+                        self.expr(a.body);
+                        self.w(")");
+                    }
+                }
+                self.w(")");
+            }
+            ExprKind::Bad(_) => self.w("BAD"),
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt) {
+        match s {
+            Stmt::Let(l) => {
+                self.w("(let ");
+                self.pat(l.pat);
+                if let Some(t) = l.ty { self.w(" "); self.typ(t); }
+                if let Some(i) = l.init { self.w(" "); self.expr(i); }
+                if let Some(e) = l.els { self.w(" else "); self.expr(e); }
+                self.w(")");
+            }
+            Stmt::Expr { x, semi } => {
+                self.expr(*x);
+                if *semi { self.w(";"); }
+            }
+            Stmt::Item(it) => self.item(it),
+            Stmt::Defer { x, .. } => self.list1("defer", *x),
+            Stmt::Empty(_) => self.w(";"),
+        }
+    }
+
+    fn pats(&mut self, tag: &str, ps: &Vec<&Pat>) {
+        self.w("(");
+        self.w(tag);
+        for p in ps.iter() { self.w(" "); self.pat(*p); }
+        self.w(")");
+    }
+
+    fn pat(&mut self, p: &Pat) {
+        match &p.kind {
+            PatKind::Wild(_) => self.w("_"),
+            PatKind::Rest(_) => self.w(".."),
+            PatKind::Ident { is_mut, name, sub } => {
+                let mut nm = name.value.clone();
+                if *is_mut { nm = `mut ${nm}`; }
+                match sub {
+                    Some(s) => {
+                        self.w(&`(@ ${nm} `);
+                        self.pat(*s);
+                        self.w(")");
+                    }
+                    None => self.w(nm.as_str()),
+                }
+            }
+            PatKind::Lit(x) => self.expr(*x),
+            PatKind::Range { lo, hi, inclusive, .. } => {
+                self.w(if *inclusive { "(..=pat " } else { "(..pat " });
+                self.opt_expr(*lo);
+                self.w(" ");
+                self.opt_expr(*hi);
+                self.w(")");
+            }
+            PatKind::Path(path) => { let s = self.path(*path); self.w(s.as_str()); }
+            PatKind::Tuple { elems, .. } => self.pats("tuple", elems),
+            PatKind::TupleStruct { path, elems } => { let s = self.path(*path); self.pats(s.as_str(), elems); }
+            PatKind::Struct { path, fields, rest } => {
+                let s = self.path(*path);
+                self.w(&`(${s} {`);
+                let mut i = 0;
+                while i < fields.len() {
+                    if i > 0 { self.w(","); }
+                    self.w(&` ${fields[i].name.value}:`);
+                    self.pat(fields[i].pat);
+                    i += 1;
+                }
+                if *rest { self.w(" .."); }
+                self.w(" })");
+            }
+            PatKind::Slice { elems, .. } => self.pats("slice", elems),
+            PatKind::Ref { pat, .. } => {
+                self.w("(& ");
+                self.pat(*pat);
+                self.w(")");
+            }
+            PatKind::Or(alts) => self.pats("|", alts),
+        }
+    }
+
+    fn generics(&mut self, g: &Generics) {
+        if g.params.len() == 0 && g.wheres.len() == 0 { return; }
+        self.w(" <");
+        let mut i = 0;
+        while i < g.params.len() {
+            let p = g.params[i];
+            if i > 0 { self.w(","); }
+            self.w(p.name.value.as_str());
+            if p.bounds.len() > 0 { let s = self.paths(&p.bounds); self.w(&`:${s}`); }
+            if let Some(d) = p.default { self.w(&`=${dump_type(d)}`); }
+            i += 1;
+        }
+        self.w(">");
+        for wp in g.wheres.iter() {
+            self.w(" where ");
+            self.typ(wp.ty);
+            let s = self.paths(&wp.bounds);
+            self.w(&`:${s}`);
+        }
+    }
+
+    fn fields(&mut self, kind: &StructKind, fields: &Vec<&Field>) {
+        if *kind == StructKind::Unit { return; }
+        self.w(if *kind == StructKind::Tuple { " (" } else { " {" });
+        let mut i = 0;
+        while i < fields.len() {
+            let f = fields[i];
+            if i > 0 { self.w(" "); }
+            if f.vis != Vis::Private { self.w("pub "); }
+            if let Some(n) = f.name { self.w(&`${n.value}:`); }
+            self.typ(f.ty);
+            i += 1;
+        }
+        self.w(if *kind == StructKind::Tuple { ")" } else { "}" });
+    }
+
+    fn use_tree(&mut self, t: &UseTree) {
+        if let Some(p) = t.prefix { let s = self.path(p); self.w(s.as_str()); }
+        if t.glob {
+            if t.prefix.is_some() { self.w("::"); }
+            self.w("*");
+        } else if t.group {
+            if t.prefix.is_some() { self.w("::"); }
+            self.w("{");
+            let mut i = 0;
+            while i < t.children.len() {
+                if i > 0 { self.w(","); }
+                self.use_tree(t.children[i]);
+                i += 1;
+            }
+            self.w("}");
+        }
+        if let Some(a) = t.alias { self.w(&` as ${a.value}`); }
+    }
+
+    fn items(&mut self, items: &Vec<Item>) {
+        for it in items.iter() {
+            self.w(" ");
+            self.item(it);
+        }
+    }
+
+    pub fn item(&mut self, it: &Item) {
+        match it {
+            Item::Fn(f) => {
+                self.w(&`(fn ${f.name.value}`);
+                self.generics(f.generics);
+                self.w(" (");
+                let mut sep = "";
+                if let Some(s) = f.self_param {
+                    if s.is_ref && s.is_mut { self.w("&mut self"); }
+                    else if s.is_ref { self.w("&self"); }
+                    else if s.is_mut { self.w("mut self"); }
+                    else { self.w("self"); }
+                    sep = " ";
+                }
+                for p in f.params.iter() {
+                    self.w(sep);
+                    self.pat(p.pat);
+                    self.w(":");
+                    self.opt_type(p.ty);
+                    sep = " ";
+                }
+                self.w(")");
+                if let Some(r) = f.result {
+                    self.w(" -> ");
+                    self.typ(r);
+                }
+                if let Some(b) = f.body {
+                    self.w(" ");
+                    self.expr(b);
+                }
+                self.w(")");
+            }
+            Item::Struct(s) => {
+                self.w(&`(struct ${s.name.value}`);
+                self.generics(s.generics);
+                self.fields(&s.kind, &s.fields);
+                self.w(")");
+            }
+            Item::Enum(e) => {
+                self.w(&`(enum ${e.name.value}`);
+                self.generics(e.generics);
+                for v in e.variants.iter() {
+                    self.w(&` (${v.name.value}`);
+                    self.fields(&v.kind, &v.fields);
+                    if let Some(d) = v.discriminant {
+                        self.w(" = ");
+                        self.expr(d);
+                    }
+                    self.w(")");
+                }
+                self.w(")");
+            }
+            Item::TypeAlias(t) => {
+                self.w(&`(type ${t.name.value}`);
+                self.generics(t.generics);
+                if t.bounds.len() > 0 { let s = self.paths(&t.bounds); self.w(&` : ${s}`); }
+                if let Some(x) = t.ty {
+                    self.w(" = ");
+                    self.typ(x);
+                }
+                self.w(")");
+            }
+            Item::Const(c) => {
+                self.w(&`(const ${c.name.value} `);
+                self.typ(c.ty);
+                self.w(" ");
+                self.opt_expr(c.value);
+                self.w(")");
+            }
+            Item::Static(s) => {
+                self.w(if s.is_mut { "(static mut " } else { "(static " });
+                self.w(&`${s.name.value} `);
+                self.typ(s.ty);
+                self.w(" ");
+                self.opt_expr(s.value);
+                self.w(")");
+            }
+            Item::Impl(im) => {
+                self.w("(impl");
+                self.generics(im.generics);
+                if let Some(tp) = im.trait_path { let s = self.path(tp); self.w(&` ${s} for`); }
+                self.w(" ");
+                self.typ(im.ty);
+                self.items(&im.items);
+                self.w(")");
+            }
+            Item::Trait(t) => {
+                self.w(&`(trait ${t.name.value}`);
+                self.generics(t.generics);
+                if t.supers.len() > 0 { let s = self.paths(&t.supers); self.w(&` : ${s}`); }
+                self.items(&t.items);
+                self.w(")");
+            }
+            Item::Mod(m) => {
+                self.w(&`(mod ${m.name.value}`);
+                self.items(&m.items);
+                self.w(")");
+            }
+            Item::Use(u) => {
+                self.w("(use ");
+                self.use_tree(u.tree);
+                self.w(")");
+            }
+            Item::Extern(e) => {
+                self.w(&`(extern ${e.abi}`);
+                self.items(&e.items);
+                self.w(")");
+            }
+        }
+    }
+}

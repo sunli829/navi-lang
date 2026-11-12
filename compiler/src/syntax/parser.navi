@@ -1,0 +1,1797 @@
+//! The parser: recursive descent over the token list.
+
+use crate::syntax::token::*;
+use crate::syntax::source::{File, Errors, Pos, NO_POS};
+use crate::syntax::lexer::{self, Lexer};
+use crate::syntax::ast::*;
+use crate::util;
+
+/// Parses one source file; errors are left in the returned Errors.
+pub fn parse_file(f: &mut File) -> (&SourceFile, &mut Errors) {
+    let errs = Errors::new(f);
+    let toks = lexer::tokenize(f.src.as_str(), errs);
+    let mut p = Parser { file: f, toks, i: 0, errs, no_struct_lit: false, last_err_pos: NO_POS };
+    let attrs = p.inner_attrs();
+    let items = p.items(EOF);
+    p.errs.diags.sort_by(|a, b| a.pos.cmp(&b.pos));
+    (&SourceFile { file: f, attrs, items }, errs)
+}
+
+pub struct Parser {
+    file: &mut File,
+    toks: Vec<Token>,
+    i: usize,
+    errs: &mut Errors,
+    no_struct_lit: bool,
+    last_err_pos: Pos,
+}
+
+const PREC_OR_OR: i32 = 1;
+const PREC_AND_AND: i32 = 2;
+const PREC_COMPARE: i32 = 3;
+const PREC_BIT_OR: i32 = 4;
+const PREC_BIT_XOR: i32 = 5;
+const PREC_BIT_AND: i32 = 6;
+const PREC_SHIFT: i32 = 7;
+const PREC_ADD: i32 = 8;
+const PREC_MUL: i32 = 9;
+const PREC_CAST: i32 = 10;
+
+fn binary_prec(k: Kind) -> i32 {
+    match k {
+        OR_OR => PREC_OR_OR,
+        AND_AND => PREC_AND_AND,
+        EQ_EQ | NE | LT | GT | LE | GE => PREC_COMPARE,
+        OR => PREC_BIT_OR,
+        CARET => PREC_BIT_XOR,
+        AND => PREC_BIT_AND,
+        SHL | SHR => PREC_SHIFT,
+        PLUS | MINUS => PREC_ADD,
+        STAR | SLASH | PERCENT => PREC_MUL,
+        KW_AS => PREC_CAST,
+        _ => 0,
+    }
+}
+
+fn is_assign_op(k: Kind) -> bool {
+    k == EQ || k == PLUS_EQ || k == MINUS_EQ || k == STAR_EQ || k == SLASH_EQ || k == PERCENT_EQ
+        || k == CARET_EQ || k == AND_EQ || k == OR_EQ || k == SHL_EQ || k == SHR_EQ
+}
+
+fn is_path_start(k: Kind) -> bool {
+    k == IDENT || k == KW_SELF_VALUE || k == KW_SELF_TYPE || k == KW_SUPER || k == KW_CRATE || k == LT
+}
+
+fn is_digit(c: u8) -> bool { c >= b'0' && c <= b'9' }
+
+impl Parser {
+    fn tok(&self) -> Token { self.toks[self.i].clone() }
+    fn kind(&self) -> Kind { self.toks[self.i].kind }
+    fn pos(&self) -> Pos { self.toks[self.i].pos }
+    fn peek(&self, n: usize) -> Token {
+        let j = if self.i + n < self.toks.len() { self.i + n } else { self.toks.len() - 1 };
+        self.toks[j].clone()
+    }
+
+    fn next(&mut self) -> Token {
+        let t = self.toks[self.i].clone();
+        if self.i < self.toks.len() - 1 { self.i += 1; }
+        t
+    }
+
+    fn got(&mut self, k: Kind) -> bool {
+        if self.kind() == k {
+            self.next();
+            return true;
+        }
+        false
+    }
+
+    fn errorf(&mut self, pos: Pos, msg: String) {
+        if pos == self.last_err_pos && self.errs.len() > 0 { return; }
+        self.last_err_pos = pos;
+        self.errs.add(pos, msg);
+    }
+
+    fn describe(&self, t: &Token) -> String {
+        if t.kind == IDENT { return `identifier ${t.text}`; }
+        if t.kind == EOF { return "end of file".to_string(); }
+        if t.text.len() > 0 { return `${kind_name(t.kind)} ${t.text}`; }
+        `'${kind_name(t.kind)}'`
+    }
+
+    fn expect(&mut self, k: Kind) -> Pos {
+        let pos = self.pos();
+        if !self.got(k) {
+            let t = self.tok();
+            let d = self.describe(&t);
+            self.errorf(pos, `expected '${kind_name(k)}', found ${d}`);
+        }
+        pos
+    }
+
+    // splitRest consumes the first character of the current token.
+    fn split_rest(&mut self, rest: Kind) {
+        let i = self.i;
+        self.toks[i].kind = rest;
+        self.toks[i].pos += 1;
+    }
+
+    fn got_gt(&mut self) -> bool {
+        let k = self.kind();
+        if k == GT { self.next(); }
+        else if k == SHR { self.split_rest(GT); }
+        else if k == GE { self.split_rest(EQ); }
+        else if k == SHR_EQ { self.split_rest(GE); }
+        else { return false; }
+        true
+    }
+
+    fn expect_gt(&mut self) {
+        if !self.got_gt() {
+            let t = self.tok();
+            let d = self.describe(&t);
+            let p = self.pos();
+            self.errorf(p, `expected '>', found ${d}`);
+        }
+    }
+
+    fn got_amp(&mut self) -> bool {
+        let k = self.kind();
+        if k == AND { self.next(); }
+        else if k == AND_AND { self.split_rest(AND); }
+        else { return false; }
+        true
+    }
+
+    fn name(&mut self) -> &Name {
+        let t = self.tok();
+        if t.kind == IDENT {
+            self.next();
+            return name(t.pos, t.text);
+        }
+        let d = self.describe(&t);
+        self.errorf(t.pos, `expected identifier, found ${d}`);
+        name(t.pos, "_")
+    }
+
+    // --- Attributes ---------------------------------------------------------------
+
+    fn inner_attrs(&mut self) -> Vec<&Attr> {
+        let mut attrs = Vec::new();
+        while self.kind() == POUND && self.peek(1).kind == NOT { attrs.push(self.attr(true)); }
+        attrs
+    }
+
+    fn outer_attrs(&mut self) -> Vec<&Attr> {
+        let mut attrs = Vec::new();
+        while self.kind() == POUND && self.peek(1).kind == L_BRACKET { attrs.push(self.attr(false)); }
+        attrs
+    }
+
+    fn attr(&mut self, inner: bool) -> &Attr {
+        let hash = self.next().pos;
+        if inner { self.expect(NOT); }
+        self.expect(L_BRACKET);
+        let path = self.mod_path();
+        let mut args = Vec::new();
+        let mut value = None;
+        if self.kind() == L_PAREN {
+            self.next();
+            let mut depth = 1;
+            loop {
+                let t = self.tok();
+                if t.kind == EOF {
+                    self.errorf(t.pos, "unterminated attribute".to_string());
+                    return &Attr { hash, inner, path, args, value };
+                }
+                if t.kind == L_PAREN || t.kind == L_BRACKET || t.kind == L_BRACE { depth += 1; }
+                if t.kind == R_PAREN || t.kind == R_BRACKET || t.kind == R_BRACE { depth -= 1; }
+                if depth == 0 {
+                    self.next();
+                    break;
+                }
+                args.push(self.next());
+            }
+        } else if self.kind() == EQ {
+            self.next();
+            value = Some(self.unary());
+        }
+        self.expect(R_BRACKET);
+        &Attr { hash, inner, path, args, value }
+    }
+
+    // --- Items --------------------------------------------------------------------
+
+    fn items(&mut self, end: Kind) -> Vec<Item> {
+        let mut items = Vec::new();
+        while self.kind() != end && self.kind() != EOF {
+            let start = self.i;
+            if let Some(it) = self.item() { items.push(it); }
+            if self.i == start {
+                let t = self.tok();
+                let d = self.describe(&t);
+                let p = self.pos();
+                self.errorf(p, `expected item, found ${d}`);
+                self.sync_item();
+                if self.i == start { self.next(); }
+            }
+        }
+        items
+    }
+
+    fn sync_item(&mut self) {
+        let mut depth = 0;
+        loop {
+            let k = self.kind();
+            if k == EOF { return; }
+            if k == L_BRACE {
+                depth += 1;
+            } else if k == R_BRACE {
+                if depth == 0 { return; }
+                depth -= 1;
+                if depth == 0 {
+                    self.next();
+                    return;
+                }
+            } else if k == SEMI {
+                if depth == 0 {
+                    self.next();
+                    return;
+                }
+            } else if k == KW_FN || k == KW_STRUCT || k == KW_ENUM || k == KW_IMPL || k == KW_TRAIT || k == KW_MOD
+                || k == KW_USE || k == KW_CONST || k == KW_STATIC || k == KW_TYPE || k == KW_PUB || k == KW_EXTERN || k == POUND {
+                if depth == 0 { return; }
+            }
+            self.next();
+        }
+    }
+
+    fn is_item_start(&self) -> bool {
+        let k = self.kind();
+        if k == KW_FN || k == KW_STRUCT || k == KW_ENUM || k == KW_IMPL || k == KW_TRAIT || k == KW_MOD || k == KW_USE
+            || k == KW_STATIC || k == KW_TYPE || k == KW_PUB || k == KW_EXTERN || k == KW_CONST {
+            return true;
+        }
+        if k == KW_UNSAFE {
+            let n = self.peek(1).kind;
+            return n == KW_FN || n == KW_IMPL || n == KW_TRAIT;
+        }
+        if k == POUND { return self.peek(1).kind == L_BRACKET; }
+        false
+    }
+
+    fn item(&mut self) -> Option<Item> {
+        let attrs = self.outer_attrs();
+        let start = self.pos();
+        let vis = self.visibility();
+        let has_attrs = attrs.len() > 0;
+        let base = ItemBase { id: new_id(), attrs, vis: vis.clone(), start };
+        let k = self.kind();
+        if k == KW_FN { return Some(Item::Fn(self.fn_decl(base, ""))); }
+        if k == KW_CONST {
+            let n = self.peek(1).kind;
+            if n == KW_FN || n == KW_UNSAFE {
+                self.next();
+                let f = self.fn_decl(base, "");
+                f.is_const = true;
+                return Some(Item::Fn(f));
+            }
+            return Some(Item::Const(self.const_decl(base)));
+        }
+        if k == KW_UNSAFE {
+            let n = self.peek(1).kind;
+            if n == KW_FN {
+                self.next();
+                let f = self.fn_decl(base, "");
+                f.is_unsafe = true;
+                return Some(Item::Fn(f));
+            }
+            if n == KW_IMPL {
+                self.next();
+                let im = self.impl_decl(base);
+                im.is_unsafe = true;
+                return Some(Item::Impl(im));
+            }
+            if n == KW_TRAIT {
+                self.next();
+                let tr = self.trait_decl(base);
+                tr.is_unsafe = true;
+                return Some(Item::Trait(tr));
+            }
+        }
+        if k == KW_EXTERN {
+            self.next();
+            let abi = self.abi();
+            if self.kind() == L_BRACE { return Some(Item::Extern(self.extern_block(base, abi.as_str()))); }
+            if self.kind() == KW_FN { return Some(Item::Fn(self.fn_decl(base, abi.as_str()))); }
+            let t = self.tok();
+            let d = self.describe(&t);
+            let p = self.pos();
+            self.errorf(p, `expected 'fn' or '{' after extern, found ${d}`);
+            return None;
+        }
+        if k == KW_STRUCT { return Some(Item::Struct(self.struct_decl(base))); }
+        if k == KW_ENUM { return Some(Item::Enum(self.enum_decl(base))); }
+        if k == KW_TYPE { return Some(Item::TypeAlias(self.type_alias(base))); }
+        if k == KW_STATIC { return Some(Item::Static(self.static_decl(base))); }
+        if k == KW_IMPL { return Some(Item::Impl(self.impl_decl(base))); }
+        if k == KW_TRAIT { return Some(Item::Trait(self.trait_decl(base))); }
+        if k == KW_MOD { return Some(Item::Mod(self.mod_decl(base))); }
+        if k == KW_USE { return Some(Item::Use(self.use_decl(base))); }
+        if has_attrs || vis != Vis::Private {
+            let t = self.tok();
+            let d = self.describe(&t);
+            let p = self.pos();
+            self.errorf(p, `expected item after attributes or visibility, found ${d}`);
+        }
+        None
+    }
+
+    fn visibility(&mut self) -> Vis {
+        if !self.got(KW_PUB) { return Vis::Private; }
+        if self.kind() == L_PAREN {
+            let n = self.peek(1).kind;
+            if n == KW_CRATE {
+                self.next();
+                self.next();
+                self.expect(R_PAREN);
+                return Vis::Crate;
+            }
+            if n == KW_SUPER {
+                self.next();
+                self.next();
+                self.expect(R_PAREN);
+                return Vis::Super;
+            }
+        }
+        Vis::Pub
+    }
+
+    fn abi(&mut self) -> String {
+        if self.kind() != STRING { return "C".to_string(); }
+        let t = self.next();
+        let abi = t.text.trim_matches('"').to_string();
+        if abi != "C" {
+            self.errorf(t.pos, `unsupported ABI ${util::quote(abi.as_str())} (only "C" is supported)`);
+        }
+        abi
+    }
+
+    fn fn_decl(&mut self, base: ItemBase, abi: &str) -> &mut FnDecl {
+        self.expect(KW_FN);
+        let nm = self.name();
+        let generics = self.generic_params();
+        let f = &mut FnDecl { base, name: nm, is_const: false, is_unsafe: false, abi: abi.to_string(), generics,
+            self_param: None, params: Vec::new(), result: None, body: None };
+        self.expect(L_PAREN);
+        if self.kind() != R_PAREN {
+            f.self_param = self.self_param();
+            if f.self_param.is_none() || self.got(COMMA) {
+                while self.kind() != R_PAREN && self.kind() != EOF {
+                    let pt = self.pat_no_top_alt();
+                    self.expect(COLON);
+                    let t = self.typ();
+                    f.params.push(&Param { pat: pt, ty: Some(t) });
+                    if !self.got(COMMA) { break; }
+                }
+            }
+        }
+        self.expect(R_PAREN);
+        if self.got(R_ARROW) { f.result = Some(self.typ()); }
+        self.where_clause(f.generics);
+        if self.kind() == L_BRACE {
+            f.body = Some(self.block());
+        } else {
+            self.expect(SEMI);
+        }
+        f
+    }
+
+    fn self_param(&mut self) -> Option<&SelfParam> {
+        let k = self.kind();
+        if k == KW_SELF_VALUE {
+            return Some(&SelfParam { pos: self.next().pos, is_ref: false, is_mut: false });
+        }
+        if k == KW_MUT && self.peek(1).kind == KW_SELF_VALUE {
+            self.next();
+            return Some(&SelfParam { pos: self.next().pos, is_ref: false, is_mut: true });
+        }
+        if k == AND && self.peek(1).kind == KW_SELF_VALUE {
+            self.next();
+            return Some(&SelfParam { pos: self.next().pos, is_ref: true, is_mut: false });
+        }
+        if k == AND && self.peek(1).kind == KW_MUT && self.peek(2).kind == KW_SELF_VALUE {
+            self.next();
+            self.next();
+            return Some(&SelfParam { pos: self.next().pos, is_ref: true, is_mut: true });
+        }
+        None
+    }
+
+    fn generic_params(&mut self) -> &mut Generics {
+        let g = &mut Generics { lt: NO_POS, params: Vec::new(), wheres: Vec::new() };
+        if self.kind() != LT { return g; }
+        g.lt = self.next().pos;
+        while self.kind() != GT && self.kind() != EOF {
+            let nm = self.name();
+            let mut bounds = Vec::new();
+            let mut default = None;
+            if self.got(COLON) { bounds = self.bounds(); }
+            if self.got(EQ) { default = Some(self.typ()); }
+            g.params.push(&GenericParam { id: new_id(), name: nm, bounds, default });
+            if !self.got(COMMA) { break; }
+        }
+        self.expect_gt();
+        g
+    }
+
+    fn bounds(&mut self) -> Vec<&Path> {
+        let mut bs = Vec::new();
+        loop {
+            bs.push(self.type_path());
+            if !self.got(PLUS) { return bs; }
+        }
+    }
+
+    fn where_clause(&mut self, g: &mut Generics) {
+        if !self.got(KW_WHERE) { return; }
+        while self.kind() != L_BRACE && self.kind() != SEMI && self.kind() != EOF {
+            let t = self.typ();
+            self.expect(COLON);
+            let bounds = self.bounds();
+            g.wheres.push(&WherePredicate { ty: t, bounds });
+            if !self.got(COMMA) { break; }
+        }
+    }
+
+    fn struct_decl(&mut self, base: ItemBase) -> &mut StructDecl {
+        self.expect(KW_STRUCT);
+        let nm = self.name();
+        let generics = self.generic_params();
+        let s = &mut StructDecl { base, name: nm, generics, kind: StructKind::Named, fields: Vec::new() };
+        let k = self.kind();
+        if k == L_PAREN {
+            s.kind = StructKind::Tuple;
+            s.fields = self.tuple_fields();
+            self.where_clause(s.generics);
+            self.expect(SEMI);
+        } else if k == SEMI {
+            s.kind = StructKind::Unit;
+            self.next();
+        } else {
+            self.where_clause(s.generics);
+            if self.kind() == SEMI {
+                s.kind = StructKind::Unit;
+                self.next();
+            } else {
+                s.kind = StructKind::Named;
+                s.fields = self.named_fields();
+            }
+        }
+        s
+    }
+
+    fn named_fields(&mut self) -> Vec<&Field> {
+        let mut fields = Vec::new();
+        self.expect(L_BRACE);
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            let attrs = self.outer_attrs();
+            let vis = self.visibility();
+            let nm = self.name();
+            self.expect(COLON);
+            let t = self.typ();
+            fields.push(&Field { id: new_id(), attrs, vis, name: Some(nm), ty: t });
+            if !self.got(COMMA) { break; }
+        }
+        self.expect(R_BRACE);
+        fields
+    }
+
+    fn tuple_fields(&mut self) -> Vec<&Field> {
+        let mut fields = Vec::new();
+        self.expect(L_PAREN);
+        while self.kind() != R_PAREN && self.kind() != EOF {
+            let attrs = self.outer_attrs();
+            let vis = self.visibility();
+            let t = self.typ();
+            fields.push(&Field { id: new_id(), attrs, vis, name: None, ty: t });
+            if !self.got(COMMA) { break; }
+        }
+        self.expect(R_PAREN);
+        fields
+    }
+
+    fn enum_decl(&mut self, base: ItemBase) -> &mut EnumDecl {
+        self.expect(KW_ENUM);
+        let nm = self.name();
+        let generics = self.generic_params();
+        let e = &mut EnumDecl { base, name: nm, generics, variants: Vec::new() };
+        self.where_clause(e.generics);
+        self.expect(L_BRACE);
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            let attrs = self.outer_attrs();
+            let vn = self.name();
+            let mut kind = StructKind::Unit;
+            let mut fields = Vec::new();
+            if self.kind() == L_BRACE {
+                kind = StructKind::Named;
+                fields = self.named_fields();
+            } else if self.kind() == L_PAREN {
+                kind = StructKind::Tuple;
+                fields = self.tuple_fields();
+            }
+            let mut disc = None;
+            if self.got(EQ) { disc = Some(self.expr()); }
+            e.variants.push(&Variant { id: new_id(), attrs, name: vn, kind, fields, discriminant: disc });
+            if !self.got(COMMA) { break; }
+        }
+        self.expect(R_BRACE);
+        e
+    }
+
+    fn type_alias(&mut self, base: ItemBase) -> &mut TypeAlias {
+        self.expect(KW_TYPE);
+        let nm = self.name();
+        let generics = self.generic_params();
+        let t = &mut TypeAlias { base, name: nm, generics, bounds: Vec::new(), ty: None };
+        if self.got(COLON) { t.bounds = self.bounds(); }
+        self.where_clause(t.generics);
+        if self.got(EQ) { t.ty = Some(self.typ()); }
+        self.expect(SEMI);
+        t
+    }
+
+    fn const_decl(&mut self, base: ItemBase) -> &mut ConstDecl {
+        self.expect(KW_CONST);
+        let nm = if self.kind() == UNDERSCORE { name(self.next().pos, "_") } else { self.name() };
+        self.expect(COLON);
+        let t = self.typ();
+        let mut value = None;
+        if self.got(EQ) { value = Some(self.expr()); }
+        self.expect(SEMI);
+        &mut ConstDecl { base, name: nm, ty: t, value }
+    }
+
+    fn static_decl(&mut self, base: ItemBase) -> &mut StaticDecl {
+        self.expect(KW_STATIC);
+        let is_mut = self.got(KW_MUT);
+        let nm = self.name();
+        self.expect(COLON);
+        let t = self.typ();
+        self.expect(EQ);
+        let v = self.expr();
+        self.expect(SEMI);
+        &mut StaticDecl { base, name: nm, is_mut, ty: t, value: Some(v) }
+    }
+
+    fn impl_decl(&mut self, base: ItemBase) -> &mut ImplDecl {
+        self.expect(KW_IMPL);
+        let generics = self.generic_params();
+        let first = self.typ();
+        let mut trait_path = None;
+        let mut self_ty = first;
+        if self.got(KW_FOR) {
+            match &first.kind {
+                TypeKind::Path(p) => { trait_path = Some(*p); }
+                _ => { self.errorf(first.pos(), "expected a trait name before 'for'".to_string()); }
+            }
+            self_ty = self.typ();
+        }
+        let im = &mut ImplDecl { base, is_unsafe: false, generics, trait_path, ty: self_ty, items: Vec::new() };
+        self.where_clause(im.generics);
+        self.expect(L_BRACE);
+        im.items = self.items(R_BRACE);
+        self.expect(R_BRACE);
+        im
+    }
+
+    fn trait_decl(&mut self, base: ItemBase) -> &mut TraitDecl {
+        self.expect(KW_TRAIT);
+        let nm = self.name();
+        let generics = self.generic_params();
+        let t = &mut TraitDecl { base, is_unsafe: false, name: nm, generics, supers: Vec::new(), items: Vec::new() };
+        if self.got(COLON) { t.supers = self.bounds(); }
+        self.where_clause(t.generics);
+        self.expect(L_BRACE);
+        t.items = self.items(R_BRACE);
+        self.expect(R_BRACE);
+        t
+    }
+
+    fn mod_decl(&mut self, base: ItemBase) -> &mut ModDecl {
+        self.expect(KW_MOD);
+        let nm = self.name();
+        let m = &mut ModDecl { base, name: nm, inline: false, items: Vec::new() };
+        if self.got(SEMI) { return m; }
+        m.inline = true;
+        self.expect(L_BRACE);
+        let inner = self.inner_attrs();
+        for a in inner.iter() { m.base.attrs.push(*a); }
+        m.items = self.items(R_BRACE);
+        self.expect(R_BRACE);
+        m
+    }
+
+    fn use_decl(&mut self, base: ItemBase) -> &mut UseDecl {
+        self.expect(KW_USE);
+        let tree = self.use_tree();
+        self.expect(SEMI);
+        &mut UseDecl { base, tree }
+    }
+
+    fn use_tree(&mut self) -> &UseTree {
+        let t = &mut UseTree { prefix: None, alias: None, glob: false, children: Vec::new(), group: false };
+        if self.kind() == L_BRACE {
+            t.group = true;
+            t.children = self.use_group();
+            return t;
+        }
+        if self.kind() == STAR {
+            self.next();
+            t.glob = true;
+            return t;
+        }
+        let mut segs = Vec::new();
+        loop {
+            segs.push(&PathSegment { name: self.path_name(), args: None });
+            if self.kind() != PATH_SEP { break; }
+            self.next();
+            if self.kind() == STAR {
+                self.next();
+                t.glob = true;
+                break;
+            }
+            if self.kind() == L_BRACE {
+                t.group = true;
+                t.children = self.use_group();
+                break;
+            }
+        }
+        t.prefix = Some(&Path { segments: segs, qself: None });
+        if !t.glob && !t.group && self.got(KW_AS) {
+            if self.kind() == UNDERSCORE {
+                t.alias = Some(name(self.next().pos, "_"));
+            } else {
+                t.alias = Some(self.name());
+            }
+        }
+        t
+    }
+
+    fn use_group(&mut self) -> Vec<&UseTree> {
+        let mut children = Vec::new();
+        self.expect(L_BRACE);
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            children.push(self.use_tree());
+            if !self.got(COMMA) { break; }
+        }
+        self.expect(R_BRACE);
+        children
+    }
+
+    fn extern_block(&mut self, base: ItemBase, abi: &str) -> &mut ExternBlock {
+        let b = &mut ExternBlock { base, abi: abi.to_string(), items: Vec::new() };
+        self.expect(L_BRACE);
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            let attrs = self.outer_attrs();
+            let start = self.pos();
+            let vis = self.visibility();
+            let ib = ItemBase { id: new_id(), attrs, vis, start };
+            let k = self.kind();
+            if k == KW_FN {
+                let f = self.fn_decl(ib, abi);
+                if let Some(body) = f.body {
+                    self.errorf(body.pos(), "functions in an extern block cannot have a body".to_string());
+                }
+                b.items.push(Item::Fn(f));
+            } else if k == KW_STATIC {
+                b.items.push(Item::Static(self.extern_static(ib)));
+            } else {
+                let t = self.tok();
+                let d = self.describe(&t);
+                let p = self.pos();
+                self.errorf(p, `expected 'fn' or 'static' in extern block, found ${d}`);
+                self.sync_item();
+            }
+        }
+        self.expect(R_BRACE);
+        b
+    }
+
+    fn extern_static(&mut self, base: ItemBase) -> &mut StaticDecl {
+        self.expect(KW_STATIC);
+        let is_mut = self.got(KW_MUT);
+        let nm = self.name();
+        self.expect(COLON);
+        let t = self.typ();
+        self.expect(SEMI);
+        &mut StaticDecl { base, name: nm, is_mut, ty: t, value: None }
+    }
+
+    // --- Paths --------------------------------------------------------------------
+
+    fn path_name(&mut self) -> &Name {
+        let t = self.tok();
+        if t.kind == IDENT {
+            self.next();
+            return name(t.pos, t.text);
+        }
+        if t.kind == KW_SELF_VALUE || t.kind == KW_SELF_TYPE || t.kind == KW_SUPER || t.kind == KW_CRATE {
+            self.next();
+            return name(t.pos, kind_name(t.kind));
+        }
+        let d = self.describe(&t);
+        self.errorf(t.pos, `expected identifier, found ${d}`);
+        name(t.pos, "_")
+    }
+
+    fn mod_path(&mut self) -> &Path {
+        let mut segs = Vec::new();
+        loop {
+            segs.push(&PathSegment { name: self.path_name(), args: None });
+            if !self.got(PATH_SEP) { return &Path { segments: segs, qself: None }; }
+        }
+    }
+
+    fn type_path(&mut self) -> &Path { self.path(false) }
+    fn expr_path(&mut self) -> &Path { self.path(true) }
+
+    fn path(&mut self, turbofish: bool) -> &Path {
+        let mut qself = None;
+        if self.kind() == LT {
+            qself = Some(self.qself());
+            self.expect(PATH_SEP);
+        }
+        let mut segs: Vec<&mut PathSegment> = Vec::new();
+        loop {
+            let seg = &mut PathSegment { name: self.path_name(), args: None };
+            segs.push(seg);
+            if !turbofish && self.kind() == LT { seg.args = Some(self.generic_args()); }
+            if self.kind() != PATH_SEP { break; }
+            if self.peek(1).kind == LT {
+                self.next();
+                seg.args = Some(self.generic_args());
+                if self.kind() != PATH_SEP { break; }
+            }
+            let n = self.peek(1).kind;
+            if !is_path_start(n) || n == LT { break; }
+            self.next();
+        }
+        let mut out: Vec<&PathSegment> = Vec::new();
+        for s in segs.iter() { out.push(*s); }
+        &Path { segments: out, qself }
+    }
+
+    fn qself(&mut self) -> &QSelf {
+        let lt = self.expect(LT);
+        let t = self.typ();
+        let mut tp = None;
+        if self.got(KW_AS) { tp = Some(self.type_path()); }
+        self.expect_gt();
+        &QSelf { lt, ty: t, trait_path: tp }
+    }
+
+    fn generic_args(&mut self) -> &GenericArgs {
+        let lt = self.expect(LT);
+        let ga = &mut GenericArgs { lt, args: Vec::new(), bindings: Vec::new() };
+        loop {
+            let k = self.kind();
+            if k == GT || k == SHR || k == GE || k == SHR_EQ || k == EOF { break; }
+            if k == IDENT && self.peek(1).kind == EQ {
+                let nm = self.name();
+                self.next();
+                let t = self.typ();
+                ga.bindings.push(&AssocBinding { name: nm, ty: t });
+            } else {
+                ga.args.push(self.typ());
+            }
+            if !self.got(COMMA) { break; }
+        }
+        self.expect_gt();
+        ga
+    }
+
+    // --- Types --------------------------------------------------------------------
+
+    fn typ(&mut self) -> &Type {
+        let t = self.tok();
+        let k = t.kind;
+        if k == AND || k == AND_AND {
+            self.got_amp();
+            let is_mut = self.got(KW_MUT);
+            let elem = self.typ();
+            return ty(TypeKind::Ref { amp: t.pos, is_mut, elem });
+        }
+        if k == STAR {
+            self.next();
+            let mut is_mut = false;
+            if self.got(KW_MUT) {
+                is_mut = true;
+            } else if self.got(KW_CONST) {
+            } else {
+                let p = self.pos();
+                self.errorf(p, "expected 'const' or 'mut' after '*' in a pointer type".to_string());
+            }
+            let elem = self.typ();
+            return ty(TypeKind::Ptr { star: t.pos, is_mut, elem });
+        }
+        if k == L_BRACKET {
+            self.next();
+            let elem = self.typ();
+            if self.got(SEMI) {
+                let n = self.expr();
+                self.expect(R_BRACKET);
+                return ty(TypeKind::Array { lbrack: t.pos, elem, len: n });
+            }
+            self.expect(R_BRACKET);
+            return ty(TypeKind::Slice { lbrack: t.pos, elem });
+        }
+        if k == L_PAREN {
+            self.next();
+            let mut elems = Vec::new();
+            let mut trailing = false;
+            while self.kind() != R_PAREN && self.kind() != EOF {
+                elems.push(self.typ());
+                trailing = self.got(COMMA);
+                if !trailing { break; }
+            }
+            self.expect(R_PAREN);
+            if elems.len() == 1 && !trailing { return elems[0]; }
+            return ty(TypeKind::Tuple { lparen: t.pos, elems });
+        }
+        if k == KW_FN { return self.fn_type(t.pos, ""); }
+        if k == KW_EXTERN {
+            self.next();
+            let abi = self.abi();
+            return self.fn_type(t.pos, abi.as_str());
+        }
+        if k == KW_DYN {
+            self.next();
+            let bounds = self.bounds();
+            return ty(TypeKind::Dyn { pos: t.pos, bounds });
+        }
+        if k == KW_IMPL {
+            self.next();
+            let bounds = self.bounds();
+            return ty(TypeKind::Impl { pos: t.pos, bounds });
+        }
+        if k == NOT {
+            self.next();
+            return ty(TypeKind::Never(t.pos));
+        }
+        if k == UNDERSCORE {
+            self.next();
+            return ty(TypeKind::Infer(t.pos));
+        }
+        if is_path_start(k) { return ty(TypeKind::Path(self.type_path())); }
+        let d = self.describe(&t);
+        self.errorf(t.pos, `expected type, found ${d}`);
+        self.next();
+        ty(TypeKind::Infer(t.pos))
+    }
+
+    fn fn_type(&mut self, start: Pos, abi: &str) -> &Type {
+        self.expect(KW_FN);
+        self.expect(L_PAREN);
+        let mut params = Vec::new();
+        while self.kind() != R_PAREN && self.kind() != EOF {
+            params.push(self.typ());
+            if !self.got(COMMA) { break; }
+        }
+        self.expect(R_PAREN);
+        let mut result = None;
+        if self.got(R_ARROW) { result = Some(self.typ()); }
+        ty(TypeKind::Fn { start, abi: abi.to_string(), params, result })
+    }
+
+    // --- Statements and blocks ----------------------------------------------------------
+
+    fn block(&mut self) -> &Expr {
+        let lbrace = self.expect(L_BRACE);
+        let b = &mut Block { lbrace, rbrace: NO_POS, is_unsafe: false, stmts: Vec::new(), tail: None };
+        let old = self.no_struct_lit;
+        self.no_struct_lit = false;
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            let start = self.i;
+            if self.stmt(b) { break; }
+            if self.i == start {
+                let t = self.tok();
+                let d = self.describe(&t);
+                let p = self.pos();
+                self.errorf(p, `expected statement, found ${d}`);
+                self.sync_stmt();
+                if self.i == start { self.next(); }
+            }
+        }
+        b.rbrace = self.expect(R_BRACE);
+        self.no_struct_lit = old;
+        expr(ExprKind::Block(b))
+    }
+
+    fn sync_stmt(&mut self) {
+        let mut depth = 0;
+        loop {
+            let k = self.kind();
+            if k == EOF { return; }
+            if k == L_BRACE || k == L_PAREN || k == L_BRACKET {
+                depth += 1;
+            } else if k == R_BRACE || k == R_PAREN || k == R_BRACKET {
+                if depth == 0 { return; }
+                depth -= 1;
+            } else if k == SEMI {
+                if depth == 0 {
+                    self.next();
+                    return;
+                }
+            }
+            self.next();
+        }
+    }
+
+    // stmt parses one statement into b; true when it parsed the tail.
+    fn stmt(&mut self, b: &mut Block) -> bool {
+        let k = self.kind();
+        if k == SEMI {
+            let p = self.next().pos;
+            b.stmts.push(&Stmt::Empty(p));
+            return false;
+        }
+        if k == KW_LET {
+            let s = self.let_stmt();
+            b.stmts.push(&Stmt::Let(s));
+            return false;
+        }
+        if k == KW_DEFER {
+            let s = self.defer_stmt();
+            b.stmts.push(s);
+            return false;
+        }
+        if self.is_item_start() && !(k == KW_CONST && self.peek(1).kind == L_BRACE) {
+            if let Some(it) = self.item() { b.stmts.push(&Stmt::Item(it)); }
+            return false;
+        }
+        let (x, block_like) = self.expr_stmt_head();
+        if self.got(SEMI) {
+            b.stmts.push(&Stmt::Expr { x, semi: true });
+        } else if self.kind() == R_BRACE {
+            b.tail = Some(x);
+            return true;
+        } else if block_like {
+            b.stmts.push(&Stmt::Expr { x, semi: false });
+        } else {
+            let t = self.tok();
+            let d = self.describe(&t);
+            let p = self.pos();
+            self.errorf(p, `expected ';' or '}' after expression, found ${d}`);
+            self.sync_stmt();
+        }
+        false
+    }
+
+    fn expr_stmt_head(&mut self) -> (&Expr, bool) {
+        if !self.starts_block_like() { return (self.expr(), false); }
+        let x = self.block_like_expr();
+        let k = self.kind();
+        if k == DOT || k == QUESTION {
+            let y = self.postfix(x);
+            return (self.expr_from(y), false);
+        }
+        (x, true)
+    }
+
+    fn starts_block_like(&self) -> bool {
+        let k = self.kind();
+        if k == L_BRACE || k == KW_IF || k == KW_MATCH || k == KW_LOOP || k == KW_WHILE || k == KW_FOR || k == KW_SELECT {
+            return true;
+        }
+        if k == KW_UNSAFE { return self.peek(1).kind == L_BRACE; }
+        if k == LIFETIME { return self.peek(1).kind == COLON; }
+        false
+    }
+
+    fn let_stmt(&mut self) -> &LetStmt {
+        let pos = self.next().pos;
+        let pt = self.pat();
+        let mut t = None;
+        let mut init = None;
+        let mut els = None;
+        if self.got(COLON) { t = Some(self.typ()); }
+        if self.got(EQ) {
+            init = Some(self.expr());
+            if self.kind() == KW_ELSE {
+                self.next();
+                els = Some(self.block());
+            }
+        }
+        self.expect(SEMI);
+        &LetStmt { pos, pat: pt, ty: t, init, els }
+    }
+
+    fn defer_stmt(&mut self) -> &Stmt {
+        let pos = self.next().pos;
+        if self.kind() == L_BRACE {
+            let x = self.block();
+            self.got(SEMI);
+            return &Stmt::Defer { pos, x };
+        }
+        let x = self.expr();
+        let ok = match &x.kind { ExprKind::Call { .. } | ExprKind::MethodCall { .. } => true, _ => false };
+        if !ok { self.errorf(x.pos(), "defer needs a function call or a block".to_string()); }
+        self.expect(SEMI);
+        &Stmt::Defer { pos, x }
+    }
+
+    // --- Expressions --------------------------------------------------------------
+
+    pub fn expr(&mut self) -> &Expr { self.assign() }
+
+    fn expr_no_struct(&mut self) -> &Expr {
+        let old = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let x = self.expr();
+        self.no_struct_lit = old;
+        x
+    }
+
+    fn assign(&mut self) -> &Expr {
+        let x = self.range_expr();
+        if is_assign_op(self.kind()) {
+            let t = self.next();
+            let y = self.assign();
+            return expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y });
+        }
+        x
+    }
+
+    fn expr_from(&mut self, x0: &Expr) -> &Expr {
+        let mut x = self.binary_from(x0, 1);
+        let k = self.kind();
+        if k == DOT_DOT || k == DOT_DOT_EQ { x = self.range_from(Some(x)); }
+        if is_assign_op(self.kind()) {
+            let t = self.next();
+            let y = self.assign();
+            return expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y });
+        }
+        x
+    }
+
+    fn range_expr(&mut self) -> &Expr {
+        let k = self.kind();
+        if k == DOT_DOT || k == DOT_DOT_EQ { return self.range_from(None); }
+        let x = self.binary(1);
+        let k2 = self.kind();
+        if k2 == DOT_DOT || k2 == DOT_DOT_EQ { return self.range_from(Some(x)); }
+        x
+    }
+
+    fn range_from(&mut self, lo: Option<&Expr>) -> &Expr {
+        let t = self.next();
+        let inclusive = t.kind == DOT_DOT_EQ;
+        let mut hi = None;
+        if self.starts_expr() {
+            hi = Some(self.binary(1));
+        } else if inclusive {
+            let p = self.pos();
+            self.errorf(p, "inclusive range '..=' needs an upper bound".to_string());
+        }
+        expr(ExprKind::Range { op_pos: t.pos, lo, hi, inclusive })
+    }
+
+    fn starts_expr(&self) -> bool {
+        let k = self.kind();
+        if k == IDENT || k == INT || k == FLOAT || k == CHAR || k == BYTE || k == STRING || k == RAW_STRING || k == BYTE_STRING
+            || k == TEMPLATE || k == KW_TRUE || k == KW_FALSE || k == KW_SELF_VALUE || k == KW_SELF_TYPE || k == KW_SUPER
+            || k == KW_CRATE || k == L_PAREN || k == L_BRACKET || k == MINUS || k == NOT || k == STAR || k == AND || k == AND_AND
+            || k == OR || k == OR_OR || k == LT || k == KW_IF || k == KW_MATCH || k == KW_LOOP || k == KW_WHILE || k == KW_FOR
+            || k == KW_UNSAFE || k == KW_RETURN || k == KW_BREAK || k == KW_CONTINUE || k == KW_SELECT || k == LIFETIME {
+            return true;
+        }
+        if k == L_BRACE { return !self.no_struct_lit; }
+        false
+    }
+
+    fn binary(&mut self, min_prec: i32) -> &Expr {
+        let x = self.unary();
+        self.binary_from(x, min_prec)
+    }
+
+    fn binary_from(&mut self, x0: &Expr, min_prec: i32) -> &Expr {
+        let mut x = x0;
+        loop {
+            let t = self.tok();
+            let prec = binary_prec(t.kind);
+            if prec == 0 || prec < min_prec { return x; }
+            self.next();
+            if t.kind == KW_AS {
+                let ct = self.typ();
+                x = expr(ExprKind::Cast { x, ty: ct });
+                continue;
+            }
+            let y = self.binary(prec + 1);
+            x = expr(ExprKind::Binary { op: t.kind, op_pos: t.pos, x, y });
+            if prec == PREC_COMPARE && binary_prec(self.kind()) == PREC_COMPARE {
+                let p = self.pos();
+                self.errorf(p, "comparison operators cannot be chained; use parentheses".to_string());
+            }
+        }
+    }
+
+    fn unary(&mut self) -> &Expr {
+        let t = self.tok();
+        let k = t.kind;
+        if k == MINUS || k == NOT || k == STAR {
+            self.next();
+            let x = self.unary();
+            return expr(ExprKind::Unary { op_pos: t.pos, op: k, x });
+        }
+        if k == AND || k == AND_AND {
+            self.got_amp();
+            let is_mut = self.got(KW_MUT);
+            let x = self.unary();
+            return expr(ExprKind::Ref { amp: t.pos, is_mut, x });
+        }
+        let p = self.primary();
+        self.postfix(p)
+    }
+
+    fn postfix(&mut self, x0: &Expr) -> &Expr {
+        let mut x = x0;
+        loop {
+            let k = self.kind();
+            if k == DOT {
+                self.next();
+                let t = self.tok();
+                if t.kind == INT {
+                    self.next();
+                    x = expr(ExprKind::Field { x, name: name(t.pos, t.text) });
+                    continue;
+                } else if t.kind == IDENT {
+                    self.next();
+                } else {
+                    let d = self.describe(&t);
+                    self.errorf(t.pos, `expected field or method name, found ${d}`);
+                    return x;
+                }
+                let nm = name(t.pos, t.text);
+                let mut targs = None;
+                if self.kind() == PATH_SEP && self.peek(1).kind == LT {
+                    self.next();
+                    targs = Some(self.generic_args());
+                }
+                if self.kind() == L_PAREN {
+                    let args = self.call_args();
+                    x = expr(ExprKind::MethodCall { recv: x, name: nm, type_args: targs, args });
+                } else {
+                    if let Some(ta) = targs {
+                        self.errorf(ta.lt, "field access cannot have generic arguments".to_string());
+                    }
+                    x = expr(ExprKind::Field { x, name: nm });
+                }
+            } else if k == L_PAREN {
+                let lp = self.pos();
+                let args = self.call_args();
+                x = expr(ExprKind::Call { fun: x, lparen: lp, args });
+            } else if k == L_BRACKET {
+                let lb = self.next().pos;
+                let old = self.no_struct_lit;
+                self.no_struct_lit = false;
+                let idx = self.expr();
+                self.no_struct_lit = old;
+                self.expect(R_BRACKET);
+                x = expr(ExprKind::Index { x, lbrack: lb, index: idx });
+            } else if k == QUESTION {
+                let q = self.next().pos;
+                x = expr(ExprKind::Try { x, question: q });
+            } else {
+                return x;
+            }
+        }
+    }
+
+    fn call_args(&mut self) -> Vec<&Expr> {
+        self.expect(L_PAREN);
+        let old = self.no_struct_lit;
+        self.no_struct_lit = false;
+        let mut args = Vec::new();
+        while self.kind() != R_PAREN && self.kind() != EOF {
+            args.push(self.expr());
+            if !self.got(COMMA) { break; }
+        }
+        self.no_struct_lit = old;
+        self.expect(R_PAREN);
+        args
+    }
+
+    fn lit(&mut self, t: &Token, kind: LitKind) -> &Expr {
+        self.next();
+        expr(ExprKind::Lit { pos: t.pos, kind, value: t.text.to_string() })
+    }
+
+    fn primary(&mut self) -> &Expr {
+        let t = self.tok();
+        let k = t.kind;
+        if k == INT { return self.lit(&t, LitKind::Int); }
+        if k == FLOAT { return self.lit(&t, LitKind::Float); }
+        if k == CHAR { return self.lit(&t, LitKind::Char); }
+        if k == BYTE { return self.lit(&t, LitKind::Byte); }
+        if k == STRING || k == RAW_STRING { return self.lit(&t, LitKind::Str); }
+        if k == BYTE_STRING { return self.lit(&t, LitKind::ByteStr); }
+        if k == KW_TRUE || k == KW_FALSE {
+            self.next();
+            return expr(ExprKind::Lit { pos: t.pos, kind: LitKind::Bool, value: kind_name(k).to_string() });
+        }
+        if k == TEMPLATE {
+            self.next();
+            return self.template(&t);
+        }
+        if k == L_PAREN { return self.paren_or_tuple(); }
+        if k == L_BRACKET { return self.array(); }
+        if k == OR || k == OR_OR { return self.closure(); }
+        if k == KW_RETURN {
+            self.next();
+            let mut value = None;
+            if self.starts_expr() { value = Some(self.expr()); }
+            return expr(ExprKind::Return { pos: t.pos, value });
+        }
+        if k == KW_BREAK {
+            self.next();
+            let mut label = None;
+            if self.kind() == LIFETIME {
+                let lt = self.next();
+                label = Some(name(lt.pos, lt.text));
+            }
+            let mut value = None;
+            if self.starts_expr() { value = Some(self.expr()); }
+            return expr(ExprKind::Break { pos: t.pos, label, value });
+        }
+        if k == KW_CONTINUE {
+            self.next();
+            let mut label = None;
+            if self.kind() == LIFETIME {
+                let lt = self.next();
+                label = Some(name(lt.pos, lt.text));
+            }
+            return expr(ExprKind::Continue { pos: t.pos, label });
+        }
+        if self.starts_block_like() { return self.block_like_expr(); }
+        if is_path_start(k) {
+            let path = self.expr_path();
+            if self.kind() == L_BRACE && !self.no_struct_lit { return self.struct_lit(path); }
+            return expr(ExprKind::Path(path));
+        }
+        let d = self.describe(&t);
+        self.errorf(t.pos, `expected expression, found ${d}`);
+        if k != EOF && k != R_BRACE && k != R_PAREN && k != R_BRACKET && k != SEMI { self.next(); }
+        expr(ExprKind::Bad(t.pos))
+    }
+
+    fn block_like_expr(&mut self) -> &Expr {
+        let mut label = None;
+        if self.kind() == LIFETIME {
+            let lt = self.next();
+            label = Some(name(lt.pos, lt.text));
+            self.expect(COLON);
+        }
+        let t = self.tok();
+        let k = t.kind;
+        if k == L_BRACE {
+            if let Some(l) = label { self.errorf(l.pos, "labels are only allowed on loops".to_string()); }
+            return self.block();
+        }
+        if k == KW_UNSAFE {
+            self.next();
+            let b = self.block();
+            b.block().is_unsafe = true;
+            return b;
+        }
+        if k == KW_IF { return self.if_expr(); }
+        if k == KW_MATCH { return self.match_expr(); }
+        if k == KW_LOOP {
+            self.next();
+            let body = self.block();
+            return expr(ExprKind::Loop { label, pos: t.pos, body });
+        }
+        if k == KW_WHILE {
+            self.next();
+            let cond = self.cond();
+            let body = self.block();
+            return expr(ExprKind::While { label, pos: t.pos, cond, body });
+        }
+        if k == KW_FOR {
+            self.next();
+            let pt = self.pat();
+            self.expect(KW_IN);
+            let iter = self.expr_no_struct();
+            let body = self.block();
+            return expr(ExprKind::For { label, pos: t.pos, pat: pt, iter, body });
+        }
+        if k == KW_SELECT { return self.select_expr(); }
+        let d = self.describe(&t);
+        self.errorf(t.pos, `expected loop after label, found ${d}`);
+        expr(ExprKind::Bad(t.pos))
+    }
+
+    fn cond(&mut self) -> &Expr {
+        if self.kind() == KW_LET {
+            let pos = self.next().pos;
+            let pt = self.pat();
+            self.expect(EQ);
+            let x = self.expr_no_struct();
+            return expr(ExprKind::Let { pos, pat: pt, x });
+        }
+        self.expr_no_struct()
+    }
+
+    fn if_expr(&mut self) -> &Expr {
+        let pos = self.expect(KW_IF);
+        let cond = self.cond();
+        let then = self.block();
+        let mut els = None;
+        if self.got(KW_ELSE) {
+            if self.kind() == KW_IF { els = Some(self.if_expr()); } else { els = Some(self.block()); }
+        }
+        expr(ExprKind::If { pos, cond, then, els })
+    }
+
+    fn match_expr(&mut self) -> &Expr {
+        let pos = self.expect(KW_MATCH);
+        let x = self.expr_no_struct();
+        self.expect(L_BRACE);
+        let old = self.no_struct_lit;
+        self.no_struct_lit = false;
+        let mut arms = Vec::new();
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            self.got(OR);
+            let pt = self.pat();
+            let mut guard = None;
+            if self.got(KW_IF) { guard = Some(self.expr()); }
+            self.expect(FAT_ARROW);
+            let (body, block_like) = self.expr_stmt_head();
+            arms.push(&MatchArm { pat: pt, guard, body });
+            if !self.got(COMMA) && !block_like && self.kind() != R_BRACE {
+                let t = self.tok();
+                let d = self.describe(&t);
+                let p = self.pos();
+                self.errorf(p, `expected ',' after match arm, found ${d}`);
+                break;
+            }
+        }
+        self.no_struct_lit = old;
+        self.expect(R_BRACE);
+        expr(ExprKind::Match { pos, x, arms })
+    }
+
+    fn select_expr(&mut self) -> &Expr {
+        let pos = self.expect(KW_SELECT);
+        self.expect(L_BRACE);
+        let old = self.no_struct_lit;
+        self.no_struct_lit = false;
+        let mut arms = Vec::new();
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            let mut pt = None;
+            let mut op = None;
+            let mut is_default = false;
+            if self.kind() == IDENT && self.tok().text == "default" && self.peek(1).kind == FAT_ARROW {
+                self.next();
+                is_default = true;
+            } else if self.select_binding() {
+                pt = Some(self.pat_no_top_alt());
+                self.expect(EQ);
+                op = Some(self.expr());
+            } else {
+                op = Some(self.expr());
+            }
+            if let Some(o) = op {
+                let ok = match &o.kind { ExprKind::MethodCall { .. } => true, _ => false };
+                if !ok { self.errorf(o.pos(), "select case must be a recv() or send() call".to_string()); }
+            }
+            self.expect(FAT_ARROW);
+            let (body, block_like) = self.expr_stmt_head();
+            arms.push(&SelectArm { pat: pt, op, is_default, body });
+            if !self.got(COMMA) && !block_like && self.kind() != R_BRACE {
+                let t = self.tok();
+                let d = self.describe(&t);
+                let p = self.pos();
+                self.errorf(p, `expected ',' after select case, found ${d}`);
+                break;
+            }
+        }
+        self.no_struct_lit = old;
+        self.expect(R_BRACE);
+        expr(ExprKind::Select { pos, arms })
+    }
+
+    fn select_binding(&self) -> bool {
+        let k = self.kind();
+        if k == IDENT || k == UNDERSCORE { return self.peek(1).kind == EQ; }
+        if k == KW_MUT { return self.peek(1).kind == IDENT && self.peek(2).kind == EQ; }
+        false
+    }
+
+    fn paren_or_tuple(&mut self) -> &Expr {
+        let lp = self.expect(L_PAREN);
+        let old = self.no_struct_lit;
+        self.no_struct_lit = false;
+        if self.got(R_PAREN) {
+            self.no_struct_lit = old;
+            return expr(ExprKind::Tuple { lparen: lp, elems: Vec::new() });
+        }
+        let first = self.expr();
+        if self.got(R_PAREN) {
+            self.no_struct_lit = old;
+            return expr(ExprKind::Paren { lparen: lp, x: first });
+        }
+        let mut elems = Vec::new();
+        elems.push(first);
+        while self.got(COMMA) && self.kind() != R_PAREN { elems.push(self.expr()); }
+        self.expect(R_PAREN);
+        self.no_struct_lit = old;
+        expr(ExprKind::Tuple { lparen: lp, elems })
+    }
+
+    fn array(&mut self) -> &Expr {
+        let lb = self.expect(L_BRACKET);
+        let old = self.no_struct_lit;
+        self.no_struct_lit = false;
+        if self.got(R_BRACKET) {
+            self.no_struct_lit = old;
+            return expr(ExprKind::Array { lbrack: lb, elems: Vec::new() });
+        }
+        let first = self.expr();
+        if self.got(SEMI) {
+            let count = self.expr();
+            self.expect(R_BRACKET);
+            self.no_struct_lit = old;
+            return expr(ExprKind::ArrayRepeat { lbrack: lb, value: first, count });
+        }
+        let mut elems = Vec::new();
+        elems.push(first);
+        while self.got(COMMA) && self.kind() != R_BRACKET { elems.push(self.expr()); }
+        self.expect(R_BRACKET);
+        self.no_struct_lit = old;
+        expr(ExprKind::Array { lbrack: lb, elems })
+    }
+
+    fn struct_lit(&mut self, path: &Path) -> &Expr {
+        self.expect(L_BRACE);
+        let mut fields = Vec::new();
+        let mut base = None;
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            if self.got(DOT_DOT) {
+                base = Some(self.expr());
+                break;
+            }
+            let t = self.tok();
+            let nm = if t.kind == INT {
+                self.next();
+                name(t.pos, t.text)
+            } else {
+                self.name()
+            };
+            let value = if self.got(COLON) { self.expr() } else { expr(ExprKind::Path(simple_path(nm))) };
+            fields.push(&FieldInit { name: nm, value });
+            if !self.got(COMMA) { break; }
+        }
+        self.expect(R_BRACE);
+        expr(ExprKind::StructLit { path, fields, base })
+    }
+
+    fn closure(&mut self) -> &Expr {
+        let pos = self.pos();
+        let mut params = Vec::new();
+        if !self.got(OR_OR) {
+            self.expect(OR);
+            while self.kind() != OR && self.kind() != EOF {
+                let pt = self.pat_no_top_alt();
+                let mut t = None;
+                if self.got(COLON) { t = Some(self.typ()); }
+                params.push(&Param { pat: pt, ty: t });
+                if !self.got(COMMA) { break; }
+            }
+            self.expect(OR);
+        }
+        if self.got(R_ARROW) {
+            let result = Some(self.typ());
+            if self.kind() != L_BRACE {
+                let p = self.pos();
+                self.errorf(p, "closure with a return type needs a block body".to_string());
+            }
+            let body = self.block();
+            return expr(ExprKind::Closure { pos, params, result, body });
+        }
+        let body = self.expr();
+        expr(ExprKind::Closure { pos, params, result: None, body })
+    }
+
+    // --- Template strings ----------------------------------------------------------
+
+    fn template(&mut self, t: &Token) -> &Expr {
+        let mut parts = Vec::new();
+        let src = self.file.src.as_str();
+        let b = src.as_bytes();
+        let mut end = t.end as usize;
+        if end > t.pos as usize + 1 && b[end - 1] == b'`' { end -= 1; }
+        let mut text: Vec<u8> = Vec::new();
+        let mut i = t.pos as usize + 1;
+        while i < end {
+            let c = b[i];
+            if c == b'\\' && i + 1 < end {
+                text.push(c);
+                text.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == b'$' && i + 1 < end && b[i + 1] == b'{' {
+                if text.len() > 0 {
+                    parts.push(&TemplatePart { text: String::from_utf8_lossy(text.as_slice()), x: None, spec: String::new() });
+                    text.clear();
+                }
+                let (part, next) = self.template_hole(i);
+                parts.push(part);
+                i = next;
+                continue;
+            }
+            text.push(c);
+            i += 1;
+        }
+        if text.len() > 0 {
+            parts.push(&TemplatePart { text: String::from_utf8_lossy(text.as_slice()), x: None, spec: String::new() });
+        }
+        expr(ExprKind::Template { pos: t.pos, parts })
+    }
+
+    fn template_hole(&mut self, start: usize) -> (&TemplatePart, usize) {
+        let sub = Errors::new(self.file);
+        let mut l = Lexer::new(self.file.src.as_str(), 0, sub);
+        l.off = start + 2;
+        let mut toks: Vec<Token> = Vec::new();
+        let mut depth = 0;
+        let mut colon: i64 = -1;
+        loop {
+            let tk = l.next();
+            if tk.kind == EOF {
+                self.errorf(start as Pos, "unterminated ${ in template string".to_string());
+                return (&TemplatePart { text: String::new(), x: Some(expr(ExprKind::Bad(start as Pos))), spec: String::new() }, self.file.src.len());
+            }
+            let k = tk.kind;
+            if k == L_PAREN || k == L_BRACKET || k == L_BRACE {
+                depth += 1;
+            } else if k == R_PAREN || k == R_BRACKET {
+                depth -= 1;
+            } else if k == R_BRACE {
+                if depth == 0 {
+                    let mut spec = String::new();
+                    let mut expr_toks = toks.clone();
+                    if colon >= 0 {
+                        let c = colon as usize;
+                        expr_toks.truncate(c);
+                        spec = self.file.src[toks[c].end as usize..tk.pos as usize].trim().to_string();
+                        self.check_spec(toks[c].end, spec.as_str());
+                    }
+                    let x = self.sub_expr(start as Pos, expr_toks, tk.pos);
+                    return (&TemplatePart { text: String::new(), x: Some(x), spec }, tk.end as usize);
+                }
+                depth -= 1;
+            } else if k == COLON {
+                if depth == 0 && colon < 0 { colon = toks.len() as i64; }
+            }
+            toks.push(tk);
+        }
+    }
+
+    fn sub_expr(&mut self, start: Pos, toks: Vec<Token>, end: Pos) -> &Expr {
+        if toks.len() == 0 {
+            self.errorf(start, "empty ${} in template string".to_string());
+            return expr(ExprKind::Bad(start));
+        }
+        let mut all = toks;
+        all.push(Token { kind: EOF, pos: end, end, text: "" });
+        let mut sp = Parser { file: self.file, toks: all, i: 0, errs: self.errs, no_struct_lit: false, last_err_pos: 0 };
+        let x = sp.expr();
+        if sp.kind() != EOF {
+            let t = sp.tok();
+            let d = sp.describe(&t);
+            let p = sp.pos();
+            self.errorf(p, `unexpected ${d} in \${...}`);
+        }
+        x
+    }
+
+    fn check_spec(&mut self, pos: Pos, spec: &str) {
+        let b = spec.as_bytes();
+        let mut i = 0;
+        let is_align = |c: u8| c == b'<' || c == b'^' || c == b'>';
+        if b.len() >= 2 && is_align(b[1]) {
+            i = 2;
+        } else if b.len() >= 1 && is_align(b[0]) {
+            i = 1;
+        }
+        if i < b.len() && b[i] == b'+' { i += 1; }
+        if i < b.len() && b[i] == b'#' { i += 1; }
+        if i < b.len() && b[i] == b'0' { i += 1; }
+        while i < b.len() && is_digit(b[i]) { i += 1; }
+        if i < b.len() && b[i] == b'.' {
+            i += 1;
+            let mut n = 0;
+            while i < b.len() && is_digit(b[i]) { i += 1; n += 1; }
+            if n == 0 {
+                self.errorf(pos, `format spec ${util::quote(spec)}: missing precision after '.'`);
+                return;
+            }
+        }
+        let rest = &spec[i..];
+        if !(rest == "" || rest == "?" || rest == "x" || rest == "X" || rest == "o" || rest == "b" || rest == "e" || rest == "E") {
+            self.errorf(pos, `invalid format spec ${util::quote(spec)}`);
+        }
+    }
+
+    // --- Patterns ------------------------------------------------------------------
+
+    fn pat(&mut self) -> &Pat {
+        let first = self.pat_no_top_alt();
+        if self.kind() != OR { return first; }
+        let mut alts = Vec::new();
+        alts.push(first);
+        while self.got(OR) { alts.push(self.pat_no_top_alt()); }
+        pat(PatKind::Or(alts))
+    }
+
+    fn pat_no_top_alt(&mut self) -> &Pat {
+        let t = self.tok();
+        let k = t.kind;
+        if k == UNDERSCORE {
+            self.next();
+            return pat(PatKind::Wild(t.pos));
+        }
+        if k == DOT_DOT {
+            self.next();
+            return pat(PatKind::Rest(t.pos));
+        }
+        if k == DOT_DOT_EQ {
+            self.next();
+            let hi = self.pat_range_end();
+            return pat(PatKind::Range { lo: None, hi: Some(hi), inclusive: true, op_pos: t.pos });
+        }
+        if k == AND || k == AND_AND {
+            self.got_amp();
+            let inner = self.pat_no_top_alt();
+            return pat(PatKind::Ref { amp: t.pos, pat: inner });
+        }
+        if k == L_PAREN {
+            self.next();
+            let mut elems = Vec::new();
+            let mut trailing = false;
+            while self.kind() != R_PAREN && self.kind() != EOF {
+                elems.push(self.pat());
+                trailing = self.got(COMMA);
+                if !trailing { break; }
+            }
+            self.expect(R_PAREN);
+            if elems.len() == 1 && !trailing {
+                let is_rest = match &elems[0].kind { PatKind::Rest(_) => true, _ => false };
+                if !is_rest { return elems[0]; }
+            }
+            return pat(PatKind::Tuple { lparen: t.pos, elems });
+        }
+        if k == L_BRACKET {
+            self.next();
+            let mut elems = Vec::new();
+            while self.kind() != R_BRACKET && self.kind() != EOF {
+                elems.push(self.pat());
+                if !self.got(COMMA) { break; }
+            }
+            self.expect(R_BRACKET);
+            return pat(PatKind::Slice { lbrack: t.pos, elems });
+        }
+        if k == KW_MUT {
+            self.next();
+            let nm = self.name();
+            let mut sub = None;
+            if self.got(AT) { sub = Some(self.pat_no_top_alt()); }
+            return pat(PatKind::Ident { is_mut: true, name: nm, sub });
+        }
+        if k == MINUS || k == INT || k == FLOAT || k == CHAR || k == BYTE || k == STRING || k == RAW_STRING
+            || k == BYTE_STRING || k == KW_TRUE || k == KW_FALSE {
+            let lit = self.pat_lit();
+            let n = self.kind();
+            if n == DOT_DOT || n == DOT_DOT_EQ { return self.pat_range(lit); }
+            return pat(PatKind::Lit(lit));
+        }
+        if is_path_start(k) {
+            let n = self.peek(1).kind;
+            if k == IDENT && n != PATH_SEP && n != L_PAREN && n != L_BRACE && n != DOT_DOT && n != DOT_DOT_EQ {
+                self.next();
+                let nm = name(t.pos, t.text);
+                let mut sub = None;
+                if self.got(AT) { sub = Some(self.pat_no_top_alt()); }
+                return pat(PatKind::Ident { is_mut: false, name: nm, sub });
+            }
+            let path = self.expr_path();
+            let n2 = self.kind();
+            if n2 == L_PAREN {
+                self.next();
+                let mut elems = Vec::new();
+                while self.kind() != R_PAREN && self.kind() != EOF {
+                    elems.push(self.pat());
+                    if !self.got(COMMA) { break; }
+                }
+                self.expect(R_PAREN);
+                return pat(PatKind::TupleStruct { path, elems });
+            }
+            if n2 == L_BRACE { return self.struct_pat(path); }
+            if n2 == DOT_DOT || n2 == DOT_DOT_EQ { return self.pat_range(expr(ExprKind::Path(path))); }
+            return pat(PatKind::Path(path));
+        }
+        let d = self.describe(&t);
+        self.errorf(t.pos, `expected pattern, found ${d}`);
+        if k != EOF && k != R_BRACE { self.next(); }
+        pat(PatKind::Wild(t.pos))
+    }
+
+    fn pat_lit(&mut self) -> &Expr {
+        let t = self.tok();
+        let k = t.kind;
+        if k == MINUS {
+            self.next();
+            let lit = self.pat_lit();
+            return expr(ExprKind::Unary { op_pos: t.pos, op: MINUS, x: lit });
+        }
+        if k == INT || k == FLOAT || k == CHAR || k == BYTE || k == STRING || k == RAW_STRING || k == BYTE_STRING
+            || k == KW_TRUE || k == KW_FALSE {
+            return self.primary();
+        }
+        let d = self.describe(&t);
+        self.errorf(t.pos, `expected literal, found ${d}`);
+        expr(ExprKind::Bad(t.pos))
+    }
+
+    fn pat_range(&mut self, lo: &Expr) -> &Pat {
+        let t = self.next();
+        let inclusive = t.kind == DOT_DOT_EQ;
+        let k = self.kind();
+        let mut hi = None;
+        if k == MINUS || k == INT || k == FLOAT || k == CHAR || k == BYTE || k == IDENT || k == KW_SELF_TYPE || k == KW_CRATE || k == KW_SUPER {
+            hi = Some(self.pat_range_end());
+        } else if inclusive {
+            let p = self.pos();
+            self.errorf(p, "inclusive range pattern needs an upper bound".to_string());
+        }
+        pat(PatKind::Range { lo: Some(lo), hi, inclusive, op_pos: t.pos })
+    }
+
+    fn pat_range_end(&mut self) -> &Expr {
+        if is_path_start(self.kind()) { return expr(ExprKind::Path(self.expr_path())); }
+        self.pat_lit()
+    }
+
+    fn struct_pat(&mut self, path: &Path) -> &Pat {
+        self.expect(L_BRACE);
+        let mut fields = Vec::new();
+        let mut rest = false;
+        while self.kind() != R_BRACE && self.kind() != EOF {
+            if self.got(DOT_DOT) {
+                rest = true;
+                break;
+            }
+            if self.kind() == KW_MUT {
+                self.next();
+                let nm = self.name();
+                fields.push(&FieldPat { name: nm, pat: pat(PatKind::Ident { is_mut: true, name: nm, sub: None }) });
+            } else {
+                let t = self.tok();
+                let nm = if t.kind == INT {
+                    self.next();
+                    name(t.pos, t.text)
+                } else {
+                    self.name()
+                };
+                let fp = if self.got(COLON) { self.pat() } else { pat(PatKind::Ident { is_mut: false, name: nm, sub: None }) };
+                fields.push(&FieldPat { name: nm, pat: fp });
+            }
+            if !self.got(COMMA) { break; }
+        }
+        self.expect(R_BRACE);
+        pat(PatKind::Struct { path, fields, rest })
+    }
+}
