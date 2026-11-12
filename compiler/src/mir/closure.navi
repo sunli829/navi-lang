@@ -65,6 +65,11 @@ impl Builder {
     /// is formatted into a String unless Arguments is wanted.
     pub fn template(&mut self, x: &Expr, parts: &Vec<&TemplatePart>, pos: Pos, dest: Place) {
         let args_def = self.info.lang_def("Arguments").unwrap();
+        let want_args = match self.body.templates.get(&x.id) { Some(w) => w.kind == types::K_ADT && w.d().id == args_def.id, None => false };
+        if !want_args && self.p.direct_templates {
+            self.template_direct(parts, pos, dest);
+            return;
+        }
         let args_ty = self.ctx().adt(args_def, Vec::new());
         let piece_ty = self.field_elem_type(args_ty, 0);
         let spec_ty = self.p.std_type(&["fmt", "Spec"]);
@@ -151,6 +156,94 @@ impl Builder {
         let mut cargs = Vec::new();
         cargs.push(copy(args));
         self.call(self.fn_const(fmt_fn, Vec::new()), cargs, dest, pos);
+    }
+
+    /// Lowers a template that is a String directly: the literal pieces are
+    /// appended and each hole is formatted with a Formatter writing into the
+    /// String, without closures or heap cells (escape analysis keeps the
+    /// String, the Formatter and the values in the frame).
+    fn template_direct(&mut self, parts: &Vec<&TemplatePart>, pos: Pos, dest: Place) {
+        let string_def = self.info.lang_def("String").unwrap();
+        let string_ty = self.ctx().adt(string_def, Vec::new());
+        let fmtr_def = self.info.lang_def("Formatter").unwrap();
+        let fmtr_ty = self.ctx().adt(fmtr_def, Vec::new());
+        let spec_ty = self.p.std_type(&["fmt", "Spec"]);
+        let disp_fmt = self.info.trait_item("Display", "fmt").unwrap();
+        let res_ty = self.info.fn_sig_of(disp_fmt).ret;
+        let str_ty = self.ctx().str_;
+        let ref_str = self.ctx().reference(false, str_ty);
+        let unit = self.ctx().unit;
+        let usize_ = self.ctx().usize_();
+        let bool_ = self.ctx().bool_;
+        let char_ = self.ctx().char_;
+        let u8_ = self.ctx().int(types::U8);
+        let s = self.temp(string_ty);
+        let new_fn = self.p.inherent_fn(string_def, "new");
+        self.call(self.fn_const(new_fn, Vec::new()), Vec::new(), s.clone(), pos);
+        let push_str = self.p.inherent_fn(string_def, "push_str");
+        let ref_s_ty = self.ctx().reference(true, string_ty);
+        let fmtr_new = self.p.inherent_fn(fmtr_def, "new");
+        let dyn_ref = self.info.fn_sig_of(fmtr_new).params[0];
+        for part in parts.iter() {
+            let px = match part.x {
+                None => {
+                    let text = decode_escapes(part.text.as_str());
+                    if text.len() == 0 { continue; }
+                    let c = cnst(C_STR, Some(ref_str));
+                    c.bytes = text;
+                    let r = self.temp(ref_s_ty);
+                    self.assign(r.clone(), Rvalue::Ref { is_mut: true, place: s.clone() });
+                    let u = self.temp(unit);
+                    let mut args = Vec::new();
+                    args.push(copy(r));
+                    args.push(const_op(c));
+                    self.call(self.fn_const(push_str, Vec::new()), args, u, pos);
+                    continue;
+                }
+                Some(e) => e,
+            };
+            let vt = self.type_of(px);
+            let v = self.temp(vt);
+            self.expr_into(px, v.clone());
+            let sp = parse_spec(part.spec.as_str());
+            let mut spec_ops = Vec::new();
+            spec_ops.push(int_const(C_CHAR, sp.fill as i64, char_));
+            spec_ops.push(int_const(C_INT, sp.align, u8_));
+            spec_ops.push(int_const(C_INT, sp.width, usize_));
+            spec_ops.push(int_const(C_BOOL, if sp.has_width { 1 } else { 0 }, bool_));
+            spec_ops.push(int_const(C_INT, sp.prec, usize_));
+            spec_ops.push(int_const(C_BOOL, if sp.has_prec { 1 } else { 0 }, bool_));
+            spec_ops.push(int_const(C_BOOL, if sp.alternate { 1 } else { 0 }, bool_));
+            spec_ops.push(int_const(C_BOOL, if sp.sign_plus { 1 } else { 0 }, bool_));
+            spec_ops.push(int_const(C_BOOL, if sp.zero { 1 } else { 0 }, bool_));
+            let spec = self.temp(spec_ty);
+            self.assign(spec.clone(), aggregate(AGG_ADT, spec_ty, 0, spec_ops));
+            let rs = self.temp(ref_s_ty);
+            self.assign(rs.clone(), Rvalue::Ref { is_mut: true, place: s.clone() });
+            let wd = self.temp(dyn_ref);
+            self.assign(wd.clone(), Rvalue::MakeDyn { x: copy(rs), concrete: string_ty, to: dyn_ref });
+            let rspec_ty = self.ctx().reference(false, spec_ty);
+            let rspec = self.temp(rspec_ty);
+            self.assign(rspec.clone(), Rvalue::Ref { is_mut: false, place: spec });
+            let f = self.temp(fmtr_ty);
+            let mut nargs = Vec::new();
+            nargs.push(copy(wd));
+            nargs.push(copy(rspec));
+            self.call(self.fn_const(fmtr_new, Vec::new()), nargs, f.clone(), pos);
+            let rv_ty = self.ctx().reference(false, vt);
+            let rv = self.temp(rv_ty);
+            self.assign(rv.clone(), Rvalue::Ref { is_mut: false, place: v });
+            let rf_ty = self.ctx().reference(true, fmtr_ty);
+            let rf = self.temp(rf_ty);
+            self.assign(rf.clone(), Rvalue::Ref { is_mut: true, place: f });
+            let m = self.info.trait_item(sp.trait_name.as_str(), "fmt").unwrap();
+            let res = self.temp(res_ty);
+            let mut fargs = Vec::new();
+            fargs.push(copy(rv));
+            fargs.push(copy(rf));
+            self.call(self.trait_fn(m, vt, Vec::new()), fargs, res, pos);
+        }
+        self.assign(dest, Rvalue::Use(copy(s)));
     }
 
     /// Builds |f| <T as Trait>::fmt(&*cell, f) for a template hole.
