@@ -86,12 +86,12 @@ fn panic_header(file: &str, line: u32, col: u32) {
     put(2, ":\n");
 }
 
-/// Runs the deferred calls of every frame on the stack, innermost first
-/// (a panic unwinding to the top: there is no catch_unwind yet).
-fn unwind() {
+/// Runs the deferred calls of every frame on the stack, innermost first,
+/// up to the frame stop (exclusive; 0: the whole stack).
+fn unwind(stop: usize) {
     let top = crate::rt::stack_top() as usize;
     let mut fp = crate::rt::frame_address() as usize;
-    while fp != 0 && fp != top {
+    while fp != 0 && fp != top && fp != stop {
         let slot = (fp - 32) as *mut usize;
         unsafe {
             let head = *slot;
@@ -104,31 +104,70 @@ fn unwind() {
     }
 }
 
+/// A catch_unwind in progress (allocated by try_call, linked from the G).
+struct CatchRec {
+    buf: [usize; 13],
+    prev: usize,
+    fp: usize,
+    payload: usize,
+}
+
+/// Calls f; a panic in f unwinds (running defers) back here and its
+/// payload is returned.
+pub fn try_call(f: fn()) -> *mut u8 {
+    let rec = crate::rt::gc::alloc(crate::intrinsics::size_of::<CatchRec>(), false) as *mut CatchRec;
+    unsafe {
+        (*rec).prev = crate::rt::sched::catch_top();
+        (*rec).fp = crate::rt::frame_address() as usize;
+        crate::rt::sched::set_catch_top(rec as usize);
+        if crate::rt::save_context(&mut (*rec).buf as *mut [usize; 13] as *mut usize) == 0 {
+            f();
+            crate::rt::sched::set_catch_top((*rec).prev);
+            return 0 as *mut u8;
+        }
+        // Resumed by throw: rec is unchanged since save_context.
+        crate::rt::sched::set_catch_top((*rec).prev);
+        (*rec).payload as *mut u8
+    }
+}
+
+/// Unwinds to the innermost catch_unwind with payload p.
+fn throw(p: *mut u8) -> ! {
+    let rec = crate::rt::sched::catch_top() as *mut CatchRec;
+    unsafe {
+        (*rec).payload = p as usize;
+        unwind((*rec).fp);
+        crate::rt::resume_context(&mut (*rec).buf as *mut [usize; 13] as *mut usize, 1)
+    }
+}
+
 static mut PANICKING: bool = false;
 
 pub fn panic_raw(msg: &str, file: &str, line: u32, col: u32) -> ! {
-    if !PANICKING {
-        PANICKING = true;
-        unwind();
-    }
     panic_header(file, line, col);
     put(2, msg);
     put(2, "\n");
+    if crate::rt::sched::catch_top() != 0 { throw(crate::panic::new_payload(msg, file, line, col)); }
+    if !PANICKING {
+        PANICKING = true;
+        unwind(0);
+    }
     exit(101)
 }
 
 /// Called by generated code when a bounds check fails.
 pub fn panic_bounds(len: usize, index: usize, file: &str, line: u32, col: u32) -> ! {
-    if !PANICKING {
-        PANICKING = true;
-        unwind();
-    }
     panic_header(file, line, col);
     put(2, "index out of bounds: the len is ");
     put_u64(2, len as u64);
     put(2, " but the index is ");
     put_u64(2, index as u64);
     put(2, "\n");
+    if crate::rt::sched::catch_top() != 0 { throw(crate::panic::bounds_payload(len, index, file, line, col)); }
+    if !PANICKING {
+        PANICKING = true;
+        unwind(0);
+    }
     exit(101)
 }
 

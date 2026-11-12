@@ -241,6 +241,10 @@ func (t *thread) intrinsic(inst *fnInst, args []val) val {
 		panic(navPanic{msg: file + ":" + strconv.FormatUint(line, 10) + ":" + strconv.FormatUint(col, 10) + ":\n" + msg})
 	case "spawn":
 		return t.spawn(args[0])
+	case "try_call":
+		// The interpreter does not catch panics: one ends the process.
+		t.callValue(args[0], nil)
+		return ptrVal(Ptr{})
 	case "join":
 		h := m.rt().handles[args[0].ptrAt(0).A].(*threadHandle)
 		m.block(func() { <-h.done })
