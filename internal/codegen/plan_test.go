@@ -1,6 +1,8 @@
 package codegen_test
 
 import (
+	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -15,6 +17,9 @@ import (
 func TestPlanGolden(t *testing.T) {
 	files, _ := filepath.Glob(filepath.Join("..", "..", "tests", "run", "*.navi"))
 	for _, f := range files {
+		if src, err := os.ReadFile(f); err == nil && bytes.Contains(src, []byte("// stage0: skip")) {
+			continue // a navic-only feature
+		}
 		spec, err := build.LoadCrate(f)
 		if err != nil {
 			t.Fatal(err)

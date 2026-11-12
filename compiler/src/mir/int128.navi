@@ -1,0 +1,316 @@
+//! Lowers i128/u128 operations to calls of std::rt::int128: the backend
+//! only moves 16-byte integers around. Arithmetic, comparisons, shifts,
+//! negation, numeric casts from or to 128 bits and switches on 128-bit
+//! values become calls (a statement that needs one splits its block).
+
+use crate::resolve::Def;
+use crate::syntax::source::Pos;
+use crate::types::{self, Type};
+use crate::layout;
+use crate::mir::*;
+use crate::mir::build::Program;
+
+pub fn is_wide(t: &Type) -> bool { t.kind == types::K_INT && (t.int == types::I128 || t.int == types::U128) }
+
+fn signed(t: &Type) -> bool { t.kind == types::K_INT && types::int_signed(t.int) }
+
+/// One step of a lowered statement: a plain statement or a call.
+enum Step {
+    S(Stmt),
+    C(&mut Def, Vec<Operand>, Place, Pos),
+}
+
+struct Lower {
+    p: &mut Program,
+    f: &mut Func,
+    lay: Option<&mut layout::Computer>,
+}
+
+impl Lower {
+    fn temp(&mut self, t: &Type) -> Place {
+        self.f.locals.push(&mut Local { ty: t, name: String::new(), boxed: false });
+        local_place(self.f.locals.len() - 1)
+    }
+
+    fn rt(&self, name: &str) -> &mut Def { self.p.std_fn(&["rt", "int128", name]) }
+
+    fn call(&self, name: &str, args: Vec<Operand>, dest: Place, pos: Pos) -> Step { Step::C(self.rt(name), args, dest, pos) }
+
+    /// The type of an operand (places: through their projections).
+    fn op_type(&mut self, o: &Operand) -> &Type {
+        if o.kind == OP_CONST { return o.cnst.unwrap().ty.unwrap(); }
+        let mut t = self.f.locals[o.place.local].ty;
+        let mut variant: i64 = -1;
+        for pj in o.place.proj.iter() {
+            if pj.kind == P_DEREF {
+                t = t.el();
+            } else if pj.kind == P_INDEX {
+                t = t.el();
+            } else if pj.kind == P_DOWNCAST {
+                variant = pj.variant as i64;
+            } else if t.kind == types::K_TUPLE {
+                t = t.elems[pj.field];
+            } else {
+                if self.lay.is_none() { self.lay = Some(layout::new_computer(self.p.info)); }
+                let fts = self.lay.unwrap().field_types(t, variant);
+                t = fts[pj.field];
+                variant = -1;
+            }
+        }
+        t
+    }
+
+    /// Converts o (an integer of at most 64 bits, bool or char) to u64.
+    fn to_u64(&mut self, o: Operand, steps: &mut Vec<Step>) -> Operand {
+        let t = self.op_type(&o);
+        let u64_ = self.p.info.ctx.int(types::U64);
+        if is_wide(t) {
+            let tmp = self.temp(u64_);
+            let name = if signed(t) { "to_u64_i" } else { "to_u64" };
+            steps.push(self.call(name, vec1(o), tmp.clone(), 0));
+            return copy(tmp);
+        }
+        if t.kind == types::K_INT && t.int == types::U64 { return o; }
+        let tmp = self.temp(u64_);
+        steps.push(Step::S(Stmt::Assign { place: tmp.clone(), rv: Rvalue::Cast { kind: CAST_NUMERIC, x: o, from: t, to: u64_ } }));
+        copy(tmp)
+    }
+
+    fn bin(&mut self, op: BinOp, x: Operand, y: Operand, ty: &Type, pos: Pos, dest: Place, steps: &mut Vec<Step>) {
+        let s = signed(ty);
+        let suffix = if s { "_i" } else { "_u" };
+        if op == SHL || op == SHR {
+            let n = self.to_u64(y, steps);
+            let name = if op == SHL { if s { "shl_i" } else { "shl" } } else if s { "shr_i" } else { "shr" };
+            steps.push(self.call(name, vec2(x, n), dest, pos));
+            return;
+        }
+        let base = if op == ADD { "add" } else if op == SUB { "sub" } else if op == MUL { "mul" } else if op == DIV { "div" }
+            else if op == REM { "rem" } else if op == BIT_AND { "and" } else if op == BIT_OR { "or" } else if op == BIT_XOR { "xor" } else { "" };
+        if base.len() > 0 {
+            steps.push(self.call(`${base}${suffix}`.as_str(), vec2(x, y), dest, pos));
+            return;
+        }
+        // Comparisons: eq and lt, with the operands swapped and the result
+        // negated as needed.
+        let (name, swap, negate) = if op == EQ { ("eq", false, false) } else if op == NE { ("eq", false, true) }
+            else if op == LT { ("lt", false, false) } else if op == GT { ("lt", true, false) }
+            else if op == LE { ("lt", true, true) } else { ("lt", false, true) };
+        let args = if swap { vec2(y, x) } else { vec2(x, y) };
+        let fname = `${name}${suffix}`;
+        if !negate {
+            steps.push(self.call(fname.as_str(), args, dest, pos));
+            return;
+        }
+        let bool_ = self.p.info.ctx.bool_;
+        let tmp = self.temp(bool_);
+        steps.push(self.call(fname.as_str(), args, tmp.clone(), pos));
+        steps.push(Step::S(Stmt::Assign { place: dest, rv: Rvalue::Un { op: NOT, x: copy(tmp), ty: bool_, pos: 0 } }));
+    }
+
+    fn cast(&mut self, x: Operand, from: &Type, to: &Type, dest: Place, steps: &mut Vec<Step>) {
+        let ctx = self.p.info.ctx;
+        if is_wide(from) && is_wide(to) {
+            steps.push(Step::S(Stmt::Assign { place: dest, rv: Rvalue::Use(x) }));
+            return;
+        }
+        if is_wide(from) {
+            if to.kind == types::K_FLOAT {
+                let f64_ = ctx.f64;
+                let name = if signed(from) { "to_f64_i" } else { "to_f64" };
+                if to.f64 {
+                    steps.push(self.call(name, vec1(x), dest, 0));
+                    return;
+                }
+                let tmp = self.temp(f64_);
+                steps.push(self.call(name, vec1(x), tmp.clone(), 0));
+                steps.push(Step::S(Stmt::Assign { place: dest, rv: Rvalue::Cast { kind: CAST_NUMERIC, x: copy(tmp), from: f64_, to } }));
+                return;
+            }
+            let u64_ = ctx.int(types::U64);
+            let name = if signed(from) { "to_u64_i" } else { "to_u64" };
+            if to.kind == types::K_INT && to.int == types::U64 {
+                steps.push(self.call(name, vec1(x), dest, 0));
+                return;
+            }
+            let tmp = self.temp(u64_);
+            steps.push(self.call(name, vec1(x), tmp.clone(), 0));
+            steps.push(Step::S(Stmt::Assign { place: dest, rv: Rvalue::Cast { kind: CAST_NUMERIC, x: copy(tmp), from: u64_, to } }));
+            return;
+        }
+        // To 128 bits.
+        if from.kind == types::K_FLOAT {
+            let f64_ = ctx.f64;
+            let mut v = x;
+            if !from.f64 {
+                let tmp = self.temp(f64_);
+                steps.push(Step::S(Stmt::Assign { place: tmp.clone(), rv: Rvalue::Cast { kind: CAST_NUMERIC, x: v, from, to: f64_ } }));
+                v = copy(tmp);
+            }
+            let name = if signed(to) { "from_f64_i" } else { "from_f64" };
+            steps.push(self.call(name, vec1(v), dest, 0));
+            return;
+        }
+        let wide_signed = signed(from);
+        let mid = if wide_signed { ctx.int(types::I64) } else { ctx.int(types::U64) };
+        let tmp = self.temp(mid);
+        steps.push(Step::S(Stmt::Assign { place: tmp.clone(), rv: Rvalue::Cast { kind: CAST_NUMERIC, x, from, to: mid } }));
+        let name = if wide_signed { "from_i64" } else { "from_u64" };
+        steps.push(self.call(name, vec1(copy(tmp)), dest, 0));
+    }
+
+    /// The steps replacing s, or None if s has no 128-bit operation.
+    fn stmt(&mut self, s: &Stmt) -> Option<Vec<Step>> {
+        let (place, rv) = match s {
+            Stmt::Assign { place, rv } => (place, rv),
+            _ => return None,
+        };
+        let mut steps: Vec<Step> = Vec::new();
+        match rv {
+            Rvalue::Bin { op, x, y, ty, pos } => {
+                if *op == OFFSET || !is_wide(*ty) { return None; }
+                self.bin(*op, x.clone(), y.clone(), *ty, *pos, place.clone(), &mut steps);
+            }
+            Rvalue::Un { op, x, ty, pos } => {
+                if !is_wide(*ty) { return None; }
+                let name = if *op == NEG { if signed(*ty) { "neg_ii" } else { "neg_u" } } else if signed(*ty) { "not_i" } else { "not_u" };
+                steps.push(self.call(name, vec1(x.clone()), place.clone(), *pos));
+            }
+            Rvalue::Cast { kind, x, from, to } => {
+                if !is_wide(*from) && !is_wide(*to) { return None; }
+                if *kind == CAST_ENUM {
+                    // Through i64.
+                    let i64_ = self.p.info.ctx.int(types::I64);
+                    let tmp = self.temp(i64_);
+                    steps.push(Step::S(Stmt::Assign { place: tmp.clone(), rv: Rvalue::Cast { kind: CAST_ENUM, x: x.clone(), from: *from, to: i64_ } }));
+                    self.cast(copy(tmp), i64_, *to, place.clone(), &mut steps);
+                } else {
+                    self.cast(x.clone(), *from, *to, place.clone(), &mut steps);
+                }
+            }
+            _ => return None,
+        }
+        Some(steps)
+    }
+}
+
+fn vec1(a: Operand) -> Vec<Operand> {
+    let mut v = Vec::new();
+    v.push(a);
+    v
+}
+
+fn vec2(a: Operand, b: Operand) -> Vec<Operand> {
+    let mut v = Vec::new();
+    v.push(a);
+    v.push(b);
+    v
+}
+
+/// Whether f has a 128-bit local (only such functions can need lowering:
+/// every 128-bit operation reads or writes one, or a 128-bit constant).
+fn has_wide(f: &Func) -> bool {
+    for l in f.locals.iter() {
+        if is_wide(l.ty) { return true; }
+    }
+    for b in f.blocks.iter() {
+        for s in b.stmts.iter() {
+            if let Stmt::Assign { rv, .. } = s {
+                match rv {
+                    Rvalue::Cast { from, to, .. } => { if is_wide(*from) || is_wide(*to) { return true; } }
+                    Rvalue::Bin { ty, .. } | Rvalue::Un { ty, .. } => { if is_wide(*ty) { return true; } }
+                    _ => {}
+                }
+            }
+        }
+        if let Term::Switch { ty, .. } = &b.term {
+            if is_wide(*ty) { return true; }
+        }
+    }
+    false
+}
+
+/// Lowers the 128-bit operations of f.
+pub fn lower(p: &mut Program, f: &mut Func) {
+    if !has_wide(f) { return; }
+    let lw = &mut Lower { p, f, lay: None };
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        let mut si = 0;
+        let mut done = false;
+        while si < b.stmts.len() && !done {
+            if let Some(steps) = lw.stmt(&b.stmts[si]) {
+                split(f, bi, si, steps);
+                done = true;
+            }
+            si += 1;
+        }
+        if !done { switch(lw, bi); }
+        bi += 1;
+    }
+}
+
+/// Replaces statement si of block bi by steps: calls end blocks, and the
+/// statements after si and the old terminator move to the last new block.
+fn split(f: &mut Func, bi: usize, si: usize, steps: Vec<Step>) {
+    let b = f.blocks[bi];
+    let rest: Vec<Stmt> = b.stmts[si + 1..].to_vec();
+    let term = b.term.clone();
+    let mut cur = b;
+    let mut stmts: Vec<Stmt> = b.stmts[0..si].to_vec();
+    for st in steps.iter() {
+        match st {
+            Step::S(s) => stmts.push(s.clone()),
+            Step::C(d, args, dest, pos) => {
+                let nb = &mut Block { stmts: Vec::new(), term: Term::Unreachable };
+                f.blocks.push(nb);
+                let target = f.blocks.len() - 1;
+                cur.stmts = stmts;
+                cur.term = Term::Call { fn_op: fn_op(fn_ref(*d, Vec::new(), None), None), args: args.clone(), dest: dest.clone(), target: target as i64, pos: *pos };
+                cur = nb;
+                stmts = Vec::new();
+            }
+        }
+    }
+    for s in rest.iter() { stmts.push(s.clone()); }
+    cur.stmts = stmts;
+    cur.term = term;
+}
+
+/// A switch on a 128-bit value becomes a chain of equality tests.
+fn switch(lw: &mut Lower, bi: usize) {
+    let f = lw.f;
+    let b = f.blocks[bi];
+    let (x, ty, vals, targets, els) = match &b.term {
+        Term::Switch { x, ty, vals, targets, els } => (x.clone(), *ty, vals.clone(), targets.clone(), *els),
+        _ => return,
+    };
+    if !is_wide(ty) { return; }
+    let bool_ = lw.p.info.ctx.bool_;
+    let eq = lw.rt(if signed(ty) { "eq_i" } else { "eq_u" });
+    let mut cur = b;
+    let mut i = 0;
+    while i < vals.len() {
+        let t = lw.temp(bool_);
+        let c = cnst(C_INT, Some(ty));
+        c.int = vals[i];
+        // The high word of a negative pattern value.
+        if vals[i] < 0 { c.bytes = [0xffu8; 8].to_vec(); }
+        let test = &mut Block { stmts: Vec::new(), term: Term::Unreachable };
+        f.blocks.push(test);
+        let test_i = f.blocks.len() - 1;
+        cur.term = Term::Call { fn_op: fn_op(fn_ref(eq, Vec::new(), None), None), args: vec2(x.clone(), const_op(c)), dest: t.clone(), target: test_i as i64, pos: 0 };
+        let next = &mut Block { stmts: Vec::new(), term: Term::Goto(els) };
+        f.blocks.push(next);
+        let next_i = f.blocks.len() - 1;
+        let mut zero = Vec::new();
+        zero.push(0i64);
+        let mut tg = Vec::new();
+        tg.push(next_i);
+        test.term = Term::Switch { x: copy(t), ty: bool_, vals: zero, targets: tg, els: targets[i] };
+        cur = next;
+        i += 1;
+    }
+    if vals.len() == 0 { b.term = Term::Goto(els); }
+}

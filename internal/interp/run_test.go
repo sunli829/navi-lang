@@ -30,7 +30,7 @@ func TestRun(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if bytes.Contains(src, []byte("// interp: skip")) {
+			if bytes.Contains(src, []byte("// interp: skip")) || bytes.Contains(src, []byte("// stage0: skip")) {
 				t.Skip("marked // interp: skip")
 			}
 			var want []string

@@ -1,0 +1,369 @@
+//! 128-bit integer operations. The backend has no 128-bit instructions:
+//! navic lowers every i128/u128 operation (arithmetic, comparison, shift,
+//! cast, switch) to a call of a function here. Values are handled as two
+//! u64 halves (little endian); nothing here may itself use a 128-bit
+//! operator. Debug builds check for overflow like the other integers.
+
+const M32: u64 = 0xffffffff;
+
+fn lo(x: u128) -> u64 { unsafe { *(&x as *const u128 as *const u64) } }
+fn hi(x: u128) -> u64 { unsafe { *((&x as *const u128 as *const u64).add(1)) } }
+
+fn mk(l: u64, h: u64) -> u128 {
+    let mut r: u128 = 0;
+    unsafe {
+        let p = &mut r as *mut u128 as *mut u64;
+        *p = l;
+        *p.add(1) = h;
+    }
+    r
+}
+
+fn mki(l: u64, h: u64) -> i128 {
+    let mut r: i128 = 0;
+    unsafe {
+        let p = &mut r as *mut i128 as *mut u64;
+        *p = l;
+        *p.add(1) = h;
+    }
+    r
+}
+
+fn ilo(x: i128) -> u64 { unsafe { *(&x as *const i128 as *const u64) } }
+fn ihi(x: i128) -> u64 { unsafe { *((&x as *const i128 as *const u64).add(1)) } }
+fn bits(x: i128) -> u128 { mk(ilo(x), ihi(x)) }
+fn from_bits(x: u128) -> i128 { mki(lo(x), hi(x)) }
+fn neg_i(x: i128) -> bool { (ihi(x) >> 63) != 0 }
+
+#[track_caller]
+fn overflow(what: &str) -> ! { crate::panic::panic(`attempt to ${what} with overflow`) }
+
+// --- Addition and subtraction --------------------------------------------------
+
+/// (a + b, carry out).
+fn add2(a: u128, b: u128) -> (u128, bool) {
+    let l = lo(a).wrapping_add(lo(b));
+    let c = if l < lo(a) { 1u64 } else { 0u64 };
+    let h1 = hi(a).wrapping_add(hi(b));
+    let h = h1.wrapping_add(c);
+    (mk(l, h), h1 < hi(a) || h < h1)
+}
+
+/// (a - b, borrow out).
+fn sub2(a: u128, b: u128) -> (u128, bool) {
+    let l = lo(a).wrapping_sub(lo(b));
+    let br = if lo(a) < lo(b) { 1u64 } else { 0u64 };
+    let h1 = hi(a).wrapping_sub(hi(b));
+    let h = h1.wrapping_sub(br);
+    (mk(l, h), hi(a) < hi(b) || h1 < br)
+}
+
+#[track_caller]
+pub fn add_u(a: u128, b: u128) -> u128 {
+    let (r, c) = add2(a, b);
+    if c && cfg_debug() { overflow("add"); }
+    r
+}
+
+#[track_caller]
+pub fn sub_u(a: u128, b: u128) -> u128 {
+    let (r, c) = sub2(a, b);
+    if c && cfg_debug() { overflow("subtract"); }
+    r
+}
+
+#[track_caller]
+pub fn add_i(a: i128, b: i128) -> i128 {
+    let (r, _) = add2(bits(a), bits(b));
+    let ri = from_bits(r);
+    if cfg_debug() && neg_i(a) == neg_i(b) && neg_i(ri) != neg_i(a) { overflow("add"); }
+    ri
+}
+
+#[track_caller]
+pub fn sub_i(a: i128, b: i128) -> i128 {
+    let (r, _) = sub2(bits(a), bits(b));
+    let ri = from_bits(r);
+    if cfg_debug() && neg_i(a) != neg_i(b) && neg_i(ri) != neg_i(a) { overflow("subtract"); }
+    ri
+}
+
+#[cfg(debug_assertions)]
+fn cfg_debug() -> bool { true }
+#[cfg(not(debug_assertions))]
+fn cfg_debug() -> bool { false }
+
+// --- Multiplication --------------------------------------------------------------
+
+/// The full product of two u64 as (low, high).
+fn mul64(a: u64, b: u64) -> (u64, u64) {
+    let a0 = a & M32;
+    let a1 = a >> 32;
+    let b0 = b & M32;
+    let b1 = b >> 32;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = (p00 >> 32) + (p01 & M32) + (p10 & M32);
+    let l = (p00 & M32) | ((mid & M32) << 32);
+    let h = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    (l, h)
+}
+
+/// (a * b mod 2^128, whether the product needs more than 128 bits).
+fn mul2(a: u128, b: u128) -> (u128, bool) {
+    let (l, h0) = mul64(lo(a), lo(b));
+    let (c1l, c1h) = mul64(lo(a), hi(b));
+    let (c2l, c2h) = mul64(hi(a), lo(b));
+    let h1 = h0.wrapping_add(c1l);
+    let h = h1.wrapping_add(c2l);
+    let ovf = hi(a) != 0 && hi(b) != 0 || c1h != 0 || c2h != 0 || h1 < h0 || h < h1;
+    (mk(l, h), ovf)
+}
+
+#[track_caller]
+pub fn mul_u(a: u128, b: u128) -> u128 {
+    let (r, o) = mul2(a, b);
+    if o && cfg_debug() { overflow("multiply"); }
+    r
+}
+
+fn abs_bits(x: i128) -> u128 { if neg_i(x) { sub2(mk(0, 0), bits(x)).0 } else { bits(x) } }
+
+#[track_caller]
+pub fn mul_i(a: i128, b: i128) -> i128 {
+    let (r, _) = mul2(bits(a), bits(b));
+    if cfg_debug() {
+        let (m, o) = mul2(abs_bits(a), abs_bits(b));
+        let neg = neg_i(a) != neg_i(b) && !(lo(m) == 0 && hi(m) == 0);
+        // The magnitude must fit: below 2^127, or exactly 2^127 if negative.
+        let top = hi(m) >> 63 != 0;
+        let exact_min = hi(m) == 1u64 << 63 && lo(m) == 0;
+        if o || top && !(neg && exact_min) { overflow("multiply"); }
+    }
+    from_bits(r)
+}
+
+// --- Division ----------------------------------------------------------------------
+
+fn shl_u(x: u128, n: u32) -> u128 {
+    if n == 0 { return x; }
+    if n >= 64 { return mk(0, lo(x) << (n - 64)); }
+    mk(lo(x) << n, (hi(x) << n) | (lo(x) >> (64 - n)))
+}
+
+fn shr_u(x: u128, n: u32) -> u128 {
+    if n == 0 { return x; }
+    if n >= 64 { return mk(hi(x) >> (n - 64), 0); }
+    mk((lo(x) >> n) | (hi(x) << (64 - n)), hi(x) >> n)
+}
+
+fn ult(a: u128, b: u128) -> bool { hi(a) < hi(b) || hi(a) == hi(b) && lo(a) < lo(b) }
+
+/// (a / b, a % b) for b != 0.
+fn divrem(a: u128, b: u128) -> (u128, u128) {
+    if hi(a) == 0 && hi(b) == 0 { return (mk(lo(a) / lo(b), 0), mk(lo(a) % lo(b), 0)); }
+    if ult(a, b) { return (mk(0, 0), a); }
+    let mut q = mk(0, 0);
+    let mut r = mk(0, 0);
+    let mut i = 128u32;
+    while i > 0 {
+        i -= 1;
+        r = shl_u(r, 1);
+        let bit = if i >= 64 { (hi(a) >> (i - 64)) & 1 } else { (lo(a) >> i) & 1 };
+        r = mk(lo(r) | bit, hi(r));
+        if !ult(r, b) {
+            r = sub2(r, b).0;
+            q = if i >= 64 { mk(lo(q), hi(q) | 1u64 << (i - 64)) } else { mk(lo(q) | 1u64 << i, hi(q)) };
+        }
+    }
+    (q, r)
+}
+
+fn is_zero(x: u128) -> bool { lo(x) == 0 && hi(x) == 0 }
+
+#[track_caller]
+pub fn div_u(a: u128, b: u128) -> u128 {
+    if is_zero(b) { crate::panic::panic("attempt to divide by zero"); }
+    divrem(a, b).0
+}
+
+#[track_caller]
+pub fn rem_u(a: u128, b: u128) -> u128 {
+    if is_zero(b) { crate::panic::panic("attempt to calculate the remainder with a divisor of zero"); }
+    divrem(a, b).1
+}
+
+fn is_min(x: i128) -> bool { ihi(x) == 1u64 << 63 && ilo(x) == 0 }
+fn is_minus_one(x: i128) -> bool { ihi(x) == 0xffffffffffffffff && ilo(x) == 0xffffffffffffffff }
+fn negate_bits(x: u128) -> u128 { sub2(mk(0, 0), x).0 }
+
+#[track_caller]
+pub fn div_i(a: i128, b: i128) -> i128 {
+    if is_zero(bits(b)) { crate::panic::panic("attempt to divide by zero"); }
+    if is_min(a) && is_minus_one(b) {
+        overflow("divide");
+    }
+    let (q, _) = divrem(abs_bits(a), abs_bits(b));
+    from_bits(if neg_i(a) != neg_i(b) { negate_bits(q) } else { q })
+}
+
+#[track_caller]
+pub fn rem_i(a: i128, b: i128) -> i128 {
+    if is_zero(bits(b)) { crate::panic::panic("attempt to calculate the remainder with a divisor of zero"); }
+    if is_min(a) && is_minus_one(b) {
+        overflow("calculate the remainder");
+    }
+    let (_, r) = divrem(abs_bits(a), abs_bits(b));
+    from_bits(if neg_i(a) { negate_bits(r) } else { r })
+}
+
+// --- Bits, shifts, negation -----------------------------------------------------
+
+pub fn and_u(a: u128, b: u128) -> u128 { mk(lo(a) & lo(b), hi(a) & hi(b)) }
+pub fn or_u(a: u128, b: u128) -> u128 { mk(lo(a) | lo(b), hi(a) | hi(b)) }
+pub fn xor_u(a: u128, b: u128) -> u128 { mk(lo(a) ^ lo(b), hi(a) ^ hi(b)) }
+pub fn not_u(a: u128) -> u128 { mk(!lo(a), !hi(a)) }
+pub fn and_i(a: i128, b: i128) -> i128 { from_bits(and_u(bits(a), bits(b))) }
+pub fn or_i(a: i128, b: i128) -> i128 { from_bits(or_u(bits(a), bits(b))) }
+pub fn xor_i(a: i128, b: i128) -> i128 { from_bits(xor_u(bits(a), bits(b))) }
+pub fn not_i(a: i128) -> i128 { from_bits(not_u(bits(a))) }
+
+#[track_caller]
+fn shift_amount(n: u64, what: &str) -> u32 {
+    if n >= 128 {
+        if cfg_debug() { overflow(what); }
+        return (n & 127) as u32;
+    }
+    n as u32
+}
+
+#[track_caller]
+pub fn shl(a: u128, n: u64) -> u128 { shl_u(a, shift_amount(n, "shift left")) }
+#[track_caller]
+pub fn shr(a: u128, n: u64) -> u128 { shr_u(a, shift_amount(n, "shift right")) }
+#[track_caller]
+pub fn shl_i(a: i128, n: u64) -> i128 { from_bits(shl_u(bits(a), shift_amount(n, "shift left"))) }
+
+#[track_caller]
+pub fn shr_i(a: i128, n: u64) -> i128 {
+    let k = shift_amount(n, "shift right");
+    let r = shr_u(bits(a), k);
+    if !neg_i(a) || k == 0 { return from_bits(r); }
+    // Fill the vacated high bits with ones.
+    let fill = not_u(shr_u(not_u(mk(0, 0)), k));
+    from_bits(or_u(r, fill))
+}
+
+#[track_caller]
+pub fn neg_u(a: u128) -> u128 {
+    if cfg_debug() && !is_zero(a) { overflow("negate"); }
+    negate_bits(a)
+}
+
+#[track_caller]
+pub fn neg_ii(a: i128) -> i128 {
+    if cfg_debug() && is_min(a) { overflow("negate"); }
+    from_bits(negate_bits(bits(a)))
+}
+
+// --- Comparisons -------------------------------------------------------------------
+
+pub fn eq_u(a: u128, b: u128) -> bool { lo(a) == lo(b) && hi(a) == hi(b) }
+pub fn lt_u(a: u128, b: u128) -> bool { ult(a, b) }
+pub fn eq_i(a: i128, b: i128) -> bool { ilo(a) == ilo(b) && ihi(a) == ihi(b) }
+pub fn lt_i(a: i128, b: i128) -> bool {
+    let ha = ihi(a) as i64;
+    let hb = ihi(b) as i64;
+    ha < hb || ha == hb && ilo(a) < ilo(b)
+}
+
+// --- Conversions -------------------------------------------------------------------
+
+pub fn from_u64(x: u64) -> u128 { mk(x, 0) }
+pub fn from_i64(x: i64) -> i128 { mki(x as u64, if x < 0 { 0xffffffffffffffff } else { 0 }) }
+pub fn to_u64(x: u128) -> u64 { lo(x) }
+pub fn to_u64_i(x: i128) -> u64 { ilo(x) }
+
+const TWO64: f64 = 18446744073709551616.0;
+
+pub fn to_f64(x: u128) -> f64 { hi(x) as f64 * TWO64 + lo(x) as f64 }
+pub fn to_f64_i(x: i128) -> f64 {
+    let m = to_f64(abs_bits(x));
+    if neg_i(x) { -m } else { m }
+}
+
+/// Saturating, as Rust's float to integer casts (NaN gives 0).
+pub fn from_f64(f: f64) -> u128 {
+    if !(f > 0.0) { return mk(0, 0); }
+    if f >= TWO64 * TWO64 { return not_u(mk(0, 0)); }
+    let h = (f / TWO64) as u64;
+    let l = (f - h as f64 * TWO64) as u64;
+    mk(l, h)
+}
+
+pub fn from_f64_i(f: f64) -> i128 {
+    if f != f { return mki(0, 0); }
+    let lim = TWO64 * TWO64 / 2.0;
+    if f >= lim { return mki(0xffffffffffffffff, 0x7fffffffffffffff); }
+    if f <= -lim { return mki(0, 1u64 << 63); }
+    let m = from_f64(if f < 0.0 { -f } else { f });
+    from_bits(if f < 0.0 { negate_bits(m) } else { m })
+}
+
+// --- Formatting ----------------------------------------------------------------------
+
+/// The digits of x in radix (2 to 16).
+pub fn digits(x: u128, radix: u64, upper: bool) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut v = x;
+    let r = mk(radix, 0);
+    loop {
+        let (q, d) = divrem(v, r);
+        let dl = lo(d) as u8;
+        buf.push(if dl < 10 { b'0' + dl } else if upper { b'A' + dl - 10 } else { b'a' + dl - 10 });
+        v = q;
+        if is_zero(v) { break; }
+    }
+    let mut s = String::new();
+    let mut i = buf.len();
+    while i > 0 {
+        i -= 1;
+        s.push(buf[i] as char);
+    }
+    s
+}
+
+pub fn digits_i(x: i128) -> String { digits(abs_bits(x), 10, false) }
+pub fn is_neg(x: i128) -> bool { neg_i(x) }
+pub fn bits_of(x: i128) -> u128 { bits(x) }
+
+// --- For the methods of u128 and i128 ------------------------------------------------
+
+pub fn overflowing_add_u(a: u128, b: u128) -> (u128, bool) { add2(a, b) }
+pub fn overflowing_sub_u(a: u128, b: u128) -> (u128, bool) { sub2(a, b) }
+pub fn overflowing_mul_u(a: u128, b: u128) -> (u128, bool) { mul2(a, b) }
+
+pub fn overflowing_add_i(a: i128, b: i128) -> (i128, bool) {
+    let r = from_bits(add2(bits(a), bits(b)).0);
+    (r, neg_i(a) == neg_i(b) && neg_i(r) != neg_i(a))
+}
+
+pub fn overflowing_sub_i(a: i128, b: i128) -> (i128, bool) {
+    let r = from_bits(sub2(bits(a), bits(b)).0);
+    (r, neg_i(a) != neg_i(b) && neg_i(r) != neg_i(a))
+}
+
+pub fn overflowing_mul_i(a: i128, b: i128) -> (i128, bool) {
+    let (r, _) = mul2(bits(a), bits(b));
+    let (m, o) = mul2(abs_bits(a), abs_bits(b));
+    let neg = neg_i(a) != neg_i(b) && !is_zero(m);
+    let top = hi(m) >> 63 != 0;
+    let exact_min = hi(m) == 1u64 << 63 && lo(m) == 0;
+    (from_bits(r), o || top && !(neg && exact_min))
+}
+
+pub fn count_ones(x: u128) -> u32 { lo(x).count_ones() + hi(x).count_ones() }
+pub fn leading_zeros(x: u128) -> u32 { if hi(x) != 0 { hi(x).leading_zeros() } else { 64 + lo(x).leading_zeros() } }
+pub fn trailing_zeros(x: u128) -> u32 { if lo(x) != 0 { lo(x).trailing_zeros() } else { 64 + hi(x).trailing_zeros() } }

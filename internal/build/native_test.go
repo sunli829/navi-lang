@@ -38,7 +38,7 @@ func TestNativeRun(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if bytes.Contains(src, []byte("// native: skip")) {
+			if bytes.Contains(src, []byte("// native: skip")) || bytes.Contains(src, []byte("// stage0: skip")) {
 				t.Skip("marked // native: skip")
 			}
 			var want, wantStderr []string

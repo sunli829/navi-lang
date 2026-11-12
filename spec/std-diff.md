@@ -42,6 +42,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `thread::spawn` | 操作系统线程 | 绿色线程（M:N 调度） |
 | 线程里 panic | 只结束该线程，`join()` 返回 `Err` | 相同（M9 起）。只有 native 后端；stage0 的解释器不捕获 panic，仍结束整个进程 |
 | panic 的载荷 | `Box<dyn Any + Send>`，通常装着消息 | `std::panic::PanicPayload`：`message()` 和 `location()`；`thread::Result<T> = Result<T, PanicPayload>` |
+| `Duration::as_nanos` / `as_micros` / `as_millis` | `u128` | 相同；只有用 stage0 编译 std 时是 `u64`（stage0 没有 128 位整数） |
 | `catch_unwind` 的参数 | `F: FnOnce() -> R + UnwindSafe` | `fn() -> R`（没有 `UnwindSafe`）；被捕获的 panic 仍会先打印消息（同 Rust 的默认 hook） |
 | `&T` | 共享借用，保证期间没有人写 | 浅只读：只禁止通过这条路径直接写，不保证别人没在写（见 language.md 1.3） |
 
