@@ -162,4 +162,9 @@ type Machine interface {
 	CopyWords(dst, src Reg, n int64)
 	// RunDefers emits the body of the deferred call runner (see lower.go).
 	RunDefers()
+	// SwapContext emits the body of the context switch routine: it is
+	// called with the C convention with two arguments, save and load, each
+	// pointing at three words (sp, fp, pc); it saves the caller's context
+	// in save and resumes the one in load.
+	SwapContext()
 }

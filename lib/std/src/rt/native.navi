@@ -73,7 +73,11 @@ fn put_u64(fd: i32, v: u64) {
 fn put_u32(fd: i32, v: u32) { put_u64(fd, v as u64); }
 
 fn panic_header(file: &str, line: u32, col: u32) {
-    put(2, "thread 'main' panicked at ");
+    if crate::rt::sched::is_main() {
+        put(2, "thread 'main' panicked at ");
+    } else {
+        put(2, "thread '<unnamed>' panicked at ");
+    }
     put(2, file);
     put(2, ":");
     put_u32(2, line);
@@ -136,20 +140,63 @@ pub fn fatal(msg: &str) -> ! {
     exit(2)
 }
 
-fn unsupported(what: &str) -> ! {
-    panic_raw(what, "<runtime>", 0, 0)
+pub fn spawn<T>(f: fn() -> T) -> *mut u8 {
+    let mut slot: Option<T> = None;
+    let cell = &mut slot;
+    let h = crate::rt::sched::new_handle(cell as *mut Option<T> as *mut u8);
+    crate::rt::sched::go(|| {
+        *cell = Some(f());
+        crate::rt::sched::finish(h);
+    });
+    h as *mut u8
 }
 
-pub fn spawn<T>(f: fn() -> T) -> *mut u8 { unsupported("threads are not supported in native code yet (M6)") }
-pub fn join<T>(h: *mut u8) -> T { unsupported("threads are not supported in native code yet (M6)") }
-pub fn yield_now() {}
-pub fn chan_new<T>(cap: usize) -> *mut u8 { unsupported("channels are not supported in native code yet (M6)") }
-pub fn chan_send<T>(c: *mut u8, v: T) -> bool { unsupported("channels are not supported in native code yet (M6)") }
-pub fn chan_recv<T>(c: *mut u8) -> Option<T> { unsupported("channels are not supported in native code yet (M6)") }
-pub fn chan_try_recv<T>(c: *mut u8) -> Option<T> { unsupported("channels are not supported in native code yet (M6)") }
-pub fn chan_close(c: *mut u8) { unsupported("channels are not supported in native code yet (M6)") }
-pub fn chan_closed(c: *mut u8) -> bool { unsupported("channels are not supported in native code yet (M6)") }
-pub fn select_cases(cases: &[crate::sync::mpmc::SelectCase], has_default: bool) -> usize { unsupported("select is not supported in native code yet (M6)") }
+pub fn join<T>(h: *mut u8) -> T {
+    let cell = crate::rt::sched::join(h as *mut crate::rt::sched::Handle) as *mut Option<T>;
+    match unsafe { *cell } {
+        Some(v) => v,
+        None => fatal("joined thread has no result"),
+    }
+}
+
+pub fn yield_now() { crate::rt::sched::yield_now(); }
+
+pub fn chan_new<T>(cap: usize) -> *mut u8 {
+    let write_result = |slot: *mut u8, src: *const u8| {
+        let r: Result<T, crate::sync::mpmc::RecvError> =
+            if src as usize == 0 { Err(crate::sync::mpmc::RecvError) } else { Ok(unsafe { *(src as *const T) }) };
+        unsafe { *(slot as *mut Result<T, crate::sync::mpmc::RecvError>) = r; }
+    };
+    crate::rt::sched::new_chan(crate::intrinsics::size_of::<T>(), cap, write_result) as *mut u8
+}
+
+pub fn chan_send<T>(c: *mut u8, v: T) -> bool {
+    let mut tmp = v;
+    let cell = &mut tmp;
+    crate::rt::sched::send(c as *mut crate::rt::sched::Chan, cell as *mut T as *const u8)
+}
+
+fn recv_typed<T>(c: *mut u8, block: bool) -> Option<T> {
+    let n = crate::intrinsics::size_of::<T>();
+    let buf = crate::rt::gc::alloc(if n == 0 { 1 } else { n }, false);
+    if crate::rt::sched::recv(c as *mut crate::rt::sched::Chan, buf, block) {
+        Some(unsafe { *(buf as *const T) })
+    } else {
+        None
+    }
+}
+
+pub fn chan_recv<T>(c: *mut u8) -> Option<T> { recv_typed::<T>(c, true) }
+pub fn chan_try_recv<T>(c: *mut u8) -> Option<T> { recv_typed::<T>(c, false) }
+pub fn chan_close(c: *mut u8) { crate::rt::sched::close(c as *mut crate::rt::sched::Chan); }
+pub fn chan_closed(c: *mut u8) -> bool { crate::rt::sched::closed(c as *mut crate::rt::sched::Chan) }
+pub fn select_cases(cases: &[crate::sync::mpmc::SelectCase], has_default: bool) -> usize {
+    crate::rt::sched::run_select(cases, has_default)
+}
+
+/// The scheduler's entry points used by generated code.
+pub fn sched_init() -> usize { crate::rt::sched::init() }
+pub fn gmain() -> ! { crate::rt::sched::gmain() }
 
 pub fn fmt_float(x: f64, prec: usize, has_prec: bool, style: u8, buf: *mut u8) -> usize {
     crate::rt::float::format(x, prec, has_prec, style, buf)

@@ -46,6 +46,8 @@ const (
 type Target struct {
 	// CPrefix is prepended to C symbol names ("_" on macOS).
 	CPrefix string
+	// Write is the C function writing to a file descriptor.
+	Write string
 }
 
 // Options control code generation.
@@ -94,6 +96,7 @@ func Generate(p *codegen.Plan, arch string, m Machine, tgt Target, opts Options)
 	}
 	g.genMain()
 	g.genRunDefers()
+	g.genSched()
 	g.genData()
 	if len(g.errs) > 0 {
 		return nil, fmt.Errorf("%s", strings.Join(g.errs, "\n"))
@@ -205,8 +208,10 @@ func (g *gen) genData() {
 	// the entry point runs their initializers). The collector scans from
 	// _navi_data_start to _navi_data_end.
 	o.Define("_navi_data_start", obj.Data, 8, false)
-	o.Define("_navi_stack_top", obj.Data, 8, false)
-	o.Sects[obj.Data] = append(o.Sects[obj.Data], make([]byte, 8)...)
+	for _, sym := range []string{"_navi_stack_top", "_navi_stack_lo", "_navi_os_sp"} {
+		o.Define(sym, obj.Data, 8, false)
+		o.Sects[obj.Data] = append(o.Sects[obj.Data], make([]byte, 8)...)
+	}
 	for _, d := range g.p.Statics {
 		ty := g.p.Info.Consts[d].Type
 		size := int64(8)
@@ -286,7 +291,8 @@ func (g *gen) genMain() {
 	if s := g.sizeOf(main.Concrete(g.p, main.Func.Locals[0].Type)); s > retSize {
 		retSize = s
 	}
-	m.EntryPrologue((retSize + 15) &^ 15)
+	frame := (retSize + 15) &^ 15
+	m.EntryPrologue(frame)
 	m.AdrSym(I1, "_navi_stack_top")
 	m.Store(8, FP, I1, 0)
 	mainLoc := g.locAt("<main>", 0, 0)
@@ -301,12 +307,64 @@ func (g *gen) genMain() {
 		m.AdrSym(CTX, in.Dict)
 		m.Call(in.Group.Sym)
 	}
+	// Create the main green thread and continue on its stack.
+	init := g.p.Runtime["sched_init"]
+	m.AddrOf(RET, SP, 0)
+	m.AdrSym(LOC, mainLoc)
+	m.AdrSym(CTX, init.Dict)
+	m.Call(init.Group.Sym)
+	m.Load(8, V1, SP, 0)
+	m.AdrSym(I1, "_navi_os_sp")
+	m.Mov(I2, SP)
+	m.Store(8, I2, I1, 0)
+	m.Mov(SP, V1)
+	m.AddImm(SP, -frame)
 	m.AddrOf(RET, SP, 0)
 	m.AdrSym(LOC, mainLoc)
 	m.AdrSym(CTX, main.Dict)
 	m.Call(main.Group.Sym)
+	m.AdrSym(I1, "_navi_os_sp")
+	m.Load(8, V1, I1, 0)
+	m.Mov(SP, V1)
 	m.EntryReturn0()
 	g.emitFunc(g.tgt.CPrefix+"main", true)
+}
+
+// genSched writes the scheduler's routines: the context switch, the start
+// of a new green thread (which calls std::rt::native::gmain with an empty
+// frame chain) and the stack overflow handler (C calls only: it runs on
+// the red zone below the stack limit).
+func (g *gen) genSched() {
+	m := g.m
+	m.Begin()
+	m.SwapContext()
+	g.emitFunc("_navi_swapctx", false)
+
+	m.Begin()
+	gm := g.p.Runtime["gmain"]
+	m.AddImm(SP, -32)
+	m.AddrOf(RET, SP, 0)
+	m.AdrSym(LOC, g.locAt("<thread>", 0, 0))
+	m.AdrSym(CTX, gm.Dict)
+	m.Call(gm.Group.Sym)
+	m.Trap()
+	g.emitFunc("_navi_gstart", false)
+
+	m.Begin()
+	m.Prologue(32)
+	msg := "fatal error: stack overflow\n"
+	m.MovImm(V1, 2)
+	m.Store(8, V1, SP, 0)
+	m.AdrSym(V1, g.p.Str(msg))
+	m.Store(8, V1, SP, 8)
+	m.MovImm(V1, int64(len(msg)))
+	m.Store(8, V1, SP, 16)
+	m.CallC(g.extern(g.tgt.Write), 0, []CArg{{}, {}, {}}, false, false)
+	m.MovImm(V1, 2)
+	m.Store(8, V1, SP, 0)
+	m.CallC(g.extern("exit"), 0, []CArg{{}}, false, false)
+	m.Trap()
+	g.emitFunc("_navi_overflow", false)
 }
 
 // genRunDefers writes _navi_rundefers(CTX = list head): calls each
@@ -478,6 +536,17 @@ func (f *fnGen) gen() {
 	frame := (cur+15)&^15 + (maxOut+15)&^15
 
 	m.Prologue(frame)
+	overflow := m.NewLabel()
+	m.AdrSym(I1, "_navi_stack_lo")
+	m.Load(8, I1, I1, 0)
+	m.Mov(I2, SP)
+	m.Cmp(I2, I1)
+	m.BranchIf(LTU, overflow)
+	f.stubFn = append(f.stubFn, func() {
+		m.Bind(overflow)
+		m.Call("_navi_overflow")
+		m.Trap()
+	})
 	if fn.Closure {
 		m.Store(8, CTX, FP, f.loff[1])
 		m.Load(8, I1, CTX, -8)
@@ -1610,6 +1679,18 @@ func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
 	case "run_defers":
 		f.loadScalar(t.Args[0], CTX)
 		m.Call("_navi_rundefers")
+	case "swap_context":
+		f.loadScalar(t.Args[0], V1)
+		m.Store(8, V1, SP, 0)
+		f.loadScalar(t.Args[1], V1)
+		m.Store(8, V1, SP, 8)
+		m.CallC("_navi_swapctx", 0, []CArg{{}, {}}, false, false)
+	case "gstart_address":
+		m.AdrSym(V1, "_navi_gstart")
+	case "set_stack_limit":
+		f.loadScalar(t.Args[0], V1)
+		m.AdrSym(I1, "_navi_stack_lo")
+		m.Store(8, V1, I1, 0)
 	case "size_of":
 		m.MovImm(V1, f.size(targ(0)))
 	case "align_of":

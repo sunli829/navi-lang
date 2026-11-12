@@ -1,0 +1,451 @@
+//! Green threads for native programs: goroutine-style Gs multiplexed on
+//! the process's one OS thread (M:1). A G runs until it blocks (join, a
+//! channel operation, select) or yields; the scheduler then switches to
+//! the next runnable G. Every G has its own stack (reserved address space,
+//! committed by the OS on first touch); function prologues check the
+//! current G's stack limit.
+//!
+//! Waiting follows the interpreter's semantics (a condition variable per
+//! waitable object): a blocked G registers on the wait lists it cares
+//! about and re-checks its condition when woken.
+
+#[cfg(not(target_os = "windows"))]
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+}
+
+#[cfg(target_os = "windows")]
+extern "C" {
+    fn VirtualAlloc(addr: *mut u8, size: usize, kind: u32, protect: u32) -> *mut u8;
+}
+
+#[cfg(target_os = "macos")]
+const MAP_FLAGS: i32 = 0x1002;
+#[cfg(target_os = "linux")]
+const MAP_FLAGS: i32 = 0x4022;
+#[cfg(target_os = "windows")]
+const MAP_FLAGS: i32 = 0;
+
+const MAIN_STACK: usize = 67108864; // 64 MiB
+#[cfg(not(target_os = "windows"))]
+const STACK: usize = 1048576; // 1 MiB per spawned G
+#[cfg(target_os = "windows")]
+const STACK: usize = 262144; // committed up front on Windows
+// The bottom of every stack is left for C calls made near the limit.
+const RED_ZONE: usize = 32768;
+
+const RUNNING: u8 = 0;
+const RUNNABLE: u8 = 1;
+const WAITING: u8 = 2;
+const DEAD: u8 = 3;
+
+/// A green thread.
+pub struct G {
+    // Saved context (sp, fp, pc) while not running.
+    sp: usize,
+    fp: usize,
+    pc: usize,
+    stack_lo: usize,
+    stack_hi: usize,
+    status: u8,
+    main: bool,
+    entry: fn(),
+    next: *mut G, // run queue
+    all_next: *mut G,
+    wait_gen: usize,
+}
+
+struct WaitNode { g: *mut G, gen: usize, next: *mut WaitNode }
+
+/// A list of Gs waiting for a change of some object.
+pub struct WaitList { head: *mut WaitNode }
+
+static mut CUR: usize = 0;
+static mut RUN_HEAD: usize = 0;
+static mut RUN_TAIL: usize = 0;
+static mut ALL: usize = 0;
+static mut FREE_GS: usize = 0; // dead Gs whose records and stacks are reused (linked by next)
+
+fn reserve(size: usize) -> usize { reserve_os(size) }
+
+#[cfg(not(target_os = "windows"))]
+fn reserve_os(size: usize) -> usize {
+    let p = unsafe { mmap(0 as *mut u8, size, 3, MAP_FLAGS, -1, 0) } as usize;
+    if p == 0 || p == 18446744073709551615 { crate::rt::native::fatal("cannot allocate a stack"); }
+    p
+}
+
+#[cfg(target_os = "windows")]
+fn reserve_os(size: usize) -> usize {
+    let p = unsafe { VirtualAlloc(0 as *mut u8, size, 0x3000, 4) } as usize;
+    if p == 0 { crate::rt::native::fatal("cannot allocate a stack"); }
+    p
+}
+
+fn new_g() -> *mut G {
+    // G records are GC objects kept alive by the ALL list (a static), so
+    // their entry closures are traced.
+    let g = crate::rt::gc::alloc(crate::intrinsics::size_of::<G>(), false) as *mut G;
+    unsafe {
+        (*g).all_next = ALL as *mut G;
+    }
+    ALL = g as usize;
+    g
+}
+
+/// Called by the entry point before anything else: creates the main G
+/// and returns the top of its stack (the entry point switches to it).
+pub fn init() -> usize {
+    let g = new_g();
+    let base = reserve(MAIN_STACK);
+    unsafe {
+        (*g).stack_lo = base;
+        (*g).stack_hi = base + MAIN_STACK;
+        (*g).status = RUNNING;
+        (*g).main = true;
+        (*g).entry = || {};
+    }
+    CUR = g as usize;
+    crate::rt::set_stack_limit(base + RED_ZONE);
+    base + MAIN_STACK
+}
+
+pub fn current() -> *mut G { CUR as *mut G }
+
+/// Whether the running G is the main thread (for panic messages).
+pub fn is_main() -> bool {
+    if CUR == 0 { return true; }
+    unsafe { (*(CUR as *mut G)).main }
+}
+
+/// The stack range of the running G that the collector must scan, and
+/// calls f for the saved stack of every other live G.
+pub fn current_stack_hi() -> usize {
+    if CUR == 0 { return crate::rt::stack_top() as usize + 16; }
+    unsafe { (*(CUR as *mut G)).stack_hi }
+}
+
+/// Scans the saved stack of every other live G.
+pub fn scan_other_stacks() {
+    let mut g = ALL as *mut G;
+    while g as usize != 0 {
+        unsafe {
+            if (*g).status != DEAD && g as usize != CUR {
+                crate::rt::gc::scan_range((*g).sp, (*g).stack_hi);
+            }
+            g = (*g).all_next;
+        }
+    }
+}
+
+/// Starts a new G running f.
+pub fn go(f: fn()) {
+    let mut g = FREE_GS as *mut G;
+    if g as usize != 0 {
+        FREE_GS = unsafe { (*g).next } as usize;
+    } else {
+        g = new_g();
+        let stack = reserve(STACK);
+        unsafe {
+            (*g).stack_lo = stack;
+            (*g).stack_hi = stack + STACK;
+        }
+    }
+    unsafe {
+        (*g).sp = (*g).stack_hi;
+        (*g).fp = 0;
+        (*g).pc = crate::rt::gstart_address() as usize;
+        (*g).entry = f;
+    }
+    ready(g);
+}
+
+/// The first function of every spawned G (called by the start routine).
+pub fn gmain() -> ! {
+    let g = current();
+    let f = unsafe { (*g).entry };
+    f();
+    exit_current()
+}
+
+fn exit_current() -> ! {
+    let g = current();
+    // The record and its stack are reused by a later G once this one has
+    // switched away for good. Dead Gs stay on the ALL list (so they stay
+    // allocated) but their stacks are not scanned.
+    unsafe {
+        (*g).status = DEAD;
+        (*g).entry = || {};
+        (*g).next = FREE_GS as *mut G;
+    }
+    FREE_GS = g as usize;
+    schedule();
+    crate::rt::native::fatal("dead goroutine resumed")
+}
+
+fn ready(g: *mut G) {
+    unsafe {
+        (*g).status = RUNNABLE;
+        (*g).next = 0 as *mut G;
+        if RUN_TAIL == 0 {
+            RUN_HEAD = g as usize;
+        } else {
+            (*(RUN_TAIL as *mut G)).next = g;
+        }
+    }
+    RUN_TAIL = g as usize;
+}
+
+// schedule switches to the next runnable G. The current G must already be
+// queued, waiting or dead.
+fn schedule() {
+    if RUN_HEAD == 0 {
+        crate::rt::native::fatal("all goroutines are asleep - deadlock!");
+    }
+    let next = RUN_HEAD as *mut G;
+    unsafe {
+        RUN_HEAD = (*next).next as usize;
+        if RUN_HEAD == 0 { RUN_TAIL = 0; }
+        (*next).status = RUNNING;
+    }
+    let prev = CUR as *mut G;
+    if next as usize == prev as usize { return; }
+    CUR = next as usize;
+    unsafe {
+        crate::rt::set_stack_limit((*next).stack_lo + RED_ZONE);
+        crate::rt::swap_context(&mut (*prev).sp as *mut usize as *mut u8, &mut (*next).sp as *mut usize as *mut u8);
+    }
+}
+
+/// Lets other Gs run.
+pub fn yield_now() {
+    ready(current());
+    schedule();
+}
+
+// --- Waiting -------------------------------------------------------------------
+
+pub fn new_wait_list() -> WaitList { WaitList { head: 0 as *mut WaitNode } }
+
+/// Registers the running G on w (it may register on several lists).
+pub fn enlist(w: *mut WaitList) {
+    let g = current();
+    let n = crate::rt::gc::alloc(crate::intrinsics::size_of::<WaitNode>(), false) as *mut WaitNode;
+    unsafe {
+        (*n).g = g;
+        (*n).gen = (*g).wait_gen;
+        (*n).next = (*w).head;
+        (*w).head = n;
+    }
+}
+
+/// Blocks the running G until a list it is on is woken.
+pub fn park() {
+    let g = current();
+    unsafe { (*g).status = WAITING; }
+    schedule();
+}
+
+/// Waits on one list.
+pub fn wait(w: *mut WaitList) {
+    enlist(w);
+    park();
+}
+
+/// Wakes every G waiting on w.
+pub fn broadcast(w: *mut WaitList) {
+    let mut n = unsafe { (*w).head };
+    unsafe { (*w).head = 0 as *mut WaitNode; }
+    while n as usize != 0 {
+        unsafe {
+            let g = (*n).g;
+            if (*n).gen == (*g).wait_gen && (*g).status == WAITING {
+                (*g).wait_gen += 1;
+                ready(g);
+            }
+            n = (*n).next;
+        }
+    }
+}
+
+// --- Threads -------------------------------------------------------------------
+
+/// A spawned thread: its result cell and the Gs joining it.
+pub struct Handle { done: bool, result: *mut u8, waiters: WaitList }
+
+pub fn new_handle(result: *mut u8) -> *mut Handle {
+    &mut Handle { done: false, result, waiters: new_wait_list() } as *mut Handle
+}
+
+pub fn finish(h: *mut Handle) {
+    unsafe {
+        (*h).done = true;
+        broadcast(&mut (*h).waiters as *mut WaitList);
+    }
+}
+
+pub fn join(h: *mut Handle) -> *mut u8 {
+    unsafe {
+        while !(*h).done { wait(&mut (*h).waiters as *mut WaitList); }
+        (*h).result
+    }
+}
+
+// --- Channels ------------------------------------------------------------------
+
+const UNBOUNDED: usize = 18446744073709551615;
+
+/// A channel of elements of elem bytes, stored in a ring buffer.
+pub struct Chan {
+    elem: usize,
+    cap: usize,
+    buf: *mut u8,
+    head: usize,
+    len: usize,
+    slots: usize,
+    closed: bool,
+    send_seq: usize,
+    recv_seq: usize,
+    recv_waiter: usize,
+    waiters: WaitList,
+    // Writes Result<T, RecvError> for select: (slot, value or null).
+    write_result: fn(*mut u8, *const u8),
+}
+
+pub fn new_chan(elem: usize, cap: usize, write_result: fn(*mut u8, *const u8)) -> *mut Chan {
+    &mut Chan { elem, cap, buf: 0 as *mut u8, head: 0, len: 0, slots: 0, closed: false, send_seq: 0,
+        recv_seq: 0, recv_waiter: 0, waiters: new_wait_list(), write_result } as *mut Chan
+}
+
+fn wl(c: *mut Chan) -> *mut WaitList { unsafe { &mut (*c).waiters as *mut WaitList } }
+
+fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) { crate::rt::copy::<u8>(src, dst, n); }
+
+fn push(c: *mut Chan, src: *const u8) {
+    unsafe {
+        if (*c).len == (*c).slots {
+            // Grow the ring (scan: elements may hold pointers).
+            let slots = if (*c).slots == 0 { 4 } else { (*c).slots * 2 };
+            let elem = if (*c).elem == 0 { 1 } else { (*c).elem };
+            let nb = crate::rt::gc::alloc(slots * elem, false);
+            let mut i = 0;
+            while i < (*c).len {
+                let from = ((*c).head + i) % (*c).slots;
+                copy_bytes(crate::rt::ptr_offset((*c).buf as *const u8, from * elem), crate::rt::ptr_offset(nb as *const u8, i * elem) as *mut u8, elem);
+                i += 1;
+            }
+            (*c).buf = nb;
+            (*c).head = 0;
+            (*c).slots = slots;
+        }
+        let at = ((*c).head + (*c).len) % (*c).slots;
+        copy_bytes(src, crate::rt::ptr_offset((*c).buf as *const u8, at * (*c).elem) as *mut u8, (*c).elem);
+        (*c).len += 1;
+    }
+}
+
+fn pop(c: *mut Chan, dst: *mut u8) {
+    unsafe {
+        copy_bytes(crate::rt::ptr_offset((*c).buf as *const u8, (*c).head * (*c).elem), dst, (*c).elem);
+        (*c).head = ((*c).head + 1) % (*c).slots;
+        (*c).len -= 1;
+    }
+}
+
+/// Sends the elem bytes at src; false if the channel is closed.
+pub fn send(c: *mut Chan, src: *const u8) -> bool {
+    unsafe {
+        loop {
+            if (*c).closed { return false; }
+            if (*c).cap == UNBOUNDED || (*c).len < (*c).cap || (*c).cap == 0 { break; }
+            wait(wl(c));
+        }
+        push(c, src);
+        (*c).send_seq += 1;
+        let seq = (*c).send_seq;
+        broadcast(wl(c));
+        if (*c).cap == 0 {
+            while (*c).recv_seq < seq && !(*c).closed { wait(wl(c)); }
+        }
+    }
+    true
+}
+
+/// Receives into dst; false if the channel is closed and empty (or, when
+/// not blocking, empty).
+pub fn recv(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
+    unsafe {
+        (*c).recv_waiter += 1;
+        broadcast(wl(c));
+        while (*c).len == 0 && !(*c).closed && block { wait(wl(c)); }
+        (*c).recv_waiter -= 1;
+        if (*c).len > 0 {
+            pop(c, dst);
+            (*c).recv_seq += 1;
+            broadcast(wl(c));
+            return true;
+        }
+    }
+    false
+}
+
+pub fn close(c: *mut Chan) {
+    unsafe { (*c).closed = true; }
+    broadcast(wl(c));
+}
+
+pub fn closed(c: *mut Chan) -> bool { unsafe { (*c).closed && (*c).len == 0 } }
+
+/// Runs a select over cases; returns the index of the case that ran or
+/// cases.len() for the default case.
+pub fn run_select(cases: &[crate::sync::mpmc::SelectCase], has_default: bool) -> usize {
+    let n = cases.len();
+    loop {
+        let mut i = 0;
+        while i < n {
+            let c = case_chan(&cases[i]);
+            let slot = case_slot(&cases[i]);
+            unsafe {
+                if case_send(&cases[i]) {
+                    let ready = (*c).cap == UNBOUNDED || (*c).len < (*c).cap
+                        || (*c).cap == 0 && (*c).recv_waiter > (*c).len;
+                    if !(*c).closed && ready {
+                        push(c, slot as *const u8);
+                        (*c).send_seq += 1;
+                        broadcast(wl(c));
+                        return i;
+                    }
+                } else if (*c).len > 0 || (*c).closed {
+                    if (*c).len > 0 {
+                        let elem = if (*c).elem == 0 { 1 } else { (*c).elem };
+                        let tmp = crate::rt::gc::alloc(elem, false);
+                        pop(c, tmp);
+                        (*c).recv_seq += 1;
+                        broadcast(wl(c));
+                        ((*c).write_result)(slot, tmp as *const u8);
+                    } else {
+                        ((*c).write_result)(slot, 0 as *const u8);
+                    }
+                    return i;
+                }
+            }
+            i += 1;
+        }
+        if has_default { return n; }
+        let mut j = 0;
+        while j < n {
+            enlist(wl(case_chan(&cases[j])));
+            j += 1;
+        }
+        park();
+    }
+}
+
+fn case_chan(c: &crate::sync::mpmc::SelectCase) -> *mut Chan {
+    // The case points at the Sender or Receiver, whose first field is the
+    // channel.
+    unsafe { *(crate::sync::mpmc::select_case_chan(c) as *const *mut Chan) }
+}
+
+fn case_slot(c: &crate::sync::mpmc::SelectCase) -> *mut u8 { crate::sync::mpmc::select_case_slot(c) }
+fn case_send(c: &crate::sync::mpmc::SelectCase) -> bool { crate::sync::mpmc::select_case_send(c) }

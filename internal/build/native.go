@@ -110,9 +110,12 @@ func Object(info *types.Info, main *resolve.Def, t Target, debug bool) ([]byte, 
 	default:
 		return nil, fmt.Errorf("code generation for %s is not implemented", t)
 	}
-	tgt := lower.Target{}
-	if t.OS == "macos" {
+	tgt := lower.Target{Write: "write"}
+	switch t.OS {
+	case "macos":
 		tgt.CPrefix = "_"
+	case "windows":
+		tgt.Write = "_write"
 	}
 	o, err := lower.Generate(plan, t.Arch, m, tgt, lower.Options{Debug: debug})
 	if err != nil {

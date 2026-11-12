@@ -328,3 +328,18 @@ func (m *Machine) RunDefers() {
 	a.LdpPost(FP, LR, SP, 16)
 	a.Ret()
 }
+
+// SwapContext: x0 = save, x1 = load (sp, fp, pc). Generated code keeps no
+// values in registers across calls, so these three are the whole context.
+func (m *Machine) SwapContext() {
+	a := m.a
+	a.MovSP(X16, SP)
+	a.Str(8, X16, X0, 0)
+	a.Str(8, FP, X0, 8)
+	a.Str(8, LR, X0, 16)
+	a.Ldr(8, X16, X1, 0)
+	a.MovSP(SP, X16)
+	a.Ldr(8, FP, X1, 8)
+	a.Ldr(8, LR, X1, 16)
+	a.Ret()
+}

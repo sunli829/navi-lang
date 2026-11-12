@@ -49,6 +49,7 @@ var Inline = map[string]bool{
 	"slice_from_raw_mut": true, "str_from_raw": true, "slice_len": true, "slice_ptr": true,
 	"str_as_bytes": true, "caller_location": true, "abort": true, "has_pointers": true,
 	"frame_address": true, "stack_top": true, "data_start": true, "data_end": true, "run_defers": true,
+	"swap_context": true, "gstart_address": true, "set_stack_limit": true,
 }
 
 // TargetKind is how a function reference is reached.
@@ -184,7 +185,7 @@ func Build(prog *mir.Program, main *resolve.Def) *Plan {
 		Runtime:    map[string]*Inst{},
 	}
 	p.findNative()
-	for _, name := range []string{"panic_raw", "panic_bounds", "gc_alloc"} {
+	for _, name := range []string{"panic_raw", "panic_bounds", "gc_alloc", "sched_init", "gmain"} {
 		if d := p.nativeFn(name); d != nil {
 			p.Runtime[name] = p.inst(d, nil, nil, prog.Func(d))
 		} else {

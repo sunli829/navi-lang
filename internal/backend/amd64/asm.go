@@ -389,8 +389,15 @@ func (a *Asm) CallR(r Reg) {
 	a.modrmReg(2, r)
 }
 
-func (a *Asm) Ret()  { a.b(0xC3) }
-func (a *Asm) Ud2()  { a.b(0x0F, 0x0B) }
+// JmpR jumps to the address in r.
+func (a *Asm) JmpR(r Reg) {
+	a.rex(false, 0, 0, r, false)
+	a.b(0xFF)
+	a.modrmReg(4, r)
+}
+
+func (a *Asm) Ret() { a.b(0xC3) }
+func (a *Asm) Ud2() { a.b(0x0F, 0x0B) }
 func (a *Asm) Push(r Reg) {
 	a.rex(false, 0, 0, r, false)
 	a.b(0x50 + byte(r&7))

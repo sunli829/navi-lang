@@ -20,7 +20,7 @@ func TestRun(t *testing.T) {
 		{args: []string{"bench"}, code: 1, stderrPart: "planned for M9"},
 		{args: []string{"run", "../../tests/run/structs.navi"}, code: 0, stdout: "Point { x: 1, y: 2 }\n(4, 6)\ntrue false\nCircle(1.5) Rect { w: 2.0, h: 3.0 } Empty\n7.0685773 6\nPoint {\n    x: 1,\n    y: 2,\n}\n"},
 		{args: []string{"test", "../../tests/syntax/example"}, code: 0},
-		// The example uses threads, which native code supports from M6.
+		{args: []string{"run", "../../tests/syntax/example"}, code: 0, stdout: "6 tokens, identifiers: [\"let\", \"x\", \"y1\"]\n"},
 		{args: []string{"run", "--interp", "../../tests/syntax/example"}, code: 0},
 		{args: []string{"check", "../../tests/syntax/example"}, code: 0},
 		{args: []string{"check", "missing-dir"}, code: 1, stderrPart: "missing-dir"},

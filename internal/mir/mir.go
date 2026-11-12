@@ -304,9 +304,9 @@ type (
 	StorageLive struct{ Local int }
 )
 
-func (Assign) stmt()    {}
-func (SetDiscr) stmt()  {}
-func (Box) stmt()       {}
+func (Assign) stmt()      {}
+func (SetDiscr) stmt()    {}
+func (Box) stmt()         {}
 func (PushDefer) stmt()   {}
 func (StorageLive) stmt() {}
 

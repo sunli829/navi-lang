@@ -595,3 +595,21 @@ func (m *Machine) RunDefers() {
 	a.Pop(RBP)
 	a.Ret()
 }
+
+// SwapContext: the first two C arguments are save and load (sp, fp, pc).
+// The return address is popped so that the saved sp is the caller's.
+func (m *Machine) SwapContext() {
+	a := m.a
+	save, load := RDI, RSI
+	if m.Win64 {
+		save, load = RCX, RDX
+	}
+	a.Pop(RAX)
+	a.Store(8, RSP, save, 0)
+	a.Store(8, RBP, save, 8)
+	a.Store(8, RAX, save, 16)
+	a.Load(8, RSP, load, 0)
+	a.Load(8, RBP, load, 8)
+	a.Load(8, RAX, load, 16)
+	a.JmpR(RAX)
+}

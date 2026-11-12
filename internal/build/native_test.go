@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 	"testing"
+	"time"
 
 	"navi/internal/resolve"
 )
