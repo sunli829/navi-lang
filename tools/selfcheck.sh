@@ -1,6 +1,7 @@
 #!/bin/sh
 # Compares the debug dumps of navic (the self-hosted compiler) with stage0
-# on every test crate and on the compiler itself.
+# on every test crate and on the compiler itself (navic without escape
+# analysis, which stage0 does not have).
 #
 #   tools/selfcheck.sh [resolve-dump|types-dump ...]
 set -e
@@ -16,7 +17,7 @@ for cmd in $cmds; do
 	for c in $crates; do
 		n=$(echo "$c" | tr '/' '_')
 		"$tmp/navi0" "$cmd" "$c" > "$tmp/$n.0" 2>&1 || true
-		"$tmp/navic" "$cmd" "$c" > "$tmp/$n.1" 2>&1 || true
+		NAVI_NOESCAPE=1 "$tmp/navic" "$cmd" "$c" > "$tmp/$n.1" 2>&1 || true
 		if ! cmp -s "$tmp/$n.0" "$tmp/$n.1"; then
 			echo "DIFF $cmd $c"
 			diff "$tmp/$n.0" "$tmp/$n.1" | head -5
