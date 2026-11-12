@@ -66,7 +66,7 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
 - Go 里遍历 map 会产生输出差异的地方，stage0 改成按记录顺序遍历（不改变行为，只让结果确定）：类型检查的结果记录、MIR 按定义顺序构建（闭包编号因此固定）、装箱时被取地址的局部变量按编号处理。
 - 发现并修正的 stage0 bug：发散的 then 分支、绑定类型未规范化、or 模式的绑定（每个分支一个新局部变量）、`&mut T: Clone`、const 每次使用都求值、静态初始化顺序。
 
-## M9（进行中）
+## M9（基本完成；未达成与 go build 持平，未做 M:N 和函数粒度增量缓存）
 
 - 自研链接器（`compiler/src/link.navi`）：navic 直接产出 PIE 的 Mach-O arm64 可执行文件，导入函数经 stub + GOT 由 dyld 非惰性绑定，数据里的绝对指针由 dyld rebase（LC_DYLD_INFO_ONLY 的 opcode 格式），带 ad-hoc 代码签名（CodeDirectory，SHA-256 逐页哈希，`compiler/src/sha256.navi`），不再依赖 cc/ld；`NAVI_LINKER=cc` 仍可用系统链接器。自举（stage2 == stage3）和 22 个 golden 测试通过。
 - 性能：师傅定的目标是与 go build 持平，性能优先。基准是 `go run ./bench/gen -lines 10000 -out /tmp/bp10`（约 9k 行 navi + 7k 行 std，等价的 Go 程序；两边都输出 `total 173105`），在 M 系列 Mac 上测：
@@ -94,6 +94,20 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   还差的：冷编译仍是 go build（std 已缓存）的约 7 倍。剩余时间分布平坦（parse+resolve 0.37s、types 0.57s、mir 0.6s、plan 0.35s、codegen 0.42s、link 0.21s），其中约 0.55s 是每次重编 std 的前端。再往下要靠：std 前端结果的缓存（需要序列化类型和 MIR）、MIR 内联小函数、函数粒度并行（需要 M:N 多线程运行时和线程安全的编译器数据结构）。
   试过但回退：GOGC=200（被 set_min_heap 取代）、早期的小函数内联实验。
 
+- 语言和工具（都只在 navic 里，stage0 冻结；std 里 stage0 编不了的部分用 `#[cfg(feature = "navic")]` 藏起来，含新语法的放在单独的模块文件里，stage0 不会去读）：
+  - `panic::catch_unwind` / `resume_unwind` / `PanicPayload`：每个 G 有一串 catch 记录，`try_call` 用 setjmp 式的上下文保存（`_navi_setjmp`/`_navi_longjmp`，存 x19–x28、fp、lr、sp），panic 先打印消息、执行到 catch 帧为止的 defer，再恢复上下文；`thread::spawn` 用它包住线程函数，`join()` 返回 `Err(PanicPayload)`；`tests/run/catch.navi`。
+  - `i128` / `u128`：16 字节整数（对齐 8），MIR 降级时把 128 位的算术、比较、移位、取反、数值转换和 switch 改写成 `std::rt::int128` 的调用（两个 u64 半字实现，debug 构建检查溢出、除零）；Display/Debug/十六进制、Hash/Ord 等 shim、常用方法（MIN/MAX、wrapping/checked/saturating、pow、count_ones…）；`Duration::as_nanos` 等改回 `u128`；`tests/run/int128.navi`。字面量最大到 `u64::MAX`。
+  - const 泛型：`const N: usize` 形参（项和 impl 上）、实参（字面量、`{ 表达式 }`、别的 const 形参）、从数组长度推断、函数体里 `N` 作值、`[x; N]`；类型上新增 `K_CONST`，长度是形参的数组把长度类型放在 `ret` 里；std 增加 `From<[T; N]> for Vec<T>`；`tests/run/constgen.navi`。不支持含形参的常量表达式（`[T; N + 1]`）。
+  - DWARF：debug 构建写 `__DWARF` 段（DWARF 4：编译单元、每个函数一个 subprogram、行号表——行号来自调用、带检查的算术和函数入口），lldb 可以按 `文件:行` 下断点、看源码和带行号的回溯；还没有变量和类型信息。
+  - `navic test` / `navic bench`：编译器为 `#[test]` / `#[bench]` 函数合成入口，调用 `std::rt::testing` 的运行器；测试在 `catch_unwind` 里跑，可按名字过滤；基准用 `std::bench::Bencher::iter`（约 0.5 秒自适应迭代），也支持无参的 `#[bench] fn`；`std::hint::black_box`；`tests/harness`。
+  - 构建缓存、`std::gc::{collect, stats, set_min_heap}`、`-timings` 显示 GC 统计、`NAVI_STAGE0=1`（让 navic 的 dump 与 stage0 可比，selfcheck 用）、测试标记 `// stage0: skip`。
+- 没做的：
+  - **M:N 并行调度**。需要：保留 x28 作当前 G 寄存器（寄存器提升少一个）、每个 M 一个 g0 和 pthread、原子指令 intrinsic、调度器和堆的锁、GC 的 STW 协议（把各 G 的栈界限改成毒值，让下一个函数序言进入安全点；可能阻塞的 C 调用前后要有进出协议并把寄存器存进 G）。一千行量级、出错就是内存损坏，这次没有做，保持 M:1。
+  - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
+  - 冷编译与 go build 持平（见上面的数字）。
+
 ## 下一步
 
-M9：性能（自研链接器、增量缓存、并行；生成代码的寄存器分配、内联、逃逸分析）和自举后的语言特性。按计划，从 M8 起新功能只加到 navic。
+1. 冷编译提速：std 前端结果缓存；MIR 层小函数内联；之后才是并行（依赖 M:N 和线程安全的编译器数据结构）。
+2. M:N 调度和并发 GC（设计见上）。
+3. DWARF 的变量和类型信息；amd64/ELF/COFF 上的自研链接器和 DWARF（现在只有 macOS arm64）。
