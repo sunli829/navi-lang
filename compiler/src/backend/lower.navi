@@ -422,7 +422,7 @@ impl Gen {
     fn gen_func(&mut self, grp: &mut Group, f: &mut Func, sym: String) {
         self.m.begin();
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
-            res_off: 0, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new() };
+            res_off: 0, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), saved: Vec::new() };
         fg.gen();
         self.emit_func(sym.as_str(), false);
     }
@@ -468,6 +468,10 @@ struct FnGen {
     tmp_off: i64,
     stubs: HashMap<String, Label>,
     stub_list: Vec<Stub>,
+    /// The register of each local kept in one (-1: in the frame).
+    preg: Vec<i64>,
+    /// The saved registers used, with their save slots.
+    saved: Vec<(Reg, i64)>,
 }
 
 fn is_signed(t: &Type) -> bool { t.kind == types::K_INT && types::int_signed(t.int) }
@@ -532,6 +536,16 @@ impl FnGen {
             self.loff[i] = -cur;
             i += 1;
         }
+        // Registers for the most used scalar locals.
+        self.choose_registers();
+        // Save slots are 8-byte aligned: the collector scans aligned words.
+        cur = (cur + 7) / 8 * 8;
+        let mut k = 0;
+        while k < self.saved.len() {
+            cur += 8;
+            self.saved[k].1 = -cur;
+            k += 1;
+        }
         // Buffers and the outgoing argument area.
         let mut max_res = 16i64;
         let mut max_tmp = 16i64;
@@ -571,12 +585,22 @@ impl FnGen {
         m.cmp(I2, I1);
         m.branch_if(LTU, overflow);
         self.stub_list.push(Stub::Overflow(overflow));
+        for sv in self.saved.iter() { m.store(8, sv.0, FP, sv.1); }
         if f.closure {
-            m.store(8, CTX, FP, self.loff[1]);
+            if self.preg[1] >= 0 { m.mov(self.preg[1] as Reg, CTX); } else { m.store(8, CTX, FP, self.loff[1]); }
             m.load(8, I1, CTX, -8);
             m.store(8, I1, FP, SLOT_CTX);
         } else {
             m.store(8, CTX, FP, SLOT_CTX);
+        }
+        // Promoted arguments.
+        let mut ai = self.first_arg();
+        while ai <= f.nargs {
+            if self.preg[ai] >= 0 {
+                let sz = self.size(self.ltypes[ai]);
+                m.load(sz, self.preg[ai] as Reg, FP, self.loff[ai]);
+            }
+            ai += 1;
         }
         m.store(8, RET, FP, SLOT_RET);
         m.store(8, LOC, FP, SLOT_LOC);
@@ -620,6 +644,107 @@ impl FnGen {
     // --- Places ------------------------------------------------------------------
 
     fn local_addr(&mut self, r: Reg, l: usize) { self.m.addr_of(r, FP, self.loff[l]); }
+
+    /// The register holding local l as a whole value, if promoted.
+    fn promoted(&self, pl: &Place) -> Option<Reg> {
+        if pl.proj.len() == 0 && self.preg[pl.local] >= 0 { return Some(self.preg[pl.local] as Reg); }
+        None
+    }
+
+    fn count_place(&mut self, pl: &Place, uses: &mut Vec<i64>, as_ref: bool) {
+        if pl.proj.len() == 0 {
+            if as_ref { uses[pl.local] = -1000000; } else { uses[pl.local] += 1; }
+        } else if pl.proj[0].kind == mir::P_DEREF {
+            uses[pl.local] += 1;
+        } else {
+            uses[pl.local] = -1000000;
+        }
+        for pr in pl.proj.iter() {
+            if pr.kind == mir::P_INDEX { uses[pr.index] += 1; }
+        }
+    }
+
+    fn count_op(&mut self, op: &Operand, uses: &mut Vec<i64>) {
+        if op.kind == mir::OP_COPY { self.count_place(&op.place, uses, false); }
+    }
+
+    /// Picks the scalar locals used most (whole, or as pointers to
+    /// dereference) for the saved registers.
+    fn choose_registers(&mut self) {
+        let f = self.f;
+        let n = f.locals.len();
+        let mut uses: Vec<i64> = Vec::new();
+        let mut i = 0;
+        while i < n {
+            self.preg.push(-1);
+            let t = self.ltypes[i];
+            let k = t.kind;
+            let scalar = k == types::K_INT || k == types::K_BOOL || k == types::K_CHAR || k == types::K_FLOAT
+                || (k == types::K_REF || k == types::K_PTR) && !layout::is_fat(t.el()) || k == types::K_FN && t.abi == "C";
+            uses.push(if scalar { 0 } else { -1000000 });
+            i += 1;
+        }
+        for b in f.blocks.iter() {
+            for st in b.stmts.iter() {
+                match st {
+                    Stmt::Assign { place, rv } => {
+                        self.count_place(place, &mut uses, false);
+                        match rv {
+                            Rvalue::Use(x) => self.count_op(x, &mut uses),
+                            Rvalue::Ref { place: p, .. } => self.count_place(p, &mut uses, true),
+                            Rvalue::Bin { x, y, .. } => {
+                                self.count_op(x, &mut uses);
+                                self.count_op(y, &mut uses);
+                            }
+                            Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => self.count_op(x, &mut uses),
+                            Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { self.count_op(o, &mut uses); } }
+                            Rvalue::Discr(p) | Rvalue::Len(p) => self.count_place(p, &mut uses, true),
+                        }
+                    }
+                    Stmt::SetDiscr { place, .. } => self.count_place(place, &mut uses, true),
+                    Stmt::Box { local, .. } => { uses[*local] += 1; }
+                    Stmt::PushDefer { fn_op, args } => {
+                        self.count_op(fn_op, &mut uses);
+                        for a in args.iter() { self.count_op(a, &mut uses); }
+                    }
+                    _ => {}
+                }
+            }
+            match &b.term {
+                Term::Switch { x, .. } => self.count_op(x, &mut uses),
+                Term::Call { fn_op, args, dest, .. } => {
+                    self.count_op(fn_op, &mut uses);
+                    for a in args.iter() { self.count_op(a, &mut uses); }
+                    self.count_place(dest, &mut uses, false);
+                }
+                Term::Assert { cond, len, index, .. } => {
+                    self.count_op(cond, &mut uses);
+                    self.count_op(len, &mut uses);
+                    self.count_op(index, &mut uses);
+                }
+                _ => {}
+            }
+        }
+        // The most used candidates, at least 3 uses each.
+        let mut next = 0;
+        while next < NUM_SAVED {
+            let mut best = -1i64;
+            let mut best_uses = 2i64;
+            i = 0;
+            while i < n {
+                if self.preg[i] < 0 && uses[i] > best_uses {
+                    best = i as i64;
+                    best_uses = uses[i];
+                }
+                i += 1;
+            }
+            if best < 0 { break; }
+            let r = S0 + next as Reg;
+            self.preg[best as usize] = r as i64;
+            self.saved.push((r, 0));
+            next += 1;
+        }
+    }
 
     fn field_of(&mut self, ty: &Type, variant: i64, field: usize) -> (i64, &Type) {
         let l = self.g.lay.of(ty);
@@ -673,7 +798,17 @@ impl FnGen {
         let mut off = self.loff[pl.local];
         let mut ty = self.ltypes[pl.local];
         let mut variant = -1i64;
+        let mut first = true;
         for pr in pl.proj.iter() {
+            if first && self.preg[pl.local] >= 0 {
+                // A promoted pointer: its register is the base.
+                first = false;
+                base = self.preg[pl.local] as Reg;
+                off = 0;
+                ty = self.reveal(ty.el());
+                continue;
+            }
+            first = false;
             if pr.kind == mir::P_DEREF {
                 let elem = self.reveal(ty.el());
                 if layout::is_fat(elem) { m.load(8, RM, base, off + 8); }
@@ -694,13 +829,14 @@ impl FnGen {
                 self.materialize(base, off);
                 base = RA;
                 off = 0;
-                m.load(8, I1, FP, self.loff[pr.index]);
+                if self.preg[pr.index] >= 0 { m.mov(I1, self.preg[pr.index] as Reg); } else { m.load(8, I1, FP, self.loff[pr.index]); }
                 let es = self.size(elem);
                 m.mov_imm(I2, es);
                 m.mul_add(RA, I1, I2, RA);
                 ty = elem;
             }
         }
+        if pl.proj.len() == 0 && self.preg[pl.local] >= 0 { panic(`lower: address of promoted local _${pl.local} in ${self.f.name}`); }
         (base, off, ty)
     }
 
@@ -743,6 +879,10 @@ impl FnGen {
     fn load_scalar(&mut self, op: &Operand, r: Reg) -> Option<&Type> {
         let m = self.m;
         if op.kind == mir::OP_COPY {
+            if let Some(pr) = self.promoted(&op.place) {
+                m.mov(r, pr);
+                return Some(self.ltypes[op.place.local]);
+            }
             let (b, o, ty) = self.place_addr(&op.place);
             let mut size = self.size(ty);
             if size > 8 { size = 8; }
@@ -850,6 +990,10 @@ impl FnGen {
         if op.kind == mir::OP_CONST && op.cnst.unwrap().kind == mir::C_FN && ty.kind == types::K_FN && ty.abi == "C" { size = 8; }
         if size == 0 { return; }
         if op.kind == mir::OP_COPY {
+            if let Some(pr) = self.promoted(&op.place) {
+                m.store(size, pr, dst, off);
+                return;
+            }
             let (b, o, _) = self.place_addr(&op.place);
             self.copy_mem(dst, off, b, o, size);
             return;
@@ -907,6 +1051,10 @@ impl FnGen {
     /// Stores V1 (and V2) into the place; sizes 1, 2, 4, 8, 16.
     fn store_regs(&mut self, pl: &Place, size: i64) {
         let m = self.m;
+        if let Some(pr) = self.promoted(pl) {
+            if size > 0 { m.zero_ext(pr, V1, size); }
+            return;
+        }
         let (b, o, _) = self.place_addr(pl);
         if size == 0 {
         } else if size == 1 || size == 2 || size == 4 || size == 8 {
@@ -934,9 +1082,13 @@ impl FnGen {
                 let size = self.g.lay.of(ct).size;
                 let ns = self.noscan(ct);
                 self.call_alloc(size, ns);
-                m.load(8, V1, FP, self.res_off);
-                self.local_addr(RA, *local);
-                m.store(8, V1, RA, 0);
+                if self.preg[*local] >= 0 {
+                    m.load(8, self.preg[*local] as Reg, FP, self.res_off);
+                } else {
+                    m.load(8, V1, FP, self.res_off);
+                    self.local_addr(RA, *local);
+                    m.store(8, V1, RA, 0);
+                }
             }
             Stmt::PushDefer { fn_op, args } => self.push_defer(fn_op, args),
             _ => {}
@@ -1470,9 +1622,14 @@ impl FnGen {
                 let size = self.size(self.ltypes[0]);
                 if size > 0 {
                     m.load(8, BASE, FP, SLOT_RET);
-                    self.local_addr(RA, 0);
-                    self.copy_mem(BASE, 0, RA, 0, size);
+                    if self.preg[0] >= 0 {
+                        m.store(size, self.preg[0] as Reg, BASE, 0);
+                    } else {
+                        self.local_addr(RA, 0);
+                        self.copy_mem(BASE, 0, RA, 0, size);
+                    }
                 }
+                for sv in self.saved.iter() { m.load(8, sv.0, FP, sv.1); }
                 m.ret();
             }
             Term::Unreachable => m.trap(),
@@ -1601,8 +1758,12 @@ impl FnGen {
         }
         let size = self.size(dt);
         if size > 0 {
-            let (b, o, _) = self.place_addr(dest);
-            self.copy_mem(b, o, FP, self.res_off, size);
+            if let Some(pr) = self.promoted(dest) {
+                m.load(size, pr, FP, self.res_off);
+            } else {
+                let (b, o, _) = self.place_addr(dest);
+                self.copy_mem(b, o, FP, self.res_off, size);
+            }
         }
         m.jump(self.blocks[target as usize]);
     }
@@ -1697,6 +1858,15 @@ impl FnGen {
             m.call_c("_navi_swapctx", 0, &ca, false, false);
         } else if name == "gstart_address" {
             m.adr_sym(V1, "_navi_gstart");
+        } else if name == "stack_pointer" {
+            m.mov(V1, SP);
+        } else if name == "spill_registers" {
+            self.load_scalar(&args[0], V1);
+            let mut k = 0;
+            while k < NUM_SAVED {
+                m.store(8, S0 + k as Reg, V1, (8 * k) as i64);
+                k += 1;
+            }
         } else if name == "set_stack_limit" {
             self.load_scalar(&args[0], V1);
             m.adr_sym(I1, "_navi_stack_lo");

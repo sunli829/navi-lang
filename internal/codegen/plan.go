@@ -49,7 +49,7 @@ var Inline = map[string]bool{
 	"slice_from_raw_mut": true, "str_from_raw": true, "slice_len": true, "slice_ptr": true,
 	"str_as_bytes": true, "caller_location": true, "abort": true, "has_pointers": true,
 	"frame_address": true, "stack_top": true, "data_start": true, "data_end": true, "run_defers": true,
-	"swap_context": true, "gstart_address": true, "set_stack_limit": true,
+	"swap_context": true, "gstart_address": true, "set_stack_limit": true, "spill_registers": true, "stack_pointer": true,
 	"wrapping_add": true, "wrapping_sub": true, "wrapping_mul": true,
 }
 

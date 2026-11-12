@@ -1706,6 +1706,10 @@ func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
 		m.CallC("_navi_swapctx", 0, []CArg{{}, {}}, false, false)
 	case "gstart_address":
 		m.AdrSym(V1, "_navi_gstart")
+	case "stack_pointer":
+		m.Mov(V1, SP)
+	case "spill_registers":
+		// Stage0 code keeps no values in callee-saved registers.
 	case "set_stack_limit":
 		f.loadScalar(t.Args[0], V1)
 		m.AdrSym(I1, "_navi_stack_lo")
