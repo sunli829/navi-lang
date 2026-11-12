@@ -1,0 +1,1175 @@
+//! Expression type checking.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Node};
+use crate::syntax::ast::{self, Expr, ExprKind, LitKind, Stmt, StructKind, TemplatePart, MatchArm, SelectArm, FieldInit};
+use crate::syntax::source::Pos;
+use crate::syntax::token::{self, kind_name};
+use crate::types::*;
+use crate::types::lower::*;
+use crate::types::collect::*;
+use crate::types::infer::*;
+use crate::types::builtin::*;
+use crate::types::body::*;
+use crate::types::solve::*;
+
+fn op_symbol(name: &str) -> &str {
+    if name == "Add" { return "+"; }
+    if name == "Sub" { return "-"; }
+    if name == "Mul" { return "*"; }
+    if name == "Div" { return "/"; }
+    if name == "Rem" { return "%"; }
+    if name == "BitAnd" { return "&"; }
+    if name == "BitOr" { return "|"; }
+    if name == "BitXor" { return "^"; }
+    if name == "Shl" { return "<<"; }
+    if name == "Shr" { return ">>"; }
+    if name == "Neg" { return "-"; }
+    if name == "Not" { return "!"; }
+    if name == "PartialEq" { return "=="; }
+    if name == "PartialOrd" { return "<"; }
+    ""
+}
+
+/// The operator trait of a binary operator token ("" if none).
+fn bin_trait(op: token::Kind) -> &str {
+    if op == token::PLUS { return "Add"; }
+    if op == token::MINUS { return "Sub"; }
+    if op == token::STAR { return "Mul"; }
+    if op == token::SLASH { return "Div"; }
+    if op == token::PERCENT { return "Rem"; }
+    if op == token::AND { return "BitAnd"; }
+    if op == token::OR { return "BitOr"; }
+    if op == token::CARET { return "BitXor"; }
+    if op == token::SHL { return "Shl"; }
+    if op == token::SHR { return "Shr"; }
+    ""
+}
+
+/// The binary operator of a compound assignment token.
+fn assign_base(op: token::Kind) -> token::Kind {
+    if op == token::PLUS_EQ { return token::PLUS; }
+    if op == token::MINUS_EQ { return token::MINUS; }
+    if op == token::STAR_EQ { return token::STAR; }
+    if op == token::SLASH_EQ { return token::SLASH; }
+    if op == token::PERCENT_EQ { return token::PERCENT; }
+    if op == token::AND_EQ { return token::AND; }
+    if op == token::OR_EQ { return token::OR; }
+    if op == token::CARET_EQ { return token::CARET; }
+    if op == token::SHL_EQ { return token::SHL; }
+    if op == token::SHR_EQ { return token::SHR; }
+    token::EOF
+}
+
+fn spec_trait(c: u8) -> &str {
+    if c == b'?' { return "Debug"; }
+    if c == b'x' { return "LowerHex"; }
+    if c == b'X' { return "UpperHex"; }
+    if c == b'o' { return "Octal"; }
+    if c == b'b' { return "Binary"; }
+    if c == b'e' { return "LowerExp"; }
+    if c == b'E' { return "UpperExp"; }
+    ""
+}
+
+fn has_hex_letter(s: &str) -> bool {
+    for b in s.bytes() {
+        if b >= b'a' && b <= b'f' { return true; }
+    }
+    false
+}
+
+impl FnCtx {
+    /// Type-checks x expecting want (with coercion).
+    pub fn check(&mut self, x: &Expr, want: &Type) -> &Type {
+        let got = self.infer(x, Some(want));
+        self.coerce_to(x, got, want, x.pos());
+        got
+    }
+
+    /// Computes the type of x; hint guides literals, closures and templates
+    /// but is not enforced.
+    pub fn infer(&mut self, x: &Expr, hint: Option<&Type>) -> &Type {
+        let t = self.infer_inner(x, hint);
+        self.record(x, t)
+    }
+
+    /// A std ADT type by lang name.
+    pub fn lang_adt(&mut self, name: &str, args: Vec<&Type>) -> &Type {
+        match self.lang(name) {
+            None => self.ctx().err,
+            Some(d) => self.ctx().adt(d, args),
+        }
+    }
+
+    fn infer_inner(&mut self, x: &Expr, hint: Option<&Type>) -> &Type {
+        let h = self.inf.shallow_opt(hint);
+        match &x.kind {
+            ExprKind::Lit { kind, value, .. } => self.literal(kind.clone(), value.as_str(), h),
+            ExprKind::Template { parts, .. } => self.template(x, parts, hint),
+            ExprKind::Path(p) => self.value_path(x, *p),
+            ExprKind::Paren { x: inner, .. } => self.infer(*inner, hint),
+            ExprKind::Unary { op_pos, op, x: inner } => self.unary(x, *op, *op_pos, *inner, hint),
+            ExprKind::Ref { amp, is_mut, x: inner } => {
+                let elem_hint = match h { Some(t) => if t.kind == K_REF { Some(t.el()) } else { None }, None => None };
+                let t = self.infer(*inner, elem_hint);
+                if *is_mut { self.check_mut_place(*inner, 0, "borrow as mutable", *amp); }
+                self.ctx().reference(*is_mut, t)
+            }
+            ExprKind::Binary { op, op_pos, x: l, y } => self.binary(*op, *op_pos, *l, *y, hint),
+            ExprKind::Assign { op, op_pos, x: l, y } => self.assign(*op, *op_pos, *l, *y),
+            ExprKind::Cast { x: inner, ty } => {
+                let from = self.infer(*inner, None);
+                let to = self.lower(*ty);
+                self.check_cast(*ty, from, to);
+                to
+            }
+            ExprKind::Range { lo, hi, inclusive, .. } => self.range_expr(*lo, *hi, *inclusive, h),
+            ExprKind::Call { fun, lparen, args } => self.call(*fun, *lparen, args, hint),
+            ExprKind::MethodCall { recv, name, type_args, args } => self.method_call(x, *recv, *name, *type_args, args),
+            ExprKind::Field { x: base, name } => self.field(x, *base, *name),
+            ExprKind::Index { x: base, lbrack, index } => self.index(*base, *lbrack, *index),
+            ExprKind::Try { x: inner, question } => self.try_expr(*inner, *question),
+            ExprKind::StructLit { path, fields, base } => self.struct_lit(*path, fields, *base, hint),
+            ExprKind::Tuple { elems, .. } => {
+                let mut hints: Option<Vec<&Type>> = None;
+                if let Some(ht) = h {
+                    if ht.kind == K_TUPLE && ht.elems.len() == elems.len() { hints = Some(ht.elems.clone()); }
+                }
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < elems.len() {
+                    match hints {
+                        Some(hs) => {
+                            self.check(elems[i], hs[i]);
+                            out.push(hs[i]);
+                        }
+                        None => out.push(self.infer(elems[i], None)),
+                    }
+                    i += 1;
+                }
+                self.ctx().tuple(out)
+            }
+            ExprKind::Array { elems, .. } => {
+                let mut elem: Option<&Type> = None;
+                if let Some(ht) = h {
+                    if ht.kind == K_ARRAY || ht.kind == K_SLICE { elem = Some(ht.el()); }
+                }
+                let el = match elem { Some(e) => e, None => self.inf.fresh() };
+                for e in elems.iter() { self.check(*e, el); }
+                self.ctx().array(el, elems.len() as i64)
+            }
+            ExprKind::ArrayRepeat { value, count, .. } => {
+                let mut elem: Option<&Type> = None;
+                if let Some(ht) = h {
+                    if ht.kind == K_ARRAY { elem = Some(ht.el()); }
+                }
+                let el = match elem { Some(e) => e, None => self.inf.fresh() };
+                self.check(*value, el);
+                let (n, ok) = self.c.eval_const(self.file, *count);
+                if !ok { return self.ctx().err; }
+                let us = self.ctx().usize_();
+                self.check(*count, us);
+                self.ctx().array(el, n)
+            }
+            ExprKind::Block(b) => {
+                if b.is_unsafe {
+                    self.unsafe_depth += 1;
+                    let t = self.check_block(x, hint);
+                    self.unsafe_depth -= 1;
+                    return t;
+                }
+                self.check_block(x, hint)
+            }
+            ExprKind::If { cond, then, els, .. } => self.if_expr(*cond, *then, *els, hint),
+            ExprKind::Let { pos, .. } => {
+                self.errorf(*pos, "let is only allowed as the condition of if and while".to_string());
+                self.ctx().err
+            }
+            ExprKind::Match { pos, x: scrut, arms } => self.match_expr(*pos, *scrut, arms, hint),
+            ExprKind::Loop { body, .. } => {
+                let bt = self.inf.fresh();
+                let lc = &mut LoopCtx { node: x.id, is_loop: true, break_ty: Some(bt), has_break: false };
+                self.loops.push(lc);
+                let unit = self.ctx().unit;
+                self.check_block(*body, Some(unit));
+                self.loops.pop();
+                if !lc.has_break { return self.ctx().never; }
+                bt
+            }
+            ExprKind::While { cond, body, .. } => {
+                self.cond(*cond);
+                self.loops.push(&mut LoopCtx { node: x.id, is_loop: false, break_ty: None, has_break: false });
+                let unit = self.ctx().unit;
+                self.check_block(*body, Some(unit));
+                self.loops.pop();
+                unit
+            }
+            ExprKind::For { pat, iter, body, .. } => {
+                self.for_expr(x, *pat, *iter, *body);
+                self.ctx().unit
+            }
+            ExprKind::Break { pos, label, value } => {
+                let lc = match self.loop_for(x, *label) {
+                    None => {
+                        if let Some(v) = value { self.infer(*v, None); }
+                        return self.ctx().never;
+                    }
+                    Some(l) => l,
+                };
+                lc.has_break = true;
+                if let Some(v) = value {
+                    if !lc.is_loop {
+                        self.errorf(*pos, "break with a value is only allowed in loop".to_string());
+                        self.infer(*v, None);
+                    } else {
+                        self.check(*v, lc.break_ty.unwrap());
+                    }
+                } else if lc.is_loop {
+                    let unit = self.ctx().unit;
+                    self.inf.unify(lc.break_ty.unwrap(), unit);
+                }
+                self.ctx().never
+            }
+            ExprKind::Continue { .. } => self.ctx().never,
+            ExprKind::Return { pos, value } => {
+                match value {
+                    Some(v) => { self.check(*v, self.ret_ty()); }
+                    None => {
+                        let unit = self.ctx().unit;
+                        if !self.inf.try_unify(self.ret_ty(), unit) {
+                            let r = self.inf.resolve(self.ret_ty());
+                            self.errorf(*pos, `return without a value in a function returning ${r}`);
+                        }
+                    }
+                }
+                self.ctx().never
+            }
+            ExprKind::Closure { params, result, body, .. } => self.closure(params, *result, *body, h),
+            ExprKind::Select { pos, arms } => self.select_expr(*pos, arms, hint),
+            ExprKind::Bad(_) => self.ctx().err,
+        }
+    }
+
+    fn loop_for(&mut self, x: &Expr, label: Option<&ast::Name>) -> Option<&mut LoopCtx> {
+        if label.is_some() {
+            let node = match self.info.res.labels.get(&x.id) { Some(n) => n.id(), None => 0 };
+            let mut i = self.loops.len() as i32 - 1;
+            while i >= 0 {
+                if self.loops[i as usize].node == node { return Some(self.loops[i as usize]); }
+                i -= 1;
+            }
+            return None;
+        }
+        if self.loops.len() == 0 { return None; }
+        Some(self.loops[self.loops.len() - 1])
+    }
+
+    // --- Literals and templates ---------------------------------------------------
+
+    fn literal(&mut self, kind: LitKind, value: &str, h: Option<&Type>) -> &Type {
+        match kind {
+            LitKind::Int => {
+                let mut k = 0u8;
+                while k < 10 {
+                    let n = int_name(k);
+                    if value.ends_with(n) && !(value.starts_with("0x") && has_hex_letter(n)) { return self.ctx().int(k); }
+                    k += 1;
+                }
+                if value.ends_with("f32") && !value.starts_with("0x") { return self.ctx().f32; }
+                if value.ends_with("f64") && !value.starts_with("0x") { return self.ctx().f64; }
+                if let Some(t) = h {
+                    if t.kind == K_INT { return t; }
+                }
+                self.inf.new_var(VAR_INT)
+            }
+            LitKind::Float => {
+                if value.ends_with("f32") { return self.ctx().f32; }
+                if value.ends_with("f64") { return self.ctx().f64; }
+                if let Some(t) = h {
+                    if t.kind == K_FLOAT { return t; }
+                }
+                self.inf.new_var(VAR_FLOAT)
+            }
+            LitKind::Char => self.ctx().char_,
+            LitKind::Byte => self.ctx().int(U8),
+            LitKind::Str => { let s = self.ctx().str_; self.ctx().reference(false, s) }
+            LitKind::ByteStr => {
+                let u = self.ctx().int(U8);
+                let s = self.ctx().slice(u);
+                self.ctx().reference(false, s)
+            }
+            LitKind::Bool => self.ctx().bool_,
+        }
+    }
+
+    fn template(&mut self, x: &Expr, parts: &Vec<&TemplatePart>, hint: Option<&Type>) -> &Type {
+        for p in parts.iter() {
+            let px = match p.x { Some(e) => e, None => continue };
+            let t = self.infer(px, None);
+            let mut tname = "Display";
+            let n = p.spec.len();
+            if n > 0 {
+                let st = spec_trait(p.spec.as_bytes()[n - 1]);
+                if st.len() > 0 { tname = st; }
+            }
+            if let Some(d) = self.lang(tname) {
+                self.require(&TraitRef { tdef: Some(d), self_ty: Some(t), args: Vec::new(), bindings: Vec::new() }, px.pos());
+            }
+        }
+        // A template is a lazy fmt::Arguments where the context wants
+        // Arguments or something bounded by Display; otherwise a String.
+        let t = if self.wants_arguments(hint) { self.lang_adt("Arguments", Vec::new()) } else { self.lang_adt("String", Vec::new()) };
+        self.body.templates.insert(x.id, t);
+        t
+    }
+
+    fn wants_arguments(&mut self, hint: Option<&Type>) -> bool {
+        let h = match self.inf.shallow_opt(hint) { Some(h) => h, None => return false };
+        if h.kind == K_ADT {
+            if let Some(a) = self.lang("Arguments") {
+                if h.d().id == a.id { return true; }
+            }
+        }
+        if h.kind != K_INFER { return false; }
+        let origin = match self.var_origin.get(&h.var) { Some(o) => *o, None => return false };
+        let display = self.lang("Display");
+        if let Some(g) = self.c.param_owner.get(&origin.def.id) {
+            for p in g.preds.iter() {
+                let is_display = match display { Some(d) => p.trait_ref.trait_def().id == d.id, None => false };
+                if is_display && same_opt(p.trait_ref.self_ty, Some(origin.ty)) { return true; }
+            }
+        }
+        false
+    }
+
+    // --- Operators ----------------------------------------------------------------
+
+    fn unary(&mut self, x: &Expr, op: token::Kind, op_pos: Pos, inner: &Expr, hint: Option<&Type>) -> &Type {
+        if op == token::STAR {
+            let it = self.infer(inner, None);
+            let t = self.inf.shallow(it);
+            if t.kind == K_REF { return t.el(); }
+            if t.kind == K_PTR {
+                self.require_unsafe(op_pos, "dereference of raw pointer".to_string());
+                return t.el();
+            }
+            if t.kind == K_ERROR { return self.ctx().err; }
+            if let Some(target) = self.overloaded_deref(t) {
+                self.adjust_of(x).derefs = 1;
+                return target;
+            }
+            let s = self.show(t);
+            self.errorf(op_pos, `type ${s} cannot be dereferenced`);
+            return self.ctx().err;
+        }
+        if op == token::MINUS || op == token::NOT {
+            let it = self.infer(inner, hint);
+            let t = self.inf.shallow(it);
+            if let Some(k) = self.inf.var_kind_of(t) {
+                if k != VAR_GENERAL {
+                    if op == token::NOT && k == VAR_FLOAT { self.errorf(op_pos, "cannot apply ! to a float".to_string()); }
+                    return t;
+                }
+            }
+            if op == token::MINUS && (is_float_t(t) || is_int_t(t) && int_signed(t.int)) { return t; }
+            if op == token::MINUS && is_int_t(t) {
+                self.errorf(op_pos, `cannot negate unsigned integer type ${t}`);
+                return t;
+            }
+            if op == token::NOT && (is_int_t(t) || t.kind == K_BOOL) { return t; }
+            let name = if op == token::NOT { "Not" } else { "Neg" };
+            return self.op_trait(name, t, None, op_pos);
+        }
+        self.ctx().err
+    }
+
+    /// Types an overloaded operator: <Self as Trait<Rhs>>::Output.
+    fn op_trait(&mut self, name: &str, self_ty: &Type, rhs: Option<&Type>, pos: Pos) -> &Type {
+        let d = match self.lang(name) { Some(d) => d, None => return self.ctx().err };
+        let mut args = Vec::new();
+        if let Some(r) = rhs { args.push(r); }
+        let tr = &TraitRef { tdef: Some(d), self_ty: Some(self_ty), args, bindings: Vec::new() };
+        let r = self.inf.resolve(self_ty);
+        if r.kind != K_ERROR && !has_infer(r) && self.holds(tr) == SEL_NO {
+            let op = op_symbol(name);
+            let rs = self.show(r);
+            match rhs {
+                Some(rh) => {
+                    let hs = self.show(rh);
+                    self.errorf(pos, `cannot apply ${op} to ${rs} and ${hs}`);
+                }
+                None => self.errorf(pos, `cannot apply ${op} to ${rs}`),
+            }
+            return self.ctx().err;
+        }
+        self.require(tr, pos);
+        let out = match self.c.find_own_assoc_type(d, "Output") { Some(o) => o, None => return self.ctx().bool_ };
+        let p = self.ctx().proj(out, tr);
+        self.normalize(p)
+    }
+
+    fn binary(&mut self, op: token::Kind, op_pos: Pos, xl: &Expr, xr: &Expr, hint: Option<&Type>) -> &Type {
+        if op == token::AND_AND || op == token::OR_OR {
+            let b = self.ctx().bool_;
+            self.check(xl, b);
+            self.check(xr, b);
+            return b;
+        }
+        if op == token::EQ_EQ || op == token::NE || op == token::LT || op == token::GT || op == token::LE || op == token::GE {
+            let l = self.infer(xl, None);
+            let r = self.infer(xr, Some(l));
+            let ls = self.inf.shallow(l);
+            let rs = self.inf.shallow(r);
+            if self.scalar_like(ls) && self.scalar_like(rs) && self.inf.try_unify(ls, rs) {
+                let ls2 = self.inf.shallow(l);
+                if ls2.kind != K_INFER || self.inf.vars[ls2.var as usize].kind != VAR_GENERAL { return self.ctx().bool_; }
+            }
+            let name = if op != token::EQ_EQ && op != token::NE { "PartialOrd" } else { "PartialEq" };
+            self.op_trait(name, l, Some(r), op_pos);
+            return self.ctx().bool_;
+        }
+        let l = self.infer(xl, hint);
+        let ls = self.inf.shallow(l);
+        if op == token::SHL || op == token::SHR {
+            let ri = self.infer(xr, None);
+            let r = self.inf.shallow(ri);
+            if self.int_like(ls) && self.int_like(r) { return l; }
+            return self.op_trait(bin_trait(op), l, Some(r), op_pos);
+        }
+        let r = self.infer(xr, Some(l));
+        let rs = self.inf.shallow(r);
+        let mut numeric = self.num_like(ls) && self.num_like(rs);
+        if op == token::AND || op == token::OR || op == token::CARET {
+            numeric = (self.int_like(ls) || ls.kind == K_BOOL) && (self.int_like(rs) || rs.kind == K_BOOL);
+        }
+        if numeric && self.inf.try_unify(ls, rs) { return l; }
+        if let Some(k) = self.inf.var_kind_of(ls) {
+            if k != VAR_GENERAL {
+                let rr = self.inf.resolve(rs);
+                if !has_infer(rr) && rr.kind != K_ERROR {
+                    let sym = if op == token::AND || op == token::OR || op == token::CARET || op == token::PLUS || op == token::MINUS
+                        || op == token::STAR || op == token::SLASH || op == token::PERCENT { kind_name(op) } else { "" };
+                    let a = self.show(ls);
+                    let b = self.show(rr);
+                    self.errorf(op_pos, `cannot apply ${sym} to ${a} and ${b}`);
+                    return self.ctx().err;
+                }
+            }
+        }
+        self.op_trait(bin_trait(op), l, Some(r), op_pos)
+    }
+
+    pub fn int_like(&self, t0: &Type) -> bool {
+        let t = self.inf.shallow(t0);
+        is_int_t(t) || self.inf.var_kind_of(t) == Some(VAR_INT)
+    }
+
+    pub fn num_like(&self, t0: &Type) -> bool {
+        let t = self.inf.shallow(t0);
+        if is_num_t(t) { return true; }
+        match self.inf.var_kind_of(t) { Some(k) => k != VAR_GENERAL, None => false }
+    }
+
+    pub fn scalar_like(&self, t0: &Type) -> bool {
+        let t = self.inf.shallow(t0);
+        self.num_like(t) || t.kind == K_BOOL || t.kind == K_CHAR
+    }
+
+    fn assign(&mut self, op: token::Kind, op_pos: Pos, xl: &Expr, xr: &Expr) -> &Type {
+        let l = self.infer(xl, None);
+        self.check_assignable(xl, op_pos);
+        let unit = self.ctx().unit;
+        if op == token::EQ {
+            self.check(xr, l);
+            return unit;
+        }
+        let ls = self.inf.shallow(l);
+        let r = self.infer(xr, Some(l));
+        let rs = self.inf.shallow(r);
+        let base = assign_base(op);
+        if base == token::SHL || base == token::SHR {
+            if self.int_like(ls) && self.int_like(rs) { return unit; }
+        } else if base == token::AND || base == token::OR || base == token::CARET {
+            if (self.int_like(ls) || ls.kind == K_BOOL) && self.inf.try_unify(ls, rs) { return unit; }
+        } else {
+            if self.num_like(ls) && self.num_like(rs) && self.inf.try_unify(ls, rs) { return unit; }
+        }
+        let name = `${bin_trait(base)}Assign`;
+        if let Some(d) = self.lang(name.as_str()) {
+            let mut args = Vec::new();
+            args.push(r);
+            let tr = &TraitRef { tdef: Some(d), self_ty: Some(l), args, bindings: Vec::new() };
+            let res = self.inf.resolve(l);
+            if !has_infer(res) && res.kind != K_ERROR && self.holds(tr) == SEL_NO {
+                let rr = self.inf.resolve(r);
+                self.errorf(op_pos, `cannot apply ${kind_name(op)} to ${res} and ${rr}`);
+                return unit;
+            }
+            self.require(tr, op_pos);
+        }
+        unit
+    }
+
+    fn check_cast(&mut self, ty: &ast::Type, from: &Type, to: &Type) {
+        let f = self.inf.shallow(from);
+        let t = self.inf.shallow(to);
+        if f.kind == K_ERROR || t.kind == K_ERROR { return; }
+        if let Some(k) = self.inf.var_kind_of(f) {
+            if k != VAR_GENERAL {
+                if is_num_t(t) || k == VAR_INT && (t.kind == K_CHAR || t.kind == K_PTR) { return; }
+            }
+        }
+        let ok = if is_num_t(f) && is_num_t(t) {
+            true
+        } else if f.kind == K_BOOL && is_int_t(t) || f.kind == K_CHAR && is_int_t(t) {
+            true
+        } else if is_int_t(f) && f.int == U8 && t.kind == K_CHAR {
+            true
+        } else if f.kind == K_REF && t.kind == K_PTR {
+            self.inf.try_unify(f.el(), t.el()) && (f.is_mut || !t.is_mut)
+        } else if f.kind == K_PTR && t.kind == K_PTR || f.kind == K_PTR && is_int_t(t) || is_int_t(f) && t.kind == K_PTR {
+            true
+        } else if f.kind == K_ADT && is_int_t(t) {
+            let ai = self.c.adt(f.d());
+            if ai.is_enum {
+                let mut all_unit = true;
+                for v in ai.variants.iter() {
+                    if v.kind != StructKind::Unit { all_unit = false; }
+                }
+                all_unit
+            } else {
+                false
+            }
+        } else if f.kind == K_FN && (t.kind == K_PTR || is_int_t(t)) && f.abi == "C" {
+            true
+        } else {
+            self.inf.try_unify(f, t)
+        };
+        if !ok {
+            let a = self.inf.resolve(f);
+            let b = self.inf.resolve(t);
+            self.errorf(ty.pos(), `invalid cast from ${a} to ${b}`);
+        }
+    }
+
+    fn range_expr(&mut self, lo: Option<&Expr>, hi: Option<&Expr>, inclusive: bool, h: Option<&Type>) -> &Type {
+        let mut elem: Option<&Type> = None;
+        if let Some(ht) = h {
+            if ht.kind == K_ADT && ht.args.len() == 1 { elem = Some(ht.args[0]); }
+        }
+        let el = match elem { Some(e) => e, None => self.inf.fresh() };
+        if let Some(x) = lo { self.check(x, el); }
+        if let Some(x) = hi { self.check(x, el); }
+        let mut args = Vec::new();
+        args.push(el);
+        if lo.is_none() && hi.is_none() { return self.lang_adt("RangeFull", Vec::new()); }
+        if lo.is_none() && inclusive { return self.lang_adt("RangeToInclusive", args); }
+        if lo.is_none() { return self.lang_adt("RangeTo", args); }
+        if hi.is_none() { return self.lang_adt("RangeFrom", args); }
+        if inclusive { return self.lang_adt("RangeInclusive", args); }
+        self.lang_adt("Range", args)
+    }
+
+    // --- Calls, fields, indexing ----------------------------------------------------
+
+    fn call(&mut self, fun: &Expr, lparen: Pos, args: &Vec<&Expr>, hint: Option<&Type>) -> &Type {
+        let f0 = self.infer(fun, None);
+        let mut ft = self.inf.shallow(f0);
+        if ft.kind == K_INFER {
+            self.solve_pending(false);
+            ft = self.inf.shallow(ft);
+        }
+        if ft.kind == K_ERROR {
+            for a in args.iter() { self.infer(*a, None); }
+            return self.ctx().err;
+        }
+        if ft.kind != K_FN {
+            let r = self.inf.resolve(ft);
+            self.errorf(lparen, `expected function, found ${r}`);
+            for a in args.iter() { self.infer(*a, None); }
+            return self.ctx().err;
+        }
+        let ret = ft.ret.unwrap();
+        if let Some(ht) = hint {
+            if self.inf.shallow(ret).kind != K_NEVER {
+                // Let the expected result guide inference of generic parameters.
+                self.inf.try_unify(ret, ht);
+            }
+        }
+        if args.len() != ft.elems.len() {
+            self.errorf(lparen, `this function takes ${ft.elems.len()} argument${plural(ft.elems.len())} but ${args.len()} were supplied`);
+        }
+        let mut i = 0;
+        while i < args.len() {
+            if i < ft.elems.len() {
+                self.check(args[i], ft.elems[i]);
+            } else {
+                self.infer(args[i], None);
+            }
+            i += 1;
+        }
+        ret
+    }
+
+    fn field(&mut self, x: &Expr, base_x: &Expr, name: &ast::Name) -> &Type {
+        let base = self.infer(base_x, None);
+        if self.inf.shallow(base).kind == K_INFER { self.solve_pending(false); }
+        let steps = self.autoderef(base, false);
+        let mut via_shared = false;
+        let mut i = 0;
+        while i < steps.len() {
+            let s = self.inf.shallow(steps[i]);
+            if i > 0 {
+                let prev = self.inf.shallow(steps[i - 1]);
+                if prev.kind == K_REF && !prev.is_mut { via_shared = true; }
+            }
+            let mut ft: Option<&Type> = None;
+            let mut idx = -1i32;
+            if s.kind == K_ADT {
+                let ai = self.c.adt(s.d());
+                if ai.is_enum {
+                    i += 1;
+                    continue;
+                }
+                let m = param_map(Some(ai.generics), &s.args);
+                let mut j = 0;
+                while j < ai.fields.len() {
+                    let f = ai.fields[j];
+                    if f.name == name.value {
+                        let accessible = match self.module { Some(md) => f.vis.accessible_from(md), None => true };
+                        if !accessible { self.errorf(name.pos, `field ${f.name} of ${s.d().name} is private`); }
+                        let st = subst(self.ctx(), f.ty, &m, None);
+                        ft = Some(self.normalize(st));
+                        idx = j as i32;
+                    }
+                    j += 1;
+                }
+            } else if s.kind == K_TUPLE {
+                let mut j = 0;
+                while j < s.elems.len() {
+                    if itoa(j) == name.value {
+                        ft = Some(s.elems[j]);
+                        idx = j as i32;
+                    }
+                    j += 1;
+                }
+            }
+            let mut t = match ft {
+                None => {
+                    i += 1;
+                    continue;
+                }
+                Some(t) => t,
+            };
+            self.body.fields.insert(x.id, idx);
+            if i > 0 { self.adjust_of(base_x).derefs = i as i32; }
+            // &T is read-only transitively: a &mut U field read through a
+            // shared reference becomes &U.
+            let r = self.inf.shallow(t);
+            if via_shared && r.kind == K_REF && r.is_mut { t = self.ctx().reference(false, r.el()); }
+            return t;
+        }
+        let r = self.inf.resolve(base);
+        if r.kind != K_ERROR {
+            if has_infer(r) {
+                self.errorf(name.pos, `type annotations needed: the type of the value must be known to access field ${name.value}`);
+            } else {
+                self.errorf(name.pos, `no field ${name.value} on type ${r}`);
+            }
+        }
+        self.ctx().err
+    }
+
+    fn index(&mut self, base_x: &Expr, lbrack: Pos, index_x: &Expr) -> &Type {
+        let base = self.infer(base_x, None);
+        let idx = self.infer(index_x, None);
+        let idx_trait = match self.lang("Index") { Some(d) => d, None => return self.ctx().err };
+        let steps = self.autoderef(base, false);
+        let mut i = 0;
+        while i < steps.len() {
+            let s = self.inf.shallow(steps[i]);
+            if s.kind == K_INFER { break; }
+            let mut args = Vec::new();
+            args.push(idx);
+            let tr = &TraitRef { tdef: Some(idx_trait), self_ty: Some(s), args, bindings: Vec::new() };
+            if self.holds(tr) == SEL_NO {
+                i += 1;
+                continue;
+            }
+            if i > 0 { self.adjust_of(base_x).derefs = i as i32; }
+            self.require(tr, lbrack);
+            let out = self.c.find_own_assoc_type(idx_trait, "Output").unwrap();
+            let p = self.ctx().proj(out, tr);
+            return self.normalize(p);
+        }
+        let r = self.inf.resolve(base);
+        if r.kind != K_ERROR {
+            let ri = self.inf.resolve(idx);
+            self.errorf(lbrack, `cannot index into a value of type ${r} with ${ri}`);
+        }
+        self.ctx().err
+    }
+
+    fn try_expr(&mut self, inner: &Expr, question: Pos) -> &Type {
+        let it = self.infer(inner, None);
+        let t = self.inf.shallow(it);
+        let mut ret = self.inf.shallow(self.ret_ty());
+        let opt_def = self.lang("Option");
+        let res_def = self.lang("Result");
+        if t.kind == K_ERROR { return self.ctx().err; }
+        let is_opt = t.kind == K_ADT && match opt_def { Some(d) => t.d().id == d.id, None => false };
+        let is_res = t.kind == K_ADT && match res_def { Some(d) => t.d().id == d.id, None => false };
+        if !is_opt && !is_res {
+            let r = self.inf.resolve(t);
+            self.errorf(question, `the ? operator can only be applied to Result or Option, not ${r}`);
+            return self.ctx().err;
+        }
+        if is_opt {
+            let od = opt_def.unwrap();
+            let ret_opt = ret.kind == K_ADT && ret.d().id == od.id;
+            if !ret_opt {
+                let mut args = Vec::new();
+                args.push(self.inf.fresh());
+                let ot = self.ctx().adt(od, args);
+                if !self.inf.try_unify(ret, ot) {
+                    self.errorf(question, "the ? operator on an Option can only be used in a function that returns Option".to_string());
+                }
+            }
+            return t.args[0];
+        }
+        let rd = res_def.unwrap();
+        if ret.kind == K_INFER {
+            let mut args = Vec::new();
+            args.push(self.inf.fresh());
+            args.push(self.inf.fresh());
+            let rt = self.ctx().adt(rd, args);
+            self.inf.unify(ret, rt);
+            ret = self.inf.shallow(ret);
+        }
+        if !(ret.kind == K_ADT && ret.d().id == rd.id) {
+            self.errorf(question, "the ? operator on a Result can only be used in a function that returns Result".to_string());
+            return t.args[0];
+        }
+        let err_from = t.args[1];
+        let err_to = ret.args[1];
+        let snap = self.inf.snapshot();
+        let same_err = self.inf.unify(err_from, err_to);
+        self.inf.rollback(snap);
+        if !same_err {
+            if let Some(from) = self.lang("From") {
+                let mut args = Vec::new();
+                args.push(err_from);
+                self.require(&TraitRef { tdef: Some(from), self_ty: Some(err_to), args, bindings: Vec::new() }, question);
+            }
+        } else {
+            self.inf.unify(err_from, err_to);
+        }
+        t.args[0]
+    }
+
+    fn struct_lit(&mut self, path: &ast::Path, fis: &Vec<&FieldInit>, base: Option<&Expr>, hint: Option<&Type>) -> &Type {
+        let res = match self.info.res.paths.get(&path.id) { Some(r) => r.clone(), None => resolve::res_err() };
+        let mut adt: Option<&Type> = None;
+        let mut variant: Option<&mut Def> = None;
+        if res.kind == resolve::RES_SELF_TY && res.rest.len() == 0 {
+            adt = self.env.unwrap().self_ty;
+        } else if res.kind == resolve::RES_DEF && res.rest.len() == 0 {
+            let d = res.def.unwrap();
+            if d.kind == resolve::DEF_STRUCT {
+                let ai = self.c.adt(d);
+                let (m, vars) = self.instantiate(ai.generics);
+                self.explicit_args(&ai.generics.params, path.segments[path.segments.len() - 1].args, &m, `struct ${d.name}`);
+                adt = Some(self.ctx().adt(d, vars));
+            } else if d.kind == resolve::DEF_VARIANT {
+                let p = d.parent.unwrap();
+                let ai = self.c.adt(p);
+                let (_, vars) = self.instantiate(ai.generics);
+                adt = Some(self.ctx().adt(p, vars));
+                variant = Some(d);
+            } else if d.kind == resolve::DEF_TYPE_ALIAS {
+                if let Some(ai) = self.c.alias(d) {
+                    let (m, _) = self.instantiate(ai.generics);
+                    let t = subst(self.ctx(), ai.ty, &m, None);
+                    adt = Some(self.normalize(t));
+                }
+            }
+        } else if res.rest.len() == 1 {
+            let (b0, _) = self.base_type(path, &res);
+            let b = self.inf.shallow(b0);
+            if b.kind == K_ADT {
+                for v in self.c.adt(b.d()).variants.iter_mut() {
+                    if v.def.name == res.rest[0].name.value {
+                        adt = Some(b);
+                        variant = Some(v.def);
+                    }
+                }
+            }
+        }
+        let ok = match adt { Some(a) => self.inf.shallow(a).kind == K_ADT, None => false };
+        if !ok {
+            if res.kind != resolve::RES_ERR {
+                self.errorf(path.pos(), "expected a struct or variant with named fields".to_string());
+            }
+            for f in fis.iter() { self.infer(f.value, None); }
+            return self.ctx().err;
+        }
+        let at = self.inf.shallow(adt.unwrap());
+        if let Some(ht) = hint { self.inf.try_unify(at, ht); }
+        let ai = self.c.adt(at.d());
+        let mut fields = ai.fields;
+        let mut kind = ai.kind.clone();
+        match variant {
+            Some(vd) => {
+                for v in ai.variants.iter() {
+                    if v.def.id == vd.id {
+                        fields = v.fields;
+                        kind = v.kind.clone();
+                    }
+                }
+            }
+            None => {
+                if ai.is_enum {
+                    self.errorf(path.pos(), `expected a struct or variant, found enum ${at.d().name}`);
+                    return self.ctx().err;
+                }
+            }
+        }
+        let m = param_map(Some(ai.generics), &at.args);
+        let mut seen: HashMap<String, bool> = HashMap::new();
+        let mut by_name: HashMap<String, &mut Field> = HashMap::new();
+        for f in fields.iter() { by_name.insert(f.name.clone(), *f); }
+        let aname = at.d().name.clone();
+        for fi in fis.iter() {
+            let f = match by_name.get(&fi.name.value) {
+                Some(f) => *f,
+                None => {
+                    self.errorf(fi.name.pos, `${aname} has no field named ${fi.name.value}`);
+                    continue;
+                }
+            };
+            if seen.contains_key(&f.name) { self.errorf(fi.name.pos, `field ${f.name} is specified more than once`); }
+            seen.insert(f.name.clone(), true);
+            let accessible = match self.module { Some(md) => f.vis.accessible_from(md), None => true };
+            if !accessible { self.errorf(fi.name.pos, `field ${f.name} of ${aname} is private`); }
+            let st = subst(self.ctx(), f.ty, &m, None);
+            let nt = self.normalize(st);
+            self.check(fi.value, nt);
+        }
+        match base {
+            Some(b) => { self.check(b, at); }
+            None => {
+                if kind != StructKind::Unit || fields.len() > 0 {
+                    let mut missing: Vec<String> = Vec::new();
+                    for f in fields.iter() {
+                        if !seen.contains_key(&f.name) { missing.push(f.name.clone()); }
+                    }
+                    if missing.len() > 0 {
+                        self.errorf(path.pos(), `missing field${plural(missing.len())} ${missing.join(", ")} in initializer of ${aname}`);
+                    }
+                }
+            }
+        }
+        at
+    }
+
+    // --- Control flow -------------------------------------------------------------
+
+    fn cond(&mut self, c: &Expr) {
+        if let ExprKind::Let { pat, x, .. } = &c.kind {
+            let t = self.infer(*x, None);
+            self.check_pat(*pat, t, true);
+            return;
+        }
+        let b = self.ctx().bool_;
+        self.check(c, b);
+    }
+
+    fn if_expr(&mut self, cond: &Expr, then: &Expr, els: Option<&Expr>, hint: Option<&Type>) -> &Type {
+        self.cond(cond);
+        let rbrace = then.block().rbrace;
+        let unit = self.ctx().unit;
+        let ex = match els {
+            None => {
+                let t = self.check_block(then, Some(unit));
+                self.coerce_to(then, t, unit, rbrace);
+                return unit;
+            }
+            Some(e) => e,
+        };
+        let tt = self.check_block(then, hint);
+        // A diverging then-branch says nothing about the else-branch's type.
+        let else_hint = if self.inf.shallow(tt).kind == K_NEVER { hint } else { Some(tt) };
+        let et = self.infer(ex, else_hint);
+        if let Some(ht) = hint {
+            if self.inf.shallow(ht).kind != K_INFER {
+                self.coerce_to(then, tt, ht, rbrace);
+                self.coerce_to(ex, et, ht, ex.pos());
+                return ht;
+            }
+        }
+        self.lub(Some(ex), tt, et, ex.pos())
+    }
+
+    fn match_expr(&mut self, pos: Pos, scrut_x: &Expr, arms: &Vec<&MatchArm>, hint: Option<&Type>) -> &Type {
+        let scrut = self.infer(scrut_x, None);
+        let mut result: Option<&Type> = None;
+        if let Some(ht) = hint {
+            if self.inf.shallow(ht).kind != K_INFER { result = Some(ht); }
+        }
+        for arm in arms.iter() {
+            self.check_pat(arm.pat, scrut, true);
+            if let Some(g) = arm.guard {
+                let b = self.ctx().bool_;
+                self.check(g, b);
+            }
+            let t = self.infer(arm.body, result);
+            match result {
+                None => {
+                    if self.inf.shallow(t).kind != K_NEVER { result = Some(t); }
+                }
+                Some(r) => {
+                    if !self.coerce(Some(arm.body), t, r) { self.mismatch(arm.body.pos(), r, t); }
+                }
+            }
+        }
+        self.check_exhaustive(pos, arms, scrut);
+        match result { Some(r) => r, None => self.ctx().never }
+    }
+
+    fn for_expr(&mut self, x: &Expr, pat: &ast::Pat, iter_x: &Expr, body: &Expr) {
+        let mut iter = self.infer(iter_x, None);
+        // Arrays iterate as slices (impls for [T; N] need const generics).
+        let it = self.inf.shallow(iter);
+        if it.kind == K_REF {
+            let e = self.inf.shallow(it.el());
+            if e.kind == K_ARRAY {
+                let s = self.ctx().slice(e.el());
+                iter = self.ctx().reference(it.is_mut, s);
+                self.adjust_of(iter_x).unsize = true;
+            }
+        }
+        let mut item = self.ctx().err;
+        if let Some(into) = self.lang("IntoIterator") {
+            let tr = &TraitRef { tdef: Some(into), self_ty: Some(iter), args: Vec::new(), bindings: Vec::new() };
+            let r = self.inf.resolve(iter);
+            if r.kind != K_ERROR && !has_infer(r) && self.holds(tr) == SEL_NO {
+                self.errorf(iter_x.pos(), `${r} is not an iterator (it does not implement IntoIterator)`);
+            } else {
+                self.require(tr, iter_x.pos());
+                if let Some(a) = self.c.find_own_assoc_type(into, "Item") {
+                    let p = self.ctx().proj(a, tr);
+                    item = self.normalize(p);
+                }
+            }
+        }
+        self.check_pat(pat, item, false);
+        self.loops.push(&mut LoopCtx { node: x.id, is_loop: false, break_ty: None, has_break: false });
+        let unit = self.ctx().unit;
+        self.check_block(body, Some(unit));
+        self.loops.pop();
+    }
+
+    fn closure(&mut self, params: &Vec<&ast::Param>, result: Option<&ast::Type>, body: &Expr, h: Option<&Type>) -> &Type {
+        let mut ps = Vec::new();
+        let fn_hint = match h { Some(ht) => if ht.kind == K_FN { Some(ht) } else { None }, None => None };
+        let mut i = 0;
+        while i < params.len() {
+            let p = params[i];
+            let mut t: Option<&Type> = match p.ty { Some(ty) => Some(self.lower(ty)), None => None };
+            if let Some(fh) = fn_hint {
+                if fh.elems.len() == params.len() {
+                    match t {
+                        None => { t = Some(fh.elems[i]); }
+                        Some(tt) => { self.inf.unify(tt, fh.elems[i]); }
+                    }
+                }
+            }
+            let pt = match t { Some(x) => x, None => self.inf.fresh() };
+            ps.push(pt);
+            self.check_pat(p.pat, pt, false);
+            i += 1;
+        }
+        let ret = match result {
+            Some(r) => self.lower(r),
+            None => match fn_hint { Some(fh) => fh.ret.unwrap(), None => self.inf.fresh() },
+        };
+        let old_ret = self.ret;
+        let old_loops = self.loops;
+        self.ret = Some(ret);
+        self.loops = Vec::new();
+        let bt = self.infer(body, Some(ret));
+        self.coerce_to(body, bt, ret, body.pos());
+        self.ret = old_ret;
+        self.loops = old_loops;
+        self.ctx().func(ps, ret, "")
+    }
+
+    fn select_expr(&mut self, pos: Pos, arms: &Vec<&SelectArm>, hint: Option<&Type>) -> &Type {
+        let mut result: Option<&Type> = None;
+        if let Some(ht) = hint {
+            if self.inf.shallow(ht).kind != K_INFER { result = Some(ht); }
+        }
+        let mut defaults = 0;
+        for arm in arms.iter() {
+            if arm.is_default {
+                defaults += 1;
+            } else {
+                let op = arm.op.unwrap();
+                let t = self.infer(op, None);
+                if let ExprKind::MethodCall { name, .. } = &op.kind {
+                    if name.value != "recv" && name.value != "send" {
+                        self.errorf(name.pos, "select cases must call recv() or send() on a channel".to_string());
+                    }
+                }
+                if let Some(p) = arm.pat { self.check_pat(p, t, false); }
+            }
+            let t = self.infer(arm.body, result);
+            match result {
+                None => {
+                    if self.inf.shallow(t).kind != K_NEVER { result = Some(t); }
+                }
+                Some(r) => {
+                    if !self.coerce(Some(arm.body), t, r) { self.mismatch(arm.body.pos(), r, t); }
+                }
+            }
+        }
+        if defaults > 1 { self.errorf(pos, "select can have at most one default case".to_string()); }
+        match result { Some(r) => r, None => self.ctx().never }
+    }
+
+    // --- Blocks and statements ------------------------------------------------------
+
+    /// Type-checks the block expression x (without recording its type).
+    pub fn check_block(&mut self, x: &Expr, hint: Option<&Type>) -> &Type {
+        let b = x.block();
+        let mut diverges = false;
+        for st in b.stmts.iter() {
+            match *st {
+                Stmt::Let(l) => {
+                    self.cur_pos = l.pos;
+                    let t = self.lower_or_infer(l.ty);
+                    if let Some(init) = l.init {
+                        let it = self.check(init, t);
+                        if self.inf.shallow(it).kind == K_NEVER { diverges = true; }
+                    }
+                    match l.els {
+                        Some(e) => {
+                            let et = self.check_block(e, None);
+                            if self.inf.shallow(et).kind != K_NEVER {
+                                self.errorf(e.block().lbrace, "the else block of let-else must diverge (return, break, continue or panic)".to_string());
+                            }
+                            self.check_pat(l.pat, t, true);
+                        }
+                        None => self.check_pat(l.pat, t, false),
+                    }
+                }
+                Stmt::Expr { x: e, semi } => {
+                    self.cur_pos = e.pos();
+                    let t = if *semi {
+                        self.infer(e, None)
+                    } else {
+                        let unit = self.ctx().unit;
+                        let t = self.infer(e, Some(unit));
+                        let s = self.inf.shallow(t);
+                        if s.kind != K_NEVER && s.kind != K_ERROR && !self.inf.try_unify(s, unit) {
+                            let r = self.inf.resolve(s);
+                            self.errorf(e.pos(), `expected (), found ${r}; add a semicolon to discard the value`);
+                        }
+                        t
+                    };
+                    if self.inf.shallow(t).kind == K_NEVER { diverges = true; }
+                }
+                Stmt::Defer { pos, x: e } => {
+                    self.cur_pos = *pos;
+                    self.infer(*e, None);
+                }
+                _ => {}
+            }
+        }
+        if let Some(tail) = b.tail {
+            self.cur_pos = tail.pos();
+            return self.infer(tail, hint);
+        }
+        if diverges { return self.ctx().never; }
+        self.ctx().unit
+    }
+
+    // --- Places and mutability ------------------------------------------------------
+
+    /// Reports an error unless x (after derefs dereferences) is a place that
+    /// may be mutated or mutably borrowed.
+    pub fn check_mut_place(&mut self, x: &Expr, derefs: i32, what: &str, pos: Pos) {
+        if derefs > 0 {
+            if let Some(t0) = self.body.types.get(&x.id) {
+                let t = self.inf.shallow(*t0);
+                if t.kind == K_REF && !t.is_mut {
+                    self.errorf(pos, `cannot ${what} data behind a & reference`);
+                    return;
+                }
+                if t.kind == K_REF { return; }
+                if t.kind == K_PTR {
+                    if !t.is_mut { self.errorf(pos, `cannot ${what} data behind a *const pointer`); }
+                    return;
+                }
+                // Overloaded deref (Vec, String): the place itself must be mutable.
+            }
+        }
+        let (ok, why) = self.is_mut_place(x);
+        if !ok { self.errorf(pos, `cannot ${what} ${why}`); }
+    }
+
+    fn check_assignable(&mut self, x: &Expr, pos: Pos) {
+        let (ok, why) = self.is_mut_place(x);
+        if !ok { self.errorf(pos, `cannot assign to ${why}`); }
+    }
+
+    fn type_of(&self, x: &Expr) -> Option<&Type> {
+        match self.body.types.get(&x.id) { Some(t) => Some(self.inf.shallow(*t)), None => None }
+    }
+
+    /// Reports whether x denotes a mutable place, and why not.
+    fn is_mut_place(&mut self, x: &Expr) -> (bool, String) {
+        match &x.kind {
+            ExprKind::Paren { x: inner, .. } => return self.is_mut_place(*inner),
+            ExprKind::Path(p) => {
+                let res = match self.info.res.paths.get(&p.id) { Some(r) => r.clone(), None => resolve::res_err() };
+                if res.kind == resolve::RES_LOCAL {
+                    let l = res.local.unwrap();
+                    if l.is_mut { return (true, String::new()); }
+                    return (false, `immutable variable ${l.name} (declare it with let mut)`);
+                }
+                if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_STATIC {
+                    let d = res.def.unwrap();
+                    if self.c.const_info(d).is_mut { return (true, String::new()); }
+                    return (false, `immutable static ${d.name}`);
+                }
+                if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_EXTERN_STATIC { return (true, String::new()); }
+                return (false, "this expression".to_string());
+            }
+            ExprKind::Field { x: base, .. } | ExprKind::Index { x: base, .. } => {
+                // Through a reference, mutability is the reference's.
+                if let Some(t) = self.type_of(*base) {
+                    if t.kind == K_REF {
+                        if !t.is_mut { return (false, "data behind a & reference".to_string()); }
+                        return (true, String::new());
+                    }
+                    if t.kind == K_PTR { return (t.is_mut, "data behind a *const pointer".to_string()); }
+                }
+                return self.is_mut_place(*base);
+            }
+            ExprKind::Unary { op, x: inner, .. } => {
+                if *op == token::STAR {
+                    let t = match self.type_of(*inner) { Some(t) => t, None => return (true, String::new()) };
+                    if t.kind == K_REF && !t.is_mut { return (false, "data behind a & reference".to_string()); }
+                    if t.kind == K_PTR && !t.is_mut { return (false, "data behind a *const pointer".to_string()); }
+                    if t.kind == K_ADT { return self.is_mut_place(*inner); }
+                    return (true, String::new());
+                }
+            }
+            _ => {}
+        }
+        // Temporaries can be mutated.
+        (true, String::new())
+    }
+}

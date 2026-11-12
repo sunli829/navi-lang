@@ -1,0 +1,124 @@
+//! Implicit conversions, autoderef and branch type joins.
+
+use crate::syntax::ast::Expr;
+use crate::syntax::source::Pos;
+use crate::types::*;
+use crate::types::body::*;
+use crate::types::solve::*;
+
+impl FnCtx {
+    /// Checks that a value of type got (produced by x) can be used where
+    /// want is expected, recording implicit conversions; it reports a
+    /// mismatch at pos otherwise.
+    pub fn coerce_to(&mut self, x: &Expr, got: &Type, want: &Type, pos: Pos) -> bool {
+        if self.coerce(Some(x), got, want) { return true; }
+        self.mismatch(pos, want, got);
+        false
+    }
+
+    /// The implicit conversions: ! to any type, &mut T to &T, &[T; N] to
+    /// &[T], &T to &dyn Trait, deref coercion (&String to &str) and &T to
+    /// *const T.
+    pub fn coerce(&mut self, x: Option<&Expr>, got: &Type, want: &Type) -> bool {
+        let g = self.inf.shallow(got);
+        let w = self.inf.shallow(want);
+        if g.kind == K_NEVER || g.kind == K_ERROR || w.kind == K_ERROR { return true; }
+        if g.kind == K_INFER || w.kind == K_INFER { return self.inf.try_unify(g, w); }
+        if w.kind == K_REF && g.kind == K_REF && (g.is_mut || !w.is_mut) {
+            if self.inf.try_unify(g.el(), w.el()) { return true; }
+            let ge = self.inf.shallow(g.el());
+            let we = self.inf.shallow(w.el());
+            if ge.kind == K_ARRAY && we.kind == K_SLICE && self.inf.try_unify(ge.el(), we.el()) {
+                self.adjust(x).unsize = true;
+                return true;
+            }
+            if we.kind == K_DYN && ge.kind != K_DYN {
+                let pos = match x { Some(e) => e.pos(), None => 0 };
+                for b in we.bounds.iter() {
+                    let tr = &TraitRef { tdef: Some(b.trait_def()), self_ty: Some(ge), args: b.args.clone(), bindings: b.bindings.clone() };
+                    self.require(tr, pos);
+                }
+                self.adjust(x).to_dyn = Some(w);
+                return true;
+            }
+            if we.kind != K_INFER {
+                let steps = self.autoderef(ge, w.is_mut);
+                let mut i = 1;
+                while i < steps.len() {
+                    if self.inf.try_unify(steps[i], we) {
+                        let a = self.adjust(x);
+                        a.derefs = (i + 1) as i32; // through the reference, then i derefs
+                        a.autoref = if w.is_mut { 2 } else { 1 };
+                        return true;
+                    }
+                    i += 1;
+                }
+            }
+            return false;
+        }
+        if w.kind == K_PTR && g.kind == K_REF && (g.is_mut || !w.is_mut) { return self.inf.try_unify(g.el(), w.el()); }
+        if w.kind == K_PTR && g.kind == K_PTR && g.is_mut && !w.is_mut { return self.inf.try_unify(g.el(), w.el()); }
+        self.inf.try_unify(g, w)
+    }
+
+    /// The adjustment record of x (created on first use).
+    pub fn adjust(&mut self, x: Option<&Expr>) -> &mut Adjust {
+        let e = match x { Some(e) => e, None => return new_adjust() };
+        if let Some(a) = self.body.adjust.get(&e.id) { return *a; }
+        let a = new_adjust();
+        self.body.adjust.insert(e.id, a);
+        a
+    }
+
+    pub fn adjust_of(&mut self, x: &Expr) -> &mut Adjust { self.adjust(Some(x)) }
+
+    /// t followed by the types reached by dereferencing it: through
+    /// references (raw pointers are not followed) and Deref impls.
+    pub fn autoderef(&mut self, t: &Type, is_mut: bool) -> Vec<&Type> {
+        let mut steps = Vec::new();
+        steps.push(t);
+        let mut cur = t;
+        let mut i = 0;
+        while i < 16 {
+            let c = self.inf.shallow(cur);
+            let next: Option<&Type> = if c.kind == K_REF {
+                Some(c.el())
+            } else if c.kind == K_INFER || c.kind == K_ERROR || c.kind == K_NEVER {
+                None
+            } else {
+                self.overloaded_deref(c)
+            };
+            match next {
+                None => break,
+                Some(n) => {
+                    steps.push(n);
+                    cur = n;
+                }
+            }
+            i += 1;
+        }
+        steps
+    }
+
+    /// <t as Deref>::Target if t implements Deref.
+    pub fn overloaded_deref(&mut self, t: &Type) -> Option<&Type> {
+        let deref = self.lang("Deref")?;
+        let tr = &TraitRef { tdef: Some(deref), self_ty: Some(t), args: Vec::new(), bindings: Vec::new() };
+        if self.holds(tr) != SEL_YES { return None; }
+        let target = self.c.find_own_assoc_type(deref, "Target")?;
+        let r = self.normalize_proj_now(target, tr)?;
+        if r.kind == K_ERROR { return None; }
+        Some(r)
+    }
+
+    /// The common type of two branches (if/else, match arms).
+    pub fn lub(&mut self, x: Option<&Expr>, a: &Type, b: &Type, pos: Pos) -> &Type {
+        let sa = self.inf.shallow(a);
+        let sb = self.inf.shallow(b);
+        if sa.kind == K_NEVER { return b; }
+        if sb.kind == K_NEVER { return a; }
+        if self.coerce(x, b, a) { return a; }
+        self.mismatch(pos, a, b);
+        a
+    }
+}

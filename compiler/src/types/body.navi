@@ -1,0 +1,482 @@
+//! Body type checking: the per-body context and the stored results.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Local, Module, Node};
+use crate::syntax::ast::{self, Expr, ExprKind, Item, Pat};
+use crate::syntax::source::{File, Pos};
+use crate::types::*;
+use crate::types::lower::*;
+use crate::types::collect::*;
+use crate::types::infer::*;
+use crate::types::solve::Obligation;
+
+/// The type-checking results of one function, constant or static body.
+/// All types are fully resolved. Maps are keyed by node (or local) id.
+pub struct BodyInfo {
+    pub owner: &mut Def,
+    pub types: HashMap<u32, &Type>,
+    pub locals: HashMap<u32, &Type>,
+    /// What a path expression or method call refers to.
+    pub callees: HashMap<u32, &mut Callee>,
+    /// The field index of field expressions (after autoderef).
+    pub fields: HashMap<u32, i32>,
+    pub adjust: HashMap<u32, &mut Adjust>,
+    pub pats: HashMap<u32, &Type>,
+    /// Bindings that bind by reference because a non-reference pattern
+    /// matched a reference (match ergonomics).
+    pub ref_bindings: HashMap<u32, bool>,
+    /// Whether a template string is a String or Arguments.
+    pub templates: HashMap<u32, &Type>,
+    // Recording order (for deterministic diagnostics).
+    pub type_order: Vec<&Expr>,
+    pub local_order: Vec<&mut Local>,
+    pub pat_order: Vec<&Pat>,
+    pub callee_order: Vec<&Expr>,
+}
+
+/// The resolved target of a path or method call.
+pub struct Callee {
+    pub def: &mut Def,
+    /// Generic arguments for all generics in scope of def.
+    pub args: Vec<&Type>,
+    /// The self type for trait items (Trait::f, methods via traits).
+    pub self_ty: Option<&Type>,
+    /// How a method call's receiver is adjusted.
+    pub recv: Option<&mut Adjust>,
+}
+
+/// Implicit conversions applied to an expression.
+pub struct Adjust {
+    /// Number of dereferences (builtin or Deref::deref).
+    pub derefs: i32,
+    /// 0: none, 1: &, 2: &mut.
+    pub autoref: i32,
+    /// [T; N] to [T] (after autoref).
+    pub unsize: bool,
+    pub to_dyn: Option<&Type>,
+}
+
+pub fn new_adjust() -> &mut Adjust { &mut Adjust { derefs: 0, autoref: 0, unsize: false, to_dyn: None } }
+
+/// A check that runs once types are resolved: exhaustiveness of a match
+/// (arms set) or irrefutability of a pattern (pat set).
+pub struct Deferred {
+    pub pos: Pos,
+    pub arms: Vec<&ast::MatchArm>,
+    pub pat: Option<&Pat>,
+    pub ty: &Type,
+    pub what: String,
+}
+
+pub struct LoopCtx {
+    pub node: u32,
+    pub is_loop: bool,
+    pub break_ty: Option<&Type>,
+    pub has_break: bool,
+}
+
+/// Type-checks one body.
+pub struct FnCtx {
+    pub c: &mut Collector,
+    pub info: &mut Info,
+    pub inf: &mut Infer,
+    pub file: Option<&File>,
+    pub owner: &mut Def,
+    pub module: Option<&mut Module>,
+    pub env: Option<Env>,
+    pub preds: Vec<&TraitRef>,
+    pub traits: Vec<&mut Def>,
+    pub body: &mut BodyInfo,
+    /// The return type of the innermost function or closure.
+    pub ret: Option<&Type>,
+    pub loops: Vec<&mut LoopCtx>,
+    pub pending: Vec<&mut Obligation>,
+    pub var_origin: HashMap<i32, &mut TypeParam>,
+    pub cur_pos: Pos,
+    pub unsafe_depth: i32,
+    pub in_const: bool,
+    /// Opaque return types (by id) -> hidden-type variables.
+    pub opaques: HashMap<u32, &Type>,
+    pub opaque_order: Vec<&Type>,
+    /// Checks that need resolved types (exhaustiveness).
+    pub deferred: Vec<&Deferred>,
+    /// To suppress follow-on "annotations needed" errors.
+    pub errs_at_start: usize,
+}
+
+fn new_body(d: &mut Def) -> &mut BodyInfo {
+    &mut BodyInfo { owner: d, types: HashMap::new(), locals: HashMap::new(), callees: HashMap::new(), fields: HashMap::new(),
+        adjust: HashMap::new(), pats: HashMap::new(), ref_bindings: HashMap::new(), templates: HashMap::new(),
+        type_order: Vec::new(), local_order: Vec::new(), pat_order: Vec::new(), callee_order: Vec::new() }
+}
+
+/// A function context for solving outside any body.
+pub fn bare_ctx(c: &mut Collector, owner: &mut Def, file: Option<&File>) -> &mut FnCtx {
+    let inf = new_infer(c.info.ctx);
+    &mut FnCtx { c, info: c.info, inf, file, owner, module: None, env: None, preds: Vec::new(), traits: Vec::new(),
+        body: new_body(owner), ret: None, loops: Vec::new(), pending: Vec::new(), var_origin: HashMap::new(), cur_pos: 0,
+        unsafe_depth: 0, in_const: false, opaques: HashMap::new(), opaque_order: Vec::new(), deferred: Vec::new(),
+        errs_at_start: 0 }
+}
+
+impl FnCtx {
+    pub fn errorf(&mut self, pos: Pos, msg: String) { self.c.errorf(self.file, pos, msg); }
+
+    pub fn ctx(&mut self) -> &mut Ctx { self.inf.ctx }
+
+    pub fn lang(&self, name: &str) -> Option<&mut Def> { self.info.lang_def(name) }
+
+    pub fn lang_name(&self, d: &Def) -> String { self.c.lang_name(d) }
+
+    pub fn ret_ty(&self) -> &Type { self.ret.unwrap() }
+}
+
+impl Collector {
+    /// Type-checks every function, constant and static body.
+    pub fn check_bodies(&mut self) {
+        let defs = self.info.res.defs.clone();
+        for d in defs.iter() {
+            match &d.node {
+                Node::Item(Item::Fn(n)) => {
+                    if n.body.is_some() && (d.kind == resolve::DEF_FN || d.kind == resolve::DEF_ASSOC_FN) {
+                        self.check_fn_body(*d, *n);
+                    }
+                }
+                Node::Item(Item::Const(n)) => {
+                    if let Some(v) = n.value { self.check_const_body(*d, v); }
+                }
+                Node::Item(Item::Static(n)) => {
+                    if let Some(v) = n.value { self.check_const_body(*d, v); }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn new_fn_ctx(&mut self, d: &mut Def) -> &mut FnCtx {
+        let fc = bare_ctx(self, d, d.file);
+        fc.module = resolve::module_of(d);
+        fc.env = Some(self.env_for(d));
+        if let Some(m) = fc.module { fc.traits = m.traits_in_scope(); }
+        fc.errs_at_start = self.errs.len();
+        let g = self.generics_of(d);
+        let mut preds: Vec<&TraitRef> = Vec::new();
+        for p in g.all_preds().iter() { preds.push(p.trait_ref); }
+        let owner = if is_assoc(d) { d.parent.unwrap() } else { d };
+        if owner.kind == resolve::DEF_TRAIT { preds.push(self.self_trait_ref(owner)); }
+        fc.preds = self.elaborate(&preds);
+        fc
+    }
+
+    fn check_fn_body(&mut self, d: &mut Def, n: &mut ast::FnDecl) {
+        let fs = self.fn_sig(d);
+        let fc = self.new_fn_ctx(d);
+        let body = n.body.unwrap();
+        let blk = body.block();
+        fc.cur_pos = blk.lbrace;
+        if n.is_unsafe { fc.unsafe_depth += 1; }
+        fc.in_const = n.is_const;
+        // Inside the defining function an opaque return type stands for a
+        // hidden type that the body determines.
+        for o in fs.opaques.iter() {
+            let v = fc.inf.fresh();
+            fc.opaques.insert(o.id, v);
+            fc.opaque_order.push(*o);
+        }
+        let ret = fc.replace_opaques(fs.ret);
+        fc.ret = Some(fc.normalize(ret));
+        if let Some(l) = self.info.res.self_locals.get(&n.base.id) {
+            if let Some(st) = fs.self_ty {
+                let t = fc.normalize(st);
+                fc.set_local(*l, t);
+            }
+        }
+        let mut i = 0;
+        while i < n.params.len() {
+            if i < fs.params.len() {
+                let t = fc.normalize(fs.params[i]);
+                fc.check_pat(n.params[i].pat, t, false);
+            }
+            i += 1;
+        }
+        let t = fc.check_block(body, fc.ret);
+        fc.coerce_to(body, t, fc.ret_ty(), blk.rbrace);
+        for o in fc.opaque_order.clone().iter() {
+            let v = fc.opaques[&o.id];
+            for b in o.bounds.iter() {
+                let tr = &TraitRef { tdef: Some(b.trait_def()), self_ty: Some(v), args: b.args.clone(), bindings: b.bindings.clone() };
+                fc.require(tr, n.name.pos);
+            }
+        }
+        fc.finish();
+        for o in fc.opaque_order.iter() {
+            let h = fc.inf.resolve(fc.opaques[&o.id]);
+            self.info.hidden.insert(o.id, h);
+        }
+    }
+
+    fn check_const_body(&mut self, d: &mut Def, x: &Expr) {
+        let ci = self.const_info(d);
+        let fc = self.new_fn_ctx(d);
+        fc.in_const = true;
+        fc.cur_pos = x.pos();
+        fc.ret = Some(ci.ty);
+        fc.check(x, ci.ty);
+        fc.finish();
+    }
+
+    /// Adds the predicates implied by preds: supertraits, and the bounds
+    /// declared on associated types (I: IntoIterator implies
+    /// <I as IntoIterator>::IntoIter: Iterator<Item = I::Item>).
+    pub fn elaborate(&mut self, preds: &Vec<&TraitRef>) -> Vec<&TraitRef> {
+        let mut out: Vec<&TraitRef> = Vec::new();
+        let mut seen: HashMap<String, bool> = HashMap::new();
+        for p in preds.iter() { self.elaborate_add(*p, 0, &mut seen, &mut out); }
+        out
+    }
+
+    fn elaborate_add(&mut self, tr: &TraitRef, depth: i32, seen: &mut HashMap<String, bool>, out: &mut Vec<&TraitRef>) {
+        for s in self.supertraits(tr).iter() {
+            let key = trait_key(Some(*s));
+            if seen.contains_key(&key) { continue; }
+            seen.insert(key, true);
+            out.push(*s);
+            if depth > 4 { continue; }
+            let ti = match self.trait_info(s.trait_def()) { Some(t) => t, None => continue };
+            let m = param_map(Some(ti.generics), &s.args);
+            for it in ti.order.iter() {
+                if it.kind != resolve::DEF_ASSOC_TYPE { continue; }
+                let ai = self.assoc_type(*it);
+                if ai.bounds.len() == 0 { continue; }
+                let ptr = &TraitRef { tdef: Some(s.trait_def()), self_ty: s.self_ty, args: s.args.clone(), bindings: Vec::new() };
+                let self_ty = self.ctx().proj(*it, ptr);
+                for b in ai.bounds.iter() {
+                    let nb = subst_trait_ref(self.ctx(), *b, &m, s.self_ty);
+                    let nb2 = &TraitRef { tdef: Some(nb.trait_def()), self_ty: Some(self_ty), args: nb.args.clone(), bindings: nb.bindings.clone() };
+                    self.elaborate_add(nb2, depth + 1, seen, out);
+                }
+            }
+        }
+    }
+}
+
+/// Replaces every occurrence of old in t by new.
+pub fn replace_type(ctx: &mut Ctx, t: &Type, old: &Type, new: &Type) -> &Type {
+    if same(t, old) { return new; }
+    match t.kind {
+        K_REF => { let e = replace_type(ctx, t.el(), old, new); ctx.reference(t.is_mut, e) }
+        K_TUPLE => {
+            let mut out = Vec::new();
+            for e in t.elems.iter() { out.push(replace_type(ctx, *e, old, new)); }
+            ctx.tuple(out)
+        }
+        K_ADT => {
+            let mut out = Vec::new();
+            for e in t.args.iter() { out.push(replace_type(ctx, *e, old, new)); }
+            ctx.adt(t.d(), out)
+        }
+        _ => t,
+    }
+}
+
+/// Replaces the variable name (not a longer one with the same prefix) in s.
+fn replace_var(s0: &str, name: &str, with: &str) -> String {
+    let mut b = String::new();
+    let mut s = s0;
+    loop {
+        let i = match s.find(name) {
+            None => {
+                b.push_str(s);
+                return b;
+            }
+            Some(i) => i,
+        };
+        let end = i + name.len();
+        let bs = s.as_bytes();
+        if end < bs.len() && bs[end] >= b'0' && bs[end] <= b'9' {
+            b.push_str(&s[..end]);
+            s = &s[end..];
+            continue;
+        }
+        b.push_str(&s[..i]);
+        b.push_str(with);
+        s = &s[end..];
+    }
+}
+
+impl FnCtx {
+    /// Substitutes the hidden-type variables for opaque types.
+    pub fn replace_opaques(&mut self, t0: &Type) -> &Type {
+        let mut t = t0;
+        for o in self.opaque_order.iter() {
+            t = replace_type(self.inf.ctx, t, *o, self.opaques[&o.id]);
+        }
+        t
+    }
+
+    /// Solves the remaining obligations, applies literal defaults and stores
+    /// fully resolved results.
+    pub fn finish(&mut self) {
+        self.solve_pending(false);
+        // Literal fallback: integers default to i32, floats to f64.
+        let i32_ = self.ctx().int(I32);
+        let f64_ = self.ctx().f64;
+        let mut i = 0;
+        while i < self.inf.vars.len() {
+            let v = self.inf.vars[i];
+            if v.bound.is_none() {
+                if v.kind == VAR_INT {
+                    v.bound = Some(i32_);
+                } else if v.kind == VAR_FLOAT {
+                    v.bound = Some(f64_);
+                }
+            }
+            i += 1;
+        }
+        // A function whose body never returns (todo(), loop {}) leaves its
+        // opaque return type undetermined; it is ! then.
+        for o in self.opaque_order.iter() {
+            let r = self.inf.shallow(self.opaques[&o.id]);
+            if r.kind == K_INFER {
+                let nv = self.ctx().never;
+                self.inf.unify(r, nv);
+            }
+        }
+        self.solve_pending(false);
+        let tainted = self.c.errs.len() > self.errs_at_start;
+        if tainted {
+            // Earlier errors leave types unknown; reporting the resulting
+            // ambiguities would only add noise.
+            self.c.quiet += 1;
+        }
+        self.solve_pending(true);
+        if !tainted {
+            let mut k = 0;
+            while k < self.deferred.len() {
+                let d = self.deferred[k];
+                self.run_deferred(d);
+                k += 1;
+            }
+        }
+        let mut reported = tainted;
+        let body = self.body;
+        for x in body.type_order.iter() {
+            let t = self.res_final(body.types[&x.id], x.pos(), &mut reported);
+            body.types.insert(x.id, t);
+        }
+        for l in body.local_order.iter() {
+            let t = self.res_final(body.locals[&l.id], l.pos, &mut reported);
+            body.locals.insert(l.id, t);
+        }
+        for p in body.pat_order.iter() {
+            let t = self.res_final(body.pats[&p.id], p.pos(), &mut reported);
+            body.pats.insert(p.id, t);
+        }
+        let tids: Vec<u32> = body.templates.keys().map(|k| *k).collect();
+        for id in tids.iter() {
+            let t = self.inf.resolve(body.templates[id]);
+            body.templates.insert(*id, t);
+        }
+        for x in body.callee_order.iter() {
+            let cl = body.callees[&x.id];
+            let mut j = 0;
+            while j < cl.args.len() {
+                cl.args[j] = self.res_final(cl.args[j], x.pos(), &mut reported);
+                j += 1;
+            }
+            if let Some(s) = cl.self_ty { cl.self_ty = Some(self.res_final(s, x.pos(), &mut reported)); }
+        }
+        for (_, a) in body.adjust.iter_mut() {
+            if let Some(td) = a.to_dyn { a.to_dyn = Some(self.inf.resolve(td)); }
+        }
+        if tainted { self.c.quiet -= 1; }
+        self.info.bodies.insert(self.owner.id, body);
+    }
+
+    fn res_final(&mut self, t: &Type, pos: Pos, reported: &mut bool) -> &Type {
+        let r = self.inf.resolve(t);
+        if has_infer(r) {
+            if !*reported {
+                self.errorf(pos, `type annotations needed: cannot infer the type ${r}`);
+                *reported = true;
+            }
+            return self.ctx().err;
+        }
+        r
+    }
+
+    /// Stores the type of an expression.
+    pub fn record(&mut self, x: &Expr, t: &Type) -> &Type {
+        if !self.body.types.contains_key(&x.id) { self.body.type_order.push(x); }
+        self.body.types.insert(x.id, t);
+        t
+    }
+
+    /// Stores the type of a local variable.
+    pub fn set_local(&mut self, l: &mut Local, t: &Type) {
+        if !self.body.locals.contains_key(&l.id) { self.body.local_order.push(l); }
+        self.body.locals.insert(l.id, t);
+    }
+
+    /// Stores the type of a pattern.
+    pub fn set_pat(&mut self, p: &Pat, t: &Type) {
+        if !self.body.pats.contains_key(&p.id) { self.body.pat_order.push(p); }
+        self.body.pats.insert(p.id, t);
+    }
+
+    /// Records the callee of a path expression or method call.
+    pub fn set_callee(&mut self, x: &Expr, cl: &mut Callee) {
+        if !self.body.callees.contains_key(&x.id) { self.body.callee_order.push(x); }
+        self.body.callees.insert(x.id, cl);
+    }
+
+    /// Lowers a type written inside the body (let annotations, casts,
+    /// turbofish, closure parameters) and normalizes it.
+    pub fn lower(&mut self, t: &ast::Type) -> &Type {
+        let e = self.env.unwrap().no_impl("function bodies");
+        let lt = self.c.lower_type(e, t);
+        self.normalize(lt)
+    }
+
+    /// Lowers t, turning `_` (or a missing type) into a fresh variable.
+    pub fn lower_or_infer(&mut self, t: Option<&ast::Type>) -> &Type {
+        match t {
+            None => self.inf.fresh(),
+            Some(x) => match &x.kind {
+                ast::TypeKind::Infer(_) => self.inf.fresh(),
+                _ => self.lower(x),
+            },
+        }
+    }
+
+    /// Reports a mismatch between expected and found.
+    pub fn mismatch(&mut self, pos: Pos, want: &Type, got: &Type) {
+        let w = self.inf.resolve(want);
+        let g = self.inf.resolve(got);
+        if w.kind == K_ERROR || g.kind == K_ERROR { return; }
+        let ws = self.show(w);
+        let gs = self.show(g);
+        self.errorf(pos, `mismatched types: expected ${ws}, found ${gs}`);
+    }
+
+    /// Renders a type for messages, writing unresolved literal variables as
+    /// {integer} and {float}.
+    pub fn show(&mut self, t: &Type) -> String {
+        let mut s = type_string(self.inf.resolve(t));
+        if !s.contains('?') { return s; }
+        let mut i = self.inf.vars.len() as i32 - 1;
+        while i >= 0 {
+            let v = self.inf.vars[i as usize];
+            let name = `?${i}`;
+            if v.bound.is_none() {
+                if v.kind == VAR_INT {
+                    s = replace_var(s.as_str(), name.as_str(), "{integer}");
+                } else if v.kind == VAR_FLOAT {
+                    s = replace_var(s.as_str(), name.as_str(), "{float}");
+                }
+            }
+            i -= 1;
+        }
+        s
+    }
+}

@@ -1,0 +1,312 @@
+//! Builtin impls: std lang traits implemented by the compiler for
+//! primitive and structural types (Rust writes these with macros in core;
+//! navi has no macros, so the compiler provides them).
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Node};
+use crate::syntax::ast::{self, Item};
+use crate::syntax::token;
+use crate::types::*;
+use crate::types::collect::*;
+use crate::types::infer::*;
+use crate::types::body::FnCtx;
+use crate::types::solve::*;
+
+pub fn is_int_t(t: &Type) -> bool { t.kind == K_INT }
+pub fn is_float_t(t: &Type) -> bool { t.kind == K_FLOAT }
+pub fn is_num_t(t: &Type) -> bool { t.kind == K_INT || t.kind == K_FLOAT }
+pub fn is_scalar_t(t: &Type) -> bool { is_num_t(t) || t.kind == K_BOOL || t.kind == K_CHAR }
+
+/// The operator trait of a compound assignment trait ("" if none).
+pub fn assign_op_base(name: &str) -> &str {
+    if name == "AddAssign" { return "Add"; }
+    if name == "SubAssign" { return "Sub"; }
+    if name == "MulAssign" { return "Mul"; }
+    if name == "DivAssign" { return "Div"; }
+    if name == "RemAssign" { return "Rem"; }
+    if name == "BitAndAssign" { return "BitAnd"; }
+    if name == "BitOrAssign" { return "BitOr"; }
+    if name == "BitXorAssign" { return "BitXor"; }
+    if name == "ShlAssign" { return "Shl"; }
+    if name == "ShrAssign" { return "Shr"; }
+    ""
+}
+
+/// The trait arguments for an elementwise nested bound: PartialEq<Rhs> on
+/// elements uses the element type as Rhs.
+fn args_like(tr: &TraitRef, elem: &Type) -> Vec<&Type> {
+    let mut out = Vec::new();
+    if tr.args.len() > 0 { out.push(elem); }
+    out
+}
+
+fn bound(trait_def: &mut Def, self_ty: &Type, args: Vec<&Type>) -> &TraitRef {
+    &TraitRef { tdef: Some(trait_def), self_ty: Some(self_ty), args, bindings: Vec::new() }
+}
+
+fn derivable(name: &str) -> bool {
+    name == "Debug" || name == "Clone" || name == "PartialEq" || name == "Eq" || name == "PartialOrd" || name == "Ord"
+        || name == "Hash" || name == "Default"
+}
+
+impl FnCtx {
+    fn elemwise(&mut self, sel: &mut Selection, tr: &TraitRef, elems: &Vec<&Type>) {
+        for e in elems.iter() { sel.nested.push(bound(tr.trait_def(), *e, args_like(tr, *e))); }
+    }
+
+    fn elem_list(t: &Type) -> Vec<&Type> {
+        let mut v = Vec::new();
+        v.push(t.el());
+        v
+    }
+
+    fn structural(&mut self, sel: &mut Selection, tr: &TraitRef, self_ty: &Type, rhs: &Type) -> bool {
+        if self_ty.kind == K_TUPLE {
+            if !self.inf.unify(rhs, self_ty) { return false; }
+            self.elemwise(sel, tr, &self_ty.elems);
+            return true;
+        }
+        if self_ty.kind == K_ARRAY || self_ty.kind == K_SLICE {
+            if !self.inf.unify(rhs, self_ty) { return false; }
+            self.elemwise(sel, tr, &FnCtx::elem_list(self_ty));
+            return true;
+        }
+        false
+    }
+
+    fn ok_if(sel: &mut Selection, ok: bool) -> Option<&mut Selection> { if ok { Some(sel) } else { None } }
+
+    /// Whether tr has a builtin impl for self_ty. The selection's nested
+    /// obligations must also hold.
+    pub fn builtin(&mut self, tr: &TraitRef, self0: &Type, depth: i32) -> Option<&mut Selection> {
+        let name = self.lang_name(tr.trait_def());
+        if name.len() == 0 { return None; }
+        let n = name.as_str();
+        let self_ty = self.inf.shallow(self0);
+        let sel = selection(SEL_BUILTIN);
+        let rhs = if tr.args.len() > 0 { tr.args[0] } else { self_ty };
+
+        // Operators on references to numbers (&i32 + i32, f64 * &f64, ...),
+        // which Rust provides with forward_ref impls in core.
+        if n == "Add" || n == "Sub" || n == "Mul" || n == "Div" || n == "Rem" || n == "BitAnd" || n == "BitOr"
+            || n == "BitXor" || n == "Shl" || n == "Shr" {
+            let mut s0 = self_ty;
+            if s0.kind == K_REF && !s0.is_mut { s0 = self.inf.shallow(s0.el()); }
+            let mut r0 = self.inf.shallow(rhs);
+            if r0.kind == K_REF && !r0.is_mut { r0 = self.inf.shallow(r0.el()); }
+            if !same(s0, self_ty) || !same(r0, self.inf.shallow(rhs)) {
+                let lit = match self.inf.var_kind_of(s0) { Some(k) => k != VAR_GENERAL, None => false };
+                if !(is_num_t(s0) || s0.kind == K_BOOL || lit) { return None; }
+                if n != "Shl" && n != "Shr" && !self.inf.unify(s0, r0) { return None; }
+                sel.assoc.insert("Output".to_string(), s0);
+                return Some(sel);
+            }
+        }
+
+        if assign_op_base(n).len() > 0 {
+            if n == "ShlAssign" || n == "ShrAssign" {
+                let r = self.inf.shallow(rhs);
+                let rok = is_int_t(r) || r.kind == K_INFER && self.inf.vars[r.var as usize].kind == VAR_INT;
+                return FnCtx::ok_if(sel, is_int_t(self_ty) && rok);
+            }
+            if n == "BitAndAssign" || n == "BitOrAssign" || n == "BitXorAssign" {
+                return FnCtx::ok_if(sel, (is_int_t(self_ty) || self_ty.kind == K_BOOL) && self.inf.unify(rhs, self_ty));
+            }
+            return FnCtx::ok_if(sel, is_num_t(self_ty) && self.inf.unify(rhs, self_ty));
+        }
+
+        let k = self_ty.kind;
+        if n == "Clone" {
+            if is_scalar_t(self_ty) || k == K_PTR || k == K_FN || k == K_NEVER { return Some(sel); }
+            // &mut T is Clone too: every navi value can be copied, and
+            // cloning a reference copies the reference.
+            if k == K_REF { return Some(sel); }
+            if k == K_TUPLE { self.elemwise(sel, tr, &self_ty.elems); return Some(sel); }
+            if k == K_ARRAY { self.elemwise(sel, tr, &FnCtx::elem_list(self_ty)); return Some(sel); }
+        } else if n == "Default" {
+            if is_scalar_t(self_ty) { return Some(sel); }
+            if k == K_REF && !self_ty.is_mut && self.inf.shallow(self_ty.el()).kind == K_STR { return Some(sel); }
+            if k == K_TUPLE { self.elemwise(sel, tr, &self_ty.elems); return Some(sel); }
+            if k == K_ARRAY { self.elemwise(sel, tr, &FnCtx::elem_list(self_ty)); return Some(sel); }
+        } else if n == "PartialEq" || n == "PartialOrd" {
+            if is_scalar_t(self_ty) || k == K_STR || k == K_PTR || k == K_FN {
+                return FnCtx::ok_if(sel, self.inf.unify(rhs, self_ty));
+            }
+            if k == K_REF {
+                let mut r = self.inf.shallow(rhs);
+                if r.kind == K_INFER {
+                    let fv = self.inf.fresh();
+                    let r2 = self.ctx().reference(self_ty.is_mut, fv);
+                    if !self.inf.unify(r, r2) { return None; }
+                    r = self.inf.shallow(rhs);
+                }
+                if r.kind != K_REF { return None; }
+                let mut args = Vec::new();
+                args.push(r.el());
+                sel.nested.push(bound(tr.trait_def(), self_ty.el(), args));
+                return Some(sel);
+            }
+            return FnCtx::ok_if(sel, self.structural(sel, tr, self_ty, rhs));
+        } else if n == "Eq" || n == "Ord" {
+            if is_int_t(self_ty) || k == K_BOOL || k == K_CHAR || k == K_STR || k == K_PTR || k == K_NEVER { return Some(sel); }
+            if k == K_REF {
+                sel.nested.push(bound(tr.trait_def(), self_ty.el(), Vec::new()));
+                return Some(sel);
+            }
+            return FnCtx::ok_if(sel, self.structural(sel, tr, self_ty, rhs));
+        } else if n == "Hash" {
+            if is_int_t(self_ty) || k == K_BOOL || k == K_CHAR || k == K_STR || k == K_PTR { return Some(sel); }
+            if k == K_REF {
+                sel.nested.push(bound(tr.trait_def(), self_ty.el(), Vec::new()));
+                return Some(sel);
+            }
+            return FnCtx::ok_if(sel, self.structural(sel, tr, self_ty, rhs));
+        } else if n == "Debug" {
+            if is_scalar_t(self_ty) || k == K_STR || k == K_PTR || k == K_NEVER || k == K_FN { return Some(sel); }
+            if k == K_REF {
+                sel.nested.push(bound(tr.trait_def(), self_ty.el(), Vec::new()));
+                return Some(sel);
+            }
+            if k == K_TUPLE { self.elemwise(sel, tr, &self_ty.elems); return Some(sel); }
+            if k == K_ARRAY || k == K_SLICE { self.elemwise(sel, tr, &FnCtx::elem_list(self_ty)); return Some(sel); }
+        } else if n == "Display" {
+            if is_scalar_t(self_ty) || k == K_STR || k == K_NEVER { return Some(sel); }
+            if k == K_REF {
+                sel.nested.push(bound(tr.trait_def(), self_ty.el(), Vec::new()));
+                return Some(sel);
+            }
+        } else if n == "LowerHex" || n == "UpperHex" || n == "Octal" || n == "Binary" {
+            if is_int_t(self_ty) { return Some(sel); }
+            if k == K_REF {
+                sel.nested.push(bound(tr.trait_def(), self_ty.el(), Vec::new()));
+                return Some(sel);
+            }
+        } else if n == "LowerExp" || n == "UpperExp" {
+            if is_float_t(self_ty) { return Some(sel); }
+            if k == K_REF {
+                sel.nested.push(bound(tr.trait_def(), self_ty.el(), Vec::new()));
+                return Some(sel);
+            }
+        } else if n == "Add" || n == "Sub" || n == "Mul" || n == "Div" || n == "Rem" {
+            if is_num_t(self_ty) && self.inf.unify(rhs, self_ty) {
+                sel.assoc.insert("Output".to_string(), self_ty);
+                return Some(sel);
+            }
+        } else if n == "BitAnd" || n == "BitOr" || n == "BitXor" {
+            if (is_int_t(self_ty) || k == K_BOOL) && self.inf.unify(rhs, self_ty) {
+                sel.assoc.insert("Output".to_string(), self_ty);
+                return Some(sel);
+            }
+        } else if n == "Shl" || n == "Shr" {
+            let r = self.inf.shallow(rhs);
+            if is_int_t(self_ty) && (is_int_t(r) || r.kind == K_INFER && self.inf.vars[r.var as usize].kind == VAR_INT) {
+                sel.assoc.insert("Output".to_string(), self_ty);
+                return Some(sel);
+            }
+        } else if n == "Neg" {
+            if is_float_t(self_ty) || is_int_t(self_ty) && int_signed(self_ty.int) {
+                sel.assoc.insert("Output".to_string(), self_ty);
+                return Some(sel);
+            }
+        } else if n == "Not" {
+            if is_int_t(self_ty) || k == K_BOOL {
+                sel.assoc.insert("Output".to_string(), self_ty);
+                return Some(sel);
+            }
+        } else if n == "Step" {
+            if is_int_t(self_ty) || k == K_CHAR { return Some(sel); }
+        } else if n == "Deref" {
+            if k == K_REF {
+                sel.assoc.insert("Target".to_string(), self_ty.el());
+                return Some(sel);
+            }
+        } else if n == "DerefMut" {
+            if k == K_REF && self_ty.is_mut {
+                sel.assoc.insert("Target".to_string(), self_ty.el());
+                return Some(sel);
+            }
+        } else if n == "Index" || n == "IndexMut" {
+            let elem: Option<&Type> = if k == K_ARRAY || k == K_SLICE { Some(self_ty.el()) } else if k == K_STR { None } else { return None };
+            let idx = self.inf.shallow(rhs);
+            let usize_ = self.ctx().usize_();
+            if elem.is_some() && (idx.kind == K_INT && idx.int == USIZE || idx.kind == K_INFER && self.inf.vars[idx.var as usize].kind == VAR_INT) {
+                self.inf.unify(idx, usize_);
+                sel.assoc.insert("Output".to_string(), elem.unwrap());
+                return Some(sel);
+            }
+            if idx.kind == K_ADT && self.is_range_def(idx.d()) {
+                for a in idx.args.iter() {
+                    if !self.inf.unify(*a, usize_) { return None; }
+                }
+                let out = match elem { Some(e) => self.ctx().slice(e), None => self.ctx().str_ };
+                sel.assoc.insert("Output".to_string(), out);
+                return Some(sel);
+            }
+        }
+        None
+    }
+
+    pub fn is_range_def(&self, d: &Def) -> bool {
+        let n = self.lang_name(d);
+        n == "Range" || n == "RangeInclusive" || n == "RangeFrom" || n == "RangeTo" || n == "RangeToInclusive" || n == "RangeFull"
+    }
+
+    /// The selection for a derived impl of tr, if any. Like Rust's derive,
+    /// each type parameter must implement the trait too.
+    pub fn derived(&mut self, tr: &TraitRef) -> Vec<&mut Selection> {
+        let mut out = Vec::new();
+        let self_ty = self.inf.shallow(tr.self_ty.unwrap());
+        if self_ty.kind != K_ADT { return out; }
+        let name = self.lang_name(tr.trait_def());
+        if name.len() == 0 || !self.c.derives(self_ty.d()).contains_key(&name) { return out; }
+        if tr.args.len() > 0 && !self.inf.unify(tr.args[0], self_ty) { return out; }
+        let sel = selection(SEL_BUILTIN);
+        for a in self_ty.args.iter() { sel.nested.push(bound(tr.trait_def(), *a, args_like(tr, *a))); }
+        out.push(sel);
+        out
+    }
+}
+
+impl Collector {
+    /// The derived trait names of an ADT.
+    pub fn derives(&mut self, d: &Def) -> HashMap<String, bool> {
+        if let Some(ds) = self.derive_cache.get(&d.id) { return *ds; }
+        let mut ds: HashMap<String, bool> = HashMap::new();
+        let attrs: Vec<&ast::Attr> = match &d.node {
+            Node::Item(Item::Struct(n)) => n.base.attrs.clone(),
+            Node::Item(Item::Enum(n)) => n.base.attrs.clone(),
+            _ => Vec::new(),
+        };
+        for a in attrs.iter() {
+            if a.path.segments.len() != 1 || a.path.segments[0].name.value != "derive" { continue; }
+            for t in a.args.iter() {
+                if t.kind == token::IDENT {
+                    if !derivable(t.text) {
+                        self.errorf(d.file, t.pos, `cannot derive ${t.text}; derivable traits are Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash and Default`);
+                        continue;
+                    }
+                    ds.insert(t.text.to_string(), true);
+                } else if t.kind == token::COMMA {
+                } else {
+                    self.errorf(d.file, t.pos, "malformed derive attribute".to_string());
+                }
+            }
+        }
+        let has = |k: &str| -> bool { ds.contains_key(&k.to_string()) };
+        if has("Eq") && !has("PartialEq") {
+            self.errorf(d.file, d.pos, "deriving Eq requires deriving PartialEq too".to_string());
+        }
+        if has("Ord") && !(has("PartialOrd") && has("Eq")) {
+            self.errorf(d.file, d.pos, "deriving Ord requires deriving PartialOrd and Eq too".to_string());
+        }
+        if has("PartialOrd") && !has("PartialEq") {
+            self.errorf(d.file, d.pos, "deriving PartialOrd requires deriving PartialEq too".to_string());
+        }
+        if has("Default") && d.kind == resolve::DEF_ENUM {
+            self.errorf(d.file, d.pos, "Default cannot be derived for enums".to_string());
+            ds.remove(&"Default".to_string());
+        }
+        self.derive_cache.insert(d.id, ds);
+        ds
+    }
+}

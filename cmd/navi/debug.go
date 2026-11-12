@@ -99,3 +99,37 @@ func resolveDump(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "defs %d\n", len(info.Defs))
 	return 0
 }
+
+// typesDump prints the signatures and body types of a crate and std (used
+// to check the self-hosted compiler against stage0).
+func typesDump(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, "usage: navi types-dump <crate or file>")
+		return 2
+	}
+	spec, err := build.LoadCrate(args[0])
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	info, errs := build.CheckSpecs(build.HostConfig(), []*resolve.CrateSpec{build.StdCrate(), spec})
+	for _, e := range errs {
+		fmt.Fprintln(stdout, "error", e.Error())
+	}
+	for _, d := range info.Res.Defs {
+		if s := info.SigString(d); s != "" {
+			fmt.Fprintf(stdout, "sig %d %s\n", d.ID, s)
+		}
+	}
+	for _, d := range info.Res.Defs {
+		b := info.Bodies[d]
+		if b == nil {
+			continue
+		}
+		fmt.Fprintf(stdout, "body %d %s\n", d.ID, d.Name)
+		for _, l := range b.DumpLines(d.File) {
+			fmt.Fprintln(stdout, l)
+		}
+	}
+	return 0
+}

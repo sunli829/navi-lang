@@ -1,0 +1,897 @@
+//! Exhaustiveness checking with the usefulness algorithm (Maranget,
+//! "Warnings for pattern matching"), as in rustc. Checks run after type
+//! inference, when pattern types are known.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Res};
+use crate::syntax::ast::{self, Expr, ExprKind, LitKind, MatchArm, Pat, PatKind, StructKind};
+use crate::syntax::dump::{dump_path, dump_expr};
+use crate::syntax::source::Pos;
+use crate::syntax::token;
+use crate::types::*;
+use crate::types::lower::*;
+use crate::types::collect::*;
+use crate::types::body::*;
+use crate::types::pat::is_rest;
+use crate::types::consteval::parse_int_lit;
+
+pub type CtorKind = u8;
+const C_WILD: CtorKind = 0;
+/// Struct, tuple, reference, array.
+const C_SINGLE: CtorKind = 1;
+/// Enum variant (index).
+const C_VARIANT: CtorKind = 2;
+/// false = 0, true = 1.
+const C_BOOL: CtorKind = 3;
+/// Integer or char range [lo, hi].
+const C_RANGE: CtorKind = 4;
+/// Slice of length n (or at least n if var_len).
+const C_SLICE: CtorKind = 5;
+/// String/float literal: never exhaustive.
+const C_OPAQUE: CtorKind = 6;
+
+/// A deconstructed pattern.
+pub struct DPat {
+    kind: CtorKind,
+    /// Variant index / bool value.
+    index: i32,
+    lo: i64,
+    hi: i64,
+    /// Slice length.
+    n: i32,
+    /// Slice pattern with ..: length >= n (prefix/suffix split at pre).
+    var_len: bool,
+    /// Slice: elements before ..
+    pre: i32,
+    /// Opaque literal ("or" marks an or-pattern).
+    lit: String,
+    /// Subpatterns (for slices with ..: prefix and suffix).
+    fields: Vec<&DPat>,
+    ty: Option<&Type>,
+}
+
+fn dpat(kind: CtorKind, ty: Option<&Type>) -> &mut DPat {
+    &mut DPat { kind, index: 0, lo: 0, hi: 0, n: 0, var_len: false, pre: 0, lit: String::new(), fields: Vec::new(), ty }
+}
+
+fn wild() -> &DPat { dpat(C_WILD, None) }
+
+fn wilds(n: usize) -> Vec<&DPat> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n { out.push(wild()); i += 1; }
+    out
+}
+
+/// One constructor of a type's value space after splitting.
+#[derive(Clone)]
+struct Ctor {
+    kind: CtorKind,
+    index: i32,
+    lo: i64,
+    hi: i64,
+    n: i32,
+    var_len: bool,
+}
+
+fn ctor(kind: CtorKind) -> Ctor { Ctor { kind, index: 0, lo: 0, hi: 0, n: 0, var_len: false } }
+
+fn ctor_dpat(c: &Ctor, t: &Type) -> &mut DPat {
+    let d = dpat(c.kind, Some(t));
+    d.index = c.index;
+    d.lo = c.lo;
+    d.hi = c.hi;
+    d.n = c.n;
+    d.var_len = c.var_len;
+    d
+}
+
+fn is_or(d: &DPat) -> bool { d.kind == C_WILD && d.lit == "or" }
+
+/// Decodes a char literal like 'a' or '\n'.
+fn char_value(lit: &str) -> (i64, bool) {
+    let mut s = lit;
+    if s.starts_with("'") { s = &s[1..]; }
+    if s.ends_with("'") { s = &s[..s.len() - 1]; }
+    if !s.starts_with("\\") {
+        return match s.chars().next() { Some(c) => (c as i64, true), None => (0xFFFD, true) };
+    }
+    if s == "\\n" { return (10, true); }
+    if s == "\\r" { return (13, true); }
+    if s == "\\t" { return (9, true); }
+    if s == "\\\\" { return (92, true); }
+    if s == "\\0" { return (0, true); }
+    if s == "\\'" { return (39, true); }
+    if s == "\\\"" { return (34, true); }
+    if s.starts_with("\\x") {
+        return match i64::from_str_radix(&s[2..], 16) { Ok(v) => (v, true), Err(_) => (0, false) };
+    }
+    if s.starts_with("\\u{") {
+        let mut h = &s[3..];
+        if h.ends_with("}") { h = &h[..h.len() - 1]; }
+        return match i64::from_str_radix(h, 16) { Ok(v) => (v, true), Err(_) => (0, false) };
+    }
+    (0, false)
+}
+
+/// The value range of an integer or char type.
+fn domain(t: &Type) -> (i64, i64, bool) {
+    if t.kind == K_CHAR { return (0, 0x10FFFF, true); }
+    if t.kind == K_INT {
+        let k = t.int;
+        if k == I8 { return (-128, 127, true); }
+        if k == I16 { return (-32768, 32767, true); }
+        if k == I32 { return (-2147483648, 2147483647, true); }
+        if k == I64 || k == ISIZE { return (i64::MIN, i64::MAX, true); }
+        if k == U8 { return (0, 255, true); }
+        if k == U16 { return (0, 65535, true); }
+        if k == U32 { return (0, 4294967295, true); }
+        if k == U64 || k == USIZE { return (0, i64::MAX, true); } // values above i64::MAX are not tracked
+    }
+    (0, 0, false)
+}
+
+/// Whether head pattern d matches all values of ctor c.
+fn covers(d: &DPat, c: &Ctor) -> bool {
+    let k = d.kind;
+    if k == C_WILD { return true; }
+    if k == C_SINGLE { return c.kind == C_SINGLE; }
+    if k == C_VARIANT || k == C_BOOL { return d.kind == c.kind && d.index == c.index; }
+    if k == C_RANGE { return c.kind == C_RANGE && d.lo <= c.lo && c.hi <= d.hi; }
+    if k == C_SLICE {
+        if c.kind != C_SLICE { return false; }
+        if d.var_len { return c.n >= d.n; }
+        return !c.var_len && c.n == d.n;
+    }
+    false
+}
+
+/// The fields of head pattern d for constructor c with nfields fields.
+fn specialize_fields(d: &DPat, nfields: usize) -> Vec<&DPat> {
+    let mut out = wilds(nfields);
+    if d.kind == C_SINGLE || d.kind == C_VARIANT || d.kind == C_SLICE && !d.var_len {
+        let mut i = 0;
+        while i < d.fields.len() && i < nfields {
+            out[i] = d.fields[i];
+            i += 1;
+        }
+    } else if d.kind == C_SLICE {
+        let pre = d.pre as usize;
+        let suffix = d.fields.len() - pre;
+        let mut i = 0;
+        while i < pre && i < nfields {
+            out[i] = d.fields[i];
+            i += 1;
+        }
+        i = 0;
+        while i < suffix {
+            let j = nfields as i64 - suffix as i64 + i as i64;
+            if j >= 0 { out[j as usize] = d.fields[pre + i]; }
+            i += 1;
+        }
+    }
+    out
+}
+
+fn concat(a: Vec<&DPat>, b: &[&DPat]) -> Vec<&DPat> {
+    let mut out = a;
+    for x in b.iter() { out.push(*x); }
+    out
+}
+
+impl FnCtx {
+    /// Records a match for checking after inference.
+    pub fn check_exhaustive(&mut self, pos: Pos, arms: &Vec<&MatchArm>, scrut: &Type) {
+        self.deferred.push(&Deferred { pos, arms: arms.clone(), pat: None, ty: scrut, what: String::new() });
+    }
+
+    /// Requires p to match every value of type t.
+    pub fn check_irrefutable(&mut self, p: &Pat, t: &Type, what: &str) {
+        self.deferred.push(&Deferred { pos: p.pos(), arms: Vec::new(), pat: Some(p), ty: t, what: what.to_string() });
+    }
+
+    pub fn run_deferred(&mut self, d: &Deferred) {
+        let t = self.inf.resolve(d.ty);
+        let mut rows: Vec<Vec<&DPat>> = Vec::new();
+        match d.pat {
+            Some(p) => {
+                let dp = self.deconstruct(p, t);
+                for x in self.expand_or(dp).iter() {
+                    let mut r = Vec::new();
+                    r.push(*x);
+                    rows.push(r);
+                }
+            }
+            None => {
+                for a in d.arms.iter() {
+                    if a.guard.is_some() { continue; }
+                    let dp = self.deconstruct(a.pat, t);
+                    for x in self.expand_or(dp).iter() {
+                        let mut r = Vec::new();
+                        r.push(*x);
+                        rows.push(r);
+                    }
+                }
+            }
+        }
+        let mut v = Vec::new();
+        v.push(wild());
+        let mut tys = Vec::new();
+        tys.push(t);
+        let (ok, w) = self.useful(rows, v, tys);
+        if ok {
+            let ws = self.show_witness(&w, t);
+            if d.pat.is_some() {
+                self.errorf(d.pos, `refutable pattern in ${d.what} binding: ${ws} not covered; use if let or let-else`);
+            } else {
+                self.errorf(d.pos, `non-exhaustive patterns: ${ws} not covered`);
+            }
+        }
+    }
+
+    fn show_witness(&mut self, w: &Vec<&DPat>, t: &Type) -> String {
+        if w.len() == 0 { return "_".to_string(); }
+        self.show_pat(Some(w[0]), Some(t))
+    }
+
+    /// Converts a pattern matched against type t.
+    fn deconstruct(&mut self, p: &Pat, t0: &Type) -> &DPat {
+        let t = self.inf.resolve(t0);
+        match &p.kind {
+            PatKind::Wild(_) | PatKind::Rest(_) => return wild(),
+            PatKind::Ident { sub, .. } => {
+                if let Some(res) = self.info.res.pat_consts.get(&p.id) {
+                    let r = res.clone();
+                    return self.with_refs_const(t, &r);
+                }
+                if let Some(s) = sub { return self.deconstruct(*s, t); }
+                return wild();
+            }
+            PatKind::Ref { pat, .. } => {
+                if t.kind != K_REF { return wild(); }
+                let d = dpat(C_SINGLE, Some(t));
+                d.fields.push(self.deconstruct(*pat, t.el()));
+                return d;
+            }
+            PatKind::Or(alts) => {
+                let out = dpat(C_WILD, None);
+                for a in alts.iter() { out.fields.push(self.deconstruct(*a, t)); }
+                out.lit = "or".to_string();
+                return out;
+            }
+            PatKind::Lit(x) => {
+                if let ExprKind::Lit { kind, value, .. } = &x.kind {
+                    if *kind == LitKind::Str || *kind == LitKind::ByteStr {
+                        // &str literal: peel references above &str.
+                        if t.kind == K_REF && t.el().kind == K_REF {
+                            let d = dpat(C_SINGLE, Some(t));
+                            d.fields.push(self.deconstruct(p, t.el()));
+                            return d;
+                        }
+                        let d = dpat(C_OPAQUE, Some(t));
+                        d.lit = value.clone();
+                        return d;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.with_refs_pat(t, p)
+    }
+
+    /// Wraps the result for implicit dereferences (match ergonomics).
+    fn with_refs_pat(&mut self, t: &Type, p: &Pat) -> &DPat {
+        if t.kind == K_REF {
+            let d = dpat(C_SINGLE, Some(t));
+            d.fields.push(self.with_refs_pat(t.el(), p));
+            return d;
+        }
+        self.deconstruct_non_ref(p, t)
+    }
+
+    fn with_refs_const(&mut self, t: &Type, res: &Res) -> &DPat {
+        if t.kind == K_REF {
+            let d = dpat(C_SINGLE, Some(t));
+            d.fields.push(self.with_refs_const(t.el(), res));
+            return d;
+        }
+        self.const_pat(res, t)
+    }
+
+    fn const_pat(&mut self, res: &Res, t: &Type) -> &DPat {
+        let d = res.def.unwrap();
+        if d.kind == resolve::DEF_STRUCT { return dpat(C_SINGLE, Some(t)); }
+        if d.kind == resolve::DEF_VARIANT {
+            let out = dpat(C_VARIANT, Some(t));
+            out.index = self.variant_index(d);
+            out.fields = self.wild_fields(d);
+            return out;
+        }
+        if d.kind == resolve::DEF_CONST {
+            let (v, ok) = self.c.const_value(d);
+            if ok && (t.kind == K_INT || t.kind == K_CHAR) {
+                let out = dpat(C_RANGE, Some(t));
+                out.lo = v;
+                out.hi = v;
+                return out;
+            }
+        }
+        let out = dpat(C_OPAQUE, Some(t));
+        out.lit = d.name.clone();
+        out
+    }
+
+    fn variant_index(&mut self, d: &Def) -> i32 {
+        let ai = self.c.adt(d.parent.unwrap());
+        let mut i = 0;
+        while i < ai.variants.len() {
+            if ai.variants[i].def.id == d.id { return i as i32; }
+            i += 1;
+        }
+        -1
+    }
+
+    fn wild_fields(&mut self, variant: &Def) -> Vec<&DPat> {
+        for v in self.c.adt(variant.parent.unwrap()).variants.iter() {
+            if v.def.id == variant.id { return wilds(v.fields.len()); }
+        }
+        Vec::new()
+    }
+
+    fn deconstruct_non_ref(&mut self, p: &Pat, t: &Type) -> &DPat {
+        match &p.kind {
+            PatKind::Lit(x) => return self.lit_pat(*x, t),
+            PatKind::Range { lo, hi, inclusive, .. } => {
+                let (mut l, mut h) = (i64::MIN, i64::MAX);
+                let (dl, dh, dok) = domain(t);
+                if dok {
+                    l = dl;
+                    h = dh;
+                }
+                let mut ok = true;
+                if let Some(x) = lo {
+                    let (v, k) = self.pat_value(*x);
+                    l = v;
+                    ok = ok && k;
+                }
+                if let Some(x) = hi {
+                    let (v, k) = self.pat_value(*x);
+                    h = v;
+                    ok = ok && k;
+                    if !*inclusive { h = h.wrapping_sub(1); }
+                }
+                if !ok {
+                    let d = dpat(C_OPAQUE, Some(t));
+                    d.lit = "range".to_string();
+                    return d;
+                }
+                let d = dpat(C_RANGE, Some(t));
+                d.lo = l;
+                d.hi = h;
+                return d;
+            }
+            PatKind::Path(path) => {
+                let res = match self.info.res.paths.get(&path.id) { Some(r) => r.clone(), None => resolve::res_err() };
+                if res.kind == resolve::RES_DEF && res.rest.len() == 0 { return self.const_pat(&res, t); }
+                let d = dpat(C_OPAQUE, Some(t));
+                d.lit = dump_path(*path);
+                return d;
+            }
+            PatKind::TupleStruct { path, elems } => {
+                let res = match self.info.res.paths.get(&path.id) { Some(r) => r.clone(), None => resolve::res_err() };
+                let types = self.ctor_field_types(&res, t);
+                let fields = self.positional(elems, &types);
+                if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_VARIANT {
+                    let d = dpat(C_VARIANT, Some(t));
+                    d.index = self.variant_index(res.def.unwrap());
+                    d.fields = fields;
+                    return d;
+                }
+                let d = dpat(C_SINGLE, Some(t));
+                d.fields = fields;
+                return d;
+            }
+            PatKind::Struct { path, fields: fps, .. } => {
+                let res = match self.info.res.paths.get(&path.id) { Some(r) => r.clone(), None => resolve::res_err() };
+                let mut variant: Option<&mut Def> = None;
+                if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_VARIANT {
+                    variant = res.def;
+                } else if res.rest.len() == 1 && t.kind == K_ADT {
+                    for v in self.c.adt(t.d()).variants.iter_mut() {
+                        if v.def.name == res.rest[0].name.value { variant = Some(v.def); }
+                    }
+                }
+                let fields = self.adt_fields(t, variant);
+                let mut out = wilds(fields.len());
+                for fp in fps.iter() {
+                    let mut i = 0;
+                    while i < fields.len() {
+                        if fields[i].name == fp.name.value {
+                            let ft = self.field_type(t, fields[i]);
+                            out[i] = self.deconstruct(fp.pat, ft);
+                        }
+                        i += 1;
+                    }
+                }
+                if let Some(vd) = variant {
+                    let d = dpat(C_VARIANT, Some(t));
+                    d.index = self.variant_index(vd);
+                    d.fields = out;
+                    return d;
+                }
+                let d = dpat(C_SINGLE, Some(t));
+                d.fields = out;
+                return d;
+            }
+            PatKind::Tuple { elems, .. } => {
+                if t.kind != K_TUPLE { return wild(); }
+                let d = dpat(C_SINGLE, Some(t));
+                d.fields = self.positional(elems, &t.elems);
+                return d;
+            }
+            PatKind::Slice { elems, .. } => {
+                if t.kind != K_ARRAY && t.kind != K_SLICE { return wild(); }
+                let mut rest = -1i32;
+                let mut i = 0;
+                while i < elems.len() {
+                    if is_rest(elems[i]) { rest = i as i32; }
+                    i += 1;
+                }
+                if t.kind == K_ARRAY {
+                    let mut types = Vec::new();
+                    let mut j = 0;
+                    while j < t.len { types.push(t.el()); j += 1; }
+                    let d = dpat(C_SINGLE, Some(t));
+                    d.fields = self.positional(elems, &types);
+                    return d;
+                }
+                let mut fields = Vec::new();
+                for el in elems.iter() {
+                    if !is_rest(*el) { fields.push(self.deconstruct(*el, t.el())); }
+                }
+                let d = dpat(C_SLICE, Some(t));
+                d.n = fields.len() as i32;
+                d.fields = fields;
+                if rest >= 0 {
+                    d.var_len = true;
+                    d.pre = rest;
+                }
+                return d;
+            }
+            _ => {}
+        }
+        wild()
+    }
+
+    /// Maps tuple-like subpatterns (with an optional ..) to fields.
+    fn positional(&mut self, elems: &Vec<&Pat>, types: &Vec<&Type>) -> Vec<&DPat> {
+        let mut out = wilds(types.len());
+        let mut rest = -1i32;
+        let mut i = 0;
+        while i < elems.len() {
+            if is_rest(elems[i]) { rest = i as i32; }
+            i += 1;
+        }
+        if rest < 0 {
+            i = 0;
+            while i < elems.len() {
+                if i < types.len() { out[i] = self.deconstruct(elems[i], types[i]); }
+                i += 1;
+            }
+            return out;
+        }
+        let r = rest as usize;
+        i = 0;
+        while i < r && i < types.len() {
+            out[i] = self.deconstruct(elems[i], types[i]);
+            i += 1;
+        }
+        let after = elems.len() - r - 1;
+        i = 0;
+        while i < after {
+            let j = types.len() as i64 - after as i64 + i as i64;
+            if j >= 0 && (j as usize) < types.len() { out[j as usize] = self.deconstruct(elems[r + 1 + i], types[j as usize]); }
+            i += 1;
+        }
+        out
+    }
+
+    fn adt_fields(&mut self, t: &Type, variant: Option<&mut Def>) -> Vec<&mut Field> {
+        if t.kind != K_ADT { return Vec::new(); }
+        let ai = self.c.adt(t.d());
+        let vd = match variant { Some(v) => v, None => return ai.fields };
+        for v in ai.variants.iter() {
+            if v.def.id == vd.id { return v.fields; }
+        }
+        Vec::new()
+    }
+
+    fn field_type(&mut self, t: &Type, f: &Field) -> &Type {
+        let ai = self.c.adt(t.d());
+        let m = param_map(Some(ai.generics), &t.args);
+        let st = subst(self.ctx(), f.ty, &m, None);
+        let n = self.normalize(st);
+        self.inf.resolve(n)
+    }
+
+    fn ctor_field_types(&mut self, res: &Res, t: &Type) -> Vec<&Type> {
+        let mut out = Vec::new();
+        if t.kind != K_ADT { return out; }
+        let mut variant: Option<&mut Def> = None;
+        if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_VARIANT { variant = res.def; }
+        for f in self.adt_fields(t, variant).iter() { out.push(self.field_type(t, *f)); }
+        out
+    }
+
+    fn lit_pat(&mut self, x: &Expr, t: &Type) -> &DPat {
+        if t.kind == K_BOOL {
+            if let ExprKind::Lit { kind, value, .. } = &x.kind {
+                if *kind == LitKind::Bool {
+                    let d = dpat(C_BOOL, Some(t));
+                    d.index = if value == "true" { 1 } else { 0 };
+                    return d;
+                }
+            }
+        }
+        let (v, ok) = self.pat_value(x);
+        if ok && (t.kind == K_INT || t.kind == K_CHAR) {
+            let d = dpat(C_RANGE, Some(t));
+            d.lo = v;
+            d.hi = v;
+            return d;
+        }
+        let d = dpat(C_OPAQUE, Some(t));
+        d.lit = dump_expr(x);
+        d
+    }
+
+    /// Evaluates an integer, char or constant in a pattern.
+    fn pat_value(&mut self, x: &Expr) -> (i64, bool) {
+        match &x.kind {
+            ExprKind::Lit { kind, value, .. } => {
+                if *kind == LitKind::Int { return parse_int_lit(value.as_str()); }
+                if *kind == LitKind::Char { return char_value(value.as_str()); }
+                if *kind == LitKind::Byte { return char_value(&value[1..]); }
+            }
+            ExprKind::Unary { op, x: inner, .. } => {
+                if *op == token::MINUS {
+                    let (v, ok) = self.pat_value(*inner);
+                    return (v.wrapping_neg(), ok);
+                }
+            }
+            ExprKind::Path(p) => {
+                let res = match self.info.res.paths.get(&p.id) { Some(r) => r.clone(), None => return (0, false) };
+                if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_CONST && res.rest.len() == 0 {
+                    return self.c.const_value(res.def.unwrap());
+                }
+                if res.kind == resolve::RES_PRIM && res.rest.len() == 1 {
+                    let (lo, hi, ok) = domain(self.c.prim(res.prim.as_str()));
+                    let n = res.rest[0].name.value.as_str();
+                    if n == "MIN" { return (lo, ok); }
+                    if n == "MAX" { return (hi, ok); }
+                }
+            }
+            _ => {}
+        }
+        (0, false)
+    }
+
+    /// Turns or-patterns at the top into separate patterns. Nested
+    /// or-patterns are expanded lazily during specialization.
+    fn expand_or(&mut self, d: &DPat) -> Vec<&DPat> {
+        let mut out = Vec::new();
+        if is_or(d) {
+            for a in d.fields.iter() {
+                for x in self.expand_or(*a).iter() { out.push(*x); }
+            }
+            return out;
+        }
+        out.push(d);
+        out
+    }
+
+    /// Expands or-patterns in the first column.
+    fn expand_rows(&mut self, rows: Vec<Vec<&DPat>>) -> Vec<Vec<&DPat>> {
+        let mut out: Vec<Vec<&DPat>> = Vec::new();
+        for r in rows.iter() {
+            if r.len() > 0 && is_or(r[0]) {
+                for a in self.expand_or(r[0]).iter() {
+                    let mut nr = Vec::new();
+                    nr.push(*a);
+                    for x in r[1..].iter() { nr.push(*x); }
+                    let mut one = Vec::new();
+                    one.push(nr);
+                    for e in self.expand_rows(one).iter() { out.push(e.clone()); }
+                }
+                continue;
+            }
+            out.push(r.clone());
+        }
+        out
+    }
+
+    /// The field types of a constructor at type t.
+    fn arity(&mut self, c: &Ctor, t: &Type) -> Vec<&Type> {
+        let mut out = Vec::new();
+        if c.kind == C_SINGLE {
+            if t.kind == K_TUPLE { return t.elems.clone(); }
+            if t.kind == K_REF { out.push(t.el()); return out; }
+            if t.kind == K_ARRAY {
+                let mut i = 0;
+                while i < t.len { out.push(t.el()); i += 1; }
+                return out;
+            }
+            if t.kind == K_ADT {
+                for f in self.adt_fields(t, None).iter() { out.push(self.field_type(t, *f)); }
+                return out;
+            }
+        } else if c.kind == C_VARIANT {
+            let v = self.c.adt(t.d()).variants[c.index as usize];
+            for f in v.fields.iter() { out.push(self.field_type(t, *f)); }
+        } else if c.kind == C_SLICE {
+            let mut i = 0;
+            while i < c.n { out.push(t.el()); i += 1; }
+        }
+        out
+    }
+
+    /// The constructors of t split according to the patterns in the first
+    /// column, and whether that set is complete (finite).
+    fn all_ctors(&mut self, t: &Type, heads: &Vec<&DPat>) -> (Vec<Ctor>, bool) {
+        let mut out: Vec<Ctor> = Vec::new();
+        let k = t.kind;
+        if k == K_BOOL {
+            out.push(ctor(C_BOOL));
+            let mut c1 = ctor(C_BOOL);
+            c1.index = 1;
+            out.push(c1);
+            return (out, true);
+        }
+        if k == K_NEVER { return (out, true); }
+        if k == K_TUPLE || k == K_REF || k == K_ARRAY {
+            out.push(ctor(C_SINGLE));
+            return (out, true);
+        }
+        if k == K_ADT {
+            let ai = self.c.adt(t.d());
+            if !ai.is_enum {
+                out.push(ctor(C_SINGLE));
+                return (out, true);
+            }
+            let mut i = 0;
+            while i < ai.variants.len() {
+                let mut c = ctor(C_VARIANT);
+                c.index = i as i32;
+                out.push(c);
+                i += 1;
+            }
+            return (out, true);
+        }
+        if k == K_INT || k == K_CHAR {
+            let (lo, hi, _) = domain(t);
+            // Split the domain at every range boundary.
+            let mut points: HashMap<i64, bool> = HashMap::new();
+            points.insert(lo, true);
+            for h in heads.iter() {
+                if h.kind == C_RANGE {
+                    points.insert(h.lo, true);
+                    if h.hi < hi { points.insert(h.hi + 1, true); }
+                }
+            }
+            let mut ps: Vec<i64> = Vec::new();
+            for (p, _) in points.iter() {
+                if *p >= lo && *p <= hi { ps.push(*p); }
+            }
+            ps.sort();
+            let mut i = 0;
+            while i < ps.len() {
+                let end = if i + 1 < ps.len() { ps[i + 1] - 1 } else { hi };
+                let mut c = ctor(C_RANGE);
+                c.lo = ps[i];
+                c.hi = end;
+                out.push(c);
+                i += 1;
+            }
+            return (out, true);
+        }
+        if k == K_SLICE {
+            let mut max_len = 0;
+            for h in heads.iter() {
+                if h.kind == C_SLICE && h.n + 1 > max_len { max_len = h.n + 1; }
+            }
+            let mut n = 0;
+            while n < max_len {
+                let mut c = ctor(C_SLICE);
+                c.n = n;
+                out.push(c);
+                n += 1;
+            }
+            let mut c = ctor(C_SLICE);
+            c.n = max_len;
+            c.var_len = true;
+            out.push(c);
+            return (out, true);
+        }
+        (out, false)
+    }
+
+    fn specialize(&mut self, rows: &Vec<Vec<&DPat>>, head: &DPat, v: &Vec<&DPat>, tys: &Vec<&Type>, c: &Ctor, t: &Type) -> (bool, Vec<&DPat>) {
+        let ftys = self.arity(c, t);
+        let mut srows: Vec<Vec<&DPat>> = Vec::new();
+        for r in rows.iter() {
+            if covers(r[0], c) { srows.push(concat(specialize_fields(r[0], ftys.len()), &r[1..])); }
+        }
+        let sv = concat(specialize_fields(head, ftys.len()), &v[1..]);
+        let mut stys = ftys.clone();
+        for x in tys[1..].iter() { stys.push(*x); }
+        let (ok, w) = self.useful(srows, sv, stys);
+        if !ok { return (false, Vec::new()); }
+        let wd = ctor_dpat(c, t);
+        let mut i = 0;
+        while i < ftys.len() { wd.fields.push(w[i]); i += 1; }
+        let mut out: Vec<&DPat> = Vec::new();
+        out.push(wd);
+        for x in w[ftys.len()..].iter() { out.push(*x); }
+        (true, out)
+    }
+
+    /// Whether v matches some value not matched by rows, with such a value
+    /// as a witness.
+    fn useful(&mut self, rows0: Vec<Vec<&DPat>>, v: Vec<&DPat>, tys: Vec<&Type>) -> (bool, Vec<&DPat>) {
+        if v.len() == 0 { return (rows0.len() == 0, Vec::new()); }
+        let rows = self.expand_rows(rows0);
+        if is_or(v[0]) {
+            for a in self.expand_or(v[0]).iter() {
+                let mut nv = Vec::new();
+                nv.push(*a);
+                for x in v[1..].iter() { nv.push(*x); }
+                let (ok, w) = self.useful(rows.clone(), nv, tys.clone());
+                if ok { return (true, w); }
+            }
+            return (false, Vec::new());
+        }
+        let t = tys[0];
+        let mut heads: Vec<&DPat> = Vec::new();
+        for r in rows.iter() { heads.push(r[0]); }
+        let head = v[0];
+
+        if head.kind != C_WILD {
+            let mut hs = heads.clone();
+            hs.push(head);
+            let (ctors, _) = self.all_ctors(t, &hs);
+            for c in ctors.iter() {
+                if covers(head, c) {
+                    let (ok, w) = self.specialize(&rows, head, &v, &tys, c, t);
+                    if ok { return (true, w); }
+                }
+            }
+            if head.kind == C_OPAQUE {
+                // Opaque literals: useful unless an identical literal or a wildcard precedes.
+                for r in rows.iter() {
+                    if r[0].kind == C_WILD || r[0].kind == C_OPAQUE && r[0].lit == head.lit {
+                        return self.useful(Vec::new(), v[1..].to_vec(), tys[1..].to_vec());
+                    }
+                }
+                return (true, v.clone());
+            }
+            return (false, Vec::new());
+        }
+
+        let (ctors, complete) = self.all_ctors(t, &heads);
+        let mut missing: Vec<Ctor> = Vec::new();
+        if complete {
+            for c in ctors.iter() {
+                let mut seen = false;
+                for h in heads.iter() {
+                    if h.kind != C_WILD && covers(*h, c) { seen = true; }
+                }
+                if !seen { missing.push(c.clone()); }
+            }
+        }
+        if complete && missing.len() == 0 {
+            for c in ctors.iter() {
+                let (ok, w) = self.specialize(&rows, head, &v, &tys, c, t);
+                if ok { return (true, w); }
+            }
+            return (false, Vec::new());
+        }
+        // Default matrix: rows whose head is a wildcard.
+        let mut drows: Vec<Vec<&DPat>> = Vec::new();
+        for r in rows.iter() {
+            if r[0].kind == C_WILD { drows.push(r[1..].to_vec()); }
+        }
+        let (ok, w) = self.useful(drows, v[1..].to_vec(), tys[1..].to_vec());
+        if !ok { return (false, Vec::new()); }
+        let wd: &DPat = if missing.len() > 0 {
+            let c = missing[0].clone();
+            let d = ctor_dpat(&c, t);
+            let n = self.arity(&c, t).len();
+            let mut i = 0;
+            while i < n { d.fields.push(wild()); i += 1; }
+            d
+        } else {
+            wild()
+        };
+        let mut out = Vec::new();
+        out.push(wd);
+        for x in w.iter() { out.push(*x); }
+        (true, out)
+    }
+
+    /// Renders a witness pattern for messages.
+    fn show_pat(&mut self, od: Option<&DPat>, t0: Option<&Type>) -> String {
+        let d = match od { Some(d) => d, None => return "_".to_string() };
+        if d.kind == C_WILD { return "_".to_string(); }
+        let t: Option<&Type> = match d.ty { Some(x) => Some(x), None => t0 };
+        let c = Ctor { kind: d.kind, index: d.index, lo: d.lo, hi: d.hi, n: d.n, var_len: d.var_len };
+        let k = d.kind;
+        if k == C_BOOL { return if d.index == 1 { "true".to_string() } else { "false".to_string() }; }
+        if k == C_RANGE {
+            let tt = t.unwrap();
+            let is_char = tt.kind == K_CHAR;
+            if d.lo == d.hi { return show_value(d.lo, is_char); }
+            let (lo, hi, _) = domain(tt);
+            if d.hi == hi && d.lo == lo { return "_".to_string(); }
+            let mut l = show_value(d.lo, is_char);
+            let mut h = show_value(d.hi, is_char);
+            if tt.kind == K_INT && d.lo == lo { l = `${tt}::MIN`; }
+            if tt.kind == K_INT && d.hi == hi { h = `${tt}::MAX`; }
+            return `${l}..=${h}`;
+        }
+        if k == C_SLICE {
+            let tt = t.unwrap();
+            let ar = self.arity(&c, tt);
+            let mut fs = self.show_fields(d, &ar);
+            if d.var_len { fs.push("..".to_string()); }
+            return `[${fs.join(", ")}]`;
+        }
+        if k == C_VARIANT {
+            let tt = t.unwrap();
+            let v = self.c.adt(tt.d()).variants[d.index as usize];
+            let mut name = `${tt.d().name}::${v.def.name}`;
+            let lang = self.lang_name(tt.d());
+            if lang == "Option" || lang == "Result" { name = v.def.name.clone(); }
+            let ar = self.arity(&c, tt);
+            let fs = self.show_fields(d, &ar);
+            return match v.kind {
+                StructKind::Unit => name,
+                StructKind::Tuple => `${name}(${fs.join(", ")})`,
+                StructKind::Named => `${name} { .. }`,
+            };
+        }
+        if k == C_SINGLE {
+            let tt = t.unwrap();
+            let ar = self.arity(&c, tt);
+            let fs = self.show_fields(d, &ar);
+            if tt.kind == K_REF { return `&${fs[0]}`; }
+            if tt.kind == K_TUPLE { return `(${fs.join(", ")})`; }
+            if tt.kind == K_ARRAY { return `[${fs.join(", ")}]`; }
+            if tt.kind == K_ADT {
+                if self.c.adt(tt.d()).kind == StructKind::Tuple { return `${tt.d().name}(${fs.join(", ")})`; }
+                return `${tt.d().name} { .. }`;
+            }
+        }
+        "_".to_string()
+    }
+
+    fn show_fields(&mut self, d: &DPat, tys: &Vec<&Type>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < d.fields.len() {
+            let ft = if i < tys.len() { Some(tys[i]) } else { None };
+            out.push(self.show_pat(Some(d.fields[i]), ft));
+            i += 1;
+        }
+        out
+    }
+}
+
+fn show_value(v: i64, is_char: bool) -> String {
+    if is_char {
+        return match char::from_u32(v as u32) {
+            Some(c) => crate::util::quote_char(c),
+            None => "'\\ufffd'".to_string(),
+        };
+    }
+    `${v}`
+}

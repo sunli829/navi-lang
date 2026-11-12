@@ -1,0 +1,648 @@
+//! Signature collection: computes item signatures on demand and caches
+//! them, then runs the item-level checks and the body checker.
+
+use std::collections::HashMap;
+use crate::diag::Sink;
+use crate::resolve::{self, Def, Crate, Module, Node, Visibility};
+use crate::syntax::ast;
+use crate::syntax::ast::Item;
+use crate::syntax::source::{File, Pos};
+use crate::types::*;
+use crate::types::lower::*;
+use crate::types::body::BodyInfo;
+
+/// The key of inherent impls in impls_of.
+pub const INHERENT: u32 = 0xFFFFFFFF;
+
+/// The results of type collection and type checking.
+pub struct Info {
+    pub ctx: &mut Ctx,
+    pub res: &mut resolve::Info,
+    pub adts: HashMap<u32, &mut AdtInfo>,
+    pub fns: HashMap<u32, &mut FnSig>,
+    pub traits: HashMap<u32, &mut TraitInfo>,
+    pub impls: HashMap<u32, &mut ImplInfo>,
+    pub assoc: HashMap<u32, &mut AssocTypeInfo>,
+    pub consts: HashMap<u32, &mut ConstInfo>,
+    pub aliases: HashMap<u32, &mut AliasInfo>,
+    /// Impls by the trait they implement (INHERENT: inherent impls).
+    pub impls_of: HashMap<u32, Vec<&mut ImplInfo>>,
+    /// Well-known std items by name (Option, Iterator, Deref, ...).
+    pub lang: HashMap<String, &mut Def>,
+    /// The type-checked bodies of functions, consts and statics.
+    pub bodies: HashMap<u32, &mut BodyInfo>,
+    /// The concrete type each opaque return type stands for (by type id).
+    pub hidden: HashMap<u32, &Type>,
+    pub c: Option<&mut Collector>,
+}
+
+impl Info {
+    pub fn lang_def(&self, name: &str) -> Option<&mut Def> {
+        match self.lang.get(&name.to_string()) { Some(d) => Some(*d), None => None }
+    }
+    pub fn impls_of_trait(&self, id: u32) -> Vec<&mut ImplInfo> {
+        match self.impls_of.get(&id) { Some(v) => v.clone(), None => Vec::new() }
+    }
+}
+
+/// Computes item signatures on demand and caches them.
+pub struct Collector {
+    pub info: &mut Info,
+    pub errs: &mut Sink,
+    /// >0 while lowering speculatively; errors are dropped.
+    pub quiet: i32,
+    pub children: HashMap<u32, Vec<&mut Def>>,
+    pub gens: HashMap<u32, &mut Generics>,
+    pub impl_self: HashMap<u32, &Type>,
+    pub busy: HashMap<u32, bool>,
+    pub consts: HashMap<u32, i64>,
+    pub lang_of: HashMap<u32, String>,
+    pub derive_cache: HashMap<u32, HashMap<String, bool>>,
+    /// The generics declaring each type parameter (by parameter def id).
+    pub param_owner: HashMap<u32, &mut Generics>,
+    /// Inherent impls by impl_key of the self type.
+    pub inherent: Option<HashMap<String, Vec<&mut ImplInfo>>>,
+    next_synth: u32,
+}
+
+impl Collector {
+    pub fn errorf(&mut self, f: Option<&File>, pos: Pos, msg: String) {
+        if self.quiet > 0 { return; }
+        self.errs.errorf(f, pos, msg);
+    }
+
+    pub fn ctx(&mut self) -> &mut Ctx { self.info.ctx }
+
+    /// A definition made up by the type checker (the parameter of an
+    /// argument-position impl Trait).
+    pub fn synth_def(&mut self, kind: resolve::DefKind, name: &str, krate: &mut Crate, file: Option<&File>, pos: Pos) -> &mut Def {
+        self.next_synth += 1;
+        &mut Def { id: 0x40000000 + self.next_synth, kind, name: name.to_string(), krate, file, pos, node: Node::None,
+            parent: None, vis: resolve::public(), module: None, ctor: false }
+    }
+
+    pub fn lang_name(&self, d: &Def) -> String {
+        match self.lang_of.get(&d.id) { Some(s) => s.clone(), None => String::new() }
+    }
+
+    pub fn children_of(&self, d: &Def) -> Vec<&mut Def> {
+        match self.children.get(&d.id) { Some(v) => v.clone(), None => Vec::new() }
+    }
+}
+
+/// Computes the signatures of every item in the resolved crates and runs
+/// the item-level and body checks.
+pub fn collect(res: &mut resolve::Info, errs: &mut Sink) -> &mut Info {
+    let info = &mut Info { ctx: new_ctx(), res, adts: HashMap::new(), fns: HashMap::new(), traits: HashMap::new(),
+        impls: HashMap::new(), assoc: HashMap::new(), consts: HashMap::new(), aliases: HashMap::new(),
+        impls_of: HashMap::new(), lang: HashMap::new(), bodies: HashMap::new(), hidden: HashMap::new(), c: None };
+    let c = &mut Collector { info, errs, quiet: 0, children: HashMap::new(), gens: HashMap::new(), impl_self: HashMap::new(),
+        busy: HashMap::new(), consts: HashMap::new(), lang_of: HashMap::new(), derive_cache: HashMap::new(),
+        param_owner: HashMap::new(), inherent: None, next_synth: 0 };
+    info.c = Some(c);
+    let defs = res.defs.clone();
+    for d in defs.iter() {
+        if d.kind == resolve::DEF_ASSOC_FN || d.kind == resolve::DEF_ASSOC_CONST || d.kind == resolve::DEF_ASSOC_TYPE {
+            let pid = d.parent.unwrap().id;
+            if !c.children.contains_key(&pid) { c.children.insert(pid, Vec::new()); }
+            let mut list = c.children[&pid];
+            list.push(*d);
+        }
+    }
+    c.find_lang();
+    for d in defs.iter() { c.collect_def(*d); }
+    for d in defs.iter() {
+        let k = d.kind;
+        if k == resolve::DEF_STRUCT || k == resolve::DEF_ENUM {
+            c.check_adt(*d);
+            c.derives(*d);
+        } else if k == resolve::DEF_IMPL {
+            c.check_impl(*d);
+            c.check_impl_sigs(*d);
+        } else if k == resolve::DEF_TRAIT {
+            c.check_trait(*d);
+        }
+    }
+    c.check_overlap();
+    c.check_bodies();
+    info
+}
+
+const LANG_PATHS: [&str; 64] = [
+    "Option=option::Option", "Result=result::Result", "String=string::String", "Vec=vec::Vec",
+    "Iterator=iter::Iterator", "IntoIterator=iter::IntoIterator", "FromIterator=iter::FromIterator",
+    "Deref=ops::Deref", "DerefMut=ops::DerefMut", "Index=ops::Index", "IndexMut=ops::IndexMut",
+    "Add=ops::Add", "Sub=ops::Sub", "Mul=ops::Mul", "Div=ops::Div", "Rem=ops::Rem", "Neg=ops::Neg", "Not=ops::Not",
+    "BitAnd=ops::BitAnd", "BitOr=ops::BitOr", "BitXor=ops::BitXor", "Shl=ops::Shl", "Shr=ops::Shr",
+    "Range=ops::Range", "RangeInclusive=ops::RangeInclusive", "RangeFrom=ops::RangeFrom", "RangeTo=ops::RangeTo",
+    "RangeToInclusive=ops::RangeToInclusive", "RangeFull=ops::RangeFull",
+    "PartialEq=cmp::PartialEq", "PartialOrd=cmp::PartialOrd", "Eq=cmp::Eq", "Ord=cmp::Ord",
+    "Clone=clone::Clone", "Default=default::Default", "Hash=hash::Hash", "From=convert::From",
+    "Display=fmt::Display", "Debug=fmt::Debug", "Arguments=fmt::Arguments", "Formatter=fmt::Formatter",
+    "Location=panic::Location",
+    "AddAssign=ops::AddAssign", "SubAssign=ops::SubAssign", "MulAssign=ops::MulAssign", "DivAssign=ops::DivAssign",
+    "RemAssign=ops::RemAssign", "BitAndAssign=ops::BitAndAssign", "BitOrAssign=ops::BitOrAssign",
+    "BitXorAssign=ops::BitXorAssign", "ShlAssign=ops::ShlAssign", "ShrAssign=ops::ShrAssign",
+    "LowerHex=fmt::LowerHex", "UpperHex=fmt::UpperHex", "Octal=fmt::Octal", "Binary=fmt::Binary",
+    "LowerExp=fmt::LowerExp", "UpperExp=fmt::UpperExp", "Ordering=cmp::Ordering", "Step=iter::Step",
+    "RecvError=sync::mpmc::RecvError", "Sender=sync::mpmc::Sender", "Receiver=sync::mpmc::Receiver", "",
+];
+
+/// The generics syntax of an item node.
+pub fn item_generics(n: Node) -> Option<&mut ast::Generics> {
+    match n {
+        Node::Item(it) => match it {
+            Item::Fn(x) => Some(x.generics),
+            Item::Struct(x) => Some(x.generics),
+            Item::Enum(x) => Some(x.generics),
+            Item::TypeAlias(x) => Some(x.generics),
+            Item::Trait(x) => Some(x.generics),
+            Item::Impl(x) => Some(x.generics),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub fn is_assoc(d: &Def) -> bool {
+    d.kind == resolve::DEF_ASSOC_FN || d.kind == resolve::DEF_ASSOC_CONST || d.kind == resolve::DEF_ASSOC_TYPE
+}
+
+pub fn has_attr(attrs: &Vec<&ast::Attr>, name: &str) -> bool {
+    for a in attrs.iter() {
+        if a.path.segments.len() == 1 && a.path.segments[0].name.value == name { return true; }
+    }
+    false
+}
+
+pub fn fn_decl(d: &Def) -> &mut ast::FnDecl {
+    match &d.node { Node::Item(Item::Fn(f)) => *f, _ => panic("not a function") }
+}
+
+pub fn impl_decl(d: &Def) -> &mut ast::ImplDecl {
+    match &d.node { Node::Item(Item::Impl(x)) => *x, _ => panic("not an impl") }
+}
+
+pub fn itoa(i: usize) -> String { `${i}` }
+
+impl Collector {
+    fn collect_def(&mut self, d: &mut Def) {
+        let k = d.kind;
+        if k == resolve::DEF_STRUCT || k == resolve::DEF_ENUM {
+            self.adt(d);
+        } else if k == resolve::DEF_TRAIT {
+            self.trait_info(d);
+        } else if k == resolve::DEF_TYPE_ALIAS {
+            self.alias(d);
+        } else if k == resolve::DEF_FN || k == resolve::DEF_ASSOC_FN || k == resolve::DEF_EXTERN_FN {
+            self.fn_sig(d);
+        } else if k == resolve::DEF_IMPL {
+            self.impl_info(d);
+        } else if k == resolve::DEF_ASSOC_TYPE {
+            self.assoc_type(d);
+        } else if k == resolve::DEF_CONST || k == resolve::DEF_STATIC || k == resolve::DEF_ASSOC_CONST || k == resolve::DEF_EXTERN_STATIC {
+            self.const_info(d);
+        }
+    }
+
+    /// Records well-known std items by their std path.
+    fn find_lang(&mut self) {
+        let mut std: Option<&mut Crate> = None;
+        for cr in self.info.res.crates.iter() {
+            if cr.is_std { std = Some(*cr); }
+        }
+        let s = match std { Some(s) => s, None => return };
+        for entry in LANG_PATHS.iter() {
+            if entry.len() == 0 { continue; }
+            let (name, path) = entry.split_once('=').unwrap();
+            let segs: Vec<&str> = path.split("::").collect();
+            let mut m = s.root.unwrap();
+            let mut def: Option<&mut Def> = None;
+            let mut i = 0;
+            while i < segs.len() {
+                let b = match m.lookup(segs[i], resolve::TYPE_NS) { Some(b) => b, None => break };
+                if i == segs.len() - 1 {
+                    def = b.res.def;
+                } else {
+                    match b.res.def {
+                        Some(bd) => match bd.module { Some(bm) => { m = bm; } None => break },
+                        None => break,
+                    }
+                }
+                i += 1;
+            }
+            if let Some(d) = def {
+                self.info.lang.insert(name.to_string(), d);
+                self.lang_of.insert(d.id, name.to_string());
+            }
+        }
+    }
+
+    // --- Environments and generics ------------------------------------------------
+
+    /// The lowering environment inside item d.
+    pub fn env_for(&mut self, d: &mut Def) -> Env {
+        let gen = self.generics_of(d);
+        let mut e = new_env(d.file, d.krate, gen);
+        let owner = if is_assoc(d) { d.parent.unwrap() } else { d };
+        if owner.kind == resolve::DEF_TRAIT {
+            e.trait_owner = Some(owner);
+            e.self_ty = Some(self.ctx().self_param(owner));
+            e.ast_gen.push(item_generics(owner.node.clone()));
+        } else if owner.kind == resolve::DEF_IMPL {
+            e.self_ty = Some(self.impl_self_type(owner));
+            e.ast_gen.push(item_generics(owner.node.clone()));
+            let ii = self.impl_info(owner);
+            e.impl_trait = ii.trait_ref;
+        }
+        if d.id != owner.id {
+            e.ast_gen.push(item_generics(d.node.clone()));
+        } else if owner.kind != resolve::DEF_TRAIT && owner.kind != resolve::DEF_IMPL {
+            e.ast_gen.push(item_generics(d.node.clone()));
+        }
+        e
+    }
+
+    /// The generics of an item (with parent generics for associated items).
+    pub fn generics_of(&mut self, d: &mut Def) -> &mut Generics {
+        if let Some(g) = self.gens.get(&d.id) { return *g; }
+        let parent = if is_assoc(d) { Some(self.generics_of(d.parent.unwrap())) } else { None };
+        let g = &mut Generics { parent, params: Vec::new(), preds: Vec::new(), self_trait: None };
+        if d.kind == resolve::DEF_TRAIT { g.self_trait = Some(d); }
+        self.gens.insert(d.id, g);
+        let ag = match item_generics(d.node.clone()) { Some(x) => x, None => return g };
+        for gp in ag.params.iter() {
+            let pd = match self.info.res.def_of.get(&gp.id) { Some(p) => *p, None => continue };
+            let tp = &mut TypeParam { def: pd, ty: self.ctx().param(pd), default: None };
+            self.param_owner.insert(pd.id, g);
+            g.params.push(tp);
+        }
+        let mut e = new_env(d.file, d.krate, g);
+        e.impl_note = "generic bounds".to_string();
+        if d.kind == resolve::DEF_TRAIT {
+            e.trait_owner = Some(d);
+            e.self_ty = Some(self.ctx().self_param(d));
+            e.ast_gen.push(Some(ag));
+        } else if is_assoc(d) && d.parent.unwrap().kind == resolve::DEF_TRAIT {
+            let p = d.parent.unwrap();
+            e.trait_owner = Some(p);
+            e.self_ty = Some(self.ctx().self_param(p));
+            e.ast_gen.push(item_generics(p.node.clone()));
+            e.ast_gen.push(Some(ag));
+        } else if is_assoc(d) && d.parent.unwrap().kind == resolve::DEF_IMPL {
+            let p = d.parent.unwrap();
+            e.self_ty = Some(self.impl_self_type(p));
+            e.ast_gen.push(item_generics(p.node.clone()));
+            e.ast_gen.push(Some(ag));
+        } else {
+            e.ast_gen.push(Some(ag));
+        }
+        let mut i = 0;
+        while i < ag.params.len() {
+            let gp = ag.params[i];
+            if let Some(dt) = gp.default {
+                if i < g.params.len() {
+                    if d.kind == resolve::DEF_FN || is_assoc(d) || d.kind == resolve::DEF_IMPL {
+                        self.errorf(d.file, gp.name.pos, "default type parameters are only allowed on structs, enums, type aliases and traits".to_string());
+                    }
+                    g.params[i].default = Some(self.lower_type(e, dt));
+                }
+            }
+            i += 1;
+        }
+        i = 0;
+        while i < ag.params.len() && i < g.params.len() {
+            for b in ag.params[i].bounds.iter() {
+                if let Some(tr) = self.lower_trait_ref(e, *b, Some(g.params[i].ty)) { g.preds.push(&Pred { trait_ref: tr }); }
+            }
+            i += 1;
+        }
+        for wp in ag.wheres.iter() {
+            let self_ty = self.lower_type(e, wp.ty);
+            for b in wp.bounds.iter() {
+                if let Some(tr) = self.lower_trait_ref(e, *b, Some(self_ty)) { g.preds.push(&Pred { trait_ref: tr }); }
+            }
+        }
+        g
+    }
+
+    /// `Self: Trait<P1, ...>` inside trait d.
+    pub fn self_trait_ref(&mut self, trait_def: &mut Def) -> &TraitRef {
+        let s = self.ctx().self_param(trait_def);
+        let mut args = Vec::new();
+        for p in self.generics_of(trait_def).params.iter() { args.push(p.ty); }
+        &TraitRef { tdef: Some(trait_def), self_ty: Some(s), args, bindings: Vec::new() }
+    }
+
+    /// tr and, recursively, each supertrait with parameters substituted
+    /// (each trait once, in preorder).
+    pub fn supertraits(&mut self, tr: &TraitRef) -> Vec<&TraitRef> {
+        let mut seen: HashMap<u32, bool> = HashMap::new();
+        let mut out = Vec::new();
+        self.walk_supers(tr, &mut seen, &mut out);
+        out
+    }
+
+    fn walk_supers(&mut self, t: &TraitRef, seen: &mut HashMap<u32, bool>, out: &mut Vec<&TraitRef>) {
+        if seen.contains_key(&t.trait_def().id) { return; }
+        seen.insert(t.trait_def().id, true);
+        out.push(t);
+        let ti = match self.trait_info(t.trait_def()) { Some(x) => x, None => return };
+        let m = param_map(Some(ti.generics), &t.args);
+        for sup in ti.supers.iter() {
+            let s = subst_trait_ref(self.ctx(), *sup, &m, t.self_ty);
+            self.walk_supers(s, seen, out);
+        }
+    }
+
+    /// The supertrait reference of tr naming trait def.
+    pub fn trait_ref_for(&mut self, tr: &TraitRef, def: &Def) -> &TraitRef {
+        for t in self.supertraits(tr).iter() {
+            if t.trait_def().id == def.id { return *t; }
+        }
+        tr
+    }
+
+    pub fn find_own_assoc_type(&self, trait_def: &Def, name: &str) -> Option<&mut Def> {
+        for ch in self.children_of(trait_def).iter() {
+            if ch.kind == resolve::DEF_ASSOC_TYPE && ch.name == name { return Some(*ch); }
+        }
+        None
+    }
+
+    /// Finds an associated type in a trait or its supertraits.
+    pub fn find_assoc_type(&mut self, trait_def: &mut Def, name: &str) -> Option<&mut Def> {
+        let s = self.ctx().self_param(trait_def);
+        let tr = &TraitRef { tdef: Some(trait_def), self_ty: Some(s), args: Vec::new(), bindings: Vec::new() };
+        self.find_assoc_type_in_supers(tr, name)
+    }
+
+    pub fn find_assoc_type_in_supers(&mut self, tr: &TraitRef, name: &str) -> Option<&mut Def> {
+        for t in self.supertraits(tr).iter() {
+            if let Some(a) = self.find_own_assoc_type(t.trait_def(), name) { return Some(a); }
+        }
+        None
+    }
+
+    // --- Signatures --------------------------------------------------------------------
+
+    pub fn adt(&mut self, d: &mut Def) -> &mut AdtInfo {
+        if let Some(ai) = self.info.adts.get(&d.id) { return *ai; }
+        let g = self.generics_of(d);
+        let ai = &mut AdtInfo { def: d, generics: g, is_enum: d.kind == resolve::DEF_ENUM, kind: ast::StructKind::Named,
+            fields: Vec::new(), variants: Vec::new() };
+        self.info.adts.insert(d.id, ai);
+        let mut e = self.env_for(d);
+        e.impl_note = "field types".to_string();
+        match &d.node {
+            Node::Item(Item::Struct(n)) => {
+                ai.kind = n.kind.clone();
+                ai.fields = self.lower_fields(e, d, &n.fields);
+            }
+            Node::Item(Item::Enum(n)) => {
+                let mut next = 0i64;
+                let mut seen: HashMap<i64, String> = HashMap::new();
+                for v in n.variants.iter() {
+                    let vd = self.info.res.def_of[&v.id];
+                    let mut fields = self.lower_fields(e, d, &v.fields);
+                    for f in fields.iter_mut() { f.vis = resolve::public(); }
+                    let vi = &mut VariantInfo { def: vd, kind: v.kind.clone(), fields, discr: 0 };
+                    if let Some(dx) = v.discriminant {
+                        let (val, ok) = self.eval_const(d.file, dx);
+                        if ok { next = val; }
+                    }
+                    vi.discr = next;
+                    if let Some(other) = seen.get(&next) {
+                        self.errorf(d.file, v.name.pos, `discriminant value ${next} is already used by variant ${other}`);
+                    }
+                    seen.insert(next, v.name.value.clone());
+                    next += 1;
+                    ai.variants.push(vi);
+                }
+            }
+            _ => {}
+        }
+        ai
+    }
+
+    fn lower_fields(&mut self, e: Env, d: &mut Def, fs: &Vec<&ast::Field>) -> Vec<&mut Field> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < fs.len() {
+            let f = fs[i];
+            let ty = self.lower_type(e, f.ty);
+            let (name, pos) = match f.name { Some(n) => (n.value.clone(), n.pos), None => (itoa(i), f.ty.pos()) };
+            out.push(&mut Field { name, ty, vis: self.field_vis(d, f), pos });
+            i += 1;
+        }
+        out
+    }
+
+    /// The visibility of a struct field (variant fields are public).
+    fn field_vis(&self, adt: &Def, f: &ast::Field) -> Visibility {
+        let m: Option<&mut Module> = match adt.parent { Some(p) => p.module, None => None };
+        match f.vis {
+            ast::Vis::Pub => return resolve::public(),
+            ast::Vis::Crate => return Visibility { restricted: adt.krate.root },
+            ast::Vis::Super => {
+                if let Some(mm) = m {
+                    if let Some(pp) = mm.parent { return Visibility { restricted: Some(pp) }; }
+                }
+            }
+            _ => {}
+        }
+        Visibility { restricted: m }
+    }
+
+    pub fn trait_info(&mut self, d: &mut Def) -> Option<&mut TraitInfo> {
+        if let Some(ti) = self.info.traits.get(&d.id) { return Some(*ti); }
+        let n = match &d.node { Node::Item(Item::Trait(n)) => *n, _ => return None };
+        let g = self.generics_of(d);
+        let ti = &mut TraitInfo { def: d, generics: g, supers: Vec::new(), items: HashMap::new(), order: Vec::new() };
+        self.info.traits.insert(d.id, ti);
+        let mut e = self.env_for(d);
+        e.impl_note = "supertraits".to_string();
+        for s in n.supers.iter() {
+            if let Some(tr) = self.lower_trait_ref(e, *s, e.self_ty) {
+                if tr.trait_def().id == d.id {
+                    self.errorf(d.file, s.pos(), `trait ${d.name} cannot be its own supertrait`);
+                    continue;
+                }
+                ti.supers.push(tr);
+            }
+        }
+        for ch in self.children_of(d).iter() {
+            if ti.items.contains_key(&ch.name) {
+                self.errorf(ch.file, ch.pos, `${ch.name} is defined multiple times in trait ${d.name}`);
+                continue;
+            }
+            ti.items.insert(ch.name.clone(), *ch);
+            ti.order.push(*ch);
+        }
+        Some(ti)
+    }
+
+    pub fn impl_self_type(&mut self, d: &mut Def) -> &Type {
+        if let Some(t) = self.impl_self.get(&d.id) { return *t; }
+        let err = self.ctx().err;
+        self.impl_self.insert(d.id, err); // guards against cycles through Self
+        let n = impl_decl(d);
+        let g = self.generics_of(d);
+        let mut e = new_env(d.file, d.krate, g);
+        e.impl_note = "impl headers".to_string();
+        e.ast_gen.push(Some(n.generics));
+        let t = self.lower_type(e, n.ty);
+        self.impl_self.insert(d.id, t);
+        t
+    }
+
+    pub fn impl_info(&mut self, d: &mut Def) -> &mut ImplInfo {
+        if let Some(ii) = self.info.impls.get(&d.id) { return *ii; }
+        let n = impl_decl(d);
+        let g = self.generics_of(d);
+        let err = self.ctx().err;
+        let ii = &mut ImplInfo { def: d, generics: g, trait_ref: None, self_ty: err, items: HashMap::new() };
+        self.info.impls.insert(d.id, ii);
+        ii.self_ty = self.impl_self_type(d);
+        let key = match n.trait_path {
+            Some(tp) => {
+                let mut e = new_env(d.file, d.krate, g);
+                e.impl_note = "impl headers".to_string();
+                e.ast_gen.push(Some(n.generics));
+                ii.trait_ref = self.lower_trait_ref(e, tp, Some(ii.self_ty));
+                match ii.trait_ref { Some(tr) => tr.trait_def().id, None => 0 }
+            }
+            None => INHERENT,
+        };
+        if key != 0 {
+            if !self.info.impls_of.contains_key(&key) { self.info.impls_of.insert(key, Vec::new()); }
+            let mut list = self.info.impls_of[&key];
+            list.push(ii);
+        }
+        for ch in self.children_of(d).iter() {
+            if ii.items.contains_key(&ch.name) {
+                self.errorf(ch.file, ch.pos, `${ch.name} is defined multiple times in this impl`);
+                continue;
+            }
+            ii.items.insert(ch.name.clone(), *ch);
+        }
+        ii
+    }
+
+    pub fn alias(&mut self, d: &mut Def) -> Option<&mut AliasInfo> {
+        if let Some(ai) = self.info.aliases.get(&d.id) { return Some(*ai); }
+        if self.busy.contains_key(&d.id) {
+            self.errorf(d.file, d.pos, `type alias ${d.name} refers to itself`);
+            return None;
+        }
+        self.busy.insert(d.id, true);
+        let n = match &d.node { Node::Item(Item::TypeAlias(n)) => *n, _ => panic("not a type alias") };
+        let g = self.generics_of(d);
+        let mut e = self.env_for(d);
+        e.impl_note = "type aliases".to_string();
+        let ty = match n.ty {
+            None => {
+                self.errorf(d.file, d.pos, `type alias ${d.name} needs a type`);
+                self.ctx().err
+            }
+            Some(t) => self.lower_type(e, t),
+        };
+        let ai = &mut AliasInfo { def: d, generics: g, ty };
+        self.info.aliases.insert(d.id, ai);
+        self.busy.remove(&d.id);
+        Some(ai)
+    }
+
+    pub fn fn_sig(&mut self, d: &mut Def) -> &mut FnSig {
+        if let Some(fs) = self.info.fns.get(&d.id) { return *fs; }
+        let n = fn_decl(d);
+        let g = self.generics_of(d);
+        let unit = self.ctx().unit;
+        let fs = &mut FnSig { def: d, generics: g, self_ty: None, params: Vec::new(), ret: unit, abi: n.abi.clone(),
+            is_const: n.is_const, is_unsafe: n.is_unsafe, has_body: n.body.is_some(), opaques: Vec::new(), variadic: false };
+        if d.kind == resolve::DEF_EXTERN_FN { fs.abi = "C".to_string(); }
+        self.info.fns.insert(d.id, fs);
+        let mut e = self.env_for(d);
+        e.fn_def = Some(d);
+        if let Some(sp) = n.self_param {
+            if let Some(st) = e.self_ty {
+                fs.self_ty = Some(if sp.is_ref { self.ctx().reference(sp.is_mut, st) } else { st });
+            }
+        }
+        let mut arg_env = e;
+        arg_env.impl_arg = Some(g.params);
+        if fs.abi == "C" {
+            arg_env.impl_arg = None;
+            arg_env.impl_note = "extern \"C\" functions".to_string();
+        }
+        for p in n.params.iter() {
+            let t = match p.ty { Some(t) => self.lower_type(arg_env, t), None => self.ctx().err };
+            fs.params.push(t);
+        }
+        let mut ret_env = e;
+        ret_env.impl_ret = Some(fs.opaques);
+        if fs.abi == "C" || d.kind == resolve::DEF_ASSOC_FN && d.parent.unwrap().kind == resolve::DEF_TRAIT {
+            ret_env.impl_ret = None;
+            ret_env.impl_note = "trait methods and extern functions".to_string();
+        }
+        fs.ret = match n.result { Some(r) => self.lower_type(ret_env, r), None => unit };
+        let in_trait = d.kind == resolve::DEF_ASSOC_FN && d.parent.unwrap().kind == resolve::DEF_TRAIT;
+        if !fs.has_body && d.kind != resolve::DEF_EXTERN_FN && !in_trait {
+            let attrs = n.base.attrs;
+            if !has_attr(&attrs, "intrinsic") && !has_attr(&attrs, "asm") {
+                self.errorf(d.file, d.pos, `function ${d.name} has no body`);
+            } else if has_attr(&attrs, "intrinsic") && !d.krate.is_std {
+                self.errorf(d.file, d.pos, "#[intrinsic] functions can only be declared in std".to_string());
+            }
+        }
+        fs
+    }
+
+    pub fn assoc_type(&mut self, d: &mut Def) -> &mut AssocTypeInfo {
+        if let Some(ai) = self.info.assoc.get(&d.id) { return *ai; }
+        let n = match &d.node { Node::Item(Item::TypeAlias(n)) => *n, _ => panic("not an associated type") };
+        let ai = &mut AssocTypeInfo { def: d, bounds: Vec::new(), value: None };
+        self.info.assoc.insert(d.id, ai);
+        let mut e = self.env_for(d);
+        e.impl_note = "associated types".to_string();
+        let parent = d.parent.unwrap();
+        if parent.kind == resolve::DEF_TRAIT {
+            let str_ = self.self_trait_ref(parent);
+            let self_ty = self.ctx().proj(d, str_);
+            for b in n.bounds.iter() {
+                if let Some(tr) = self.lower_trait_ref(e, *b, Some(self_ty)) { ai.bounds.push(tr); }
+            }
+        } else if n.bounds.len() > 0 {
+            self.errorf(d.file, d.pos, "bounds on associated types are only allowed in traits".to_string());
+        }
+        if let Some(t) = n.ty {
+            ai.value = Some(self.lower_type(e, t));
+        } else if parent.kind == resolve::DEF_IMPL {
+            self.errorf(d.file, d.pos, `associated type ${d.name} in an impl needs a type`);
+        }
+        ai
+    }
+
+    pub fn const_info(&mut self, d: &mut Def) -> &mut ConstInfo {
+        if let Some(ci) = self.info.consts.get(&d.id) { return *ci; }
+        let err = self.ctx().err;
+        let ci = &mut ConstInfo { def: d, ty: err, is_mut: false };
+        self.info.consts.insert(d.id, ci);
+        let mut e = self.env_for(d);
+        e.impl_note = "constants and statics".to_string();
+        match &d.node {
+            Node::Item(Item::Const(n)) => {
+                ci.ty = self.lower_type(e, n.ty);
+                if n.value.is_none() && !(d.kind == resolve::DEF_ASSOC_CONST && d.parent.unwrap().kind == resolve::DEF_TRAIT) {
+                    self.errorf(d.file, d.pos, `constant ${d.name} needs a value`);
+                }
+            }
+            Node::Item(Item::Static(n)) => {
+                ci.ty = self.lower_type(e, n.ty);
+                ci.is_mut = n.is_mut;
+            }
+            _ => {}
+        }
+        ci
+    }
+}

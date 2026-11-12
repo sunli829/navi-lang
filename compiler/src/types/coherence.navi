@@ -1,0 +1,149 @@
+//! Item checks that need the trait solver: impl method signatures,
+//! overlap between impls, and dyn-compatibility of trait methods.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def};
+use crate::syntax::source::{File, Pos};
+use crate::types::*;
+use crate::types::lower::*;
+use crate::types::collect::*;
+use crate::types::infer::*;
+use crate::types::body::*;
+use crate::types::solve::*;
+
+impl Collector {
+    /// A function context for solving outside any body.
+    pub fn scratch_ctx(&mut self, d: &mut Def) -> &mut FnCtx { bare_ctx(self, d, d.file) }
+
+    /// Compares each method of a trait impl with the trait's declaration
+    /// (after substituting the impl's types and normalizing associated
+    /// types through the solver).
+    pub fn check_impl_sigs(&mut self, d: &mut Def) {
+        let ii = self.impl_info(d);
+        let itr = match ii.trait_ref { Some(t) => t, None => return };
+        let ti = match self.trait_info(itr.trait_def()) { Some(t) => t, None => return };
+        let tm = param_map(Some(ti.generics), &itr.args);
+        for (name, item) in ii.items.iter() {
+            let decl = match ti.items.get(name) { Some(x) => *x, None => continue };
+            if item.kind != resolve::DEF_ASSOC_FN || decl.kind != resolve::DEF_ASSOC_FN { continue; }
+            let is = self.fn_sig(*item);
+            let ds = self.fn_sig(decl);
+            if is.generics.params.len() != ds.generics.params.len() {
+                let n = is.generics.params.len();
+                self.errorf(item.file, item.pos, `method ${name} has ${n} type parameter${plural(n)} but its declaration in trait ${ti.def.name} has ${ds.generics.params.len()}`);
+                continue;
+            }
+            if is.self_ty.is_none() != ds.self_ty.is_none() || is.params.len() != ds.params.len() { continue; }
+            if let Some(iself) = is.self_ty {
+                let dself = ds.self_ty.unwrap();
+                if iself.kind != dself.kind || iself.is_mut != dself.is_mut { continue; } // reported by check_method_shape
+            }
+            let mut m: ParamMap = HashMap::new();
+            for (k, v) in tm.iter() { m.insert(*k, *v); }
+            let mut i = 0;
+            while i < ds.generics.params.len() {
+                m.insert(ds.generics.params[i].def.id, is.generics.params[i].ty);
+                i += 1;
+            }
+            let fc = self.new_fn_ctx(*item);
+            let mut wp = Vec::new();
+            if let Some(s) = ds.self_ty { wp.push(fc.conv_sig(s, &m, Some(ii.self_ty))); }
+            for p in ds.params.iter() { wp.push(fc.conv_sig(*p, &m, Some(ii.self_ty))); }
+            let wr = fc.conv_sig(ds.ret, &m, Some(ii.self_ty));
+            let want = self.ctx().func(wp, wr, "");
+            let mut gp = Vec::new();
+            if let Some(s) = is.self_ty { gp.push(fc.norm_sig(s)); }
+            for p in is.params.iter() { gp.push(fc.norm_sig(*p)); }
+            let gr = fc.norm_sig(is.ret);
+            let got = self.ctx().func(gp, gr, "");
+            if !same(want, got) && !has_infer(want) && !has_infer(got) {
+                self.errorf(item.file, item.pos, `method ${name} has an incompatible signature for trait ${ti.def.name}: expected ${want}, found ${got}`);
+            }
+        }
+    }
+
+    /// Reports pairs of impls of the same trait that could apply to the
+    /// same type.
+    pub fn check_overlap(&mut self) {
+        let keys: Vec<u32> = self.info.impls_of.keys().map(|k| *k).collect();
+        for key in keys.iter() {
+            if *key == INHERENT { continue; }
+            let impls = self.info.impls_of[key];
+            let mut i = 0;
+            while i < impls.len() {
+                let mut j = i + 1;
+                while j < impls.len() {
+                    let a = impls[i];
+                    let b = impls[j];
+                    if a.trait_ref.is_some() && b.trait_ref.is_some() && self.impls_overlap(a, b) {
+                        let tname = a.trait_ref.unwrap().trait_def().name.clone();
+                        self.errorf(b.def.file, b.def.pos, `conflicting implementations of trait ${tname}: this impl for ${b.self_ty} overlaps with the impl for ${a.self_ty}`);
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    fn impls_overlap(&mut self, a: &mut ImplInfo, b: &mut ImplInfo) -> bool {
+        let fc = self.scratch_ctx(b.def);
+        let (ma, _) = fc.instantiate(a.generics);
+        let (mb, _) = fc.instantiate(b.generics);
+        let ta = subst_trait_ref(self.ctx(), a.trait_ref.unwrap(), &ma, None);
+        let tb = subst_trait_ref(self.ctx(), b.trait_ref.unwrap(), &mb, None);
+        if !fc.match_trait_ref(ta, tb) { return false; }
+        // Both impls' where clauses must be satisfiable for a real overlap.
+        let mut nested: Vec<&TraitRef> = Vec::new();
+        for p in a.generics.all_preds().iter() { nested.push(subst_trait_ref(self.ctx(), p.trait_ref, &ma, None)); }
+        for p in b.generics.all_preds().iter() { nested.push(subst_trait_ref(self.ctx(), p.trait_ref, &mb, None)); }
+        for n in nested.iter() {
+            if fc.holds(*n) == SEL_NO { return false; }
+        }
+        true
+    }
+
+    /// Whether a trait method can be called through dyn: it takes &self or
+    /// &mut self, has no type parameters of its own and does not mention
+    /// Self elsewhere. Other methods are left out of the vtable (as if they
+    /// had Rust's `where Self: Sized`).
+    pub fn dyn_callable(&mut self, m: &mut Def) -> bool {
+        let fs = self.fn_sig(m);
+        let st = match fs.self_ty { Some(s) => s, None => return false };
+        if st.kind != K_REF || fs.generics.params.len() > 0 { return false; }
+        for p in fs.params.iter() {
+            if mentions_self(*p) { return false; }
+        }
+        !mentions_self(fs.ret)
+    }
+
+    /// Verifies a dyn type: every associated type must be given.
+    pub fn check_dyn(&mut self, file: Option<&File>, pos: Pos, bounds: &Vec<&TraitRef>) {
+        for b in bounds.iter() {
+            let mut given: HashMap<String, bool> = HashMap::new();
+            for bd in b.bindings.iter() { given.insert(bd.name.clone(), true); }
+            let s = self.ctx().self_param(b.trait_def());
+            let tr = &TraitRef { tdef: Some(b.trait_def()), self_ty: Some(s), args: b.args.clone(), bindings: Vec::new() };
+            for t in self.supertraits(tr).iter() {
+                for ch in self.children_of(t.trait_def()).iter() {
+                    if ch.kind == resolve::DEF_ASSOC_TYPE && !given.contains_key(&ch.name) {
+                        let bn = b.trait_def().name.clone();
+                        self.errorf(file, pos, `the associated type ${ch.name} of trait ${t.trait_def().name} must be specified in dyn ${bn} (write dyn ${bn}<${ch.name} = ...>)`);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl FnCtx {
+    fn norm_sig(&mut self, t: &Type) -> &Type {
+        let n = self.normalize(t);
+        self.inf.resolve(n)
+    }
+
+    fn conv_sig(&mut self, t: &Type, m: &ParamMap, self_ty: Option<&Type>) -> &Type {
+        let s = subst(self.ctx(), t, m, self_ty);
+        self.norm_sig(s)
+    }
+}

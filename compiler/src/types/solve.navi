@@ -1,0 +1,444 @@
+//! The trait solver: selecting impls for trait bounds, pending
+//! obligations, and normalization of associated type projections.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def};
+use crate::syntax::source::Pos;
+use crate::types::*;
+use crate::types::lower::*;
+use crate::types::collect::*;
+use crate::types::infer::*;
+use crate::types::body::FnCtx;
+
+/// A trait bound that must hold: Self: Trait<Args>. With proj set it is a
+/// projection obligation: the projection must normalize to proj.target.
+pub struct Obligation {
+    pub tr: &TraitRef,
+    pub pos: Pos,
+    pub proj: Option<&mut PendingProj>,
+}
+
+pub struct PendingProj {
+    /// The associated type.
+    pub assoc: &mut Def,
+    /// The inference variable standing for it.
+    pub target: &Type,
+}
+
+pub type SelKind = u8;
+pub const SEL_NONE: SelKind = 0;
+pub const SEL_IMPL: SelKind = 1;
+pub const SEL_PARAM: SelKind = 2;
+pub const SEL_BUILTIN: SelKind = 3;
+pub const SEL_DYN: SelKind = 4;
+pub const SEL_ERR: SelKind = 5;
+
+/// How a trait bound is satisfied.
+pub struct Selection {
+    pub kind: SelKind,
+    pub impl_info: Option<&mut ImplInfo>,
+    /// Impl generic arguments.
+    pub args: Vec<&Type>,
+    /// The where clause or dyn/opaque bound used.
+    pub pred: Option<&TraitRef>,
+    pub nested: Vec<&TraitRef>,
+    /// Builtin associated types (Output, Target, Item).
+    pub assoc: HashMap<String, &Type>,
+}
+
+pub fn selection(kind: SelKind) -> &mut Selection {
+    &mut Selection { kind, impl_info: None, args: Vec::new(), pred: None, nested: Vec::new(), assoc: HashMap::new() }
+}
+
+pub type SelStatus = u8;
+pub const SEL_YES: SelStatus = 0;
+pub const SEL_NO: SelStatus = 1;
+pub const SEL_AMBIG: SelStatus = 2;
+
+const MAX_SOLVE_DEPTH: i32 = 32;
+
+pub fn trait_ref_has_infer(tr: &TraitRef) -> bool {
+    if let Some(s) = tr.self_ty {
+        if has_infer(s) { return true; }
+    }
+    for a in tr.args.iter() {
+        if has_infer(*a) { return true; }
+    }
+    false
+}
+
+fn has_proj(t: &Type) -> bool {
+    let mut found = false;
+    visit(t, |x| { if x.kind == K_PROJ { found = true; } });
+    found
+}
+
+impl FnCtx {
+    /// Runs match_trait_ref in a probe.
+    pub fn probe_match(&mut self, have: &TraitRef, want: &TraitRef) -> bool {
+        let snap = self.inf.snapshot();
+        let ok = self.match_trait_ref(have, want);
+        self.inf.rollback(snap);
+        ok
+    }
+
+    /// Finds how tr is satisfied. On success the inference variables are
+    /// bound as needed (callers wanting a probe use snapshots).
+    pub fn select_trait(&mut self, tr: &TraitRef, depth: i32) -> (Option<&mut Selection>, SelStatus) {
+        if depth > MAX_SOLVE_DEPTH { return (None, SEL_AMBIG); }
+        let self_ty = self.inf.shallow(tr.self_ty.unwrap());
+        if self_ty.kind == K_ERROR || self_ty.kind == K_NEVER {
+            // ! never has a value, so any bound on it holds vacuously.
+            return (Some(selection(SEL_ERR)), SEL_YES);
+        }
+        for a in tr.args.iter() {
+            if self.inf.shallow(*a).kind == K_ERROR { return (Some(selection(SEL_ERR)), SEL_YES); }
+        }
+        // An unknown self type could be anything: wait until it is known.
+        if self_ty.kind == K_INFER && self.inf.vars[self_ty.var as usize].kind == VAR_GENERAL {
+            return (None, SEL_AMBIG);
+        }
+
+        // 1. Where clauses (including supertraits of them).
+        let mut cands: Vec<&TraitRef> = Vec::new();
+        for p in self.preds.clone().iter() {
+            if p.trait_def().id != tr.trait_def().id { continue; }
+            if self.probe_match(*p, tr) { cands.push(*p); }
+        }
+        if cands.len() > 0 {
+            if cands.len() > 1 && trait_ref_has_infer(self.inf.resolve_trait_ref(tr)) { return (None, SEL_AMBIG); }
+            self.match_trait_ref(cands[0], tr);
+            let sel = selection(SEL_PARAM);
+            sel.pred = Some(cands[0]);
+            return (Some(sel), SEL_YES);
+        }
+
+        if self_ty.kind == K_INFER {
+            let kind = self.inf.vars[self_ty.var as usize].kind;
+            if kind == VAR_GENERAL { return (None, SEL_AMBIG); }
+            // Integer/float literals: builtin impls exist for all their types.
+            let i32_ = self.ctx().int(I32);
+            if self.builtin(tr, i32_, depth).is_some() && kind == VAR_INT { return (None, SEL_AMBIG); }
+            let f64_ = self.ctx().f64;
+            if self.builtin(tr, f64_, depth).is_some() && kind == VAR_FLOAT { return (None, SEL_AMBIG); }
+        }
+
+        // 2. dyn and impl-Trait bounds.
+        if self_ty.kind == K_DYN || self_ty.kind == K_OPAQUE {
+            for b in self_ty.bounds.iter() {
+                let bound = &TraitRef { tdef: Some(b.trait_def()), self_ty: Some(self_ty), args: b.args.clone(), bindings: b.bindings.clone() };
+                let mut hit: Option<&TraitRef> = None;
+                for s in self.c.supertraits(bound).iter() {
+                    if hit.is_none() && s.trait_def().id == tr.trait_def().id { hit = Some(*s); }
+                }
+                if let Some(h) = hit {
+                    if self.probe_match(h, tr) {
+                        self.match_trait_ref(h, tr);
+                        let sel = selection(SEL_DYN);
+                        sel.pred = Some(h);
+                        return (Some(sel), SEL_YES);
+                    }
+                }
+            }
+        }
+
+        // 3. Builtin impls for primitive and structural types.
+        let snap = self.inf.snapshot();
+        if let Some(sel) = self.builtin(tr, self_ty, depth) {
+            if self.nested_hold(&sel.nested, depth) != SEL_NO { return (Some(sel), SEL_YES); }
+        }
+        self.inf.rollback(snap);
+
+        // 4. Impls.
+        let mut hits: Vec<&mut Selection> = Vec::new();
+        let mut ambig = false;
+        for ii in self.info.impls_of_trait(tr.trait_def().id).iter() {
+            if ii.trait_ref.is_none() { continue; }
+            let snap2 = self.inf.snapshot();
+            if let Some(sel) = self.match_impl(*ii, tr) {
+                let st = self.nested_hold(&sel.nested, depth);
+                if st == SEL_YES {
+                    hits.push(sel);
+                } else if st == SEL_AMBIG {
+                    hits.push(sel);
+                    ambig = true;
+                }
+            }
+            self.inf.rollback(snap2);
+        }
+        for sel in self.derived(tr).iter() { hits.push(*sel); }
+        if hits.len() == 0 && self_ty.kind == K_INFER { return (None, SEL_AMBIG); } // a literal: decide after it falls back
+        if hits.len() == 0 { return (None, SEL_NO); }
+        if hits.len() > 1 || ambig && trait_ref_has_infer(self.inf.resolve_trait_ref(tr)) { return (None, SEL_AMBIG); }
+        let mut sel = hits[0];
+        if let Some(ii) = sel.impl_info {
+            sel = self.match_impl(ii, tr).unwrap();
+        }
+        (Some(sel), SEL_YES)
+    }
+
+    /// Checks nested obligations in a probe.
+    pub fn nested_hold(&mut self, nested: &Vec<&TraitRef>, depth: i32) -> SelStatus {
+        let mut status = SEL_YES;
+        for n in nested.iter() {
+            let snap = self.inf.snapshot();
+            let (_, st) = self.select_trait(*n, depth + 1);
+            self.inf.rollback(snap);
+            if st == SEL_NO { return SEL_NO; }
+            if st == SEL_AMBIG { status = SEL_AMBIG; }
+        }
+        status
+    }
+
+    /// Unifies a known bound with the wanted trait ref.
+    pub fn match_trait_ref(&mut self, have: &TraitRef, want: &TraitRef) -> bool {
+        if have.trait_def().id != want.trait_def().id || have.args.len() != want.args.len() { return false; }
+        if !self.inf.unify(have.self_ty.unwrap(), want.self_ty.unwrap()) { return false; }
+        let mut i = 0;
+        while i < have.args.len() {
+            if !self.inf.unify(have.args[i], want.args[i]) { return false; }
+            i += 1;
+        }
+        true
+    }
+
+    /// Creates fresh inference variables for the parameters of g (and its
+    /// parents) and returns the substitution.
+    pub fn instantiate(&mut self, g: &Generics) -> (ParamMap, Vec<&Type>) {
+        let mut m: ParamMap = HashMap::new();
+        let mut vars = Vec::new();
+        for p in g.all().iter() {
+            let v = self.inf.fresh();
+            self.var_origin.insert(v.var, *p);
+            m.insert(p.def.id, v);
+            vars.push(v);
+        }
+        (m, vars)
+    }
+
+    /// Tries to use impl ii for tr, returning the selection with its nested
+    /// obligations.
+    pub fn match_impl(&mut self, ii: &mut ImplInfo, tr: &TraitRef) -> Option<&mut Selection> {
+        let (m, vars) = self.instantiate(ii.generics);
+        let itr0 = subst_trait_ref(self.ctx(), ii.trait_ref.unwrap(), &m, None);
+        let ns = self.normalize(itr0.self_ty.unwrap());
+        let itr = &TraitRef { tdef: Some(itr0.trait_def()), self_ty: Some(ns), args: itr0.args.clone(), bindings: itr0.bindings.clone() };
+        if !self.match_trait_ref(itr, tr) { return None; }
+        let sel = selection(SEL_IMPL);
+        sel.impl_info = Some(ii);
+        sel.args = vars;
+        for p in ii.generics.all_preds().iter() {
+            sel.nested.push(subst_trait_ref(self.ctx(), p.trait_ref, &m, None));
+        }
+        Some(sel)
+    }
+
+    /// Tries to discharge pending obligations; errors are reported for those
+    /// that cannot hold. With final set, ambiguity is reported too.
+    pub fn solve_pending(&mut self, final_: bool) {
+        let mut progress = true;
+        while progress {
+            progress = false;
+            let cur = self.pending;
+            self.pending = Vec::new();
+            for ob in cur.iter() {
+                if let Some(pj) = ob.proj {
+                    let t = match self.normalize_proj_now(pj.assoc, ob.tr) {
+                        None => {
+                            self.pending.push(*ob);
+                            continue;
+                        }
+                        Some(t) => t,
+                    };
+                    if !self.inf.unify(pj.target, t) {
+                        let a = self.inf.resolve(pj.target);
+                        let b = self.inf.resolve(t);
+                        self.errorf(ob.pos, `type mismatch: expected ${a}, found ${b}`);
+                    }
+                    progress = true;
+                    continue;
+                }
+                let (sel, st) = self.select_trait(ob.tr, 0);
+                if st == SEL_YES {
+                    let s = sel.unwrap();
+                    for n in s.nested.iter() { self.pending.push(&mut Obligation { tr: *n, pos: ob.pos, proj: None }); }
+                    self.apply_bindings(ob.tr, s, ob.pos);
+                    progress = true;
+                } else if st == SEL_NO {
+                    self.unsatisfied(*ob);
+                    progress = true;
+                } else {
+                    self.pending.push(*ob);
+                }
+            }
+        }
+        if final_ {
+            for ob in self.pending.clone().iter() {
+                if ob.proj.is_some() { continue; }
+                let d = self.describe_bound(ob.tr);
+                self.errorf(ob.pos, `type annotations needed: cannot decide whether ${d} holds`);
+            }
+            self.pending = Vec::new();
+        }
+    }
+
+    /// Unifies Item = T bindings of a bound with the selected impl's
+    /// associated types.
+    pub fn apply_bindings(&mut self, tr: &TraitRef, sel: &mut Selection, pos: Pos) {
+        for b in tr.bindings.iter() {
+            let base = &TraitRef { tdef: Some(tr.trait_def()), self_ty: tr.self_ty, args: Vec::new(), bindings: Vec::new() };
+            let assoc = match self.c.find_assoc_type_in_supers(base, b.name.as_str()) { Some(a) => a, None => continue };
+            let full = &TraitRef { tdef: Some(tr.trait_def()), self_ty: tr.self_ty, args: tr.args.clone(), bindings: Vec::new() };
+            let owner = self.c.trait_ref_for(full, assoc.parent.unwrap());
+            let got = match self.normalize_proj_now(assoc, owner) {
+                Some(g) => g,
+                None => {
+                    let v = self.inf.fresh();
+                    let owner2 = self.c.trait_ref_for(full, assoc.parent.unwrap());
+                    self.pending.push(&mut Obligation { tr: owner2, pos, proj: Some(&mut PendingProj { assoc, target: v }) });
+                    v
+                }
+            };
+            let want = self.normalize(b.ty);
+            if !self.inf.unify(got, want) {
+                let s = self.inf.resolve(tr.self_ty.unwrap());
+                let w = self.inf.resolve(want);
+                let g = self.inf.resolve(got);
+                self.errorf(pos, `type mismatch resolving ${s}::${b.name}: expected ${w}, found ${g}`);
+            }
+        }
+    }
+
+    fn unsatisfied(&mut self, ob: &Obligation) {
+        let d = self.describe_bound(ob.tr);
+        self.errorf(ob.pos, `the trait bound ${d} is not satisfied`);
+    }
+
+    pub fn describe_bound(&mut self, tr: &TraitRef) -> String {
+        let r = self.inf.resolve_trait_ref(tr);
+        let s = match r.self_ty { Some(x) => self.show(x), None => "?".to_string() };
+        `${s}: ${trait_ref_string(r)}`
+    }
+
+    /// Registers an obligation.
+    pub fn require(&mut self, tr: &TraitRef, pos: Pos) {
+        self.pending.push(&mut Obligation { tr, pos, proj: None });
+    }
+
+    /// Checks a bound immediately (in a probe), for method lookup.
+    pub fn holds(&mut self, tr: &TraitRef) -> SelStatus {
+        let snap = self.inf.snapshot();
+        let (_, st) = self.select_trait(tr, 0);
+        self.inf.rollback(snap);
+        st
+    }
+
+    // --- Normalization ------------------------------------------------------------
+
+    fn normalize_list(&mut self, ts: &Vec<&Type>) -> Vec<&Type> {
+        let mut out = Vec::new();
+        for x in ts.iter() { out.push(self.normalize(*x)); }
+        out
+    }
+
+    /// Replaces projections in t by the types they stand for, where known.
+    /// Unknown projections on inference variables become fresh variables
+    /// with pending projection obligations.
+    pub fn normalize(&mut self, t: &Type) -> &Type {
+        if !has_proj(t) { return t; }
+        match t.kind {
+            K_PROJ => {
+                let ttr = t.tr();
+                let s = self.normalize(ttr.self_ty.unwrap());
+                let args = self.normalize_list(&ttr.args);
+                let tr = &TraitRef { tdef: Some(ttr.trait_def()), self_ty: Some(s), args, bindings: Vec::new() };
+                if let Some(r) = self.normalize_proj_now(t.d(), tr) { return r; }
+                // Not decidable yet (the self type or a nested bound still has
+                // inference variables): stand in a variable and solve later.
+                let v = self.inf.fresh();
+                self.pending.push(&mut Obligation { tr, pos: self.cur_pos, proj: Some(&mut PendingProj { assoc: t.d(), target: v }) });
+                v
+            }
+            K_REF => { let e = self.normalize(t.el()); self.ctx().reference(t.is_mut, e) }
+            K_PTR => { let e = self.normalize(t.el()); self.ctx().ptr(t.is_mut, e) }
+            K_SLICE => { let e = self.normalize(t.el()); self.ctx().slice(e) }
+            K_ARRAY => { let e = self.normalize(t.el()); self.ctx().array(e, t.len) }
+            K_TUPLE => { let es = self.normalize_list(&t.elems); self.ctx().tuple(es) }
+            K_FN => {
+                let ps = self.normalize_list(&t.elems);
+                let r = self.normalize(t.ret.unwrap());
+                self.ctx().func(ps, r, t.abi.as_str())
+            }
+            K_ADT => { let args = self.normalize_list(&t.args); self.ctx().adt(t.d(), args) }
+            _ => t,
+        }
+    }
+
+    pub fn normalize_opt(&mut self, t: Option<&Type>) -> Option<&Type> {
+        match t { Some(x) => Some(self.normalize(x)), None => None }
+    }
+
+    /// Tries to compute <tr.self as tr.trait>::assoc. It returns None if the
+    /// self type is not known well enough yet, or the projection itself if
+    /// it is rigid (a parameter without a binding).
+    pub fn normalize_proj_now(&mut self, assoc: &mut Def, tr: &TraitRef) -> Option<&Type> {
+        let self_ty = self.inf.shallow(tr.self_ty.unwrap());
+        if self_ty.kind == K_INFER && self.inf.vars[self_ty.var as usize].kind == VAR_GENERAL { return None; }
+        // Where clauses with a binding for this associated type.
+        let parent = assoc.parent.unwrap();
+        for p in self.preds.clone().iter() {
+            for b in p.bindings.iter() {
+                if b.name != assoc.name { continue; }
+                let owner = self.c.trait_ref_for(*p, parent);
+                if owner.trait_def().id == parent.id && self.probe_match(owner, tr) {
+                    self.match_trait_ref(owner, tr);
+                    return Some(self.normalize(b.ty));
+                }
+            }
+        }
+        let snap = self.inf.snapshot();
+        let (osel, st) = self.select_trait(tr, 0);
+        if st == SEL_AMBIG {
+            self.inf.rollback(snap);
+            return None;
+        }
+        if st == SEL_NO {
+            self.inf.rollback(snap);
+            let d = self.describe_bound(tr);
+            self.errorf(self.cur_pos, `the trait bound ${d} is not satisfied`);
+            return Some(self.ctx().err);
+        }
+        let sel = osel.unwrap();
+        let k = sel.kind;
+        if k == SEL_ERR { return Some(self.ctx().err); }
+        if k == SEL_IMPL {
+            let ii = sel.impl_info.unwrap();
+            let val: Option<&Type> = match ii.items.get(&assoc.name) {
+                Some(item) => self.c.assoc_type(*item).value,
+                None => self.c.assoc_type(assoc).value, // trait default
+            };
+            let v = match val { Some(v) => v, None => return Some(self.ctx().err) };
+            let mut m: ParamMap = HashMap::new();
+            let all = ii.generics.all();
+            let mut i = 0;
+            while i < all.len() {
+                m.insert(all[i].def.id, sel.args[i]);
+                i += 1;
+            }
+            let st2 = subst(self.ctx(), v, &m, Some(ii.self_ty));
+            return Some(self.normalize(st2));
+        }
+        if k == SEL_BUILTIN {
+            return match sel.assoc.get(&assoc.name) { Some(t) => Some(*t), None => Some(self.ctx().err) };
+        }
+        if k == SEL_DYN || k == SEL_PARAM {
+            for b in sel.pred.unwrap().bindings.iter() {
+                if b.name == assoc.name { return Some(self.normalize(b.ty)); }
+            }
+            // Rigid projection on a parameter (or dyn without a binding).
+            let r = self.inf.resolve_trait_ref(tr);
+            return Some(self.ctx().proj(assoc, r));
+        }
+        Some(self.ctx().err)
+    }
+}

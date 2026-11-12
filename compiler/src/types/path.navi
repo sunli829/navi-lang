@@ -1,0 +1,402 @@
+//! Paths in expressions: functions, constants, constructors and
+//! associated items.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Res};
+use crate::syntax::ast::{self, Expr, Path, PathSegment, GenericArgs, StructKind};
+use crate::syntax::source::Pos;
+use crate::types::*;
+use crate::types::lower::*;
+use crate::types::collect::*;
+use crate::types::body::*;
+use crate::types::solve::*;
+
+/// Groups types for inherent impl lookup: the ADT definition or the kind
+/// of primitive.
+fn impl_key(t: &Type) -> String {
+    match t.kind {
+        K_ADT => `adt${t.d().id}`,
+        K_INT => int_name(t.int).to_string(),
+        K_FLOAT => if t.f64 { "f64".to_string() } else { "f32".to_string() },
+        K_BOOL => "bool".to_string(),
+        K_CHAR => "char".to_string(),
+        K_STR => "str".to_string(),
+        K_SLICE => "slice".to_string(),
+        K_ARRAY => "array".to_string(),
+        K_PTR => "ptr".to_string(),
+        K_DYN => if t.bounds.len() > 0 { `dyn${t.bounds[0].trait_def().id}` } else { String::new() },
+        _ => String::new(),
+    }
+}
+
+/// Generics holding only the given parameters (no parent).
+pub fn own_generics(params: Vec<&mut TypeParam>) -> &mut Generics {
+    &mut Generics { parent: None, params, preds: Vec::new(), self_trait: None }
+}
+
+fn preds_only(preds: Vec<&Pred>) -> &mut Generics {
+    &mut Generics { parent: None, params: Vec::new(), preds, self_trait: None }
+}
+
+fn callee(def: &mut Def, args: Vec<&Type>, self_ty: Option<&Type>) -> &mut Callee {
+    &mut Callee { def, args, self_ty, recv: None }
+}
+
+impl Collector {
+    /// The inherent impls that may apply to t.
+    pub fn inherent_impls(&mut self, t: &Type) -> Vec<&mut ImplInfo> {
+        if self.inherent.is_none() {
+            let mut m: HashMap<String, Vec<&mut ImplInfo>> = HashMap::new();
+            for ii in self.info.impls_of_trait(INHERENT).iter() {
+                let k = impl_key(ii.self_ty);
+                if k.len() > 0 {
+                    if !m.contains_key(&k) { m.insert(k.clone(), Vec::new()); }
+                    let mut list = m[&k];
+                    list.push(*ii);
+                }
+            }
+            self.inherent = Some(m);
+        }
+        match self.inherent.unwrap().get(&impl_key(t)) { Some(v) => *v, None => Vec::new() }
+    }
+}
+
+impl FnCtx {
+    /// The function type of a signature after substitution.
+    pub fn fn_type(&mut self, fs: &FnSig, m: &ParamMap, self_ty: Option<&Type>) -> &Type {
+        let mut params = Vec::new();
+        if let Some(s) = fs.self_ty {
+            let t = subst(self.ctx(), s, m, self_ty);
+            params.push(self.normalize(t));
+        }
+        for p in fs.params.iter() {
+            let t = subst(self.ctx(), *p, m, self_ty);
+            params.push(self.normalize(t));
+        }
+        let r = subst(self.ctx(), fs.ret, m, self_ty);
+        let ret = self.normalize(r);
+        self.ctx().func(params, ret, fs.abi.as_str())
+    }
+
+    /// Registers the where clauses of g (and parents) under m.
+    pub fn require_preds(&mut self, g: &Generics, m: &ParamMap, self_ty: Option<&Type>, pos: Pos) {
+        for p in g.all_preds().iter() {
+            let tr0 = subst_trait_ref(self.ctx(), p.trait_ref, m, self_ty);
+            let s = self.normalize(tr0.self_ty.unwrap());
+            let mut args = Vec::new();
+            for a in tr0.args.iter() { args.push(self.normalize(*a)); }
+            let tr = &TraitRef { tdef: Some(tr0.trait_def()), self_ty: Some(s), args, bindings: tr0.bindings.clone() };
+            self.require(tr, pos);
+        }
+    }
+
+    /// Lowers turbofish arguments for params (the item's own parameters),
+    /// unifying them with the fresh variables in m.
+    pub fn explicit_args(&mut self, params: &Vec<&mut TypeParam>, args: Option<&GenericArgs>, m: &ParamMap, what: String) {
+        let ga = match args { Some(a) => a, None => return };
+        if ga.args.len() > params.len() {
+            self.errorf(ga.lt, `${what} takes ${params.len()} generic argument${plural(params.len())} but ${ga.args.len()} were supplied`);
+            return;
+        }
+        let mut i = 0;
+        while i < ga.args.len() {
+            let t = self.lower_or_infer(Some(ga.args[i]));
+            self.inf.unify(m[&params[i].def.id], t);
+            i += 1;
+        }
+    }
+
+    /// Types a path used as an expression.
+    pub fn value_path(&mut self, x: &Expr, path: &Path) -> &Type {
+        let res = match self.info.res.paths.get(&path.id) { Some(r) => r.clone(), None => return self.ctx().err };
+        if res.kind == resolve::RES_ERR { return self.ctx().err; }
+        let segs = path.segments;
+        if res.rest.len() > 0 || res.kind == resolve::RES_QUALIFIED { return self.assoc_path(x, path, res); }
+        if res.kind == resolve::RES_LOCAL {
+            return match self.body.locals.get(&res.local.unwrap().id) { Some(t) => *t, None => self.ctx().err };
+        }
+        if res.kind == resolve::RES_SELF_TY {
+            if let Some(st) = self.env.unwrap().self_ty {
+                if st.kind == K_ADT && !self.c.adt(st.d()).is_enum {
+                    let ad = self.c.adt(st.d()).def;
+                    return self.ctor_type(ad, st, x);
+                }
+            }
+            self.errorf(x.pos(), "Self is not a value here".to_string());
+            return self.ctx().err;
+        }
+        if res.kind != resolve::RES_DEF { return self.ctx().err; }
+        let d = res.def.unwrap();
+        let last = segs[segs.len() - 1];
+        let k = d.kind;
+        if k == resolve::DEF_FN || k == resolve::DEF_EXTERN_FN {
+            let fs = self.c.fn_sig(d);
+            let (m, vars) = self.instantiate(fs.generics);
+            self.explicit_args(&fs.generics.params, last.args, &m, `function ${d.name}`);
+            self.require_preds(fs.generics, &m, None, x.pos());
+            self.set_callee(x, callee(d, vars, None));
+            if fs.is_unsafe || k == resolve::DEF_EXTERN_FN {
+                self.require_unsafe(x.pos(), `call to unsafe function ${d.name}`);
+            }
+            return self.fn_type(fs, &m, None);
+        }
+        if k == resolve::DEF_CONST || k == resolve::DEF_STATIC || k == resolve::DEF_EXTERN_STATIC {
+            let ci = self.c.const_info(d);
+            if k == resolve::DEF_EXTERN_STATIC { self.require_unsafe(x.pos(), `use of extern static ${d.name}`); }
+            self.set_callee(x, callee(d, Vec::new(), None));
+            return self.normalize(ci.ty);
+        }
+        if k == resolve::DEF_STRUCT {
+            let ai = self.c.adt(d);
+            let (m, vars) = self.instantiate(ai.generics);
+            self.explicit_args(&ai.generics.params, last.args, &m, `struct ${d.name}`);
+            let t = self.ctx().adt(d, vars);
+            return self.ctor_type(d, t, x);
+        }
+        if k == resolve::DEF_VARIANT {
+            let en = d.parent.unwrap();
+            let ai = self.c.adt(en);
+            let (m, vars) = self.instantiate(ai.generics);
+            // Option::<i32>::None or None::<i32>
+            if segs.len() >= 2 && segs[segs.len() - 2].args.is_some() {
+                self.explicit_args(&ai.generics.params, segs[segs.len() - 2].args, &m, `enum ${en.name}`);
+            }
+            self.explicit_args(&ai.generics.params, last.args, &m, `enum ${en.name}`);
+            let t = self.ctx().adt(en, vars);
+            return self.ctor_type(d, t, x);
+        }
+        self.errorf(x.pos(), `expected value, found ${resolve::def_kind_name(k)} ${d.name}`);
+        self.ctx().err
+    }
+
+    /// The type of a struct or variant constructor used as a value: the ADT
+    /// itself for unit forms, a function for tuple forms.
+    pub fn ctor_type(&mut self, d: &mut Def, adt: &Type, x: &Expr) -> &Type {
+        let ai = self.c.adt(adt.d());
+        let m = param_map(Some(ai.generics), &adt.args);
+        let mut kind = ai.kind.clone();
+        let mut fields = ai.fields;
+        if d.kind == resolve::DEF_VARIANT {
+            for v in ai.variants.iter() {
+                if v.def.id == d.id {
+                    kind = v.kind.clone();
+                    fields = v.fields;
+                }
+            }
+        }
+        self.set_callee(x, callee(d, adt.args.clone(), None));
+        match kind {
+            StructKind::Unit => adt,
+            StructKind::Tuple => {
+                let mut params = Vec::new();
+                for f in fields.iter() {
+                    let t = subst(self.ctx(), f.ty, &m, None);
+                    params.push(self.normalize(t));
+                }
+                self.ctx().func(params, adt, "")
+            }
+            StructKind::Named => {
+                self.errorf(x.pos(), `${resolve::def_kind_name(d.kind)} ${d.name} has named fields; use ${d.name} { ... }`);
+                self.ctx().err
+            }
+        }
+    }
+
+    /// The type named by a path with associated-item segments, before the
+    /// first such segment. Missing generic arguments become inference
+    /// variables. For trait bases (Trait::item) the trait is returned too.
+    pub fn base_type(&mut self, p: &Path, res: &Res) -> (&Type, Option<&TraitRef>) {
+        if res.kind == resolve::RES_QUALIFIED {
+            let q = p.qself.unwrap();
+            let self_ty = self.lower(q.ty);
+            let tp = match q.trait_path { Some(t) => t, None => return (self_ty, None) };
+            let e = self.env.unwrap();
+            let tr = self.c.lower_trait_ref(e, tp, Some(self_ty));
+            return (self_ty, tr);
+        }
+        let seg = p.segments[p.segments.len() - 1 - res.rest.len()];
+        if res.kind == resolve::RES_PRIM { return (self.c.prim(res.prim.as_str()), None); }
+        if res.kind == resolve::RES_SELF_TY {
+            return match self.env.unwrap().self_ty { Some(s) => (s, None), None => (self.ctx().err, None) };
+        }
+        if res.kind == resolve::RES_DEF {
+            let d = res.def.unwrap();
+            let k = d.kind;
+            if k == resolve::DEF_STRUCT || k == resolve::DEF_ENUM {
+                let ai = self.c.adt(d);
+                let (m, vars) = self.instantiate(ai.generics);
+                self.explicit_args(&ai.generics.params, seg.args, &m, `${resolve::def_kind_name(k)} ${d.name}`);
+                return (self.ctx().adt(d, vars), None);
+            }
+            if k == resolve::DEF_TYPE_ALIAS {
+                let ai = match self.c.alias(d) { Some(a) => a, None => return (self.ctx().err, None) };
+                let (m, _) = self.instantiate(ai.generics);
+                self.explicit_args(&ai.generics.params, seg.args, &m, `type alias ${d.name}`);
+                let t = subst(self.ctx(), ai.ty, &m, None);
+                return (self.normalize(t), None);
+            }
+            if k == resolve::DEF_TYPE_PARAM { return (self.ctx().param(d), None); }
+            if k == resolve::DEF_TRAIT {
+                let ti = self.c.trait_info(d).unwrap();
+                let self_ty = self.inf.fresh();
+                let (m, vars) = self.instantiate(own_generics(ti.generics.params));
+                self.explicit_args(&ti.generics.params, seg.args, &m, `trait ${d.name}`);
+                let tr = &TraitRef { tdef: Some(d), self_ty: Some(self_ty), args: vars, bindings: Vec::new() };
+                return (self_ty, Some(tr));
+            }
+        }
+        (self.ctx().err, None)
+    }
+
+    /// Types Base::item: an enum variant through an alias or Self, an
+    /// associated function or constant of an inherent impl or of a trait.
+    pub fn assoc_path(&mut self, x: &Expr, path: &Path, res: Res) -> &Type {
+        if res.rest.len() > 1 {
+            self.errorf(res.rest[1].name.pos, "nested associated item paths are not supported".to_string());
+            return self.ctx().err;
+        }
+        let seg = if res.kind == resolve::RES_QUALIFIED { path.segments[0] } else { res.rest[0] };
+        let name = seg.name.value.clone();
+        let (base0, trait_ref) = self.base_type(path, &res);
+        let base = self.inf.shallow(base0);
+        if base.kind == K_ERROR { return self.ctx().err; }
+        // Variants through Self or an alias: Self::Circle.
+        if trait_ref.is_none() && base.kind == K_ADT {
+            let ai = self.c.adt(base.d());
+            for v in ai.variants.iter_mut() {
+                if v.def.name == name { return self.ctor_type(v.def, base, x); }
+            }
+        }
+        let (oitem, owner, self_ty, tr) = self.find_assoc(base, trait_ref, name.as_str(), x.pos());
+        let item = match oitem {
+            Some(i) => i,
+            None => {
+                let rb = self.inf.resolve(base);
+                self.errorf(seg.name.pos, `no associated item named ${name} found for ${rb}`);
+                return self.ctx().err;
+            }
+        };
+        let accessible = match self.module { Some(m) => item.vis.accessible_from(m), None => true };
+        if !accessible {
+            self.errorf(seg.name.pos, `${resolve::def_kind_name(item.kind)} ${name} is private`);
+        }
+        let mut m: ParamMap = HashMap::new();
+        let mut args: Vec<&Type> = Vec::new();
+        if let Some(ow) = owner {
+            // Inherent or trait impl: instantiate and match its self type.
+            let (om, vars) = self.instantiate(ow.generics);
+            for (k, v) in om.iter() { m.insert(*k, *v); }
+            for v in vars.iter() { args.push(*v); }
+            let st = subst(self.ctx(), ow.self_ty, &om, None);
+            let nst = self.normalize(st);
+            self.inf.unify(nst, base);
+            self.require_preds(preds_only(ow.generics.all_preds()), &om, None, x.pos());
+        } else if let Some(t) = tr {
+            // Trait item: Self and trait parameters.
+            let ti = self.c.trait_info(t.trait_def()).unwrap();
+            let mut i = 0;
+            while i < ti.generics.params.len() {
+                if i < t.args.len() { m.insert(ti.generics.params[i].def.id, t.args[i]); }
+                i += 1;
+            }
+            for a in t.args.iter() { args.push(*a); }
+            self.require(t, x.pos());
+        }
+        if item.kind == resolve::DEF_ASSOC_FN {
+            let fs = self.c.fn_sig(item);
+            let (own, vars) = self.instantiate(own_generics(fs.generics.params));
+            for (k, v) in own.iter() { m.insert(*k, *v); }
+            for v in vars.iter() { args.push(*v); }
+            self.explicit_args(&fs.generics.params, seg.args, &m, `function ${name}`);
+            self.require_preds(preds_only(fs.generics.preds), &m, self_ty, x.pos());
+            self.set_callee(x, callee(item, args, self_ty));
+            if fs.is_unsafe { self.require_unsafe(x.pos(), `call to unsafe function ${name}`); }
+            return self.fn_type(fs, &m, self_ty);
+        }
+        if item.kind == resolve::DEF_ASSOC_CONST {
+            let ci = self.c.const_info(item);
+            self.set_callee(x, callee(item, args, self_ty));
+            let t = subst(self.ctx(), ci.ty, &m, self_ty);
+            return self.normalize(t);
+        }
+        self.errorf(seg.name.pos, `${name} is an associated type, not a value`);
+        self.ctx().err
+    }
+
+    /// Finds an associated fn or const named name for base: inherent impls
+    /// first, then traits (the given one, bounds of parameters, or traits in
+    /// scope that base implements). It returns the item and either the impl
+    /// that owns it or the trait reference it comes from, plus the Self type.
+    pub fn find_assoc(&mut self, base: &Type, trait_ref: Option<&TraitRef>, name: &str, pos: Pos)
+            -> (Option<&mut Def>, Option<&mut ImplInfo>, Option<&Type>, Option<&TraitRef>) {
+        if let Some(t0) = trait_ref {
+            for t in self.c.supertraits(t0).iter() {
+                let ti = self.c.trait_info(t.trait_def()).unwrap();
+                if let Some(it) = ti.items.get(&name.to_string()) {
+                    if it.kind != resolve::DEF_ASSOC_TYPE { return (Some(*it), None, t0.self_ty, Some(*t)); }
+                }
+            }
+            return (None, None, t0.self_ty, None);
+        }
+        for ii in self.c.inherent_impls(base).iter() {
+            let it = match ii.items.get(&name.to_string()) { Some(i) => *i, None => continue };
+            if it.kind == resolve::DEF_ASSOC_TYPE { continue; }
+            let snap = self.inf.snapshot();
+            let (om, _) = self.instantiate(ii.generics);
+            let st = subst(self.ctx(), ii.self_ty, &om, None);
+            let nst = self.normalize(st);
+            let ok = self.inf.unify(nst, base);
+            self.inf.rollback(snap);
+            if ok { return (Some(it), Some(*ii), Some(base), None); }
+        }
+        let mut hits: Vec<&TraitRef> = Vec::new();
+        let mut items: Vec<&mut Def> = Vec::new();
+        for td in self.candidate_traits(base).iter() {
+            let ti = self.c.trait_info(*td).unwrap();
+            let it = match ti.items.get(&name.to_string()) { Some(i) => *i, None => continue };
+            if it.kind == resolve::DEF_ASSOC_TYPE { continue; }
+            let (_, vars) = self.instantiate(own_generics(ti.generics.params));
+            let tr = &TraitRef { tdef: Some(*td), self_ty: Some(base), args: vars, bindings: Vec::new() };
+            if self.holds(tr) != SEL_NO {
+                hits.push(tr);
+                items.push(it);
+            }
+        }
+        if hits.len() > 1 {
+            let rb = self.inf.resolve(base);
+            self.errorf(pos, `multiple applicable items named ${name} for ${rb} (from traits ${hits[0].trait_def().name} and ${hits[1].trait_def().name})`);
+        }
+        if hits.len() > 0 { return (Some(items[0]), None, Some(base), Some(hits[0])); }
+        (None, None, None, None)
+    }
+
+    /// Traits whose items may apply to t: traits in scope, plus the bounds
+    /// of parameters, dyn and impl Trait types.
+    pub fn candidate_traits(&mut self, t: &Type) -> Vec<&mut Def> {
+        let mut seen: HashMap<u32, bool> = HashMap::new();
+        let mut out: Vec<&mut Def> = Vec::new();
+        let s = self.inf.shallow(t);
+        for p in self.preds.clone().iter() {
+            if same(self.inf.shallow(p.self_ty.unwrap()), s) { add_def(p.trait_def(), &mut seen, &mut out); }
+        }
+        if s.kind == K_DYN || s.kind == K_OPAQUE {
+            for b in s.bounds.iter() {
+                let tr = &TraitRef { tdef: Some(b.trait_def()), self_ty: Some(s), args: b.args.clone(), bindings: Vec::new() };
+                for sup in self.c.supertraits(tr).iter() { add_def(sup.trait_def(), &mut seen, &mut out); }
+            }
+        }
+        for d in self.traits.iter() { add_def(*d, &mut seen, &mut out); }
+        out
+    }
+
+    pub fn require_unsafe(&mut self, pos: Pos, what: String) {
+        if self.unsafe_depth == 0 { self.errorf(pos, `${what} requires an unsafe block or function`); }
+    }
+}
+
+fn add_def(d: &mut Def, seen: &mut HashMap<u32, bool>, out: &mut Vec<&mut Def>) {
+    if !seen.contains_key(&d.id) {
+        seen.insert(d.id, true);
+        out.push(d);
+    }
+}

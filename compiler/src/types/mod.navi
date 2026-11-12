@@ -1,0 +1,527 @@
+//! Types: their representation, lowering of type syntax, signature
+//! collection and body type checking.
+
+pub mod lower;
+pub mod collect;
+pub mod check;
+pub mod infer;
+pub mod solve;
+pub mod builtin;
+pub mod body;
+pub mod expr;
+pub mod coerce;
+pub mod path;
+pub mod method;
+pub mod pat;
+pub mod exhaustive;
+pub mod coherence;
+pub mod consteval;
+pub mod query;
+pub mod dump;
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Visibility};
+use crate::syntax::ast::StructKind;
+use crate::syntax::source::Pos;
+
+pub type Kind = u8;
+pub const K_ERROR: Kind = 0;
+pub const K_BOOL: Kind = 1;
+pub const K_CHAR: Kind = 2;
+pub const K_STR: Kind = 3;
+pub const K_INT: Kind = 4;
+pub const K_FLOAT: Kind = 5;
+pub const K_NEVER: Kind = 6;
+pub const K_TUPLE: Kind = 7;
+pub const K_REF: Kind = 8;
+pub const K_PTR: Kind = 9;
+pub const K_SLICE: Kind = 10;
+pub const K_ARRAY: Kind = 11;
+pub const K_FN: Kind = 12;
+pub const K_ADT: Kind = 13;
+pub const K_PARAM: Kind = 14;
+pub const K_PROJ: Kind = 15;
+pub const K_DYN: Kind = 16;
+pub const K_OPAQUE: Kind = 17;
+pub const K_INFER: Kind = 18;
+
+pub type IntKind = u8;
+pub const I8: IntKind = 0;
+pub const I16: IntKind = 1;
+pub const I32: IntKind = 2;
+pub const I64: IntKind = 3;
+pub const ISIZE: IntKind = 4;
+pub const U8: IntKind = 5;
+pub const U16: IntKind = 6;
+pub const U32: IntKind = 7;
+pub const U64: IntKind = 8;
+pub const USIZE: IntKind = 9;
+
+const INT_NAMES: [&str; 10] = ["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize"];
+
+pub fn int_name(k: IntKind) -> &str { INT_NAMES[k as usize] }
+pub fn int_signed(k: IntKind) -> bool { k <= ISIZE }
+
+/// An interned type: two interned types are equal iff they are the same
+/// object (inference variables are not interned).
+pub struct Type {
+    pub id: u32,
+    pub kind: Kind,
+    pub int: IntKind,
+    pub f64: bool,
+    pub is_mut: bool,
+    pub elem: Option<&Type>,
+    pub len: i64,
+    pub elems: Vec<&Type>,
+    pub ret: Option<&Type>,
+    pub abi: String,
+    pub def: Option<&mut Def>,
+    pub args: Vec<&Type>,
+    pub is_self: bool,
+    pub trait_ref: Option<&TraitRef>,
+    pub bounds: Vec<&TraitRef>,
+    pub index: i32,
+    pub var: i32,
+}
+
+pub fn same(a: &Type, b: &Type) -> bool { std::ptr::eq(a, b) }
+
+pub fn same_opt(a: Option<&Type>, b: Option<&Type>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => same(x, y),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+pub fn same_list(a: &Vec<&Type>, b: &Vec<&Type>) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut i = 0;
+    while i < a.len() {
+        if !same(a[i], b[i]) { return false; }
+        i += 1;
+    }
+    true
+}
+
+impl Type {
+    pub fn el(&self) -> &Type { self.elem.unwrap() }
+    pub fn d(&self) -> &mut Def { self.def.unwrap() }
+    pub fn tr(&self) -> &TraitRef { self.trait_ref.unwrap() }
+}
+
+fn blank(kind: Kind) -> Type {
+    Type { id: 0, kind, int: 0, f64: false, is_mut: false, elem: None, len: 0, elems: Vec::new(), ret: None,
+        abi: String::new(), def: None, args: Vec::new(), is_self: false, trait_ref: None, bounds: Vec::new(), index: 0, var: 0 }
+}
+
+/// A reference to a trait with its self type and generic arguments; the
+/// bindings carry `Item = T` constraints.
+pub struct TraitRef {
+    pub tdef: Option<&mut Def>,
+    pub self_ty: Option<&Type>,
+    pub args: Vec<&Type>,
+    pub bindings: Vec<AssocBinding>,
+}
+
+#[derive(Clone)]
+pub struct AssocBinding {
+    pub name: String,
+    pub ty: &Type,
+}
+
+impl TraitRef {
+    pub fn trait_def(&self) -> &mut Def { self.tdef.unwrap() }
+}
+
+pub fn trait_ref(trait_def: &mut Def, self_ty: Option<&Type>, args: Vec<&Type>) -> &TraitRef {
+    &TraitRef { tdef: Some(trait_def), self_ty, args, bindings: Vec::new() }
+}
+
+/// Interns types.
+pub struct Ctx {
+    types: HashMap<String, &Type>,
+    next: u32,
+    pub bool_: &Type,
+    pub char_: &Type,
+    pub str_: &Type,
+    pub never: &Type,
+    pub unit: &Type,
+    pub err: &Type,
+    pub f32: &Type,
+    pub f64: &Type,
+    pub ints: Vec<&Type>,
+}
+
+pub fn new_ctx() -> &mut Ctx {
+    let mut types: HashMap<String, &Type> = HashMap::new();
+    let mut next = 0u32;
+    let mut mk = |t: Type| -> &Type {
+        let key = compute_key(&t);
+        next += 1;
+        let r = &Type { id: next, ..t };
+        types.insert(key, r);
+        r
+    };
+    let err = mk(blank(K_ERROR));
+    let b = mk(blank(K_BOOL));
+    let c = mk(blank(K_CHAR));
+    let s = mk(blank(K_STR));
+    let nv = mk(blank(K_NEVER));
+    let u = mk(blank(K_TUPLE));
+    let f32 = mk(blank(K_FLOAT));
+    let f64 = mk(Type { f64: true, ..blank(K_FLOAT) });
+    let mut ints = Vec::new();
+    let mut k = 0u8;
+    while k < 10 {
+        ints.push(mk(Type { int: k, ..blank(K_INT) }));
+        k += 1;
+    }
+    &mut Ctx { types, next, bool_: b, char_: c, str_: s, never: nv, unit: u, err, f32, f64, ints }
+}
+
+fn types_key(ts: &Vec<&Type>) -> String {
+    let mut b = String::new();
+    let mut i = 0;
+    while i < ts.len() {
+        if i > 0 { b.push(','); }
+        b.push_str(&`${ts[i].id}`);
+        i += 1;
+    }
+    b
+}
+
+pub fn trait_key(tr: Option<&TraitRef>) -> String {
+    match tr {
+        None => "-".to_string(),
+        Some(t) => {
+            let self_key = match t.self_ty { Some(s) => `${s.id}`, None => "-".to_string() };
+            let mut b = `${t.trait_def().id}:${self_key}<${types_key(&t.args)}>`;
+            for bd in t.bindings.iter() { b.push_str(&`{${bd.name}=${bd.ty.id}}`); }
+            b
+        }
+    }
+}
+
+fn compute_key(t: &Type) -> String {
+    match t.kind {
+        K_INT => `i${t.int}`,
+        K_FLOAT => if t.f64 { "f64".to_string() } else { "f32".to_string() },
+        K_REF | K_PTR => `${t.kind}:${t.is_mut}:${t.el().id}`,
+        K_SLICE => `${t.kind}:${t.el().id}`,
+        K_ARRAY => `${t.kind}:${t.el().id};${t.len}`,
+        K_TUPLE => `(${types_key(&t.elems)})`,
+        K_FN => {
+            let ret = match t.ret { Some(r) => r.id, None => 0 };
+            `fn${t.abi}(${types_key(&t.elems)})${ret}`
+        }
+        K_ADT => `adt${t.d().id}<${types_key(&t.args)}>`,
+        K_PARAM => `param${t.d().id}:${t.is_self}`,
+        K_PROJ => `proj${t.d().id}${trait_key(t.trait_ref)}`,
+        K_DYN | K_OPAQUE => {
+            let mut b = `${t.kind}:${t.index}:`;
+            if let Some(d) = t.def { b.push_str(&`${d.id}`); }
+            for tr in t.bounds.iter() {
+                b.push_str(trait_key(Some(*tr)).as_str());
+                b.push('+');
+            }
+            b
+        }
+        _ => `${t.kind}`,
+    }
+}
+
+impl Ctx {
+    fn intern(&mut self, t: Type) -> &Type {
+        let key = compute_key(&t);
+        if let Some(old) = self.types.get(&key) { return *old; }
+        self.next += 1;
+        let r = &Type { id: self.next, ..t };
+        self.types.insert(key, r);
+        r
+    }
+
+    pub fn int(&self, k: IntKind) -> &Type { self.ints[k as usize] }
+    pub fn usize_(&self) -> &Type { self.ints[USIZE as usize] }
+
+    pub fn reference(&mut self, is_mut: bool, elem: &Type) -> &Type {
+        self.intern(Type { is_mut, elem: Some(elem), ..blank(K_REF) })
+    }
+    pub fn ptr(&mut self, is_mut: bool, elem: &Type) -> &Type {
+        self.intern(Type { is_mut, elem: Some(elem), ..blank(K_PTR) })
+    }
+    pub fn slice(&mut self, elem: &Type) -> &Type { self.intern(Type { elem: Some(elem), ..blank(K_SLICE) }) }
+    pub fn array(&mut self, elem: &Type, n: i64) -> &Type { self.intern(Type { elem: Some(elem), len: n, ..blank(K_ARRAY) }) }
+    pub fn tuple(&mut self, elems: Vec<&Type>) -> &Type {
+        if elems.len() == 0 { return self.unit; }
+        self.intern(Type { elems, ..blank(K_TUPLE) })
+    }
+    pub fn func(&mut self, params: Vec<&Type>, ret: &Type, abi: &str) -> &Type {
+        self.intern(Type { elems: params, ret: Some(ret), abi: abi.to_string(), ..blank(K_FN) })
+    }
+    pub fn adt(&mut self, def: &mut Def, args: Vec<&Type>) -> &Type { self.intern(Type { def: Some(def), args, ..blank(K_ADT) }) }
+    pub fn param(&mut self, def: &mut Def) -> &Type { self.intern(Type { def: Some(def), ..blank(K_PARAM) }) }
+    pub fn self_param(&mut self, trait_def: &mut Def) -> &Type {
+        self.intern(Type { def: Some(trait_def), is_self: true, ..blank(K_PARAM) })
+    }
+    pub fn proj(&mut self, assoc: &mut Def, tr: &TraitRef) -> &Type {
+        self.intern(Type { def: Some(assoc), trait_ref: Some(tr), ..blank(K_PROJ) })
+    }
+    pub fn dyn_(&mut self, bounds: Vec<&TraitRef>) -> &Type { self.intern(Type { bounds, ..blank(K_DYN) }) }
+    pub fn opaque(&mut self, f: &mut Def, index: i32, bounds: Vec<&TraitRef>) -> &Type {
+        self.intern(Type { def: Some(f), index, bounds, ..blank(K_OPAQUE) })
+    }
+    /// A fresh (not interned) inference variable.
+    pub fn infer_var(&mut self, var: i32) -> &Type {
+        self.next += 1;
+        &Type { id: self.next, var, ..blank(K_INFER) }
+    }
+}
+
+// --- Printing --------------------------------------------------------------------
+
+pub fn type_string(t: &Type) -> String {
+    let mut b = String::new();
+    write_type(&mut b, t);
+    b
+}
+
+fn write_types(b: &mut String, ts: &Vec<&Type>) {
+    let mut i = 0;
+    while i < ts.len() {
+        if i > 0 { b.push_str(", "); }
+        write_type(b, ts[i]);
+        i += 1;
+    }
+}
+
+pub fn write_type(b: &mut String, t: &Type) {
+    match t.kind {
+        K_ERROR => b.push_str("{error}"),
+        K_BOOL => b.push_str("bool"),
+        K_CHAR => b.push_str("char"),
+        K_STR => b.push_str("str"),
+        K_INT => b.push_str(int_name(t.int)),
+        K_FLOAT => b.push_str(if t.f64 { "f64" } else { "f32" }),
+        K_NEVER => b.push('!'),
+        K_TUPLE => {
+            b.push('(');
+            write_types(b, &t.elems);
+            if t.elems.len() == 1 { b.push(','); }
+            b.push(')');
+        }
+        K_REF => {
+            b.push('&');
+            if t.is_mut { b.push_str("mut "); }
+            write_type(b, t.el());
+        }
+        K_PTR => {
+            b.push_str(if t.is_mut { "*mut " } else { "*const " });
+            write_type(b, t.el());
+        }
+        K_SLICE => {
+            b.push('[');
+            write_type(b, t.el());
+            b.push(']');
+        }
+        K_ARRAY => {
+            b.push('[');
+            write_type(b, t.el());
+            b.push_str(&`; ${t.len}]`);
+        }
+        K_FN => {
+            if t.abi.len() > 0 { b.push_str(&`extern ${crate::util::quote(t.abi.as_str())} `); }
+            b.push_str("fn(");
+            write_types(b, &t.elems);
+            b.push(')');
+            if let Some(r) = t.ret {
+                if !(r.kind == K_TUPLE && r.elems.len() == 0) {
+                    b.push_str(" -> ");
+                    write_type(b, r);
+                }
+            }
+        }
+        K_ADT => {
+            b.push_str(t.d().name.as_str());
+            if t.args.len() > 0 {
+                b.push('<');
+                write_types(b, &t.args);
+                b.push('>');
+            }
+        }
+        K_PARAM => b.push_str(if t.is_self { "Self" } else { t.d().name.as_str() }),
+        K_PROJ => {
+            let tr = t.tr();
+            let plain = match tr.self_ty { Some(s) => s.kind == K_PARAM && !s.is_self, None => false };
+            if plain {
+                write_type(b, tr.self_ty.unwrap());
+            } else {
+                b.push('<');
+                if let Some(s) = tr.self_ty { write_type(b, s); }
+                b.push_str(" as ");
+                b.push_str(trait_ref_string(tr).as_str());
+                b.push('>');
+            }
+            b.push_str("::");
+            b.push_str(t.d().name.as_str());
+        }
+        K_DYN => {
+            b.push_str("dyn ");
+            write_bounds(b, &t.bounds);
+        }
+        K_OPAQUE => {
+            b.push_str("impl ");
+            write_bounds(b, &t.bounds);
+        }
+        K_INFER => b.push_str(&`?${t.var}`),
+        _ => {}
+    }
+}
+
+fn write_bounds(b: &mut String, bounds: &Vec<&TraitRef>) {
+    let mut i = 0;
+    while i < bounds.len() {
+        if i > 0 { b.push_str(" + "); }
+        b.push_str(trait_ref_string(bounds[i]).as_str());
+        i += 1;
+    }
+}
+
+/// The trait part of a trait reference (without Self): Iterator<Item = i32>.
+pub fn trait_ref_string(tr: &TraitRef) -> String {
+    let mut b = tr.trait_def().name.clone();
+    if tr.args.len() > 0 || tr.bindings.len() > 0 {
+        b.push('<');
+        write_types(&mut b, &tr.args);
+        let mut i = 0;
+        while i < tr.bindings.len() {
+            if i > 0 || tr.args.len() > 0 { b.push_str(", "); }
+            b.push_str(tr.bindings[i].name.as_str());
+            b.push_str(" = ");
+            write_type(&mut b, tr.bindings[i].ty);
+            i += 1;
+        }
+        b.push('>');
+    }
+    b
+}
+
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str(type_string(self).as_str()) }
+}
+
+// --- Item information ---------------------------------------------------------------
+
+/// The type parameters of an item; associated items have the impl/trait
+/// generics as parent.
+pub struct Generics {
+    pub parent: Option<&mut Generics>,
+    pub params: Vec<&mut TypeParam>,
+    pub preds: Vec<&Pred>,
+    pub self_trait: Option<&mut Def>,
+}
+
+pub struct TypeParam {
+    pub def: &mut Def,
+    pub ty: &Type,
+    pub default: Option<&Type>,
+}
+
+/// A where-clause predicate `Type: Trait<...>`.
+pub struct Pred {
+    pub trait_ref: &TraitRef,
+}
+
+impl Generics {
+    /// The parameters of g and its parents, outermost first.
+    pub fn all(&self) -> Vec<&mut TypeParam> {
+        let mut out = match self.parent { Some(p) => p.all(), None => Vec::new() };
+        for p in self.params.iter() { out.push(*p); }
+        out
+    }
+
+    pub fn all_preds(&self) -> Vec<&Pred> {
+        let mut out = match self.parent { Some(p) => p.all_preds(), None => Vec::new() };
+        for p in self.preds.iter() { out.push(*p); }
+        out
+    }
+}
+
+pub fn all_params(g: Option<&mut Generics>) -> Vec<&mut TypeParam> {
+    match g { Some(x) => x.all(), None => Vec::new() }
+}
+
+pub fn all_preds(g: Option<&mut Generics>) -> Vec<&Pred> {
+    match g { Some(x) => x.all_preds(), None => Vec::new() }
+}
+
+pub struct Field {
+    pub name: String,
+    pub ty: &Type,
+    pub vis: Visibility,
+    pub pos: Pos,
+}
+
+pub struct AdtInfo {
+    pub def: &mut Def,
+    pub generics: &mut Generics,
+    pub is_enum: bool,
+    pub kind: StructKind,
+    pub fields: Vec<&mut Field>,
+    pub variants: Vec<&mut VariantInfo>,
+}
+
+pub struct VariantInfo {
+    pub def: &mut Def,
+    pub kind: StructKind,
+    pub fields: Vec<&mut Field>,
+    pub discr: i64,
+}
+
+pub struct FnSig {
+    pub def: &mut Def,
+    pub generics: &mut Generics,
+    pub self_ty: Option<&Type>,
+    pub params: Vec<&Type>,
+    pub ret: &Type,
+    pub abi: String,
+    pub is_const: bool,
+    pub is_unsafe: bool,
+    pub has_body: bool,
+    pub opaques: Vec<&Type>,
+    pub variadic: bool,
+}
+
+pub struct TraitInfo {
+    pub def: &mut Def,
+    pub generics: &mut Generics,
+    pub supers: Vec<&TraitRef>,
+    pub items: HashMap<String, &mut Def>,
+    pub order: Vec<&mut Def>,
+}
+
+pub struct ImplInfo {
+    pub def: &mut Def,
+    pub generics: &mut Generics,
+    pub trait_ref: Option<&TraitRef>,
+    pub self_ty: &Type,
+    pub items: HashMap<String, &mut Def>,
+}
+
+pub struct AssocTypeInfo {
+    pub def: &mut Def,
+    pub bounds: Vec<&TraitRef>,
+    pub value: Option<&Type>,
+}
+
+pub struct ConstInfo {
+    pub def: &mut Def,
+    pub ty: &Type,
+    pub is_mut: bool,
+}
+
+pub struct AliasInfo {
+    pub def: &mut Def,
+    pub generics: &mut Generics,
+    pub ty: &Type,
+}

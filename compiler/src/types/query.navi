@@ -1,0 +1,168 @@
+//! Queries used by later phases (MIR building, interpretation, codegen).
+//! They run the trait solver outside any function body, on types that are
+//! concrete or that mention only the parameters of owner (whose where
+//! clauses are assumed).
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def};
+use crate::types::*;
+use crate::types::collect::*;
+use crate::types::body::*;
+use crate::types::solve::*;
+
+/// The resolution of a (possibly trait) function for concrete types.
+pub struct Instance {
+    /// The function to run (impl method or trait default).
+    pub def: &mut Def,
+    /// Generic arguments for def's generics (all levels).
+    pub args: Vec<&Type>,
+    /// Self for trait default methods.
+    pub self_ty: Option<&Type>,
+    /// For compiler-provided impls: the trait's lang name.
+    pub builtin: String,
+    /// For #[derive] impls: the trait's lang name.
+    pub derived: String,
+    /// For calls through dyn.
+    pub is_virtual: bool,
+}
+
+fn instance(def: &mut Def, args: Vec<&Type>, self_ty: Option<&Type>) -> &mut Instance {
+    &mut Instance { def, args, self_ty, builtin: String::new(), derived: String::new(), is_virtual: false }
+}
+
+impl Info {
+    fn col(&self) -> &mut Collector { self.c.unwrap() }
+
+    fn scratch(&mut self, owner: Option<&mut Def>) -> &mut FnCtx {
+        let c = self.col();
+        match owner {
+            Some(o) => c.new_fn_ctx(o),
+            None => bare_ctx(c, self.res.defs[0], None),
+        }
+    }
+
+    /// <t as Deref>::Target, or none if t does not implement Deref.
+    pub fn deref_target(&mut self, owner: Option<&mut Def>, t: &Type) -> Option<&Type> {
+        let fc = self.scratch(owner);
+        let c = self.col();
+        c.quiet += 1;
+        let r = match fc.overloaded_deref(t) { Some(x) => Some(fc.inf.resolve(x)), None => None };
+        c.quiet -= 1;
+        r
+    }
+
+    /// Resolves projections in t as far as possible.
+    pub fn normalize(&mut self, owner: Option<&mut Def>, t: &Type) -> &Type {
+        let fc = self.scratch(owner);
+        let c = self.col();
+        c.quiet += 1;
+        let n = fc.normalize(t);
+        let r = fc.inf.resolve(n);
+        c.quiet -= 1;
+        r
+    }
+
+    /// The item of a lang trait by name.
+    pub fn trait_item(&self, trait_name: &str, item: &str) -> Option<&mut Def> {
+        let d = self.lang_def(trait_name)?;
+        let ti = self.traits.get(&d.id)?;
+        match ti.items.get(&item.to_string()) { Some(x) => Some(*x), None => None }
+    }
+
+    /// Resolves a trait method for a concrete self type and generic
+    /// arguments (trait parameters followed by the method's own).
+    pub fn resolve_method(&mut self, method: &mut Def, self_ty: &Type, args: &Vec<&Type>) -> Option<&mut Instance> {
+        let c = self.col();
+        let trait_def = method.parent.unwrap();
+        let ti = self.traits[&trait_def.id];
+        let n_trait = ti.generics.params.len();
+        let mut trait_args: Vec<&Type> = args.clone();
+        let mut own_args: Vec<&Type> = Vec::new();
+        if args.len() > n_trait {
+            trait_args = args[..n_trait].to_vec();
+            own_args = args[n_trait..].to_vec();
+        }
+        if self_ty.kind == K_DYN {
+            // Methods of the dyn's own traits dispatch through the vtable;
+            // other traits (ToString for dyn Display) are found through impls.
+            for b in self_ty.bounds.iter() {
+                let tr = &TraitRef { tdef: Some(b.trait_def()), self_ty: Some(self_ty), args: b.args.clone(), bindings: Vec::new() };
+                for sup in c.supertraits(tr).iter() {
+                    if sup.trait_def().id == trait_def.id {
+                        let inst = instance(method, args.clone(), Some(self_ty));
+                        inst.is_virtual = true;
+                        return Some(inst);
+                    }
+                }
+            }
+        }
+        let fc = self.scratch(None);
+        c.quiet += 1;
+        let tr = &TraitRef { tdef: Some(trait_def), self_ty: Some(self_ty), args: trait_args.clone(), bindings: Vec::new() };
+        // The method may be defined in a supertrait's impl when called
+        // through a subtrait bound; the trait here is the method's own trait.
+        let (osel, st) = fc.select_trait(tr, 0);
+        c.quiet -= 1;
+        if st != SEL_YES { return None; }
+        let sel = osel.unwrap();
+        if sel.kind == SEL_IMPL {
+            let ii = sel.impl_info.unwrap();
+            let mut full: Vec<&Type> = Vec::new();
+            for a in sel.args.iter() { full.push(fc.inf.resolve(*a)); }
+            if let Some(it) = ii.items.get(&method.name) {
+                for a in own_args.iter() { full.push(*a); }
+                return Some(instance(*it, full, None));
+            }
+            // Default method from the trait.
+            let mut all = trait_args.clone();
+            for a in own_args.iter() { all.push(*a); }
+            return Some(instance(method, all, Some(self_ty)));
+        }
+        if sel.kind == SEL_BUILTIN {
+            let name = c.lang_name(trait_def);
+            let inst = instance(method, args.clone(), Some(self_ty));
+            if self_ty.kind == K_ADT && c.derives(self_ty.d()).contains_key(&name) {
+                inst.derived = name;
+            } else {
+                inst.builtin = name;
+            }
+            return Some(inst);
+        }
+        if sel.kind == SEL_DYN {
+            let inst = instance(method, args.clone(), Some(self_ty));
+            inst.is_virtual = true;
+            return Some(inst);
+        }
+        None
+    }
+
+    /// The signature of a function definition.
+    pub fn fn_sig_of(&mut self, d: &mut Def) -> &mut FnSig { self.col().fn_sig(d) }
+
+    /// The generics of a definition.
+    pub fn generics_of(&mut self, d: &mut Def) -> &mut Generics { self.col().generics_of(d) }
+
+    /// The impl information for an impl definition.
+    pub fn impl_of(&mut self, d: &mut Def) -> &mut ImplInfo { self.col().impl_info(d) }
+
+    /// The derived traits of an ADT.
+    pub fn derives_of(&mut self, d: &Def) -> HashMap<String, bool> { self.col().derives(d) }
+
+    /// The lang name of a std item, or "".
+    pub fn lang_name(&self, d: &Def) -> String { self.col().lang_name(d) }
+
+    /// Whether a trait method can be called through dyn.
+    pub fn dyn_callable(&mut self, m: &mut Def) -> bool { self.col().dyn_callable(m) }
+
+    /// The methods of a trait in declaration order.
+    pub fn trait_methods(&self, trait_def: &Def) -> Vec<&mut Def> {
+        let mut out = Vec::new();
+        for it in self.traits[&trait_def.id].order.iter() {
+            if it.kind == resolve::DEF_ASSOC_FN { out.push(*it); }
+        }
+        out
+    }
+
+    /// tr and all its supertraits.
+    pub fn supertraits(&mut self, tr: &TraitRef) -> Vec<&TraitRef> { self.col().supertraits(tr) }
+}

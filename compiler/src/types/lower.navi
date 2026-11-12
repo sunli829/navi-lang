@@ -1,0 +1,493 @@
+//! Lowering type syntax into types, and substitution.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Crate, Node};
+use crate::syntax::ast;
+use crate::syntax::ast::TypeKind;
+use crate::syntax::source::{File, Pos};
+use crate::types::*;
+use crate::types::collect::Collector;
+
+/// The context for lowering type syntax.
+/// Env values are copied (shallowly) when passed: copies share the
+/// impl_arg/impl_ret lists, like the Go pointers they stand for.
+pub struct Env {
+    pub file: Option<&File>,
+    pub krate: &mut Crate,
+    pub gen: &mut Generics,
+    /// What Self means here (impl self type, trait Self, or none).
+    pub self_ty: Option<&Type>,
+    /// The trait an impl implements, for Self::Name in trait impls.
+    pub impl_trait: Option<&TraitRef>,
+    /// For trait items: the trait, so that Self::Name finds its assoc types.
+    pub trait_owner: Option<&mut Def>,
+    /// The generics syntax in scope (innermost last), used to find the
+    /// bounds of a parameter for T::Name shorthand.
+    pub ast_gen: Vec<Option<&mut ast::Generics>>,
+    /// Where impl Trait is allowed and what it becomes.
+    pub fn_def: Option<&mut Def>,
+    pub impl_arg: Option<Vec<&mut TypeParam>>,
+    pub impl_ret: Option<Vec<&Type>>,
+    pub impl_note: String,
+}
+
+pub fn new_env(file: Option<&File>, krate: &mut Crate, gen: &mut Generics) -> Env {
+    Env { file, krate, gen, self_ty: None, impl_trait: None, trait_owner: None, ast_gen: Vec::new(), fn_def: None,
+        impl_arg: None, impl_ret: None, impl_note: String::new() }
+}
+
+impl Env {
+    /// A copy where impl Trait is not allowed (with the reason).
+    pub fn no_impl(self, note: &str) -> Env {
+        let mut n = self;
+        n.impl_arg = None;
+        n.impl_ret = None;
+        n.impl_note = note.to_string();
+        n
+    }
+}
+
+pub fn plural(n: usize) -> &str { if n == 1 { "" } else { "s" } }
+
+pub fn pad_err(ctx: &Ctx, n: usize) -> Vec<&Type> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n { out.push(ctx.err); i += 1; }
+    out
+}
+
+/// A substitution of type parameters (keyed by definition id).
+pub type ParamMap = HashMap<u32, &Type>;
+
+/// Maps the parameters of g to args.
+pub fn param_map(g: Option<&mut Generics>, args: &Vec<&Type>) -> ParamMap {
+    let mut m: ParamMap = HashMap::new();
+    if let Some(gen) = g {
+        let mut i = 0;
+        while i < gen.params.len() && i < args.len() {
+            m.insert(gen.params[i].def.id, args[i]);
+            i += 1;
+        }
+    }
+    m
+}
+
+/// Replaces type parameters in t according to m, and the Self parameter of
+/// traits by self_ty (when present).
+pub fn subst(ctx: &mut Ctx, t: &Type, m: &ParamMap, self_ty: Option<&Type>) -> &Type {
+    if m.len() == 0 && self_ty.is_none() { return t; }
+    match t.kind {
+        K_PARAM => {
+            if t.is_self {
+                return match self_ty { Some(s) => s, None => t };
+            }
+            match m.get(&t.d().id) { Some(r) => *r, None => t }
+        }
+        K_REF => { let e = subst(ctx, t.el(), m, self_ty); ctx.reference(t.is_mut, e) }
+        K_PTR => { let e = subst(ctx, t.el(), m, self_ty); ctx.ptr(t.is_mut, e) }
+        K_SLICE => { let e = subst(ctx, t.el(), m, self_ty); ctx.slice(e) }
+        K_ARRAY => { let e = subst(ctx, t.el(), m, self_ty); ctx.array(e, t.len) }
+        K_TUPLE => { let es = subst_list(ctx, &t.elems, m, self_ty); ctx.tuple(es) }
+        K_FN => {
+            let ps = subst_list(ctx, &t.elems, m, self_ty);
+            let r = subst(ctx, t.ret.unwrap(), m, self_ty);
+            ctx.func(ps, r, t.abi.as_str())
+        }
+        K_ADT => { let args = subst_list(ctx, &t.args, m, self_ty); ctx.adt(t.d(), args) }
+        K_PROJ => { let tr = subst_trait_ref(ctx, t.tr(), m, self_ty); ctx.proj(t.d(), tr) }
+        K_DYN => { let bs = subst_bounds(ctx, &t.bounds, m, self_ty); ctx.dyn_(bs) }
+        K_OPAQUE => { let bs = subst_bounds(ctx, &t.bounds, m, self_ty); ctx.opaque(t.d(), t.index, bs) }
+        _ => t,
+    }
+}
+
+pub fn subst_list(ctx: &mut Ctx, ts: &Vec<&Type>, m: &ParamMap, self_ty: Option<&Type>) -> Vec<&Type> {
+    let mut out = Vec::new();
+    for x in ts.iter() { out.push(subst(ctx, *x, m, self_ty)); }
+    out
+}
+
+fn subst_bounds(ctx: &mut Ctx, bs: &Vec<&TraitRef>, m: &ParamMap, self_ty: Option<&Type>) -> Vec<&TraitRef> {
+    let mut out = Vec::new();
+    for b in bs.iter() { out.push(subst_trait_ref(ctx, *b, m, self_ty)); }
+    out
+}
+
+pub fn subst_opt(ctx: &mut Ctx, t: Option<&Type>, m: &ParamMap, self_ty: Option<&Type>) -> Option<&Type> {
+    match t { Some(x) => Some(subst(ctx, x, m, self_ty)), None => None }
+}
+
+/// Substitutes inside a trait reference.
+pub fn subst_trait_ref(ctx: &mut Ctx, tr: &TraitRef, m: &ParamMap, self_ty: Option<&Type>) -> &TraitRef {
+    let s = subst_opt(ctx, tr.self_ty, m, self_ty);
+    let args = subst_list(ctx, &tr.args, m, self_ty);
+    let mut bindings = Vec::new();
+    for b in tr.bindings.iter() {
+        bindings.push(AssocBinding { name: b.name.clone(), ty: subst(ctx, b.ty, m, self_ty) });
+    }
+    &TraitRef { tdef: Some(tr.trait_def()), self_ty: s, args, bindings }
+}
+
+/// Reports whether t contains the Self parameter of a trait.
+pub fn mentions_self(t: &Type) -> bool {
+    let mut found = false;
+    visit(t, |x| { if x.kind == K_PARAM && x.is_self { found = true; } });
+    found
+}
+
+/// Calls f for t and every type nested in it.
+pub fn visit(t: &Type, f: fn(&Type)) {
+    f(t);
+    match t.kind {
+        K_REF | K_PTR | K_SLICE | K_ARRAY => visit(t.el(), f),
+        K_TUPLE => { for e in t.elems.iter() { visit(*e, f); } }
+        K_FN => {
+            for e in t.elems.iter() { visit(*e, f); }
+            if let Some(r) = t.ret { visit(r, f); }
+        }
+        K_ADT => { for a in t.args.iter() { visit(*a, f); } }
+        K_PROJ => {
+            if let Some(s) = t.tr().self_ty { visit(s, f); }
+            for a in t.tr().args.iter() { visit(*a, f); }
+        }
+        K_DYN | K_OPAQUE => {
+            for b in t.bounds.iter() {
+                for a in b.args.iter() { visit(*a, f); }
+                for bd in b.bindings.iter() { visit(bd.ty, f); }
+            }
+        }
+        _ => {}
+    }
+}
+
+impl Collector {
+    /// Converts type syntax into a Type.
+    pub fn lower_type(&mut self, e: Env, t: &ast::Type) -> &Type {
+        match &t.kind {
+            TypeKind::Path(p) => self.lower_path_type(e, *p),
+            TypeKind::Ref { is_mut, elem, .. } => { let el = self.lower_type(e, *elem); self.ctx().reference(*is_mut, el) }
+            TypeKind::Ptr { is_mut, elem, .. } => { let el = self.lower_type(e, *elem); self.ctx().ptr(*is_mut, el) }
+            TypeKind::Slice { elem, .. } => { let el = self.lower_type(e, *elem); self.ctx().slice(el) }
+            TypeKind::Array { elem, len, .. } => {
+                let el = self.lower_type(e, *elem);
+                let (n, ok) = self.eval_const(e.file, *len);
+                if !ok { return self.ctx().err; }
+                if n < 0 {
+                    self.errorf(e.file, len.pos(), "array length cannot be negative".to_string());
+                    return self.ctx().err;
+                }
+                self.ctx().array(el, n)
+            }
+            TypeKind::Tuple { elems, .. } => {
+                let mut out = Vec::new();
+                for el in elems.iter() { out.push(self.lower_type(e, *el)); }
+                self.ctx().tuple(out)
+            }
+            TypeKind::Fn { abi, params, result, .. } => {
+                let inner = e.no_impl("function pointer types");
+                let mut ps = Vec::new();
+                for p in params.iter() { ps.push(self.lower_type(inner, *p)); }
+                let ret = match result { Some(r) => self.lower_type(inner, *r), None => self.ctx().unit };
+                self.ctx().func(ps, ret, abi.as_str())
+            }
+            TypeKind::Dyn { pos, bounds } => {
+                let mut bs = Vec::new();
+                for b in bounds.iter() {
+                    if let Some(tr) = self.lower_trait_ref(e, *b, None) { bs.push(tr); }
+                }
+                if bs.len() == 0 { return self.ctx().err; }
+                self.check_dyn(e.file, *pos, &bs);
+                self.ctx().dyn_(bs)
+            }
+            TypeKind::Impl { .. } => self.lower_impl_trait(e, t),
+            TypeKind::Never(_) => self.ctx().never,
+            TypeKind::Infer(pos) => {
+                self.errorf(e.file, *pos, "the placeholder _ is not allowed in item signatures".to_string());
+                self.ctx().err
+            }
+        }
+    }
+
+    pub fn lower_opt_type(&mut self, e: Env, t: Option<&ast::Type>) -> &Type {
+        match t { Some(x) => self.lower_type(e, x), None => self.ctx().unit }
+    }
+
+    fn lower_impl_trait(&mut self, e: Env, t: &ast::Type) -> &Type {
+        let bounds = match &t.kind { TypeKind::Impl { bounds, .. } => bounds.clone(), _ => Vec::new() };
+        if let Some(mut list) = e.impl_arg {
+            // Argument position: an anonymous type parameter with these bounds.
+            let dump = ast_dump_type(t);
+            let name = `impl ${&dump[6..dump.len() - 1]}`;
+            let def = self.synth_def(resolve::DEF_TYPE_PARAM, name.as_str(), e.krate, e.file, t.pos());
+            let p = &mut TypeParam { def, ty: self.ctx().param(def), default: None };
+            list.push(p);
+            self.param_owner.insert(def.id, e.gen);
+            for b in bounds.iter() {
+                if let Some(tr) = self.lower_trait_ref(e, *b, Some(p.ty)) { e.gen.preds.push(&Pred { trait_ref: tr }); }
+            }
+            return p.ty;
+        }
+        if let Some(mut list) = e.impl_ret {
+            let mut bs = Vec::new();
+            for b in bounds.iter() {
+                if let Some(tr) = self.lower_trait_ref(e, *b, None) { bs.push(tr); }
+            }
+            let o = self.ctx().opaque(e.fn_def.unwrap(), list.len() as i32, bs);
+            list.push(o);
+            return o;
+        }
+        let place = if e.impl_note.len() == 0 { "this position".to_string() } else { e.impl_note.clone() };
+        self.errorf(e.file, t.pos(), `impl Trait is only allowed in function parameter and return types, not in ${place}`);
+        self.ctx().err
+    }
+
+    /// Lowers a named type.
+    fn lower_path_type(&mut self, e: Env, p: &ast::Path) -> &Type {
+        let res = match self.info.res.paths.get(&p.id) { Some(r) => r.clone(), None => return self.ctx().err };
+        if res.kind == resolve::RES_ERR { return self.ctx().err; }
+        let last = p.segments[p.segments.len() - 1 - res.rest.len()];
+        let base: &Type = match res.kind {
+            resolve::RES_PRIM => {
+                let b = self.prim(res.prim.as_str());
+                if let Some(a) = last.args {
+                    self.errorf(e.file, a.lt, `primitive type ${res.prim} takes no generic arguments`);
+                }
+                b
+            }
+            resolve::RES_SELF_TY => match e.self_ty {
+                None => {
+                    self.errorf(e.file, p.pos(), "Self is not available here".to_string());
+                    return self.ctx().err;
+                }
+                Some(s) => s,
+            },
+            resolve::RES_QUALIFIED => return self.lower_qualified(e, p),
+            resolve::RES_DEF => {
+                let d = res.def.unwrap();
+                if d.kind == resolve::DEF_STRUCT || d.kind == resolve::DEF_ENUM {
+                    let g = self.generics_of(d);
+                    let args = self.lower_generic_args(e, d, Some(g), last.args, None, p.pos());
+                    self.ctx().adt(d, args)
+                } else if d.kind == resolve::DEF_TYPE_ALIAS {
+                    let ai = match self.alias(d) { Some(a) => a, None => return self.ctx().err };
+                    let args = self.lower_generic_args(e, d, Some(ai.generics), last.args, None, p.pos());
+                    let m = param_map(Some(ai.generics), &args);
+                    subst(self.ctx(), ai.ty, &m, None)
+                } else if d.kind == resolve::DEF_TYPE_PARAM {
+                    self.ctx().param(d)
+                } else {
+                    self.errorf(e.file, p.pos(), `expected type, found ${resolve::def_kind_name(d.kind)} ${d.name}`);
+                    return self.ctx().err;
+                }
+            }
+            _ => {
+                self.errorf(e.file, p.pos(), "expected type".to_string());
+                return self.ctx().err;
+            }
+        };
+        if res.rest.len() == 0 { return base; }
+        if res.rest.len() > 1 {
+            self.errorf(e.file, res.rest[1].name.pos, "nested associated type paths are not supported".to_string());
+            return self.ctx().err;
+        }
+        self.assoc_shorthand(e, base, res.rest[0], p.pos())
+    }
+
+    /// Lowers <T as Trait>::Name.
+    fn lower_qualified(&mut self, e: Env, p: &ast::Path) -> &Type {
+        if p.segments.len() != 1 {
+            self.errorf(e.file, p.pos(), "expected a single associated type name after <T as Trait>".to_string());
+            return self.ctx().err;
+        }
+        let q = p.qself.unwrap();
+        let self_ty = self.lower_type(e, q.ty);
+        let name = p.segments[0].name.value.clone();
+        let tp = match q.trait_path {
+            None => {
+                self.errorf(e.file, p.pos(), `ambiguous associated type; write <${self_ty} as Trait>::${name}`);
+                return self.ctx().err;
+            }
+            Some(tp) => tp,
+        };
+        let tr = match self.lower_trait_ref(e, tp, Some(self_ty)) { Some(t) => t, None => return self.ctx().err };
+        let assoc = match self.find_assoc_type(tr.trait_def(), name.as_str()) {
+            Some(a) => a,
+            None => {
+                self.errorf(e.file, p.segments[0].name.pos, `trait ${tr.trait_def().name} has no associated type ${name}`);
+                return self.ctx().err;
+            }
+        };
+        let tr2 = self.trait_ref_for(tr, assoc.parent.unwrap());
+        self.ctx().proj(assoc, tr2)
+    }
+
+    /// Resolves Base::Name where Base is a type parameter or Self: the
+    /// trait is found among the bounds of the parameter.
+    fn assoc_shorthand(&mut self, e: Env, base: &Type, seg: &ast::PathSegment, pos: Pos) -> &Type {
+        let name = seg.name.value.clone();
+        if let Some(a) = seg.args {
+            self.errorf(e.file, a.lt, "associated types take no generic arguments".to_string());
+        }
+        if base.kind == K_ERROR { return base; }
+        let mut candidates: Vec<&TraitRef> = Vec::new();
+        if base.kind == K_PARAM && base.is_self {
+            // Self inside a trait: the trait itself (and its supertraits).
+            candidates.push(self.self_trait_ref(base.d()));
+        } else if base.kind == K_PARAM {
+            candidates = self.param_bounds(e, base);
+        } else if e.impl_trait.is_some() && same_opt(Some(base), e.self_ty) {
+            candidates.push(e.impl_trait.unwrap());
+        } else {
+            self.errorf(e.file, seg.name.pos, `ambiguous associated type ${base}::${name}; write <${base} as Trait>::${name}`);
+            return self.ctx().err;
+        }
+        let mut hits: Vec<&Type> = Vec::new();
+        let mut seen: HashMap<u32, bool> = HashMap::new();
+        for tr in candidates.iter() {
+            for sup in self.supertraits(*tr).iter() {
+                if seen.contains_key(&sup.trait_def().id) { continue; }
+                seen.insert(sup.trait_def().id, true);
+                if let Some(a) = self.find_own_assoc_type(sup.trait_def(), name.as_str()) {
+                    hits.push(self.ctx().proj(a, *sup));
+                }
+            }
+        }
+        if hits.len() == 0 {
+            self.errorf(e.file, seg.name.pos, `associated type ${name} not found for ${base}`);
+            return self.ctx().err;
+        }
+        if hits.len() == 1 { return hits[0]; }
+        self.errorf(e.file, seg.name.pos, `ambiguous associated type ${name} for ${base}: it is defined in more than one bound`);
+        self.ctx().err
+    }
+
+    /// The trait bounds of a type parameter declared in the generics syntax
+    /// in scope (bounds on the parameter and where clauses).
+    fn param_bounds(&mut self, e: Env, param: &Type) -> Vec<&TraitRef> {
+        let mut out = Vec::new();
+        for og in e.ast_gen.iter() {
+            let g = match *og { Some(g) => g, None => continue };
+            for gp in g.params.iter() {
+                let is_it = match self.info.res.def_of.get(&gp.id) { Some(d) => d.id == param.d().id, None => false };
+                if is_it {
+                    for b in gp.bounds.iter() {
+                        if let Some(tr) = self.lower_trait_ref_quiet(e, *b, Some(param)) { out.push(tr); }
+                    }
+                }
+            }
+            for wp in g.wheres.iter() {
+                let pp = match &wp.ty.kind { TypeKind::Path(pp) => *pp, _ => continue };
+                if pp.segments.len() != 1 { continue; }
+                let hit = match self.info.res.paths.get(&pp.id) {
+                    Some(res) => res.kind == resolve::RES_DEF && res.def.unwrap().id == param.d().id && res.rest.len() == 0,
+                    None => false,
+                };
+                if hit {
+                    for b in wp.bounds.iter() {
+                        if let Some(tr) = self.lower_trait_ref_quiet(e, *b, Some(param)) { out.push(tr); }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Lowers a bound without reporting errors (they are reported when the
+    /// predicate itself is lowered).
+    pub fn lower_trait_ref_quiet(&mut self, e: Env, p: &ast::Path, self_ty: Option<&Type>) -> Option<&TraitRef> {
+        self.quiet += 1;
+        let r = self.lower_trait_ref(e, p, self_ty);
+        self.quiet -= 1;
+        r
+    }
+
+    /// Lowers a trait bound or dyn component with the given self type (none
+    /// for dyn).
+    pub fn lower_trait_ref(&mut self, e: Env, p: &ast::Path, self_ty: Option<&Type>) -> Option<&TraitRef> {
+        let res = match self.info.res.paths.get(&p.id) { Some(r) => r.clone(), None => return None };
+        if res.kind != resolve::RES_DEF || res.def.unwrap().kind != resolve::DEF_TRAIT || res.rest.len() > 0 { return None; }
+        let trait_def = res.def.unwrap();
+        let ti = match self.trait_info(trait_def) { Some(t) => t, None => return None };
+        let last = p.segments[p.segments.len() - 1];
+        let args = self.lower_generic_args(e, trait_def, Some(ti.generics), last.args, self_ty, p.pos());
+        let tr = &mut TraitRef { tdef: Some(trait_def), self_ty, args, bindings: Vec::new() };
+        if let Some(ga) = last.args {
+            for b in ga.bindings.iter() {
+                let ty = self.lower_type(e.no_impl("associated type bindings"), b.ty);
+                if self.find_assoc_type_in_supers(tr, b.name.value.as_str()).is_none() {
+                    self.errorf(e.file, b.name.pos, `trait ${trait_def.name} has no associated type ${b.name.value}`);
+                    continue;
+                }
+                tr.bindings.push(AssocBinding { name: b.name.value.clone(), ty });
+            }
+        }
+        Some(tr)
+    }
+
+    /// Lowers the generic arguments for an item with generics g, filling in
+    /// defaults. self_ty is the Self type for trait defaults.
+    pub fn lower_generic_args(&mut self, e: Env, d: &mut Def, g: Option<&mut Generics>, args: Option<&ast::GenericArgs>,
+            self_ty: Option<&Type>, pos: Pos) -> Vec<&Type> {
+        let params: Vec<&mut TypeParam> = match g { Some(x) => x.params.clone(), None => Vec::new() };
+        let mut given: Vec<&Type> = Vec::new();
+        if let Some(ga) = args {
+            let inner = e.no_impl("generic arguments");
+            for a in ga.args.iter() { given.push(self.lower_type(inner, *a)); }
+            if d.kind != resolve::DEF_TRAIT && ga.bindings.len() > 0 {
+                self.errorf(e.file, ga.bindings[0].name.pos, "associated type bindings are only allowed on traits".to_string());
+            }
+        }
+        let kind = resolve::def_kind_name(d.kind);
+        if given.len() > params.len() {
+            self.errorf(e.file, pos, `${kind} ${d.name} takes ${params.len()} generic argument${plural(params.len())} but ${given.len()} were supplied`);
+            return pad_err(self.ctx(), params.len());
+        }
+        let mut out: Vec<&Type> = Vec::new();
+        let mut m: ParamMap = HashMap::new();
+        let mut i = 0;
+        while i < params.len() {
+            let p = params[i];
+            if i < given.len() {
+                out.push(given[i]);
+                m.insert(p.def.id, given[i]);
+                i += 1;
+                continue;
+            }
+            let dflt = match p.default {
+                None => {
+                    self.errorf(e.file, pos, `missing generic argument${plural(params.len() - given.len())} for ${kind} ${d.name} (expected ${params.len()}, found ${given.len()})`);
+                    return pad_err(self.ctx(), params.len());
+                }
+                Some(x) => x,
+            };
+            if self_ty.is_none() && mentions_self(dflt) {
+                self.errorf(e.file, pos, `the type parameter ${p.def.name} of ${d.name} must be specified explicitly here (its default refers to Self)`);
+                out.push(self.ctx().err);
+                i += 1;
+                continue;
+            }
+            let t = subst(self.ctx(), dflt, &m, self_ty);
+            out.push(t);
+            m.insert(p.def.id, t);
+            i += 1;
+        }
+        out
+    }
+
+    pub fn prim(&self, name: &str) -> &Type {
+        let ctx = self.info.ctx;
+        if name == "bool" { return ctx.bool_; }
+        if name == "char" { return ctx.char_; }
+        if name == "str" { return ctx.str_; }
+        if name == "f32" { return ctx.f32; }
+        if name == "f64" { return ctx.f64; }
+        let mut k = 0u8;
+        while k < 10 {
+            if int_name(k) == name { return ctx.int(k); }
+            k += 1;
+        }
+        ctx.err
+    }
+}
+
+fn ast_dump_type(t: &ast::Type) -> String { crate::syntax::dump::dump_type(t) }

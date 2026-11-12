@@ -1,0 +1,124 @@
+//! Integer constant evaluation for array lengths, enum discriminants and
+//! patterns (full const evaluation runs on MIR).
+
+use crate::resolve::{self, Def, Node};
+use crate::syntax::ast::{Expr, ExprKind, Item, LitKind};
+use crate::syntax::source::File;
+use crate::syntax::token;
+use crate::types::collect::Collector;
+
+fn go_shl(a: i64, b: i64) -> i64 {
+    if b < 0 || b >= 64 { return 0; }
+    ((a as u64) << (b as u32)) as i64
+}
+
+fn go_shr(a: i64, b: i64) -> i64 {
+    if b < 0 || b >= 64 { return if a < 0 { -1 } else { 0 }; }
+    a >> (b as u32)
+}
+
+impl Collector {
+    /// Evaluates an integer constant expression: literals, constants,
+    /// arithmetic, bit operations and casts.
+    pub fn eval_const(&mut self, file: Option<&File>, x: &Expr) -> (i64, bool) {
+        let (v, ok) = self.eval(file, x);
+        if !ok { self.errorf(file, x.pos(), "expected a constant integer expression".to_string()); }
+        (v, ok)
+    }
+
+    fn eval(&mut self, file: Option<&File>, x: &Expr) -> (i64, bool) {
+        match &x.kind {
+            ExprKind::Lit { kind, value, .. } => {
+                if *kind != LitKind::Int { return (0, false); }
+                parse_int_lit(value.as_str())
+            }
+            ExprKind::Paren { x, .. } => self.eval(file, *x),
+            ExprKind::Unary { op, x, .. } => {
+                let (v, ok) = self.eval(file, *x);
+                if !ok { return (0, false); }
+                if *op == token::MINUS { return (v.wrapping_neg(), true); }
+                if *op == token::NOT { return (!v, true); }
+                (0, false)
+            }
+            ExprKind::Cast { x, .. } => self.eval(file, *x),
+            ExprKind::Binary { op, op_pos, x, y } => {
+                let (a, ok1) = self.eval(file, *x);
+                let (b, ok2) = self.eval(file, *y);
+                if !ok1 || !ok2 { return (0, false); }
+                let o = *op;
+                if o == token::PLUS { return (a.wrapping_add(b), true); }
+                if o == token::MINUS { return (a.wrapping_sub(b), true); }
+                if o == token::STAR { return (a.wrapping_mul(b), true); }
+                if o == token::SLASH || o == token::PERCENT {
+                    if b == 0 {
+                        self.errorf(file, *op_pos, "division by zero in a constant expression".to_string());
+                        return (0, false);
+                    }
+                    if a == i64::MIN && b == -1 { return if o == token::SLASH { (a, true) } else { (0, true) }; }
+                    if o == token::SLASH { return (a / b, true); }
+                    return (a % b, true);
+                }
+                if o == token::SHL { return (go_shl(a, b), true); }
+                if o == token::SHR { return (go_shr(a, b), true); }
+                if o == token::AND { return (a & b, true); }
+                if o == token::OR { return (a | b, true); }
+                if o == token::CARET { return (a ^ b, true); }
+                (0, false)
+            }
+            ExprKind::Path(p) => {
+                let res = match self.info.res.paths.get(&p.id) { Some(r) => r.clone(), None => return (0, false) };
+                if res.kind != resolve::RES_DEF || res.def.unwrap().kind != resolve::DEF_CONST || res.rest.len() > 0 {
+                    return (0, false);
+                }
+                self.const_value(res.def.unwrap())
+            }
+            _ => (0, false),
+        }
+    }
+
+    pub fn const_value(&mut self, d: &Def) -> (i64, bool) {
+        if let Some(v) = self.consts.get(&d.id) { return (*v, true); }
+        let value = match &d.node {
+            Node::Item(Item::Const(n)) => match n.value { Some(v) => v, None => return (0, false) },
+            _ => return (0, false),
+        };
+        if self.busy.contains_key(&d.id) {
+            self.errorf(d.file, d.pos, `constant ${d.name} refers to itself`);
+            return (0, false);
+        }
+        self.busy.insert(d.id, true);
+        let (v, ok) = self.eval(d.file, value);
+        if ok { self.consts.insert(d.id, v); }
+        self.busy.remove(&d.id);
+        (v, ok)
+    }
+}
+
+const INT_SUFFIXES: [&str; 10] = ["isize", "usize", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"];
+
+/// Parses an integer literal such as 1_000, 0xff or 10u8.
+pub fn parse_int_lit(lit: &str) -> (i64, bool) {
+    let mut s = lit.replace("_", "");
+    let mut base = 10u32;
+    if s.starts_with("0x") {
+        base = 16;
+        s = s[2..].to_string();
+    } else if s.starts_with("0o") {
+        base = 8;
+        s = s[2..].to_string();
+    } else if s.starts_with("0b") {
+        base = 2;
+        s = s[2..].to_string();
+    }
+    for suf in INT_SUFFIXES.iter() {
+        let hexy = suf.contains('a') || suf.contains('b') || suf.contains('c') || suf.contains('d') || suf.contains('e') || suf.contains('f');
+        if s.ends_with(*suf) && !(base == 16 && hexy) {
+            s = s[0..s.len() - suf.len()].to_string();
+            break;
+        }
+    }
+    match u64::from_str_radix(s.as_str(), base) {
+        Ok(u) => if u > 0x7FFFFFFFFFFFFFFF { (0, false) } else { (u as i64, true) },
+        Err(_) => (0, false),
+    }
+}
