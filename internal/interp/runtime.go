@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"navi/internal/layout"
 	"navi/internal/resolve"
@@ -90,6 +91,8 @@ func (t *thread) intrinsic(inst *fnInst, args []val) val {
 			return intVal(size, a-b)
 		}
 		return intVal(size, a*b)
+	case "monotonic_nanos":
+		return intVal(8, time.Since(processStart).Nanoseconds())
 	case "os_arg_count":
 		return intVal(8, int64(len(m.Args)))
 	case "os_arg":
@@ -569,3 +572,6 @@ func (m *Machine) recvResult(elem *types.Type, v val, ok bool) val {
 }
 
 var _ = layout.PtrSize
+
+// processStart anchors monotonic_nanos.
+var processStart = time.Now()

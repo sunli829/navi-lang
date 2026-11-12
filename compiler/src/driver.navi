@@ -26,6 +26,10 @@ fn host_arch() -> &str { "x86_64" }
 /// The std crate, read from $NAVI_STD (default lib/std).
 pub fn std_crate() -> &CrateSpec {
     let dir = match std::env::var("NAVI_STD") { Ok(d) => d, Err(_) => "lib/std".to_string() };
+    if !Path::new(util::path_join(dir.as_str(), "src/lib.navi").as_str()).exists() {
+        eprintln(`navic: the standard library is not at ${dir} (set NAVI_STD)`);
+        std::process::exit(2);
+    }
     &CrateSpec { name: "std".to_string(), fs_root: dir, root: "src/lib.navi".to_string(), deps: Vec::new(), dir: String::new() }
 }
 
@@ -73,12 +77,35 @@ fn package_name(manifest: &str) -> String {
     String::new()
 }
 
+static mut TIMINGS: bool = false;
+static mut PHASE_START: u64 = 0;
+
+/// Prints the time since the previous phase ended (with -timings).
+pub fn phase(name: &str) {
+    let t = crate::driver::now_nanos();
+    if TIMINGS && PHASE_START != 0 {
+        let ms = (t - PHASE_START) / 1000000;
+        eprintln(`  ${name}: ${ms} ms`);
+    }
+    PHASE_START = t;
+}
+
+pub fn now_nanos() -> u64 {
+    let d = std::time::Instant::now().duration_since(START.clone());
+    d.as_nanos() + 1
+}
+
+static START: std::time::Instant = std::time::Instant::now();
+
 /// Runs the front end over the given crates.
 pub fn check_specs(cfg: Config, specs: &Vec<&CrateSpec>) -> (&mut types::collect::Info, Vec<Error>) {
+    phase("start");
     let (res, rerrs) = resolve::resolve(cfg, specs);
+    phase("parse+resolve");
     let sink = Sink::new();
     for e in rerrs.iter() { sink.add(e.clone()); }
     let info = types::collect::collect(res, sink);
+    phase("types");
     (info, sink.sorted())
 }
 
@@ -98,10 +125,14 @@ pub fn find_main(info: &types::collect::Info, name: &str) -> Option<&mut resolve
 /// Compiles a checked program into the object model for arm64 macOS.
 pub fn code(info: &mut types::collect::Info, main: &mut resolve::Def, debug: bool) -> Result<&mut crate::obj::Object, String> {
     let prog = crate::mir::build::build_program(info);
+    phase("mir");
     let plan = crate::codegen::build_plan(prog, main);
+    phase("plan");
     let m = crate::backend::arm64::new_machine();
     let tgt = crate::backend::lower::TargetConv { c_prefix: "_".to_string(), write: "write".to_string() };
-    crate::backend::lower::generate(plan, "arm64", m, tgt, debug)
+    let o = crate::backend::lower::generate(plan, "arm64", m, tgt, debug);
+    phase("codegen");
+    o
 }
 
 /// Compiles a checked program into a Mach-O object file for arm64 macOS.
@@ -118,6 +149,7 @@ pub fn native(info: &mut types::collect::Info, main: &mut resolve::Def, out: &st
         let o = code(info, main, debug)?;
         let exe = crate::link::link(o, util::path_base(out).as_str())?;
         if let Err(e) = std::fs::write(out, exe.as_slice()) { return Err(`${e}`); }
+        phase("link");
         let st = std::process::Command::new("chmod").arg("755").arg(out).status();
         return match st { Ok(_) => Ok(()), Err(e) => Err(`${e}`) };
     }
@@ -150,6 +182,8 @@ pub fn build_command(args: &Vec<String>) -> i32 {
             release = true;
         } else if a == "-c" {
             obj_only = true;
+        } else if a == "-timings" {
+            TIMINGS = true;
         } else {
             paths.push(args[i].clone());
         }

@@ -138,9 +138,10 @@ pub fn trait_ref(trait_def: &mut Def, self_ty: Option<&Type>, args: Vec<&Type>) 
     &TraitRef { tdef: Some(trait_def), self_ty, args, bindings: Vec::new() }
 }
 
-/// Interns types.
+/// Interns types: structurally equal types (by kind and the ids of their
+/// parts) are the same object.
 pub struct Ctx {
-    types: HashMap<String, &Type>,
+    types: HashMap<u64, Vec<&Type>>,
     next: u32,
     pub bool_: &Type,
     pub char_: &Type,
@@ -153,28 +154,131 @@ pub struct Ctx {
     pub ints: Vec<&Type>,
 }
 
+fn mix(h: u64, v: u64) -> u64 { (h.rotate_left(5) ^ v).wrapping_mul(0x517cc1b727220a95) }
+
+fn hash_list(h0: u64, ts: &Vec<&Type>) -> u64 {
+    let mut h = mix(h0, ts.len() as u64);
+    for t in ts.iter() { h = mix(h, t.id as u64); }
+    h
+}
+
+fn hash_trait_ref(h0: u64, tr: &TraitRef) -> u64 {
+    let mut h = mix(h0, tr.trait_def().id as u64);
+    h = mix(h, match tr.self_ty { Some(s) => s.id as u64, None => 0 });
+    h = hash_list(h, &tr.args);
+    for b in tr.bindings.iter() {
+        for c in b.name.bytes() { h = mix(h, c as u64); }
+        h = mix(h, b.ty.id as u64);
+    }
+    h
+}
+
+/// The hash of the identity of t (consistent with type_eq).
+fn hash_type(t: &Type) -> u64 {
+    let k = t.kind;
+    let mut h = mix(0, k as u64);
+    if k == K_INT { return mix(h, t.int as u64); }
+    if k == K_FLOAT { return mix(h, if t.f64 { 1 } else { 0 }); }
+    if k == K_REF || k == K_PTR { return mix(mix(h, if t.is_mut { 1 } else { 0 }), t.el().id as u64); }
+    if k == K_SLICE { return mix(h, t.el().id as u64); }
+    if k == K_ARRAY { return mix(mix(h, t.el().id as u64), t.len as u64); }
+    if k == K_TUPLE { return hash_list(h, &t.elems); }
+    if k == K_FN {
+        for c in t.abi.bytes() { h = mix(h, c as u64); }
+        h = hash_list(h, &t.elems);
+        return mix(h, match t.ret { Some(r) => r.id as u64, None => 0 });
+    }
+    if k == K_ADT { return hash_list(mix(h, t.d().id as u64), &t.args); }
+    if k == K_PARAM { return mix(mix(h, t.d().id as u64), if t.is_self { 1 } else { 0 }); }
+    if k == K_PROJ { return hash_trait_ref(mix(h, t.d().id as u64), t.tr()); }
+    if k == K_DYN || k == K_OPAQUE {
+        h = mix(h, t.index as u64);
+        if let Some(d) = t.def { h = mix(h, d.id as u64); }
+        for b in t.bounds.iter() { h = hash_trait_ref(h, *b); }
+        return h;
+    }
+    h
+}
+
+fn list_eq(a: &Vec<&Type>, b: &Vec<&Type>) -> bool { same_list(a, b) }
+
+fn trait_ref_eq(a: &TraitRef, b: &TraitRef) -> bool {
+    if a.trait_def().id != b.trait_def().id || !same_opt(a.self_ty, b.self_ty) || !list_eq(&a.args, &b.args) { return false; }
+    if a.bindings.len() != b.bindings.len() { return false; }
+    let mut i = 0;
+    while i < a.bindings.len() {
+        if a.bindings[i].name != b.bindings[i].name || !same(a.bindings[i].ty, b.bindings[i].ty) { return false; }
+        i += 1;
+    }
+    true
+}
+
+/// Whether a and b have the same identity (the old string key).
+fn type_eq(a: &Type, b: &Type) -> bool {
+    let k = a.kind;
+    if k != b.kind { return false; }
+    if k == K_INT { return a.int == b.int; }
+    if k == K_FLOAT { return a.f64 == b.f64; }
+    if k == K_REF || k == K_PTR { return a.is_mut == b.is_mut && same(a.el(), b.el()); }
+    if k == K_SLICE { return same(a.el(), b.el()); }
+    if k == K_ARRAY { return a.len == b.len && same(a.el(), b.el()); }
+    if k == K_TUPLE { return list_eq(&a.elems, &b.elems); }
+    if k == K_FN {
+        let ra = match a.ret { Some(r) => r.id, None => 0 };
+        let rb = match b.ret { Some(r) => r.id, None => 0 };
+        return a.abi == b.abi && ra == rb && list_eq(&a.elems, &b.elems);
+    }
+    if k == K_ADT { return a.d().id == b.d().id && list_eq(&a.args, &b.args); }
+    if k == K_PARAM { return a.d().id == b.d().id && a.is_self == b.is_self; }
+    if k == K_PROJ { return a.d().id == b.d().id && trait_ref_eq(a.tr(), b.tr()); }
+    if k == K_DYN || k == K_OPAQUE {
+        if a.index != b.index { return false; }
+        let da = match a.def { Some(d) => d.id as i64, None => -1 };
+        let db = match b.def { Some(d) => d.id as i64, None => -1 };
+        if da != db || a.bounds.len() != b.bounds.len() { return false; }
+        let mut i = 0;
+        while i < a.bounds.len() {
+            if !trait_ref_eq(a.bounds[i], b.bounds[i]) { return false; }
+            i += 1;
+        }
+        return true;
+    }
+    true
+}
+
+fn intern_in(types: &mut HashMap<u64, Vec<&Type>>, next: &mut u32, t: Type) -> &Type {
+    let h = hash_type(&t);
+    match types.get(&h) {
+        Some(bucket) => {
+            for old in bucket.iter() {
+                if type_eq(&t, *old) { return *old; }
+            }
+        }
+        None => {}
+    }
+    *next += 1;
+    let r = &Type { id: *next, ..t };
+    if !types.contains_key(&h) { types.insert(h, Vec::new()); }
+    let mut bucket = types[&h];
+    bucket.push(r);
+    r
+}
+
 pub fn new_ctx() -> &mut Ctx {
-    let mut types: HashMap<String, &Type> = HashMap::new();
+    let mut types: HashMap<u64, Vec<&Type>> = HashMap::new();
     let mut next = 0u32;
-    let mut mk = |t: Type| -> &Type {
-        let key = compute_key(&t);
-        next += 1;
-        let r = &Type { id: next, ..t };
-        types.insert(key, r);
-        r
-    };
-    let err = mk(blank(K_ERROR));
-    let b = mk(blank(K_BOOL));
-    let c = mk(blank(K_CHAR));
-    let s = mk(blank(K_STR));
-    let nv = mk(blank(K_NEVER));
-    let u = mk(blank(K_TUPLE));
-    let f32 = mk(blank(K_FLOAT));
-    let f64 = mk(Type { f64: true, ..blank(K_FLOAT) });
+    let err = intern_in(&mut types, &mut next, blank(K_ERROR));
+    let b = intern_in(&mut types, &mut next, blank(K_BOOL));
+    let c = intern_in(&mut types, &mut next, blank(K_CHAR));
+    let s = intern_in(&mut types, &mut next, blank(K_STR));
+    let nv = intern_in(&mut types, &mut next, blank(K_NEVER));
+    let u = intern_in(&mut types, &mut next, blank(K_TUPLE));
+    let f32 = intern_in(&mut types, &mut next, blank(K_FLOAT));
+    let f64 = intern_in(&mut types, &mut next, Type { f64: true, ..blank(K_FLOAT) });
     let mut ints = Vec::new();
     let mut k = 0u8;
     while k < 10 {
-        ints.push(mk(Type { int: k, ..blank(K_INT) }));
+        ints.push(intern_in(&mut types, &mut next, Type { int: k, ..blank(K_INT) }));
         k += 1;
     }
     &mut Ctx { types, next, bool_: b, char_: c, str_: s, never: nv, unit: u, err, f32, f64, ints }
@@ -203,43 +307,8 @@ pub fn trait_key(tr: Option<&TraitRef>) -> String {
     }
 }
 
-fn compute_key(t: &Type) -> String {
-    match t.kind {
-        K_INT => `i${t.int}`,
-        K_FLOAT => if t.f64 { "f64".to_string() } else { "f32".to_string() },
-        K_REF | K_PTR => `${t.kind}:${t.is_mut}:${t.el().id}`,
-        K_SLICE => `${t.kind}:${t.el().id}`,
-        K_ARRAY => `${t.kind}:${t.el().id};${t.len}`,
-        K_TUPLE => `(${types_key(&t.elems)})`,
-        K_FN => {
-            let ret = match t.ret { Some(r) => r.id, None => 0 };
-            `fn${t.abi}(${types_key(&t.elems)})${ret}`
-        }
-        K_ADT => `adt${t.d().id}<${types_key(&t.args)}>`,
-        K_PARAM => `param${t.d().id}:${t.is_self}`,
-        K_PROJ => `proj${t.d().id}${trait_key(t.trait_ref)}`,
-        K_DYN | K_OPAQUE => {
-            let mut b = `${t.kind}:${t.index}:`;
-            if let Some(d) = t.def { b.push_str(&`${d.id}`); }
-            for tr in t.bounds.iter() {
-                b.push_str(trait_key(Some(*tr)).as_str());
-                b.push('+');
-            }
-            b
-        }
-        _ => `${t.kind}`,
-    }
-}
-
 impl Ctx {
-    fn intern(&mut self, t: Type) -> &Type {
-        let key = compute_key(&t);
-        if let Some(old) = self.types.get(&key) { return *old; }
-        self.next += 1;
-        let r = &Type { id: self.next, ..t };
-        self.types.insert(key, r);
-        r
-    }
+    fn intern(&mut self, t: Type) -> &Type { intern_in(&mut self.types, &mut self.next, t) }
 
     pub fn int(&self, k: IntKind) -> &Type { self.ints[k as usize] }
     pub fn usize_(&self) -> &Type { self.ints[USIZE as usize] }
