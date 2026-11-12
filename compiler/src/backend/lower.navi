@@ -1,0 +1,1822 @@
+//! Turns the code generation plan into machine code and data for any
+//! architecture: lowers MIR to the abstract operations of a Machine and
+//! lays out dictionaries, vtables, locations, statics and strings in a
+//! format-neutral object.
+//!
+//! Internal calling convention (all navi functions, closures and shims):
+//! CTX is the dictionary of the instance (for closures the environment,
+//! whose word at -8 holds the dictionary), RET the address of the result
+//! slot, LOC the caller location for #[track_caller]; arguments are on the
+//! caller's stack at sp+off, each rounded up to 8 bytes (the callee sees
+//! them at FP+16+off). No register survives a call. Every MIR local lives
+//! in the frame: FP-8 context, FP-16 result slot address, FP-24 caller
+//! location, FP-32 head of the defer list, then locals, the call result
+//! buffer and the staging buffer; SP+0 is the outgoing argument area.
+
+use std::collections::HashMap;
+use crate::resolve::{Def, Node};
+use crate::syntax::ast::{ExprKind, Item, LitKind};
+use crate::syntax::source::{File, Pos};
+use crate::types::{self, Type};
+use crate::layout::{self, Computer, Layout};
+use crate::mir::{self, Func, Const, Operand, Place, Rvalue, Stmt, Term};
+use crate::codegen::{self, Plan, Group, Inst, Target, Vtable, DictEntry};
+use crate::obj::{self, Object};
+use crate::backend::machine::*;
+
+const SLOT_CTX: i64 = -8;
+const SLOT_RET: i64 = -16;
+const SLOT_LOC: i64 = -24;
+const SLOT_DEFERS: i64 = -32;
+const FIXED_FRAME: i64 = 40;
+
+/// The platform conventions that matter to lowering.
+#[derive(Clone)]
+pub struct TargetConv {
+    /// Prepended to C symbol names ("_" on macOS).
+    pub c_prefix: String,
+    /// The C function writing to a file descriptor.
+    pub write: String,
+}
+
+struct LocData {
+    sym: String,
+    file: String,
+    line: i64,
+    col: i64,
+}
+
+pub struct Gen {
+    p: &mut Plan,
+    o: &mut Object,
+    m: &mut dyn Machine,
+    tgt: TargetConv,
+    debug: bool,
+    lay: &mut Computer,
+    locs: HashMap<String, String>,
+    loc_list: Vec<LocData>,
+    closure: HashMap<String, String>,
+    statics: HashMap<u32, String>,
+    errs: Vec<String>,
+}
+
+fn round8(n: i64) -> i64 { (n + 7) & !7 }
+
+fn int_min(size: i64) -> i64 { -1i64 << (size * 8 - 1) as u32 }
+
+fn put_u64(b: &mut Vec<u8>, at: usize, v: u64) {
+    let mut i = 0;
+    while i < 8 {
+        b[at + i] = (v >> (8 * i) as u32) as u8;
+        i += 1;
+    }
+}
+
+fn put_u32(b: &mut Vec<u8>, at: usize, v: u32) {
+    let mut i = 0;
+    while i < 4 {
+        b[at + i] = (v >> (8 * i) as u32) as u8;
+        i += 1;
+    }
+}
+
+fn zeros(n: i64) -> Vec<u8> {
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < n { v.push(0u8); i += 1; }
+    v
+}
+
+/// The C symbol of an extern function (#[link_name = "..."]).
+fn link_name(d: &Def) -> String {
+    if let Node::Item(Item::Fn(f)) = &d.node {
+        for a in f.base.attrs.iter() {
+            if a.path.segments.len() == 1 && a.path.segments[0].name.value == "link_name" {
+                if let Some(v) = a.value {
+                    if let ExprKind::Lit { kind, value, .. } = &v.kind {
+                        if *kind == LitKind::Str {
+                            return String::from_utf8_lossy(crate::mir::expr::unquote(value.as_str()).as_slice()).to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    d.name.clone()
+}
+
+/// Lowers the plan with machine m into a new object for arch.
+pub fn generate(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug: bool) -> Result<&mut Object, String> {
+    if p.errors.len() > 0 { return Err(p.errors.join("\n")); }
+    let g = &mut Gen { p, o: obj::new_object(arch), m, tgt, debug, lay: p.lay, locs: HashMap::new(), loc_list: Vec::new(),
+        closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new() };
+    let mut i = 0;
+    while i < p.statics.len() {
+        let d = p.statics[i];
+        g.statics.insert(d.id, `_navi_static${i}_${d.name}`);
+        i += 1;
+    }
+    for grp in p.groups.iter() { g.gen_group(*grp); }
+    g.gen_main();
+    g.gen_run_defers();
+    g.gen_sched();
+    g.gen_data();
+    if g.errs.len() > 0 { return Err(g.errs.join("\n")); }
+    Ok(g.o)
+}
+
+impl Gen {
+    fn errorf(&mut self, msg: String) { self.errs.push(msg); }
+
+    /// Places the machine's current function in the text section.
+    fn emit_func(&mut self, sym: &str, global: bool) {
+        let c = self.m.finish();
+        if c.err.len() > 0 {
+            self.errorf(`${sym}: ${c.err}`);
+            return;
+        }
+        let align = if self.o.arch == "amd64" { 16 } else { 4 };
+        let off = self.o.define(sym, obj::TEXT, align, global);
+        self.o.append(obj::TEXT, c.code.as_slice());
+        for r in c.relocs.iter() { self.o.reloc(obj::TEXT, off as u32 + r.off, r.kind, r.sym.as_str()); }
+    }
+
+    /// The symbol of a C function, declared undefined.
+    fn extern_sym(&mut self, name: &str) -> String {
+        let sym = `${self.tgt.c_prefix}${name}`;
+        self.o.undefined(sym.as_str());
+        sym
+    }
+
+    /// The symbol of a static Location.
+    fn loc(&mut self, file: Option<&File>, pos: Pos) -> String {
+        match file {
+            Some(f) => {
+                let ps = f.position(pos);
+                self.loc_at(ps.file.as_str(), ps.line as i64, ps.col as i64)
+            }
+            None => self.loc_at("<unknown>", 0, 0),
+        }
+    }
+
+    fn loc_at(&mut self, file: &str, line: i64, col: i64) -> String {
+        let key = `${file}:${line}:${col}`;
+        if let Some(s) = self.locs.get(&key) { return s.clone(); }
+        let s = `_navi_loc${self.locs.len()}`;
+        self.locs.insert(key, s.clone());
+        self.loc_list.push(LocData { sym: s.clone(), file: file.to_string(), line, col });
+        self.p.str_sym(&file.as_bytes().to_vec());
+        s
+    }
+
+    fn str_sym(&mut self, s: &str) -> String { self.p.str_sym(&s.as_bytes().to_vec()) }
+
+    /// Writes strings, locations, dictionaries, vtables and statics.
+    fn gen_data(&mut self) {
+        // Locations: { file: &str, line: u32, col: u32 }.
+        let loc_def = self.p.info.lang_def("Location").unwrap();
+        let loc_ty = self.p.info.ctx.adt(loc_def, Vec::new());
+        let ll = self.lay.of(loc_ty);
+        let mut li = 0;
+        while li < self.loc_list.len() {
+            let l = &self.loc_list[li];
+            let off = self.o.define(l.sym.as_str(), obj::DATA_CONST, 8, false);
+            let mut buf = zeros(ll.size);
+            put_u64(&mut buf, (ll.fields[0] + 8) as usize, l.file.len() as u64);
+            put_u32(&mut buf, ll.fields[1] as usize, l.line as u32);
+            put_u32(&mut buf, ll.fields[2] as usize, l.col as u32);
+            self.o.append(obj::DATA_CONST, buf.as_slice());
+            let fs = self.p.str_sym(&l.file.as_bytes().to_vec());
+            self.o.reloc(obj::DATA_CONST, (off + ll.fields[0] as u64) as u32, obj::ABS64, fs.as_str());
+            li += 1;
+        }
+        // Dictionaries: [code, ctx] per slot (vtables: [vtable, 0]).
+        for grp in self.p.groups.iter() {
+            for inst in grp.insts.iter() {
+                let off = self.o.define(inst.dict.as_str(), obj::DATA_CONST, 8, false);
+                let n = grp.nslots as i64;
+                if n == 0 {
+                    self.o.zeros(obj::DATA_CONST, 8);
+                    continue;
+                }
+                self.o.zeros(obj::DATA_CONST, 16 * n);
+                let entries = self.p.dict_entries(*inst);
+                let mut i = 0;
+                while i < entries.len() {
+                    let at = off as u32 + (16 * i) as u32;
+                    match &entries[i] {
+                        DictEntry::Target(t) => self.target_words(at, *t),
+                        DictEntry::Vtable(v) => self.o.reloc(obj::DATA_CONST, at, obj::ABS64, v.sym.as_str()),
+                    }
+                    i += 1;
+                }
+            }
+        }
+        // Vtables: [code, ctx] per dyn method.
+        let mut vts: Vec<&mut Vtable> = self.p.vtable_list.clone();
+        vts.sort_by(|a, b| a.sym.cmp(&b.sym));
+        for v in vts.iter() {
+            let off = self.o.define(v.sym.as_str(), obj::DATA_CONST, 8, false);
+            self.o.zeros(obj::DATA_CONST, 16 * v.methods.len() as i64 + 8);
+            let mut i = 0;
+            while i < v.methods.len() {
+                self.target_words(off as u32 + (16 * i) as u32, v.methods[i]);
+                i += 1;
+            }
+        }
+        // Writable data: the stack top, then the statics (zero-initialized;
+        // the entry point runs their initializers). The collector scans from
+        // _navi_data_start to _navi_data_end.
+        self.o.define("_navi_data_start", obj::DATA, 8, false);
+        for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv"].iter() {
+            self.o.define(*sym, obj::DATA, 8, false);
+            self.o.zeros(obj::DATA, 8);
+        }
+        for d in self.p.statics.iter() {
+            let ty = self.p.info.consts[&d.id].ty;
+            let l = self.lay.of(ty);
+            let size = if l.size > 0 { l.size } else { 8 };
+            let sym = self.statics[&d.id].clone();
+            self.o.define(sym.as_str(), obj::DATA, 8, false);
+            self.o.zeros(obj::DATA, size);
+        }
+        self.o.define("_navi_data_end", obj::DATA, 8, false);
+        self.o.zeros(obj::DATA, 8);
+        // Strings last: code generation adds file names.
+        let mut strs: Vec<(String, Vec<u8>)> = Vec::new();
+        for s in self.p.string_list.iter() { strs.push((self.p.strings[s].clone(), s.clone())); }
+        strs.sort_by(|a, b| a.0.cmp(&b.0));
+        for s in strs.iter() {
+            self.o.define(s.0.as_str(), obj::RO_DATA, 1, false);
+            self.o.append(obj::RO_DATA, s.1.as_slice());
+            self.o.zeros(obj::RO_DATA, 1);
+        }
+    }
+
+    fn target_words(&mut self, at: u32, t: &Target) {
+        if t.kind == codegen::T_INST {
+            let i = t.inst.unwrap();
+            self.o.reloc(obj::DATA_CONST, at, obj::ABS64, i.grp().sym.as_str());
+            self.o.reloc(obj::DATA_CONST, at + 8, obj::ABS64, i.dict.as_str());
+        } else if t.kind == codegen::T_INTRINSIC {
+            if t.intrinsic == "extern" {
+                let s = self.extern_sym(link_name(t.def).as_str());
+                self.o.reloc(obj::DATA_CONST, at, obj::ABS64, s.as_str());
+            } else if t.intrinsic != "unreachable" {
+                self.errorf(`intrinsic ${t.intrinsic} cannot be called dynamically`);
+            }
+        } else {
+            self.errorf("virtual call target in a dictionary".to_string());
+        }
+    }
+
+    /// Writes the C entry point: record the stack top, initialize the
+    /// statics, call main, return 0.
+    fn gen_main(&mut self) {
+        let m = self.m;
+        m.begin();
+        let main = self.p.main.unwrap();
+        let mut ret_size = 32i64;
+        let mt = main.concrete(self.p.info, main.func.locals[0].ty);
+        let s = self.size_of(Some(mt));
+        if s > ret_size { ret_size = s; }
+        let frame = (ret_size + 15) & !15;
+        m.entry_prologue(frame);
+        m.adr_sym(I1, "_navi_stack_top");
+        m.store(8, FP, I1, 0);
+        let main_loc = self.loc_at("<main>", 0, 0);
+        // Keep argc and argv for std::rt::native::set_args (called after the
+        // statics are initialized).
+        m.entry_args();
+        m.load(8, V1, SP, 0);
+        m.adr_sym(I1, "_navi_argc");
+        m.store(8, V1, I1, 0);
+        m.load(8, V1, SP, 8);
+        m.adr_sym(I1, "_navi_argv");
+        m.store(8, V1, I1, 0);
+        for d in self.p.statics.iter() {
+            let inst = match self.p.static_init.get(&d.id) { Some(i) => *i, None => continue };
+            m.adr_sym(RET, self.statics[&d.id].as_str());
+            m.adr_sym(LOC, main_loc.as_str());
+            m.adr_sym(CTX, inst.dict.as_str());
+            m.call(inst.grp().sym.as_str());
+        }
+        let set_args = self.p.runtime[&"set_args".to_string()];
+        m.adr_sym(I1, "_navi_argc");
+        m.load(8, V1, I1, 0);
+        m.store(8, V1, SP, 0);
+        m.adr_sym(I1, "_navi_argv");
+        m.load(8, V1, I1, 0);
+        m.store(8, V1, SP, 8);
+        m.addr_of(RET, SP, 16);
+        m.adr_sym(LOC, main_loc.as_str());
+        m.adr_sym(CTX, set_args.dict.as_str());
+        m.call(set_args.grp().sym.as_str());
+        // Create the main green thread and continue on its stack.
+        let init = self.p.runtime[&"sched_init".to_string()];
+        m.addr_of(RET, SP, 0);
+        m.adr_sym(LOC, main_loc.as_str());
+        m.adr_sym(CTX, init.dict.as_str());
+        m.call(init.grp().sym.as_str());
+        m.load(8, V1, SP, 0);
+        m.adr_sym(I1, "_navi_os_sp");
+        m.mov(I2, SP);
+        m.store(8, I2, I1, 0);
+        m.mov(SP, V1);
+        m.add_imm(SP, -frame);
+        m.addr_of(RET, SP, 0);
+        m.adr_sym(LOC, main_loc.as_str());
+        m.adr_sym(CTX, main.dict.as_str());
+        m.call(main.grp().sym.as_str());
+        m.adr_sym(I1, "_navi_os_sp");
+        m.load(8, V1, I1, 0);
+        m.mov(SP, V1);
+        m.entry_return0();
+        let name = `${self.tgt.c_prefix}main`;
+        self.emit_func(name.as_str(), true);
+    }
+
+    /// Writes the scheduler's routines: the context switch, the start of a
+    /// new green thread and the stack overflow handler.
+    fn gen_sched(&mut self) {
+        let m = self.m;
+        m.begin();
+        m.swap_context();
+        self.emit_func("_navi_swapctx", false);
+
+        m.begin();
+        let gm = self.p.runtime[&"gmain".to_string()];
+        m.add_imm(SP, -32);
+        m.addr_of(RET, SP, 0);
+        let tl = self.loc_at("<thread>", 0, 0);
+        m.adr_sym(LOC, tl.as_str());
+        m.adr_sym(CTX, gm.dict.as_str());
+        m.call(gm.grp().sym.as_str());
+        m.trap();
+        self.emit_func("_navi_gstart", false);
+
+        m.begin();
+        m.prologue(32);
+        let msg = "fatal error: stack overflow\n";
+        m.mov_imm(V1, 2);
+        m.store(8, V1, SP, 0);
+        let ms = self.str_sym(msg);
+        m.adr_sym(V1, ms.as_str());
+        m.store(8, V1, SP, 8);
+        m.mov_imm(V1, msg.len() as i64);
+        m.store(8, V1, SP, 16);
+        let w = self.tgt.write.clone();
+        let ws = self.extern_sym(w.as_str());
+        let mut a3 = Vec::new();
+        a3.push(int_arg());
+        a3.push(int_arg());
+        a3.push(int_arg());
+        m.call_c(ws.as_str(), 0, &a3, false, false);
+        m.mov_imm(V1, 2);
+        m.store(8, V1, SP, 0);
+        let es = self.extern_sym("exit");
+        let mut a1 = Vec::new();
+        a1.push(int_arg());
+        m.call_c(es.as_str(), 0, &a1, false, false);
+        m.trap();
+        self.emit_func("_navi_overflow", false);
+    }
+
+    /// Writes _navi_rundefers(CTX = list head).
+    fn gen_run_defers(&mut self) {
+        self.m.begin();
+        self.m.run_defers();
+        self.emit_func("_navi_rundefers", false);
+    }
+
+    fn size_of(&mut self, t: Option<&Type>) -> i64 {
+        let ty = match t { Some(x) => x, None => return 0 };
+        if ty.kind == types::K_NEVER { return 0; }
+        let l = self.lay.of(ty);
+        if l.unsized {
+            self.errorf(`size of unsized type ${ty}`);
+            return 0;
+        }
+        l.size
+    }
+
+    fn closure_sym(&mut self, grp: &Group, f: &Func) -> String {
+        let k = `${grp.sym}/${f.id}`;
+        if let Some(s) = self.closure.get(&k) { return s.clone(); }
+        let s = `${grp.sym}_c${self.closure.len()}`;
+        self.closure.insert(k, s.clone());
+        s
+    }
+
+    /// Generates the shared code of a shape group and its closures.
+    fn gen_group(&mut self, grp: &mut Group) {
+        let mut todo: Vec<&mut Func> = Vec::new();
+        collect_closures(grp.rep.func, &mut todo);
+        self.gen_func(grp, grp.rep.func, grp.sym.clone());
+        for c in todo.iter() {
+            let s = self.closure_sym(grp, *c);
+            self.gen_func(grp, *c, s);
+        }
+    }
+
+    fn gen_func(&mut self, grp: &mut Group, f: &mut Func, sym: String) {
+        self.m.begin();
+        let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
+            res_off: 0, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new() };
+        fg.gen();
+        self.emit_func(sym.as_str(), false);
+    }
+}
+
+fn collect_closures(f: &Func, todo: &mut Vec<&mut Func>) {
+    for b in f.blocks.iter() {
+        for s in b.stmts.iter() {
+            if let Stmt::Assign { rv, .. } = s {
+                if let Rvalue::Aggregate { closure, .. } = rv {
+                    if let Some(c) = closure {
+                        todo.push(*c);
+                        collect_closures(*c, todo);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Out-of-line code emitted after the function body.
+enum Stub {
+    /// The stack overflow check's slow path.
+    Overflow(Label),
+    /// A panic with a message at a position.
+    Panic { label: Label, msg: String, pos: Pos },
+}
+
+/// Generates one function body.
+struct FnGen {
+    g: &mut Gen,
+    m: &mut dyn Machine,
+    grp: &mut Group,
+    inst: &mut Inst,
+    f: &mut Func,
+    ltypes: Vec<&Type>,
+    /// FP-relative offsets of locals.
+    loff: Vec<i64>,
+    blocks: Vec<Label>,
+    /// The call result buffer.
+    res_off: i64,
+    /// The staging buffer.
+    tmp_off: i64,
+    stubs: HashMap<String, Label>,
+    stub_list: Vec<Stub>,
+}
+
+fn is_signed(t: &Type) -> bool { t.kind == types::K_INT && types::int_signed(t.int) }
+
+impl FnGen {
+    fn conc(&mut self, t: &Type) -> &Type {
+        let c = self.inst.concrete(self.g.p.info, t);
+        if c.kind == types::K_OPAQUE {
+            if let Some(h) = self.g.p.info.hidden.get(&c.id) { return self.conc(*h); }
+        }
+        c
+    }
+
+    fn conc_opt(&mut self, t: Option<&Type>) -> Option<&Type> {
+        match t { Some(x) => Some(self.conc(x)), None => None }
+    }
+
+    fn size(&mut self, t: &Type) -> i64 { self.g.size_of(Some(t)) }
+
+    /// The first local passed on the stack (closures receive the
+    /// environment in CTX).
+    fn first_arg(&self) -> usize { if self.f.closure { 2 } else { 1 } }
+
+    fn gen(&mut self) {
+        let m = self.m;
+        let f = self.f;
+        let n = f.locals.len();
+        let mut i = 0;
+        while i < n {
+            let t = self.conc(f.locals[i].ty);
+            self.ltypes.push(t);
+            self.loff.push(0);
+            i += 1;
+        }
+        // Incoming arguments.
+        let mut off = 16i64;
+        i = self.first_arg();
+        while i <= f.nargs {
+            self.loff[i] = off;
+            off += round8(self.size(self.ltypes[i]));
+            i += 1;
+        }
+        // Frame locals.
+        let mut cur = FIXED_FRAME;
+        i = 0;
+        while i < n {
+            if i >= self.first_arg() && i <= f.nargs {
+                i += 1;
+                continue;
+            }
+            let t = self.ltypes[i];
+            let mut size = 0i64;
+            let mut align = 1i64;
+            if t.kind != types::K_NEVER {
+                let l = self.g.lay.of(t);
+                size = l.size;
+                align = l.align;
+            }
+            if size == 0 { size = 1; }
+            if align < 1 { align = 1; }
+            cur = (cur + size + align - 1) / align * align;
+            self.loff[i] = -cur;
+            i += 1;
+        }
+        // Buffers and the outgoing argument area.
+        let mut max_res = 16i64;
+        let mut max_tmp = 16i64;
+        let mut max_out = 48i64;
+        for b in f.blocks.iter() {
+            for s in b.stmts.iter() {
+                if let Stmt::Assign { place, .. } = s {
+                    // Aggregates and large copies are staged in the buffer.
+                    let pt = self.place_type(place);
+                    let sz = self.size(pt);
+                    if sz > max_tmp { max_tmp = sz; }
+                }
+            }
+            if let Term::Call { args, dest, .. } = &b.term {
+                let dt = self.place_type(dest);
+                let sz = self.size(dt);
+                if sz > max_res { max_res = sz; }
+                let mut na = 0i64;
+                for a in args.iter() {
+                    let at = self.operand_type(a);
+                    na += round8(self.size(at));
+                }
+                if na > max_out { max_out = na; }
+            }
+        }
+        cur = (cur + max_res + 7) / 8 * 8;
+        self.res_off = -cur;
+        cur = (cur + max_tmp + 7) / 8 * 8;
+        self.tmp_off = -cur;
+        let frame = ((cur + 15) & !15) + ((max_out + 15) & !15);
+
+        m.prologue(frame);
+        let overflow = m.new_label();
+        m.adr_sym(I1, "_navi_stack_lo");
+        m.load(8, I1, I1, 0);
+        m.mov(I2, SP);
+        m.cmp(I2, I1);
+        m.branch_if(LTU, overflow);
+        self.stub_list.push(Stub::Overflow(overflow));
+        if f.closure {
+            m.store(8, CTX, FP, self.loff[1]);
+            m.load(8, I1, CTX, -8);
+            m.store(8, I1, FP, SLOT_CTX);
+        } else {
+            m.store(8, CTX, FP, SLOT_CTX);
+        }
+        m.store(8, RET, FP, SLOT_RET);
+        m.store(8, LOC, FP, SLOT_LOC);
+        m.store_zero(8, FP, SLOT_DEFERS);
+
+        i = 0;
+        while i < f.blocks.len() {
+            self.blocks.push(m.new_label());
+            i += 1;
+        }
+        let mut bi = 0;
+        while bi < f.blocks.len() {
+            m.bind(self.blocks[bi]);
+            let b = f.blocks[bi];
+            let mut si = 0;
+            while si < b.stmts.len() {
+                self.stmt(bi, si, &b.stmts[si]);
+                si += 1;
+            }
+            self.term(bi, &b.term);
+            bi += 1;
+        }
+        let mut k = 0;
+        while k < self.stub_list.len() {
+            match &self.stub_list[k] {
+                Stub::Overflow(l) => {
+                    m.bind(*l);
+                    m.call("_navi_overflow");
+                    m.trap();
+                }
+                Stub::Panic { label, msg, pos } => {
+                    m.bind(*label);
+                    let ms = msg.clone();
+                    self.call_panic(ms.as_str(), *pos);
+                }
+            }
+            k += 1;
+        }
+    }
+
+    // --- Places ------------------------------------------------------------------
+
+    fn local_addr(&mut self, r: Reg, l: usize) { self.m.addr_of(r, FP, self.loff[l]); }
+
+    fn field_of(&mut self, ty: &Type, variant: i64, field: usize) -> (i64, &Type) {
+        let l = self.g.lay.of(ty);
+        if ty.kind == types::K_TUPLE { return (l.fields[field], ty.elems[field]); }
+        if ty.kind == types::K_ADT {
+            if variant >= 0 {
+                let ft = self.g.lay.field_types(ty, variant)[field];
+                return (l.variants[variant as usize][field], self.reveal(ft));
+            }
+            let ft = self.g.lay.field_types(ty, -1)[field];
+            return (l.fields[field], self.reveal(ft));
+        }
+        self.g.errorf(`${self.f.name}: field of ${ty}`);
+        (0, ty)
+    }
+
+    fn reveal(&mut self, t: &Type) -> &Type {
+        if t.kind == types::K_OPAQUE {
+            if let Some(h) = self.g.p.info.hidden.get(&t.id) { return self.conc(*h); }
+        }
+        t
+    }
+
+    /// The type of a place (no code).
+    fn place_type(&mut self, pl: &Place) -> &Type {
+        let mut ty = self.ltypes[pl.local];
+        let mut variant = -1i64;
+        for pr in pl.proj.iter() {
+            if pr.kind == mir::P_DEREF {
+                ty = self.reveal(ty.el());
+                variant = -1;
+            } else if pr.kind == mir::P_DOWNCAST {
+                variant = pr.variant as i64;
+            } else if pr.kind == mir::P_FIELD {
+                let (_, ft) = self.field_of(ty, variant, pr.field);
+                ty = ft;
+                variant = -1;
+            } else {
+                ty = self.reveal(ty.el());
+            }
+        }
+        ty
+    }
+
+    /// Computes the address of a place into RA (and the metadata of an
+    /// unsized place into RM). Clobbers I1, I2.
+    fn place(&mut self, pl: &Place) -> &Type {
+        let m = self.m;
+        self.local_addr(RA, pl.local);
+        let mut ty = self.ltypes[pl.local];
+        let mut variant = -1i64;
+        for pr in pl.proj.iter() {
+            if pr.kind == mir::P_DEREF {
+                let elem = self.reveal(ty.el());
+                if layout::is_fat(elem) { m.load(8, RM, RA, 8); }
+                m.load(8, RA, RA, 0);
+                ty = elem;
+                variant = -1;
+            } else if pr.kind == mir::P_DOWNCAST {
+                variant = pr.variant as i64;
+            } else if pr.kind == mir::P_FIELD {
+                let (off, ft) = self.field_of(ty, variant, pr.field);
+                ty = ft;
+                variant = -1;
+                if off != 0 { m.add_imm(RA, off); }
+            } else {
+                let elem = self.reveal(ty.el());
+                self.local_addr(I1, pr.index);
+                m.load(8, I1, I1, 0);
+                let es = self.size(elem);
+                m.mov_imm(I2, es);
+                m.mul_add(RA, I1, I2, RA);
+                ty = elem;
+            }
+        }
+        ty
+    }
+
+    // --- Operands ----------------------------------------------------------------
+
+    fn operand_type(&mut self, op: &Operand) -> &Type {
+        if op.kind == mir::OP_COPY { return self.place_type(&op.place); }
+        self.conc(op.cnst.unwrap().ty.unwrap())
+    }
+
+    /// The size of a scalar used in arithmetic.
+    fn scalar_size(&self, t: &Type) -> i64 {
+        if t.kind == types::K_INT { return layout::int_size(t.int); }
+        if t.kind == types::K_BOOL { return 1; }
+        if t.kind == types::K_CHAR { return 4; }
+        if t.kind == types::K_FLOAT { return if t.f64 { 8 } else { 4 }; }
+        8
+    }
+
+    /// Loads a value of at most 8 bytes, zero-extended, into r (fat values:
+    /// their first word). Clobbers RA, RM, I1, I2 (and T1 for function
+    /// constants).
+    fn load_scalar(&mut self, op: &Operand, r: Reg) -> Option<&Type> {
+        let m = self.m;
+        if op.kind == mir::OP_COPY {
+            let ty = self.place(&op.place);
+            let mut size = self.size(ty);
+            if size > 8 { size = 8; }
+            if size == 0 {
+                m.mov_imm(r, 0);
+            } else if size == 1 || size == 2 || size == 4 || size == 8 {
+                m.load(size, r, RA, 0);
+            } else {
+                self.g.errorf(`${self.f.name}: scalar load of ${size} bytes`);
+            }
+            return Some(ty);
+        }
+        let c = op.cnst.unwrap();
+        let ty = self.conc_opt(c.ty);
+        let k = c.kind;
+        if k == mir::C_INT || k == mir::C_CHAR || k == mir::C_BOOL {
+            let mut v = c.int;
+            if let Some(t) = ty {
+                if t.kind == types::K_INT && !types::int_signed(t.int) {
+                    let s = layout::int_size(t.int);
+                    if s < 8 { v = v & ((1i64 << (8 * s) as u32) - 1); }
+                }
+            }
+            m.mov_imm(r, v);
+        } else if k == mir::C_FLOAT {
+            let f64_ = match ty { Some(t) => t.f64, None => true };
+            if f64_ {
+                m.mov_imm(r, c.float.to_bits() as i64);
+            } else {
+                m.mov_imm(r, (c.float as f32).to_bits() as i64);
+            }
+        } else if k == mir::C_STATIC {
+            let s = self.g.statics[&c.static_def.unwrap().id].clone();
+            m.adr_sym(r, s.as_str());
+        } else if k == mir::C_STR || k == mir::C_BYTES {
+            let s = self.g.p.str_sym(&c.bytes);
+            m.adr_sym(r, s.as_str());
+        } else if k == mir::C_FN {
+            self.fn_value(c, r, T1);
+        } else {
+            m.mov_imm(r, 0);
+        }
+        ty
+    }
+
+    /// Loads a value of 1, 2, 4, 8 or 16 bytes into V1 (and V2).
+    fn load_val(&mut self, op: &Operand, size: i64) {
+        let m = self.m;
+        if size <= 8 {
+            self.load_scalar(op, V1);
+            return;
+        }
+        if op.kind == mir::OP_COPY {
+            self.place(&op.place);
+            m.load(8, V1, RA, 0);
+            m.load(8, V2, RA, 8);
+            return;
+        }
+        let c = op.cnst.unwrap();
+        if c.kind == mir::C_STR || c.kind == mir::C_BYTES {
+            let s = self.g.p.str_sym(&c.bytes);
+            m.adr_sym(V1, s.as_str());
+            m.mov_imm(V2, c.bytes.len() as i64);
+        } else if c.kind == mir::C_FN {
+            self.fn_value(c, V1, V2);
+        } else {
+            m.mov_imm(V1, 0);
+            m.mov_imm(V2, 0);
+        }
+    }
+
+    /// Materializes a function constant as (code, ctx).
+    fn fn_value(&mut self, c: &Const, code: Reg, ctx: Reg) {
+        let m = self.m;
+        let (t, slot) = self.g.p.site_target(self.inst, c);
+        if slot >= 0 {
+            m.load(8, I1, FP, SLOT_CTX);
+            m.load(8, code, I1, 16 * slot);
+            m.load(8, ctx, I1, 16 * slot + 8);
+            return;
+        }
+        if t.kind == codegen::T_INST {
+            let i = t.inst.unwrap();
+            m.adr_sym(code, i.grp().sym.as_str());
+            m.adr_sym(ctx, i.dict.as_str());
+        } else if t.kind == codegen::T_INTRINSIC {
+            if t.intrinsic == "extern" {
+                let s = self.g.extern_sym(link_name(t.def).as_str());
+                m.adr_sym(code, s.as_str());
+                m.mov_imm(ctx, 0);
+                return;
+            }
+            self.g.errorf(`${self.f.name}: intrinsic ${t.intrinsic} used as a value`);
+        } else {
+            self.g.errorf(`${self.f.name}: dynamic method ${t.def.name} used as a value`);
+        }
+    }
+
+    /// Writes an operand to [dst + off]; dst must be BASE, FP or SP.
+    /// Clobbers RA, RM, V1, V2, T1, I1, I2.
+    fn store_operand(&mut self, op: &Operand, dst: Reg, off: i64) {
+        let m = self.m;
+        let ty = self.operand_type(op);
+        let mut size = self.size(ty);
+        if op.kind == mir::OP_CONST && op.cnst.unwrap().kind == mir::C_FN && ty.kind == types::K_FN && ty.abi == "C" { size = 8; }
+        if size == 0 { return; }
+        if op.kind == mir::OP_COPY {
+            self.place(&op.place);
+            self.copy_mem(dst, off, RA, 0, size);
+            return;
+        }
+        let ck = op.cnst.unwrap().kind;
+        if ck == mir::C_ZERO || ck == mir::C_UNIT {
+            self.zero_mem(dst, off, size);
+            return;
+        }
+        if size == 1 || size == 2 || size == 4 || size == 8 {
+            self.load_scalar(op, V1);
+            m.store(size, V1, dst, off);
+        } else if size == 16 {
+            self.load_val(op, 16);
+            m.store(8, V1, dst, off);
+            m.store(8, V2, dst, off + 8);
+        } else {
+            self.g.errorf(`${self.f.name}: constant of ${size} bytes`);
+        }
+    }
+
+    /// Copies size bytes; clobbers V2, T1, I1, I2.
+    fn copy_mem(&mut self, dst: Reg, d_off: i64, src: Reg, s_off: i64, size: i64) {
+        if size > 256 {
+            self.m.addr_of(I1, src, s_off);
+            self.m.addr_of(I2, dst, d_off);
+            self.m.copy_words(I2, I1, size / 8);
+            self.copy_small(I2, 0, I1, 0, size % 8);
+            return;
+        }
+        self.copy_small(dst, d_off, src, s_off, size);
+    }
+
+    fn copy_small(&mut self, dst: Reg, d_off: i64, src: Reg, s_off: i64, size: i64) {
+        let mut pos = 0i64;
+        for chunk in [8i64, 4, 2, 1].iter() {
+            while size - pos >= *chunk {
+                self.m.load(*chunk, T1, src, s_off + pos);
+                self.m.store(*chunk, T1, dst, d_off + pos);
+                pos += *chunk;
+            }
+        }
+    }
+
+    fn zero_mem(&mut self, dst: Reg, off: i64, size: i64) {
+        let mut pos = 0i64;
+        for chunk in [8i64, 4, 2, 1].iter() {
+            while size - pos >= *chunk {
+                self.m.store_zero(*chunk, dst, off + pos);
+                pos += *chunk;
+            }
+        }
+    }
+
+    /// Stores V1 (and V2) into the place; sizes 1, 2, 4, 8, 16.
+    fn store_regs(&mut self, pl: &Place, size: i64) {
+        let m = self.m;
+        self.place(pl);
+        if size == 0 {
+        } else if size == 1 || size == 2 || size == 4 || size == 8 {
+            m.store(size, V1, RA, 0);
+        } else if size == 16 {
+            m.store(8, V1, RA, 0);
+            m.store(8, V2, RA, 8);
+        } else {
+            self.g.errorf(`${self.f.name}: register store of ${size} bytes`);
+        }
+    }
+
+    // --- Statements --------------------------------------------------------------
+
+    fn stmt(&mut self, bi: usize, si: usize, s: &Stmt) {
+        let m = self.m;
+        match s {
+            Stmt::Assign { place, rv } => self.assign(bi, si, place, rv),
+            Stmt::SetDiscr { place, variant } => {
+                let ty = self.place(place);
+                self.write_tag(RA, ty, *variant);
+            }
+            Stmt::Box { local, ty } => {
+                let ct = self.conc(*ty);
+                let size = self.g.lay.of(ct).size;
+                let ns = self.noscan(ct);
+                self.call_alloc(size, ns);
+                m.load(8, V1, FP, self.res_off);
+                self.local_addr(RA, *local);
+                m.store(8, V1, RA, 0);
+            }
+            Stmt::PushDefer { fn_op, args } => self.push_defer(fn_op, args),
+            _ => {}
+        }
+    }
+
+    /// Calls std::rt::native::gc_alloc(size, noscan); the pointer is left in
+    /// the result buffer.
+    fn call_alloc(&mut self, size: i64, noscan: bool) {
+        let m = self.m;
+        m.mov_imm(V1, size);
+        m.store(8, V1, SP, 0);
+        if noscan {
+            m.mov_imm(V1, 1);
+            m.store(1, V1, SP, 8);
+        } else {
+            m.store_zero(1, SP, 8);
+        }
+        self.call_runtime("gc_alloc");
+    }
+
+    /// Whether values of t hold no pointers.
+    fn noscan(&mut self, t: &Type) -> bool {
+        if t.kind == types::K_NEVER { return true; }
+        self.g.lay.of(t).ptrs.len() == 0
+    }
+
+    fn call_runtime(&mut self, name: &str) {
+        let m = self.m;
+        let inst = self.g.p.runtime[&name.to_string()];
+        m.addr_of(RET, FP, self.res_off);
+        let l = self.g.loc_at("<runtime>", 0, 0);
+        m.adr_sym(LOC, l.as_str());
+        m.adr_sym(CTX, inst.dict.as_str());
+        m.call(inst.grp().sym.as_str());
+    }
+
+    fn write_tag(&mut self, base: Reg, ty: &Type, variant: usize) {
+        let m = self.m;
+        let l = self.g.lay.of(ty);
+        if l.tag == layout::TAG_INT {
+            let d = self.g.p.info.adts[&ty.d().id].variants[variant].discr;
+            m.mov_imm(V1, d);
+            m.store(l.tag_size, V1, base, l.tag_off);
+        } else if l.tag == layout::TAG_NICHE {
+            if variant == l.niche_variant { m.store_zero(8, base, 0); }
+        }
+    }
+
+    /// Leaves the variant index of the enum at RA in V1.
+    fn read_variant(&mut self, ty: &Type) {
+        let m = self.m;
+        let l = self.g.lay.of(ty);
+        if l.tag == layout::TAG_INT {
+            m.load(l.tag_size, V1, RA, l.tag_off);
+            let vs = self.g.p.info.adts[&ty.d().id].variants;
+            let mut identity = true;
+            let mut i = 0;
+            while i < vs.len() {
+                if vs[i].discr != i as i64 { identity = false; }
+                i += 1;
+            }
+            if identity { return; }
+            let mask: u64 = if l.tag_size < 8 { (1u64 << (8 * l.tag_size) as u32) - 1 } else { 0xFFFFFFFFFFFFFFFF };
+            m.mov_imm(V2, 0);
+            i = 0;
+            while i < vs.len() {
+                m.mov_imm(T1, ((vs[i].discr as u64) & mask) as i64);
+                m.cmp(V1, T1);
+                m.mov_imm(I1, i as i64);
+                m.select_reg(V2, I1, V2, EQ);
+                i += 1;
+            }
+            m.mov(V1, V2);
+        } else if l.tag == layout::TAG_NICHE {
+            m.load(8, V1, RA, 0);
+            m.cmp_imm(V1, 0);
+            if l.niche_variant == 0 { m.set_cond(V1, NE); } else { m.set_cond(V1, EQ); }
+        } else {
+            m.mov_imm(V1, 0);
+        }
+    }
+
+    fn assign(&mut self, bi: usize, si: usize, place: &Place, rv: &Rvalue) {
+        let m = self.m;
+        let dt = self.place_type(place);
+        if dt.kind == types::K_NEVER { return; }
+        let size = self.size(dt);
+        let regs = size == 1 || size == 2 || size == 4 || size == 8 || size == 16;
+        match rv {
+            Rvalue::Use(x) => {
+                if size == 0 { return; }
+                if regs {
+                    self.load_val(x, size);
+                    self.store_regs(place, size);
+                    return;
+                }
+                m.addr_of(BASE, FP, self.tmp_off);
+                self.store_operand(x, BASE, 0);
+                self.place(place);
+                self.copy_mem(RA, 0, BASE, 0, size);
+            }
+            Rvalue::Ref { place: src, .. } => {
+                let pt = self.place(src);
+                m.mov(V1, RA);
+                if layout::is_fat(pt) { m.mov(V2, RM); }
+                self.store_regs(place, size);
+            }
+            Rvalue::Bin { op, x, y, ty, pos } => {
+                self.binop(*op, x, y, *ty, *pos);
+                self.store_regs(place, size);
+            }
+            Rvalue::Un { op, x, ty, pos } => {
+                self.unop(*op, x, *ty, *pos);
+                self.store_regs(place, size);
+            }
+            Rvalue::Cast { kind, x, .. } => {
+                self.cast(*kind, x, dt);
+                self.store_regs(place, size);
+            }
+            Rvalue::Discr(p) => {
+                let ty = self.place(p);
+                self.read_variant(ty);
+                self.store_regs(place, size);
+            }
+            Rvalue::Len(p) => {
+                let pt = self.place_type(p);
+                if pt.kind == types::K_ARRAY {
+                    m.mov_imm(V1, pt.len);
+                } else {
+                    self.place(p);
+                    m.mov(V1, RM);
+                }
+                self.store_regs(place, size);
+            }
+            Rvalue::Unsize { x, len, .. } => {
+                self.load_scalar(x, V1);
+                m.mov_imm(V2, *len);
+                self.store_regs(place, size);
+            }
+            Rvalue::MakeDyn { x, .. } => {
+                self.load_scalar(x, V1);
+                let key = codegen::dyn_site(self.f, bi, si);
+                let (vt, slot) = self.g.p.site_vtable(self.inst, &key);
+                if slot >= 0 {
+                    m.load(8, I1, FP, SLOT_CTX);
+                    m.load(8, V2, I1, 16 * slot);
+                } else {
+                    m.adr_sym(V2, vt.sym.as_str());
+                }
+                self.store_regs(place, size);
+            }
+            Rvalue::Aggregate { kind, ty, variant, ops, closure } => {
+                if *kind == mir::AGG_CLOSURE {
+                    self.closure(ops, closure.unwrap());
+                    self.store_regs(place, size);
+                    return;
+                }
+                if size == 0 { return; }
+                m.addr_of(BASE, FP, self.tmp_off);
+                let aty = self.conc(*ty);
+                let l = self.g.lay.of(aty);
+                if *kind == mir::AGG_TUPLE {
+                    let mut i = 0;
+                    while i < ops.len() {
+                        self.store_operand(&ops[i], BASE, l.fields[i]);
+                        i += 1;
+                    }
+                } else if *kind == mir::AGG_ARRAY {
+                    if ops.len() > 0 {
+                        let stride = l.size / ops.len() as i64;
+                        let mut i = 0;
+                        while i < ops.len() {
+                            self.store_operand(&ops[i], BASE, i as i64 * stride);
+                            i += 1;
+                        }
+                    }
+                } else {
+                    if !self.g.p.info.adts[&aty.d().id].is_enum {
+                        let mut i = 0;
+                        while i < ops.len() {
+                            self.store_operand(&ops[i], BASE, l.fields[i]);
+                            i += 1;
+                        }
+                    } else {
+                        let mut i = 0;
+                        while i < ops.len() {
+                            self.store_operand(&ops[i], BASE, l.variants[*variant][i]);
+                            i += 1;
+                        }
+                        self.write_tag(BASE, aty, *variant);
+                    }
+                }
+                self.place(place);
+                self.copy_mem(RA, 0, BASE, 0, size);
+            }
+        }
+    }
+
+    /// Allocates the environment [dict, captures...] and leaves the closure
+    /// value (code, env+8) in V1, V2.
+    fn closure(&mut self, ops: &Vec<Operand>, cf: &Func) {
+        let m = self.m;
+        self.call_alloc((8 + 8 * ops.len()) as i64, false);
+        m.load(8, BASE, FP, self.res_off);
+        m.load(8, T1, FP, SLOT_CTX);
+        m.store(8, T1, BASE, 0);
+        let mut i = 0;
+        while i < ops.len() {
+            self.store_operand(&ops[i], BASE, (8 + 8 * i) as i64);
+            i += 1;
+        }
+        let s = self.g.closure_sym(self.grp, cf);
+        m.adr_sym(V1, s.as_str());
+        m.addr_of(V2, BASE, 8);
+    }
+
+    // --- Arithmetic ----------------------------------------------------------------
+
+    fn panic_stub(&mut self, msg: &str, pos: Pos) -> Label {
+        let key = `${msg}@${pos}`;
+        if let Some(l) = self.stubs.get(&key) { return *l; }
+        let l = self.m.new_label();
+        self.stubs.insert(key, l);
+        self.stub_list.push(Stub::Panic { label: l, msg: msg.to_string(), pos });
+        l
+    }
+
+    /// Calls panic_raw(msg, file, line, col). Compiler-generated impls
+    /// report their caller's location.
+    fn call_panic(&mut self, msg: &str, pos: Pos) {
+        let m = self.m;
+        let ms = self.g.str_sym(msg);
+        m.adr_sym(V1, ms.as_str());
+        m.store(8, V1, SP, 0);
+        m.mov_imm(V1, msg.len() as i64);
+        m.store(8, V1, SP, 8);
+        if self.f.shim {
+            self.store_caller_loc(16);
+        } else {
+            match self.f.file {
+                Some(file) => {
+                    let ps = file.position(pos);
+                    self.store_file_line(16, ps.file.as_str(), ps.line as i64, ps.col as i64);
+                }
+                None => self.store_file_line(16, "<unknown>", 0, 0),
+            }
+        }
+        self.call_runtime("panic_raw");
+        m.trap();
+    }
+
+    /// Writes the received caller location as (file, line, col) arguments
+    /// at sp+off.
+    fn store_caller_loc(&mut self, off: i64) {
+        let m = self.m;
+        let ld = self.g.p.info.lang_def("Location").unwrap();
+        let lt = self.g.p.info.ctx.adt(ld, Vec::new());
+        let ll = self.g.lay.of(lt);
+        m.load(8, BASE, FP, SLOT_LOC);
+        m.load(8, V1, BASE, ll.fields[0]);
+        m.store(8, V1, SP, off);
+        m.load(8, V1, BASE, ll.fields[0] + 8);
+        m.store(8, V1, SP, off + 8);
+        m.load(4, V1, BASE, ll.fields[1]);
+        m.store(4, V1, SP, off + 16);
+        m.load(4, V1, BASE, ll.fields[2]);
+        m.store(4, V1, SP, off + 24);
+    }
+
+    fn store_file_line(&mut self, off: i64, file: &str, line: i64, col: i64) {
+        let m = self.m;
+        let fs = self.g.str_sym(file);
+        m.adr_sym(V1, fs.as_str());
+        m.store(8, V1, SP, off);
+        m.mov_imm(V1, file.len() as i64);
+        m.store(8, V1, SP, off + 8);
+        m.mov_imm(V1, line);
+        m.store(4, V1, SP, off + 16);
+        m.mov_imm(V1, col);
+        m.store(4, V1, SP, off + 24);
+    }
+
+    /// Leaves the result in V1.
+    fn binop(&mut self, op: mir::BinOp, x: &Operand, y: &Operand, ty0: &Type, pos: Pos) {
+        let m = self.m;
+        let ty = self.conc(ty0);
+        self.load_scalar(x, V1);
+        self.load_scalar(y, V2);
+        if ty.kind == types::K_FLOAT {
+            let f64_ = ty.f64;
+            m.fmov_to(F0, V1, f64_);
+            m.fmov_to(F1, V2, f64_);
+            if op == mir::ADD {
+                m.farith(ADD, F0, F0, F1, f64_);
+            } else if op == mir::SUB {
+                m.farith(SUB, F0, F0, F1, f64_);
+            } else if op == mir::MUL {
+                m.farith(MUL, F0, F0, F1, f64_);
+            } else if op == mir::DIV {
+                m.farith(FDIV, F0, F0, F1, f64_);
+            } else if op == mir::REM {
+                m.store(8, V1, SP, 0);
+                m.store(8, V2, SP, 8);
+                let name = if f64_ { "fmod" } else { "fmodf" };
+                let s = self.g.extern_sym(name);
+                let mut args = Vec::new();
+                args.push(CArg { float: true, f64: f64_ });
+                args.push(CArg { float: true, f64: f64_ });
+                m.call_c(s.as_str(), 0, &args, true, f64_);
+                return;
+            } else {
+                let c = if op == mir::EQ { EQ } else if op == mir::NE { NE } else if op == mir::LT { LT } else if op == mir::LE { LE }
+                    else if op == mir::GT { GT } else { GE };
+                m.fcompare(V1, c, F0, F1, f64_);
+                return;
+            }
+            m.fmov_from(V1, F0, f64_);
+            return;
+        }
+        let size = self.scalar_size(ty);
+        let signed = is_signed(ty);
+        if signed {
+            m.sign_ext(V1, V1, size);
+            if op != mir::SHL && op != mir::SHR { m.sign_ext(V2, V2, size); }
+        }
+        let dbg = self.g.debug;
+        if op == mir::ADD || op == mir::SUB || op == mir::MUL {
+            let what = if op == mir::ADD { "add" } else if op == mir::SUB { "subtract" } else { "multiply" };
+            let aop = if op == mir::ADD { ADD } else if op == mir::SUB { SUB } else { MUL };
+            if size == 8 && dbg {
+                let l = self.panic_stub(`attempt to ${what} with overflow`.as_str(), pos);
+                m.arith_ovf(aop, signed, V1, V1, V2, l);
+                return;
+            }
+            m.arith(aop, V1, V1, V2);
+            if dbg {
+                let l = self.panic_stub(`attempt to ${what} with overflow`.as_str(), pos);
+                self.check_range(size, signed, l);
+            }
+        } else if op == mir::DIV || op == mir::REM {
+            let l = self.panic_stub("attempt to divide by zero", pos);
+            m.branch_zero(V2, l);
+            if signed {
+                let skip = m.new_label();
+                m.cmp_imm(V2, -1);
+                m.branch_if(NE, skip);
+                m.mov_imm(T1, int_min(size));
+                m.cmp(V1, T1);
+                let l2 = self.panic_stub("attempt to divide with overflow", pos);
+                m.branch_if(EQ, l2);
+                m.bind(skip);
+            }
+            let aop = if op == mir::DIV && signed { DIV_S } else if op == mir::DIV { DIV_U } else if signed { REM_S } else { REM_U };
+            m.arith(aop, V1, V1, V2);
+        } else if op == mir::SHL || op == mir::SHR {
+            m.cmp_imm(V2, size * 8);
+            let l = self.panic_stub("attempt to shift with overflow", pos);
+            m.branch_if(GEU, l);
+            if op == mir::SHL {
+                m.arith(SHL, V1, V1, V2);
+            } else if signed {
+                m.arith(SHR_S, V1, V1, V2);
+            } else {
+                m.arith(SHR_U, V1, V1, V2);
+            }
+        } else if op == mir::BIT_AND {
+            m.arith(AND, V1, V1, V2);
+        } else if op == mir::BIT_OR {
+            m.arith(OR, V1, V1, V2);
+        } else if op == mir::BIT_XOR {
+            m.arith(XOR, V1, V1, V2);
+        } else if op == mir::OFFSET {
+            let et = self.reveal(ty.el());
+            let es = self.size(et);
+            m.mov_imm(T1, es);
+            m.mul_add(V1, V2, T1, V1);
+        } else {
+            m.cmp(V1, V2);
+            let c = if op == mir::EQ { EQ } else if op == mir::NE { NE }
+                else if op == mir::LT { if signed { LT } else { LTU } }
+                else if op == mir::LE { if signed { LE } else { LEU } }
+                else if op == mir::GT { if signed { GT } else { GTU } }
+                else if signed { GE } else { GEU };
+            m.set_cond(V1, c);
+        }
+    }
+
+    /// Jumps to l unless V1 fits in size bytes.
+    fn check_range(&mut self, size: i64, signed: bool, l: Label) {
+        if size >= 8 { return; }
+        let m = self.m;
+        if signed {
+            m.sign_ext(T1, V1, size);
+            m.cmp(T1, V1);
+            m.branch_if(NE, l);
+        } else {
+            m.mov_imm(T1, (1i64 << (8 * size) as u32) - 1);
+            m.cmp(V1, T1);
+            m.branch_if(GTU, l);
+        }
+    }
+
+    fn unop(&mut self, op: mir::UnOp, x: &Operand, ty0: &Type, pos: Pos) {
+        let m = self.m;
+        let ty = self.conc(ty0);
+        self.load_scalar(x, V1);
+        if ty.kind == types::K_FLOAT {
+            m.fmov_to(F0, V1, ty.f64);
+            m.fneg(F0, F0, ty.f64);
+            m.fmov_from(V1, F0, ty.f64);
+        } else if ty.kind == types::K_BOOL {
+            m.mov_imm(V2, 1);
+            m.arith(XOR, V1, V1, V2);
+        } else if op == mir::NOT {
+            m.not(V1, V1);
+        } else {
+            let size = self.scalar_size(ty);
+            if is_signed(ty) && self.g.debug {
+                m.sign_ext(V1, V1, size);
+                m.mov_imm(T1, int_min(size));
+                m.cmp(V1, T1);
+                let l = self.panic_stub("attempt to negate with overflow", pos);
+                m.branch_if(EQ, l);
+            }
+            m.neg(V1, V1);
+        }
+    }
+
+    fn cast(&mut self, kind: mir::CastKind, x: &Operand, to: &Type) {
+        let m = self.m;
+        if kind == mir::CAST_PTR {
+            let s = self.size(to);
+            self.load_val(x, s);
+            return;
+        }
+        if kind == mir::CAST_PTR_INT || kind == mir::CAST_FN_PTR || kind == mir::CAST_INT_PTR {
+            self.load_scalar(x, V1);
+            return;
+        }
+        if kind == mir::CAST_ENUM {
+            let from = self.operand_type(x);
+            if x.kind != mir::OP_COPY {
+                self.load_scalar(x, V1);
+                return;
+            }
+            self.place(&x.place);
+            let l = self.g.lay.of(from);
+            let vs = self.g.p.info.adts[&from.d().id].variants;
+            if l.tag != layout::TAG_INT {
+                if vs.len() > 0 { m.mov_imm(V1, vs[0].discr); }
+                return;
+            }
+            m.load(l.tag_size, V1, RA, l.tag_off);
+            for v in vs.iter() {
+                if v.discr < 0 {
+                    m.sign_ext(V1, V1, l.tag_size);
+                    break;
+                }
+            }
+            return;
+        }
+        let from = self.operand_type(x);
+        self.load_scalar(x, V1);
+        if from.kind == types::K_FLOAT && to.kind == types::K_FLOAT {
+            if from.f64 == to.f64 { return; }
+            m.fmov_to(F0, V1, from.f64);
+            m.float_conv(F0, F0, to.f64);
+            m.fmov_from(V1, F0, to.f64);
+        } else if from.kind == types::K_FLOAT {
+            m.fmov_to(F0, V1, from.f64);
+            let size = self.scalar_size(to);
+            if size == 8 {
+                m.float_to_int(V1, F0, is_signed(to), from.f64);
+                return;
+            }
+            m.float_to_int(V1, F0, true, from.f64);
+            let (lo, hi) = if is_signed(to) { (int_min(size), -int_min(size) - 1) } else { (0, (1i64 << (8 * size) as u32) - 1) };
+            m.mov_imm(V2, lo);
+            m.cmp(V1, V2);
+            m.select_reg(V1, V2, V1, LT);
+            m.mov_imm(V2, hi);
+            m.cmp(V1, V2);
+            m.select_reg(V1, V2, V1, GT);
+        } else if to.kind == types::K_FLOAT {
+            if is_signed(from) {
+                let s = self.scalar_size(from);
+                m.sign_ext(V1, V1, s);
+                m.int_to_float(F0, V1, true, to.f64);
+            } else {
+                m.int_to_float(F0, V1, false, to.f64);
+            }
+            m.fmov_from(V1, F0, to.f64);
+        } else {
+            if is_signed(from) {
+                let s = self.scalar_size(from);
+                m.sign_ext(V1, V1, s);
+            }
+        }
+    }
+
+    // --- Terminators ---------------------------------------------------------------
+
+    fn term(&mut self, bi: usize, t: &Term) {
+        let m = self.m;
+        match t {
+            Term::Goto(target) => {
+                if *target != bi + 1 { m.jump(self.blocks[*target]); }
+            }
+            Term::Switch { x, ty, vals, targets, els } => {
+                let cty = self.conc(*ty);
+                self.load_scalar(x, V1);
+                if is_signed(cty) {
+                    let s = self.scalar_size(cty);
+                    m.sign_ext(V1, V1, s);
+                }
+                let mut i = 0;
+                while i < vals.len() {
+                    m.cmp_imm(V1, vals[i]);
+                    m.branch_if(EQ, self.blocks[targets[i]]);
+                    i += 1;
+                }
+                m.jump(self.blocks[*els]);
+            }
+            Term::Return => {
+                m.load(8, CTX, FP, SLOT_DEFERS);
+                let skip = m.new_label();
+                m.branch_zero(CTX, skip);
+                m.call("_navi_rundefers");
+                m.bind(skip);
+                let size = self.size(self.ltypes[0]);
+                if size > 0 {
+                    m.load(8, BASE, FP, SLOT_RET);
+                    self.local_addr(RA, 0);
+                    self.copy_mem(BASE, 0, RA, 0, size);
+                }
+                m.ret();
+            }
+            Term::Unreachable => m.trap(),
+            Term::Assert { cond, msg, target, pos, bounds, len, index } => {
+                self.load_scalar(cond, V1);
+                m.branch_non_zero(V1, self.blocks[*target]);
+                if *bounds {
+                    self.load_scalar(len, V1);
+                    m.store(8, V1, SP, 0);
+                    self.load_scalar(index, V1);
+                    m.store(8, V1, SP, 8);
+                    match self.f.file {
+                        Some(file) => {
+                            let ps = file.position(*pos);
+                            self.store_file_line(16, ps.file.as_str(), ps.line as i64, ps.col as i64);
+                        }
+                        None => self.store_file_line(16, "<unknown>", 0, 0),
+                    }
+                    self.call_runtime("panic_bounds");
+                    m.trap();
+                    return;
+                }
+                self.call_panic(msg.as_str(), *pos);
+            }
+            Term::Call { fn_op, args, dest, target, pos } => self.call(fn_op, args, dest, *target, *pos),
+            Term::None => {
+                self.g.errorf(`${self.f.name}: block without terminator`);
+            }
+        }
+    }
+
+    /// Sets LOC to the location passed to a callee.
+    fn pass_loc(&mut self, pos: Pos) {
+        if self.inst.track_caller && !self.f.closure {
+            self.m.load(8, LOC, FP, SLOT_LOC);
+            return;
+        }
+        let l = self.g.loc(self.f.file, pos);
+        self.m.adr_sym(LOC, l.as_str());
+    }
+
+    /// Writes the arguments to the outgoing area. If thin_recv, the first
+    /// argument is a fat pointer of which only the data word is passed.
+    fn store_args(&mut self, args: &Vec<Operand>, thin_recv: bool) {
+        let mut off = 0i64;
+        let mut i = 0;
+        while i < args.len() {
+            if i == 0 && thin_recv {
+                self.load_scalar(&args[0], V1);
+                self.m.store(8, V1, SP, 0);
+                off = 8;
+                i += 1;
+                continue;
+            }
+            self.store_operand(&args[i], SP, off);
+            let at = self.operand_type(&args[i]);
+            off += round8(self.size(at));
+            i += 1;
+        }
+    }
+
+    fn call(&mut self, fn_op: &Operand, args: &Vec<Operand>, dest: &Place, target: i64, pos: Pos) {
+        let m = self.m;
+        let dt = self.place_type(dest);
+        let mut tgt: Option<&mut Target> = None;
+        let mut slot = -1i64;
+        if fn_op.kind == mir::OP_CONST && fn_op.cnst.unwrap().kind == mir::C_FN {
+            let (t, s) = self.g.p.site_target(self.inst, fn_op.cnst.unwrap());
+            tgt = Some(t);
+            slot = s;
+            if s < 0 && t.kind == codegen::T_INTRINSIC {
+                self.intrinsic(t, args, dest, target, pos, dt);
+                return;
+            }
+        }
+        match tgt {
+            None => {
+                let ft = self.operand_type(fn_op);
+                if ft.kind == types::K_FN && ft.abi == "C" {
+                    self.c_call(fn_op, args, dest, target, dt, "", true);
+                    return;
+                }
+                self.store_args(args, false);
+                self.load_val(fn_op, 16);
+                m.mov(BASE, V1);
+                m.mov(CTX, V2);
+                self.pass_loc(pos);
+                m.addr_of(RET, FP, self.res_off);
+                m.call_reg(BASE);
+            }
+            Some(t) => {
+                if slot >= 0 {
+                    self.store_args(args, false);
+                    m.load(8, BASE, FP, SLOT_CTX);
+                    m.load(8, CTX, BASE, 16 * slot + 8);
+                    m.load(8, BASE, BASE, 16 * slot);
+                    self.pass_loc(pos);
+                    m.addr_of(RET, FP, self.res_off);
+                    m.call_reg(BASE);
+                } else if t.kind == codegen::T_VIRTUAL {
+                    self.store_args(args, true);
+                    self.load_val(&args[0], 16);
+                    m.load(8, CTX, V2, (16 * t.method + 8) as i64);
+                    m.load(8, BASE, V2, (16 * t.method) as i64);
+                    self.pass_loc(pos);
+                    m.addr_of(RET, FP, self.res_off);
+                    m.call_reg(BASE);
+                } else {
+                    self.store_args(args, false);
+                    self.pass_loc(pos);
+                    m.addr_of(RET, FP, self.res_off);
+                    let i = t.inst.unwrap();
+                    m.adr_sym(CTX, i.dict.as_str());
+                    m.call(i.grp().sym.as_str());
+                }
+            }
+        }
+        self.after_call(dest, target, dt);
+    }
+
+    fn after_call(&mut self, dest: &Place, target: i64, dt: &Type) {
+        let m = self.m;
+        if target < 0 || dt.kind == types::K_NEVER {
+            m.trap();
+            return;
+        }
+        let size = self.size(dt);
+        if size > 0 {
+            self.place(dest);
+            self.copy_mem(RA, 0, FP, self.res_off, size);
+        }
+        m.jump(self.blocks[target as usize]);
+    }
+
+    /// Calls a C function (sym, or the C function pointer fn_op when via_fn)
+    /// with the platform's C convention.
+    fn c_call(&mut self, fn_op: &Operand, args: &Vec<Operand>, dest: &Place, target: i64, dt: &Type, sym: &str, via_fn: bool) {
+        let m = self.m;
+        let mut cargs: Vec<CArg> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let ty = self.operand_type(&args[i]);
+            if ty.kind == types::K_FLOAT {
+                self.load_scalar(&args[i], V1);
+                cargs.push(CArg { float: true, f64: ty.f64 });
+            } else if self.size(ty) <= 8 {
+                self.load_scalar(&args[i], V1);
+                if is_signed(ty) {
+                    let s = self.scalar_size(ty);
+                    m.sign_ext(V1, V1, s);
+                }
+                cargs.push(int_arg());
+            } else {
+                self.g.errorf(`${self.f.name}: unsupported C argument type ${ty}`);
+                return;
+            }
+            m.store(8, V1, SP, (8 * i) as i64);
+            i += 1;
+        }
+        let float_ret = dt.kind == types::K_FLOAT;
+        let f64_ = float_ret && dt.f64;
+        if via_fn {
+            self.load_scalar(fn_op, BASE);
+            m.call_c("", BASE, &cargs, float_ret, f64_);
+        } else {
+            m.call_c(sym, 0, &cargs, float_ret, f64_);
+        }
+        if target < 0 || dt.kind == types::K_NEVER {
+            m.trap();
+            return;
+        }
+        let size = self.size(dt);
+        if size > 0 { self.store_regs(dest, size); }
+        m.jump(self.blocks[target as usize]);
+    }
+
+    /// Generates an inline intrinsic or a C call.
+    fn intrinsic(&mut self, t: &Target, args: &Vec<Operand>, dest: &Place, target: i64, pos: Pos, dt: &Type) {
+        let m = self.m;
+        let size = self.size(dt);
+        let name = t.intrinsic.as_str();
+        let targ0: Option<&Type> = if t.type_args.len() > 0 { Some(t.type_args[0]) } else { None };
+        if name == "extern" {
+            let s = self.g.extern_sym(link_name(t.def).as_str());
+            let fo = mir::copy(mir::local_place(0));
+            self.c_call(&fo, args, dest, target, dt, s.as_str(), false);
+            return;
+        }
+        if name == "unreachable" {
+            m.trap();
+            return;
+        }
+        if name == "abort" {
+            let s = self.g.extern_sym("abort");
+            m.call_c(s.as_str(), 0, &Vec::new(), false, false);
+            m.trap();
+            return;
+        }
+        if name == "has_pointers" {
+            let ns = self.noscan(targ0.unwrap());
+            m.mov_imm(V1, if ns { 0 } else { 1 });
+        } else if name == "frame_address" {
+            m.mov(V1, FP);
+        } else if name == "stack_top" {
+            m.adr_sym(V1, "_navi_stack_top");
+            m.load(8, V1, V1, 0);
+        } else if name == "data_start" {
+            m.adr_sym(V1, "_navi_data_start");
+        } else if name == "data_end" {
+            m.adr_sym(V1, "_navi_data_end");
+        } else if name == "run_defers" {
+            self.load_scalar(&args[0], CTX);
+            m.call("_navi_rundefers");
+        } else if name == "swap_context" {
+            self.load_scalar(&args[0], V1);
+            m.store(8, V1, SP, 0);
+            self.load_scalar(&args[1], V1);
+            m.store(8, V1, SP, 8);
+            let mut ca = Vec::new();
+            ca.push(int_arg());
+            ca.push(int_arg());
+            m.call_c("_navi_swapctx", 0, &ca, false, false);
+        } else if name == "gstart_address" {
+            m.adr_sym(V1, "_navi_gstart");
+        } else if name == "set_stack_limit" {
+            self.load_scalar(&args[0], V1);
+            m.adr_sym(I1, "_navi_stack_lo");
+            m.store(8, V1, I1, 0);
+        } else if name == "wrapping_add" || name == "wrapping_sub" || name == "wrapping_mul" {
+            self.load_scalar(&args[1], V2);
+            m.store(8, V2, FP, self.res_off);
+            self.load_scalar(&args[0], V1);
+            m.load(8, V2, FP, self.res_off);
+            let op = if name == "wrapping_add" { ADD } else if name == "wrapping_sub" { SUB } else { MUL };
+            m.arith(op, V1, V1, V2);
+        } else if name == "size_of" {
+            let s = self.size(targ0.unwrap());
+            m.mov_imm(V1, s);
+        } else if name == "align_of" {
+            let a = self.g.lay.of(targ0.unwrap()).align;
+            m.mov_imm(V1, a);
+        } else if name == "ptr_offset" {
+            self.load_scalar(&args[1], V2);
+            m.store(8, V2, FP, self.res_off);
+            self.load_scalar(&args[0], V1);
+            m.load(8, V2, FP, self.res_off);
+            let s = self.size(targ0.unwrap());
+            m.mov_imm(T1, s);
+            m.mul_add(V1, V2, T1, V1);
+        } else if name == "slice_from_raw" || name == "slice_from_raw_mut" || name == "str_from_raw" {
+            self.load_scalar(&args[1], V2);
+            m.store(8, V2, FP, self.res_off);
+            self.load_scalar(&args[0], V1);
+            m.load(8, V2, FP, self.res_off);
+        } else if name == "slice_len" {
+            self.load_val(&args[0], 16);
+            m.mov(V1, V2);
+        } else if name == "slice_ptr" {
+            self.load_scalar(&args[0], V1);
+        } else if name == "str_as_bytes" {
+            self.load_val(&args[0], 16);
+        } else if name == "caller_location" {
+            if self.inst.track_caller && !self.f.closure {
+                m.load(8, BASE, FP, SLOT_LOC);
+            } else {
+                let l = self.g.loc(self.f.file, pos);
+                m.adr_sym(BASE, l.as_str());
+            }
+            self.place(dest);
+            self.copy_mem(RA, 0, BASE, 0, size);
+            if target >= 0 { m.jump(self.blocks[target as usize]); }
+            return;
+        } else {
+            self.g.errorf(`${self.f.name}: intrinsic ${name} has no native implementation`);
+            return;
+        }
+        self.store_regs(dest, size);
+        if target >= 0 { m.jump(self.blocks[target as usize]); } else { m.trap(); }
+    }
+
+    // --- Defer ---------------------------------------------------------------------
+
+    /// Allocates a record [next, code, ctx, argsize, retsize, loc, args...]
+    /// and links it into the frame's defer list.
+    fn push_defer(&mut self, fn_op: &Operand, args: &Vec<Operand>) {
+        let m = self.m;
+        let mut is_virtual = false;
+        let mut tgt: Option<&mut Target> = None;
+        let mut ret_ty: Option<&Type> = None;
+        if fn_op.kind == mir::OP_CONST && fn_op.cnst.unwrap().kind == mir::C_FN {
+            let (t, _) = self.g.p.site_target(self.inst, fn_op.cnst.unwrap());
+            tgt = Some(t);
+            if t.kind == codegen::T_VIRTUAL {
+                is_virtual = true;
+                let sig = self.g.p.info.fn_sig_of(t.def);
+                ret_ty = Some(self.conc(sig.ret));
+            } else if t.kind == codegen::T_INST {
+                let i = t.inst.unwrap();
+                ret_ty = Some(i.concrete(self.g.p.info, i.func.locals[0].ty));
+            } else {
+                self.g.errorf(`${self.f.name}: cannot defer intrinsic ${t.intrinsic}`);
+                return;
+            }
+        } else {
+            let ft = self.operand_type(fn_op);
+            if ft.kind == types::K_FN { ret_ty = ft.ret; }
+        }
+        let mut arg_size = 0i64;
+        let mut i = 0;
+        while i < args.len() {
+            if i == 0 && is_virtual {
+                arg_size += 8;
+                i += 1;
+                continue;
+            }
+            let at = self.operand_type(&args[i]);
+            arg_size += round8(self.size(at));
+            i += 1;
+        }
+        let mut ret_size = 16i64;
+        if let Some(rt) = ret_ty {
+            let rs = self.size(rt);
+            if rs > ret_size { ret_size = rs; }
+        }
+        ret_size = round8(ret_size);
+        self.call_alloc(48 + arg_size, false);
+        m.load(8, BASE, FP, self.res_off);
+        // Code and context.
+        if is_virtual {
+            let t = tgt.unwrap();
+            self.load_val(&args[0], 16);
+            m.store(8, V1, BASE, 48);
+            m.load(8, V1, V2, (16 * t.method) as i64);
+            m.load(8, V2, V2, (16 * t.method + 8) as i64);
+        } else if tgt.is_some() {
+            self.fn_value(fn_op.cnst.unwrap(), V1, V2);
+        } else {
+            self.load_val(fn_op, 16);
+        }
+        m.store(8, V1, BASE, 8);
+        m.store(8, V2, BASE, 16);
+        m.mov_imm(V1, arg_size);
+        m.store(8, V1, BASE, 24);
+        m.mov_imm(V1, ret_size);
+        m.store(8, V1, BASE, 32);
+        if self.inst.track_caller && !self.f.closure {
+            m.load(8, V1, FP, SLOT_LOC);
+        } else {
+            let l = self.g.loc(self.f.file, 0);
+            m.adr_sym(V1, l.as_str());
+        }
+        m.store(8, V1, BASE, 40);
+        let mut off = 48i64;
+        i = 0;
+        while i < args.len() {
+            if i == 0 && is_virtual {
+                off += 8;
+                i += 1;
+                continue;
+            }
+            self.store_operand(&args[i], BASE, off);
+            let at = self.operand_type(&args[i]);
+            off += round8(self.size(at));
+            i += 1;
+        }
+        m.load(8, V1, FP, SLOT_DEFERS);
+        m.store(8, V1, BASE, 0);
+        m.store(8, BASE, FP, SLOT_DEFERS);
+    }
+}

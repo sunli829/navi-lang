@@ -1,0 +1,628 @@
+//! AArch64 code: an instruction encoder with labels and relocations, and
+//! the Machine implementation (AAPCS64 for C calls).
+
+use crate::obj::{self, Reloc};
+use crate::backend::machine::{self as lm, Machine, Code, CArg, Label as LLabel};
+
+/// A general purpose or floating point register number. 31 is SP or XZR
+/// depending on the instruction.
+pub type R = u32;
+const X0: R = 0;
+const X1: R = 1;
+const X8: R = 8;
+const X9: R = 9;
+const X10: R = 10;
+const X11: R = 11;
+const X12: R = 12;
+const X13: R = 13;
+const X14: R = 14;
+const X15: R = 15;
+const X16: R = 16;
+const X17: R = 17;
+const XFP: R = 29;
+const LR: R = 30;
+const XSP: R = 31;
+const ZR: R = 31;
+
+/// A condition code.
+pub type C = u32;
+const CEQ: C = 0;
+const CNE: C = 1;
+const HS: C = 2;
+const LO: C = 3;
+const MI: C = 4;
+const VS: C = 6;
+const HI: C = 8;
+const LS: C = 9;
+const CGE: C = 10;
+const CLT: C = 11;
+const CGT: C = 12;
+const CLE: C = 13;
+
+const FIX_B: u8 = 0;
+const FIX_BCOND: u8 = 1;
+const FIX_CB: u8 = 2;
+const FIX_ADR: u8 = 3;
+
+struct Fixup {
+    at: usize,
+    label: usize,
+    kind: u8,
+}
+
+/// The instructions of one function.
+pub struct Asm {
+    code: Vec<u32>,
+    labels: Vec<i64>,
+    fixups: Vec<Fixup>,
+    relocs: Vec<Reloc>,
+}
+
+fn new_asm() -> &mut Asm { &mut Asm { code: Vec::new(), labels: Vec::new(), fixups: Vec::new(), relocs: Vec::new() } }
+
+fn r3(base: u32, rd: R, rn: R, rm: R) -> u32 { base | (rm & 31) << 16 | (rn & 31) << 5 | (rd & 31) }
+
+fn ftype(f64: bool) -> u32 { if f64 { 1 << 22 } else { 0 } }
+
+fn ldr_scaled(size: i64, store: bool) -> u32 {
+    if size == 1 { return if store { 0x39000000 } else { 0x39400000 }; }
+    if size == 2 { return if store { 0x79000000 } else { 0x79400000 }; }
+    if size == 4 { return if store { 0xB9000000 } else { 0xB9400000 }; }
+    if store { 0xF9000000 } else { 0xF9400000 }
+}
+
+fn ldr_unscaled(size: i64, store: bool) -> u32 {
+    if size == 1 { return if store { 0x38000000 } else { 0x38400000 }; }
+    if size == 2 { return if store { 0x78000000 } else { 0x78400000 }; }
+    if size == 4 { return if store { 0xB8000000 } else { 0xB8400000 }; }
+    if store { 0xF8000000 } else { 0xF8400000 }
+}
+
+impl Asm {
+    fn emit(&mut self, w: u32) { self.code.push(w); }
+
+    fn new_label(&mut self) -> usize {
+        self.labels.push(-1);
+        self.labels.len() - 1
+    }
+
+    fn bind(&mut self, l: usize) { self.labels[l] = self.code.len() as i64; }
+
+    /// Resolves label references.
+    fn finish(&mut self) -> String {
+        for f in self.fixups.iter() {
+            let to = self.labels[f.label];
+            if to < 0 { return "arm64: unbound label".to_string(); }
+            let d = (to - f.at as i64) as i32;
+            let mut w = self.code[f.at];
+            if f.kind == FIX_B {
+                w = w | ((d as u32) & 0x3ffffff);
+            } else if f.kind == FIX_BCOND || f.kind == FIX_CB {
+                if d >= 1 << 18 || d < -(1 << 18) { return "arm64: conditional branch out of range".to_string(); }
+                w = w | (((d as u32) & 0x7ffff) << 5);
+            } else {
+                let bd = (d * 4) as u32;
+                w = w | (bd & 3) << 29 | ((bd >> 2) & 0x7ffff) << 5;
+            }
+            self.code[f.at] = w;
+        }
+        String::new()
+    }
+
+    /// The little-endian encoding.
+    fn bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for w in self.code.iter() {
+            out.push(*w as u8);
+            out.push((*w >> 8) as u8);
+            out.push((*w >> 16) as u8);
+            out.push((*w >> 24) as u8);
+        }
+        out
+    }
+
+    // --- Arithmetic ----------------------------------------------------------------
+
+    fn add_imm(&mut self, rd: R, rn: R, imm: i64) { self.add_sub_imm(0x91000000, rd, rn, imm); }
+    fn sub_imm(&mut self, rd: R, rn: R, imm: i64) { self.add_sub_imm(0xD1000000, rd, rn, imm); }
+    fn cmp_imm(&mut self, rn: R, imm: i64) { self.add_sub_imm(0xF1000000, ZR, rn, imm); }
+    fn subs_imm(&mut self, rd: R, rn: R, imm: i64) { self.add_sub_imm(0xF1000000, rd, rn, imm); }
+    fn cmn_imm(&mut self, rn: R, imm: i64) { self.add_sub_imm(0xB1000000, ZR, rn, imm); }
+
+    fn add_sub_imm(&mut self, base: u32, rd: R, rn: R, imm0: i64) {
+        let mut imm = imm0;
+        if imm < 0 || imm >= 1 << 24 || imm >= 4096 && imm & 0xfff != 0 { panic(`arm64: immediate ${imm} out of range`); }
+        let mut sh = 0u32;
+        if imm >= 4096 {
+            sh = 1;
+            imm = imm >> 12;
+        }
+        self.emit(base | sh << 22 | (imm as u32) << 10 | (rn & 31) << 5 | (rd & 31));
+    }
+
+    fn add(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x8B000000, rd, rn, rm)); }
+    fn sub(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0xCB000000, rd, rn, rm)); }
+    fn adds(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0xAB000000, rd, rn, rm)); }
+    fn subs(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0xEB000000, rd, rn, rm)); }
+    fn cmp(&mut self, rn: R, rm: R) { self.subs(ZR, rn, rm); }
+    /// cmp rn, rm, asr #63.
+    fn cmp_asr63(&mut self, rn: R, rm: R) { self.emit(r3(0xEB000000, ZR, rn, rm) | 2 << 22 | 63 << 10); }
+    /// add rd, rn, rm (uxtx), usable with SP as rd/rn.
+    fn add_ext(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x8B200000, rd, rn, rm) | 3 << 13); }
+    /// sub rd, rn, rm (uxtx), usable with SP as rd/rn.
+    fn sub_ext(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0xCB200000, rd, rn, rm) | 3 << 13); }
+    fn mul(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x9B000000, rd, rn, rm) | 31 << 10); }
+    /// rd = ra + rn*rm.
+    fn madd(&mut self, rd: R, rn: R, rm: R, ra: R) { self.emit(r3(0x9B000000, rd, rn, rm) | ra << 10); }
+    /// rd = ra - rn*rm.
+    fn msub(&mut self, rd: R, rn: R, rm: R, ra: R) { self.emit(r3(0x9B008000, rd, rn, rm) | ra << 10); }
+    fn smulh(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x9B400000, rd, rn, rm) | 31 << 10); }
+    fn umulh(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x9BC00000, rd, rn, rm) | 31 << 10); }
+    fn sdiv(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x9AC00C00, rd, rn, rm)); }
+    fn udiv(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x9AC00800, rd, rn, rm)); }
+    fn lslv(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x9AC02000, rd, rn, rm)); }
+    fn lsrv(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x9AC02400, rd, rn, rm)); }
+    fn asrv(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x9AC02800, rd, rn, rm)); }
+    fn and(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0x8A000000, rd, rn, rm)); }
+    fn orr(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0xAA000000, rd, rn, rm)); }
+    fn eor(&mut self, rd: R, rn: R, rm: R) { self.emit(r3(0xCA000000, rd, rn, rm)); }
+    fn mvn(&mut self, rd: R, rm: R) { self.emit(r3(0xAA200000, rd, ZR, rm)); }
+    /// Copies a register (not SP).
+    fn mov(&mut self, rd: R, rm: R) { self.orr(rd, ZR, rm); }
+    /// mov rd, rn where either may be SP.
+    fn mov_sp(&mut self, rd: R, rn: R) { self.add_imm(rd, rn, 0); }
+    /// rd = cond ? rn : rm.
+    fn csel(&mut self, rd: R, rn: R, rm: R, c: C) { self.emit(r3(0x9A800000, rd, rn, rm) | c << 12); }
+    /// rd = cond ? 1 : 0.
+    fn cset(&mut self, rd: R, c: C) { self.emit(r3(0x9A800400, rd, ZR, ZR) | (c ^ 1) << 12); }
+    fn sbfm(&mut self, rd: R, rn: R, immr: u32, imms: u32) { self.emit(0x93400000 | immr << 16 | imms << 10 | rn << 5 | rd); }
+    fn ubfm(&mut self, rd: R, rn: R, immr: u32, imms: u32) { self.emit(0xD3400000 | immr << 16 | imms << 10 | rn << 5 | rd); }
+
+    /// Sign-extends the low size bytes of rn into rd.
+    fn sign_ext(&mut self, rd: R, rn: R, size: i64) {
+        if size >= 8 {
+            if rd != rn { self.mov(rd, rn); }
+            return;
+        }
+        self.sbfm(rd, rn, 0, (size * 8 - 1) as u32);
+    }
+
+    /// Zero-extends the low size bytes of rn into rd.
+    fn zero_ext(&mut self, rd: R, rn: R, size: i64) {
+        if size >= 8 {
+            if rd != rn { self.mov(rd, rn); }
+            return;
+        }
+        self.ubfm(rd, rn, 0, (size * 8 - 1) as u32);
+    }
+
+    fn lsr_imm(&mut self, rd: R, rn: R, s: u32) { self.ubfm(rd, rn, s, 63); }
+    fn lsl_imm(&mut self, rd: R, rn: R, s: u32) { self.ubfm(rd, rn, (64 - s) % 64, 63 - s); }
+
+    /// Loads a 64-bit constant.
+    fn mov_imm(&mut self, rd: R, v: i64) {
+        let u = v as u64;
+        if u == 0 {
+            self.emit(0xD2800000 | rd);
+            return;
+        }
+        // movn for values with mostly ones.
+        if !u < 1 << 16 {
+            self.emit(0x92800000 | ((!u & 0xffff) as u32) << 5 | rd);
+            return;
+        }
+        let mut first = true;
+        let mut hw = 0u32;
+        while hw < 4 {
+            let part = ((u >> (16 * hw)) & 0xffff) as u32;
+            if part != 0 {
+                if first {
+                    self.emit(0xD2800000 | hw << 21 | part << 5 | rd);
+                    first = false;
+                } else {
+                    self.emit(0xF2800000 | hw << 21 | part << 5 | rd);
+                }
+            }
+            hw += 1;
+        }
+    }
+
+    // --- Memory --------------------------------------------------------------------
+
+    fn ldr(&mut self, size: i64, rt: R, rn: R, off: i64) { self.ldst(size, rt, rn, off, false); }
+    fn str(&mut self, size: i64, rt: R, rn: R, off: i64) { self.ldst(size, rt, rn, off, true); }
+
+    /// Offsets that do not fit an instruction use X17 as a temporary.
+    fn ldst(&mut self, size: i64, rt: R, rn: R, off: i64, store: bool) {
+        if off >= 0 && off % size == 0 && off / size < 4096 {
+            self.emit(ldr_scaled(size, store) | ((off / size) as u32) << 10 | rn << 5 | rt);
+        } else if off >= -256 && off < 256 {
+            self.emit(ldr_unscaled(size, store) | ((off as u32) & 0x1ff) << 12 | rn << 5 | rt);
+        } else {
+            if rn == X17 || rt == X17 { panic("arm64: X17 used with a large offset"); }
+            self.addr_of(X17, rn, off);
+            self.emit(ldr_scaled(size, store) | X17 << 5 | rt);
+        }
+    }
+
+    fn ldr_post(&mut self, rt: R, rn: R, off: i64) { self.emit(0xF8400400 | ((off as u32) & 0x1ff) << 12 | rn << 5 | rt); }
+    fn str_post(&mut self, rt: R, rn: R, off: i64) { self.emit(0xF8000400 | ((off as u32) & 0x1ff) << 12 | rn << 5 | rt); }
+
+    /// rd = rn + off for any offset (rn may be SP).
+    fn addr_of(&mut self, rd: R, rn: R, off: i64) {
+        if off >= 0 && off < 4096 {
+            self.add_imm(rd, rn, off);
+        } else if off < 0 && off > -4096 {
+            self.sub_imm(rd, rn, -off);
+        } else {
+            if rd == rn { panic("arm64: AddrOf with rd == rn and a large offset"); }
+            self.mov_imm(rd, off);
+            self.add_ext(rd, rn, rd);
+        }
+    }
+
+    fn stp_pre(&mut self, rt: R, rt2: R, rn: R, off: i64) {
+        self.emit(0xA9800000 | (((off / 8) as u32) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt);
+    }
+    fn ldp_post(&mut self, rt: R, rt2: R, rn: R, off: i64) {
+        self.emit(0xA8C00000 | (((off / 8) as u32) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt);
+    }
+
+    // --- Control flow --------------------------------------------------------------
+
+    fn fix(&mut self, l: usize, kind: u8) { self.fixups.push(Fixup { at: self.code.len(), label: l, kind }); }
+
+    fn b(&mut self, l: usize) {
+        self.fix(l, FIX_B);
+        self.emit(0x14000000);
+    }
+    fn bcond(&mut self, c: C, l: usize) {
+        self.fix(l, FIX_BCOND);
+        self.emit(0x54000000 | c);
+    }
+    fn cbz(&mut self, rt: R, l: usize) {
+        self.fix(l, FIX_CB);
+        self.emit(0xB4000000 | rt);
+    }
+    fn cbnz(&mut self, rt: R, l: usize) {
+        self.fix(l, FIX_CB);
+        self.emit(0xB5000000 | rt);
+    }
+
+    fn reloc(&mut self, kind: obj::RelocKind, sym: &str) {
+        self.relocs.push(Reloc { sec: obj::TEXT, off: (4 * self.code.len()) as u32, kind, sym: sym.to_string() });
+    }
+
+    /// Calls a symbol.
+    fn bl(&mut self, sym: &str) {
+        self.reloc(obj::BRANCH26, sym);
+        self.emit(0x94000000);
+    }
+
+    fn blr(&mut self, rn: R) { self.emit(0xD63F0000 | rn << 5); }
+    fn ret(&mut self) { self.emit(0xD65F03C0); }
+    fn brk(&mut self, n: u32) { self.emit(0xD4200000 | (n & 0xffff) << 5); }
+
+    /// Loads the address of a symbol (adrp + add).
+    fn adr_sym(&mut self, rd: R, sym: &str) {
+        self.reloc(obj::PAGE21, sym);
+        self.emit(0x90000000 | rd);
+        self.reloc(obj::PAGE_OFF12, sym);
+        self.emit(0x91000000 | rd << 5 | rd);
+    }
+
+    // --- Floating point ------------------------------------------------------------
+
+    fn fmov_to_f(&mut self, rd: R, rn: R, f64: bool) {
+        if f64 { self.emit(0x9E670000 | rn << 5 | rd); } else { self.emit(0x1E270000 | rn << 5 | rd); }
+    }
+    fn fmov_from_f(&mut self, rd: R, rn: R, f64: bool) {
+        if f64 { self.emit(0x9E660000 | rn << 5 | rd); } else { self.emit(0x1E260000 | rn << 5 | rd); }
+    }
+    fn fadd(&mut self, rd: R, rn: R, rm: R, f64: bool) { self.emit(r3(0x1E202800 | ftype(f64), rd, rn, rm)); }
+    fn fsub(&mut self, rd: R, rn: R, rm: R, f64: bool) { self.emit(r3(0x1E203800 | ftype(f64), rd, rn, rm)); }
+    fn fmul(&mut self, rd: R, rn: R, rm: R, f64: bool) { self.emit(r3(0x1E200800 | ftype(f64), rd, rn, rm)); }
+    fn fdiv(&mut self, rd: R, rn: R, rm: R, f64: bool) { self.emit(r3(0x1E201800 | ftype(f64), rd, rn, rm)); }
+    fn fneg(&mut self, rd: R, rn: R, f64: bool) { self.emit(r3(0x1E214000 | ftype(f64), rd, rn, 0)); }
+    fn fcmp(&mut self, rn: R, rm: R, f64: bool) { self.emit(r3(0x1E202000 | ftype(f64), 0, rn, rm)); }
+    fn fcvt_ds(&mut self, rd: R, rn: R) { self.emit(0x1E22C000 | rn << 5 | rd); }
+    fn fcvt_sd(&mut self, rd: R, rn: R) { self.emit(0x1E624000 | rn << 5 | rd); }
+    fn scvtf(&mut self, rd: R, rn: R, f64: bool) { self.emit(0x9E220000 | ftype(f64) | rn << 5 | rd); }
+    fn ucvtf(&mut self, rd: R, rn: R, f64: bool) { self.emit(0x9E230000 | ftype(f64) | rn << 5 | rd); }
+    fn fcvtzs(&mut self, rd: R, rn: R, f64: bool) { self.emit(0x9E380000 | ftype(f64) | rn << 5 | rd); }
+    fn fcvtzu(&mut self, rd: R, rn: R, f64: bool) { self.emit(0x9E390000 | ftype(f64) | rn << 5 | rd); }
+}
+
+/// The Machine for AArch64.
+pub struct Arm64 {
+    a: &mut Asm,
+}
+
+pub fn new_machine() -> &mut Arm64 { &mut Arm64 { a: new_asm() } }
+
+const REGS: [R; 15] = [X10, X11, X12, X13, X14, X15, X16, X17, X0, X8, X9, XFP, XSP, 0, 1];
+
+fn r(x: lm::Reg) -> R { REGS[x as usize] }
+
+const CONDS: [C; 10] = [CEQ, CNE, CLT, CLE, CGT, CGE, LO, LS, HI, HS];
+
+fn cond(c: lm::Cond) -> C { CONDS[c as usize] }
+
+impl Machine for Arm64 {
+    fn begin(&mut self) { self.a = new_asm(); }
+
+    fn finish(&mut self) -> Code {
+        let err = self.a.finish();
+        if err.len() > 0 { return Code { code: Vec::new(), relocs: Vec::new(), err }; }
+        Code { code: self.a.bytes(), relocs: self.a.relocs.clone(), err }
+    }
+
+    fn new_label(&mut self) -> LLabel { self.a.new_label() }
+    fn bind(&mut self, l: LLabel) { self.a.bind(l); }
+
+    fn prologue(&mut self, frame: i64) {
+        let a = self.a;
+        a.stp_pre(XFP, LR, XSP, -16);
+        a.mov_sp(XFP, XSP);
+        if frame < 4096 {
+            a.sub_imm(XSP, XSP, frame);
+        } else {
+            a.mov_imm(X16, frame);
+            a.sub_ext(XSP, XSP, X16);
+        }
+    }
+
+    fn ret(&mut self) {
+        self.a.mov_sp(XSP, XFP);
+        self.a.ldp_post(XFP, LR, XSP, 16);
+        self.a.ret();
+    }
+
+    // Generated code only uses x0-x17 and d0-d1, so the entry point has no
+    // C callee-saved registers to preserve.
+    fn entry_prologue(&mut self, frame: i64) { self.prologue(frame); }
+
+    fn entry_return0(&mut self) {
+        self.a.mov_imm(X0, 0);
+        self.ret();
+    }
+
+    fn entry_args(&mut self) {
+        self.a.str(8, X0, XSP, 0);
+        self.a.str(8, X1, XSP, 8);
+    }
+
+    fn mov_imm(&mut self, x: lm::Reg, v: i64) { self.a.mov_imm(r(x), v); }
+
+    fn mov(&mut self, dst: lm::Reg, src: lm::Reg) {
+        if dst == lm::SP || src == lm::SP {
+            self.a.mov_sp(r(dst), r(src));
+            return;
+        }
+        self.a.mov(r(dst), r(src));
+    }
+
+    fn load(&mut self, size: i64, dst: lm::Reg, base: lm::Reg, off: i64) { self.a.ldr(size, r(dst), r(base), off); }
+    fn store(&mut self, size: i64, src: lm::Reg, base: lm::Reg, off: i64) { self.a.str(size, r(src), r(base), off); }
+    fn store_zero(&mut self, size: i64, base: lm::Reg, off: i64) { self.a.str(size, ZR, r(base), off); }
+    fn addr_of(&mut self, dst: lm::Reg, base: lm::Reg, off: i64) { self.a.addr_of(r(dst), r(base), off); }
+
+    fn add_imm(&mut self, x: lm::Reg, v: i64) {
+        if v >= 0 && v < 4096 {
+            self.a.add_imm(r(x), r(x), v);
+        } else if v < 0 && v > -4096 {
+            self.a.sub_imm(r(x), r(x), -v);
+        } else {
+            self.a.mov_imm(X17, v);
+            self.a.add(r(x), r(x), X17);
+        }
+    }
+
+    fn adr_sym(&mut self, dst: lm::Reg, sym: &str) { self.a.adr_sym(r(dst), sym); }
+    fn sign_ext(&mut self, dst: lm::Reg, src: lm::Reg, size: i64) { self.a.sign_ext(r(dst), r(src), size); }
+    fn zero_ext(&mut self, dst: lm::Reg, src: lm::Reg, size: i64) { self.a.zero_ext(r(dst), r(src), size); }
+    fn mul_add(&mut self, dst: lm::Reg, x: lm::Reg, y: lm::Reg, c: lm::Reg) { self.a.madd(r(dst), r(x), r(y), r(c)); }
+    fn neg(&mut self, dst: lm::Reg, src: lm::Reg) { self.a.sub(r(dst), ZR, r(src)); }
+    fn not(&mut self, dst: lm::Reg, src: lm::Reg) { self.a.mvn(r(dst), r(src)); }
+    fn cmp(&mut self, x: lm::Reg, y: lm::Reg) { self.a.cmp(r(x), r(y)); }
+    fn set_cond(&mut self, dst: lm::Reg, c: lm::Cond) { self.a.cset(r(dst), cond(c)); }
+    fn branch_if(&mut self, c: lm::Cond, l: LLabel) { self.a.bcond(cond(c), l); }
+    fn select_reg(&mut self, dst: lm::Reg, x: lm::Reg, y: lm::Reg, c: lm::Cond) { self.a.csel(r(dst), r(x), r(y), cond(c)); }
+    fn jump(&mut self, l: LLabel) { self.a.b(l); }
+    fn branch_zero(&mut self, x: lm::Reg, l: LLabel) { self.a.cbz(r(x), l); }
+    fn branch_non_zero(&mut self, x: lm::Reg, l: LLabel) { self.a.cbnz(r(x), l); }
+    fn fmov_to(&mut self, f: lm::Reg, x: lm::Reg, f64: bool) { self.a.fmov_to_f(r(f), r(x), f64); }
+    fn fmov_from(&mut self, x: lm::Reg, f: lm::Reg, f64: bool) { self.a.fmov_from_f(r(x), r(f), f64); }
+    fn fneg(&mut self, dst: lm::Reg, src: lm::Reg, f64: bool) { self.a.fneg(r(dst), r(src), f64); }
+    fn call(&mut self, sym: &str) { self.a.bl(sym); }
+    fn call_reg(&mut self, x: lm::Reg) { self.a.blr(r(x)); }
+    fn trap(&mut self) { self.a.brk(1); }
+
+    fn int_to_float(&mut self, f: lm::Reg, x: lm::Reg, signed: bool, f64: bool) {
+        if signed { self.a.scvtf(r(f), r(x), f64); } else { self.a.ucvtf(r(f), r(x), f64); }
+    }
+
+    // fcvtzs/fcvtzu already saturate and map NaN to 0.
+    fn float_to_int(&mut self, x: lm::Reg, f: lm::Reg, signed: bool, f64: bool) {
+        if signed { self.a.fcvtzs(r(x), r(f), f64); } else { self.a.fcvtzu(r(x), r(f), f64); }
+    }
+
+    fn float_conv(&mut self, dst: lm::Reg, src: lm::Reg, to_f64: bool) {
+        if to_f64 { self.a.fcvt_ds(r(dst), r(src)); } else { self.a.fcvt_sd(r(dst), r(src)); }
+    }
+
+    fn cmp_imm(&mut self, x: lm::Reg, v: i64) {
+        if v >= 0 && v < 4096 {
+            self.a.cmp_imm(r(x), v);
+        } else if v < 0 && v > -4096 {
+            self.a.cmn_imm(r(x), -v);
+        } else {
+            self.a.mov_imm(X17, v);
+            self.a.cmp(r(x), X17);
+        }
+    }
+
+    fn arith(&mut self, op: lm::Op, dst: lm::Reg, x: lm::Reg, y: lm::Reg) {
+        let a = self.a;
+        let d = r(dst);
+        let n = r(x);
+        let k = r(y);
+        if op == lm::ADD { a.add(d, n, k); }
+        else if op == lm::SUB { a.sub(d, n, k); }
+        else if op == lm::MUL { a.mul(d, n, k); }
+        else if op == lm::AND { a.and(d, n, k); }
+        else if op == lm::OR { a.orr(d, n, k); }
+        else if op == lm::XOR { a.eor(d, n, k); }
+        else if op == lm::SHL { a.lslv(d, n, k); }
+        else if op == lm::SHR_U { a.lsrv(d, n, k); }
+        else if op == lm::SHR_S { a.asrv(d, n, k); }
+        else if op == lm::DIV_S { a.sdiv(d, n, k); }
+        else if op == lm::DIV_U { a.udiv(d, n, k); }
+        else if op == lm::REM_S {
+            a.sdiv(X17, n, k);
+            a.msub(d, X17, k, n);
+        } else if op == lm::REM_U {
+            a.udiv(X17, n, k);
+            a.msub(d, X17, k, n);
+        }
+    }
+
+    fn arith_ovf(&mut self, op: lm::Op, signed: bool, dst: lm::Reg, x: lm::Reg, y: lm::Reg, ovf: LLabel) {
+        let a = self.a;
+        let d = r(dst);
+        let n = r(x);
+        let k = r(y);
+        if op == lm::ADD {
+            a.adds(d, n, k);
+            if signed { a.bcond(VS, ovf); } else { a.bcond(HS, ovf); }
+        } else if op == lm::SUB {
+            a.subs(d, n, k);
+            if signed { a.bcond(VS, ovf); } else { a.bcond(LO, ovf); }
+        } else if op == lm::MUL {
+            a.mul(X17, n, k);
+            if signed {
+                a.smulh(X14, n, k);
+                a.cmp_asr63(X14, X17);
+                a.bcond(CNE, ovf);
+            } else {
+                a.umulh(X14, n, k);
+                a.cbnz(X14, ovf);
+            }
+            a.mov(d, X17);
+        }
+    }
+
+    fn farith(&mut self, op: lm::Op, dst: lm::Reg, x: lm::Reg, y: lm::Reg, f64: bool) {
+        if op == lm::ADD { self.a.fadd(r(dst), r(x), r(y), f64); }
+        else if op == lm::SUB { self.a.fsub(r(dst), r(x), r(y), f64); }
+        else if op == lm::MUL { self.a.fmul(r(dst), r(x), r(y), f64); }
+        else if op == lm::FDIV { self.a.fdiv(r(dst), r(x), r(y), f64); }
+    }
+
+    // After fcmp an unordered result sets C and V, so mi, ls, gt and ge are
+    // false for NaN, and ne is true.
+    fn fcompare(&mut self, dst: lm::Reg, c: lm::Cond, x: lm::Reg, y: lm::Reg, f64: bool) {
+        self.a.fcmp(r(x), r(y), f64);
+        let fc = if c == lm::EQ { CEQ } else if c == lm::NE { CNE } else if c == lm::LT { MI } else if c == lm::LE { LS }
+            else if c == lm::GT { CGT } else if c == lm::GE { CGE } else { CEQ };
+        self.a.cset(r(dst), fc);
+    }
+
+    fn call_c(&mut self, sym: &str, fn_reg: lm::Reg, args: &Vec<CArg>, float_ret: bool, f64: bool) {
+        let a = self.a;
+        let mut ints = 0u32;
+        let mut floats = 0u32;
+        let mut i = 0;
+        while i < args.len() {
+            if args[i].float {
+                a.ldr(8, X17, XSP, (8 * i) as i64);
+                a.fmov_to_f(floats, X17, args[i].f64);
+                floats += 1;
+            } else {
+                a.ldr(8, ints, XSP, (8 * i) as i64);
+                ints += 1;
+            }
+            i += 1;
+        }
+        if sym.len() > 0 { a.bl(sym); } else { a.blr(r(fn_reg)); }
+        if float_ret { a.fmov_from_f(X12, 0, f64); } else { a.mov(X12, X0); }
+    }
+
+    fn copy_words(&mut self, dst: lm::Reg, src: lm::Reg, n: i64) {
+        let a = self.a;
+        a.mov_imm(X13, n);
+        let lp = a.new_label();
+        a.bind(lp);
+        a.ldr_post(X14, r(src), 8);
+        a.str_post(X14, r(dst), 8);
+        a.subs_imm(X13, X13, 1);
+        a.bcond(CNE, lp);
+    }
+
+    // x0 = list head. Uses x19/x20 (saved) to survive the calls. The frame
+    // has the standard fixed slots, with an empty defer list at x29-32 so
+    // unwinding can walk through it.
+    fn run_defers(&mut self) {
+        let a = self.a;
+        a.stp_pre(XFP, LR, XSP, -16);
+        a.mov_sp(XFP, XSP);
+        a.sub_imm(XSP, XSP, 48);
+        a.str(8, 19, XFP, -8);
+        a.str(8, 20, XFP, -16);
+        a.str(8, ZR, XFP, -32);
+        a.mov(19, X0);
+        let lp = a.new_label();
+        let done = a.new_label();
+        let copy_loop = a.new_label();
+        let copied = a.new_label();
+        a.bind(lp);
+        a.cbz(19, done);
+        a.ldr(8, X10, 19, 24);
+        a.ldr(8, X11, 19, 32);
+        a.add(X12, X10, X11);
+        a.add_imm(X12, X12, 15);
+        a.lsr_imm(X12, X12, 4);
+        a.lsl_imm(X12, X12, 4);
+        a.sub_ext(XSP, XSP, X12);
+        a.mov_sp(X17, XSP);
+        a.add_imm(X16, 19, 48);
+        a.lsr_imm(X13, X10, 3);
+        a.cbz(X13, copied);
+        a.bind(copy_loop);
+        a.ldr_post(X14, X16, 8);
+        a.str_post(X14, X17, 8);
+        a.subs_imm(X13, X13, 1);
+        a.bcond(CNE, copy_loop);
+        a.bind(copied);
+        a.add_ext(X8, XSP, X10);
+        a.ldr(8, X9, 19, 40);
+        a.ldr(8, X0, 19, 16);
+        a.ldr(8, X16, 19, 8);
+        a.ldr(8, 20, 19, 0);
+        a.blr(X16);
+        a.sub_imm(XSP, XFP, 48);
+        a.mov(19, 20);
+        a.b(lp);
+        a.bind(done);
+        a.ldr(8, 19, XFP, -8);
+        a.ldr(8, 20, XFP, -16);
+        a.mov_sp(XSP, XFP);
+        a.ldp_post(XFP, LR, XSP, 16);
+        a.ret();
+    }
+
+    // x0 = save, x1 = load (sp, fp, pc). Generated code keeps no values in
+    // registers across calls, so these three are the whole context.
+    fn swap_context(&mut self) {
+        let a = self.a;
+        a.mov_sp(X16, XSP);
+        a.str(8, X16, X0, 0);
+        a.str(8, XFP, X0, 8);
+        a.str(8, LR, X0, 16);
+        a.ldr(8, X16, X1, 0);
+        a.mov_sp(XSP, X16);
+        a.ldr(8, XFP, X1, 8);
+        a.ldr(8, LR, X1, 16);
+        a.ret();
+    }
+}

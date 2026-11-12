@@ -1,0 +1,234 @@
+//! The memory layout of navi types: size, alignment, field offsets, enum
+//! tags and pointer maps for the GC.
+
+use std::collections::HashMap;
+use crate::types::{self, Type};
+use crate::types::collect::Info;
+use crate::types::lower::{param_map, subst};
+
+/// The size of a pointer on all supported targets (64-bit).
+pub const PTR_SIZE: i64 = 8;
+
+pub type TagKind = u8;
+/// Structs, single-variant enums.
+pub const NO_TAG: TagKind = 0;
+/// An integer tag.
+pub const TAG_INT: TagKind = 1;
+/// A pointer that is null for niche_variant.
+pub const TAG_NICHE: TagKind = 2;
+
+/// How values of a type are stored.
+pub struct Layout {
+    pub size: i64,
+    pub align: i64,
+    /// Field offsets for tuples, structs and the payload of each enum
+    /// variant.
+    pub fields: Vec<i64>,
+    pub tag: TagKind,
+    pub tag_off: i64,
+    pub tag_size: i64,
+    /// Field offsets per variant.
+    pub variants: Vec<Vec<i64>>,
+    /// For Option-like enums represented by a null pointer: the variant
+    /// encoded as null (the other variant holds the pointer at offset 0).
+    pub niche_variant: usize,
+    /// Offsets of words that may hold GC pointers (for enums the union over
+    /// variants).
+    pub ptrs: Vec<i64>,
+    /// [T], str and dyn have no layout of their own.
+    pub unsized: bool,
+}
+
+fn lay(size: i64, align: i64) -> &mut Layout {
+    &mut Layout { size, align, fields: Vec::new(), tag: NO_TAG, tag_off: 0, tag_size: 0, variants: Vec::new(), niche_variant: 0,
+        ptrs: Vec::new(), unsized: false }
+}
+
+fn ints(xs: &[i64]) -> Vec<i64> {
+    let mut v = Vec::new();
+    for x in xs.iter() { v.push(*x); }
+    v
+}
+
+/// Computes and caches layouts.
+pub struct Computer {
+    pub info: &mut Info,
+    cache: HashMap<u32, &mut Layout>,
+}
+
+pub fn new_computer(info: &mut Info) -> &mut Computer { &mut Computer { info, cache: HashMap::new() } }
+
+fn align_to(x: i64, a: i64) -> i64 {
+    if a <= 1 { return x; }
+    (x + a - 1) / a * a
+}
+
+/// Whether a pointer to t is a fat pointer (pointer plus length or vtable).
+pub fn is_fat(t: &Type) -> bool { t.kind == types::K_STR || t.kind == types::K_SLICE || t.kind == types::K_DYN }
+
+/// The size in bytes of an integer kind.
+pub fn int_size(k: types::IntKind) -> i64 {
+    if k == types::I8 || k == types::U8 { return 1; }
+    if k == types::I16 || k == types::U16 { return 2; }
+    if k == types::I32 || k == types::U32 { return 4; }
+    8
+}
+
+impl Computer {
+    /// The layout of a fully concrete type.
+    pub fn of(&mut self, t: &Type) -> &mut Layout {
+        if let Some(l) = self.cache.get(&t.id) { return *l; }
+        let l = self.compute(t);
+        self.cache.insert(t.id, l);
+        l
+    }
+
+    fn compute(&mut self, t: &Type) -> &mut Layout {
+        let k = t.kind;
+        if k == types::K_BOOL { return lay(1, 1); }
+        if k == types::K_CHAR { return lay(4, 4); }
+        if k == types::K_INT { let s = int_size(t.int); return lay(s, s); }
+        if k == types::K_FLOAT { return if t.f64 { lay(8, 8) } else { lay(4, 4) }; }
+        if k == types::K_NEVER { return lay(0, 1); }
+        if k == types::K_STR || k == types::K_SLICE || k == types::K_DYN {
+            let l = lay(0, 1);
+            l.unsized = true;
+            return l;
+        }
+        if k == types::K_REF || k == types::K_PTR {
+            if is_fat(t.el()) {
+                let l = lay(16, 8);
+                l.fields = ints(&[0, 8]);
+                l.ptrs = if t.el().kind == types::K_DYN { ints(&[0, 8]) } else { ints(&[0]) };
+                return l;
+            }
+            let l = lay(8, 8);
+            l.ptrs = ints(&[0]);
+            return l;
+        }
+        if k == types::K_FN {
+            if t.abi == "C" { return lay(8, 8); }
+            // A closure: code pointer and environment pointer.
+            let l = lay(16, 8);
+            l.fields = ints(&[0, 8]);
+            l.ptrs = ints(&[8]);
+            return l;
+        }
+        if k == types::K_TUPLE { return self.record(&t.elems); }
+        if k == types::K_ARRAY {
+            let el = self.of(t.el());
+            let stride = align_to(el.size, el.align);
+            let l = lay(stride * t.len, el.align);
+            let mut i = 0i64;
+            while i < t.len && el.ptrs.len() > 0 {
+                for p in el.ptrs.iter() { l.ptrs.push(i * stride + *p); }
+                i += 1;
+            }
+            return l;
+        }
+        if k == types::K_ADT { return self.adt(t); }
+        if k == types::K_OPAQUE {
+            if let Some(h) = self.info.hidden.get(&t.id) { return self.of(*h); }
+        }
+        panic(`layout of non-concrete type ${t}`)
+    }
+
+    /// Lays out fields in declaration order with natural alignment.
+    fn record(&mut self, fields: &Vec<&Type>) -> &mut Layout {
+        let l = lay(0, 1);
+        let mut off = 0i64;
+        for f in fields.iter() {
+            let fl = self.of(*f);
+            off = align_to(off, fl.align);
+            l.fields.push(off);
+            for p in fl.ptrs.iter() { l.ptrs.push(off + *p); }
+            off += fl.size;
+            if fl.align > l.align { l.align = fl.align; }
+        }
+        l.size = align_to(off, l.align);
+        l
+    }
+
+    /// The field types of an ADT variant (-1 for structs) with the ADT's
+    /// arguments substituted.
+    pub fn field_types(&mut self, t: &Type, variant: i64) -> Vec<&Type> {
+        let ai = self.info.adts[&t.d().id];
+        let fields = if variant >= 0 { ai.variants[variant as usize].fields } else { ai.fields };
+        let sub = param_map(Some(ai.generics), &t.args);
+        let mut out = Vec::new();
+        for f in fields.iter() {
+            let ft = subst(self.info.ctx, f.ty, &sub, None);
+            out.push(self.info.normalize(None, ft));
+        }
+        out
+    }
+
+    fn adt(&mut self, t: &Type) -> &mut Layout {
+        let ai = self.info.adts[&t.d().id];
+        if !ai.is_enum {
+            let fts = self.field_types(t, -1);
+            return self.record(&fts);
+        }
+        let n = ai.variants.len();
+        if n == 0 { return lay(0, 1); }
+        // Option-like enums: one unit variant and one variant holding a single
+        // non-null pointer use the null pointer for the unit variant.
+        if n == 2 {
+            let mut unit = 0;
+            while unit < 2 {
+                let other = 1 - unit;
+                if ai.variants[unit].fields.len() == 0 && ai.variants[other].fields.len() == 1 {
+                    let ft = self.field_types(t, other as i64)[0];
+                    if ft.kind == types::K_REF || ft.kind == types::K_FN && ft.abi.len() == 0 {
+                        let fl = self.of(ft);
+                        let l = lay(fl.size, fl.align);
+                        l.tag = TAG_NICHE;
+                        l.niche_variant = unit;
+                        l.variants.push(Vec::new());
+                        l.variants.push(Vec::new());
+                        l.ptrs = fl.ptrs.clone();
+                        l.variants[other] = ints(&[0]);
+                        return l;
+                    }
+                }
+                unit += 1;
+            }
+        }
+        // Tag: the smallest integer that holds every discriminant.
+        let mut min_d = ai.variants[0].discr;
+        let mut max_d = ai.variants[0].discr;
+        for v in ai.variants.iter() {
+            if v.discr < min_d { min_d = v.discr; }
+            if v.discr > max_d { max_d = v.discr; }
+        }
+        let tag_size = if min_d >= 0 && max_d <= 0xff || min_d >= -128 && max_d <= 127 { 1 }
+            else if min_d >= -32768 && max_d <= 0xffff { 2 }
+            else if min_d >= -2147483648 && max_d <= 0xffffffff { 4 }
+            else { 8 };
+        let l = lay(0, tag_size);
+        l.tag = TAG_INT;
+        l.tag_size = tag_size;
+        let mut max_end = tag_size;
+        let mut i = 0;
+        while i < n {
+            let fields = self.field_types(t, i as i64);
+            let mut off = tag_size;
+            let mut offs = Vec::new();
+            for f in fields.iter() {
+                let fl = self.of(*f);
+                off = align_to(off, fl.align);
+                offs.push(off);
+                for p in fl.ptrs.iter() {
+                    if !l.ptrs.contains(&(off + *p)) { l.ptrs.push(off + *p); }
+                }
+                off += fl.size;
+                if fl.align > l.align { l.align = fl.align; }
+            }
+            l.variants.push(offs);
+            if off > max_end { max_end = off; }
+            i += 1;
+        }
+        l.size = align_to(max_end, l.align);
+        l
+    }
+}

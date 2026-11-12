@@ -46,7 +46,7 @@
 - defer：每次 `defer` 分配一条记录 [next, code, ctx, argsize, retsize, loc, args...] 挂在帧的链表上（每个帧 x29-32 处是链表头），返回时由 `_navi_rundefers` 依次调用；panic 时 `std::rt::native::unwind` 沿帧指针链到 main 的帧为止，逐帧执行 defer，然后打印 panic 信息并以 101 退出（与解释器、Go 的顺序相同）。
 - 算术溢出、除零、移位溢出的检查直接生成在代码里，失败时调 `std::rt::native::panic_raw`；越界调 `panic_bounds`。
 
-## M8 自举（进行中）
+## M8 自举（完成）
 
 用 navi 重写的编译器在 `compiler/`（navic），按 stage0 的包逐个移植，每移植完一层就用调试输出和 stage0 逐字节对比（`tools/selfcheck.sh`，覆盖 tests/ 下全部 47 个 crate 和编译器自身）：
 
@@ -56,7 +56,10 @@
 | 名称解析 | 完成 | `resolve-dump`（每个路径、绑定的解析结果） |
 | 类型检查 | 完成 | `types-dump`（所有签名，及每个函数体里每个表达式、局部变量、模式的类型、被调对象、隐式转换），错误信息逐条一致 |
 | MIR 构建 | 完成 | `mir-dump`（每个函数体和闭包的 MIR 打印） |
-| 代码生成、目标文件、驱动 | 未开始 | |
+| 布局、shim、代码生成规划、lowering、arm64、Mach-O、驱动 | 完成 | `build -c` 的目标文件与 stage0 逐字节相同（全部 22 个运行测试和编译器自身） |
+| 自举 | 完成 | `tools/bootstrap.sh`：stage0 → stage1 → stage2 → stage3，stage1 编译自身得到的目标文件与 stage0 相同，stage2 与 stage3 逐字节相同；stage2 编译的 22 个 golden 测试全部通过 |
+
+navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0 提供，按需再移植。navic 编译自身约 48 秒（stage0 约 0.6 秒），生成代码没有寄存器分配、没有内联、所有被取地址的局部变量都装箱，这是 M9 性能工作的起点。
 
 移植中的做法：
 - Go 里以指针为键的 map 改成以 id 为键：AST 节点带全局唯一 id，`Def` 带下标 id，类型带驻留 id；为 `impl Trait` 参数合成的类型参数从 0x40000000 起编号。
@@ -65,4 +68,4 @@
 
 ## 下一步
 
-M8 余下部分：MIR（对比 MIR 打印）、代码生成到目标文件（目标文件与 stage0 逐字节相同）、驱动；然后 stage1 → stage2 → stage3，stage2 与 stage3 逐字节相同。
+M9：性能（自研链接器、增量缓存、并行；生成代码的寄存器分配、内联、逃逸分析）和自举后的语言特性。按计划，从 M8 起新功能只加到 navic。

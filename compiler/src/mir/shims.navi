@@ -1,0 +1,1088 @@
+//! Shims: MIR bodies the compiler generates for builtin impls (lang traits
+//! on primitive and structural types) and #[derive] impls, for one concrete
+//! self type.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def};
+use crate::syntax::ast::StructKind;
+use crate::types::{self, Type, TraitRef, Ctx};
+use crate::types::lower::{param_map, subst};
+use crate::layout::{self, Computer};
+use crate::mir::*;
+use crate::mir::build::*;
+use crate::mir::expr::{variant_index, zero_const};
+use crate::mir::boxing::box_address_taken;
+
+/// Whether method of a builtin/derived impl of trait is implemented by a
+/// shim (rather than the trait's default body).
+pub fn uses_shim(trait_name: &str, method: &str) -> bool {
+    let t = trait_name;
+    if t == "Clone" { return method == "clone"; }
+    if t == "Default" { return method == "default"; }
+    if t == "PartialEq" { return method == "eq"; }
+    if t == "PartialOrd" { return method == "partial_cmp"; }
+    if t == "Ord" { return method == "cmp"; }
+    if t == "Hash" { return method == "hash"; }
+    if t == "Debug" || t == "Display" || t == "LowerHex" || t == "UpperHex" || t == "Octal" || t == "Binary" || t == "LowerExp"
+        || t == "UpperExp" { return method == "fmt"; }
+    if t == "Deref" { return method == "deref"; }
+    if t == "DerefMut" { return method == "deref_mut"; }
+    if t == "Index" { return method == "index"; }
+    if t == "IndexMut" { return method == "index_mut"; }
+    if t == "Step" { return method == "forward" || method == "backward"; }
+    true // operator traits: every method
+}
+
+fn ptr_key(t: Option<&Type>) -> String { match t { Some(x) => `${x.id}`, None => "0".to_string() } }
+
+pub fn args_key(args: &Vec<&Type>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for a in args.iter() { parts.push(`${a.id}`); }
+    parts.join(",")
+}
+
+fn op_of(trait_name: &str) -> BinOp {
+    let t = trait_name;
+    if t == "Add" { return ADD; }
+    if t == "Sub" { return SUB; }
+    if t == "Mul" { return MUL; }
+    if t == "Div" { return DIV; }
+    if t == "Rem" { return REM; }
+    if t == "BitAnd" { return BIT_AND; }
+    if t == "BitOr" { return BIT_OR; }
+    if t == "BitXor" { return BIT_XOR; }
+    if t == "Shl" { return SHL; }
+    if t == "Shr" { return SHR; }
+    ADD
+}
+
+fn is_scalar_type(t: &Type) -> bool {
+    let k = t.kind;
+    k == types::K_INT || k == types::K_FLOAT || k == types::K_BOOL || k == types::K_CHAR || k == types::K_PTR || k == types::K_FN
+        || k == types::K_NEVER
+}
+
+/// The element types of a tuple or array.
+fn elems(t: &Type) -> Vec<&Type> {
+    if t.kind == types::K_TUPLE { return t.elems.clone(); }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < t.len { out.push(t.el()); i += 1; }
+    out
+}
+
+fn str_const(ctx: &mut Ctx, v: &str) -> Operand {
+    let s = ctx.str_;
+    let c = cnst(C_STR, Some(ctx.reference(false, s)));
+    c.bytes = v.as_bytes().to_vec();
+    const_op(c)
+}
+
+fn vec1<T>(x: T) -> Vec<T> {
+    let mut v = Vec::new();
+    v.push(x);
+    v
+}
+
+fn vec2<T>(x: T, y: T) -> Vec<T> {
+    let mut v = Vec::new();
+    v.push(x);
+    v.push(y);
+    v
+}
+
+/// Builds a shim body.
+pub struct Sb {
+    p: &mut Program,
+    f: &mut Func,
+    cur: usize,
+    ctx: &mut Ctx,
+    lay: &mut Computer,
+}
+
+/// One arm of for_each_variant: the variant (-1 for structs), the place of
+/// its fields, their types and the block to lower it in.
+struct VariantArm {
+    v: i64,
+    fp: Place,
+    fts: Vec<&Type>,
+    block: usize,
+}
+
+impl Sb {
+    fn local(&mut self, t: &Type) -> Place {
+        self.f.locals.push(&mut Local { ty: t, name: String::new(), boxed: false });
+        local_place(self.f.locals.len() - 1)
+    }
+
+    fn block(&mut self) -> usize {
+        self.f.blocks.push(&mut Block { stmts: Vec::new(), term: Term::None });
+        self.f.blocks.len() - 1
+    }
+
+    fn emit(&mut self, st: Stmt) {
+        let mut stmts = self.f.blocks[self.cur].stmts;
+        stmts.push(st);
+    }
+
+    fn assign(&mut self, p: Place, rv: Rvalue) { self.emit(Stmt::Assign { place: p, rv }); }
+
+    fn term(&mut self, t: Term) { self.f.blocks[self.cur].term = t; }
+
+    fn ret(&mut self) { self.term(Term::Return); }
+
+    /// Calls def (a function or trait method) and continues in a new block.
+    fn call(&mut self, def: &mut Def, self_ty: Option<&Type>, targs: Vec<&Type>, args: Vec<Operand>, dest: Place) {
+        let next = self.block();
+        let r = &FnRef { def: Some(def), args: targs, self_ty, closure: None, ctor: false };
+        self.term(Term::Call { fn_op: fn_op(r, None), args, dest, target: next as i64, pos: 0 });
+        self.cur = next;
+    }
+
+    fn trait_item(&self, name: &str, method: &str) -> &mut Def { self.p.info.trait_item(name, method).unwrap() }
+
+    fn std_fn(&self, path: &[&str]) -> &mut Def { self.p.std_fn(path) }
+
+    fn r(&mut self, p: Place, t: &Type) -> Operand {
+        let rt = self.ctx.reference(false, t);
+        let r = self.local(rt);
+        self.assign(r.clone(), Rvalue::Ref { is_mut: false, place: p });
+        copy(r)
+    }
+
+    fn bool_const(&self, v: bool) -> Operand { int_const(C_BOOL, if v { 1 } else { 0 }, self.ctx.bool_) }
+
+    /// Jumps to t if c is true, else to f.
+    fn branch(&mut self, c: Operand, t: usize, f: usize) {
+        let b = self.ctx.bool_;
+        self.term(Term::Switch { x: c, ty: b, vals: vec1(0i64), targets: vec1(f), els: t });
+    }
+
+    fn gen(&mut self, trait_name: &str, method: &str, self_ty: &Type, targs: &Vec<&Type>, params: &Vec<&Type>) {
+        let ret = local_place(0);
+        let a1 = local_place(1);
+        let a2 = local_place(2);
+        let derived = self_ty.kind == types::K_ADT && self.p.info.derives_of(self_ty.d()).contains_key(&trait_name.to_string());
+        if derived {
+            self.derived(trait_name, self_ty, targs);
+            return;
+        }
+        let t = trait_name;
+        let unit = const_op(cnst(C_UNIT, Some(self.ctx.unit)));
+        if t == "Clone" {
+            if self_ty.kind == types::K_TUPLE || self_ty.kind == types::K_ARRAY {
+                self.fieldwise_clone(self_ty, a1.deref(), ret);
+            } else {
+                self.assign(ret, Rvalue::Use(copy(a1.deref())));
+            }
+            self.ret();
+        } else if t == "Default" {
+            self.default_val(self_ty, ret);
+            self.ret();
+        } else if t == "PartialEq" {
+            let rhs = params[1].el();
+            self.eq(self_ty, rhs, a1.deref(), a2.deref(), ret);
+            self.ret();
+        } else if t == "PartialOrd" || t == "Ord" {
+            self.cmp(t, self_ty, a1.deref(), a2.deref(), ret);
+            self.ret();
+        } else if t == "Hash" {
+            self.hash(self_ty, a1.deref(), copy(a2), params[1].el());
+            self.assign(ret, Rvalue::Use(unit));
+            self.ret();
+        } else if t == "Debug" || t == "Display" || t == "LowerHex" || t == "UpperHex" || t == "Octal" || t == "Binary" || t == "LowerExp" || t == "UpperExp" {
+            self.format(t, self_ty, a1.deref(), copy(a2), ret);
+            self.ret();
+        } else if t == "Add" || t == "Sub" || t == "Mul" || t == "Div" || t == "Rem" || t == "BitAnd" || t == "BitOr" || t == "BitXor" || t == "Shl" || t == "Shr" {
+            let mut x = copy(a1.clone());
+            let mut y = copy(a2.clone());
+            let mut ty = self_ty;
+            if ty.kind == types::K_REF {
+                ty = ty.el();
+                x = copy(a1.deref());
+            }
+            if params[1].kind == types::K_REF { y = copy(a2.deref()); }
+            if (t == "Div" || t == "Rem") && ty.kind == types::K_INT {
+                let b = self.ctx.bool_;
+                let nz = self.local(b);
+                self.assign(nz.clone(), Rvalue::Bin { op: NE, x: y.clone(), y: int_const(C_INT, 0, params[1]), ty: params[1], pos: 0 });
+                let next = self.block();
+                self.term(Term::Assert { cond: copy(nz), msg: "attempt to divide by zero".to_string(), target: next, pos: 0, bounds: false,
+                    len: copy(local_place(0)), index: copy(local_place(0)) });
+                self.cur = next;
+            }
+            self.assign(ret, Rvalue::Bin { op: op_of(t), x, y, ty, pos: 0 });
+            self.ret();
+        } else if t.ends_with("Assign") {
+            let base = &t[0..t.len() - 6];
+            self.assign(a1.deref(), Rvalue::Bin { op: op_of(base), x: copy(a1.deref()), y: copy(a2), ty: self_ty, pos: 0 });
+            self.assign(ret, Rvalue::Use(unit));
+            self.ret();
+        } else if t == "Neg" || t == "Not" {
+            let op = if t == "Not" { NOT } else { NEG };
+            self.assign(ret, Rvalue::Un { op, x: copy(a1), ty: self_ty, pos: 0 });
+            self.ret();
+        } else if t == "Deref" || t == "DerefMut" {
+            self.assign(ret, Rvalue::Use(copy(a1.deref())));
+            self.ret();
+        } else if t == "Index" || t == "IndexMut" {
+            self.index(self_ty, params, ret, t == "IndexMut");
+            self.ret();
+        } else if t == "Step" {
+            let n = self.local(self_ty);
+            let us = self.ctx.usize_();
+            self.assign(n.clone(), Rvalue::Cast { kind: CAST_NUMERIC, x: copy(a2), from: us, to: self_ty });
+            let op = if method == "backward" { SUB } else { ADD };
+            self.assign(ret, Rvalue::Bin { op, x: copy(a1), y: copy(n), ty: self_ty, pos: 0 });
+            self.ret();
+        } else {
+            panic(`mir: no shim for builtin ${t}`);
+        }
+    }
+
+    /// The place of element i of a tuple or array place.
+    fn elem_place(&mut self, t: &Type, p: Place, i: usize) -> Place {
+        if t.kind == types::K_TUPLE { return p.field(i); }
+        let us = self.ctx.usize_();
+        let idx = self.local(us);
+        self.assign(idx.clone(), Rvalue::Use(int_const(C_INT, i as i64, us)));
+        p.index(idx.local)
+    }
+
+    /// Clones the value at p (of type t) into dest.
+    fn clone_into(&mut self, t: &Type, p: Place, dest: Place) {
+        if is_scalar_type(t) || t.kind == types::K_REF && !t.is_mut {
+            self.assign(dest, Rvalue::Use(copy(p)));
+        } else if t.kind == types::K_TUPLE || t.kind == types::K_ARRAY {
+            self.fieldwise_clone(t, p, dest);
+        } else {
+            let m = self.trait_item("Clone", "clone");
+            let a = self.r(p, t);
+            self.call(m, Some(t), Vec::new(), vec1(a), dest);
+        }
+    }
+
+    fn fieldwise_clone(&mut self, t: &Type, p: Place, dest: Place) {
+        let es = elems(t);
+        let mut ops = Vec::new();
+        let mut i = 0;
+        while i < es.len() {
+            let tmp = self.local(es[i]);
+            let ep = self.elem_place(t, p.clone(), i);
+            self.clone_into(es[i], ep, tmp.clone());
+            ops.push(copy(tmp));
+            i += 1;
+        }
+        let kind = if t.kind == types::K_ARRAY { AGG_ARRAY } else { AGG_TUPLE };
+        self.assign(dest, aggregate(kind, t, 0, ops));
+    }
+
+    fn default_val(&mut self, t: &Type, dest: Place) {
+        if t.kind == types::K_REF {
+            let c = cnst(C_STR, Some(t));
+            self.assign(dest, Rvalue::Use(const_op(c)));
+        } else if is_scalar_type(t) {
+            self.assign(dest, Rvalue::Use(zero_const(t)));
+        } else if t.kind == types::K_TUPLE || t.kind == types::K_ARRAY {
+            let es = elems(t);
+            let mut ops = Vec::new();
+            for et in es.iter() {
+                let tmp = self.local(*et);
+                self.default_val(*et, tmp.clone());
+                ops.push(copy(tmp));
+            }
+            let kind = if t.kind == types::K_ARRAY { AGG_ARRAY } else { AGG_TUPLE };
+            self.assign(dest, aggregate(kind, t, 0, ops));
+        } else {
+            let m = self.trait_item("Default", "default");
+            self.call(m, Some(t), Vec::new(), Vec::new(), dest);
+        }
+    }
+
+    /// Stores a == b into dest.
+    fn eq(&mut self, t: &Type, rhs: &Type, a: Place, b: Place, dest: Place) {
+        if is_scalar_type(t) {
+            self.assign(dest, Rvalue::Bin { op: EQ, x: copy(a), y: copy(b), ty: t, pos: 0 });
+        } else if t.kind == types::K_STR {
+            let f = self.std_fn(&["str", "str_eq"]);
+            let x = self.r(a, t);
+            let y = self.r(b, t);
+            self.call(f, None, Vec::new(), vec2(x, y), dest);
+        } else if t.kind == types::K_REF {
+            self.eq(t.el(), rhs.el(), a.deref(), b.deref(), dest);
+        } else if t.kind == types::K_TUPLE {
+            let end = self.block();
+            let fail = self.block();
+            let bt = self.ctx.bool_;
+            let mut i = 0;
+            while i < t.elems.len() {
+                let r = self.local(bt);
+                self.eq(t.elems[i], rhs.elems[i], a.field(i), b.field(i), r.clone());
+                let next = self.block();
+                self.branch(copy(r), next, fail);
+                self.cur = next;
+                i += 1;
+            }
+            let tc = self.bool_const(true);
+            self.assign(dest.clone(), Rvalue::Use(tc));
+            self.term(Term::Goto(end));
+            self.cur = fail;
+            let fc = self.bool_const(false);
+            self.assign(dest, Rvalue::Use(fc));
+            self.term(Term::Goto(end));
+            self.cur = end;
+        } else if t.kind == types::K_ARRAY || t.kind == types::K_SLICE {
+            let sa = self.as_slice(t, a);
+            let sbv = self.as_slice(rhs, b);
+            let f = self.std_fn(&["slice", "eq_slices"]);
+            self.call(f, None, vec2(t.el(), rhs.el()), vec2(sa, sbv), dest);
+        } else {
+            let m = self.trait_item("PartialEq", "eq");
+            let x = self.r(a, t);
+            let y = self.r(b, rhs);
+            self.call(m, Some(t), vec1(rhs), vec2(x, y), dest);
+        }
+    }
+
+    /// A &[T] for an array or slice place.
+    fn as_slice(&mut self, t: &Type, p: Place) -> Operand {
+        if t.kind == types::K_SLICE { return self.r(p, t); }
+        let r = self.r(p, t);
+        let s = self.ctx.slice(t.el());
+        let st = self.ctx.reference(false, s);
+        let out = self.local(st);
+        self.assign(out.clone(), Rvalue::Unsize { x: r, len: t.len, to: st });
+        copy(out)
+    }
+
+    fn ordering(&mut self) -> &Type {
+        let d = self.p.info.lang_def("Ordering").unwrap();
+        self.ctx.adt(d, Vec::new())
+    }
+
+    fn option_of(&mut self, t: &Type) -> &Type {
+        let d = self.p.info.lang_def("Option").unwrap();
+        self.ctx.adt(d, vec1(t))
+    }
+
+    fn variant_named(&self, t: &Type, name: &str) -> usize {
+        let ai = self.p.info.adts[&t.d().id];
+        let mut i = 0;
+        while i < ai.variants.len() {
+            if ai.variants[i].def.name == name { return i; }
+            i += 1;
+        }
+        0xFFFFFFFF
+    }
+
+    /// Stores Less/Equal/Greater in dest (wrapped in Some for partial_cmp).
+    fn store_ordering(&mut self, name: &str, partial: bool, dest: Place) {
+        let ord = self.ordering();
+        let vi = self.variant_named(ord, name);
+        if !partial {
+            self.assign(dest, aggregate(AGG_ADT, ord, vi, Vec::new()));
+            return;
+        }
+        let tmp = self.local(ord);
+        self.assign(tmp.clone(), aggregate(AGG_ADT, ord, vi, Vec::new()));
+        let opt = self.option_of(ord);
+        let some = self.variant_named(opt, "Some");
+        self.assign(dest, aggregate(AGG_ADT, opt, some, vec1(copy(tmp))));
+    }
+
+    /// Stores the comparison of a and b in dest (Ordering for Ord,
+    /// Option<Ordering> for PartialOrd).
+    fn cmp(&mut self, trait_name: &str, t: &Type, a: Place, b: Place, dest: Place) {
+        let partial = trait_name == "PartialOrd";
+        if is_scalar_type(t) {
+            let bt = self.ctx.bool_;
+            let lt = self.local(bt);
+            let gt = self.local(bt);
+            self.assign(lt.clone(), Rvalue::Bin { op: LT, x: copy(a.clone()), y: copy(b.clone()), ty: t, pos: 0 });
+            self.assign(gt.clone(), Rvalue::Bin { op: GT, x: copy(a.clone()), y: copy(b.clone()), ty: t, pos: 0 });
+            let less = self.block();
+            let not_less = self.block();
+            let greater = self.block();
+            let not_greater = self.block();
+            let end = self.block();
+            self.branch(copy(lt), less, not_less);
+            self.cur = less;
+            self.store_ordering("Less", partial, dest.clone());
+            self.term(Term::Goto(end));
+            self.cur = not_less;
+            self.branch(copy(gt), greater, not_greater);
+            self.cur = greater;
+            self.store_ordering("Greater", partial, dest.clone());
+            self.term(Term::Goto(end));
+            self.cur = not_greater;
+            if t.kind == types::K_FLOAT && partial {
+                let eq = self.local(bt);
+                self.assign(eq.clone(), Rvalue::Bin { op: EQ, x: copy(a), y: copy(b), ty: t, pos: 0 });
+                let equal = self.block();
+                let nan = self.block();
+                self.branch(copy(eq), equal, nan);
+                self.cur = nan;
+                let ord = self.ordering();
+                let opt = self.option_of(ord);
+                let none = self.variant_named(opt, "None");
+                self.assign(dest.clone(), aggregate(AGG_ADT, opt, none, Vec::new()));
+                self.term(Term::Goto(end));
+                self.cur = equal;
+            }
+            self.store_ordering("Equal", partial, dest);
+            self.term(Term::Goto(end));
+            self.cur = end;
+        } else if t.kind == types::K_STR {
+            let f = self.std_fn(&["str", "str_cmp"]);
+            if partial {
+                let ord = self.ordering();
+                let o = self.local(ord);
+                let x = self.r(a, t);
+                let y = self.r(b, t);
+                self.call(f, None, Vec::new(), vec2(x, y), o.clone());
+                let opt = self.option_of(ord);
+                let some = self.variant_named(opt, "Some");
+                self.assign(dest, aggregate(AGG_ADT, opt, some, vec1(copy(o))));
+            } else {
+                let x = self.r(a, t);
+                let y = self.r(b, t);
+                self.call(f, None, Vec::new(), vec2(x, y), dest);
+            }
+        } else if t.kind == types::K_REF {
+            self.cmp(trait_name, t.el(), a.deref(), b.deref(), dest);
+        } else if t.kind == types::K_ARRAY || t.kind == types::K_SLICE {
+            let name = if partial { "partial_cmp_slices" } else { "cmp_slices" };
+            let f = self.std_fn(&["slice", name]);
+            let x = self.as_slice(t, a);
+            let y = self.as_slice(t, b);
+            self.call(f, None, vec1(t.el()), vec2(x, y), dest);
+        } else if t.kind == types::K_TUPLE {
+            let es = t.elems.clone();
+            self.lexicographic(trait_name, &es, a, b, dest);
+        } else {
+            let (method, targs) = if partial { ("partial_cmp", vec1(t)) } else { ("cmp", Vec::new()) };
+            let m = self.trait_item(trait_name, method);
+            let x = self.r(a, t);
+            let y = self.r(b, t);
+            self.call(m, Some(t), targs, vec2(x, y), dest);
+        }
+    }
+
+    /// Compares fields a.i and b.i in order, stopping at the first that is
+    /// not Equal.
+    fn lexicographic(&mut self, trait_name: &str, fts: &Vec<&Type>, a: Place, b: Place, dest: Place) {
+        let partial = trait_name == "PartialOrd";
+        let end = self.block();
+        let ord = self.ordering();
+        let isize_ = self.ctx.int(types::ISIZE);
+        let mut i = 0;
+        while i < fts.len() {
+            let ct = self.cmp_type(partial);
+            let r = self.local(ct);
+            self.cmp(trait_name, fts[i], a.field(i), b.field(i), r.clone());
+            // Equal (or Some(Equal)) continues with the next field.
+            let ord_place = if partial {
+                let opt = self.option_of(ord);
+                let d = self.local(isize_);
+                self.assign(d.clone(), Rvalue::Discr(r.clone()));
+                let is_some = self.block();
+                let done = self.block();
+                let some = self.variant_named(opt, "Some");
+                self.term(Term::Switch { x: copy(d), ty: isize_, vals: vec1(some as i64), targets: vec1(is_some), els: done });
+                self.cur = done;
+                self.assign(dest.clone(), Rvalue::Use(copy(r.clone())));
+                self.term(Term::Goto(end));
+                self.cur = is_some;
+                r.downcast(some).field(0)
+            } else {
+                r.clone()
+            };
+            let d = self.local(isize_);
+            self.assign(d.clone(), Rvalue::Discr(ord_place));
+            let next = self.block();
+            let done = self.block();
+            let eqv = self.variant_named(ord, "Equal");
+            self.term(Term::Switch { x: copy(d), ty: isize_, vals: vec1(eqv as i64), targets: vec1(next), els: done });
+            self.cur = done;
+            self.assign(dest.clone(), Rvalue::Use(copy(r)));
+            self.term(Term::Goto(end));
+            self.cur = next;
+            i += 1;
+        }
+        self.store_ordering("Equal", partial, dest);
+        self.term(Term::Goto(end));
+        self.cur = end;
+    }
+
+    /// Option<Ordering> for partial comparisons, else Ordering.
+    fn cmp_type(&mut self, partial: bool) -> &Type {
+        let ord = self.ordering();
+        if partial { return self.option_of(ord); }
+        ord
+    }
+
+    fn hash(&mut self, t: &Type, p: Place, state: Operand, hasher: &Type) {
+        let unit_t = self.ctx.unit;
+        let unit = self.local(unit_t);
+        let k = t.kind;
+        if k == types::K_INT || k == types::K_BOOL || k == types::K_CHAR || k == types::K_PTR {
+            let size = self.lay.of(t).size;
+            let u8_ = self.ctx.int(types::U8);
+            let pt = self.ctx.ptr(false, u8_);
+            let ptr = self.local(pt);
+            let rt = self.ctx.reference(false, t);
+            let rp = self.r(p, t);
+            self.assign(ptr.clone(), Rvalue::Cast { kind: CAST_PTR, x: rp, from: rt, to: pt });
+            let su = self.ctx.slice(u8_);
+            let sut = self.ctx.reference(false, su);
+            let sl = self.local(sut);
+            let f = self.std_fn(&["rt", "slice_from_raw"]);
+            let us = self.ctx.usize_();
+            self.call(f, None, vec1(u8_), vec2(copy(ptr), int_const(C_INT, size, us)), sl.clone());
+            let w = self.hasher_write();
+            self.call(w, Some(hasher), Vec::new(), vec2(state, copy(sl)), unit);
+        } else if k == types::K_STR {
+            let f = self.std_fn(&["str", "str_hash"]);
+            let x = self.r(p, t);
+            self.call(f, None, vec1(hasher), vec2(x, state), unit);
+        } else if k == types::K_REF {
+            self.hash(t.el(), p.deref(), state, hasher);
+        } else if k == types::K_TUPLE {
+            let mut i = 0;
+            while i < t.elems.len() {
+                self.hash(t.elems[i], p.field(i), state.clone(), hasher);
+                i += 1;
+            }
+        } else if k == types::K_ARRAY || k == types::K_SLICE {
+            let f = self.std_fn(&["slice", "hash_slice"]);
+            let x = self.as_slice(t, p);
+            self.call(f, None, vec2(t.el(), hasher), vec2(x, state), unit);
+        } else {
+            let m = self.trait_item("Hash", "hash");
+            let x = self.r(p, t);
+            self.call(m, Some(t), vec1(hasher), vec2(x, state), unit);
+        }
+    }
+
+    fn hasher_write(&self) -> &mut Def {
+        for (_, ti) in self.p.info.traits.iter() {
+            if ti.def.krate.is_std && ti.def.name == "Hasher" { return ti.items[&"write".to_string()]; }
+        }
+        panic("mir: std has no Hasher")
+    }
+
+    fn rt_call(&mut self, name: &str, args: Vec<Operand>, f: Operand, dest: Place) {
+        let d = self.std_fn(&["fmt", "rt", name]);
+        let mut a = args;
+        a.push(f);
+        self.call(d, None, Vec::new(), a, dest);
+    }
+
+    fn cast_to(&mut self, p: Place, from: &Type, to: &Type) -> Operand {
+        let tmp = self.local(to);
+        self.assign(tmp.clone(), Rvalue::Cast { kind: CAST_NUMERIC, x: copy(p), from, to });
+        copy(tmp)
+    }
+
+    /// Formats the value at p with trait (Display, Debug, ...).
+    fn format(&mut self, trait_name: &str, t: &Type, p: Place, f: Operand, dest: Place) {
+        let u64_ = self.ctx.int(types::U64);
+        let i64_ = self.ctx.int(types::I64);
+        let k = t.kind;
+        if k == types::K_INT {
+            // Hex and friends show the bits of the value's own width.
+            let mut bits = self.cast_to(p.clone(), t, u64_);
+            if types::int_signed(t.int) {
+                let size = self.lay.of(t).size;
+                if size < 8 {
+                    let masked = self.local(u64_);
+                    let mask = (1i64 << (size * 8) as u32) - 1;
+                    self.assign(masked.clone(), Rvalue::Bin { op: BIT_AND, x: bits, y: int_const(C_INT, mask, u64_), ty: u64_, pos: 0 });
+                    bits = copy(masked);
+                }
+            }
+            let tn = trait_name;
+            if tn == "LowerHex" || tn == "UpperHex" || tn == "Octal" || tn == "Binary" {
+                let radix = if tn == "Octal" { 8 } else if tn == "Binary" { 2 } else { 16 };
+                let prefix = if tn == "Octal" { "0o" } else if tn == "Binary" { "0b" } else { "0x" };
+                let upper = self.bool_const(tn == "UpperHex");
+                let pc = str_const(self.ctx, prefix);
+                let mut args = Vec::new();
+                args.push(bits);
+                args.push(int_const(C_INT, radix, u64_));
+                args.push(upper);
+                args.push(pc);
+                self.rt_call("fmt_radix", args, f, dest);
+            } else if types::int_signed(t.int) {
+                let v = self.cast_to(p, t, i64_);
+                self.rt_call("fmt_i64", vec1(v), f, dest);
+            } else {
+                let v = self.cast_to(p, t, u64_);
+                self.rt_call("fmt_u64", vec1(v), f, dest);
+            }
+        } else if k == types::K_FLOAT {
+            let mut style = if trait_name == "Debug" { 1 } else if trait_name == "LowerExp" { 2 } else if trait_name == "UpperExp" { 3 } else { 0 };
+            if !t.f64 { style += 16; }
+            let f64_ = self.ctx.f64;
+            let v = self.cast_to(p, t, f64_);
+            let u8_ = self.ctx.int(types::U8);
+            self.rt_call("fmt_float", vec2(v, int_const(C_INT, style, u8_)), f, dest);
+        } else if k == types::K_BOOL {
+            self.rt_call("fmt_bool", vec1(copy(p)), f, dest);
+        } else if k == types::K_CHAR {
+            let name = if trait_name == "Debug" { "debug_char" } else { "fmt_char" };
+            self.rt_call(name, vec1(copy(p)), f, dest);
+        } else if k == types::K_STR {
+            if trait_name == "Debug" {
+                let x = self.r(p, t);
+                self.rt_call("debug_str", vec1(x), f, dest);
+            } else {
+                let fm = self.p.info.lang_def("Formatter").unwrap();
+                let pad = self.p.inherent_fn(fm, "pad");
+                let x = self.r(p, t);
+                self.call(pad, None, Vec::new(), vec2(f, x), dest);
+            }
+        } else if k == types::K_REF {
+            let m = self.trait_item(trait_name, "fmt");
+            self.call(m, Some(t.el()), Vec::new(), vec2(copy(p), f), dest);
+        } else if k == types::K_TUPLE {
+            if t.elems.len() == 0 {
+                self.rt_call("debug_unit", Vec::new(), f, dest);
+                return;
+            }
+            let es = t.elems.clone();
+            self.debug_tuple("", &es, p, f, dest);
+        } else if k == types::K_ARRAY || k == types::K_SLICE {
+            let d = self.std_fn(&["fmt", "rt", "debug_slice"]);
+            let x = self.as_slice(t, p);
+            self.call(d, None, vec1(t.el()), vec2(x, f), dest);
+        } else {
+            let m = self.trait_item(trait_name, "fmt");
+            let x = self.r(p, t);
+            self.call(m, Some(t), Vec::new(), vec2(x, f), dest);
+        }
+    }
+
+    /// Writes name(f0, f1, ...) with Formatter::debug_tuple.
+    fn debug_tuple(&mut self, name: &str, fts: &Vec<&Type>, base: Place, f: Operand, dest: Place) {
+        let fmtr = self.p.info.lang_def("Formatter").unwrap();
+        let bt = self.p.std_type(&["fmt", "DebugTuple"]);
+        let b = self.local(bt);
+        let dt = self.p.inherent_fn(fmtr, "debug_tuple");
+        let nc = str_const(self.ctx, name);
+        self.call(dt, None, Vec::new(), vec2(f, nc), b.clone());
+        let rbt = self.ctx.reference(true, bt);
+        let bref = self.local(rbt);
+        self.assign(bref.clone(), Rvalue::Ref { is_mut: true, place: b });
+        let mut i = 0;
+        while i < fts.len() {
+            let r = self.local(rbt);
+            let fld = self.p.inherent_fn(bt.d(), "field");
+            let dd = self.dyn_debug(base.field(i), fts[i]);
+            self.call(fld, None, Vec::new(), vec2(copy(bref.clone()), dd), r);
+            i += 1;
+        }
+        let fin = self.p.inherent_fn(bt.d(), "finish");
+        self.call(fin, None, Vec::new(), vec1(copy(bref)), dest);
+    }
+
+    /// &field as &dyn Debug.
+    fn dyn_debug(&mut self, p: Place, t: &Type) -> Operand {
+        let dbg = self.p.info.lang_def("Debug").unwrap();
+        let tr = &TraitRef { tdef: Some(dbg), self_ty: None, args: Vec::new(), bindings: Vec::new() };
+        let dt = self.ctx.dyn_(vec1(tr));
+        let dyn_ref = self.ctx.reference(false, dt);
+        let out = self.local(dyn_ref);
+        let x = self.r(p, t);
+        self.assign(out.clone(), Rvalue::MakeDyn { x, concrete: t, to: dyn_ref });
+        copy(out)
+    }
+
+    fn index(&mut self, self_ty: &Type, params: &Vec<&Type>, ret: Place, is_mut: bool) {
+        let idx_ty = params[1];
+        let recv = local_place(1);
+        let sl = if self_ty.kind == types::K_ARRAY { self.as_slice(self_ty, recv.deref()) } else { copy(recv.clone()) };
+        let usize_ = self.ctx.usize_();
+        if idx_ty.kind == types::K_INT {
+            let f = self.std_fn(&["slice", "index_ref"]);
+            self.call(f, None, vec1(self_ty.el()), vec2(sl, copy(local_place(2))), ret);
+            return;
+        }
+        let mut start = int_const(C_INT, 0, usize_);
+        let mut end = if self_ty.kind == types::K_ARRAY {
+            int_const(C_INT, self_ty.len, usize_)
+        } else {
+            let n = self.local(usize_);
+            self.assign(n.clone(), Rvalue::Len(recv.deref()));
+            copy(n)
+        };
+        let ai = self.p.info.adts[&idx_ty.d().id];
+        let ln = self.p.info.lang_name(idx_ty.d());
+        let inclusive = ln == "RangeInclusive" || ln == "RangeToInclusive";
+        let mut i = 0;
+        while i < ai.fields.len() {
+            let fname = ai.fields[i].name.clone();
+            if fname == "start" {
+                start = copy(local_place(2).field(i));
+            } else if fname == "end" {
+                end = copy(local_place(2).field(i));
+                if inclusive {
+                    let e = self.local(usize_);
+                    self.assign(e.clone(), Rvalue::Bin { op: ADD, x: end, y: int_const(C_INT, 1, usize_), ty: usize_, pos: 0 });
+                    end = copy(e);
+                }
+            }
+            i += 1;
+        }
+        let mut args = Vec::new();
+        args.push(sl);
+        args.push(start);
+        args.push(end);
+        if self_ty.kind == types::K_STR {
+            let f = self.std_fn(&["str", "str_index_range"]);
+            self.call(f, None, Vec::new(), args, ret);
+        } else if is_mut {
+            let f = self.std_fn(&["slice", "index_range_mut"]);
+            self.call(f, None, vec1(self_ty.el()), args, ret);
+        } else {
+            let f = self.std_fn(&["slice", "index_range"]);
+            self.call(f, None, vec1(self_ty.el()), args, ret);
+        }
+    }
+
+    // --- Derived impls ---------------------------------------------------------------
+
+    /// The arms of a walk over the variants of the value at p (one arm with
+    /// variant -1 in the current block for structs), and the join block.
+    fn variant_arms(&mut self, self_ty: &Type, p: Place) -> (Vec<VariantArm>, Option<usize>) {
+        let ai = self.p.info.adts[&self_ty.d().id];
+        let mut arms = Vec::new();
+        if !ai.is_enum {
+            let fts = self.lay.field_types(self_ty, -1);
+            arms.push(VariantArm { v: -1, fp: p, fts, block: self.cur });
+            return (arms, None);
+        }
+        let end = self.block();
+        let isize_ = self.ctx.int(types::ISIZE);
+        let d = self.local(isize_);
+        self.assign(d.clone(), Rvalue::Discr(p.clone()));
+        let mut vals = Vec::new();
+        let mut targets = Vec::new();
+        let mut i = 0;
+        while i < ai.variants.len() {
+            vals.push(i as i64);
+            targets.push(self.block());
+            i += 1;
+        }
+        let unreach = self.block();
+        self.term(Term::Switch { x: copy(d), ty: isize_, vals, targets: targets.clone(), els: unreach });
+        self.cur = unreach;
+        self.term(Term::Unreachable);
+        i = 0;
+        while i < ai.variants.len() {
+            arms.push(VariantArm { v: i as i64, fp: p.downcast(i), fts: Vec::new(), block: targets[i] });
+            i += 1;
+        }
+        (arms, Some(end))
+    }
+
+    /// Starts an arm (computing its field types, as the Go walk does when it
+    /// reaches the variant).
+    fn arm_start(&mut self, self_ty: &Type, arm: &mut VariantArm) {
+        self.cur = arm.block;
+        if arm.v >= 0 { arm.fts = self.lay.field_types(self_ty, arm.v); }
+    }
+
+    fn arm_end(&mut self, end: Option<usize>) {
+        if let Some(e) = end {
+            if let Term::None = self.f.blocks[self.cur].term { self.term(Term::Goto(e)); }
+        }
+    }
+
+    fn derived(&mut self, trait_name: &str, self_ty: &Type, targs: &Vec<&Type>) {
+        let ai = self.p.info.adts[&self_ty.d().id];
+        let ret = local_place(0);
+        let a1 = local_place(1);
+        let a2 = local_place(2);
+        let isize_ = self.ctx.int(types::ISIZE);
+        let bool_ = self.ctx.bool_;
+        let t = trait_name;
+        if t == "Clone" {
+            let (mut arms, end) = self.variant_arms(self_ty, a1.deref());
+            for arm in arms.iter_mut() {
+                self.arm_start(self_ty, arm);
+                let mut ops = Vec::new();
+                let mut i = 0;
+                while i < arm.fts.len() {
+                    let tmp = self.local(arm.fts[i]);
+                    self.clone_into(arm.fts[i], arm.fp.field(i), tmp.clone());
+                    ops.push(copy(tmp));
+                    i += 1;
+                }
+                let v = if arm.v < 0 { 0 } else { arm.v as usize };
+                self.assign(ret.clone(), aggregate(AGG_ADT, self_ty, v, ops));
+                self.arm_end(end);
+            }
+            if let Some(e) = end { self.cur = e; }
+            self.ret();
+        } else if t == "Default" {
+            let fts = self.lay.field_types(self_ty, -1);
+            let mut ops = Vec::new();
+            for ft in fts.iter() {
+                let tmp = self.local(*ft);
+                self.default_val(*ft, tmp.clone());
+                ops.push(copy(tmp));
+            }
+            self.assign(ret, aggregate(AGG_ADT, self_ty, 0, ops));
+            self.ret();
+        } else if t == "PartialEq" {
+            let end = self.block();
+            let fail = self.block();
+            if ai.is_enum {
+                let d1 = self.local(isize_);
+                let d2 = self.local(isize_);
+                self.assign(d1.clone(), Rvalue::Discr(a1.deref()));
+                self.assign(d2.clone(), Rvalue::Discr(a2.deref()));
+                let same = self.local(bool_);
+                self.assign(same.clone(), Rvalue::Bin { op: EQ, x: copy(d1), y: copy(d2), ty: isize_, pos: 0 });
+                let next = self.block();
+                self.branch(copy(same), next, fail);
+                self.cur = next;
+            }
+            let (mut arms, vend) = self.variant_arms(self_ty, a1.deref());
+            for arm in arms.iter_mut() {
+                self.arm_start(self_ty, arm);
+                let other = if arm.v >= 0 { a2.deref().downcast(arm.v as usize) } else { a2.deref() };
+                let mut i = 0;
+                while i < arm.fts.len() {
+                    let r = self.local(bool_);
+                    self.eq(arm.fts[i], arm.fts[i], arm.fp.field(i), other.field(i), r.clone());
+                    let next = self.block();
+                    self.branch(copy(r), next, fail);
+                    self.cur = next;
+                    i += 1;
+                }
+                self.arm_end(vend);
+            }
+            if let Some(e) = vend { self.cur = e; }
+            let tc = self.bool_const(true);
+            self.assign(ret.clone(), Rvalue::Use(tc));
+            self.term(Term::Goto(end));
+            self.cur = fail;
+            let fc = self.bool_const(false);
+            self.assign(ret, Rvalue::Use(fc));
+            self.term(Term::Goto(end));
+            self.cur = end;
+            self.ret();
+        } else if t == "PartialOrd" || t == "Ord" {
+            if ai.is_enum {
+                let d1 = self.local(isize_);
+                let d2 = self.local(isize_);
+                self.assign(d1.clone(), Rvalue::Discr(a1.deref()));
+                self.assign(d2.clone(), Rvalue::Discr(a2.deref()));
+                let ct = self.cmp_type(t == "PartialOrd");
+                let r = self.local(ct);
+                self.cmp(t, isize_, d1.clone(), d2.clone(), r.clone());
+                // Different variants: the variant order decides.
+                let eqv = self.local(bool_);
+                self.assign(eqv.clone(), Rvalue::Bin { op: EQ, x: copy(d1), y: copy(d2), ty: isize_, pos: 0 });
+                let same = self.block();
+                let diff = self.block();
+                let end = self.block();
+                self.branch(copy(eqv), same, diff);
+                self.cur = diff;
+                self.assign(ret.clone(), Rvalue::Use(copy(r)));
+                self.term(Term::Goto(end));
+                self.cur = same;
+                let (mut arms, vend) = self.variant_arms(self_ty, a1.deref());
+                for arm in arms.iter_mut() {
+                    self.arm_start(self_ty, arm);
+                    let other = a2.deref().downcast(arm.v as usize);
+                    let fts = arm.fts.clone();
+                    self.lexicographic(t, &fts, arm.fp.clone(), other, ret.clone());
+                    self.arm_end(vend);
+                }
+                if let Some(e) = vend { self.cur = e; }
+                self.term(Term::Goto(end));
+                self.cur = end;
+                self.ret();
+                return;
+            }
+            let fts = self.lay.field_types(self_ty, -1);
+            self.lexicographic(t, &fts, a1.deref(), a2.deref(), ret);
+            self.ret();
+        } else if t == "Hash" {
+            let hasher = targs[targs.len() - 1];
+            if ai.is_enum {
+                let d = self.local(isize_);
+                self.assign(d.clone(), Rvalue::Discr(a1.deref()));
+                self.hash(isize_, d, copy(a2.clone()), hasher);
+            }
+            let (mut arms, vend) = self.variant_arms(self_ty, a1.deref());
+            for arm in arms.iter_mut() {
+                self.arm_start(self_ty, arm);
+                let mut i = 0;
+                while i < arm.fts.len() {
+                    self.hash(arm.fts[i], arm.fp.field(i), copy(a2.clone()), hasher);
+                    i += 1;
+                }
+                self.arm_end(vend);
+            }
+            if let Some(e) = vend { self.cur = e; }
+            let unit = const_op(cnst(C_UNIT, Some(self.ctx.unit)));
+            self.assign(ret, Rvalue::Use(unit));
+            self.ret();
+        } else if t == "Debug" {
+            let fmtr = self.p.info.lang_def("Formatter").unwrap();
+            let f = copy(a2);
+            let (mut arms, vend) = self.variant_arms(self_ty, a1.deref());
+            for arm in arms.iter_mut() {
+                self.arm_start(self_ty, arm);
+                let (name, kind, fields) = if arm.v >= 0 {
+                    let vi = ai.variants[arm.v as usize];
+                    (vi.def.name.clone(), vi.kind.clone(), vi.fields)
+                } else {
+                    (self_ty.d().name.clone(), ai.kind.clone(), ai.fields)
+                };
+                match kind {
+                    StructKind::Unit => {
+                        let ws = self.p.inherent_fn(fmtr, "write_str");
+                        let nc = str_const(self.ctx, name.as_str());
+                        self.call(ws, None, Vec::new(), vec2(f.clone(), nc), ret.clone());
+                    }
+                    StructKind::Tuple => {
+                        let fts = arm.fts.clone();
+                        self.debug_tuple(name.as_str(), &fts, arm.fp.clone(), f.clone(), ret.clone());
+                    }
+                    StructKind::Named => {
+                        let bt = self.p.std_type(&["fmt", "DebugStruct"]);
+                        let b = self.local(bt);
+                        let ds = self.p.inherent_fn(fmtr, "debug_struct");
+                        let nc = str_const(self.ctx, name.as_str());
+                        self.call(ds, None, Vec::new(), vec2(f.clone(), nc), b.clone());
+                        let rbt = self.ctx.reference(true, bt);
+                        let bref = self.local(rbt);
+                        self.assign(bref.clone(), Rvalue::Ref { is_mut: true, place: b });
+                        let mut i = 0;
+                        while i < arm.fts.len() {
+                            let r = self.local(rbt);
+                            let fld = self.p.inherent_fn(bt.d(), "field");
+                            let fnc = str_const(self.ctx, fields[i].name.as_str());
+                            let dd = self.dyn_debug(arm.fp.field(i), arm.fts[i]);
+                            let mut args = Vec::new();
+                            args.push(copy(bref.clone()));
+                            args.push(fnc);
+                            args.push(dd);
+                            self.call(fld, None, Vec::new(), args, r);
+                            i += 1;
+                        }
+                        let fin = self.p.inherent_fn(bt.d(), "finish");
+                        self.call(fin, None, Vec::new(), vec1(copy(bref)), ret.clone());
+                    }
+                }
+                self.arm_end(vend);
+            }
+            if let Some(e) = vend { self.cur = e; }
+            self.ret();
+        } else {
+            panic(`mir: no derived shim for ${t}`);
+        }
+    }
+}
+
+impl Program {
+    /// A std function by path (module segments then name).
+    pub fn std_fn(&self, path: &[&str]) -> &mut Def {
+        for c in self.info.res.crates.iter() {
+            if !c.is_std { continue; }
+            let mut m = c.root.unwrap();
+            let mut i = 0;
+            while i < path.len() {
+                let ns = if i == path.len() - 1 { resolve::VALUE_NS } else { resolve::TYPE_NS };
+                let b = match m.lookup(path[i], ns) { Some(b) => b, None => panic(`mir: std has no ${path.join("::")}`) };
+                let d = match b.res.def { Some(d) => d, None => panic(`mir: std has no ${path.join("::")}`) };
+                if i == path.len() - 1 { return d; }
+                m = d.module.unwrap();
+                i += 1;
+            }
+        }
+        panic("mir: no std crate")
+    }
+
+    /// An inherent method of a std ADT.
+    pub fn inherent_fn(&self, adt: &Def, name: &str) -> &mut Def {
+        for ii in self.info.impls_of_trait(crate::types::collect::INHERENT).iter() {
+            if ii.self_ty.kind == types::K_ADT && ii.self_ty.d().id == adt.id {
+                if let Some(it) = ii.items.get(&name.to_string()) { return *it; }
+            }
+        }
+        panic(`mir: no std method ${adt.name}::${name}`)
+    }
+
+    /// The shim for a builtin or derived impl method.
+    pub fn shim(&mut self, trait_name: &str, method: &mut Def, self_ty: &Type, targs: &Vec<&Type>) -> &mut Func {
+        let key = `${trait_name}.${method.name}.${self_ty.id}.${args_key(targs)}`;
+        if let Some(f) = self.shims.get(&key) { return *f; }
+        let ctx = self.info.ctx;
+        let sig = self.info.fn_sig_of(method);
+        let ti = self.info.traits[&method.parent.unwrap().id];
+        let mut m = param_map(Some(ti.generics), targs);
+        let own = sig.generics.params.clone();
+        let nt = ti.generics.params.len();
+        let mut i = 0;
+        while i < own.len() {
+            if nt + i < targs.len() { m.insert(own[i].def.id, targs[nt + i]); }
+            i += 1;
+        }
+        let f = new_func(`<${self_ty} as ${trait_name}>::${method.name}`, None, None, method.file);
+        f.shim = true;
+        let s = &mut Sb { p: self, f, cur: 0, ctx, lay: layout::new_computer(self.info) };
+        let rt = subst(ctx, sig.ret, &m, Some(self_ty));
+        let ret_ty = self.info.normalize(None, rt);
+        f.locals.push(&mut Local { ty: ret_ty, name: String::new(), boxed: false });
+        let mut params: Vec<&Type> = Vec::new();
+        if let Some(st) = sig.self_ty {
+            let x = subst(ctx, st, &m, Some(self_ty));
+            params.push(self.info.normalize(None, x));
+        }
+        for pt in sig.params.iter() {
+            let x = subst(ctx, *pt, &m, Some(self_ty));
+            params.push(self.info.normalize(None, x));
+        }
+        for pt in params.iter() { f.locals.push(&mut Local { ty: *pt, name: String::new(), boxed: false }); }
+        f.nargs = params.len();
+        s.cur = s.block();
+        self.shims.insert(key, f);
+        s.gen(trait_name, method.name.as_str(), self_ty, targs, &params);
+        box_address_taken(ctx, f);
+        f
+    }
+
+    /// A function that builds a struct or variant from its arguments, for
+    /// constructors used as function values (`.map(Some)`).
+    pub fn ctor_thunk(&mut self, def: &Def, adt: &Type) -> &mut Func {
+        let key = `ctor.${def.id}.${adt.id}`;
+        if let Some(f) = self.shims.get(&key) { return *f; }
+        let lay = layout::new_computer(self.info);
+        let variant: i64 = if def.kind == resolve::DEF_VARIANT { variant_index(self.info, def) as i64 } else { -1 };
+        let fts = lay.field_types(adt, variant);
+        let f = new_func(`ctor ${def.name}`, None, None, None);
+        f.shim = true;
+        f.nargs = fts.len();
+        f.locals.push(&mut Local { ty: adt, name: String::new(), boxed: false });
+        let mut ops = Vec::new();
+        let mut i = 0;
+        while i < fts.len() {
+            f.locals.push(&mut Local { ty: fts[i], name: String::new(), boxed: false });
+            ops.push(copy(local_place(i + 1)));
+            i += 1;
+        }
+        let v = if variant < 0 { 0 } else { variant as usize };
+        let mut stmts = Vec::new();
+        stmts.push(Stmt::Assign { place: local_place(0), rv: aggregate(AGG_ADT, adt, v, ops) });
+        f.blocks.push(&mut Block { stmts, term: Term::Return });
+        box_address_taken(self.info.ctx, f);
+        self.shims.insert(key, f);
+        f
+    }
+}
