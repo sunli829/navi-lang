@@ -48,7 +48,9 @@ pub fn load_crate(path: &str) -> Result<&CrateSpec, String> {
         return Ok(&CrateSpec { name, fs_root: dir.clone(), root: base, deps: Vec::new(), dir });
     }
     let mut name = util::path_base(util::path_clean(path).as_str());
-    if let Ok(manifest) = std::fs::read_to_string(util::path_join(path, "navi.toml")) {
+    let toml = util::path_join(path, "navi.toml");
+    if let Ok(manifest) = std::fs::read_to_string(toml.as_str()) {
+        crate::cache::note(toml.as_str(), &manifest);
         let n = package_name(manifest.as_str());
         if n.len() > 0 { name = n; }
     }
@@ -151,8 +153,8 @@ pub fn native(info: &mut types::collect::Info, main: &mut resolve::Def, out: &st
         let exe = crate::link::link(o, util::path_base(out).as_str())?;
         if let Err(e) = std::fs::write(out, exe.as_slice()) { return Err(`${e}`); }
         phase("link");
-        let st = std::process::Command::new("chmod").arg("755").arg(out).status();
-        return match st { Ok(_) => Ok(()), Err(e) => Err(`${e}`) };
+        chmod_x(out);
+        return Ok(());
     }
     let data = object(info, main, debug)?;
     let obj_path = `${out}.navi.o`;
@@ -165,11 +167,15 @@ pub fn native(info: &mut types::collect::Info, main: &mut resolve::Def, out: &st
     }
 }
 
-/// navic build [-o output] [--release] [-c] <crate or file>
+/// navic build [-o output] [--release] [-c] [-a] [-timings] <crate or file>
+///
+/// -c writes an object file; -a rebuilds even if the build cache has the
+/// output.
 pub fn build_command(args: &Vec<String>) -> i32 {
     let mut out = String::new();
     let mut release = false;
     let mut obj_only = false;
+    let mut force = false;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -185,19 +191,30 @@ pub fn build_command(args: &Vec<String>) -> i32 {
             obj_only = true;
         } else if a == "-timings" {
             TIMINGS = true;
+        } else if a == "-a" {
+            force = true;
         } else {
             paths.push(args[i].clone());
         }
         i += 1;
     }
     if paths.len() != 1 {
-        eprintln("usage: navic build [-o output] [--release] [-c] <crate or file>");
+        eprintln("usage: navic build [-o output] [--release] [-c] [-a] [-timings] <crate or file>");
         return 2;
     }
     let spec = match load_crate(paths[0].as_str()) {
         Ok(s) => s,
         Err(e) => { eprintln(e); return 1; }
     };
+    if out.len() == 0 { out = if obj_only { `${spec.name}.o` } else { spec.name.clone() }; }
+    let key = crate::cache::key(`${if obj_only { "obj" } else { "exe" }} release=${release}`.as_str(), paths[0].as_str());
+    if let Some(k) = key {
+        if !force && crate::cache::lookup(k.as_str(), out.as_str()) {
+            if !obj_only { chmod_x(out.as_str()); }
+            phase("cached");
+            return 0;
+        }
+    }
     let mut cfg = host_config();
     cfg.debug = !release;
     let mut specs = Vec::new();
@@ -215,7 +232,6 @@ pub fn build_command(args: &Vec<String>) -> i32 {
         None => { eprintln(`${paths[0]}: no main function`); return 1; }
     };
     if obj_only {
-        if out.len() == 0 { out = `${spec.name}.o`; }
         let r = match object(info, main, !release) {
             Ok(data) => match std::fs::write(out.as_str(), data.as_slice()) { Ok(_) => Ok(()), Err(e) => Err(`${e}`) },
             Err(e) => Err(e),
@@ -224,12 +240,17 @@ pub fn build_command(args: &Vec<String>) -> i32 {
             eprintln(e);
             return 1;
         }
+        if let Some(k) = key { crate::cache::store(k.as_str(), out.as_str()); }
         return 0;
     }
-    if out.len() == 0 { out = spec.name.clone(); }
     if let Err(e) = native(info, main, out.as_str(), !release) {
         eprintln(e);
         return 1;
     }
+    if let Some(k) = key { crate::cache::store(k.as_str(), out.as_str()); }
     0
+}
+
+fn chmod_x(path: &str) {
+    let _ = std::process::Command::new("chmod").arg("755").arg(path).status();
 }

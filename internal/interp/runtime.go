@@ -93,6 +93,9 @@ func (t *thread) intrinsic(inst *fnInst, args []val) val {
 		return intVal(size, a*b)
 	case "monotonic_nanos":
 		return intVal(8, time.Since(processStart).Nanoseconds())
+	case "is_copy_clone":
+		// Conservative: navic's native code copies bitwise when true.
+		return intVal(1, 0)
 	case "os_arg_count":
 		return intVal(8, int64(len(m.Args)))
 	case "os_arg":

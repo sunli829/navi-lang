@@ -1680,6 +1680,8 @@ func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
 		m.CallC(f.g.extern("abort"), 0, nil, false, false)
 		m.Trap()
 		return
+	case "is_copy_clone":
+		m.MovImm(V1, 0) // conservative (stage0 only bootstraps navic)
 	case "has_pointers":
 		if f.noscan(targ(0)) {
 			m.MovImm(V1, 0)
