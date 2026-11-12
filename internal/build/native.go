@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 
+	"navi/internal/backend/amd64"
 	"navi/internal/backend/arm64"
 	"navi/internal/backend/lower"
 	"navi/internal/codegen"
@@ -96,6 +97,8 @@ func Object(info *types.Info, main *resolve.Def, t Target, debug bool) ([]byte, 
 	switch t.Arch {
 	case "arm64":
 		m = arm64.NewMachine()
+	case "amd64":
+		m = amd64.NewMachine(t.OS == "windows")
 	default:
 		return nil, fmt.Errorf("code generation for %s is not implemented", t)
 	}
