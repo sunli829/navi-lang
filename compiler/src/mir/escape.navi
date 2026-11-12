@@ -171,7 +171,23 @@ fn intrinsic_summary(name: &str, nargs: usize) -> Option<Summary> {
         return Some(s);
     }
     if n == "size_of" || n == "align_of" || n == "slice_len" || n == "wrapping_add" || n == "wrapping_sub" || n == "wrapping_mul"
-        || n == "has_pointers" || n == "write" || n == "fmt_float" || n == "float_op" || n == "monotonic_nanos" {
+        || n == "has_pointers" || n == "write" || n == "fmt_float" || n == "float_op" || n == "monotonic_nanos"
+        || n == "panic_raw" || n == "exit" || n == "os_arg_count" || n == "os_arg" || n == "os_getenv" || n == "os_system"
+        || n.starts_with("fs_") {
+        return Some(s);
+    }
+    if n == "alloc" || n == "alloc_array" {
+        // Fresh heap memory.
+        s.esc[nargs] = 1;
+        return Some(s);
+    }
+    if n == "copy" {
+        // Copies what src points to into what dst points to.
+        let mut d = 2;
+        while d <= D {
+            s.pairs.push((0, d as u8, 1, d as u8));
+            d += 1;
+        }
         return Some(s);
     }
     None
@@ -198,12 +214,24 @@ fn builtin_pairs(trait_name: &str, s: &mut Summary, nargs: usize) {
     }
 }
 
+/// The head of a self type that selects impls (-1: any impl may apply).
+/// Impls do not overlap, so a call whose self type has a concrete head can
+/// only reach impls with that head or blanket impls.
+fn head(t: &Type) -> i64 {
+    let k = t.kind;
+    if k == types::K_ADT { return t.d().id as i64 * 32 + 31; }
+    if k == types::K_PARAM || k == types::K_PROJ || k == types::K_DYN || k == types::K_OPAQUE || k == types::K_INFER
+        || k == types::K_ERROR { return -1; }
+    k as i64
+}
+
 struct Escape {
     summaries: HashMap<u32, Summary>,
     by_def: HashMap<u32, &mut Func>,
-    impls: HashMap<String, Vec<&mut Func>>,
+    impls: HashMap<String, Vec<(&mut Func, i64)>>,
     lang_of: HashMap<u32, String>,
     changed: bool,
+    debug: String,
 }
 
 fn unknown_summary(nargs: usize) -> Summary {
@@ -254,15 +282,32 @@ impl Escape {
         if let Node::Item(Item::Fn(fd)) = &d.node {
             if has_attr(&fd.base.attrs, "intrinsic") { return intrinsic_summary(d.name.as_str(), nargs); }
         }
-        if d.kind == resolve::DEF_EXTERN_FN { return None; }
+        if d.kind == resolve::DEF_EXTERN_FN {
+            // C code cannot keep GC pointers (the collector does not see
+            // its memory); a returned pointer may point into an argument.
+            let mut s = empty_summary(nargs);
+            let mut k = 0;
+            while k < nargs {
+                let mut d = 1;
+                while d <= D {
+                    s.pairs.push((k as u8, d as u8, nargs as u8, d as u8));
+                    d += 1;
+                }
+                k += 1;
+            }
+            return Some(s);
+        }
         let in_trait = match d.parent { Some(p) => p.kind == resolve::DEF_TRAIT, None => false };
         if in_trait {
             let p = d.parent.unwrap();
             let mut s = empty_summary(nargs);
             if let Some(ln) = self.lang_of.get(&p.id) { builtin_pairs(ln.as_str(), &mut s, nargs); }
             let key = `${p.id}.${d.name}`;
+            let h = match r.self_ty { Some(t) => head(t), None => -1 };
             if let Some(fs) = self.impls.get(&key) {
-                for f in fs.iter() { merge(&mut s, self.summary_of(*f, nargs)); }
+                for (f, fh) in fs.iter() {
+                    if h < 0 || *fh < 0 || *fh == h { merge(&mut s, self.summary_of(*f, nargs)); }
+                }
             }
             return Some(s);
         }
@@ -326,6 +371,10 @@ impl Escape {
                 }
             }
             if let Term::Call { fn_op, args, dest, .. } = &b.term {
+                if self.debug.len() > 0 && f.name.contains(self.debug.as_str()) {
+                    let sm = match self.callee(fn_op, args.len()) { Some(s) => `${s.esc:?}`, None => "unknown".to_string() };
+                    eprintln(`  call in ${f.name}: ${operand_string(fn_op)} ${sm}`);
+                }
                 match self.callee(fn_op, args.len()) {
                     None => {
                         for a in args.iter() { escape_op(g, a); }
@@ -625,7 +674,8 @@ fn loop_blocks(f: &Func) -> Vec<bool> {
 /// Runs the analysis over all functions and returns, per function id, the
 /// locals whose address may stay in the frame.
 pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<bool>> {
-    let e = &mut Escape { summaries: HashMap::new(), by_def: HashMap::new(), impls: HashMap::new(), lang_of: HashMap::new(), changed: true };
+    let e = &mut Escape { summaries: HashMap::new(), by_def: HashMap::new(), impls: HashMap::new(), lang_of: HashMap::new(), changed: true,
+        debug: match std::env::var("NAVI_ESCDEBUG") { Ok(v) => v, Err(_) => String::new() } };
     for (name, d) in info.lang.iter() { e.lang_of.insert(d.id, name.clone()); }
     for f in funcs.iter() {
         if let Some(d) = f.def {
@@ -633,17 +683,21 @@ pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<
             if let Some(p) = d.parent {
                 // Trait impl methods and trait default bodies.
                 let mut trait_id: i64 = -1;
+                let mut h: i64 = -1;
                 if p.kind == resolve::DEF_TRAIT { trait_id = p.id as i64; }
                 if p.kind == resolve::DEF_IMPL {
                     if let Some(ii) = info.impls.get(&p.id) {
-                        if let Some(tr) = ii.trait_ref { trait_id = tr.trait_def().id as i64; }
+                        if let Some(tr) = ii.trait_ref {
+                            trait_id = tr.trait_def().id as i64;
+                            h = head(ii.self_ty);
+                        }
                     }
                 }
                 if trait_id >= 0 {
                     let key = `${trait_id}.${d.name}`;
                     if !e.impls.contains_key(&key) { e.impls.insert(key.clone(), Vec::new()); }
                     let mut list = e.impls[&key];
-                    list.push(*f);
+                    list.push((*f, h));
                 }
             }
         }
@@ -655,6 +709,20 @@ pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<
         rounds += 1;
     }
     let mut keep: HashMap<u32, Vec<bool>> = HashMap::new();
-    for f in funcs.iter() { keep.insert(f.id, e.keep(*f)); }
+    let debug = std::env::var("NAVI_ESCDEBUG").is_ok();
+    for f in funcs.iter() {
+        let k = e.keep(*f);
+        if debug {
+            let s = e.summary_of(*f, f.nargs + 1 - first_param(*f));
+            let mut boxed = String::new();
+            let mut i = 0;
+            while i < k.len() {
+                if !k[i] { boxed.push_str(` ${i}`.as_str()); }
+                i += 1;
+            }
+            eprintln(`esc ${f.name} ${s.esc:?} boxed:${boxed}`);
+        }
+        keep.insert(f.id, k);
+    }
     keep
 }
