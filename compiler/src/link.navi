@@ -184,7 +184,13 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     let dylib_size = align_up((24 + libsystem.len() + 1) as u64, 8) as u32;
     cmds_size += dylib_size;
     cmds_size += 16; // LC_CODE_SIGNATURE
-    let ncmds = 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
+    let mut ncmds = 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
+    // Debug builds: a __DWARF segment (between __DATA and __LINKEDIT).
+    let has_dwarf = o.lines.len() > 0;
+    if has_dwarf {
+        cmds_size += 72 + 80 * 3;
+        ncmds += 1;
+    }
 
     // __TEXT: header, commands, __text, __stubs, __const.
     let text = &mut Sect { seg: "__TEXT", name: "__text", data: o.sects[obj::TEXT].clone(), addr: 0, off: 0, align: 2, flags: 0x80000400 };
@@ -213,7 +219,25 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     let data_off = dc_off + dc_size;
     data.off = data_off;
     let data_size = max_u64(align_up(data.data.len() as u64, PAGE), PAGE);
-    let linkedit_off = data_off + data_size;
+    let dwarf_off = data_off + data_size;
+    let mut dsects_dwarf: Vec<&Sect> = Vec::new();
+    let mut dwarf_size = 0u64;
+    if has_dwarf {
+        let pwd = match std::env::var("PWD") { Ok(p) => p, Err(_) => ".".to_string() };
+        let ds = crate::dwarf::sections(o, BASE + text.off, text.data.len() as u64, pwd.as_str());
+        let mut at = dwarf_off;
+        let names = ["__debug_abbrev", "__debug_info", "__debug_line"];
+        let datas = [ds.abbrev, ds.info, ds.line];
+        let mut i = 0;
+        while i < 3 {
+            let s = &mut Sect { seg: "__DWARF", name: names[i], data: datas[i], addr: BASE + at, off: at, align: 0, flags: 0x02000000 };
+            dsects_dwarf.push(s);
+            at += s.data.len() as u64;
+            i += 1;
+        }
+        dwarf_size = at - dwarf_off;
+    }
+    let linkedit_off = dwarf_off + align_up(dwarf_size, PAGE);
     // File offsets equal address offsets from BASE.
     text.addr = BASE + text.off;
     stubs.addr = BASE + stubs.off;
@@ -384,6 +408,7 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     segment(w, "__TEXT", BASE, text_size, 0, text_size, 5, &tsects);
     segment(w, "__DATA_CONST", BASE + dc_off, dc_size, dc_off, dc_size, 3, &dsects);
     segment(w, "__DATA", BASE + data_off, data_size, data_off, data_size, 3, &wsects);
+    if has_dwarf { segment(w, "__DWARF", BASE + dwarf_off, align_up(dwarf_size, PAGE), dwarf_off, dwarf_size, 0, &dsects_dwarf); }
     segment(w, "__LINKEDIT", BASE + linkedit_off, align_up(linkedit_size, PAGE), linkedit_off, linkedit_size, 1, &Vec::new());
     // LC_DYLD_INFO_ONLY
     w.u32(0x80000022);
@@ -471,6 +496,10 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     w.b.extend_from_slice(dconst.data.as_slice());
     w.pad_to(data.off);
     w.b.extend_from_slice(data.data.as_slice());
+    for s in dsects_dwarf.iter() {
+        w.pad_to(s.off);
+        w.b.extend_from_slice(s.data.as_slice());
+    }
     w.pad_to(linkedit_off);
     w.b.extend_from_slice(le.b.as_slice());
     if w.b.len() as u64 != sig_off { return Err("link: layout mismatch".to_string()); }

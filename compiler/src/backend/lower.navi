@@ -58,6 +58,11 @@ pub struct Gen {
     closure: HashMap<String, String>,
     statics: HashMap<u32, String>,
     errs: Vec<String>,
+    /// The current function's line rows (code offset, position) and file,
+    /// recorded in debug builds.
+    cur_lines: Vec<(usize, Pos)>,
+    cur_file: Option<&File>,
+    cur_name: String,
 }
 
 fn round8(n: i64) -> i64 { (n + 7) & !7 }
@@ -109,7 +114,7 @@ fn link_name(d: &Def) -> String {
 pub fn generate(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug: bool) -> Result<&mut Object, String> {
     if p.errors.len() > 0 { return Err(p.errors.join("\n")); }
     let g = &mut Gen { p, o: obj::new_object(arch), m, tgt, debug, lay: p.lay, locs: HashMap::new(), loc_list: Vec::new(),
-        closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new() };
+        closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new() };
     let mut i = 0;
     while i < p.statics.len() {
         let d = p.statics[i];
@@ -138,6 +143,19 @@ impl Gen {
         let align = if self.o.arch == "amd64" { 16 } else { 4 };
         let off = self.o.define(sym, obj::TEXT, align, global);
         self.o.append(obj::TEXT, c.code.as_slice());
+        if self.debug {
+            let name = if self.cur_name.len() > 0 { self.cur_name.clone() } else { sym.to_string() };
+            self.o.funcs.push(obj::FuncRange { name, off, size: c.code.len() as u64 });
+            if let Some(f) = self.cur_file {
+                for (o, pos) in self.cur_lines.iter() {
+                    let ps = f.position(*pos);
+                    self.o.lines.push(obj::Line { off: off + *o as u64, file: ps.file.clone(), line: ps.line as u32 });
+                }
+            }
+            self.cur_lines = Vec::new();
+            self.cur_file = None;
+            self.cur_name = String::new();
+        }
         for r in c.relocs.iter() { self.o.reloc(obj::TEXT, off as u32 + r.off, r.kind, r.sym.as_str()); }
     }
 
@@ -429,6 +447,12 @@ impl Gen {
 
     fn gen_func(&mut self, grp: &mut Group, f: &mut Func, sym: String) {
         self.m.begin();
+        self.cur_lines = Vec::new();
+        self.cur_file = f.file;
+        self.cur_name = f.name.clone();
+        if self.debug {
+            if let Some(d) = f.def { self.cur_lines.push((0, d.pos)); }
+        }
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
             res_off: 0, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), saved: Vec::new() };
         fg.gen();
@@ -625,9 +649,11 @@ impl FnGen {
             let b = f.blocks[bi];
             let mut si = 0;
             while si < b.stmts.len() {
+                if self.g.debug { self.note_line(stmt_pos(&b.stmts[si])); }
                 self.stmt(bi, si, &b.stmts[si]);
                 si += 1;
             }
+            if self.g.debug { self.note_line(term_pos(&b.term)); }
             self.term(bi, &b.term);
             bi += 1;
         }
@@ -1093,6 +1119,18 @@ impl FnGen {
     }
 
     // --- Statements --------------------------------------------------------------
+
+    /// Records that the code from here on comes from pos (debug builds).
+    fn note_line(&mut self, pos: Pos) {
+        if pos <= 0 { return; }
+        let off = self.m.offset();
+        let mut ls = self.g.cur_lines;
+        if ls.len() > 0 && ls[ls.len() - 1].0 == off {
+            ls[ls.len() - 1] = (off, pos);
+            return;
+        }
+        ls.push((off, pos));
+    }
 
     fn stmt(&mut self, bi: usize, si: usize, s: &Stmt) {
         let m = self.m;
@@ -2080,4 +2118,23 @@ fn copy_clone(t: &Type) -> bool {
         return true;
     }
     false
+}
+
+/// The source position of a statement, if it has one.
+fn stmt_pos(s: &Stmt) -> Pos {
+    if let Stmt::Assign { rv, .. } = s {
+        match rv {
+            Rvalue::Bin { pos, .. } | Rvalue::Un { pos, .. } => return *pos,
+            _ => {}
+        }
+    }
+    0
+}
+
+/// The source position of a terminator, if it has one.
+fn term_pos(t: &Term) -> Pos {
+    match t {
+        Term::Call { pos, .. } | Term::Assert { pos, .. } => *pos,
+        _ => 0,
+    }
 }

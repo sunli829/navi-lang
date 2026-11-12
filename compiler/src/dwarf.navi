@@ -1,0 +1,211 @@
+//! DWARF 4 debug information for debug builds: one compilation unit with a
+//! subprogram per function and a line table built from the positions the
+//! backend recorded (calls, checked arithmetic, function entries). The
+//! linker puts the sections in a __DWARF segment of the executable, where
+//! lldb, atos and dsymutil find them.
+
+use std::collections::HashMap;
+use crate::obj::Object;
+
+pub struct Sections {
+    pub abbrev: Vec<u8>,
+    pub info: Vec<u8>,
+    pub line: Vec<u8>,
+}
+
+fn u16le(b: &mut Vec<u8>, v: u16) {
+    b.push(v as u8);
+    b.push((v >> 8) as u8);
+}
+
+fn u32le(b: &mut Vec<u8>, v: u32) {
+    let mut i = 0;
+    while i < 4 {
+        b.push((v >> (8 * i) as u32) as u8);
+        i += 1;
+    }
+}
+
+fn u64le(b: &mut Vec<u8>, v: u64) {
+    let mut i = 0;
+    while i < 8 {
+        b.push((v >> (8 * i) as u32) as u8);
+        i += 1;
+    }
+}
+
+fn set32(b: &mut Vec<u8>, at: usize, v: u32) {
+    let mut i = 0;
+    while i < 4 {
+        b[at + i] = (v >> (8 * i) as u32) as u8;
+        i += 1;
+    }
+}
+
+fn uleb(b: &mut Vec<u8>, v0: u64) {
+    let mut v = v0;
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v = v >> 7;
+        if v == 0 {
+            b.push(byte);
+            return;
+        }
+        b.push(byte | 0x80);
+    }
+}
+
+fn sleb(b: &mut Vec<u8>, v0: i64) {
+    let mut v = v0;
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v = v >> 7;
+        let done = v == 0 && byte & 0x40 == 0 || v == -1 && byte & 0x40 != 0;
+        if done {
+            b.push(byte);
+            return;
+        }
+        b.push(byte | 0x80);
+    }
+}
+
+fn cstr(b: &mut Vec<u8>, s: &str) {
+    b.extend_from_slice(s.as_bytes());
+    b.push(0);
+}
+
+// Tags, attributes and forms.
+const TAG_COMPILE_UNIT: u64 = 0x11;
+const TAG_SUBPROGRAM: u64 = 0x2e;
+const AT_NAME: u64 = 0x03;
+const AT_STMT_LIST: u64 = 0x10;
+const AT_LOW_PC: u64 = 0x11;
+const AT_HIGH_PC: u64 = 0x12;
+const AT_LANGUAGE: u64 = 0x13;
+const AT_COMP_DIR: u64 = 0x1b;
+const AT_PRODUCER: u64 = 0x25;
+const FORM_ADDR: u64 = 0x01;
+const FORM_DATA2: u64 = 0x05;
+const FORM_DATA8: u64 = 0x07;
+const FORM_STRING: u64 = 0x08;
+const FORM_SEC_OFFSET: u64 = 0x17;
+
+/// The debug sections for o, whose text section starts at text_addr.
+pub fn sections(o: &Object, text_addr: u64, text_size: u64, comp_dir: &str) -> &mut Sections {
+    // .debug_abbrev: 1 = compile unit (with children), 2 = subprogram.
+    let mut ab: Vec<u8> = Vec::new();
+    uleb(&mut ab, 1);
+    uleb(&mut ab, TAG_COMPILE_UNIT);
+    ab.push(1);
+    let cu_attrs = [AT_PRODUCER, FORM_STRING, AT_LANGUAGE, FORM_DATA2, AT_NAME, FORM_STRING, AT_COMP_DIR, FORM_STRING,
+        AT_STMT_LIST, FORM_SEC_OFFSET, AT_LOW_PC, FORM_ADDR, AT_HIGH_PC, FORM_DATA8];
+    for a in cu_attrs.iter() { uleb(&mut ab, *a); }
+    ab.push(0);
+    ab.push(0);
+    uleb(&mut ab, 2);
+    uleb(&mut ab, TAG_SUBPROGRAM);
+    ab.push(0);
+    let sp_attrs = [AT_NAME, FORM_STRING, AT_LOW_PC, FORM_ADDR, AT_HIGH_PC, FORM_DATA8];
+    for a in sp_attrs.iter() { uleb(&mut ab, *a); }
+    ab.push(0);
+    ab.push(0);
+    ab.push(0);
+
+    // .debug_info: the unit and its functions.
+    let mut info: Vec<u8> = Vec::new();
+    u32le(&mut info, 0); // unit length, patched below
+    u16le(&mut info, 4);
+    u32le(&mut info, 0); // abbreviations at offset 0
+    info.push(8);
+    uleb(&mut info, 1);
+    cstr(&mut info, "navic");
+    u16le(&mut info, 0x0c); // DW_LANG_C99: debuggers show the names as they are
+    let main_file = if o.lines.len() > 0 { o.lines[0].file.clone() } else { "navi".to_string() };
+    cstr(&mut info, main_file.as_str());
+    cstr(&mut info, comp_dir);
+    u32le(&mut info, 0); // line table at offset 0
+    u64le(&mut info, text_addr);
+    u64le(&mut info, text_size);
+    for f in o.funcs.iter() {
+        if f.size == 0 { continue; }
+        uleb(&mut info, 2);
+        cstr(&mut info, f.name.as_str());
+        u64le(&mut info, text_addr + f.off);
+        u64le(&mut info, f.size);
+    }
+    info.push(0);
+    let n = info.len() as u32 - 4;
+    set32(&mut info, 0, n);
+
+    // .debug_line: one sequence over the text section.
+    let mut files: Vec<String> = Vec::new();
+    let mut file_ix: HashMap<String, u64> = HashMap::new();
+    for l in o.lines.iter() {
+        if !file_ix.contains_key(&l.file) {
+            files.push(l.file.clone());
+            file_ix.insert(l.file.clone(), files.len() as u64);
+        }
+    }
+    let mut ln: Vec<u8> = Vec::new();
+    u32le(&mut ln, 0); // unit length
+    u16le(&mut ln, 4);
+    u32le(&mut ln, 0); // header length
+    let header_start = ln.len();
+    ln.push(4); // minimum instruction length (arm64)
+    ln.push(1); // maximum operations per instruction
+    ln.push(1); // default is_stmt
+    ln.push(0xfb); // line base -5
+    ln.push(14); // line range
+    ln.push(13); // opcode base
+    let lens = [0u8, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
+    for x in lens.iter() { ln.push(*x); }
+    ln.push(0); // no include directories
+    for f in files.iter() {
+        cstr(&mut ln, f.as_str());
+        uleb(&mut ln, 0);
+        uleb(&mut ln, 0);
+        uleb(&mut ln, 0);
+    }
+    ln.push(0);
+    let hl = (ln.len() - header_start) as u32;
+    set32(&mut ln, 6, hl);
+    // DW_LNE_set_address.
+    ln.push(0);
+    uleb(&mut ln, 9);
+    ln.push(2);
+    u64le(&mut ln, text_addr);
+    let mut addr = 0u64;
+    let mut line = 1i64;
+    let mut file = 1u64;
+    for l in o.lines.iter() {
+        if l.off < addr { continue; }
+        let fi = file_ix[&l.file];
+        if fi != file {
+            ln.push(4); // DW_LNS_set_file
+            uleb(&mut ln, fi);
+            file = fi;
+        }
+        if l.line as i64 != line {
+            ln.push(3); // DW_LNS_advance_line
+            sleb(&mut ln, l.line as i64 - line);
+            line = l.line as i64;
+        }
+        if l.off > addr {
+            ln.push(2); // DW_LNS_advance_pc (in instructions)
+            uleb(&mut ln, (l.off - addr) / 4);
+            addr = l.off;
+        }
+        ln.push(1); // DW_LNS_copy
+    }
+    if text_size > addr {
+        ln.push(2);
+        uleb(&mut ln, (text_size - addr) / 4);
+    }
+    // DW_LNE_end_sequence.
+    ln.push(0);
+    uleb(&mut ln, 1);
+    ln.push(1);
+    let total = ln.len() as u32 - 4;
+    set32(&mut ln, 0, total);
+    &mut Sections { abbrev: ab, info, line: ln }
+}
