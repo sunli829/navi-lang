@@ -33,7 +33,6 @@ commands:
 // commands lists the subcommands that exist but are not implemented yet,
 // with the milestone that delivers each of them.
 var commands = map[string]string{
-	"build": "M3",
 	"bench": "M9",
 }
 
@@ -61,6 +60,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return dumpMIR(args[1:], stdout, stderr)
 	case "run":
 		return runCrate(args[1:], stdout, stderr)
+	case "build":
+		return buildCrate(args[1:], stdout, stderr)
 	case "test":
 		return testCrate(args[1:], stdout, stderr)
 	default:
@@ -181,6 +182,55 @@ func runCrate(args []string, stdout, stderr io.Writer) int {
 	m := interp.New(mir.Build(info))
 	m.Stdout, m.Stderr = stdout, stderr
 	return m.Run(main)
+}
+
+// buildCrate compiles a crate into a native executable.
+func buildCrate(args []string, stdout, stderr io.Writer) int {
+	out := ""
+	release := false
+	var paths []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-o":
+			if i+1 < len(args) {
+				out = args[i+1]
+				i++
+			}
+		case "--release":
+			release = true
+		default:
+			paths = append(paths, args[i])
+		}
+	}
+	if len(paths) != 1 {
+		fmt.Fprintln(stderr, "usage: navi build [-o output] [--release] <crate or file>")
+		return 2
+	}
+	spec, err := build.LoadCrate(paths[0])
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	cfg := build.HostConfig()
+	cfg.Debug = !release
+	info, errs := build.CheckSpecs(cfg, []*resolve.CrateSpec{build.StdCrate(), spec})
+	if len(errs) > 0 {
+		fmt.Fprintln(stderr, errs)
+		return 1
+	}
+	main := build.FindMain(info, spec.Name)
+	if main == nil {
+		fmt.Fprintf(stderr, "%s: no main function\n", paths[0])
+		return 1
+	}
+	if out == "" {
+		out = spec.Name
+	}
+	if err := build.Native(info, main, out, !release); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
 // testCrate builds a crate with cfg(test) and runs every #[test] function

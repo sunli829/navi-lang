@@ -32,8 +32,22 @@ type Plan struct {
 	Vtables  map[string]*Vtable
 	Strings  map[string]string // literal -> symbol
 	Errors   []string
+	// StaticInit holds the initializer instance of each static.
+	StaticInit map[*resolve.Def]*Inst
+	// Runtime holds the std::rt::native functions the backend calls
+	// directly (panic_raw, panic_bounds, alloc).
+	Runtime map[string]*Inst
 
 	groups map[string]*Group
+	native *resolve.Module
+}
+
+// Inline lists the intrinsics the backends generate inline; the others
+// call the function of the same name in std::rt::native.
+var Inline = map[string]bool{
+	"size_of": true, "align_of": true, "ptr_offset": true, "slice_from_raw": true,
+	"slice_from_raw_mut": true, "str_from_raw": true, "slice_len": true, "slice_ptr": true,
+	"str_as_bytes": true, "caller_location": true, "abort": true,
 }
 
 // TargetKind is how a function reference is reached.
@@ -70,6 +84,7 @@ type Inst struct {
 	Key   string
 	Func  *mir.Func
 	Def   *resolve.Def
+	Args  []*types.Type
 	Subst map[*resolve.Def]*types.Type
 	Self  *types.Type
 	Group *Group
@@ -163,11 +178,51 @@ func Build(prog *mir.Program, main *resolve.Def) *Plan {
 		Strings:  map[string]string{},
 		staticOK: map[*resolve.Def]bool{},
 		groups:   map[string]*Group{},
+
+		StaticInit: map[*resolve.Def]*Inst{},
+		Runtime:    map[string]*Inst{},
+	}
+	p.findNative()
+	for _, name := range []string{"panic_raw", "panic_bounds", "alloc"} {
+		if d := p.nativeFn(name); d != nil {
+			p.Runtime[name] = p.inst(d, nil, nil, prog.Func(d))
+		} else {
+			p.Errors = append(p.Errors, "std::rt::native::"+name+" is missing")
+		}
 	}
 	p.Main = p.inst(main, nil, nil, prog.Func(main))
 	p.assignSlots()
 	sort.Slice(p.Groups, func(i, j int) bool { return p.Groups[i].Sym < p.Groups[j].Sym })
 	return p
+}
+
+// Str returns the symbol of a string literal.
+func (p *Plan) Str(s string) string { return p.str(s) }
+
+func (p *Plan) findNative() {
+	for _, c := range p.Info.Res.Crates {
+		if !c.IsStd {
+			continue
+		}
+		rt := c.Root.Lookup("rt", resolve.TypeNS)
+		if rt == nil || rt.Res.Def == nil {
+			return
+		}
+		if n := rt.Res.Def.Module.Lookup("native", resolve.TypeNS); n != nil && n.Res.Def != nil {
+			p.native = n.Res.Def.Module
+		}
+	}
+}
+
+func (p *Plan) nativeFn(name string) *resolve.Def {
+	if p.native == nil {
+		return nil
+	}
+	b := p.native.Lookup(name, resolve.ValueNS)
+	if b == nil || b.Res.Def == nil || p.Mir.Func(b.Res.Def) == nil {
+		return nil
+	}
+	return b.Res.Def
 }
 
 func argsKey(ts []*types.Type) string {
@@ -188,7 +243,7 @@ func (p *Plan) inst(def *resolve.Def, args []*types.Type, self *types.Type, f *m
 	if in := p.Insts[key]; in != nil {
 		return in
 	}
-	in := &Inst{Key: key, Func: f, Def: def, Self: self, Subst: map[*resolve.Def]*types.Type{},
+	in := &Inst{Key: key, Func: f, Def: def, Args: args, Self: self, Subst: map[*resolve.Def]*types.Type{},
 		targets: map[any]*Target{}, vtables: map[any]*Vtable{}}
 	if def != nil {
 		switch def.Kind {
@@ -311,7 +366,7 @@ func (p *Plan) static(d *resolve.Def) {
 	p.staticOK[d] = true
 	p.Statics = append(p.Statics, d)
 	if f := p.Mir.Func(d); f != nil {
-		p.inst(d, nil, nil, f)
+		p.StaticInit[d] = p.inst(d, nil, nil, f)
 	}
 }
 
@@ -350,6 +405,11 @@ func (p *Plan) resolve(in *Inst, ref *mir.FnRef) *Target {
 		return p.resolved(r, def, self, args)
 	}
 	if isIntrinsic(def) {
+		if !Inline[def.Name] {
+			if nd := p.nativeFn(def.Name); nd != nil {
+				return &Target{Kind: TInst, Inst: p.inst(nd, args, nil, p.Mir.Func(nd)), Def: nd}
+			}
+		}
 		return &Target{Kind: TIntrinsic, Intrinsic: def.Name, TypeArgs: args, Def: def}
 	}
 	if def.Kind == resolve.DefExternFn {
@@ -427,6 +487,15 @@ func (p *Plan) vtable(concrete, dyn *types.Type) *Vtable {
 func (p *Plan) shapeKey(in *Inst) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%p", in.Func)
+	// The type arguments' shapes (as Go does): generic code may depend on
+	// layouts that no local exposes, such as a field offset of S<T> reached
+	// through a pointer.
+	for _, a := range in.Args {
+		b.WriteString("<" + p.shape(a, 0))
+	}
+	if in.Self != nil {
+		b.WriteString("<self " + p.shape(in.Self, 0))
+	}
 	var walk func(f *mir.Func)
 	walk = func(f *mir.Func) {
 		for _, l := range f.Locals {
