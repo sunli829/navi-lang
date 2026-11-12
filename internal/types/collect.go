@@ -77,10 +77,12 @@ func Collect(res *resolve.Info, errs *diag.Sink) *Info {
 			c.derives(d)
 		case resolve.DefImpl:
 			c.checkImpl(d)
+			c.checkImplSigs(d)
 		case resolve.DefTrait:
 			c.checkTrait(d)
 		}
 	}
+	c.checkOverlap()
 	c.checkBodies()
 	return info
 }

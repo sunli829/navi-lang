@@ -145,6 +145,9 @@ func (fc *fnCtx) methodCall(x *syntax.MethodCallExpr, hint *Type) *Type {
 	if !p.def.Vis.AccessibleFrom(fc.module) {
 		fc.errorf(x.Name.NamePos, "method %s is private", x.Name.Value)
 	}
+	if st := fc.in.shallow(p.step); st.Kind == KDyn && p.trait != nil && !fc.c.dynCallable(p.def) {
+		fc.errorf(x.Name.NamePos, "method %s cannot be called on dyn %s: it is generic, takes self by value or mentions Self", x.Name.Value, st.Bounds[0].Trait.Name)
+	}
 	fs := fc.c.fnSig(p.def)
 	m := map[*resolve.Def]*Type{}
 	var args []*Type

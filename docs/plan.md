@@ -191,7 +191,7 @@ impl<T: Display> ToString for T {           // blanket impl
 - 固有 impl（`impl Point`）只能写在定义这个类型的 crate 里
 - trait impl 遵守孤儿规则：trait 或类型至少有一个是本 crate 定义的（同 Rust）
 - **impl 不允许重叠**；不支持特化、负 impl、auto trait
-- **trait 对象**：`&dyn Trait`，只有"对象安全"的 trait 才能用（规则同 Rust：方法不能带类型参数，也不能按值返回 `Self`）
+- **trait 对象**：`&dyn Trait`。navi 没有 `Sized`，所以规则和 Rust 稍有不同：任何 trait 都能做成 `dyn`，但只有"可经 dyn 调用"的方法进入 vtable——接收者是 `&self` / `&mut self`、没有自己的类型参数、参数和返回值里不出现 `Self`。其余方法（如 `Iterator::map`）不能通过 `dyn` 调用，效果等同 Rust 给它们加了 `where Self: Sized`。`dyn` 类型必须写出 trait 的全部关联类型（`dyn Iterator<Item = u8>`）
 - **没有 `Drop`**，资源释放用 `defer`（见 1.8）
 
 ### 1.6 泛型

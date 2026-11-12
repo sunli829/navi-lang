@@ -84,6 +84,7 @@ func (c *collector) lowerType(e *env, t syntax.Type) *Type {
 		if len(bounds) == 0 {
 			return ctx.Err
 		}
+		c.checkDyn(e.file, t.Pos(), bounds)
 		return ctx.Dyn(bounds)
 	case *syntax.ImplType:
 		return c.lowerImplTrait(e, t)
