@@ -342,7 +342,7 @@ select {
 - `Sender` / `Receiver` / `JoinHandle` 都是引用语义
 - `select` 是 navi 新增的关键字（Rust std 没有对应的东西）
 - 没有 `Send` / `Sync`：不做 auto trait，数据竞争由用户负责（同 Go）
-- **线程里的 panic 会结束整个进程**（同 Go），这和 Rust 不同：Rust 里只有那个线程结束，`join()` 返回 `Err`。navi 的 `join()` 保留 Rust 的签名 `-> thread::Result<T>`，等以后有了 `panic::catch_unwind` 才会真的返回 `Err`。这一条记进 `spec/std-diff.md`
+- **线程里的 panic 只结束这个线程**（同 Rust，M9 起）：`join()` 返回 `Err(PanicPayload)`。早先的版本里它会结束整个进程（同 Go）
 - `Mutex`、`RwLock`、`Condvar`、原子操作和定时器这一版不做
 - 不提供 `async` / `await`
 
@@ -350,7 +350,7 @@ select {
 
 - 可恢复的错误用 `Result<T, E>` 和 `?`；`Option<T>` 也可以用 `?`
 - ``panic(`bad value ${x}`)``：类型是 `!`，展开当前线程的栈并依次执行 `defer`；没有被捕获就打印栈回溯并结束进程
-- 捕获 panic 用 Rust 的 `std::panic::catch_unwind`（相当于 Go 的 recover），这一版不做
+- 捕获 panic 用 Rust 的 `std::panic::catch_unwind(f)`（相当于 Go 的 recover）：返回 `Result<R, PanicPayload>`，`f` 里的 `defer` 在返回 `Err` 之前都已执行；`resume_unwind(payload)` 重新抛出
 - 数组越界、除以零、debug 构建下的整数溢出、`unwrap()` 失败，都会 panic
 
 ## 1.13 模板字符串（字符串插值，JS 写法）

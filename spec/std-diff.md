@@ -40,7 +40,9 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | 集合（`Vec`、`String`、`HashMap` …）的赋值 | move | 拷贝句柄，两者共享同一个容器；要独立副本用 `.clone()` |
 | channel 模块 | 常用 `std::sync::mpsc`（单消费者） | `std::sync::mpmc`（`Receiver` 可以被多个线程共享） |
 | `thread::spawn` | 操作系统线程 | 绿色线程（M:N 调度） |
-| 线程里 panic | 只结束该线程，`join()` 返回 `Err` | 结束整个进程；`join()` 保留 `-> thread::Result<T>` 签名，等有了 `catch_unwind` 才会返回 `Err` |
+| 线程里 panic | 只结束该线程，`join()` 返回 `Err` | 相同（M9 起）。只有 native 后端；stage0 的解释器不捕获 panic，仍结束整个进程 |
+| panic 的载荷 | `Box<dyn Any + Send>`，通常装着消息 | `std::panic::PanicPayload`：`message()` 和 `location()`；`thread::Result<T> = Result<T, PanicPayload>` |
+| `catch_unwind` 的参数 | `F: FnOnce() -> R + UnwindSafe` | `fn() -> R`（没有 `UnwindSafe`）；被捕获的 panic 仍会先打印消息（同 Rust 的默认 hook） |
 | `&T` | 共享借用，保证期间没有人写 | 浅只读：只禁止通过这条路径直接写，不保证别人没在写（见 language.md 1.3） |
 
 ## 5. 暂时的差异（等对应的语言特性实现后消除）
@@ -56,7 +58,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `std::io::{print, println, eprint, eprintln}` | 代替 `print!` 系列宏，参数类型 `impl Display` |
 | `std::panic::{panic, assert, assert_eq, assert_ne}` | 代替对应的宏，带 `#[track_caller]` |
 | `Sender::close()` | 见第 3 节 |
-| `std::gc`（以后） | `collect()`、`Weak<T>`、finalizer 等 GC 语言特有的功能 |
+| `std::gc` | `collect()`、`stats()`、`set_min_heap(bytes)`（M9）；`Weak<T>`、finalizer 以后再做 |
 
 ## 5. M7 补充标准库时新增的偏离
 
