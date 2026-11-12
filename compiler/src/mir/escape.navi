@@ -1,0 +1,660 @@
+//! Escape analysis: finds the address-taken locals whose address never
+//! outlives the function's frame, so they need no heap cell.
+//!
+//! Within a function this is Steensgaard's points-to analysis: every
+//! local has a location node, every node (class) has one pointee class,
+//! assignments unify pointee classes (field-insensitively), and the heap,
+//! statics and anything unknown are one escaped class H whose pointee is
+//! itself. A local escapes if its location ends up in H, or is reachable
+//! from memory the function does not own (what its parameters, closure
+//! environment or result point to).
+//!
+//! Calls use per-function summaries, computed for all functions to a fixed
+//! point: for each parameter, the depth at which its pointee chain escapes,
+//! and which levels of parameter and result chains are unified (up to depth
+//! D). Trait and dyn calls merge the summaries of every impl of the method
+//! (plus a conservative shape for builtin and derived impls); calls of
+//! closures, extern functions and unknown intrinsics escape everything.
+//!
+//! A local declared inside a loop is a new variable in every iteration; if
+//! its address is reachable from a named variable or argument (which could
+//! carry it into a later iteration), it keeps its heap cell.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Node};
+use crate::syntax::ast::Item;
+use crate::types::{self, Type};
+use crate::types::collect::{Info, has_attr};
+use crate::mir::*;
+
+const D: usize = 3;
+
+/// The effect of a call on its arguments and result: esc[k] is the depth
+/// (1..=D) from which chain k escapes (0: never; chain n is the result);
+/// pairs unify level d of chain a with level e of chain b.
+#[derive(Clone)]
+struct Summary {
+    esc: Vec<u8>,
+    pairs: Vec<(u8, u8, u8, u8)>,
+}
+
+fn empty_summary(nargs: usize) -> Summary {
+    let mut esc = Vec::new();
+    let mut i = 0;
+    while i <= nargs { esc.push(0u8); i += 1; }
+    Summary { esc, pairs: Vec::new() }
+}
+
+fn summary_eq(a: &Summary, b: &Summary) -> bool {
+    if a.esc != b.esc || a.pairs.len() != b.pairs.len() { return false; }
+    let mut i = 0;
+    while i < a.pairs.len() {
+        if a.pairs[i] != b.pairs[i] { return false; }
+        i += 1;
+    }
+    true
+}
+
+/// The union-find points-to graph of one function.
+struct Graph {
+    parent: Vec<usize>,
+    pt: Vec<i64>,
+    escaped: Vec<bool>,
+    h: usize,
+}
+
+fn new_graph(nlocals: usize) -> &mut Graph {
+    let g = &mut Graph { parent: Vec::new(), pt: Vec::new(), escaped: Vec::new(), h: 0 };
+    let mut i = 0;
+    while i <= nlocals {
+        g.parent.push(i);
+        g.pt.push(-1);
+        g.escaped.push(false);
+        i += 1;
+    }
+    // Node nlocals is H: escaped, pointing to itself.
+    g.h = nlocals;
+    g.escaped[nlocals] = true;
+    g.pt[nlocals] = nlocals as i64;
+    g
+}
+
+impl Graph {
+    fn find(&mut self, x: usize) -> usize {
+        let mut r = x;
+        while self.parent[r] != r { r = self.parent[r]; }
+        let mut y = x;
+        while self.parent[y] != r {
+            let n = self.parent[y];
+            self.parent[y] = r;
+            y = n;
+        }
+        r
+    }
+
+    fn new_node(&mut self) -> usize {
+        let n = self.parent.len();
+        self.parent.push(n);
+        self.pt.push(-1);
+        self.escaped.push(false);
+        n
+    }
+
+    /// The pointee class of x (created on first use).
+    fn deref(&mut self, x: usize) -> usize {
+        let r = self.find(x);
+        if self.pt[r] < 0 {
+            let n = self.new_node();
+            self.pt[r] = n as i64;
+        }
+        let p = self.pt[r] as usize;
+        self.find(p)
+    }
+
+    /// The pointee of x if it has one.
+    fn pointee(&mut self, x: usize) -> Option<usize> {
+        let r = self.find(x);
+        if self.pt[r] < 0 { return None; }
+        let p = self.pt[r] as usize;
+        Some(self.find(p))
+    }
+
+    /// Unifies two classes and, recursively, their pointees.
+    fn join(&mut self, a0: usize, b0: usize) {
+        let mut work: Vec<(usize, usize)> = Vec::new();
+        work.push((a0, b0));
+        while work.len() > 0 {
+            let (a, b) = work.pop().unwrap();
+            let ra = self.find(a);
+            let rb = self.find(b);
+            if ra == rb { continue; }
+            // Keep H as the root.
+            let (keep, gone) = if rb == self.h { (rb, ra) } else { (ra, rb) };
+            self.parent[gone] = keep;
+            if self.escaped[gone] { self.escaped[keep] = true; }
+            let pk = self.pt[keep];
+            let pg = self.pt[gone];
+            if pk < 0 {
+                self.pt[keep] = pg;
+            } else if pg >= 0 {
+                work.push((pk as usize, pg as usize));
+            }
+        }
+    }
+
+    /// Level d (1 = what x points to) of the chain from x.
+    fn level(&mut self, x: usize, d: usize) -> usize {
+        let mut n = x;
+        let mut i = 0;
+        while i < d {
+            n = self.deref(n);
+            i += 1;
+        }
+        n
+    }
+}
+
+fn first_param(f: &Func) -> usize { if f.closure { 2 } else { 1 } }
+
+/// Intrinsics that keep no pointer: some return pointers into what
+/// argument 0 points to.
+fn intrinsic_summary(name: &str, nargs: usize) -> Option<Summary> {
+    let n = name;
+    let mut s = empty_summary(nargs);
+    if n == "ptr_offset" || n == "slice_from_raw" || n == "slice_from_raw_mut" || n == "str_from_raw" || n == "slice_ptr"
+        || n == "str_as_bytes" {
+        let mut d = 1;
+        while d <= D {
+            s.pairs.push((0, d as u8, nargs as u8, d as u8));
+            d += 1;
+        }
+        return Some(s);
+    }
+    if n == "size_of" || n == "align_of" || n == "slice_len" || n == "wrapping_add" || n == "wrapping_sub" || n == "wrapping_mul"
+        || n == "has_pointers" || n == "write" || n == "fmt_float" || n == "float_op" || n == "monotonic_nanos" {
+        return Some(s);
+    }
+    None
+}
+
+/// The conservative shape of builtin and derived impls of a lang trait's
+/// methods.
+fn builtin_pairs(trait_name: &str, s: &mut Summary, nargs: usize) {
+    let t = trait_name;
+    let r = nargs as u8;
+    if t == "Clone" || t == "Deref" || t == "DerefMut" {
+        // The result is (a copy of) what self points to.
+        let mut d = 2;
+        while d <= D {
+            s.pairs.push((0, d as u8, r, (d - 1) as u8));
+            d += 1;
+        }
+    } else if t == "Index" || t == "IndexMut" {
+        let mut d = 1;
+        while d <= D {
+            s.pairs.push((0, d as u8, r, d as u8));
+            d += 1;
+        }
+    }
+}
+
+struct Escape {
+    summaries: HashMap<u32, Summary>,
+    by_def: HashMap<u32, &mut Func>,
+    impls: HashMap<String, Vec<&mut Func>>,
+    lang_of: HashMap<u32, String>,
+    changed: bool,
+}
+
+fn unknown_summary(nargs: usize) -> Summary {
+    let mut s = empty_summary(nargs);
+    let mut k = 0;
+    while k <= nargs {
+        s.esc[k] = 1;
+        k += 1;
+    }
+    s
+}
+
+fn merge(s: &mut Summary, t: Summary) {
+    let mut k = 0;
+    while k < s.esc.len() && k < t.esc.len() {
+        if t.esc[k] != 0 && (s.esc[k] == 0 || t.esc[k] < s.esc[k]) { s.esc[k] = t.esc[k]; }
+        k += 1;
+    }
+    for p in t.pairs.iter() {
+        if !s.pairs.contains(p) { s.pairs.push(*p); }
+    }
+}
+
+impl Escape {
+    /// The summary of a call through fn_op with nargs arguments (None:
+    /// unknown callee).
+    fn callee(&self, fn_op: &Operand, nargs: usize) -> Option<Summary> {
+        if fn_op.kind != OP_CONST { return None; }
+        let c = fn_op.cnst.unwrap();
+        if c.kind != C_FN { return None; }
+        let r = c.fn_ref.unwrap();
+        if r.closure.is_some() { return None; }
+        if r.ctor {
+            // The result holds the arguments.
+            let mut s = empty_summary(nargs);
+            let mut k = 0;
+            while k < nargs {
+                let mut d = 1;
+                while d <= D {
+                    s.pairs.push((k as u8, d as u8, nargs as u8, d as u8));
+                    d += 1;
+                }
+                k += 1;
+            }
+            return Some(s);
+        }
+        let d = r.def?;
+        if let Node::Item(Item::Fn(fd)) = &d.node {
+            if has_attr(&fd.base.attrs, "intrinsic") { return intrinsic_summary(d.name.as_str(), nargs); }
+        }
+        if d.kind == resolve::DEF_EXTERN_FN { return None; }
+        let in_trait = match d.parent { Some(p) => p.kind == resolve::DEF_TRAIT, None => false };
+        if in_trait {
+            let p = d.parent.unwrap();
+            let mut s = empty_summary(nargs);
+            if let Some(ln) = self.lang_of.get(&p.id) { builtin_pairs(ln.as_str(), &mut s, nargs); }
+            let key = `${p.id}.${d.name}`;
+            if let Some(fs) = self.impls.get(&key) {
+                for f in fs.iter() { merge(&mut s, self.summary_of(*f, nargs)); }
+            }
+            return Some(s);
+        }
+        match self.by_def.get(&d.id) {
+            Some(f) => Some(self.summary_of(*f, nargs)),
+            None => None,
+        }
+    }
+
+    fn summary_of(&self, f: &Func, nargs: usize) -> Summary {
+        match self.summaries.get(&f.id) {
+            Some(s) => if s.esc.len() == nargs + 1 { s.clone() } else { unknown_summary(nargs) },
+            None => empty_summary(nargs),
+        }
+    }
+
+    /// Builds the points-to graph of f.
+    fn graph(&self, f: &Func) -> &mut Graph {
+        let n = f.locals.len();
+        let g = new_graph(n);
+        for b in f.blocks.iter() {
+            for s in b.stmts.iter() {
+                match s {
+                    Stmt::Assign { place, rv } => {
+                        let dl = loc(g, place);
+                        let dv = g.deref(dl);
+                        match rv {
+                            Rvalue::Use(x) | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => flow(g, dv, x),
+                            Rvalue::Ref { place: p, .. } => {
+                                let l = loc(g, p);
+                                g.join(dv, l);
+                            }
+                            Rvalue::Bin { op, x, y, .. } => {
+                                if *op == OFFSET {
+                                    flow(g, dv, x);
+                                    flow(g, dv, y);
+                                }
+                            }
+                            Rvalue::Aggregate { ops, closure, .. } => {
+                                if closure.is_some() {
+                                    for o in ops.iter() { escape_op(g, o); }
+                                    let h = g.h;
+                                    g.join(dv, h);
+                                } else {
+                                    for o in ops.iter() { flow(g, dv, o); }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Stmt::Box { local, .. } => {
+                        let p = g.deref(*local);
+                        let h = g.h;
+                        g.join(p, h);
+                    }
+                    Stmt::PushDefer { fn_op, args } => {
+                        escape_op(g, fn_op);
+                        for a in args.iter() { escape_op(g, a); }
+                    }
+                    _ => {}
+                }
+            }
+            if let Term::Call { fn_op, args, dest, .. } = &b.term {
+                match self.callee(fn_op, args.len()) {
+                    None => {
+                        for a in args.iter() { escape_op(g, a); }
+                        let dl = loc(g, dest);
+                        let dv = g.deref(dl);
+                        let h = g.h;
+                        g.join(dv, h);
+                    }
+                    Some(s) => apply(g, &s, args, dest),
+                }
+            }
+        }
+        g
+    }
+
+    /// Recomputes the summary of f.
+    fn summarize(&mut self, f: &Func) {
+        let g = self.graph(f);
+        let mut roots: Vec<usize> = Vec::new();
+        let mut i = first_param(f);
+        while i <= f.nargs {
+            roots.push(i);
+            i += 1;
+        }
+        roots.push(0);
+        let nargs = roots.len() - 1;
+        let mut s = empty_summary(nargs);
+        let mut chains: Vec<Vec<usize>> = Vec::new();
+        for r in roots.iter() {
+            let mut c = Vec::new();
+            let mut d = 1;
+            while d <= D {
+                c.push(g.level(*r, d));
+                d += 1;
+            }
+            chains.push(c);
+        }
+        let mut k = 0;
+        while k < chains.len() {
+            let mut d = 0;
+            while d < D {
+                let r = g.find(chains[k][d]);
+                if g.escaped[r] && s.esc[k] == 0 { s.esc[k] = (d + 1) as u8; }
+                d += 1;
+            }
+            k += 1;
+        }
+        // Unified levels between different chains.
+        let mut a = 0;
+        while a < chains.len() {
+            let mut b = a + 1;
+            while b < chains.len() {
+                let mut d = 0;
+                while d < D {
+                    let mut e = 0;
+                    while e < D {
+                        let ca = g.find(chains[a][d]);
+                        let cb = g.find(chains[b][e]);
+                        if ca == cb && !g.escaped[ca] { s.pairs.push((a as u8, (d + 1) as u8, b as u8, (e + 1) as u8)); }
+                        e += 1;
+                    }
+                    d += 1;
+                }
+                b += 1;
+            }
+            a += 1;
+        }
+        let same = match self.summaries.get(&f.id) { Some(o) => summary_eq(o, &s), None => false };
+        if !same {
+            self.summaries.insert(f.id, s);
+            self.changed = true;
+        }
+    }
+
+    /// The locals of f whose address may stay in the frame.
+    fn keep(&self, f: &Func) -> Vec<bool> {
+        let g = self.graph(f);
+        let n = f.locals.len();
+        // Memory f does not own: reachable from what its parameters, closure
+        // environment and result point to.
+        let mut external: HashMap<usize, bool> = HashMap::new();
+        let mut work: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i <= f.nargs && i < n {
+            if let Some(p) = g.pointee(i) { work.push(p); }
+            i += 1;
+        }
+        while work.len() > 0 {
+            let x = work.pop().unwrap();
+            let r = g.find(x);
+            if external.contains_key(&r) { continue; }
+            external.insert(r, true);
+            if let Some(p) = g.pointee(r) { work.push(p); }
+        }
+        let in_loop = loop_blocks(f);
+        let mut decl_block: Vec<i64> = Vec::new();
+        i = 0;
+        while i < n { decl_block.push(-1); i += 1; }
+        let mut bi = 0;
+        while bi < f.blocks.len() {
+            for s in f.blocks[bi].stmts.iter() {
+                if let Stmt::StorageLive(l) = s { decl_block[*l] = bi as i64; }
+            }
+            bi += 1;
+        }
+        let mut out: Vec<bool> = Vec::new();
+        i = 0;
+        while i < n {
+            let r = g.find(i);
+            let mut ok = !g.escaped[r] && !external.contains_key(&r);
+            if ok && decl_block[i] >= 0 && in_loop[decl_block[i] as usize] {
+                // Reachable from another named variable or an argument?
+                let mut j = 0;
+                while j < n && ok {
+                    if j != i && (j <= f.nargs || f.locals[j].name.len() > 0) {
+                        if reaches(g, j, r) { ok = false; }
+                    }
+                    j += 1;
+                }
+            }
+            out.push(ok);
+            i += 1;
+        }
+        out
+    }
+}
+
+/// Whether the class target is reachable through pointees from local x's
+/// value.
+fn reaches(g: &mut Graph, x: usize, target: usize) -> bool {
+    let mut seen: HashMap<usize, bool> = HashMap::new();
+    let mut cur = g.pointee(x);
+    while let Some(c) = cur {
+        let r = g.find(c);
+        if r == target { return true; }
+        if seen.contains_key(&r) { return false; }
+        seen.insert(r, true);
+        cur = g.pointee(r);
+    }
+    false
+}
+
+/// The location node of a place (field-insensitive: only derefs move).
+fn loc(g: &mut Graph, p: &Place) -> usize {
+    let mut n = p.local;
+    for pr in p.proj.iter() {
+        if pr.kind == P_DEREF { n = g.deref(n); }
+    }
+    g.find(n)
+}
+
+/// The value of operand x flows into a value whose pointee is dv.
+fn flow(g: &mut Graph, dv: usize, x: &Operand) {
+    if x.kind == OP_COPY {
+        let l = loc(g, &x.place);
+        let p = g.deref(l);
+        g.join(dv, p);
+        return;
+    }
+    let c = x.cnst.unwrap();
+    if c.kind == C_STATIC || c.kind == C_STR || c.kind == C_BYTES || c.kind == C_FN {
+        let h = g.h;
+        g.join(dv, h);
+    }
+}
+
+fn escape_op(g: &mut Graph, x: &Operand) {
+    if x.kind == OP_COPY {
+        let l = loc(g, &x.place);
+        let p = g.deref(l);
+        let h = g.h;
+        g.join(p, h);
+    }
+}
+
+/// Applies a callee summary at a call.
+fn apply(g: &mut Graph, s: &Summary, args: &Vec<Operand>, dest: &Place) {
+    let n = args.len();
+    // The chain roots: each argument's value and the result.
+    let mut nodes: Vec<i64> = Vec::new();
+    for a in args.iter() {
+        if a.kind == OP_COPY {
+            let l = loc(g, &a.place);
+            nodes.push(l as i64);
+        } else {
+            nodes.push(-1);
+        }
+    }
+    let dl = loc(g, dest);
+    nodes.push(dl as i64);
+    let mut k = 0;
+    while k <= n {
+        if nodes[k] >= 0 && k < s.esc.len() && s.esc[k] != 0 {
+            let x = g.level(nodes[k] as usize, s.esc[k] as usize);
+            let h = g.h;
+            g.join(x, h);
+        }
+        k += 1;
+    }
+    for p in s.pairs.iter() {
+        let (a, d, b, e) = *p;
+        if (a as usize) <= n && (b as usize) <= n && nodes[a as usize] >= 0 && nodes[b as usize] >= 0 {
+            let x = g.level(nodes[a as usize] as usize, d as usize);
+            let y = g.level(nodes[b as usize] as usize, e as usize);
+            g.join(x, y);
+        }
+    }
+}
+
+fn successors(t: &Term) -> Vec<usize> {
+    let mut out = Vec::new();
+    match t {
+        Term::Goto(b) => out.push(*b),
+        Term::Switch { targets, els, .. } => {
+            for b in targets.iter() { out.push(*b); }
+            out.push(*els);
+        }
+        Term::Call { target, .. } => { if *target >= 0 { out.push(*target as usize); } }
+        Term::Assert { target, .. } => out.push(*target),
+        _ => {}
+    }
+    out
+}
+
+/// Which blocks lie on a cycle of the control flow graph (Tarjan).
+fn loop_blocks(f: &Func) -> Vec<bool> {
+    let n = f.blocks.len();
+    let mut succ: Vec<Vec<usize>> = Vec::new();
+    for b in f.blocks.iter() { succ.push(successors(&b.term)); }
+    let mut index: Vec<i64> = Vec::new();
+    let mut low: Vec<i64> = Vec::new();
+    let mut on_stack: Vec<bool> = Vec::new();
+    let mut out: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        index.push(-1);
+        low.push(0);
+        on_stack.push(false);
+        out.push(false);
+        i += 1;
+    }
+    let mut next_index = 0i64;
+    let mut stack: Vec<usize> = Vec::new();
+    let mut root = 0;
+    while root < n {
+        if index[root] >= 0 {
+            root += 1;
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = Vec::new();
+        work.push((root, 0));
+        index[root] = next_index;
+        low[root] = next_index;
+        next_index += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while work.len() > 0 {
+            let top = work.len() - 1;
+            let (v, k) = work[top];
+            if k < succ[v].len() {
+                work[top] = (v, k + 1);
+                let w = succ[v][k];
+                if index[w] < 0 {
+                    index[w] = next_index;
+                    low[w] = next_index;
+                    next_index += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    if index[w] < low[v] { low[v] = index[w]; }
+                }
+                continue;
+            }
+            work.pop();
+            if work.len() > 0 {
+                let u = work[work.len() - 1].0;
+                if low[v] < low[u] { low[u] = low[v]; }
+            }
+            if low[v] == index[v] {
+                let mut members: Vec<usize> = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    members.push(w);
+                    if w == v { break; }
+                }
+                let cyclic = members.len() > 1 || succ[v].contains(&v);
+                if cyclic { for m in members.iter() { out[*m] = true; } }
+            }
+        }
+        root += 1;
+    }
+    out
+}
+
+/// Runs the analysis over all functions and returns, per function id, the
+/// locals whose address may stay in the frame.
+pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<bool>> {
+    let e = &mut Escape { summaries: HashMap::new(), by_def: HashMap::new(), impls: HashMap::new(), lang_of: HashMap::new(), changed: true };
+    for (name, d) in info.lang.iter() { e.lang_of.insert(d.id, name.clone()); }
+    for f in funcs.iter() {
+        if let Some(d) = f.def {
+            e.by_def.insert(d.id, *f);
+            if let Some(p) = d.parent {
+                // Trait impl methods and trait default bodies.
+                let mut trait_id: i64 = -1;
+                if p.kind == resolve::DEF_TRAIT { trait_id = p.id as i64; }
+                if p.kind == resolve::DEF_IMPL {
+                    if let Some(ii) = info.impls.get(&p.id) {
+                        if let Some(tr) = ii.trait_ref { trait_id = tr.trait_def().id as i64; }
+                    }
+                }
+                if trait_id >= 0 {
+                    let key = `${trait_id}.${d.name}`;
+                    if !e.impls.contains_key(&key) { e.impls.insert(key.clone(), Vec::new()); }
+                    let mut list = e.impls[&key];
+                    list.push(*f);
+                }
+            }
+        }
+    }
+    let mut rounds = 0;
+    while e.changed && rounds < 30 {
+        e.changed = false;
+        for f in funcs.iter() { e.summarize(*f); }
+        rounds += 1;
+    }
+    let mut keep: HashMap<u32, Vec<bool>> = HashMap::new();
+    for f in funcs.iter() { keep.insert(f.id, e.keep(*f)); }
+    keep
+}
