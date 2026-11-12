@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"syscall"
 
 	"navi/internal/build"
 	"navi/internal/interp"
 	"navi/internal/mir"
 	"navi/internal/resolve"
 	"navi/internal/syntax"
+	"navi/internal/types"
 )
 
 const version = "0.0.0-m0"
@@ -20,8 +24,8 @@ const usage = `usage: navi <command> [arguments]
 
 commands:
   build     compile a crate into a native binary
-  run       run a crate (with the MIR interpreter until native code
-            generation lands)
+  run       build and run a crate (--interp: run it on the MIR
+            interpreter instead)
   check     check a crate for errors without generating code
             (currently: syntax and name resolution)
   test      build and run #[test] functions
@@ -147,8 +151,11 @@ func dumpMIR(paths []string, stdout, stderr io.Writer) int {
 // interpreter.
 func runCrate(args []string, stdout, stderr io.Writer) int {
 	var paths []string
+	useInterp := !build.NativeSupported()
 	for _, a := range args {
-		if a != "--interp" {
+		if a == "--interp" {
+			useInterp = true
+		} else {
 			paths = append(paths, a)
 		}
 	}
@@ -179,9 +186,41 @@ func runCrate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%s: no main function\n", paths[0])
 		return 1
 	}
+	if !useInterp {
+		return runNative(info, main, stdout, stderr)
+	}
 	m := interp.New(mir.Build(info))
 	m.Stdout, m.Stderr = stdout, stderr
 	return m.Run(main)
+}
+
+// runNative builds a temporary executable and runs it.
+func runNative(info *types.Info, main *resolve.Def, stdout, stderr io.Writer) int {
+	dir, err := os.MkdirTemp("", "navi-run")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer os.RemoveAll(dir)
+	exe := filepath.Join(dir, "main")
+	if err := build.Native(info, main, exe, true); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	cmd := exec.Command(exe)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				fmt.Fprintf(stderr, "navi run: program killed by %v\n", ws.Signal())
+				return 128 + int(ws.Signal())
+			}
+			return ee.ExitCode()
+		}
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
 // buildCrate compiles a crate into a native executable.

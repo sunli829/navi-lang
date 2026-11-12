@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -342,7 +343,11 @@ func (t *thread) exec(fr *frame) {
 // panic starts a navi panic with the current position.
 func (t *thread) panic(fr *frame, msg string) {
 	loc := "<unknown>"
-	if fr.fn.File != nil {
+	if fr.fn.Shim {
+		// Compiler-generated impls report their caller (#[track_caller]).
+		l := t.callerLocation()
+		loc = t.m.readStr(val{b: l.b[:16], ptrs: l.ptrs}) + ":" + strconv.FormatUint(uint64(readInt(l.b[16:20], 4, false)), 10) + ":" + strconv.FormatUint(uint64(readInt(l.b[20:24], 4, false)), 10)
+	} else if fr.fn.File != nil {
 		loc = fr.fn.File.Position(fr.pos).String()
 	}
 	panic(navPanic{msg: loc + ":\n" + msg})
@@ -550,9 +555,15 @@ func (t *thread) rvalue(fr *frame, rv mir.Rvalue, dt *types.Type) val {
 		}
 		return ptrVal(p)
 	case mir.Bin:
+		if r.Pos != 0 {
+			fr.pos = r.Pos
+		}
 		ty := fr.inst.concrete(m, r.Type)
 		return t.binop(fr, r.Op, t.operand(fr, r.X), t.operand(fr, r.Y), ty)
 	case mir.Un:
+		if r.Pos != 0 {
+			fr.pos = r.Pos
+		}
 		ty := fr.inst.concrete(m, r.Type)
 		x := t.operand(fr, r.X)
 		switch ty.Kind {

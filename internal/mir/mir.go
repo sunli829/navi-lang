@@ -203,17 +203,20 @@ type (
 		Mut   bool
 		Place Place
 	}
-	// Bin is a primitive binary operation on X and Y of type Type.
+	// Bin is a primitive binary operation on X and Y of type Type. Pos is
+	// the operator, for overflow panics.
 	Bin struct {
 		Op   BinOp
 		X, Y Operand
 		Type *types.Type // operand type
+		Pos  syntax.Pos
 	}
 	// Un is a primitive unary operation.
 	Un struct {
 		Op   UnOp
 		X    Operand
 		Type *types.Type
+		Pos  syntax.Pos
 	}
 	// Cast converts X to To.
 	Cast struct {

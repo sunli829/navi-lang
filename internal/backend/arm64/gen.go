@@ -398,7 +398,7 @@ type fnGen struct {
 	loff   []int64 // x29-relative offsets of locals
 	// heap marks locals whose address is taken: they live in a heap cell
 	// whose pointer is in the frame slot (M3 has no escape analysis).
-	heap []bool
+	heap   []bool
 	blocks []Label
 	resOff int64 // call result buffer
 	tmpOff int64 // aggregate buffer
@@ -1153,21 +1153,42 @@ func (f *fnGen) panicStub(msg string, pos syntax.Pos) Label {
 	return l
 }
 
-// callPanic calls panic_raw(msg, file, line, col).
+// callPanic calls panic_raw(msg, file, line, col). Compiler-generated
+// impls report their caller's location.
 func (f *fnGen) callPanic(msg string, pos syntax.Pos) {
 	a := f.a
-	file, line, col := "<unknown>", 0, 0
-	if f.f.File != nil {
-		ps := f.f.File.Position(pos)
-		file, line, col = ps.File, ps.Line, ps.Col
-	}
 	a.AdrSym(X12, f.g.p.Str(msg))
 	a.Str(8, X12, SP, 0)
 	a.MovImm(X12, int64(len(msg)))
 	a.Str(8, X12, SP, 8)
-	f.storeFileLine(16, file, line, col)
+	if f.f.Shim {
+		f.storeCallerLoc(16)
+	} else {
+		file, line, col := "<unknown>", 0, 0
+		if f.f.File != nil {
+			ps := f.f.File.Position(pos)
+			file, line, col = ps.File, ps.Line, ps.Col
+		}
+		f.storeFileLine(16, file, line, col)
+	}
 	f.callRuntime("panic_raw")
 	a.Brk(1)
+}
+
+// storeCallerLoc writes the received caller location as (file, line,
+// col) arguments at sp+off.
+func (f *fnGen) storeCallerLoc(off int64) {
+	a := f.a
+	ll := f.g.lay.Of(f.g.p.Info.Ctx.Adt(f.g.p.Info.Lang["Location"], nil))
+	a.Ldr(8, X15, FP, slotLoc)
+	a.Ldr(8, X12, X15, ll.Fields[0])
+	a.Str(8, X12, SP, off)
+	a.Ldr(8, X12, X15, ll.Fields[0]+8)
+	a.Str(8, X12, SP, off+8)
+	a.Ldr(4, X12, X15, ll.Fields[1])
+	a.Str(4, X12, SP, off+16)
+	a.Ldr(4, X12, X15, ll.Fields[2])
+	a.Str(4, X12, SP, off+24)
 }
 
 func (f *fnGen) storeFileLine(off int64, file string, line, col int) {
@@ -1228,7 +1249,8 @@ func (f *fnGen) binop(r mir.Bin) {
 		}
 	}
 	dbg := f.g.opts.Debug
-	ovf := func(what string) Label { return f.panicStub("attempt to "+what+" with overflow", noPos) }
+	pos := r.Pos
+	ovf := func(what string) Label { return f.panicStub("attempt to "+what+" with overflow", pos) }
 	switch r.Op {
 	case mir.Add, mir.Sub:
 		what := "add"
@@ -1278,14 +1300,14 @@ func (f *fnGen) binop(r mir.Bin) {
 			f.checkRange(size, signed, ovf("multiply"))
 		}
 	case mir.Div, mir.Rem:
-		a.Cbz(X13, f.panicStub("attempt to divide by zero", noPos))
+		a.Cbz(X13, f.panicStub("attempt to divide by zero", pos))
 		if signed {
 			skip := a.NewLabel()
 			a.CmnImm(X13, 1)
 			a.BCond(NE, skip)
 			a.MovImm(X14, intMin(size))
 			a.Cmp(X12, X14)
-			a.BCond(EQ, f.panicStub("attempt to divide with overflow", noPos))
+			a.BCond(EQ, f.panicStub("attempt to divide with overflow", pos))
 			a.Bind(skip)
 			a.Sdiv(X14, X12, X13)
 		} else {
@@ -1300,7 +1322,7 @@ func (f *fnGen) binop(r mir.Bin) {
 		_ = yt
 		if dbg || true {
 			a.CmpImm(X13, size*8)
-			a.BCond(HS, f.panicStub("attempt to shift with overflow", noPos))
+			a.BCond(HS, f.panicStub("attempt to shift with overflow", pos))
 		}
 		switch {
 		case r.Op == mir.Shl:
@@ -1388,7 +1410,7 @@ func (f *fnGen) unop(r mir.Un) {
 			a.SignExt(X12, X12, size)
 			a.MovImm(X14, intMin(size))
 			a.Cmp(X12, X14)
-			a.BCond(EQ, f.panicStub("attempt to negate with overflow", noPos))
+			a.BCond(EQ, f.panicStub("attempt to negate with overflow", r.Pos))
 		}
 		a.Sub(X12, ZR, X12)
 	}

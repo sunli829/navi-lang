@@ -451,7 +451,7 @@ func (b *builder) unary(x *syntax.UnaryExpr, dest Place) {
 		}
 		v := b.operand(x.X)
 		if isPrim(t) {
-			b.assign(dest, Un{Op: op, X: v, Type: t})
+			b.assign(dest, Un{Op: op, X: v, Type: t, Pos: x.OpPos})
 			return
 		}
 		b.call(b.traitFn(b.info.TraitItem(trait, method), t, nil), []Operand{v}, dest, x.OpPos)
@@ -534,7 +534,7 @@ func (b *builder) primBin(op BinOp, l, r Operand, t *types.Type, dest Place, pos
 		b.terminate(Assert{Cond: Copy(nz), Msg: "attempt to divide by zero", Target: next, Pos: pos})
 		b.cur = next
 	}
-	b.assign(dest, Bin{Op: op, X: l, Y: r, Type: t})
+	b.assign(dest, Bin{Op: op, X: l, Y: r, Type: t, Pos: pos})
 }
 
 // refTo stores an operand in a temporary and returns a reference to it.

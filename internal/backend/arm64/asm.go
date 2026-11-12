@@ -442,7 +442,15 @@ func (a *Asm) FcvtSD(rd, rn Reg) { a.emit(0x1E624000 | uint32(rn)<<5 | uint32(rd
 
 // Scvtf/Ucvtf convert a 64-bit integer to float; Fcvtzs/Fcvtzu convert
 // a float to a 64-bit integer (saturating, NaN to 0).
-func (a *Asm) Scvtf(rd, rn Reg, f64 bool)  { a.emit(0x9E220000 | ftype(f64) | uint32(rn)<<5 | uint32(rd)) }
-func (a *Asm) Ucvtf(rd, rn Reg, f64 bool)  { a.emit(0x9E230000 | ftype(f64) | uint32(rn)<<5 | uint32(rd)) }
-func (a *Asm) Fcvtzs(rd, rn Reg, f64 bool) { a.emit(0x9E380000 | ftype(f64) | uint32(rn)<<5 | uint32(rd)) }
-func (a *Asm) Fcvtzu(rd, rn Reg, f64 bool) { a.emit(0x9E390000 | ftype(f64) | uint32(rn)<<5 | uint32(rd)) }
+func (a *Asm) Scvtf(rd, rn Reg, f64 bool) {
+	a.emit(0x9E220000 | ftype(f64) | uint32(rn)<<5 | uint32(rd))
+}
+func (a *Asm) Ucvtf(rd, rn Reg, f64 bool) {
+	a.emit(0x9E230000 | ftype(f64) | uint32(rn)<<5 | uint32(rd))
+}
+func (a *Asm) Fcvtzs(rd, rn Reg, f64 bool) {
+	a.emit(0x9E380000 | ftype(f64) | uint32(rn)<<5 | uint32(rd))
+}
+func (a *Asm) Fcvtzu(rd, rn Reg, f64 bool) {
+	a.emit(0x9E390000 | ftype(f64) | uint32(rn)<<5 | uint32(rd))
+}
