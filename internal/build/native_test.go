@@ -17,7 +17,16 @@ import (
 // and compares its output with the // out: lines (the same expectations
 // the interpreter is held to).
 func TestNativeRun(t *testing.T) {
-	if !NativeSupported() {
+	// NAVI_TEST_TARGET selects another target the host can run (for
+	// example macos-x64 under Rosetta).
+	target := HostTarget()
+	if name := os.Getenv("NAVI_TEST_TARGET"); name != "" {
+		tt, err := ParseTarget(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target = tt
+	} else if !NativeSupported() {
 		t.Skip("native code generation is not available on this host")
 	}
 	files, _ := filepath.Glob(filepath.Join("..", "..", "tests", "run", "*.navi"))
@@ -46,12 +55,12 @@ func TestNativeRun(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			info, errs := CheckSpecs(HostConfig(), []*resolve.CrateSpec{StdCrate(), spec})
+			info, errs := CheckSpecs(target.Config(true), []*resolve.CrateSpec{StdCrate(), spec})
 			if len(errs) > 0 {
 				t.Fatalf("compile errors:\n%v", errs)
 			}
 			exe := filepath.Join(t.TempDir(), "prog")
-			if err := Native(info, FindMain(info, spec.Name), exe, true); err != nil {
+			if err := Native(info, FindMain(info, spec.Name), exe, target, true); err != nil {
 				t.Fatal(err)
 			}
 			cmd := exec.Command("perl", "-e", "alarm 10; exec @ARGV", exe)

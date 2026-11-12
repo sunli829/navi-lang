@@ -203,7 +203,7 @@ func runNative(info *types.Info, main *resolve.Def, stdout, stderr io.Writer) in
 	}
 	defer os.RemoveAll(dir)
 	exe := filepath.Join(dir, "main")
-	if err := build.Native(info, main, exe, true); err != nil {
+	if err := build.Native(info, main, exe, build.HostTarget(), true); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -226,7 +226,8 @@ func runNative(info *types.Info, main *resolve.Def, stdout, stderr io.Writer) in
 // buildCrate compiles a crate into a native executable.
 func buildCrate(args []string, stdout, stderr io.Writer) int {
 	out := ""
-	release := false
+	release, objOnly := false, false
+	target := build.HostTarget()
 	var paths []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -237,12 +238,24 @@ func buildCrate(args []string, stdout, stderr io.Writer) int {
 			}
 		case "--release":
 			release = true
+		case "-c":
+			objOnly = true
+		case "--target":
+			if i+1 < len(args) {
+				t, err := build.ParseTarget(args[i+1])
+				if err != nil {
+					fmt.Fprintln(stderr, err)
+					return 2
+				}
+				target = t
+				i++
+			}
 		default:
 			paths = append(paths, args[i])
 		}
 	}
 	if len(paths) != 1 {
-		fmt.Fprintln(stderr, "usage: navi build [-o output] [--release] <crate or file>")
+		fmt.Fprintln(stderr, "usage: navi build [-o output] [--release] [--target name] [-c] <crate or file>")
 		return 2
 	}
 	spec, err := build.LoadCrate(paths[0])
@@ -250,9 +263,7 @@ func buildCrate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	cfg := build.HostConfig()
-	cfg.Debug = !release
-	info, errs := build.CheckSpecs(cfg, []*resolve.CrateSpec{build.StdCrate(), spec})
+	info, errs := build.CheckSpecs(target.Config(!release), []*resolve.CrateSpec{build.StdCrate(), spec})
 	if len(errs) > 0 {
 		fmt.Fprintln(stderr, errs)
 		return 1
@@ -262,10 +273,27 @@ func buildCrate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%s: no main function\n", paths[0])
 		return 1
 	}
+	if objOnly {
+		if out == "" {
+			out = spec.Name + ".o"
+		}
+		data, err := build.Object(info, main, target, !release)
+		if err == nil {
+			err = os.WriteFile(out, data, 0o644)
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
+	}
 	if out == "" {
 		out = spec.Name
+		if target.OS == "windows" {
+			out += ".exe"
+		}
 	}
-	if err := build.Native(info, main, out, !release); err != nil {
+	if err := build.Native(info, main, out, target, !release); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}

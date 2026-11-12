@@ -7,90 +7,19 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+
+	"navi/internal/obj"
 )
 
-// Section identifies where a symbol or relocation lives.
-type Section int
+const numSections = obj.NumSections
 
-const (
-	Text      Section = iota // __TEXT,__text: code
-	RoData                   // __TEXT,__const: bytes without pointers
-	DataConst                // __DATA,__const: read-only data with pointers
-	Data                     // __DATA,__data: writable data
-	numSections
-)
+type Section = obj.Section
 
 var sectNames = [...][2]string{
-	Text:      {"__TEXT", "__text"},
-	RoData:    {"__TEXT", "__const"},
-	DataConst: {"__DATA", "__const"},
-	Data:      {"__DATA", "__data"},
-}
-
-// RelocKind is a relocation type.
-type RelocKind uint8
-
-const (
-	Branch26  RelocKind = iota // bl/b to a symbol (arm64)
-	Page21                     // adrp (arm64)
-	PageOff12                  // add/ldr low 12 bits (arm64)
-	Abs64                      // 64-bit absolute address in data
-	Rel32Call                  // x86_64 call rel32
-	Rel32                      // x86_64 rip-relative rel32 (lea)
-)
-
-// Reloc is a relocation in a section.
-type Reloc struct {
-	Sec  Section
-	Off  uint32
-	Kind RelocKind
-	Sym  string
-}
-
-// Symbol is a symbol defined in the object.
-type Symbol struct {
-	Name   string
-	Sec    Section
-	Off    uint64
-	Global bool
-}
-
-// Object accumulates the contents of an object file.
-type Object struct {
-	Arch   string // "arm64" or "amd64"
-	Sects  [numSections][]byte
-	Align  [numSections]uint32 // log2
-	Syms   []Symbol
-	Relocs []Reloc
-	undef  map[string]bool
-}
-
-// New returns an empty object for arch.
-func New(arch string) *Object {
-	o := &Object{Arch: arch, undef: map[string]bool{}}
-	o.Align = [numSections]uint32{Text: 2, RoData: 3, DataConst: 3, Data: 3}
-	if arch == "amd64" {
-		o.Align[Text] = 4
-	}
-	return o
-}
-
-// Define adds a symbol at the current end of sec (after aligning it).
-func (o *Object) Define(name string, sec Section, align int, global bool) uint64 {
-	for len(o.Sects[sec])%align != 0 {
-		o.Sects[sec] = append(o.Sects[sec], 0)
-	}
-	off := uint64(len(o.Sects[sec]))
-	o.Syms = append(o.Syms, Symbol{Name: name, Sec: sec, Off: off, Global: global})
-	return off
-}
-
-// Undefined declares an external symbol (from a library).
-func (o *Object) Undefined(name string) { o.undef[name] = true }
-
-// Reloc records a relocation.
-func (o *Object) Reloc(sec Section, off uint32, kind RelocKind, sym string) {
-	o.Relocs = append(o.Relocs, Reloc{Sec: sec, Off: off, Kind: kind, Sym: sym})
+	obj.Text:      {"__TEXT", "__text"},
+	obj.RoData:    {"__TEXT", "__const"},
+	obj.DataConst: {"__DATA", "__const"},
+	obj.Data:      {"__DATA", "__data"},
 }
 
 const (
@@ -100,7 +29,6 @@ const (
 	cpuSubtypeAll    = 0
 	cpuSubtypeX86All = 3
 	mhObject         = 1
-	mhSubsections    = 0x2000
 	lcSegment64      = 0x19
 	lcSymtab         = 0x2
 	lcDysymtab       = 0xb
@@ -111,8 +39,10 @@ const (
 	nUndf            = 0x0
 )
 
-// Bytes encodes the object file.
-func (o *Object) Bytes() ([]byte, error) {
+// Write encodes o as a Mach-O object file (MH_OBJECT). Sections are not
+// split at symbols (no MH_SUBSECTIONS_VIA_SYMBOLS), so the linker keeps
+// their contents in order.
+func Write(o *obj.Object) ([]byte, error) {
 	le := binary.LittleEndian
 	// Section addresses (object files lay sections out from 0).
 	var addr [numSections]uint64
@@ -126,7 +56,7 @@ func (o *Object) Bytes() ([]byte, error) {
 	vmSize := cur
 
 	// Symbols: locals, then external definitions, then undefined.
-	var locals, globals []Symbol
+	var locals, globals []obj.Symbol
 	for _, s := range o.Syms {
 		if s.Global {
 			globals = append(globals, s)
@@ -135,7 +65,7 @@ func (o *Object) Bytes() ([]byte, error) {
 		}
 	}
 	var undef []string
-	for name := range o.undef {
+	for name := range o.Undef {
 		undef = append(undef, name)
 	}
 	sort.Strings(undef)
@@ -176,17 +106,17 @@ func (o *Object) Bytes() ([]byte, error) {
 		}
 		var typ, length, pcrel uint32
 		switch r.Kind {
-		case Branch26:
+		case obj.Branch26:
 			typ, length, pcrel = 2, 2, 1
-		case Page21:
+		case obj.Page21:
 			typ, length, pcrel = 3, 2, 1
-		case PageOff12:
+		case obj.PageOff12:
 			typ, length, pcrel = 4, 2, 0
-		case Abs64:
+		case obj.Abs64:
 			typ, length, pcrel = 0, 3, 0
-		case Rel32Call:
+		case obj.Call32:
 			typ, length, pcrel = 2, 2, 1 // X86_64_RELOC_BRANCH
-		case Rel32:
+		case obj.PC32:
 			typ, length, pcrel = 1, 2, 1 // X86_64_RELOC_SIGNED
 		}
 		info := uint32(idx) | pcrel<<24 | length<<25 | 1<<27 | typ<<28
@@ -198,25 +128,14 @@ func (o *Object) Bytes() ([]byte, error) {
 	segCmdSize := uint32(72 + 80*nsects)
 	cmdsSize := segCmdSize + 24 /*build*/ + 24 /*symtab*/ + 80 /*dysymtab*/
 	headerSize := uint32(32) + cmdsSize
-	// File offsets of section contents.
+	// Section contents follow the load commands, at the same relative
+	// offsets as their addresses.
+	base := (headerSize + 15) / 16 * 16
 	var fileOff [numSections]uint32
-	off := headerSize
-	for s := Section(0); s < numSections; s++ {
-		a := uint32(1) << o.Align[s]
-		off = (off + a - 1) / a * a
-		// Keep file offsets congruent with addresses.
-		fileOff[s] = off + uint32(addr[s]) - uint32(addr[0])
-		if s == 0 {
-			fileOff[s] = off
-		}
-	}
-	contentEnd := fileOff[numSections-1] + uint32(len(o.Sects[numSections-1]))
-	// Recompute section offsets so that they follow addresses exactly.
-	base := fileOff[0]
 	for s := Section(0); s < numSections; s++ {
 		fileOff[s] = base + uint32(addr[s])
 	}
-	contentEnd = base + uint32(vmSize)
+	contentEnd := base + uint32(vmSize)
 	relOff := (contentEnd + 7) / 8 * 8
 	var relFile [numSections]uint32
 	pos := relOff
@@ -239,7 +158,7 @@ func (o *Object) Bytes() ([]byte, error) {
 	w(uint32(mhObject))
 	w(uint32(4)) // ncmds
 	w(cmdsSize)
-	w(uint32(mhSubsections))
+	w(uint32(0)) // flags
 	w(uint32(0))
 
 	name16 := func(s string) [16]byte {
@@ -273,7 +192,7 @@ func (o *Object) Bytes() ([]byte, error) {
 		}
 		w(uint32(len(relocs[s]) / 2))
 		flags := uint32(0)
-		if s == Text {
+		if s == obj.Text {
 			flags = 0x80000400 // pure instructions, some instructions
 		}
 		w(flags)

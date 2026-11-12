@@ -6,7 +6,7 @@ package arm64
 import (
 	"fmt"
 
-	"navi/internal/obj/macho"
+	"navi/internal/obj"
 )
 
 // Reg is a general purpose or floating point register number. 31 is SP or
@@ -76,7 +76,7 @@ type fixup struct {
 // Reloc is a relocation against a symbol at a byte offset of the code.
 type Reloc struct {
 	Off  int
-	Kind macho.RelocKind
+	Kind obj.RelocKind
 	Sym  string
 }
 
@@ -376,13 +376,13 @@ func (a *Asm) Adr(rd Reg, l Label) {
 
 // Bl calls a symbol.
 func (a *Asm) Bl(sym string) {
-	a.Relocs = append(a.Relocs, Reloc{4 * len(a.Code), macho.Branch26, sym})
+	a.Relocs = append(a.Relocs, Reloc{4 * len(a.Code), obj.Branch26, sym})
 	a.emit(0x94000000)
 }
 
 // BSym jumps to a symbol (tail call).
 func (a *Asm) BSym(sym string) {
-	a.Relocs = append(a.Relocs, Reloc{4 * len(a.Code), macho.Branch26, sym})
+	a.Relocs = append(a.Relocs, Reloc{4 * len(a.Code), obj.Branch26, sym})
 	a.emit(0x14000000)
 }
 
@@ -395,9 +395,9 @@ func (a *Asm) Brk(n uint32) {
 
 // AdrSym loads the address of a symbol (adrp + add).
 func (a *Asm) AdrSym(rd Reg, sym string) {
-	a.Relocs = append(a.Relocs, Reloc{4 * len(a.Code), macho.Page21, sym})
+	a.Relocs = append(a.Relocs, Reloc{4 * len(a.Code), obj.Page21, sym})
 	a.emit(0x90000000 | uint32(rd))
-	a.Relocs = append(a.Relocs, Reloc{4 * len(a.Code), macho.PageOff12, sym})
+	a.Relocs = append(a.Relocs, Reloc{4 * len(a.Code), obj.PageOff12, sym})
 	a.emit(0x91000000 | uint32(rd)<<5 | uint32(rd))
 }
 

@@ -1,4 +1,4 @@
-package arm64
+package lower
 
 import (
 	"fmt"
@@ -10,7 +10,7 @@ import (
 	"navi/internal/codegen"
 	"navi/internal/layout"
 	"navi/internal/mir"
-	"navi/internal/obj/macho"
+	"navi/internal/obj"
 	"navi/internal/resolve"
 	"navi/internal/syntax"
 	"navi/internal/types"
@@ -18,22 +18,22 @@ import (
 
 // Internal calling convention (all navi functions, closures and shims):
 //
-//	x0   context: the dictionary of the instance, or for closures the
+//	CTX  context: the dictionary of the instance, or for closures the
 //	     environment (whose word at -8 holds the dictionary)
-//	x8   address of the result slot
-//	x9   caller location (a *Location) for #[track_caller]
+//	RET  address of the result slot
+//	LOC  caller location (a *Location) for #[track_caller]
 //	args on the caller's stack at sp+off, each rounded up to 8 bytes;
-//	     the callee sees them at x29+16+off
+//	     the callee sees them at FP+16+off
 //
 // No register survives a call. Every MIR local lives in the frame:
 //
-//	x29+16+off  incoming arguments
-//	x29-8       context (dictionary)
-//	x29-16      result slot address
-//	x29-24      caller location
-//	x29-32      head of the defer list
-//	x29-...     locals, the call result buffer, the aggregate buffer
-//	sp+0        outgoing arguments
+//	FP+16+off  incoming arguments
+//	FP-8       context (dictionary)
+//	FP-16      result slot address
+//	FP-24      caller location
+//	FP-32      head of the defer list (panics walk the frames for it)
+//	FP-...     locals, the call result buffer, the staging buffer
+//	SP+0       outgoing arguments
 const (
 	slotCtx    = -8
 	slotRet    = -16
@@ -41,6 +41,12 @@ const (
 	slotDefers = -32
 	fixedFrame = 40
 )
+
+// Target describes the platform conventions that matter to lowering.
+type Target struct {
+	// CPrefix is prepended to C symbol names ("_" on macOS).
+	CPrefix string
+}
 
 // Options control code generation.
 type Options struct {
@@ -50,12 +56,13 @@ type Options struct {
 
 type gen struct {
 	p       *codegen.Plan
-	o       *macho.Object
+	o       *obj.Object
+	m       Machine
+	tgt     Target
 	opts    Options
 	lay     *layout.Computer
 	locs    map[string]string
 	locList []locData
-	externs map[string]bool
 	closure map[closureKey]string
 	statics map[*resolve.Def]string
 	errs    []string
@@ -72,13 +79,13 @@ type locData struct {
 	line, col int
 }
 
-// Generate produces a Mach-O object with the code and data of the plan.
-func Generate(p *codegen.Plan, opts Options) (*macho.Object, error) {
+// Generate lowers the plan with machine m into a new object for arch.
+func Generate(p *codegen.Plan, arch string, m Machine, tgt Target, opts Options) (*obj.Object, error) {
 	if len(p.Errors) > 0 {
 		return nil, fmt.Errorf("%s", strings.Join(p.Errors, "\n"))
 	}
-	g := &gen{p: p, o: macho.New("arm64"), opts: opts, lay: p.Lay, locs: map[string]string{},
-		externs: map[string]bool{}, closure: map[closureKey]string{}, statics: map[*resolve.Def]string{}}
+	g := &gen{p: p, o: obj.New(arch), m: m, tgt: tgt, opts: opts, lay: p.Lay, locs: map[string]string{},
+		closure: map[closureKey]string{}, statics: map[*resolve.Def]string{}}
 	for i, d := range p.Statics {
 		g.statics[d] = fmt.Sprintf("_navi_static%d_%s", i, d.Name)
 	}
@@ -91,9 +98,6 @@ func Generate(p *codegen.Plan, opts Options) (*macho.Object, error) {
 	if len(g.errs) > 0 {
 		return nil, fmt.Errorf("%s", strings.Join(g.errs, "\n"))
 	}
-	for name := range g.externs {
-		g.o.Undefined(name)
-	}
 	return g.o, nil
 }
 
@@ -101,29 +105,28 @@ func (g *gen) errorf(format string, args ...any) {
 	g.errs = append(g.errs, fmt.Sprintf(format, args...))
 }
 
-// emitFunc places assembled code in the text section.
-func (g *gen) emitFunc(sym string, a *Asm, global bool) {
-	if err := a.Finish(); err != nil {
+// emitFunc places the machine's current function in the text section.
+func (g *gen) emitFunc(sym string, global bool) {
+	code, relocs, err := g.m.Finish()
+	if err != nil {
 		g.errorf("%s: %v", sym, err)
 		return
 	}
-	off := g.o.Define(sym, macho.Text, 4, global)
-	g.o.Sects[macho.Text] = append(g.o.Sects[macho.Text], a.Bytes()...)
-	for _, r := range a.Relocs {
-		g.o.Reloc(macho.Text, uint32(off)+uint32(r.Off), r.Kind, r.Sym)
+	align := 4
+	if g.o.Arch == "amd64" {
+		align = 16
+	}
+	off := g.o.Define(sym, obj.Text, align, global)
+	g.o.Sects[obj.Text] = append(g.o.Sects[obj.Text], code...)
+	for _, r := range relocs {
+		g.o.Reloc(obj.Text, uint32(off)+r.Off, r.Kind, r.Sym)
 	}
 }
 
 // extern returns the symbol of a C function, declaring it undefined.
 func (g *gen) extern(name string) string {
-	sym := "_" + name
-	g.externs[sym] = true
-	return sym
-}
-
-// linkerSym declares a symbol the linker defines (section bounds).
-func (g *gen) linkerSym(sym string) string {
-	g.externs[sym] = true
+	sym := g.tgt.CPrefix + name
+	g.o.Undefined(sym)
 	return sym
 }
 
@@ -156,31 +159,31 @@ func (g *gen) genData() {
 	locTy := g.p.Info.Ctx.Adt(g.p.Info.Lang["Location"], nil)
 	ll := g.lay.Of(locTy)
 	for _, l := range g.locList {
-		off := o.Define(l.sym, macho.DataConst, 8, false)
+		off := o.Define(l.sym, obj.DataConst, 8, false)
 		buf := make([]byte, ll.Size)
 		putU64(buf[ll.Fields[0]+8:], uint64(len(l.file)))
 		putU32(buf[ll.Fields[1]:], uint32(l.line))
 		putU32(buf[ll.Fields[2]:], uint32(l.col))
-		o.Sects[macho.DataConst] = append(o.Sects[macho.DataConst], buf...)
-		o.Reloc(macho.DataConst, uint32(off+uint64(ll.Fields[0])), macho.Abs64, g.p.Str(l.file))
+		o.Sects[obj.DataConst] = append(o.Sects[obj.DataConst], buf...)
+		o.Reloc(obj.DataConst, uint32(off+uint64(ll.Fields[0])), obj.Abs64, g.p.Str(l.file))
 	}
 	// Dictionaries: [code, ctx] per slot (vtables: [vtable, 0]).
 	for _, grp := range g.p.Groups {
 		for _, in := range grp.Insts {
-			off := o.Define(in.Dict, macho.DataConst, 8, false)
+			off := o.Define(in.Dict, obj.DataConst, 8, false)
 			n := grp.NSlots
 			if n == 0 {
-				o.Sects[macho.DataConst] = append(o.Sects[macho.DataConst], make([]byte, 8)...)
+				o.Sects[obj.DataConst] = append(o.Sects[obj.DataConst], make([]byte, 8)...)
 				continue
 			}
-			o.Sects[macho.DataConst] = append(o.Sects[macho.DataConst], make([]byte, 16*n)...)
+			o.Sects[obj.DataConst] = append(o.Sects[obj.DataConst], make([]byte, 16*n)...)
 			for i, e := range g.p.DictEntries(in) {
 				at := uint32(off) + uint32(16*i)
 				switch e := e.(type) {
 				case *codegen.Target:
 					g.targetWords(at, e)
 				case *codegen.Vtable:
-					o.Reloc(macho.DataConst, at, macho.Abs64, e.Sym)
+					o.Reloc(obj.DataConst, at, obj.Abs64, e.Sym)
 				}
 			}
 		}
@@ -192,24 +195,29 @@ func (g *gen) genData() {
 	}
 	sort.Slice(vts, func(i, j int) bool { return vts[i].Sym < vts[j].Sym })
 	for _, v := range vts {
-		off := o.Define(v.Sym, macho.DataConst, 8, false)
-		o.Sects[macho.DataConst] = append(o.Sects[macho.DataConst], make([]byte, 16*len(v.Methods)+8)...)
+		off := o.Define(v.Sym, obj.DataConst, 8, false)
+		o.Sects[obj.DataConst] = append(o.Sects[obj.DataConst], make([]byte, 16*len(v.Methods)+8)...)
 		for i, t := range v.Methods {
 			g.targetWords(uint32(off)+uint32(16*i), t)
 		}
 	}
-	o.Define("_navi_stack_top", macho.Data, 8, false)
-	o.Sects[macho.Data] = append(o.Sects[macho.Data], make([]byte, 8)...)
-	// Statics (zero-initialized; _main runs the initializers).
+	// Writable data: the stack top, then the statics (zero-initialized;
+	// the entry point runs their initializers). The collector scans from
+	// _navi_data_start to _navi_data_end.
+	o.Define("_navi_data_start", obj.Data, 8, false)
+	o.Define("_navi_stack_top", obj.Data, 8, false)
+	o.Sects[obj.Data] = append(o.Sects[obj.Data], make([]byte, 8)...)
 	for _, d := range g.p.Statics {
 		ty := g.p.Info.Consts[d].Type
 		size := int64(8)
 		if l := g.lay.Of(ty); l.Size > 0 {
 			size = l.Size
 		}
-		o.Define(g.statics[d], macho.Data, 8, false)
-		o.Sects[macho.Data] = append(o.Sects[macho.Data], make([]byte, size)...)
+		o.Define(g.statics[d], obj.Data, 8, false)
+		o.Sects[obj.Data] = append(o.Sects[obj.Data], make([]byte, size)...)
 	}
+	o.Define("_navi_data_end", obj.Data, 8, false)
+	o.Sects[obj.Data] = append(o.Sects[obj.Data], make([]byte, 8)...)
 	// Strings last: code generation adds file names.
 	type str struct{ sym, s string }
 	var strs []str
@@ -218,20 +226,20 @@ func (g *gen) genData() {
 	}
 	sort.Slice(strs, func(i, j int) bool { return strs[i].sym < strs[j].sym })
 	for _, s := range strs {
-		o.Define(s.sym, macho.RoData, 1, false)
-		o.Sects[macho.RoData] = append(o.Sects[macho.RoData], s.s...)
-		o.Sects[macho.RoData] = append(o.Sects[macho.RoData], 0)
+		o.Define(s.sym, obj.RoData, 1, false)
+		o.Sects[obj.RoData] = append(o.Sects[obj.RoData], s.s...)
+		o.Sects[obj.RoData] = append(o.Sects[obj.RoData], 0)
 	}
 }
 
 func (g *gen) targetWords(at uint32, t *codegen.Target) {
 	switch t.Kind {
 	case codegen.TInst:
-		g.o.Reloc(macho.DataConst, at, macho.Abs64, t.Inst.Group.Sym)
-		g.o.Reloc(macho.DataConst, at+8, macho.Abs64, t.Inst.Dict)
+		g.o.Reloc(obj.DataConst, at, obj.Abs64, t.Inst.Group.Sym)
+		g.o.Reloc(obj.DataConst, at+8, obj.Abs64, t.Inst.Dict)
 	case codegen.TIntrinsic:
 		if t.Intrinsic == "extern" {
-			g.o.Reloc(macho.DataConst, at, macho.Abs64, g.extern(linkName(t.Def)))
+			g.o.Reloc(obj.DataConst, at, obj.Abs64, g.extern(linkName(t.Def)))
 		} else if t.Intrinsic != "unreachable" {
 			g.errorf("intrinsic %s cannot be called dynamically", t.Intrinsic)
 		}
@@ -268,22 +276,19 @@ func linkName(d *resolve.Def) string {
 	return d.Name
 }
 
-// genMain writes the C entry point: initialize statics, call main.
+// genMain writes the C entry point: record the stack top, initialize the
+// statics, call main, return 0.
 func (g *gen) genMain() {
-	a := &Asm{}
-	a.StpPre(FP, LR, SP, -16)
-	a.MovSP(FP, SP)
+	m := g.m
+	m.Begin()
 	main := g.p.Main
 	retSize := int64(16)
 	if s := g.sizeOf(main.Concrete(g.p, main.Func.Locals[0].Type)); s > retSize {
 		retSize = s
 	}
-	frame := (retSize + 15) &^ 15
-	a.MovImm(X16, frame)
-	a.SubExt(SP, SP, X16)
-	// The collector scans the stack up to here; unwinding stops here.
-	a.AdrSym(X16, "_navi_stack_top")
-	a.Str(8, FP, X16, 0)
+	m.EntryPrologue((retSize + 15) &^ 15)
+	m.AdrSym(I1, "_navi_stack_top")
+	m.Store(8, FP, I1, 0)
 	mainLoc := g.locAt("<main>", 0, 0)
 	for i := len(g.p.Statics) - 1; i >= 0; i-- {
 		d := g.p.Statics[i]
@@ -291,71 +296,25 @@ func (g *gen) genMain() {
 		if in == nil {
 			continue
 		}
-		a.AdrSym(X8, g.statics[d])
-		a.AdrSym(X9, mainLoc)
-		a.AdrSym(X0, in.Dict)
-		a.Bl(in.Group.Sym)
+		m.AdrSym(RET, g.statics[d])
+		m.AdrSym(LOC, mainLoc)
+		m.AdrSym(CTX, in.Dict)
+		m.Call(in.Group.Sym)
 	}
-	a.MovSP(X8, SP)
-	a.AdrSym(X9, mainLoc)
-	a.AdrSym(X0, main.Dict)
-	a.Bl(main.Group.Sym)
-	a.MovImm(X0, 0)
-	a.MovSP(SP, FP)
-	a.LdpPost(FP, LR, SP, 16)
-	a.Ret()
-	g.emitFunc("_main", a, true)
+	m.AddrOf(RET, SP, 0)
+	m.AdrSym(LOC, mainLoc)
+	m.AdrSym(CTX, main.Dict)
+	m.Call(main.Group.Sym)
+	m.EntryReturn0()
+	g.emitFunc(g.tgt.CPrefix+"main", true)
 }
 
-// genRunDefers writes _navi_rundefers(x0 = list head): calls each
+// genRunDefers writes _navi_rundefers(CTX = list head): calls each
 // deferred record [next, code, ctx, argsize, retsize, loc, args...].
 func (g *gen) genRunDefers() {
-	a := &Asm{}
-	a.StpPre(FP, LR, SP, -16)
-	a.MovSP(FP, SP)
-	// Same fixed slots as generated functions: x19/x20 saved at -8/-16,
-	// an empty defer list at -32 (unwinding walks through this frame).
-	a.SubImm(SP, SP, 48)
-	a.Str(8, 19, FP, -8)
-	a.Str(8, 20, FP, -16)
-	a.Str(8, ZR, FP, slotDefers)
-	a.Mov(19, X0)
-	loop, done, copyLoop, copied := a.NewLabel(), a.NewLabel(), a.NewLabel(), a.NewLabel()
-	a.Bind(loop)
-	a.Cbz(19, done)
-	a.Ldr(8, X10, 19, 24)
-	a.Ldr(8, X11, 19, 32)
-	a.Add(X12, X10, X11)
-	a.AddImm(X12, X12, 15)
-	a.LsrImm(X12, X12, 4)
-	a.LslImm(X12, X12, 4)
-	a.SubExt(SP, SP, X12)
-	a.MovSP(X17, SP)
-	a.AddImm(X16, 19, 48)
-	a.LsrImm(X13, X10, 3)
-	a.Cbz(X13, copied)
-	a.Bind(copyLoop)
-	a.LdrPost(X14, X16, 8)
-	a.StrPost(X14, X17, 8)
-	a.SubsImm(X13, X13, 1)
-	a.BCond(NE, copyLoop)
-	a.Bind(copied)
-	a.AddExt(X8, SP, X10)
-	a.Ldr(8, X9, 19, 40)
-	a.Ldr(8, X0, 19, 16)
-	a.Ldr(8, X16, 19, 8)
-	a.Ldr(8, 20, 19, 0)
-	a.Blr(X16)
-	a.SubImm(SP, FP, 48)
-	a.Mov(19, 20)
-	a.B(loop)
-	a.Bind(done)
-	a.Ldr(8, 19, FP, -8)
-	a.Ldr(8, 20, FP, -16)
-	a.MovSP(SP, FP)
-	a.LdpPost(FP, LR, SP, 16)
-	a.Ret()
-	g.emitFunc("_navi_rundefers", a, false)
+	g.m.Begin()
+	g.m.RunDefers()
+	g.emitFunc("_navi_rundefers", false)
 }
 
 func (g *gen) sizeOf(t *types.Type) int64 {
@@ -408,26 +367,24 @@ func (g *gen) genGroup(grp *codegen.Group) {
 // fnGen generates one function body.
 type fnGen struct {
 	g      *gen
-	a      *Asm
+	m      Machine
 	grp    *codegen.Group
 	inst   *codegen.Inst
 	f      *mir.Func
 	ltypes []*types.Type
-	loff   []int64 // x29-relative offsets of locals
-	// heap marks locals whose address is taken: they live in a heap cell
-	// whose pointer is in the frame slot (M3 has no escape analysis).
-	heap   []bool
+	loff   []int64 // FP-relative offsets of locals
 	blocks []Label
 	resOff int64 // call result buffer
-	tmpOff int64 // aggregate buffer
+	tmpOff int64 // staging buffer
 	stubs  map[string]Label
 	stubFn []func()
 }
 
 func (g *gen) genFunc(grp *codegen.Group, f *mir.Func, sym string) {
-	fg := &fnGen{g: g, a: &Asm{}, grp: grp, inst: grp.Rep, f: f, stubs: map[string]Label{}}
+	g.m.Begin()
+	fg := &fnGen{g: g, m: g.m, grp: grp, inst: grp.Rep, f: f, stubs: map[string]Label{}}
 	fg.gen()
-	g.emitFunc(sym, fg.a, false)
+	g.emitFunc(sym, false)
 }
 
 func (f *fnGen) conc(t *types.Type) *types.Type {
@@ -446,7 +403,7 @@ func (f *fnGen) conc(t *types.Type) *types.Type {
 func (f *fnGen) size(t *types.Type) int64 { return f.g.sizeOf(t) }
 
 // firstArg is the first local passed on the stack (closures receive the
-// environment in x0).
+// environment in CTX).
 func (f *fnGen) firstArg() int {
 	if f.f.Closure {
 		return 2
@@ -455,7 +412,7 @@ func (f *fnGen) firstArg() int {
 }
 
 func (f *fnGen) gen() {
-	a := f.a
+	m := f.m
 	fn := f.f
 	f.ltypes = make([]*types.Type, len(fn.Locals))
 	f.loff = make([]int64, len(fn.Locals))
@@ -494,64 +451,50 @@ func (f *fnGen) gen() {
 	}
 	// Buffers and the outgoing argument area.
 	maxRes, maxTmp, maxOut := int64(16), int64(16), int64(48)
-	var scan func(fn *mir.Func)
-	scan = func(fn *mir.Func) {
-		for _, b := range fn.Blocks {
-			for _, s := range b.Stmts {
-				as, ok := s.(mir.Assign)
-				if !ok {
-					continue
-				}
+	for _, b := range fn.Blocks {
+		for _, s := range b.Stmts {
+			if as, ok := s.(mir.Assign); ok {
 				// Aggregates and large copies are staged in the buffer.
 				if s := f.size(f.placeType(as.Place)); s > maxTmp {
 					maxTmp = s
 				}
 			}
-			if c, ok := b.Term.(mir.Call); ok {
-				if s := f.size(f.placeType(c.Dest)); s > maxRes {
-					maxRes = s
-				}
-				n := int64(0)
-				for _, arg := range c.Args {
-					n += round8(f.size(f.operandType(arg)))
-				}
-				if n > maxOut {
-					maxOut = n
-				}
+		}
+		if c, ok := b.Term.(mir.Call); ok {
+			if s := f.size(f.placeType(c.Dest)); s > maxRes {
+				maxRes = s
+			}
+			n := int64(0)
+			for _, arg := range c.Args {
+				n += round8(f.size(f.operandType(arg)))
+			}
+			if n > maxOut {
+				maxOut = n
 			}
 		}
 	}
-	scan(fn)
 	f.resOff = alloc(maxRes, 8)
 	f.tmpOff = alloc(maxTmp, 8)
 	frame := (cur+15)&^15 + (maxOut+15)&^15
 
-	// Prologue.
-	a.StpPre(FP, LR, SP, -16)
-	a.MovSP(FP, SP)
-	if frame < 4096 {
-		a.SubImm(SP, SP, frame)
-	} else {
-		a.MovImm(X16, frame)
-		a.SubExt(SP, SP, X16)
-	}
+	m.Prologue(frame)
 	if fn.Closure {
-		a.Str(8, X0, FP, f.loff[1])
-		a.Ldr(8, X16, X0, -8)
-		a.Str(8, X16, FP, slotCtx)
+		m.Store(8, CTX, FP, f.loff[1])
+		m.Load(8, I1, CTX, -8)
+		m.Store(8, I1, FP, slotCtx)
 	} else {
-		a.Str(8, X0, FP, slotCtx)
+		m.Store(8, CTX, FP, slotCtx)
 	}
-	a.Str(8, X8, FP, slotRet)
-	a.Str(8, X9, FP, slotLoc)
-	a.Str(8, ZR, FP, slotDefers)
+	m.Store(8, RET, FP, slotRet)
+	m.Store(8, LOC, FP, slotLoc)
+	m.StoreZero(8, FP, slotDefers)
 
 	f.blocks = make([]Label, len(fn.Blocks))
 	for i := range f.blocks {
-		f.blocks[i] = a.NewLabel()
+		f.blocks[i] = m.NewLabel()
 	}
 	for bi, b := range fn.Blocks {
-		a.Bind(f.blocks[bi])
+		m.Bind(f.blocks[bi])
 		for si, s := range b.Stmts {
 			f.stmt(bi, si, s)
 		}
@@ -564,7 +507,7 @@ func (f *fnGen) gen() {
 
 // --- Places ----------------------------------------------------------------
 
-func (f *fnGen) localAddr(r Reg, l int) { f.a.AddrOf(r, FP, f.loff[l]) }
+func (f *fnGen) localAddr(r Reg, l int) { f.m.AddrOf(r, FP, f.loff[l]) }
 
 func (f *fnGen) fieldOf(ty *types.Type, variant, field int) (int64, *types.Type) {
 	l := f.g.lay.Of(ty)
@@ -610,11 +553,11 @@ func (f *fnGen) placeType(pl mir.Place) *types.Type {
 	return ty
 }
 
-// place computes the address of a place into X10 (and the metadata of an
-// unsized place into X11). Clobbers X16, X17.
+// place computes the address of a place into RA (and the metadata of an
+// unsized place into RM). Clobbers I1, I2.
 func (f *fnGen) place(pl mir.Place) *types.Type {
-	a := f.a
-	f.localAddr(X10, pl.Local)
+	m := f.m
+	f.localAddr(RA, pl.Local)
 	ty := f.ltypes[pl.Local]
 	variant := -1
 	for _, pr := range pl.Proj {
@@ -622,9 +565,9 @@ func (f *fnGen) place(pl mir.Place) *types.Type {
 		case mir.PDeref:
 			elem := f.reveal(ty.Elem)
 			if layout.IsFat(elem) {
-				a.Ldr(8, X11, X10, 8)
+				m.Load(8, RM, RA, 8)
 			}
-			a.Ldr(8, X10, X10, 0)
+			m.Load(8, RA, RA, 0)
 			ty, variant = elem, -1
 		case mir.PDowncast:
 			variant = pr.Variant
@@ -632,29 +575,19 @@ func (f *fnGen) place(pl mir.Place) *types.Type {
 			var off int64
 			off, ty = f.fieldOf(ty, variant, pr.Field)
 			variant = -1
-			f.addConst(X10, off)
+			if off != 0 {
+				m.AddImm(RA, off)
+			}
 		case mir.PIndex:
 			elem := f.reveal(ty.Elem)
-			f.localAddr(X16, pr.Index)
-			a.Ldr(8, X16, X16, 0)
-			a.MovImm(X17, f.size(elem))
-			a.Madd(X10, X16, X17, X10)
+			f.localAddr(I1, pr.Index)
+			m.Load(8, I1, I1, 0)
+			m.MovImm(I2, f.size(elem))
+			m.MulAdd(RA, I1, I2, RA)
 			ty = elem
 		}
 	}
 	return ty
-}
-
-// addConst adds a constant to r (clobbers X16 for large values).
-func (f *fnGen) addConst(r Reg, off int64) {
-	switch {
-	case off == 0:
-	case off > 0 && off < 4096:
-		f.a.AddImm(r, r, off)
-	default:
-		f.a.MovImm(X16, off)
-		f.a.Add(r, r, X16)
-	}
 }
 
 // --- Operands --------------------------------------------------------------
@@ -687,9 +620,10 @@ func (f *fnGen) scalarSize(t *types.Type) int64 {
 }
 
 // loadScalar loads a value of at most 8 bytes, zero-extended, into r
-// (fat values: their first word). Clobbers X10, X11, X16, X17.
+// (fat values: their first word). Clobbers RA, RM, I1, I2 (and T1 for
+// function constants).
 func (f *fnGen) loadScalar(op mir.Operand, r Reg) *types.Type {
-	a := f.a
+	m := f.m
 	if op.Kind == mir.OpCopy {
 		ty := f.place(op.Place)
 		size := f.size(ty)
@@ -698,9 +632,9 @@ func (f *fnGen) loadScalar(op mir.Operand, r Reg) *types.Type {
 		}
 		switch size {
 		case 0:
-			a.MovImm(r, 0)
+			m.MovImm(r, 0)
 		case 1, 2, 4, 8:
-			a.Ldr(size, r, X10, 0)
+			m.Load(size, r, RA, 0)
 		default:
 			f.g.errorf("%s: scalar load of %d bytes", f.f.Name, size)
 		}
@@ -716,73 +650,73 @@ func (f *fnGen) loadScalar(op mir.Operand, r Reg) *types.Type {
 				v &= 1<<(8*s) - 1
 			}
 		}
-		a.MovImm(r, v)
+		m.MovImm(r, v)
 	case mir.CFloat:
 		if ty == nil || ty.F64 {
-			a.MovImm(r, int64(math.Float64bits(c.Float)))
+			m.MovImm(r, int64(math.Float64bits(c.Float)))
 		} else {
-			a.MovImm(r, int64(math.Float32bits(float32(c.Float))))
+			m.MovImm(r, int64(math.Float32bits(float32(c.Float))))
 		}
 	case mir.CStatic:
-		a.AdrSym(r, f.g.statics[c.Static])
+		m.AdrSym(r, f.g.statics[c.Static])
 	case mir.CStr, mir.CBytes:
-		a.AdrSym(r, f.g.p.Str(c.Str))
+		m.AdrSym(r, f.g.p.Str(c.Str))
 	case mir.CFn:
-		f.fnValue(c, r, X14)
+		f.fnValue(c, r, T1)
 	default:
-		a.MovImm(r, 0)
+		m.MovImm(r, 0)
 	}
 	return ty
 }
 
-// loadVal loads a value of 1, 2, 4, 8 or 16 bytes into X12 (and X13).
+// loadVal loads a value of 1, 2, 4, 8 or 16 bytes into V1 (and V2).
 func (f *fnGen) loadVal(op mir.Operand, size int64) {
-	a := f.a
+	m := f.m
 	if size <= 8 {
-		f.loadScalar(op, X12)
+		f.loadScalar(op, V1)
 		return
 	}
 	if op.Kind == mir.OpCopy {
 		f.place(op.Place)
-		a.Ldr(8, X12, X10, 0)
-		a.Ldr(8, X13, X10, 8)
+		m.Load(8, V1, RA, 0)
+		m.Load(8, V2, RA, 8)
 		return
 	}
 	c := op.Const
 	switch c.Kind {
 	case mir.CStr, mir.CBytes:
-		a.AdrSym(X12, f.g.p.Str(c.Str))
-		a.MovImm(X13, int64(len(c.Str)))
+		m.AdrSym(V1, f.g.p.Str(c.Str))
+		m.MovImm(V2, int64(len(c.Str)))
 	case mir.CFn:
-		f.fnValue(c, X12, X13)
+		f.fnValue(c, V1, V2)
 	default:
-		a.MovImm(X12, 0)
-		a.MovImm(X13, 0)
+		m.MovImm(V1, 0)
+		m.MovImm(V2, 0)
 	}
 }
 
 // fnValue materializes a function constant as (code, ctx).
 func (f *fnGen) fnValue(c *mir.Const, code, ctx Reg) {
-	a := f.a
+	m := f.m
 	t, slot := f.g.p.SiteTarget(f.inst, c)
 	if t == nil {
 		f.g.errorf("%s: unresolved function constant", f.f.Name)
 		return
 	}
 	if slot >= 0 {
-		a.Ldr(8, X16, FP, slotCtx)
-		a.Ldr(8, code, X16, int64(16*slot))
-		a.Ldr(8, ctx, X16, int64(16*slot+8))
+		m.Load(8, I1, FP, slotCtx)
+		m.Load(8, code, I1, int64(16*slot))
+		m.Load(8, ctx, I1, int64(16*slot+8))
 		return
 	}
 	switch t.Kind {
 	case codegen.TInst:
-		a.AdrSym(code, t.Inst.Group.Sym)
-		a.AdrSym(ctx, t.Inst.Dict)
+		m.AdrSym(code, t.Inst.Group.Sym)
+		m.AdrSym(ctx, t.Inst.Dict)
 	case codegen.TIntrinsic:
 		if t.Intrinsic == "extern" {
-			a.AdrSym(code, f.g.extern(linkName(t.Def)))
-			a.MovImm(ctx, 0)
+			m.AdrSym(code, f.g.extern(linkName(t.Def)))
+			m.MovImm(ctx, 0)
 			return
 		}
 		f.g.errorf("%s: intrinsic %s used as a value", f.f.Name, t.Intrinsic)
@@ -791,10 +725,10 @@ func (f *fnGen) fnValue(c *mir.Const, code, ctx Reg) {
 	}
 }
 
-// storeOperand writes an operand to [dst + off]; dst must be X15, FP or
-// SP. Clobbers X10-X14, X16, X17.
+// storeOperand writes an operand to [dst + off]; dst must be BASE, FP or
+// SP. Clobbers RA, RM, V1, V2, T1, I1, I2.
 func (f *fnGen) storeOperand(op mir.Operand, dst Reg, off int64) {
-	a := f.a
+	m := f.m
 	ty := f.operandType(op)
 	size := f.size(ty)
 	if op.Kind == mir.OpConst && op.Const.Kind == mir.CFn && ty != nil && ty.Kind == types.KFn && ty.Abi == "C" {
@@ -805,7 +739,7 @@ func (f *fnGen) storeOperand(op mir.Operand, dst Reg, off int64) {
 	}
 	if op.Kind == mir.OpCopy {
 		f.place(op.Place)
-		f.copyMem(dst, off, X10, 0, size)
+		f.copyMem(dst, off, RA, 0, size)
 		return
 	}
 	switch op.Const.Kind {
@@ -815,44 +749,36 @@ func (f *fnGen) storeOperand(op mir.Operand, dst Reg, off int64) {
 	}
 	switch size {
 	case 1, 2, 4, 8:
-		f.loadScalar(op, X12)
-		a.Str(size, X12, dst, off)
+		f.loadScalar(op, V1)
+		m.Store(size, V1, dst, off)
 	case 16:
 		f.loadVal(op, 16)
-		a.Str(8, X12, dst, off)
-		a.Str(8, X13, dst, off+8)
+		m.Store(8, V1, dst, off)
+		m.Store(8, V2, dst, off+8)
 	default:
 		f.g.errorf("%s: constant of %d bytes", f.f.Name, size)
 	}
 }
 
-// copyMem copies size bytes; clobbers X13, X14, X16, X17.
+// copyMem copies size bytes; clobbers V2, T1, I1, I2.
 func (f *fnGen) copyMem(dst Reg, dOff int64, src Reg, sOff int64, size int64) {
-	a := f.a
+	m := f.m
 	if size > 256 {
-		a.AddrOf(X16, src, sOff)
-		a.AddrOf(X17, dst, dOff)
-		a.MovImm(X13, size/8)
-		loop := a.NewLabel()
-		a.Bind(loop)
-		a.LdrPost(X14, X16, 8)
-		a.StrPost(X14, X17, 8)
-		a.SubsImm(X13, X13, 1)
-		a.BCond(NE, loop)
-		rest := size % 8
-		f.copySmall(X17, 0, X16, 0, rest)
+		m.AddrOf(I1, src, sOff)
+		m.AddrOf(I2, dst, dOff)
+		m.CopyWords(I2, I1, size/8)
+		f.copySmall(I2, 0, I1, 0, size%8)
 		return
 	}
 	f.copySmall(dst, dOff, src, sOff, size)
 }
 
 func (f *fnGen) copySmall(dst Reg, dOff int64, src Reg, sOff int64, size int64) {
-	a := f.a
 	pos := int64(0)
 	for _, chunk := range []int64{8, 4, 2, 1} {
 		for size-pos >= chunk {
-			a.Ldr(chunk, X14, src, sOff+pos)
-			a.Str(chunk, X14, dst, dOff+pos)
+			f.m.Load(chunk, T1, src, sOff+pos)
+			f.m.Store(chunk, T1, dst, dOff+pos)
 			pos += chunk
 		}
 	}
@@ -862,23 +788,23 @@ func (f *fnGen) zeroMem(dst Reg, off, size int64) {
 	pos := int64(0)
 	for _, chunk := range []int64{8, 4, 2, 1} {
 		for size-pos >= chunk {
-			f.a.Str(chunk, ZR, dst, off+pos)
+			f.m.StoreZero(chunk, dst, off+pos)
 			pos += chunk
 		}
 	}
 }
 
-// storeReg stores X12 (and X13) into the place; sizes 1, 2, 4, 8, 16.
+// storeRegs stores V1 (and V2) into the place; sizes 1, 2, 4, 8, 16.
 func (f *fnGen) storeRegs(pl mir.Place, size int64) {
-	a := f.a
+	m := f.m
 	f.place(pl)
 	switch size {
 	case 0:
 	case 1, 2, 4, 8:
-		a.Str(size, X12, X10, 0)
+		m.Store(size, V1, RA, 0)
 	case 16:
-		a.Str(8, X12, X10, 0)
-		a.Str(8, X13, X10, 8)
+		m.Store(8, V1, RA, 0)
+		m.Store(8, V2, RA, 8)
 	default:
 		f.g.errorf("%s: register store of %d bytes", f.f.Name, size)
 	}
@@ -887,20 +813,20 @@ func (f *fnGen) storeRegs(pl mir.Place, size int64) {
 // --- Statements ------------------------------------------------------------
 
 func (f *fnGen) stmt(bi, si int, s mir.Stmt) {
-	a := f.a
+	m := f.m
 	switch s := s.(type) {
 	case mir.Assign:
 		f.assign(bi, si, s)
 	case mir.SetDiscr:
 		ty := f.place(s.Place)
-		f.writeTag(X10, ty, s.Variant)
+		f.writeTag(RA, ty, s.Variant)
 	case mir.Box:
 		ct := f.conc(s.Type)
 		l := f.g.lay.Of(ct)
 		f.callAlloc(l.Size, f.noscan(ct))
-		a.Ldr(8, X12, FP, f.resOff)
-		f.localAddr(X10, s.Local)
-		a.Str(8, X12, X10, 0)
+		m.Load(8, V1, FP, f.resOff)
+		f.localAddr(RA, s.Local)
+		m.Store(8, V1, RA, 0)
 	case mir.PushDefer:
 		f.pushDefer(s)
 	}
@@ -909,14 +835,14 @@ func (f *fnGen) stmt(bi, si int, s mir.Stmt) {
 // callAlloc calls std::rt::native::gc_alloc(size, noscan); the pointer
 // is left in the result buffer.
 func (f *fnGen) callAlloc(size int64, noscan bool) {
-	a := f.a
-	a.MovImm(X12, size)
-	a.Str(8, X12, SP, 0)
+	m := f.m
+	m.MovImm(V1, size)
+	m.Store(8, V1, SP, 0)
 	if noscan {
-		a.MovImm(X12, 1)
-		a.Str(1, X12, SP, 8)
+		m.MovImm(V1, 1)
+		m.Store(1, V1, SP, 8)
 	} else {
-		a.Str(1, ZR, SP, 8)
+		m.StoreZero(1, SP, 8)
 	}
 	f.callRuntime("gc_alloc")
 }
@@ -930,35 +856,35 @@ func (f *fnGen) noscan(t *types.Type) bool {
 }
 
 func (f *fnGen) callRuntime(name string) {
-	a := f.a
+	m := f.m
 	in := f.g.p.Runtime[name]
-	a.AddrOf(X8, FP, f.resOff)
-	a.AdrSym(X9, f.g.locAt("<runtime>", 0, 0))
-	a.AdrSym(X0, in.Dict)
-	a.Bl(in.Group.Sym)
+	m.AddrOf(RET, FP, f.resOff)
+	m.AdrSym(LOC, f.g.locAt("<runtime>", 0, 0))
+	m.AdrSym(CTX, in.Dict)
+	m.Call(in.Group.Sym)
 }
 
 func (f *fnGen) writeTag(base Reg, ty *types.Type, variant int) {
-	a := f.a
+	m := f.m
 	l := f.g.lay.Of(ty)
 	switch l.Tag {
 	case layout.TagInt:
-		a.MovImm(X12, f.g.p.Info.Adts[ty.Def].Variants[variant].Discr)
-		a.Str(l.TagSize, X12, base, l.TagOff)
+		m.MovImm(V1, f.g.p.Info.Adts[ty.Def].Variants[variant].Discr)
+		m.Store(l.TagSize, V1, base, l.TagOff)
 	case layout.TagNiche:
 		if variant == l.NicheVariant {
-			a.Str(8, ZR, base, 0)
+			m.StoreZero(8, base, 0)
 		}
 	}
 }
 
-// readVariant leaves the variant index of the enum at X10 in X12.
+// readVariant leaves the variant index of the enum at RA in V1.
 func (f *fnGen) readVariant(ty *types.Type) {
-	a := f.a
+	m := f.m
 	l := f.g.lay.Of(ty)
 	switch l.Tag {
 	case layout.TagInt:
-		a.Ldr(l.TagSize, X12, X10, l.TagOff)
+		m.Load(l.TagSize, V1, RA, l.TagOff)
 		vs := f.g.p.Info.Adts[ty.Def].Variants
 		identity := true
 		for i, v := range vs {
@@ -973,29 +899,29 @@ func (f *fnGen) readVariant(ty *types.Type) {
 		if l.TagSize < 8 {
 			mask = 1<<(8*l.TagSize) - 1
 		}
-		a.MovImm(X13, 0)
+		m.MovImm(V2, 0)
 		for i, v := range vs {
-			a.MovImm(X14, int64(uint64(v.Discr)&mask))
-			a.Cmp(X12, X14)
-			a.MovImm(X16, int64(i))
-			a.Csel(X13, X16, X13, EQ)
+			m.MovImm(T1, int64(uint64(v.Discr)&mask))
+			m.Cmp(V1, T1)
+			m.MovImm(I1, int64(i))
+			m.Select(V2, I1, V2, EQ)
 		}
-		a.Mov(X12, X13)
+		m.Mov(V1, V2)
 	case layout.TagNiche:
-		a.Ldr(8, X12, X10, 0)
-		a.CmpImm(X12, 0)
+		m.Load(8, V1, RA, 0)
+		m.CmpImm(V1, 0)
 		if l.NicheVariant == 0 {
-			a.Cset(X12, NE)
+			m.SetCond(V1, NE)
 		} else {
-			a.Cset(X12, EQ)
+			m.SetCond(V1, EQ)
 		}
 	default:
-		a.MovImm(X12, 0)
+		m.MovImm(V1, 0)
 	}
 }
 
 func (f *fnGen) assign(bi, si int, s mir.Assign) {
-	a := f.a
+	m := f.m
 	dt := f.placeType(s.Place)
 	if dt.Kind == types.KNever {
 		return
@@ -1012,15 +938,15 @@ func (f *fnGen) assign(bi, si int, s mir.Assign) {
 			f.storeRegs(s.Place, size)
 			return
 		}
-		a.AddrOf(X15, FP, f.tmpOff)
-		f.storeOperand(r.X, X15, 0)
+		m.AddrOf(BASE, FP, f.tmpOff)
+		f.storeOperand(r.X, BASE, 0)
 		f.place(s.Place)
-		f.copyMem(X10, 0, X15, 0, size)
+		f.copyMem(RA, 0, BASE, 0, size)
 	case mir.Ref:
 		pt := f.place(r.Place)
-		a.Mov(X12, X10)
+		m.Mov(V1, RA)
 		if layout.IsFat(pt) {
-			a.Mov(X13, X11)
+			m.Mov(V2, RM)
 		}
 		f.storeRegs(s.Place, size)
 	case mir.Bin:
@@ -1039,24 +965,24 @@ func (f *fnGen) assign(bi, si int, s mir.Assign) {
 	case mir.Len:
 		pt := f.placeType(r.Place)
 		if pt.Kind == types.KArray {
-			a.MovImm(X12, pt.Len)
+			m.MovImm(V1, pt.Len)
 		} else {
 			f.place(r.Place)
-			a.Mov(X12, X11)
+			m.Mov(V1, RM)
 		}
 		f.storeRegs(s.Place, size)
 	case mir.Unsize:
-		f.loadScalar(r.X, X12)
-		a.MovImm(X13, r.Len)
+		f.loadScalar(r.X, V1)
+		m.MovImm(V2, r.Len)
 		f.storeRegs(s.Place, size)
 	case mir.MakeDyn:
-		f.loadScalar(r.X, X12)
+		f.loadScalar(r.X, V1)
 		vt, slot := f.g.p.SiteVtable(f.inst, codegen.DynSite{F: f.f, B: bi, S: si})
 		if slot >= 0 {
-			a.Ldr(8, X16, FP, slotCtx)
-			a.Ldr(8, X13, X16, int64(16*slot))
+			m.Load(8, I1, FP, slotCtx)
+			m.Load(8, V2, I1, int64(16*slot))
 		} else if vt != nil {
-			a.AdrSym(X13, vt.Sym)
+			m.AdrSym(V2, vt.Sym)
 		} else {
 			f.g.errorf("%s: missing vtable", f.f.Name)
 		}
@@ -1070,7 +996,7 @@ func (f *fnGen) assign(bi, si int, s mir.Assign) {
 		if size == 0 {
 			return
 		}
-		a.AddrOf(X15, FP, f.tmpOff)
+		m.AddrOf(BASE, FP, f.tmpOff)
 		ty := dt
 		if r.Type != nil {
 			ty = f.conc(r.Type)
@@ -1079,47 +1005,47 @@ func (f *fnGen) assign(bi, si int, s mir.Assign) {
 		switch r.Kind {
 		case mir.AggTuple:
 			for i, op := range r.Ops {
-				f.storeOperand(op, X15, l.Fields[i])
+				f.storeOperand(op, BASE, l.Fields[i])
 			}
 		case mir.AggArray:
 			if len(r.Ops) > 0 {
 				stride := l.Size / int64(len(r.Ops))
 				for i, op := range r.Ops {
-					f.storeOperand(op, X15, int64(i)*stride)
+					f.storeOperand(op, BASE, int64(i)*stride)
 				}
 			}
 		case mir.AggAdt:
 			if !f.g.p.Info.Adts[ty.Def].IsEnum {
 				for i, op := range r.Ops {
-					f.storeOperand(op, X15, l.Fields[i])
+					f.storeOperand(op, BASE, l.Fields[i])
 				}
 				break
 			}
 			for i, op := range r.Ops {
-				f.storeOperand(op, X15, l.Variants[r.Variant][i])
+				f.storeOperand(op, BASE, l.Variants[r.Variant][i])
 			}
-			f.writeTag(X15, ty, r.Variant)
+			f.writeTag(BASE, ty, r.Variant)
 		}
 		f.place(s.Place)
-		f.copyMem(X10, 0, X15, 0, size)
+		f.copyMem(RA, 0, BASE, 0, size)
 	default:
 		f.g.errorf("%s: unsupported rvalue %T", f.f.Name, s.Rv)
 	}
 }
 
 // closure allocates the environment [dict, captures...] and leaves the
-// closure value (code, env+8) in X12, X13.
+// closure value (code, env+8) in V1, V2.
 func (f *fnGen) closure(r mir.Aggregate) {
-	a := f.a
+	m := f.m
 	f.callAlloc(int64(8+8*len(r.Ops)), false)
-	a.Ldr(8, X15, FP, f.resOff)
-	a.Ldr(8, X14, FP, slotCtx)
-	a.Str(8, X14, X15, 0)
+	m.Load(8, BASE, FP, f.resOff)
+	m.Load(8, T1, FP, slotCtx)
+	m.Store(8, T1, BASE, 0)
 	for i, op := range r.Ops {
-		f.storeOperand(op, X15, int64(8+8*i))
+		f.storeOperand(op, BASE, int64(8+8*i))
 	}
-	a.AdrSym(X12, f.g.closureSym(f.grp, r.Closure))
-	a.AddImm(X13, X15, 8)
+	m.AdrSym(V1, f.g.closureSym(f.grp, r.Closure))
+	m.AddrOf(V2, BASE, 8)
 }
 
 // --- Arithmetic ------------------------------------------------------------
@@ -1131,11 +1057,11 @@ func (f *fnGen) panicStub(msg string, pos syntax.Pos) Label {
 	if l, ok := f.stubs[key]; ok {
 		return l
 	}
-	a := f.a
-	l := a.NewLabel()
+	m := f.m
+	l := m.NewLabel()
 	f.stubs[key] = l
 	f.stubFn = append(f.stubFn, func() {
-		a.Bind(l)
+		m.Bind(l)
 		f.callPanic(msg, pos)
 	})
 	return l
@@ -1144,11 +1070,11 @@ func (f *fnGen) panicStub(msg string, pos syntax.Pos) Label {
 // callPanic calls panic_raw(msg, file, line, col). Compiler-generated
 // impls report their caller's location.
 func (f *fnGen) callPanic(msg string, pos syntax.Pos) {
-	a := f.a
-	a.AdrSym(X12, f.g.p.Str(msg))
-	a.Str(8, X12, SP, 0)
-	a.MovImm(X12, int64(len(msg)))
-	a.Str(8, X12, SP, 8)
+	m := f.m
+	m.AdrSym(V1, f.g.p.Str(msg))
+	m.Store(8, V1, SP, 0)
+	m.MovImm(V1, int64(len(msg)))
+	m.Store(8, V1, SP, 8)
 	if f.f.Shim {
 		f.storeCallerLoc(16)
 	} else {
@@ -1160,177 +1086,146 @@ func (f *fnGen) callPanic(msg string, pos syntax.Pos) {
 		f.storeFileLine(16, file, line, col)
 	}
 	f.callRuntime("panic_raw")
-	a.Brk(1)
+	m.Trap()
 }
 
 // storeCallerLoc writes the received caller location as (file, line,
 // col) arguments at sp+off.
 func (f *fnGen) storeCallerLoc(off int64) {
-	a := f.a
+	m := f.m
 	ll := f.g.lay.Of(f.g.p.Info.Ctx.Adt(f.g.p.Info.Lang["Location"], nil))
-	a.Ldr(8, X15, FP, slotLoc)
-	a.Ldr(8, X12, X15, ll.Fields[0])
-	a.Str(8, X12, SP, off)
-	a.Ldr(8, X12, X15, ll.Fields[0]+8)
-	a.Str(8, X12, SP, off+8)
-	a.Ldr(4, X12, X15, ll.Fields[1])
-	a.Str(4, X12, SP, off+16)
-	a.Ldr(4, X12, X15, ll.Fields[2])
-	a.Str(4, X12, SP, off+24)
+	m.Load(8, BASE, FP, slotLoc)
+	m.Load(8, V1, BASE, ll.Fields[0])
+	m.Store(8, V1, SP, off)
+	m.Load(8, V1, BASE, ll.Fields[0]+8)
+	m.Store(8, V1, SP, off+8)
+	m.Load(4, V1, BASE, ll.Fields[1])
+	m.Store(4, V1, SP, off+16)
+	m.Load(4, V1, BASE, ll.Fields[2])
+	m.Store(4, V1, SP, off+24)
 }
 
 func (f *fnGen) storeFileLine(off int64, file string, line, col int) {
-	a := f.a
-	a.AdrSym(X12, f.g.p.Str(file))
-	a.Str(8, X12, SP, off)
-	a.MovImm(X12, int64(len(file)))
-	a.Str(8, X12, SP, off+8)
-	a.MovImm(X12, int64(line))
-	a.Str(4, X12, SP, off+16)
-	a.MovImm(X12, int64(col))
-	a.Str(4, X12, SP, off+24)
+	m := f.m
+	m.AdrSym(V1, f.g.p.Str(file))
+	m.Store(8, V1, SP, off)
+	m.MovImm(V1, int64(len(file)))
+	m.Store(8, V1, SP, off+8)
+	m.MovImm(V1, int64(line))
+	m.Store(4, V1, SP, off+16)
+	m.MovImm(V1, int64(col))
+	m.Store(4, V1, SP, off+24)
 }
 
-// noPos is the position used for arithmetic panics: MIR statements carry
-// no positions yet.
+// noPos is the position of arithmetic panics in generated code without
+// a source position.
 var noPos syntax.Pos
 
-// binop leaves the result in X12.
+var floatConds = map[mir.BinOp]Cond{mir.Eq: EQ, mir.Ne: NE, mir.Lt: LT, mir.Le: LE, mir.Gt: GT, mir.Ge: GE}
+
+// binop leaves the result in V1.
 func (f *fnGen) binop(r mir.Bin) {
-	a := f.a
+	m := f.m
 	ty := f.conc(r.Type)
-	f.loadScalar(r.X, X12)
-	yt := f.loadScalar(r.Y, X13)
+	f.loadScalar(r.X, V1)
+	f.loadScalar(r.Y, V2)
 	if ty.Kind == types.KFloat {
 		f64 := ty.F64
-		a.FmovToF(0, X12, f64)
-		a.FmovToF(1, X13, f64)
+		m.FMovTo(F0, V1, f64)
+		m.FMovTo(F1, V2, f64)
 		switch r.Op {
 		case mir.Add:
-			a.Fadd(0, 0, 1, f64)
+			m.FArith(Add, F0, F0, F1, f64)
 		case mir.Sub:
-			a.Fsub(0, 0, 1, f64)
+			m.FArith(Sub, F0, F0, F1, f64)
 		case mir.Mul:
-			a.Fmul(0, 0, 1, f64)
+			m.FArith(Mul, F0, F0, F1, f64)
 		case mir.Div:
-			a.Fdiv(0, 0, 1, f64)
+			m.FArith(FDiv, F0, F0, F1, f64)
 		case mir.Rem:
-			if f64 {
-				a.Bl(f.g.extern("fmod"))
-			} else {
-				a.Bl(f.g.extern("fmodf"))
+			m.Store(8, V1, SP, 0)
+			m.Store(8, V2, SP, 8)
+			name := "fmod"
+			if !f64 {
+				name = "fmodf"
 			}
+			m.CallC(f.g.extern(name), 0, []CArg{{Float: true, F64: f64}, {Float: true, F64: f64}}, true, f64)
+			return
 		default:
-			a.Fcmp(0, 1, f64)
-			a.Cset(X12, map[mir.BinOp]Cond{mir.Eq: EQ, mir.Ne: NE, mir.Lt: MI, mir.Le: LS, mir.Gt: GT, mir.Ge: GE}[r.Op])
+			m.FCompare(V1, floatConds[r.Op], F0, F1, f64)
 			return
 		}
-		a.FmovFromF(X12, 0, f64)
+		m.FMovFrom(V1, F0, f64)
 		return
 	}
 	size := f.scalarSize(ty)
 	signed := isSigned(ty)
 	if signed {
-		a.SignExt(X12, X12, size)
+		m.SignExt(V1, V1, size)
 		if r.Op != mir.Shl && r.Op != mir.Shr {
-			a.SignExt(X13, X13, size)
+			m.SignExt(V2, V2, size)
 		}
 	}
 	dbg := f.g.opts.Debug
 	pos := r.Pos
 	ovf := func(what string) Label { return f.panicStub("attempt to "+what+" with overflow", pos) }
 	switch r.Op {
-	case mir.Add, mir.Sub:
-		what := "add"
-		if r.Op == mir.Sub {
-			what = "subtract"
-		}
+	case mir.Add, mir.Sub, mir.Mul:
+		what := map[mir.BinOp]string{mir.Add: "add", mir.Sub: "subtract", mir.Mul: "multiply"}[r.Op]
+		op := map[mir.BinOp]Op{mir.Add: Add, mir.Sub: Sub, mir.Mul: Mul}[r.Op]
 		if size == 8 && dbg {
-			if r.Op == mir.Add {
-				a.Adds(X12, X12, X13)
-			} else {
-				a.Subs(X12, X12, X13)
-			}
-			switch {
-			case signed:
-				a.BCond(VS, ovf(what))
-			case r.Op == mir.Add:
-				a.BCond(HS, ovf(what))
-			default:
-				a.BCond(LO, ovf(what))
-			}
+			m.ArithOvf(op, signed, V1, V1, V2, ovf(what))
 			return
 		}
-		if r.Op == mir.Add {
-			a.Add(X12, X12, X13)
-		} else {
-			a.Sub(X12, X12, X13)
-		}
+		m.Arith(op, V1, V1, V2)
 		if dbg {
 			f.checkRange(size, signed, ovf(what))
 		}
-	case mir.Mul:
-		if size == 8 && dbg {
-			a.Mul(X14, X12, X13)
-			if signed {
-				a.Smulh(X15, X12, X13)
-				a.CmpAsr63(X15, X14)
-				a.BCond(NE, ovf("multiply"))
-			} else {
-				a.Umulh(X15, X12, X13)
-				a.Cbnz(X15, ovf("multiply"))
-			}
-			a.Mov(X12, X14)
-			return
-		}
-		a.Mul(X12, X12, X13)
-		if dbg {
-			f.checkRange(size, signed, ovf("multiply"))
-		}
 	case mir.Div, mir.Rem:
-		a.Cbz(X13, f.panicStub("attempt to divide by zero", pos))
+		m.BranchZero(V2, f.panicStub("attempt to divide by zero", pos))
 		if signed {
-			skip := a.NewLabel()
-			a.CmnImm(X13, 1)
-			a.BCond(NE, skip)
-			a.MovImm(X14, intMin(size))
-			a.Cmp(X12, X14)
-			a.BCond(EQ, f.panicStub("attempt to divide with overflow", pos))
-			a.Bind(skip)
-			a.Sdiv(X14, X12, X13)
-		} else {
-			a.Udiv(X14, X12, X13)
+			skip := m.NewLabel()
+			m.CmpImm(V2, -1)
+			m.BranchIf(NE, skip)
+			m.MovImm(T1, intMin(size))
+			m.Cmp(V1, T1)
+			m.BranchIf(EQ, f.panicStub("attempt to divide with overflow", pos))
+			m.Bind(skip)
 		}
-		if r.Op == mir.Div {
-			a.Mov(X12, X14)
-		} else {
-			a.Msub(X12, X14, X13, X12)
+		var op Op
+		switch {
+		case r.Op == mir.Div && signed:
+			op = DivS
+		case r.Op == mir.Div:
+			op = DivU
+		case signed:
+			op = RemS
+		default:
+			op = RemU
 		}
+		m.Arith(op, V1, V1, V2)
 	case mir.Shl, mir.Shr:
-		_ = yt
-		if dbg || true {
-			a.CmpImm(X13, size*8)
-			a.BCond(HS, f.panicStub("attempt to shift with overflow", pos))
-		}
+		m.CmpImm(V2, size*8)
+		m.BranchIf(GEU, f.panicStub("attempt to shift with overflow", pos))
 		switch {
 		case r.Op == mir.Shl:
-			a.Lslv(X12, X12, X13)
+			m.Arith(Shl, V1, V1, V2)
 		case signed:
-			a.Asrv(X12, X12, X13)
+			m.Arith(ShrS, V1, V1, V2)
 		default:
-			a.Lsrv(X12, X12, X13)
+			m.Arith(ShrU, V1, V1, V2)
 		}
 	case mir.BitAnd:
-		a.And(X12, X12, X13)
+		m.Arith(And, V1, V1, V2)
 	case mir.BitOr:
-		a.Orr(X12, X12, X13)
+		m.Arith(Or, V1, V1, V2)
 	case mir.BitXor:
-		a.Eor(X12, X12, X13)
+		m.Arith(Xor, V1, V1, V2)
 	case mir.Offset:
-		a.MovImm(X14, f.size(f.reveal(ty.Elem)))
-		a.Madd(X12, X13, X14, X12)
+		m.MovImm(T1, f.size(f.reveal(ty.Elem)))
+		m.MulAdd(V1, V2, T1, V1)
 	default:
-		a.Cmp(X12, X13)
+		m.Cmp(V1, V2)
 		var c Cond
 		switch r.Op {
 		case mir.Eq:
@@ -1338,85 +1233,86 @@ func (f *fnGen) binop(r mir.Bin) {
 		case mir.Ne:
 			c = NE
 		case mir.Lt:
-			c = LO
+			c = LTU
 			if signed {
 				c = LT
 			}
 		case mir.Le:
-			c = LS
+			c = LEU
 			if signed {
 				c = LE
 			}
 		case mir.Gt:
-			c = HI
+			c = GTU
 			if signed {
 				c = GT
 			}
 		case mir.Ge:
-			c = HS
+			c = GEU
 			if signed {
 				c = GE
 			}
 		}
-		a.Cset(X12, c)
+		m.SetCond(V1, c)
 	}
 }
 
-// checkRange branches to l unless X12 fits in size bytes.
+// checkRange jumps to l unless V1 fits in size bytes.
 func (f *fnGen) checkRange(size int64, signed bool, l Label) {
 	if size >= 8 {
 		return
 	}
-	a := f.a
+	m := f.m
 	if signed {
-		a.SignExt(X14, X12, size)
-		a.Cmp(X14, X12)
-		a.BCond(NE, l)
+		m.SignExt(T1, V1, size)
+		m.Cmp(T1, V1)
+		m.BranchIf(NE, l)
 	} else {
-		a.LsrImm(X14, X12, uint32(size*8))
-		a.Cbnz(X14, l)
+		m.MovImm(T1, 1<<(8*size)-1)
+		m.Cmp(V1, T1)
+		m.BranchIf(GTU, l)
 	}
 }
 
 func (f *fnGen) unop(r mir.Un) {
-	a := f.a
+	m := f.m
 	ty := f.conc(r.Type)
-	f.loadScalar(r.X, X12)
+	f.loadScalar(r.X, V1)
 	switch {
 	case ty.Kind == types.KFloat:
-		a.FmovToF(0, X12, ty.F64)
-		a.Fneg(0, 0, ty.F64)
-		a.FmovFromF(X12, 0, ty.F64)
+		m.FMovTo(F0, V1, ty.F64)
+		m.FNeg(F0, F0, ty.F64)
+		m.FMovFrom(V1, F0, ty.F64)
 	case ty.Kind == types.KBool:
-		a.MovImm(X13, 1)
-		a.Eor(X12, X12, X13)
+		m.MovImm(V2, 1)
+		m.Arith(Xor, V1, V1, V2)
 	case r.Op == mir.Not:
-		a.Mvn(X12, X12)
+		m.Not(V1, V1)
 	default:
 		size := f.scalarSize(ty)
 		if isSigned(ty) && f.g.opts.Debug {
-			a.SignExt(X12, X12, size)
-			a.MovImm(X14, intMin(size))
-			a.Cmp(X12, X14)
-			a.BCond(EQ, f.panicStub("attempt to negate with overflow", r.Pos))
+			m.SignExt(V1, V1, size)
+			m.MovImm(T1, intMin(size))
+			m.Cmp(V1, T1)
+			m.BranchIf(EQ, f.panicStub("attempt to negate with overflow", r.Pos))
 		}
-		a.Sub(X12, ZR, X12)
+		m.Neg(V1, V1)
 	}
 }
 
 func (f *fnGen) cast(r mir.Cast, to *types.Type) {
-	a := f.a
+	m := f.m
 	switch r.Kind {
 	case mir.CastPtr:
 		f.loadVal(r.X, f.size(to))
 		return
 	case mir.CastPtrInt, mir.CastFnPtr, mir.CastIntPtr:
-		f.loadScalar(r.X, X12)
+		f.loadScalar(r.X, V1)
 		return
 	case mir.CastEnum:
 		from := f.operandType(r.X)
 		if r.X.Kind != mir.OpCopy {
-			f.loadScalar(r.X, X12)
+			f.loadScalar(r.X, V1)
 			return
 		}
 		f.place(r.X.Place)
@@ -1424,66 +1320,58 @@ func (f *fnGen) cast(r mir.Cast, to *types.Type) {
 		vs := f.g.p.Info.Adts[from.Def].Variants
 		if l.Tag != layout.TagInt {
 			if len(vs) > 0 {
-				a.MovImm(X12, vs[0].Discr)
+				m.MovImm(V1, vs[0].Discr)
 			}
 			return
 		}
-		a.Ldr(l.TagSize, X12, X10, l.TagOff)
+		m.Load(l.TagSize, V1, RA, l.TagOff)
 		for _, v := range vs {
 			if v.Discr < 0 {
-				a.SignExt(X12, X12, l.TagSize)
+				m.SignExt(V1, V1, l.TagSize)
 				break
 			}
 		}
 		return
 	}
 	from := f.operandType(r.X)
-	f.loadScalar(r.X, X12)
+	f.loadScalar(r.X, V1)
 	switch {
 	case from.Kind == types.KFloat && to.Kind == types.KFloat:
 		if from.F64 == to.F64 {
 			return
 		}
-		a.FmovToF(0, X12, from.F64)
-		if to.F64 {
-			a.FcvtDS(0, 0)
-		} else {
-			a.FcvtSD(0, 0)
-		}
-		a.FmovFromF(X12, 0, to.F64)
+		m.FMovTo(F0, V1, from.F64)
+		m.FloatConv(F0, F0, to.F64)
+		m.FMovFrom(V1, F0, to.F64)
 	case from.Kind == types.KFloat:
-		a.FmovToF(0, X12, from.F64)
+		m.FMovTo(F0, V1, from.F64)
 		size := f.scalarSize(to)
 		if size == 8 {
-			if isSigned(to) {
-				a.Fcvtzs(X12, 0, from.F64)
-			} else {
-				a.Fcvtzu(X12, 0, from.F64)
-			}
+			m.FloatToInt(V1, F0, isSigned(to), from.F64)
 			return
 		}
-		a.Fcvtzs(X12, 0, from.F64)
+		m.FloatToInt(V1, F0, true, from.F64)
 		lo, hi := intMin(size), -intMin(size)-1
 		if !isSigned(to) {
 			lo, hi = 0, 1<<(8*size)-1
 		}
-		a.MovImm(X13, lo)
-		a.Cmp(X12, X13)
-		a.Csel(X12, X13, X12, LT)
-		a.MovImm(X13, hi)
-		a.Cmp(X12, X13)
-		a.Csel(X12, X13, X12, GT)
+		m.MovImm(V2, lo)
+		m.Cmp(V1, V2)
+		m.Select(V1, V2, V1, LT)
+		m.MovImm(V2, hi)
+		m.Cmp(V1, V2)
+		m.Select(V1, V2, V1, GT)
 	case to.Kind == types.KFloat:
 		if isSigned(from) {
-			a.SignExt(X12, X12, f.scalarSize(from))
-			a.Scvtf(0, X12, to.F64)
+			m.SignExt(V1, V1, f.scalarSize(from))
+			m.IntToFloat(F0, V1, true, to.F64)
 		} else {
-			a.Ucvtf(0, X12, to.F64)
+			m.IntToFloat(F0, V1, false, to.F64)
 		}
-		a.FmovFromF(X12, 0, to.F64)
+		m.FMovFrom(V1, F0, to.F64)
 	default:
 		if isSigned(from) {
-			a.SignExt(X12, X12, f.scalarSize(from))
+			m.SignExt(V1, V1, f.scalarSize(from))
 		}
 	}
 }
@@ -1491,51 +1379,45 @@ func (f *fnGen) cast(r mir.Cast, to *types.Type) {
 // --- Terminators -----------------------------------------------------------
 
 func (f *fnGen) term(bi int, t mir.Term) {
-	a := f.a
+	m := f.m
 	switch t := t.(type) {
 	case mir.Goto:
 		if t.Target != bi+1 {
-			a.B(f.blocks[t.Target])
+			m.Jump(f.blocks[t.Target])
 		}
 	case mir.Switch:
 		ty := f.conc(t.Type)
-		f.loadScalar(t.X, X12)
+		f.loadScalar(t.X, V1)
 		if ty != nil && isSigned(ty) {
-			a.SignExt(X12, X12, f.scalarSize(ty))
+			m.SignExt(V1, V1, f.scalarSize(ty))
 		}
 		for i, v := range t.Vals {
-			if v >= 0 && v < 4096 {
-				a.CmpImm(X12, v)
-			} else {
-				a.MovImm(X13, v)
-				a.Cmp(X12, X13)
-			}
-			a.BCond(EQ, f.blocks[t.Targets[i]])
+			m.CmpImm(V1, v)
+			m.BranchIf(EQ, f.blocks[t.Targets[i]])
 		}
-		a.B(f.blocks[t.Else])
+		m.Jump(f.blocks[t.Else])
 	case mir.Return:
-		if f.f.HasDefer {
-			a.Ldr(8, X0, FP, slotDefers)
-			a.Bl("_navi_rundefers")
-		}
+		m.Load(8, CTX, FP, slotDefers)
+		skip := m.NewLabel()
+		m.BranchZero(CTX, skip)
+		m.Call("_navi_rundefers")
+		m.Bind(skip)
 		if size := f.size(f.ltypes[0]); size > 0 {
-			a.Ldr(8, X15, FP, slotRet)
-			f.localAddr(X10, 0)
-			f.copyMem(X15, 0, X10, 0, size)
+			m.Load(8, BASE, FP, slotRet)
+			f.localAddr(RA, 0)
+			f.copyMem(BASE, 0, RA, 0, size)
 		}
-		a.MovSP(SP, FP)
-		a.LdpPost(FP, LR, SP, 16)
-		a.Ret()
+		m.Return()
 	case mir.Unreachable:
-		a.Brk(1)
+		m.Trap()
 	case mir.Assert:
-		f.loadScalar(t.Cond, X12)
-		a.Cbnz(X12, f.blocks[t.Target])
+		f.loadScalar(t.Cond, V1)
+		m.BranchNonZero(V1, f.blocks[t.Target])
 		if t.Bounds {
-			f.loadScalar(t.Len, X12)
-			a.Str(8, X12, SP, 0)
-			f.loadScalar(t.Index, X12)
-			a.Str(8, X12, SP, 8)
+			f.loadScalar(t.Len, V1)
+			m.Store(8, V1, SP, 0)
+			f.loadScalar(t.Index, V1)
+			m.Store(8, V1, SP, 8)
 			file, line, col := "<unknown>", 0, 0
 			if f.f.File != nil {
 				ps := f.f.File.Position(t.Pos)
@@ -1543,7 +1425,7 @@ func (f *fnGen) term(bi int, t mir.Term) {
 			}
 			f.storeFileLine(16, file, line, col)
 			f.callRuntime("panic_bounds")
-			a.Brk(1)
+			m.Trap()
 			return
 		}
 		f.callPanic(t.Msg, t.Pos)
@@ -1554,13 +1436,13 @@ func (f *fnGen) term(bi int, t mir.Term) {
 	}
 }
 
-// passLoc sets X9 to the location passed to a callee.
+// passLoc sets LOC to the location passed to a callee.
 func (f *fnGen) passLoc(pos syntax.Pos) {
 	if f.inst.TrackCaller && !f.f.Closure {
-		f.a.Ldr(8, X9, FP, slotLoc)
+		f.m.Load(8, LOC, FP, slotLoc)
 		return
 	}
-	f.a.AdrSym(X9, f.g.loc(f.f.File, pos))
+	f.m.AdrSym(LOC, f.g.loc(f.f.File, pos))
 }
 
 // storeArgs writes the arguments to the outgoing area. If thinRecv, the
@@ -1569,8 +1451,8 @@ func (f *fnGen) storeArgs(args []mir.Operand, thinRecv bool) {
 	off := int64(0)
 	for i, arg := range args {
 		if i == 0 && thinRecv {
-			f.loadScalar(arg, X12)
-			f.a.Str(8, X12, SP, 0)
+			f.loadScalar(arg, V1)
+			f.m.Store(8, V1, SP, 0)
 			off = 8
 			continue
 		}
@@ -1580,7 +1462,7 @@ func (f *fnGen) storeArgs(args []mir.Operand, thinRecv bool) {
 }
 
 func (f *fnGen) call(t mir.Call) {
-	a := f.a
+	m := f.m
 	dt := f.placeType(t.Dest)
 	var target *codegen.Target
 	slot := -1
@@ -1599,107 +1481,99 @@ func (f *fnGen) call(t mir.Call) {
 	case target == nil:
 		ft := f.operandType(t.Fn)
 		if ft.Kind == types.KFn && ft.Abi == "C" {
-			f.loadScalar(t.Fn, X16)
-			a.Mov(X15, X16)
-			f.cCall(t, dt, func() { a.Blr(X15) })
+			f.cCall(t, dt, "", true)
 			return
 		}
 		f.storeArgs(t.Args, false)
 		f.loadVal(t.Fn, 16)
-		a.Mov(X16, X12)
-		a.Mov(X0, X13)
+		m.Mov(BASE, V1)
+		m.Mov(CTX, V2)
 		f.passLoc(t.Pos)
-		a.AddrOf(X8, FP, f.resOff)
-		a.Blr(X16)
+		m.AddrOf(RET, FP, f.resOff)
+		m.CallReg(BASE)
 	case slot >= 0:
 		f.storeArgs(t.Args, false)
-		a.Ldr(8, X16, FP, slotCtx)
-		a.Ldr(8, X0, X16, int64(16*slot+8))
-		a.Ldr(8, X16, X16, int64(16*slot))
+		m.Load(8, BASE, FP, slotCtx)
+		m.Load(8, CTX, BASE, int64(16*slot+8))
+		m.Load(8, BASE, BASE, int64(16*slot))
 		f.passLoc(t.Pos)
-		a.AddrOf(X8, FP, f.resOff)
-		a.Blr(X16)
+		m.AddrOf(RET, FP, f.resOff)
+		m.CallReg(BASE)
 	case target.Kind == codegen.TVirtual:
 		f.storeArgs(t.Args, true)
 		f.loadVal(t.Args[0], 16)
-		a.Ldr(8, X0, X13, int64(16*target.Method+8))
-		a.Ldr(8, X16, X13, int64(16*target.Method))
+		m.Load(8, CTX, V2, int64(16*target.Method+8))
+		m.Load(8, BASE, V2, int64(16*target.Method))
 		f.passLoc(t.Pos)
-		a.AddrOf(X8, FP, f.resOff)
-		a.Blr(X16)
+		m.AddrOf(RET, FP, f.resOff)
+		m.CallReg(BASE)
 	default:
 		f.storeArgs(t.Args, false)
 		f.passLoc(t.Pos)
-		a.AddrOf(X8, FP, f.resOff)
-		a.AdrSym(X0, target.Inst.Dict)
-		a.Bl(target.Inst.Group.Sym)
+		m.AddrOf(RET, FP, f.resOff)
+		m.AdrSym(CTX, target.Inst.Dict)
+		m.Call(target.Inst.Group.Sym)
 	}
 	f.afterCall(t, dt)
 }
 
 func (f *fnGen) afterCall(t mir.Call, dt *types.Type) {
-	a := f.a
+	m := f.m
 	if t.Target < 0 || dt.Kind == types.KNever {
-		a.Brk(1)
+		m.Trap()
 		return
 	}
 	if size := f.size(dt); size > 0 {
 		f.place(t.Dest)
-		f.copyMem(X10, 0, FP, f.resOff, size)
+		f.copyMem(RA, 0, FP, f.resOff, size)
 	}
-	if t.Target != -1 {
-		a.B(f.blocks[t.Target])
-	}
+	m.Jump(f.blocks[t.Target])
 }
 
-// cCall calls a C function with the AAPCS64 convention.
-func (f *fnGen) cCall(t mir.Call, dt *types.Type, emit func()) {
-	a := f.a
-	ints, floats := 0, 0
-	// Stash the code pointer: argument loads clobber X10-X17 but not X15
-	// unless an argument is a constant function.
-	for _, arg := range t.Args {
+// cCall calls a C function (sym, or the C function pointer t.Fn when
+// viaFn) with the platform's C convention.
+func (f *fnGen) cCall(t mir.Call, dt *types.Type, sym string, viaFn bool) {
+	m := f.m
+	var args []CArg
+	for i, arg := range t.Args {
 		ty := f.operandType(arg)
 		switch {
 		case ty.Kind == types.KFloat:
-			f.loadScalar(arg, X12)
-			a.FmovToF(Reg(floats), X12, ty.F64)
-			floats++
+			f.loadScalar(arg, V1)
+			args = append(args, CArg{Float: true, F64: ty.F64})
 		case f.size(ty) <= 8:
-			if ints >= 8 {
-				f.g.errorf("%s: too many arguments for a C call", f.f.Name)
-				return
-			}
-			f.loadScalar(arg, Reg(ints))
+			f.loadScalar(arg, V1)
 			if isSigned(ty) {
-				a.SignExt(Reg(ints), Reg(ints), f.scalarSize(ty))
+				m.SignExt(V1, V1, f.scalarSize(ty))
 			}
-			ints++
+			args = append(args, CArg{})
 		default:
 			f.g.errorf("%s: unsupported C argument type %s", f.f.Name, ty)
 			return
 		}
+		m.Store(8, V1, SP, int64(8*i))
 	}
-	emit()
+	floatRet := dt.Kind == types.KFloat
+	f64 := floatRet && dt.F64
+	if viaFn {
+		f.loadScalar(t.Fn, BASE)
+		m.CallC("", BASE, args, floatRet, f64)
+	} else {
+		m.CallC(sym, 0, args, floatRet, f64)
+	}
 	if t.Target < 0 || dt.Kind == types.KNever {
-		a.Brk(1)
+		m.Trap()
 		return
 	}
-	size := f.size(dt)
-	if size > 0 {
-		if dt.Kind == types.KFloat {
-			a.FmovFromF(X12, 0, dt.F64)
-		} else {
-			a.Mov(X12, X0)
-		}
+	if size := f.size(dt); size > 0 {
 		f.storeRegs(t.Dest, size)
 	}
-	a.B(f.blocks[t.Target])
+	m.Jump(f.blocks[t.Target])
 }
 
 // intrinsic generates an inline intrinsic or a C call.
 func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
-	a := f.a
+	m := f.m
 	size := f.size(dt)
 	targ := func(i int) *types.Type {
 		if i < len(target.TypeArgs) {
@@ -1709,67 +1583,66 @@ func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
 	}
 	switch target.Intrinsic {
 	case "extern":
-		sym := f.g.extern(linkName(target.Def))
-		f.cCall(t, dt, func() { a.Bl(sym) })
+		f.cCall(t, dt, f.g.extern(linkName(target.Def)), false)
 		return
 	case "unreachable":
-		a.Brk(1)
+		m.Trap()
 		return
 	case "abort":
-		a.Bl(f.g.extern("abort"))
-		a.Brk(1)
+		m.CallC(f.g.extern("abort"), 0, nil, false, false)
+		m.Trap()
 		return
 	case "has_pointers":
 		if f.noscan(targ(0)) {
-			a.MovImm(X12, 0)
+			m.MovImm(V1, 0)
 		} else {
-			a.MovImm(X12, 1)
+			m.MovImm(V1, 1)
 		}
 	case "frame_address":
-		a.Mov(X12, FP)
+		m.Mov(V1, FP)
 	case "stack_top":
-		a.AdrSym(X12, "_navi_stack_top")
-		a.Ldr(8, X12, X12, 0)
+		m.AdrSym(V1, "_navi_stack_top")
+		m.Load(8, V1, V1, 0)
 	case "data_start":
-		a.AdrSym(X12, f.g.linkerSym("section$start$__DATA$__data"))
+		m.AdrSym(V1, "_navi_data_start")
 	case "data_end":
-		a.AdrSym(X12, f.g.linkerSym("section$end$__DATA$__data"))
+		m.AdrSym(V1, "_navi_data_end")
 	case "run_defers":
-		f.loadScalar(t.Args[0], X0)
-		a.Bl("_navi_rundefers")
+		f.loadScalar(t.Args[0], CTX)
+		m.Call("_navi_rundefers")
 	case "size_of":
-		a.MovImm(X12, f.size(targ(0)))
+		m.MovImm(V1, f.size(targ(0)))
 	case "align_of":
-		a.MovImm(X12, f.g.lay.Of(targ(0)).Align)
+		m.MovImm(V1, f.g.lay.Of(targ(0)).Align)
 	case "ptr_offset":
-		f.loadScalar(t.Args[1], X13)
-		a.Str(8, X13, FP, f.resOff)
-		f.loadScalar(t.Args[0], X12)
-		a.Ldr(8, X13, FP, f.resOff)
-		a.MovImm(X14, f.size(targ(0)))
-		a.Madd(X12, X13, X14, X12)
+		f.loadScalar(t.Args[1], V2)
+		m.Store(8, V2, FP, f.resOff)
+		f.loadScalar(t.Args[0], V1)
+		m.Load(8, V2, FP, f.resOff)
+		m.MovImm(T1, f.size(targ(0)))
+		m.MulAdd(V1, V2, T1, V1)
 	case "slice_from_raw", "slice_from_raw_mut", "str_from_raw":
-		f.loadScalar(t.Args[1], X13)
-		a.Str(8, X13, FP, f.resOff)
-		f.loadScalar(t.Args[0], X12)
-		a.Ldr(8, X13, FP, f.resOff)
+		f.loadScalar(t.Args[1], V2)
+		m.Store(8, V2, FP, f.resOff)
+		f.loadScalar(t.Args[0], V1)
+		m.Load(8, V2, FP, f.resOff)
 	case "slice_len":
 		f.loadVal(t.Args[0], 16)
-		a.Mov(X12, X13)
+		m.Mov(V1, V2)
 	case "slice_ptr":
-		f.loadScalar(t.Args[0], X12)
+		f.loadScalar(t.Args[0], V1)
 	case "str_as_bytes":
 		f.loadVal(t.Args[0], 16)
 	case "caller_location":
 		if f.inst.TrackCaller && !f.f.Closure {
-			a.Ldr(8, X15, FP, slotLoc)
+			m.Load(8, BASE, FP, slotLoc)
 		} else {
-			a.AdrSym(X15, f.g.loc(f.f.File, t.Pos))
+			m.AdrSym(BASE, f.g.loc(f.f.File, t.Pos))
 		}
 		f.place(t.Dest)
-		f.copyMem(X10, 0, X15, 0, size)
+		f.copyMem(RA, 0, BASE, 0, size)
 		if t.Target >= 0 {
-			a.B(f.blocks[t.Target])
+			m.Jump(f.blocks[t.Target])
 		}
 		return
 	default:
@@ -1778,9 +1651,9 @@ func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
 	}
 	f.storeRegs(t.Dest, size)
 	if t.Target >= 0 {
-		a.B(f.blocks[t.Target])
+		m.Jump(f.blocks[t.Target])
 	} else {
-		a.Brk(1)
+		m.Trap()
 	}
 }
 
@@ -1789,13 +1662,12 @@ func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
 // pushDefer allocates a record [next, code, ctx, argsize, retsize, loc,
 // args...] and links it into the frame's defer list.
 func (f *fnGen) pushDefer(s mir.PushDefer) {
-	a := f.a
+	m := f.m
 	virtual := false
 	var target *codegen.Target
-	slot := -1
 	var retTy *types.Type
 	if s.Fn.Kind == mir.OpConst && s.Fn.Const.Kind == mir.CFn {
-		target, slot = f.g.p.SiteTarget(f.inst, s.Fn.Const)
+		target, _ = f.g.p.SiteTarget(f.inst, s.Fn.Const)
 		if target == nil {
 			f.g.errorf("%s: unresolved deferred call", f.f.Name)
 			return
@@ -1829,43 +1701,43 @@ func (f *fnGen) pushDefer(s mir.PushDefer) {
 			retSize = rs
 		}
 	}
+	retSize = round8(retSize)
 	f.callAlloc(48+argSize, false)
-	a.Ldr(8, X15, FP, f.resOff)
+	m.Load(8, BASE, FP, f.resOff)
 	// Code and context.
 	switch {
 	case virtual:
 		f.loadVal(s.Args[0], 16)
-		a.Str(8, X12, X15, 48)
-		a.Ldr(8, X12, X13, int64(16*target.Method))
-		a.Ldr(8, X13, X13, int64(16*target.Method+8))
+		m.Store(8, V1, BASE, 48)
+		m.Load(8, V1, V2, int64(16*target.Method))
+		m.Load(8, V2, V2, int64(16*target.Method+8))
 	case target != nil:
-		f.fnValue(s.Fn.Const, X12, X13)
-		_ = slot
+		f.fnValue(s.Fn.Const, V1, V2)
 	default:
 		f.loadVal(s.Fn, 16)
 	}
-	a.Str(8, X12, X15, 8)
-	a.Str(8, X13, X15, 16)
-	a.MovImm(X12, argSize)
-	a.Str(8, X12, X15, 24)
-	a.MovImm(X12, retSize)
-	a.Str(8, X12, X15, 32)
+	m.Store(8, V1, BASE, 8)
+	m.Store(8, V2, BASE, 16)
+	m.MovImm(V1, argSize)
+	m.Store(8, V1, BASE, 24)
+	m.MovImm(V1, retSize)
+	m.Store(8, V1, BASE, 32)
 	if f.inst.TrackCaller && !f.f.Closure {
-		a.Ldr(8, X12, FP, slotLoc)
+		m.Load(8, V1, FP, slotLoc)
 	} else {
-		a.AdrSym(X12, f.g.loc(f.f.File, noPos))
+		m.AdrSym(V1, f.g.loc(f.f.File, noPos))
 	}
-	a.Str(8, X12, X15, 40)
+	m.Store(8, V1, BASE, 40)
 	off := int64(48)
 	for i, arg := range s.Args {
 		if i == 0 && virtual {
 			off += 8
 			continue
 		}
-		f.storeOperand(arg, X15, off)
+		f.storeOperand(arg, BASE, off)
 		off += round8(f.size(f.operandType(arg)))
 	}
-	a.Ldr(8, X12, FP, slotDefers)
-	a.Str(8, X12, X15, 0)
-	a.Str(8, X15, FP, slotDefers)
+	m.Load(8, V1, FP, slotDefers)
+	m.Store(8, V1, BASE, 0)
+	m.Store(8, BASE, FP, slotDefers)
 }
