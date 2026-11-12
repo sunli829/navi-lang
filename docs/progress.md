@@ -89,7 +89,9 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   - 链接：镜像只哈希一次（UUID 由各页哈希导出）、SHA-256 轮函数展开；
   - 构建缓存（`compiler/src/cache.navi`，同 Go 的 action cache）：键 = 编译器 UUID + 选项 + 路径 + 相关环境变量，命中条件是本次读过的每个源文件 SHA-256 不变；`-a` 强制重编，`NAVI_CACHE=off` 关闭。
 
-  还差的：冷编译仍是 go build（std 已缓存）的约 5.6 倍。剩余时间分布平坦（parse+resolve 0.37s、types 0.57s、mir 0.6s、plan 0.35s、codegen 0.42s、link 0.21s），其中约 0.55s 是每次重编 std 的前端。再往下要靠：std 前端结果的缓存（需要序列化类型和 MIR）、MIR 内联小函数、函数粒度并行（需要 M:N 多线程运行时和线程安全的编译器数据结构）。
+  完整的对比见 `docs/bench.md`（`tools/bench.sh`）：1 万行冷编译 2.6s 对 0.38s，10 万行 24s 对 2.7s，无改动重编译 0.03s 对 0.10s。10 万行曾经是 50s：`DefaultHasher` 对只在高位不同的键（`id << 32`）产生低位相同的哈希，HashMap 严重聚集，加了终混合后恢复线性。
+
+  还差的：冷编译仍是 go build（std 已缓存）的约 7 倍。剩余时间分布平坦（parse+resolve 0.37s、types 0.57s、mir 0.6s、plan 0.35s、codegen 0.42s、link 0.21s），其中约 0.55s 是每次重编 std 的前端。再往下要靠：std 前端结果的缓存（需要序列化类型和 MIR）、MIR 内联小函数、函数粒度并行（需要 M:N 多线程运行时和线程安全的编译器数据结构）。
   试过但回退：GOGC=200（被 set_min_heap 取代）、早期的小函数内联实验。
 
 ## 下一步

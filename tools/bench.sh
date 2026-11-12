@@ -34,6 +34,7 @@ for n in $sizes; do
 	printf 'package main\n\nimport (\n\t"fmt"\n\t"strings"\n)\n\nfunc main() { fmt.Println(strings.Repeat("a", 1)) }\n' > "$tmp/hello/main.go"
 	(cd "$tmp/hello" && GOCACHE=$tmp/gocache$n go build -o "$tmp/hb" . >/dev/null 2>&1)
 	export GOCACHE=$tmp/gocache$n
+	rm -f "$tmp/gb" # go build skips the build if the output is up to date
 	gcold=$(cd "$d/go" && t go build -o "$tmp/gb" .)
 	gnoop=$(cd "$d/go" && t go build -o "$tmp/gb" .)
 	sed -i '' 's/dx\*dx + dy\*dy/dx*dx + dy*dy + 0/' "$d/go/m0.go"
