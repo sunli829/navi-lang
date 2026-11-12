@@ -1691,6 +1691,13 @@ func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
 		f.loadScalar(t.Args[0], V1)
 		m.AdrSym(I1, "_navi_stack_lo")
 		m.Store(8, V1, I1, 0)
+	case "wrapping_add", "wrapping_sub", "wrapping_mul":
+		f.loadScalar(t.Args[1], V2)
+		m.Store(8, V2, FP, f.resOff)
+		f.loadScalar(t.Args[0], V1)
+		m.Load(8, V2, FP, f.resOff)
+		op := map[string]Op{"wrapping_add": Add, "wrapping_sub": Sub, "wrapping_mul": Mul}[target.Intrinsic]
+		m.Arith(op, V1, V1, V2)
 	case "size_of":
 		m.MovImm(V1, f.size(targ(0)))
 	case "align_of":

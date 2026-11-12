@@ -461,3 +461,171 @@ pub fn format(x: f64, prec: usize, has_prec: bool, style: u8, buf: *mut u8) -> u
     }
     out.n
 }
+
+// --- Parsing -----------------------------------------------------------------
+
+impl Big {
+    // Divides self by den, returning the quotient and leaving the remainder.
+    fn divmod(&mut self, den: &Big) -> Big {
+        let mut q = Big::from_u64(0);
+        let mut r = Big::from_u64(0);
+        let mut i = self.bits();
+        while i > 0 {
+            i -= 1;
+            r.shl(1);
+            if self.bit(i) == 1 {
+                if r.n == 0 { r.n = 1; r.d[0] = 1; } else { r.d[0] = r.d[0] | 1; }
+            }
+            if r.cmp(den) >= 0 {
+                r.sub(den);
+                q.set_bit(i);
+            }
+        }
+        *self = r;
+        q
+    }
+
+    // Shifts right by k bits, returning whether any one bit was lost.
+    fn shr_sticky(&mut self, k: usize) -> bool {
+        let mut lost = false;
+        let mut i = 0;
+        while i < k && i < self.bits() {
+            if self.bit(i) == 1 { lost = true; }
+            i += 1;
+        }
+        let mut left = k;
+        while left >= 16 { self.divrem_small(65536); left -= 16; }
+        while left > 0 { self.divrem_small(2); left -= 1; }
+        lost
+    }
+
+    fn low_u64(&self) -> u64 {
+        let mut v: u64 = 0;
+        if self.n > 0 { v = self.d[0] as u64; }
+        if self.n > 1 { v = v | ((self.d[1] as u64) << 32); }
+        v
+    }
+}
+
+// Builds the double nearest to m * 2^e where m has 54 or more significant
+// bits available through q (and sticky says whether bits below q were
+// non-zero), rounding half to even.
+fn assemble(q: &mut Big, e: i32, sticky: bool, neg: bool) -> f64 {
+    let mut exp = e;
+    let mut st = sticky;
+    let bl = q.bits() as i32;
+    // Keep 54 bits (53 + a rounding bit).
+    if bl > 54 {
+        if q.shr_sticky((bl - 54) as usize) { st = true; }
+        exp += bl - 54;
+    }
+    let mut m = q.low_u64();
+    if bl < 54 {
+        m = m << ((54 - bl) as u32);
+        exp -= 54 - bl;
+    }
+    // Value = m * 2^exp with m in [2^53, 2^54).
+    // Subnormals: the unbiased exponent of the leading bit is exp + 53.
+    let mut lead = exp + 53;
+    if lead < -1022 {
+        let shift = -1022 - lead;
+        if shift > 60 { return if neg { -0.0 } else { 0.0 }; }
+        let lost = m & ((1u64 << (shift as u32)) - 1);
+        if lost != 0 { st = true; }
+        m = m >> (shift as u32);
+        exp += shift;
+        lead = -1022;
+    }
+    // Round the 54-bit m to 53 bits.
+    let half = m & 1;
+    m = m >> 1;
+    exp += 1;
+    if half == 1 && (st || m & 1 == 1) {
+        m += 1;
+        if m == 9007199254740992 { m = m >> 1; exp += 1; lead += 1; }
+    }
+    if m == 0 { return if neg { -0.0 } else { 0.0 }; }
+    let bits: u64 = if m < 4503599627370496 {
+        // Subnormal.
+        m
+    } else {
+        let biased = (exp + 52 + 1023) as i64;
+        if biased >= 2047 { return if neg { -1.0 / 0.0 } else { 1.0 / 0.0 }; }
+        ((biased as u64) << 52) | (m & 4503599627370495)
+    };
+    let v = f64::from_bits(bits);
+    if neg { -v } else { v }
+}
+
+/// Parses a decimal float ("1.5", "-2e10", "inf", "NaN"), correctly
+/// rounded.
+pub fn parse(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    let n = b.len();
+    if n == 0 { return None; }
+    let mut i = 0;
+    let mut neg = false;
+    if b[0] == b'-' || b[0] == b'+' { neg = b[0] == b'-'; i = 1; }
+    let rest = &s[i..];
+    if rest == "inf" || rest == "infinity" || rest == "Infinity" { return Some(if neg { -1.0 / 0.0 } else { 1.0 / 0.0 }); }
+    if rest == "NaN" || rest == "nan" { return Some(0.0 / 0.0); }
+    let mut digits = Big::from_u64(0);
+    let mut nd = 0;
+    let mut exp10: i32 = 0;
+    let mut seen_dot = false;
+    let mut any = false;
+    while i < n {
+        let c = b[i];
+        if c >= b'0' && c <= b'9' {
+            any = true;
+            if nd < 800 {
+                digits.mul_small(10);
+                digits.add(&Big::from_u64((c - b'0') as u64));
+                if !digits.is_zero() { nd += 1; }
+                if seen_dot { exp10 -= 1; }
+            } else if !seen_dot {
+                exp10 += 1;
+            }
+        } else if c == b'.' && !seen_dot {
+            seen_dot = true;
+        } else if c == b'_' {
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if !any { return None; }
+    if i < n && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        let mut eneg = false;
+        if i < n && (b[i] == b'-' || b[i] == b'+') { eneg = b[i] == b'-'; i += 1; }
+        if i >= n { return None; }
+        let mut e: i32 = 0;
+        while i < n {
+            let c = b[i];
+            if c < b'0' || c > b'9' { return None; }
+            if e < 100000 { e = e * 10 + (c - b'0') as i32; }
+            i += 1;
+        }
+        exp10 += if eneg { -e } else { e };
+    }
+    if i != n { return None; }
+    if digits.is_zero() { return Some(if neg { -0.0 } else { 0.0 }); }
+    if exp10 + nd as i32 > 310 { return Some(if neg { -1.0 / 0.0 } else { 1.0 / 0.0 }); }
+    if exp10 + (nd as i32) < -330 { return Some(if neg { -0.0 } else { 0.0 }); }
+    if exp10 >= 0 {
+        digits.mul_pow10(exp10);
+        return Some(assemble(&mut digits, 0, false, neg));
+    }
+    // digits / 10^-exp10: scale the numerator so the quotient has at least
+    // 54 bits.
+    let mut den = Big::from_u64(1);
+    den.mul_pow10(-exp10);
+    let k = 54 + den.bits() as i32 - digits.bits() as i32 + 1;
+    let k = if k < 0 { 0 } else { k };
+    digits.shl(k);
+    let q = digits.divmod(&den);
+    let mut qq = q;
+    let sticky = !digits.is_zero();
+    Some(assemble(&mut qq, -k, sticky, neg))
+}

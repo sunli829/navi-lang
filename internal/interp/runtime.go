@@ -76,6 +76,31 @@ func (t *thread) intrinsic(inst *fnInst, args []val) val {
 	switch inst.intrinsic {
 	case "size_of":
 		return intVal(8, m.sizeOf(targ(0)))
+	case "wrapping_add", "wrapping_sub", "wrapping_mul":
+		size := m.sizeOf(targ(0))
+		a, b := readInt(args[0].b, size, false), readInt(args[1].b, size, false)
+		switch inst.intrinsic {
+		case "wrapping_add":
+			return intVal(size, a+b)
+		case "wrapping_sub":
+			return intVal(size, a-b)
+		}
+		return intVal(size, a*b)
+	case "float_op":
+		x := readFloat(args[1].b, true)
+		switch args[0].b[0] {
+		case 0:
+			x = math.Floor(x)
+		case 1:
+			x = math.Ceil(x)
+		case 2:
+			x = math.Trunc(x)
+		case 3:
+			x = math.Round(x)
+		default:
+			x = math.Sqrt(x)
+		}
+		return floatVal(true, x)
 	case "align_of":
 		return intVal(8, m.layoutOf(targ(0)).Align)
 	case "abort":
