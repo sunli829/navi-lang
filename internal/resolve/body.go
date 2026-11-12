@@ -175,9 +175,16 @@ func (r *resolver) genericParams(s *scope, g *syntax.Generics) {
 		d := r.newDef(DefTypeParam, gp.Name.Value, s.file, gp, gp.Name.NamePos, nil, s.module.Crate)
 		top.types[gp.Name.Value] = Res{Kind: ResDef, Def: d}
 	}
+	sawDefault := false
 	for _, gp := range g.Params {
 		for _, b := range gp.Bounds {
 			r.resolveBound(s, b)
+		}
+		if gp.Default != nil {
+			sawDefault = true
+			r.resolveType(s, gp.Default)
+		} else if sawDefault {
+			r.errorf(s.file, gp.Name.NamePos, "generic parameters with a default must come after those without one")
 		}
 	}
 	for _, wp := range g.Where {

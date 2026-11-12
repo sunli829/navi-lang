@@ -95,10 +95,11 @@ type Generics struct {
 	Where  []*WherePredicate
 }
 
-// GenericParam is a type parameter T: A + B.
+// GenericParam is a type parameter T: A + B = Default.
 type GenericParam struct {
-	Name   *Name
-	Bounds []*Path
+	Name    *Name
+	Bounds  []*Path
+	Default Type // nil if none
 }
 
 func (g *GenericParam) Pos() Pos { return g.Name.NamePos }

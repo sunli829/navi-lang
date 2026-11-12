@@ -59,6 +59,7 @@ func children(n Node) []Node {
 		}
 		for _, gp := range g.Params {
 			addPaths(gp.Bounds)
+			add(gp.Default)
 		}
 		for _, wp := range g.Where {
 			add(wp.Type)

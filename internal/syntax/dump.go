@@ -543,6 +543,9 @@ func (d *dumper) generics(g *Generics) {
 		if len(p.Bounds) > 0 {
 			d.w(":%s", d.paths(p.Bounds))
 		}
+		if p.Default != nil {
+			d.w("=%s", Dump(p.Default))
+		}
 	}
 	d.w(">")
 	for _, wp := range g.Where {

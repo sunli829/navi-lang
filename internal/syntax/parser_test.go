@@ -194,6 +194,9 @@ func TestItems(t *testing.T) {
 		{"#[asm] fn memmove(dst: *mut u8, src: *const u8, n: usize);",
 			"(file (fn memmove (dst:(*mut u8) src:(*const u8) n:usize)))"},
 		{"const fn make_table() -> [u32; 4] { [0; 4] }", "(file (fn make_table () -> (array u32 4) (block (repeat 0 4))))"},
+		{"trait PartialEq<Rhs = Self> { fn eq(&self, other: &Rhs) -> bool; }",
+			"(file (trait PartialEq <Rhs=Self> (fn eq (&self other:(& Rhs)) -> bool)))"},
+		{"struct S<A, B: Clone = Vec<A>>;", "(file (struct S <A,B:Clone=Vec<A>>))"},
 	}
 	for _, tt := range tests {
 		got := Dump(parseWith(t, tt.src, func(p *parser) *SourceFile {

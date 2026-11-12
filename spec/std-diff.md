@@ -47,8 +47,6 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 
 | Rust | navi 现在 | 原因 | 何时消除 |
 |---|---|---|---|
-| `PartialEq<Rhs = Self>`、`PartialOrd<Rhs = Self>` | `PartialEq`、`PartialOrd`，不带类型参数，只能和 `Self` 比较 | 默认类型参数推到自举之后 | 支持默认类型参数后 |
-| `Add<Rhs = Self>` 等运算符 trait | `Add<Rhs>` 等，`Rhs` 必须写出来 | 同上 | 同上 |
 | `impl From<[T; N]> for Vec<T>` | `impl From<&[T]> for Vec<T>` | const 泛型推到自举之后 | 支持 const 泛型后 |
 
 ## 6. 新增的 API

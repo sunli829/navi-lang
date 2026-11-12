@@ -423,6 +423,9 @@ func (p *parser) genericParams() *Generics {
 		if p.got(Colon) {
 			gp.Bounds = p.bounds()
 		}
+		if p.got(Eq) {
+			gp.Default = p.typ()
+		}
 		g.Params = append(g.Params, gp)
 		if !p.got(Comma) {
 			break
