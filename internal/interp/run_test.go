@@ -75,3 +75,30 @@ func TestRun(t *testing.T) {
 	}
 	_ = testutil.Annotations
 }
+
+// TestSpecExample runs the complete example from spec/language.md 1.18.
+func TestSpecExample(t *testing.T) {
+	dir := filepath.Join("..", "..", "tests", "syntax", "example")
+	want, err := os.ReadFile(filepath.Join(dir, "expected.out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := build.LoadCrate(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, errs := build.CheckSpecs(cfg, []*resolve.CrateSpec{build.StdCrate(), spec})
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	main := info.Res.Crates[1].Root.Lookup("main", resolve.ValueNS).Res.Def
+	m := interp.New(mir.Build(info))
+	var stdout, stderr bytes.Buffer
+	m.Stdout, m.Stderr = &stdout, &stderr
+	if code := m.Run(main); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if stdout.String() != string(want) {
+		t.Fatalf("output %q, want %q", stdout.String(), want)
+	}
+}

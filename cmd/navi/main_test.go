@@ -17,6 +17,8 @@ func TestRun(t *testing.T) {
 		{args: []string{"version"}, code: 0, stdout: "navi " + version + "\n"},
 		{args: []string{"help"}, code: 0},
 		{args: []string{"build"}, code: 1, stderrPart: "planned for M3"},
+		{args: []string{"test", "../../tests/syntax/example"}, code: 0},
+		{args: []string{"run", "../../tests/syntax/example"}, code: 0},
 		{args: []string{"check", "../../tests/syntax/example"}, code: 0},
 		{args: []string{"check", "missing-dir"}, code: 1, stderrPart: "missing-dir"},
 		{args: []string{"frobnicate"}, code: 2, stderrPart: `unknown command "frobnicate"`},

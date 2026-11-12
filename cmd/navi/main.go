@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"navi/internal/build"
 	"navi/internal/interp"
@@ -33,7 +34,6 @@ commands:
 // with the milestone that delivers each of them.
 var commands = map[string]string{
 	"build": "M3",
-	"test":  "M2",
 	"bench": "M9",
 }
 
@@ -61,6 +61,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return dumpMIR(args[1:], stdout, stderr)
 	case "run":
 		return runCrate(args[1:], stdout, stderr)
+	case "test":
+		return testCrate(args[1:], stdout, stderr)
 	default:
 		if milestone, ok := commands[cmd]; ok {
 			fmt.Fprintf(stderr, "navi %s: not implemented yet (planned for %s)\n", cmd, milestone)
@@ -179,4 +181,55 @@ func runCrate(args []string, stdout, stderr io.Writer) int {
 	m := interp.New(mir.Build(info))
 	m.Stdout, m.Stderr = stdout, stderr
 	return m.Run(main)
+}
+
+// testCrate builds a crate with cfg(test) and runs every #[test] function
+// on the interpreter.
+func testCrate(paths []string, stdout, stderr io.Writer) int {
+	if len(paths) == 0 {
+		paths = []string{"."}
+	}
+	spec, err := build.LoadCrate(paths[0])
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	cfg := build.HostConfig()
+	cfg.Test = true
+	info, errs := build.CheckSpecs(cfg, []*resolve.CrateSpec{build.StdCrate(), spec})
+	if len(errs) > 0 {
+		fmt.Fprintln(stderr, errs)
+		return 1
+	}
+	prog := mir.Build(info)
+	var tests []*resolve.Def
+	for _, d := range info.Res.Defs {
+		if d.Crate.Name != spec.Name || d.Kind != resolve.DefFn {
+			continue
+		}
+		if fn, ok := d.Node.(*syntax.FnDecl); ok {
+			for _, a := range fn.Attrs {
+				if len(a.Path.Segments) == 1 && a.Path.Segments[0].Name.Value == "test" {
+					tests = append(tests, d)
+				}
+			}
+		}
+	}
+	failed := 0
+	for _, d := range tests {
+		m := interp.New(prog)
+		var out strings.Builder
+		m.Stdout, m.Stderr = &out, &out
+		if code := m.Run(d); code != 0 {
+			failed++
+			fmt.Fprintf(stdout, "--- FAIL: %s\n%s", d.Name, out.String())
+		} else {
+			fmt.Fprintf(stdout, "ok   %s\n", d.Name)
+		}
+	}
+	fmt.Fprintf(stdout, "%d passed, %d failed\n", len(tests)-failed, failed)
+	if failed > 0 {
+		return 1
+	}
+	return 0
 }

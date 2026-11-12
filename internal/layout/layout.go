@@ -194,7 +194,8 @@ func (c *Computer) FieldTypes(t *types.Type, variant int) []*types.Type {
 	out := make([]*types.Type, len(fields))
 	sub := types.ParamMap(ai.Generics, t.Args)
 	for i, f := range fields {
-		out[i] = types.Subst(c.Info.Ctx, f.Type, sub, nil)
+		ft := types.Subst(c.Info.Ctx, f.Type, sub, nil)
+		out[i] = c.Info.Normalize(nil, ft)
 	}
 	return out
 }
