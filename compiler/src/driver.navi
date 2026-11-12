@@ -125,11 +125,29 @@ pub fn find_main(info: &types::collect::Info, name: &str) -> Option<&mut resolve
     None
 }
 
+/// What an executable runs: main, or the harness of navi test / bench.
+pub struct Entry {
+    pub main: Option<&mut resolve::Def>,
+    pub tests: Vec<&mut resolve::Def>,
+    pub bench: bool,
+}
+
+pub fn main_entry(main: &mut resolve::Def) -> &Entry { &Entry { main: Some(main), tests: Vec::new(), bench: false } }
+
 /// Compiles a checked program into the object model for arm64 macOS.
-pub fn code(info: &mut types::collect::Info, main: &mut resolve::Def, debug: bool) -> Result<&mut crate::obj::Object, String> {
-    let prog = crate::mir::build::build_program(info, Some(main));
+pub fn code(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Result<&mut crate::obj::Object, String> {
+    let mut roots: Vec<&mut resolve::Def> = Vec::new();
+    match entry.main {
+        Some(m) => roots.push(m),
+        None => { for t in entry.tests.iter() { roots.push(*t); } }
+    }
+    let prog = crate::mir::build::build_program(info, Some(roots));
+    let mf = match entry.main {
+        Some(m) => prog.func(m).unwrap(),
+        None => crate::mir::harness::harness(prog, &entry.tests, entry.bench),
+    };
     phase("mir");
-    let plan = crate::codegen::build_plan(prog, main);
+    let plan = crate::codegen::build_plan(prog, entry.main, mf);
     phase("plan");
     let m = crate::backend::arm64::new_machine();
     let tgt = crate::backend::lower::TargetConv { c_prefix: "_".to_string(), write: "write".to_string() };
@@ -139,24 +157,24 @@ pub fn code(info: &mut types::collect::Info, main: &mut resolve::Def, debug: boo
 }
 
 /// Compiles a checked program into a Mach-O object file for arm64 macOS.
-pub fn object(info: &mut types::collect::Info, main: &mut resolve::Def, debug: bool) -> Result<Vec<u8>, String> {
-    let o = code(info, main, debug)?;
+pub fn object(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Result<Vec<u8>, String> {
+    let o = code(info, entry, debug)?;
     crate::macho::write(o)
 }
 
 /// Compiles a checked program into the executable out with navic's own
 /// linker (NAVI_LINKER=cc uses the system linker instead).
-pub fn native(info: &mut types::collect::Info, main: &mut resolve::Def, out: &str, debug: bool) -> Result<(), String> {
+pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, debug: bool) -> Result<(), String> {
     let use_cc = match std::env::var("NAVI_LINKER") { Ok(v) => v == "cc", Err(_) => false };
     if !use_cc {
-        let o = code(info, main, debug)?;
+        let o = code(info, entry, debug)?;
         let exe = crate::link::link(o, util::path_base(out).as_str())?;
         if let Err(e) = std::fs::write(out, exe.as_slice()) { return Err(`${e}`); }
         phase("link");
         chmod_x(out);
         return Ok(());
     }
-    let data = object(info, main, debug)?;
+    let data = object(info, entry, debug)?;
     let obj_path = `${out}.navi.o`;
     if let Err(e) = std::fs::write(obj_path.as_str(), data.as_slice()) { return Err(`${e}`); }
     let st = std::process::Command::new("cc").arg("-arch").arg("arm64").arg("-o").arg(out).arg(obj_path.as_str()).status();
@@ -232,7 +250,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
         None => { eprintln(`${paths[0]}: no main function`); return 1; }
     };
     if obj_only {
-        let r = match object(info, main, !release) {
+        let r = match object(info, main_entry(main), !release) {
             Ok(data) => match std::fs::write(out.as_str(), data.as_slice()) { Ok(_) => Ok(()), Err(e) => Err(`${e}`) },
             Err(e) => Err(e),
         };
@@ -243,7 +261,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
         if let Some(k) = key { crate::cache::store(k.as_str(), out.as_str()); }
         return 0;
     }
-    if let Err(e) = native(info, main, out.as_str(), !release) {
+    if let Err(e) = native(info, main_entry(main), out.as_str(), !release) {
         eprintln(e);
         return 1;
     }
@@ -253,4 +271,63 @@ pub fn build_command(args: &Vec<String>) -> i32 {
 
 fn chmod_x(path: &str) {
     let _ = std::process::Command::new("chmod").arg("755").arg(path).status();
+}
+
+/// navic test|bench [--release] [crate or file] [filter]: builds the
+/// #[test] (or #[bench]) functions of the crate with cfg(test) into a
+/// harness and runs the ones whose name contains filter.
+pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
+    let mut release = false;
+    let mut rest: Vec<String> = Vec::new();
+    for a in args.iter() {
+        if a == "--release" { release = true; } else if a == "-timings" { TIMINGS = true; } else { rest.push(a.clone()); }
+    }
+    let path = if rest.len() > 0 { rest[0].clone() } else { ".".to_string() };
+    let spec = match load_crate(path.as_str()) {
+        Ok(s) => s,
+        Err(e) => { eprintln(e); return 1; }
+    };
+    let mut cfg = host_config();
+    cfg.debug = !release;
+    cfg.test = true;
+    let mut specs = Vec::new();
+    specs.push(std_crate());
+    specs.push(spec);
+    let (info, errs) = check_specs(cfg, &specs);
+    if errs.len() > 0 {
+        let mut lines: Vec<String> = Vec::new();
+        for e in errs.iter() { lines.push(`${e}`); }
+        eprintln(lines.join("\n"));
+        return 1;
+    }
+    let attr = if bench { "bench" } else { "test" };
+    let mut fns: Vec<&mut resolve::Def> = Vec::new();
+    for d in info.res.defs.iter() {
+        if d.krate.name != spec.name || d.kind != resolve::DEF_FN { continue; }
+        if let resolve::Node::Item(crate::syntax::ast::Item::Fn(fd)) = &d.node {
+            if !types::collect::has_attr(&fd.base.attrs, attr) { continue; }
+            let sig = info.fn_sig_of(*d);
+            let ok_params = sig.params.len() == 0 || bench && sig.params.len() == 1 && sig.params[0].kind == types::K_REF;
+            if sig.generics.params.len() > 0 || !ok_params || sig.ret.kind != types::K_TUPLE || sig.ret.elems.len() != 0 {
+                let what = if bench { "fn() or fn(&mut Bencher)" } else { "fn()" };
+                eprintln(`${crate::mir::harness::test_name(*d)}: a #[${attr}] function must be ${what}`);
+                return 1;
+            }
+            fns.push(*d);
+        }
+    }
+    let exe = util::path_join(std::env::temp_dir().to_str().unwrap(), `navi-${attr}-${spec.name}`.as_str());
+    let entry = &Entry { main: None, tests: fns, bench };
+    if let Err(e) = native(info, entry, exe.as_str(), !release) {
+        eprintln(e);
+        return 1;
+    }
+    let mut cmd = std::process::Command::new(exe.as_str());
+    if rest.len() > 1 { cmd.arg(rest[1].as_str()); }
+    let st = cmd.status();
+    let _ = std::fs::remove_file(exe.as_str());
+    match st {
+        Ok(s) => match s.code() { Some(c) => c, None => 1 },
+        Err(e) => { eprintln(`${exe}: ${e}`); 1 }
+    }
 }

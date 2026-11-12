@@ -1,5 +1,6 @@
 #!/bin/sh
-# Runs the golden tests in tests/run with a self-hosted compiler.
+# Runs the golden tests in tests/run, and navic test / bench on
+# tests/harness, with a self-hosted compiler.
 #
 #   tools/navictest.sh path/to/navic
 set -e
@@ -26,4 +27,19 @@ for f in tests/run/*.navi; do
 		echo "FAIL $f (exit $code, want $want_code)"; fail=1
 	fi
 done
+# navi test and navi bench on a crate with passing and failing tests.
+set +e
+got_out=$("$navic" test tests/harness 2>/dev/null)
+code=$?
+set -e
+if [ "$got_out" = "$(cat tests/harness/expected.out)" ] && [ "$code" = 1 ]; then
+	echo "ok   navic test tests/harness"
+else
+	echo "FAIL navic test tests/harness (exit $code)"; echo "$got_out"; fail=1
+fi
+if [ "$("$navic" bench tests/harness 2>&1 | grep -c ' ns/iter ')" = 2 ]; then
+	echo "ok   navic bench tests/harness"
+else
+	echo "FAIL navic bench tests/harness"; fail=1
+fi
 exit $fail

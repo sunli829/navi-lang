@@ -1,0 +1,112 @@
+//! The entry function of navi test and navi bench: it passes the names
+//! and the #[test] (or #[bench]) functions to the runner in
+//! std::rt::testing.
+
+use crate::resolve::{self, Def};
+use crate::types::{self, Type};
+use crate::mir::*;
+use crate::mir::build::Program;
+
+/// The test's path within its crate (tests::lex_num).
+pub fn test_name(d: &Def) -> String {
+    let mut name = d.name.clone();
+    let mut x = d.parent;
+    while let Some(p) = x {
+        if p.kind == resolve::DEF_MOD && p.parent.is_some() { name = `${p.name}::${name}`; }
+        x = p.parent;
+    }
+    name
+}
+
+/// A std function by path (the last segment in the value namespace).
+fn std_fn(p: &Program, path: &[&str]) -> &mut Def {
+    for c in p.info.res.crates.iter() {
+        if !c.is_std { continue; }
+        let mut m = c.root.unwrap();
+        let mut i = 0;
+        while i + 1 < path.len() {
+            m = m.lookup(path[i], resolve::TYPE_NS).unwrap().res.def.unwrap().module.unwrap();
+            i += 1;
+        }
+        return m.lookup(path[i], resolve::VALUE_NS).unwrap().res.def.unwrap();
+    }
+    panic("mir: no std crate")
+}
+
+struct Harness {
+    f: &mut Func,
+    stmts: Vec<Stmt>,
+}
+
+impl Harness {
+    fn local(&mut self, ty: &Type, boxed: bool) -> usize {
+        self.f.locals.push(&mut Local { ty, name: String::new(), boxed });
+        self.f.locals.len() - 1
+    }
+
+    /// A &[elem] local holding ops (in a heap array, as templates do).
+    fn slice(&mut self, ctx: &mut types::Ctx, elem: &Type, ops: Vec<Operand>) -> Operand {
+        let n = ops.len() as i64;
+        let arr_ty = ctx.array(elem, n);
+        let cell_ty = ctx.reference(true, arr_ty);
+        let cell = self.local(cell_ty, true);
+        self.stmts.push(Stmt::Box { local: cell, ty: arr_ty });
+        self.stmts.push(Stmt::Assign { place: local_place(cell).deref(), rv: aggregate(AGG_ARRAY, arr_ty, 0, ops) });
+        let st = ctx.slice(elem);
+        let slice_ty = ctx.reference(false, st);
+        let s = self.local(slice_ty, false);
+        self.stmts.push(Stmt::Assign { place: local_place(s), rv: Rvalue::Unsize { x: copy(local_place(cell)), len: n, to: slice_ty } });
+        copy(local_place(s))
+    }
+}
+
+fn str_op(ctx: &mut types::Ctx, s: &str) -> Operand {
+    let t = ctx.reference(false, ctx.str_);
+    let c = cnst(C_STR, Some(t));
+    c.bytes = s.as_bytes().to_vec();
+    const_op(c)
+}
+
+/// Builds the entry: run_tests(names, tests), or for benchmarks
+/// run_benches(names, plain, bench_names, with_bencher) where with_bencher
+/// are the functions taking &mut Bencher.
+pub fn harness(p: &mut Program, fns: &Vec<&mut Def>, bench: bool) -> &mut Func {
+    let ctx = p.info.ctx;
+    let f = new_func("navi_harness".to_string(), None, None, None);
+    let h = &mut Harness { f, stmts: Vec::new() };
+    h.local(ctx.unit, false);
+    let ref_str = ctx.reference(false, ctx.str_);
+    let plain_ty = ctx.func(Vec::new(), ctx.unit, "");
+    let mut names: Vec<Operand> = Vec::new();
+    let mut plain: Vec<Operand> = Vec::new();
+    let mut bnames: Vec<Operand> = Vec::new();
+    let mut with_b: Vec<Operand> = Vec::new();
+    let bencher = p.std_type(&["bench", "Bencher"]);
+    let mut bps = Vec::new();
+    bps.push(ctx.reference(true, bencher));
+    let with_b_ty = ctx.func(bps, ctx.unit, "");
+    for d in fns.iter() {
+        let n = test_name(*d);
+        if p.info.fn_sig_of(*d).params.len() == 0 {
+            names.push(str_op(ctx, n.as_str()));
+            plain.push(fn_op(fn_ref(*d, Vec::new(), None), Some(plain_ty)));
+        } else {
+            bnames.push(str_op(ctx, n.as_str()));
+            with_b.push(fn_op(fn_ref(*d, Vec::new(), None), Some(with_b_ty)));
+        }
+    }
+    let mut args = Vec::new();
+    args.push(h.slice(ctx, ref_str, names));
+    args.push(h.slice(ctx, plain_ty, plain));
+    let runner = if bench {
+        args.push(h.slice(ctx, ref_str, bnames));
+        args.push(h.slice(ctx, with_b_ty, with_b));
+        std_fn(p, &["rt", "testing", "run_benches"])
+    } else {
+        std_fn(p, &["rt", "testing", "run_tests"])
+    };
+    let call = Term::Call { fn_op: fn_op(fn_ref(runner, Vec::new(), None), None), args, dest: local_place(0), target: 1, pos: 0 };
+    h.f.blocks.push(&mut Block { stmts: h.stmts, term: call });
+    h.f.blocks.push(&mut Block { stmts: Vec::new(), term: Term::Return });
+    h.f
+}
