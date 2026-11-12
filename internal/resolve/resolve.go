@@ -1,12 +1,9 @@
 package resolve
 
 import (
-	"fmt"
 	"io/fs"
-	"sort"
-	"strings"
-	"sync"
 
+	"navi/internal/diag"
 	"navi/internal/syntax"
 )
 
@@ -36,27 +33,11 @@ type Crate struct {
 	fileKeys map[*syntax.File]string // file -> its path inside FS
 }
 
-// Error is one diagnostic.
-type Error struct {
-	Pos syntax.Position
-	Msg string
-}
-
-func (e Error) Error() string { return e.Pos.String() + ": " + e.Msg }
-
-// ErrorList is a sorted list of diagnostics.
-type ErrorList []Error
-
-func (l ErrorList) Error() string {
-	var b strings.Builder
-	for i, e := range l {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString(e.Error())
-	}
-	return b.String()
-}
+// Error and ErrorList are the shared diagnostic types.
+type (
+	Error     = diag.Error
+	ErrorList = diag.List
+)
 
 // Info holds the results of name resolution.
 type Info struct {
@@ -75,8 +56,7 @@ type resolver struct {
 	cfg  Config
 	info *Info
 
-	mu   sync.Mutex
-	errs ErrorList
+	errs diag.Sink
 
 	crates  map[string]*Crate
 	imports []*Import
@@ -86,13 +66,7 @@ type resolver struct {
 }
 
 func (r *resolver) errorf(f *syntax.File, pos syntax.Pos, format string, args ...any) {
-	e := Error{Msg: fmt.Sprintf(format, args...)}
-	if f != nil {
-		e.Pos = f.Position(pos)
-	}
-	r.mu.Lock()
-	r.errs = append(r.errs, e)
-	r.mu.Unlock()
+	r.errs.Errorf(f, pos, format, args...)
 }
 
 // Resolve loads the given crates and resolves all names. The std crate must
@@ -151,17 +125,7 @@ func Resolve(cfg Config, specs []*CrateSpec) (*Info, ErrorList) {
 		}
 	}
 
-	sort.SliceStable(r.errs, func(i, j int) bool {
-		a, b := r.errs[i].Pos, r.errs[j].Pos
-		if a.File != b.File {
-			return a.File < b.File
-		}
-		if a.Line != b.Line {
-			return a.Line < b.Line
-		}
-		return a.Col < b.Col
-	})
-	return r.info, r.errs
+	return r.info, r.errs.List()
 }
 
 func (r *resolver) newDef(kind DefKind, name string, file *syntax.File, node syntax.Node, pos syntax.Pos, parent *Def, c *Crate) *Def {

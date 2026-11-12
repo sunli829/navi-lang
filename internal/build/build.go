@@ -13,7 +13,9 @@ import (
 	"strings"
 
 	"navi"
+	"navi/internal/diag"
 	"navi/internal/resolve"
+	"navi/internal/types"
 )
 
 // HostConfig returns the #[cfg] settings for the machine navi runs on.
@@ -93,12 +95,23 @@ func packageName(manifest []byte) string {
 }
 
 // Check loads the crate at path together with std and runs every phase
-// that exists so far (currently name resolution).
-func Check(path string, cfg resolve.Config) (resolve.ErrorList, error) {
+// that exists so far (name resolution and signature collection).
+func Check(path string, cfg resolve.Config) (diag.List, error) {
 	spec, err := LoadCrate(path)
 	if err != nil {
 		return nil, err
 	}
-	_, errs := resolve.Resolve(cfg, []*resolve.CrateSpec{StdCrate(), spec})
+	_, errs := CheckSpecs(cfg, []*resolve.CrateSpec{StdCrate(), spec})
 	return errs, nil
+}
+
+// CheckSpecs runs the front end over the given crates.
+func CheckSpecs(cfg resolve.Config, specs []*resolve.CrateSpec) (*types.Info, diag.List) {
+	res, rerrs := resolve.Resolve(cfg, specs)
+	var sink diag.Sink
+	for _, e := range rerrs {
+		sink.Add(e)
+	}
+	info := types.Collect(res, &sink)
+	return info, sink.List()
 }

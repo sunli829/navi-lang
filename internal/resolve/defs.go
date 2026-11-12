@@ -227,3 +227,20 @@ var primitives = map[string]bool{
 	"u8": true, "u16": true, "u32": true, "u64": true, "usize": true,
 	"f32": true, "f64": true, "bool": true, "char": true, "str": true,
 }
+
+// Lookup returns the binding of name in namespace ns of m, ignoring
+// visibility: an item or single import, else an unambiguous glob import.
+func (m *Module) Lookup(name string, ns Namespace) *Binding {
+	if b := m.bindings[ns][name]; b != nil {
+		return b
+	}
+	if gs := m.globs[ns][name]; len(gs) > 0 {
+		for _, g := range gs[1:] {
+			if !sameRes(g.Res, gs[0].Res) {
+				return nil
+			}
+		}
+		return gs[0]
+	}
+	return nil
+}
