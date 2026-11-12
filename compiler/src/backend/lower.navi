@@ -664,37 +664,60 @@ impl FnGen {
         ty
     }
 
-    /// Computes the address of a place into RA (and the metadata of an
-    /// unsized place into RM). Clobbers I1, I2.
-    fn place(&mut self, pl: &Place) -> &Type {
+    /// The address of a place as base register plus offset (base is FP or
+    /// RA), and its type; the metadata of an unsized place is left in RM.
+    /// Clobbers RA, I1, I2.
+    fn place_addr(&mut self, pl: &Place) -> (Reg, i64, &Type) {
         let m = self.m;
-        self.local_addr(RA, pl.local);
+        let mut base = FP;
+        let mut off = self.loff[pl.local];
         let mut ty = self.ltypes[pl.local];
         let mut variant = -1i64;
         for pr in pl.proj.iter() {
             if pr.kind == mir::P_DEREF {
                 let elem = self.reveal(ty.el());
-                if layout::is_fat(elem) { m.load(8, RM, RA, 8); }
-                m.load(8, RA, RA, 0);
+                if layout::is_fat(elem) { m.load(8, RM, base, off + 8); }
+                m.load(8, RA, base, off);
+                base = RA;
+                off = 0;
                 ty = elem;
                 variant = -1;
             } else if pr.kind == mir::P_DOWNCAST {
                 variant = pr.variant as i64;
             } else if pr.kind == mir::P_FIELD {
-                let (off, ft) = self.field_of(ty, variant, pr.field);
+                let (foff, ft) = self.field_of(ty, variant, pr.field);
                 ty = ft;
                 variant = -1;
-                if off != 0 { m.add_imm(RA, off); }
+                off += foff;
             } else {
                 let elem = self.reveal(ty.el());
-                self.local_addr(I1, pr.index);
-                m.load(8, I1, I1, 0);
+                self.materialize(base, off);
+                base = RA;
+                off = 0;
+                m.load(8, I1, FP, self.loff[pr.index]);
                 let es = self.size(elem);
                 m.mov_imm(I2, es);
                 m.mul_add(RA, I1, I2, RA);
                 ty = elem;
             }
         }
+        (base, off, ty)
+    }
+
+    /// Sets RA to base + off.
+    fn materialize(&mut self, base: Reg, off: i64) {
+        if base == RA {
+            if off != 0 { self.m.add_imm(RA, off); }
+        } else {
+            self.m.addr_of(RA, base, off);
+        }
+    }
+
+    /// Computes the address of a place into RA (and the metadata of an
+    /// unsized place into RM). Clobbers I1, I2.
+    fn place(&mut self, pl: &Place) -> &Type {
+        let (b, o, ty) = self.place_addr(pl);
+        self.materialize(b, o);
         ty
     }
 
@@ -720,13 +743,13 @@ impl FnGen {
     fn load_scalar(&mut self, op: &Operand, r: Reg) -> Option<&Type> {
         let m = self.m;
         if op.kind == mir::OP_COPY {
-            let ty = self.place(&op.place);
+            let (b, o, ty) = self.place_addr(&op.place);
             let mut size = self.size(ty);
             if size > 8 { size = 8; }
             if size == 0 {
                 m.mov_imm(r, 0);
             } else if size == 1 || size == 2 || size == 4 || size == 8 {
-                m.load(size, r, RA, 0);
+                m.load(size, r, b, o);
             } else {
                 self.g.errorf(`${self.f.name}: scalar load of ${size} bytes`);
             }
@@ -773,9 +796,9 @@ impl FnGen {
             return;
         }
         if op.kind == mir::OP_COPY {
-            self.place(&op.place);
-            m.load(8, V1, RA, 0);
-            m.load(8, V2, RA, 8);
+            let (b, o, _) = self.place_addr(&op.place);
+            m.load(8, V1, b, o);
+            m.load(8, V2, b, o + 8);
             return;
         }
         let c = op.cnst.unwrap();
@@ -827,8 +850,8 @@ impl FnGen {
         if op.kind == mir::OP_CONST && op.cnst.unwrap().kind == mir::C_FN && ty.kind == types::K_FN && ty.abi == "C" { size = 8; }
         if size == 0 { return; }
         if op.kind == mir::OP_COPY {
-            self.place(&op.place);
-            self.copy_mem(dst, off, RA, 0, size);
+            let (b, o, _) = self.place_addr(&op.place);
+            self.copy_mem(dst, off, b, o, size);
             return;
         }
         let ck = op.cnst.unwrap().kind;
@@ -884,13 +907,13 @@ impl FnGen {
     /// Stores V1 (and V2) into the place; sizes 1, 2, 4, 8, 16.
     fn store_regs(&mut self, pl: &Place, size: i64) {
         let m = self.m;
-        self.place(pl);
+        let (b, o, _) = self.place_addr(pl);
         if size == 0 {
         } else if size == 1 || size == 2 || size == 4 || size == 8 {
-            m.store(size, V1, RA, 0);
+            m.store(size, V1, b, o);
         } else if size == 16 {
-            m.store(8, V1, RA, 0);
-            m.store(8, V2, RA, 8);
+            m.store(8, V1, b, o);
+            m.store(8, V2, b, o + 8);
         } else {
             self.g.errorf(`${self.f.name}: register store of ${size} bytes`);
         }
@@ -1013,8 +1036,8 @@ impl FnGen {
                 }
                 m.addr_of(BASE, FP, self.tmp_off);
                 self.store_operand(x, BASE, 0);
-                self.place(place);
-                self.copy_mem(RA, 0, BASE, 0, size);
+                let (b, o, _) = self.place_addr(place);
+                self.copy_mem(b, o, BASE, 0, size);
             }
             Rvalue::Ref { place: src, .. } => {
                 let pt = self.place(src);
@@ -1107,8 +1130,8 @@ impl FnGen {
                         self.write_tag(BASE, aty, *variant);
                     }
                 }
-                self.place(place);
-                self.copy_mem(RA, 0, BASE, 0, size);
+                let (b, o, _) = self.place_addr(place);
+                self.copy_mem(b, o, BASE, 0, size);
             }
         }
     }
@@ -1436,7 +1459,7 @@ impl FnGen {
                     m.branch_if(EQ, self.blocks[targets[i]]);
                     i += 1;
                 }
-                m.jump(self.blocks[*els]);
+                if *els != bi + 1 { m.jump(self.blocks[*els]); }
             }
             Term::Return => {
                 m.load(8, CTX, FP, SLOT_DEFERS);
@@ -1578,8 +1601,8 @@ impl FnGen {
         }
         let size = self.size(dt);
         if size > 0 {
-            self.place(dest);
-            self.copy_mem(RA, 0, FP, self.res_off, size);
+            let (b, o, _) = self.place_addr(dest);
+            self.copy_mem(b, o, FP, self.res_off, size);
         }
         m.jump(self.blocks[target as usize]);
     }

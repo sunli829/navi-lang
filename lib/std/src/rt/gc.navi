@@ -141,7 +141,9 @@ pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
 }
 
 fn class_of(size: usize) -> usize {
-    let mut c = 0;
+    // Classes step by 16 up to 128 bytes.
+    if size <= 128 { return (size + 15) / 16 - 1; }
+    let mut c = 8;
     while CLASSES[c] < size { c += 1; }
     c
 }
@@ -170,10 +172,10 @@ fn alloc_small(c: usize, noscan: bool) -> usize {
 fn take(s: *mut Span) -> usize {
     unsafe {
         let p = (*s).freelist;
-        (*s).freelist = ld(p);
+        (*s).freelist = *(p as *const usize);
         (*s).nfree -= 1;
         let i = (p - (*s).start) / (*s).elem;
-        stb((*s).bits as usize + i, 1);
+        *(((*s).bits as usize + i) as *mut u8) = 1;
         memset(p as *mut u8, 0, (*s).elem);
         ALLOCATED += (*s).elem;
         p
@@ -248,46 +250,50 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
 
 // --- Marking -----------------------------------------------------------------
 
-fn mark_word(w: usize) {
-    if w < ARENA || w >= ARENA_NEXT { return; }
-    let s = ld(PAGES + ((w - ARENA) >> PAGE_SHIFT) * 8) as *mut Span;
-    if s as usize == 0 { return; }
-    unsafe {
-        let i = (w - (*s).start) / (*s).elem;
-        if i >= (*s).nelems { return; }
-        let bits = (*s).bits as usize;
-        if ldb(bits + i) == 0 { return; }
-        let m = bits + (*s).nelems + i;
-        if ldb(m) != 0 { return; }
-        stb(m, 1);
-        if (*s).noscan { return; }
-        push((*s).start + i * (*s).elem);
-    }
-}
-
 fn push(obj: usize) {
     if MARK_LEN == MARK_CAP {
         MARK_CAP = MARK_CAP * 2;
         MARK = unsafe { realloc(MARK as *mut u8, MARK_CAP * 8) } as usize;
         if MARK == 0 { out_of_memory(); }
     }
-    st(MARK + MARK_LEN * 8, obj);
+    unsafe { *((MARK + MARK_LEN * 8) as *mut usize) = obj; }
     MARK_LEN += 1;
 }
 
+/// Marks every object a word in [lo, hi) points into (the hot loop of the
+/// collector: memory accesses are written out instead of calling ld/ldb).
 pub(crate) fn scan_range(lo: usize, hi: usize) {
+    let arena = ARENA;
+    let next = ARENA_NEXT;
+    let pages = PAGES;
     let mut p = (lo + 7) / 8 * 8;
     while p + 8 <= hi {
-        mark_word(ld(p));
+        let w = unsafe { *(p as *const usize) };
         p += 8;
+        if w < arena || w >= next { continue; }
+        let s = unsafe { *((pages + ((w - arena) >> PAGE_SHIFT) * 8) as *const usize) } as *mut Span;
+        if s as usize == 0 { continue; }
+        unsafe {
+            let start = (*s).start;
+            let i = (w - start) / (*s).elem;
+            let n = (*s).nelems;
+            if i >= n { continue; }
+            let bits = (*s).bits as usize;
+            if *((bits + i) as *const u8) == 0 { continue; }
+            let m = (bits + n + i) as *mut u8;
+            if *m != 0 { continue; }
+            *m = 1;
+            if (*s).noscan { continue; }
+            push(start + i * (*s).elem);
+        }
     }
 }
 
 fn drain() {
     while MARK_LEN > 0 {
         MARK_LEN -= 1;
-        let obj = ld(MARK + MARK_LEN * 8);
-        let s = ld(PAGES + ((obj - ARENA) >> PAGE_SHIFT) * 8) as *mut Span;
+        let obj = unsafe { *((MARK + MARK_LEN * 8) as *const usize) };
+        let s = unsafe { *((PAGES + ((obj - ARENA) >> PAGE_SHIFT) * 8) as *const usize) } as *mut Span;
         let elem = unsafe { (*s).elem };
         scan_range(obj, obj + elem);
     }
@@ -331,16 +337,18 @@ fn sweep() {
             } else {
                 let mut free = 0usize;
                 let mut nfree = 0usize;
+                let start = (*s).start;
+                let elem = (*s).elem;
                 let mut i = n;
                 while i > 0 {
                     i -= 1;
-                    if ldb(bits + i) != 0 && ldb(bits + n + i) == 0 {
-                        stb(bits + i, 0);
-                    }
-                    stb(bits + n + i, 0);
-                    if ldb(bits + i) == 0 {
-                        let p = (*s).start + i * (*s).elem;
-                        st(p, free);
+                    let a = (bits + i) as *mut u8;
+                    let m = (bits + n + i) as *mut u8;
+                    if *a != 0 && *m == 0 { *a = 0; }
+                    *m = 0;
+                    if *a == 0 {
+                        let p = start + i * elem;
+                        *(p as *mut usize) = free;
                         free = p;
                         nfree += 1;
                     }
