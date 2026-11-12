@@ -76,7 +76,7 @@ static mut PAGES: usize = 0; // *mut *mut Span, one entry per page of the arena
 static mut ALL: usize = 0; // *mut Span: every span
 static mut FREE: [usize; 65] = [0; 65]; // spans with free objects per class and noscan; [64]: dead large spans
 static mut ALLOCATED: usize = 0;
-static mut NEXT_GC: usize = 33554432;
+static mut NEXT_GC: usize = 0;
 static mut LIVE: usize = 0;
 static mut COLLECTIONS: usize = 0;
 static mut MARK: usize = 0; // *mut usize
@@ -129,21 +129,55 @@ fn init() {
     PAGES = table;
     MARK_CAP = 4096;
     MARK = unsafe { calloc(MARK_CAP, 8) } as usize;
+    let mut k = 0;
+    while k <= MAX_SMALL / 16 {
+        CLASS_OF[k] = class_of(if k == 0 { 1 } else { k * 16 }) as u8;
+        k += 1;
+    }
+    NEXT_GC = MIN_GC;
 }
 
-/// Allocates size zeroed bytes. noscan objects hold no pointers.
+/// The size class of each size up to MAX_SMALL in 16-byte steps.
+static mut CLASS_OF: [u8; 513] = [0; 513];
+
+/// Allocates size zeroed bytes. noscan objects hold no pointers. The fast
+/// path (a free object in the first span of the size class) is written out
+/// in this one function.
 pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
-    if ARENA == 0 { init(); }
-    if ALLOCATED >= NEXT_GC { collect(); }
-    let n = if size == 0 { 1 } else { size };
-    let p = if n > MAX_SMALL { alloc_large(n, noscan) } else { alloc_small(class_of(n), noscan) };
-    p as *mut u8
+    if ALLOCATED >= NEXT_GC {
+        if ARENA == 0 { init(); } else { collect(); }
+    }
+    if size > MAX_SMALL { return alloc_large(size, noscan) as *mut u8; }
+    let c = CLASS_OF[(size + 15) >> 4] as usize;
+    let list = c * 2 + if noscan { 1 } else { 0 };
+    let s = FREE[list] as *mut Span;
+    unsafe {
+        if s as usize != 0 && (*s).nfree > 0 {
+            let p = (*s).freelist;
+            (*s).freelist = *(p as *const usize);
+            (*s).nfree -= 1;
+            let elem = (*s).elem;
+            let i = (p - (*s).start) / elem;
+            *(((*s).bits as usize + i) as *mut u8) = 1;
+            ALLOCATED += elem;
+            // Zero the object (the free list link is in its first word).
+            if elem <= 64 {
+                let mut q = p;
+                while q < p + elem {
+                    *(q as *mut usize) = 0;
+                    q += 8;
+                }
+            } else {
+                memset(p as *mut u8, 0, elem);
+            }
+            return p as *mut u8;
+        }
+    }
+    alloc_small(c, noscan) as *mut u8
 }
 
 fn class_of(size: usize) -> usize {
-    // Classes step by 16 up to 128 bytes.
-    if size <= 128 { return (size + 15) / 16 - 1; }
-    let mut c = 8;
+    let mut c = 0;
     while CLASSES[c] < size { c += 1; }
     c
 }
