@@ -86,7 +86,13 @@ pub fn subst(ctx: &mut Ctx, t: &Type, m: &ParamMap, self_ty: Option<&Type>) -> &
         K_REF => { let e = subst(ctx, t.el(), m, self_ty); ctx.reference(t.is_mut, e) }
         K_PTR => { let e = subst(ctx, t.el(), m, self_ty); ctx.ptr(t.is_mut, e) }
         K_SLICE => { let e = subst(ctx, t.el(), m, self_ty); ctx.slice(e) }
-        K_ARRAY => { let e = subst(ctx, t.el(), m, self_ty); ctx.array(e, t.len) }
+        K_ARRAY => {
+            let e = subst(ctx, t.el(), m, self_ty);
+            match t.ret {
+                Some(l) => { let ln = subst(ctx, l, m, self_ty); ctx.array_n(e, ln) }
+                None => ctx.array(e, t.len),
+            }
+        }
         K_TUPLE => { let es = subst_list(ctx, &t.elems, m, self_ty); ctx.tuple(es) }
         K_FN => {
             let ps = subst_list(ctx, &t.elems, m, self_ty);
@@ -139,7 +145,11 @@ pub fn mentions_self(t: &Type) -> bool {
 pub fn visit(t: &Type, f: fn(&Type)) {
     f(t);
     match t.kind {
-        K_REF | K_PTR | K_SLICE | K_ARRAY => visit(t.el(), f),
+        K_REF | K_PTR | K_SLICE => visit(t.el(), f),
+        K_ARRAY => {
+            visit(t.el(), f);
+            if let Some(l) = t.ret { visit(l, f); }
+        }
         K_TUPLE => { for e in t.elems.iter() { visit(*e, f); } }
         K_FN => {
             for e in t.elems.iter() { visit(*e, f); }
@@ -170,6 +180,10 @@ impl Collector {
             TypeKind::Slice { elem, .. } => { let el = self.lower_type(e, *elem); self.ctx().slice(el) }
             TypeKind::Array { elem, len, .. } => {
                 let el = self.lower_type(e, *elem);
+                if let Some(d) = self.const_param_expr(*len) {
+                    let p = self.ctx().param(d);
+                    return self.ctx().array_n(el, p);
+                }
                 let (n, ok) = self.eval_const(e.file, *len);
                 if !ok { return self.ctx().err; }
                 if n < 0 {
@@ -201,6 +215,12 @@ impl Collector {
             }
             TypeKind::Impl { .. } => self.lower_impl_trait(e, t),
             TypeKind::Never(_) => self.ctx().never,
+            TypeKind::Const(x) => {
+                if let Some(d) = self.const_param_expr(*x) { return self.ctx().param(d); }
+                let (n, ok) = self.eval_const(e.file, *x);
+                if !ok { return self.ctx().err; }
+                self.ctx().const_val(n)
+            }
             TypeKind::Infer(pos) => {
                 self.errorf(e.file, *pos, "the placeholder _ is not allowed in item signatures".to_string());
                 self.ctx().err
@@ -472,6 +492,36 @@ impl Collector {
             i += 1;
         }
         out
+    }
+
+    /// The const generic parameter that x (a path, or a block holding
+    /// only one) names, if any.
+    pub fn const_param_expr(&self, x: &ast::Expr) -> Option<&mut Def> {
+        match &x.kind {
+            ast::ExprKind::Path(p) => {
+                let r = self.info.res.paths.get(&p.id)?;
+                if r.kind == resolve::RES_DEF && crate::resolve::body::is_const_param(r.def) { return r.def; }
+                None
+            }
+            ast::ExprKind::Block(b) => {
+                if b.stmts.len() > 0 { return None; }
+                self.const_param_expr(b.tail?)
+            }
+            _ => None,
+        }
+    }
+
+    /// The value type of a const generic parameter (an integer, bool or
+    /// char type).
+    pub fn const_param_type(&self, d: &Def) -> &Type {
+        if let Node::Param(gp) = &d.node {
+            if let Some(t) = gp.ty {
+                if let TypeKind::Path(p) = &t.kind {
+                    if p.segments.len() == 1 { return self.prim(p.segments[0].name.value.as_str()); }
+                }
+            }
+        }
+        self.info.ctx.usize_()
     }
 
     pub fn prim(&self, name: &str) -> &Type {

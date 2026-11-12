@@ -50,7 +50,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 
 | Rust | navi 现在 | 原因 | 何时消除 |
 |---|---|---|---|
-| `impl From<[T; N]> for Vec<T>` | `impl From<&[T]> for Vec<T>` | const 泛型推到自举之后 | 支持 const 泛型后 |
+| `impl From<[T; N]> for Vec<T>` | navic：两者都有；stage0：只有 `impl From<&[T]> for Vec<T>` | stage0 没有 const 泛型 | — |
 
 ## 6. 新增的 API
 
