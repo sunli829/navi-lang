@@ -66,6 +66,11 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
 - Go 里遍历 map 会产生输出差异的地方，stage0 改成按记录顺序遍历（不改变行为，只让结果确定）：类型检查的结果记录、MIR 按定义顺序构建（闭包编号因此固定）、装箱时被取地址的局部变量按编号处理。
 - 发现并修正的 stage0 bug：发散的 then 分支、绑定类型未规范化、or 模式的绑定（每个分支一个新局部变量）、`&mut T: Clone`、const 每次使用都求值、静态初始化顺序。
 
+## M9（进行中）
+
+- 自研链接器（`compiler/src/link.navi`）：navic 直接产出 PIE 的 Mach-O arm64 可执行文件，导入函数经 stub + GOT 由 dyld 非惰性绑定，数据里的绝对指针由 dyld rebase（LC_DYLD_INFO_ONLY 的 opcode 格式），带 ad-hoc 代码签名（CodeDirectory，SHA-256 逐页哈希，`compiler/src/sha256.navi`），不再依赖 cc/ld；`NAVI_LINKER=cc` 仍可用系统链接器。自举（stage2 == stage3）和 22 个 golden 测试通过。
+- 性能：师傅定的目标是与 go build 持平，性能优先，其余 M9 特性延后。已做：GC 热路径手工内联、分级查表（自编译 48s → 33s）、lowering 的基址+偏移寻址和 switch 直落（→ 29.5s）。试过但回退：GOGC=200（快 15%，峰值内存 1.1GB → 1.5GB）、小函数内联（前端几乎无收益）。
+
 ## 下一步
 
 M9：性能（自研链接器、增量缓存、并行；生成代码的寄存器分配、内联、逃逸分析）和自举后的语言特性。按计划，从 M8 起新功能只加到 navic。
