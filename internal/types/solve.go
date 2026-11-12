@@ -75,6 +75,11 @@ func (fc *fnCtx) selectTrait(tr *TraitRef, depth int) (*selection, selStatus) {
 	}
 	var cands []cand
 
+	// An unknown self type could be anything: wait until it is known.
+	if self.Kind == KInfer && fc.in.vars[self.Var].kind == varGeneral {
+		return nil, selAmbig
+	}
+
 	// 1. Where clauses (including supertraits of them).
 	for _, p := range fc.preds {
 		if p.Trait != tr.Trait {
@@ -361,10 +366,8 @@ func (fc *fnCtx) normalize(t *Type) *Type {
 		if r := fc.normalizeProjNow(t.Def, tr); r != nil {
 			return r
 		}
-		self := fc.in.shallow(tr.Self)
-		if self.Kind != KInfer {
-			return ctx.Proj(t.Def, tr) // rigid
-		}
+		// Not decidable yet (the self type or a nested bound still has
+		// inference variables): stand in a variable and solve later.
 		v := fc.in.fresh()
 		fc.pending = append(fc.pending, &obligation{tr: tr, pos: fc.curPos, proj: &pendingProj{assoc: t.Def, target: v}})
 		return v

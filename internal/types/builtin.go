@@ -61,6 +61,30 @@ func (fc *fnCtx) builtin(tr *TraitRef, self *Type, depth int) (*selection, bool)
 		return false
 	}
 
+	// Operators on references to numbers (&i32 + i32, f64 * &f64, ...),
+	// which Rust provides with forward_ref impls in core.
+	switch name {
+	case "Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl", "Shr":
+		s0 := self
+		if s0.Kind == KRef && !s0.Mut {
+			s0 = in.shallow(s0.Elem)
+		}
+		r0 := in.shallow(rhs)
+		if r0.Kind == KRef && !r0.Mut {
+			r0 = in.shallow(r0.Elem)
+		}
+		if s0 != self || r0 != in.shallow(rhs) {
+			if k, isVar := in.varKindOf(s0); !(isNumT(s0) || s0.Kind == KBool || isVar && k != varGeneral) {
+				return nil, false
+			}
+			if name != "Shl" && name != "Shr" && !in.unify(s0, r0) {
+				return nil, false
+			}
+			sel.assoc["Output"] = s0
+			return sel, true
+		}
+	}
+
 	if base, ok := assignOps[name]; ok {
 		_ = base
 		switch {

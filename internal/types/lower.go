@@ -563,3 +563,6 @@ func visit(t *Type, f func(*Type)) {
 		}
 	}
 }
+
+// ParamMap maps the parameters of g to args.
+func ParamMap(g *Generics, args []*Type) map[*resolve.Def]*Type { return paramMap(g, args) }

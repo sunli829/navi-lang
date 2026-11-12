@@ -141,18 +141,7 @@ func (c *collector) newFnCtx(d *resolve.Def) *fnCtx {
 	if owner.Kind == resolve.DefTrait {
 		preds = append(preds, c.selfTraitRef(owner))
 	}
-	seen := map[string]bool{}
-	for _, p := range preds {
-		c.walkSupertraits(p, func(s *TraitRef) {
-			key := traitKey(s)
-			if !seen[key] {
-				seen[key] = true
-				fc.preds = append(fc.preds, s)
-			}
-		})
-		// Bounds declared on associated types of the bound traits are
-		// implied too (e.g. I::IntoIter: Iterator).
-	}
+	fc.preds = c.elaborate(preds)
 	return fc
 }
 
@@ -392,4 +381,50 @@ func replaceVar(s, name, with string) string {
 		b.WriteString(with)
 		s = s[end:]
 	}
+}
+
+// elaborate adds the predicates implied by preds: supertraits, and the
+// bounds declared on associated types (I: IntoIterator implies
+// <I as IntoIterator>::IntoIter: Iterator<Item = I::Item>).
+func (c *collector) elaborate(preds []*TraitRef) []*TraitRef {
+	var out []*TraitRef
+	seen := map[string]bool{}
+	var add func(tr *TraitRef, depth int)
+	add = func(tr *TraitRef, depth int) {
+		c.walkSupertraits(tr, func(s *TraitRef) {
+			key := traitKey(s)
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			out = append(out, s)
+			if depth > 4 {
+				return
+			}
+			ti := c.trait(s.Trait)
+			if ti == nil {
+				return
+			}
+			m := paramMap(ti.Generics, s.Args)
+			for _, it := range ti.Order {
+				if it.Kind != resolve.DefAssocType {
+					continue
+				}
+				ai := c.assocType(it)
+				if ai == nil || len(ai.Bounds) == 0 {
+					continue
+				}
+				self := c.info.Ctx.Proj(it, &TraitRef{Trait: s.Trait, Self: s.Self, Args: s.Args})
+				for _, b := range ai.Bounds {
+					nb := SubstTraitRef(c.info.Ctx, b, m, s.Self)
+					nb.Self = self
+					add(nb, depth+1)
+				}
+			}
+		})
+	}
+	for _, p := range preds {
+		add(p, 0)
+	}
+	return out
 }

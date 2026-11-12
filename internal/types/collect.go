@@ -60,6 +60,7 @@ func Collect(res *resolve.Info, errs *diag.Sink) *Info {
 		deriveCache: map[*resolve.Def]map[string]bool{},
 		paramOwner:  map[*TypeParam]*Generics{},
 	}
+	info.c = c
 	for _, d := range res.Defs {
 		switch d.Kind {
 		case resolve.DefAssocFn, resolve.DefAssocConst, resolve.DefAssocType:

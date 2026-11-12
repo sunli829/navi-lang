@@ -150,4 +150,6 @@ type Info struct {
 	// Hidden maps each opaque return type to the concrete type its function
 	// returns.
 	Hidden map[*Type]*Type
+
+	c *collector
 }

@@ -1,5 +1,7 @@
 //! Formatting: the traits behind template strings and #[derive(Debug)].
 
+use crate::string::String;
+
 pub type Result = crate::result::Result<(), Error>;
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -10,14 +12,59 @@ pub enum Alignment { Left, Right, Center }
 
 pub trait Write {
     fn write_str(&mut self, s: &str) -> Result;
-    fn write_char(&mut self, c: char) -> Result { todo() }
-    fn write_fmt(&mut self, args: Arguments) -> Result { todo() }
+    fn write_char(&mut self, c: char) -> Result {
+        let mut s = String::new();
+        s.push(c);
+        self.write_str(s.as_str())
+    }
+    fn write_fmt(&mut self, args: Arguments) -> Result { write(self, args) }
+}
+
+/// The format spec of one ${...} in a template string.
+#[derive(Clone)]
+pub struct Spec {
+    pub fill: char,
+    pub align: u8, // 0 unknown, 1 left, 2 right, 3 center
+    pub width: usize,
+    pub has_width: bool,
+    pub precision: usize,
+    pub has_precision: bool,
+    pub alternate: bool,
+    pub sign_plus: bool,
+    pub zero: bool,
+}
+
+/// A piece of a template string: literal text, or a value with its spec.
+pub enum Piece {
+    Lit(&str),
+    Arg(fn(&mut Formatter) -> Result, Spec),
 }
 
 /// A template string evaluated lazily: the interpolated values are captured
 /// when it is created and formatted when it is written.
 pub struct Arguments {
-    pieces: &[&str],
+    pieces: &[Piece],
+}
+
+/// Writes formatted arguments to an output.
+pub fn write(out: &mut dyn Write, args: Arguments) -> Result {
+    for p in args.pieces {
+        match p {
+            Piece::Lit(s) => { out.write_str(s)?; }
+            Piece::Arg(f, spec) => {
+                let mut fmt = Formatter::new(out, spec);
+                (*f)(&mut fmt)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Formats arguments into a String (what a template string evaluates to).
+pub fn format(args: Arguments) -> String {
+    let mut s = String::new();
+    let _ = write(&mut s, args);
+    s
 }
 
 pub struct Formatter {
@@ -28,10 +75,36 @@ pub struct Formatter {
     align: Option<Alignment>,
     alternate: bool,
     sign_plus: bool,
+    zero: bool,
 }
 
 impl Formatter {
-    pub fn write_fmt(&mut self, args: Arguments) -> Result { todo() }
+    fn new(out: &mut dyn Write, spec: &Spec) -> Formatter {
+        let align = match spec.align {
+            1 => Some(Alignment::Left),
+            2 => Some(Alignment::Right),
+            3 => Some(Alignment::Center),
+            _ => None,
+        };
+        Formatter {
+            out,
+            width: if spec.has_width { Some(spec.width) } else { None },
+            precision: if spec.has_precision { Some(spec.precision) } else { None },
+            fill: spec.fill,
+            align,
+            alternate: spec.alternate,
+            sign_plus: spec.sign_plus,
+            zero: spec.zero,
+        }
+    }
+
+    /// A formatter writing to out with the flags of other (used for
+    /// nested values in pretty debug output).
+    fn wrap(out: &mut dyn Write, other: &Formatter) -> Formatter {
+        Formatter { out, width: None, precision: None, fill: ' ', align: None, alternate: other.alternate, sign_plus: false, zero: false }
+    }
+
+    pub fn write_fmt(&mut self, args: Arguments) -> Result { write(self.out, args) }
     pub fn write_str(&mut self, s: &str) -> Result { self.out.write_str(s) }
     pub fn width(&self) -> Option<usize> { self.width }
     pub fn precision(&self) -> Option<usize> { self.precision }
@@ -39,43 +112,292 @@ impl Formatter {
     pub fn align(&self) -> Option<Alignment> { self.align.clone() }
     pub fn alternate(&self) -> bool { self.alternate }
     pub fn sign_plus(&self) -> bool { self.sign_plus }
-    pub fn pad(&mut self, s: &str) -> Result { todo() }
-    pub fn pad_integral(&mut self, is_nonnegative: bool, prefix: &str, digits: &str) -> Result { todo() }
-    pub fn debug_struct(&mut self, name: &str) -> DebugStruct { todo() }
-    pub fn debug_tuple(&mut self, name: &str) -> DebugTuple { todo() }
-    pub fn debug_list(&mut self) -> DebugList { todo() }
-    pub fn debug_set(&mut self) -> DebugSet { todo() }
-    pub fn debug_map(&mut self) -> DebugMap { todo() }
+
+    fn write_fill(&mut self, n: usize) -> Result {
+        let mut i = 0;
+        while i < n {
+            self.out.write_char(self.fill)?;
+            i += 1;
+        }
+        Ok(())
+    }
+
+    // Writes s padded to the width; default_align applies without an
+    // explicit alignment.
+    fn padded(&mut self, s: &str, default_align: u8) -> Result {
+        let len = s.chars().count();
+        let width = match self.width { Some(w) => w, None => 0 };
+        if len >= width {
+            return self.out.write_str(s);
+        }
+        let pad = width - len;
+        let align = match self.align {
+            Some(Alignment::Left) => 1,
+            Some(Alignment::Right) => 2,
+            Some(Alignment::Center) => 3,
+            None => default_align,
+        };
+        let (before, after) = match align {
+            1 => (0, pad),
+            3 => (pad / 2, pad - pad / 2),
+            _ => (pad, 0),
+        };
+        self.write_fill(before)?;
+        self.out.write_str(s)?;
+        self.write_fill(after)
+    }
+
+    /// Writes s, applying precision (truncation) and width.
+    pub fn pad(&mut self, s: &str) -> Result {
+        match self.precision {
+            Some(p) => {
+                let mut t = String::new();
+                for c in s.chars().take(p) { t.push(c); }
+                self.padded(t.as_str(), 1)
+            }
+            None => self.padded(s, 1),
+        }
+    }
+
+    /// Writes a number given its digits: adds the sign, the prefix (with
+    /// #), and zero or fill padding.
+    pub fn pad_integral(&mut self, is_nonnegative: bool, prefix: &str, digits: &str) -> Result {
+        let mut head = String::new();
+        if !is_nonnegative {
+            head.push('-');
+        } else if self.sign_plus {
+            head.push('+');
+        }
+        if self.alternate {
+            head.push_str(prefix);
+        }
+        let width = match self.width { Some(w) => w, None => 0 };
+        let len = head.len() + digits.len();
+        if self.zero && len < width {
+            self.out.write_str(head.as_str())?;
+            let mut i = 0;
+            while i < width - len {
+                self.out.write_char('0')?;
+                i += 1;
+            }
+            return self.out.write_str(digits);
+        }
+        head.push_str(digits);
+        self.padded(head.as_str(), 2)
+    }
+
+    pub fn debug_struct(&mut self, name: &str) -> DebugStruct {
+        let result = self.write_str(name);
+        DebugStruct { fmt: self, result, has_fields: false }
+    }
+
+    pub fn debug_tuple(&mut self, name: &str) -> DebugTuple {
+        let result = self.write_str(name);
+        DebugTuple { fmt: self, result, fields: 0, empty_name: name.is_empty() }
+    }
+
+    pub fn debug_list(&mut self) -> DebugList {
+        let result = self.write_str("[");
+        DebugList { fmt: self, result, has_fields: false }
+    }
+
+    pub fn debug_set(&mut self) -> DebugSet {
+        let result = self.write_str("{");
+        DebugSet { fmt: self, result, has_fields: false }
+    }
+
+    pub fn debug_map(&mut self) -> DebugMap {
+        let result = self.write_str("{");
+        DebugMap { fmt: self, result, has_fields: false }
+    }
+}
+
+/// Indents everything written through it (for {:#?}).
+struct PadAdapter {
+    inner: &mut dyn Write,
+    on_newline: bool,
+}
+
+impl Write for PadAdapter {
+    fn write_str(&mut self, s: &str) -> Result {
+        for c in s.chars() {
+            if self.on_newline {
+                self.inner.write_str("    ")?;
+            }
+            self.on_newline = c == '\n';
+            self.inner.write_char(c)?;
+        }
+        Ok(())
+    }
+}
+
+/// Writes one entry of a pretty-printed composite: indented, then ",\n".
+fn pretty_entry(fmt: &mut Formatter, prefix: &str, value: &dyn Debug) -> Result {
+    let mut pad = PadAdapter { inner: fmt.out, on_newline: true };
+    let mut f2 = Formatter::wrap(&mut pad, fmt);
+    f2.write_str(prefix)?;
+    value.fmt(&mut f2)?;
+    f2.write_str(",\n")
 }
 
 pub struct DebugStruct { fmt: &mut Formatter, result: Result, has_fields: bool }
+
 impl DebugStruct {
-    pub fn field(&mut self, name: &str, value: &dyn Debug) -> &mut DebugStruct { todo() }
-    pub fn finish(&mut self) -> Result { todo() }
+    pub fn field(&mut self, name: &str, value: &dyn Debug) -> &mut DebugStruct {
+        if self.result.is_ok() {
+            self.result = if self.fmt.alternate {
+                let open = if self.has_fields { Ok(()) } else { self.fmt.write_str(" {\n") };
+                match open {
+                    Ok(_) => {
+                        let mut prefix = String::from(name);
+                        prefix.push_str(": ");
+                        pretty_entry(self.fmt, prefix.as_str(), value)
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                let sep = if self.has_fields { ", " } else { " { " };
+                match self.fmt.write_str(sep) {
+                    Ok(_) => match self.fmt.write_str(name) {
+                        Ok(_) => match self.fmt.write_str(": ") {
+                            Ok(_) => value.fmt(self.fmt),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            };
+        }
+        self.has_fields = true;
+        self
+    }
+
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() && self.has_fields {
+            self.result = if self.fmt.alternate { self.fmt.write_str("}") } else { self.fmt.write_str(" }") };
+        }
+        self.result.clone()
+    }
 }
 
-pub struct DebugTuple { fmt: &mut Formatter, result: Result, fields: usize }
+pub struct DebugTuple { fmt: &mut Formatter, result: Result, fields: usize, empty_name: bool }
+
 impl DebugTuple {
-    pub fn field(&mut self, value: &dyn Debug) -> &mut DebugTuple { todo() }
-    pub fn finish(&mut self) -> Result { todo() }
+    pub fn field(&mut self, value: &dyn Debug) -> &mut DebugTuple {
+        if self.result.is_ok() {
+            self.result = if self.fmt.alternate {
+                let open = if self.fields > 0 { Ok(()) } else { self.fmt.write_str("(\n") };
+                match open {
+                    Ok(_) => pretty_entry(self.fmt, "", value),
+                    Err(e) => Err(e),
+                }
+            } else {
+                let sep = if self.fields > 0 { ", " } else { "(" };
+                match self.fmt.write_str(sep) {
+                    Ok(_) => value.fmt(self.fmt),
+                    Err(e) => Err(e),
+                }
+            };
+        }
+        self.fields += 1;
+        self
+    }
+
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() && self.fields > 0 {
+            if self.fields == 1 && self.empty_name && !self.fmt.alternate {
+                self.result = self.fmt.write_str(",");
+            }
+            if self.result.is_ok() {
+                self.result = self.fmt.write_str(")");
+            }
+        }
+        self.result.clone()
+    }
 }
 
 pub struct DebugList { fmt: &mut Formatter, result: Result, has_fields: bool }
+
 impl DebugList {
-    pub fn entry(&mut self, value: &dyn Debug) -> &mut DebugList { todo() }
-    pub fn finish(&mut self) -> Result { todo() }
+    pub fn entry(&mut self, value: &dyn Debug) -> &mut DebugList {
+        if self.result.is_ok() {
+            self.result = if self.fmt.alternate {
+                let open = if self.has_fields { Ok(()) } else { self.fmt.write_str("\n") };
+                match open {
+                    Ok(_) => pretty_entry(self.fmt, "", value),
+                    Err(e) => Err(e),
+                }
+            } else {
+                let sep = if self.has_fields { self.fmt.write_str(", ") } else { Ok(()) };
+                match sep {
+                    Ok(_) => value.fmt(self.fmt),
+                    Err(e) => Err(e),
+                }
+            };
+        }
+        self.has_fields = true;
+        self
+    }
+
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() {
+            self.result = self.fmt.write_str("]");
+        }
+        self.result.clone()
+    }
 }
 
 pub struct DebugSet { fmt: &mut Formatter, result: Result, has_fields: bool }
+
 impl DebugSet {
-    pub fn entry(&mut self, value: &dyn Debug) -> &mut DebugSet { todo() }
-    pub fn finish(&mut self) -> Result { todo() }
+    pub fn entry(&mut self, value: &dyn Debug) -> &mut DebugSet {
+        if self.result.is_ok() {
+            let sep = if self.has_fields { self.fmt.write_str(", ") } else { Ok(()) };
+            self.result = match sep {
+                Ok(_) => value.fmt(self.fmt),
+                Err(e) => Err(e),
+            };
+        }
+        self.has_fields = true;
+        self
+    }
+
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() {
+            self.result = self.fmt.write_str("}");
+        }
+        self.result.clone()
+    }
 }
 
 pub struct DebugMap { fmt: &mut Formatter, result: Result, has_fields: bool }
+
 impl DebugMap {
-    pub fn entry(&mut self, key: &dyn Debug, value: &dyn Debug) -> &mut DebugMap { todo() }
-    pub fn finish(&mut self) -> Result { todo() }
+    pub fn entry(&mut self, key: &dyn Debug, value: &dyn Debug) -> &mut DebugMap {
+        if self.result.is_ok() {
+            let sep = if self.has_fields { self.fmt.write_str(", ") } else { Ok(()) };
+            self.result = match sep {
+                Ok(_) => match key.fmt(self.fmt) {
+                    Ok(_) => match self.fmt.write_str(": ") {
+                        Ok(_) => value.fmt(self.fmt),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+        }
+        self.has_fields = true;
+        self
+    }
+
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() {
+            self.result = self.fmt.write_str("}");
+        }
+        self.result.clone()
+    }
 }
 
 pub trait Display { fn fmt(&self, f: &mut Formatter) -> Result; }
@@ -88,9 +410,17 @@ pub trait LowerExp { fn fmt(&self, f: &mut Formatter) -> Result; }
 pub trait UpperExp { fn fmt(&self, f: &mut Formatter) -> Result; }
 
 impl Display for Arguments {
-    fn fmt(&self, f: &mut Formatter) -> Result { f.write_fmt(self.clone_args()) }
+    fn fmt(&self, f: &mut Formatter) -> Result {
+        write(f.out, Arguments { pieces: self.pieces })
+    }
 }
 
-impl Arguments {
-    fn clone_args(&self) -> Arguments { Arguments { pieces: self.pieces } }
+impl Debug for Arguments {
+    fn fmt(&self, f: &mut Formatter) -> Result {
+        write(f.out, Arguments { pieces: self.pieces })
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> Result { f.pad("an error occurred when formatting an argument") }
 }
