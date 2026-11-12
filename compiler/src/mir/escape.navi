@@ -232,6 +232,10 @@ struct Escape {
     lang_of: HashMap<u32, String>,
     changed: bool,
     debug: String,
+    /// The functions whose summaries the graph being built used.
+    used: Vec<u32>,
+    /// Per function id, the functions whose graphs use its summary.
+    users: HashMap<u32, Vec<u32>>,
 }
 
 fn unknown_summary(nargs: usize) -> Summary {
@@ -258,7 +262,7 @@ fn merge(s: &mut Summary, t: Summary) {
 impl Escape {
     /// The summary of a call through fn_op with nargs arguments (None:
     /// unknown callee).
-    fn callee(&self, fn_op: &Operand, nargs: usize) -> Option<Summary> {
+    fn callee(&mut self, fn_op: &Operand, nargs: usize) -> Option<Summary> {
         if fn_op.kind != OP_CONST { return None; }
         let c = fn_op.cnst.unwrap();
         if c.kind != C_FN { return None; }
@@ -317,7 +321,8 @@ impl Escape {
         }
     }
 
-    fn summary_of(&self, f: &Func, nargs: usize) -> Summary {
+    fn summary_of(&mut self, f: &Func, nargs: usize) -> Summary {
+        self.used.push(f.id);
         match self.summaries.get(&f.id) {
             Some(s) => if s.esc.len() == nargs + 1 { s.clone() } else { unknown_summary(nargs) },
             None => empty_summary(nargs),
@@ -325,7 +330,7 @@ impl Escape {
     }
 
     /// Builds the points-to graph of f.
-    fn graph(&self, f: &Func) -> &mut Graph {
+    fn graph(&mut self, f: &Func) -> &mut Graph {
         let n = f.locals.len();
         let g = new_graph(n);
         for b in f.blocks.iter() {
@@ -450,7 +455,7 @@ impl Escape {
     }
 
     /// The locals of f whose address may stay in the frame.
-    fn keep(&self, f: &Func) -> Vec<bool> {
+    fn keep(&mut self, f: &Func) -> Vec<bool> {
         let g = self.graph(f);
         let n = f.locals.len();
         // Memory f does not own: reachable from what its parameters, closure
@@ -674,7 +679,7 @@ fn loop_blocks(f: &Func) -> Vec<bool> {
 /// Runs the analysis over all functions and returns, per function id, the
 /// locals whose address may stay in the frame.
 pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<bool>> {
-    let e = &mut Escape { summaries: HashMap::new(), by_def: HashMap::new(), impls: HashMap::new(), lang_of: HashMap::new(), changed: true,
+    let e = &mut Escape { summaries: HashMap::new(), by_def: HashMap::new(), impls: HashMap::new(), lang_of: HashMap::new(), changed: true, used: Vec::new(), users: HashMap::new(),
         debug: match std::env::var("NAVI_ESCDEBUG") { Ok(v) => v, Err(_) => String::new() } };
     for (name, d) in info.lang.iter() { e.lang_of.insert(d.id, name.clone()); }
     for f in funcs.iter() {
@@ -702,10 +707,38 @@ pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<
             }
         }
     }
+    // Summaries to a fixed point; after the first round only the users of
+    // changed summaries are recomputed.
+    let mut by_id: HashMap<u32, &mut Func> = HashMap::new();
+    for f in funcs.iter() { by_id.insert(f.id, *f); }
+    let mut todo: Vec<&mut Func> = funcs.clone();
     let mut rounds = 0;
-    while e.changed && rounds < 30 {
-        e.changed = false;
-        for f in funcs.iter() { e.summarize(*f); }
+    while todo.len() > 0 && rounds < 30 {
+        let mut changed: Vec<u32> = Vec::new();
+        for f in todo.iter() {
+            e.used = Vec::new();
+            e.changed = false;
+            e.summarize(*f);
+            if rounds == 0 {
+                for u in e.used.iter() {
+                    if !e.users.contains_key(u) { e.users.insert(*u, Vec::new()); }
+                    let mut us = e.users[u];
+                    if us.len() == 0 || us[us.len() - 1] != f.id { us.push(f.id); }
+                }
+            }
+            if e.changed { changed.push(f.id); }
+        }
+        let mut seen: HashMap<u32, bool> = HashMap::new();
+        todo = Vec::new();
+        for c in changed.iter() {
+            if let Some(us) = e.users.get(c) {
+                for u in us.iter() {
+                    if seen.contains_key(u) { continue; }
+                    seen.insert(*u, true);
+                    if let Some(f) = by_id.get(u) { todo.push(*f); }
+                }
+            }
+        }
         rounds += 1;
     }
     let mut keep: HashMap<u32, Vec<bool>> = HashMap::new();
