@@ -12,6 +12,8 @@ type SourceFile struct {
 	Items []Item
 }
 
+func (f *SourceFile) Pos() Pos { return 0 }
+
 // ---------------------------------------------------------------------------
 // Common pieces
 
@@ -98,6 +100,8 @@ type GenericParam struct {
 	Name   *Name
 	Bounds []*Path
 }
+
+func (g *GenericParam) Pos() Pos { return g.Name.NamePos }
 
 // WherePredicate is Type: A + B in a where clause.
 type WherePredicate struct {
@@ -194,6 +198,8 @@ type Variant struct {
 	Fields       []*Field
 	Discriminant Expr // = value, or nil
 }
+
+func (v *Variant) Pos() Pos { return v.Name.NamePos }
 
 // TypeAlias is type Name<T> = Type; In a trait it may have no Type.
 type TypeAlias struct {

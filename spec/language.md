@@ -489,6 +489,7 @@ let s: String = p.to_string();
 | `#[track_caller]` | 隐式传入调用位置 |
 | `#[repr(C)]`、`#[repr(u8)]` | 内存布局 |
 | `#[link(name = "...")]`、`#[export_name = "..."]`、`#[asm]` | FFI 和 runtime 用 |
+| `#[intrinsic]` | 声明由编译器实现的函数（没有函数体），只有 std 能用 |
 | `#[deprecated]`、`#[allow(...)]`、`#[must_use]` | 诊断 |
 
 ## 1.16 unsafe 与 FFI

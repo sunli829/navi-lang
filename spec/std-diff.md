@@ -43,7 +43,15 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | 线程里 panic | 只结束该线程，`join()` 返回 `Err` | 结束整个进程；`join()` 保留 `-> thread::Result<T>` 签名，等有了 `catch_unwind` 才会返回 `Err` |
 | `&T` | 共享借用，保证期间没有人写 | 浅只读：只禁止通过这条路径直接写，不保证别人没在写（见 language.md 1.3） |
 
-## 5. 新增的 API
+## 5. 暂时的差异（等对应的语言特性实现后消除）
+
+| Rust | navi 现在 | 原因 | 何时消除 |
+|---|---|---|---|
+| `PartialEq<Rhs = Self>`、`PartialOrd<Rhs = Self>` | `PartialEq`、`PartialOrd`，不带类型参数，只能和 `Self` 比较 | 默认类型参数推到自举之后 | 支持默认类型参数后 |
+| `Add<Rhs = Self>` 等运算符 trait | `Add<Rhs>` 等，`Rhs` 必须写出来 | 同上 | 同上 |
+| `impl From<[T; N]> for Vec<T>` | `impl From<&[T]> for Vec<T>` | const 泛型推到自举之后 | 支持 const 泛型后 |
+
+## 6. 新增的 API
 
 | API | 说明 |
 |---|---|
