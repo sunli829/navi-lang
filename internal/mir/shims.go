@@ -882,3 +882,31 @@ func (s *sb) derived(trait string, self *types.Type, targs []*types.Type) {
 		panic("mir: no derived shim for " + trait)
 	}
 }
+
+// CtorThunk returns a function that builds a struct or variant from its
+// arguments, for constructors used as function values (`.map(Some)`).
+func (p *Program) CtorThunk(def *resolve.Def, adt *types.Type) *Func {
+	key := fmt.Sprintf("ctor.%p.%p", def, adt)
+	if f := p.shims[key]; f != nil {
+		return f
+	}
+	lay := layout.New(p.Info)
+	variant := -1
+	if def.Kind == resolve.DefVariant {
+		variant = variantIndex(p.Info, def)
+	}
+	fts := lay.FieldTypes(adt, variant)
+	f := &Func{Name: "ctor " + def.Name, Shim: true, NArgs: len(fts)}
+	f.Locals = append(f.Locals, &Local{Type: adt})
+	ops := make([]Operand, len(fts))
+	for i, ft := range fts {
+		f.Locals = append(f.Locals, &Local{Type: ft})
+		ops[i] = Copy(LocalPlace(i + 1))
+	}
+	f.Blocks = []*Block{{
+		Stmts: []Stmt{Assign{Place: LocalPlace(0), Rv: Aggregate{Kind: AggAdt, Type: adt, Variant: max(variant, 0), Ops: ops}}},
+		Term:  Return{},
+	}}
+	p.shims[key] = f
+	return f
+}

@@ -80,7 +80,15 @@ func (info *Info) ResolveMethod(method *resolve.Def, self *Type, args []*Type) *
 		traitArgs, ownArgs = args[:nTrait], args[nTrait:]
 	}
 	if self.Kind == KDyn {
-		return &Instance{Def: method, Args: args, Self: self, Virtual: true}
+		// Methods of the dyn's own traits dispatch through the vtable; other
+		// traits (ToString for dyn Display) are found through impls below.
+		for _, b := range self.Bounds {
+			for _, sup := range info.Supertraits(&TraitRef{Trait: b.Trait, Self: self, Args: b.Args}) {
+				if sup.Trait == trait {
+					return &Instance{Def: method, Args: args, Self: self, Virtual: true}
+				}
+			}
+		}
 	}
 	fc := info.scratch(nil)
 	c.quiet++
