@@ -114,6 +114,9 @@ type builder struct {
 	closureCaps map[*syntax.ClosureExpr][]*resolve.Local
 	// deferClosures holds the closures standing for `defer { ... }` blocks.
 	deferClosures map[*syntax.BlockExpr]*syntax.ClosureExpr
+	// orBound holds the places of the bindings of the or-pattern being
+	// lowered.
+	orBound map[*resolve.Local]Place
 }
 
 func newBuilder(p *Program, def *resolve.Def, body *types.BodyInfo) *builder {

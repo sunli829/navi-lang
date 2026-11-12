@@ -1,0 +1,425 @@
+//! Name resolution: loads crates (following mod declarations and
+//! #[cfg]), builds the module tree and resolves every name to its
+//! definition.
+
+pub mod cfg;
+pub mod load;
+pub mod imports;
+pub mod body;
+
+use std::collections::HashMap;
+use crate::syntax::ast::*;
+use crate::syntax::source::{File, Pos};
+use crate::diag::{Sink, Error};
+
+pub type DefKind = u8;
+pub const DEF_MOD: DefKind = 0;
+pub const DEF_STRUCT: DefKind = 1;
+pub const DEF_ENUM: DefKind = 2;
+pub const DEF_VARIANT: DefKind = 3;
+pub const DEF_TRAIT: DefKind = 4;
+pub const DEF_TYPE_ALIAS: DefKind = 5;
+pub const DEF_FN: DefKind = 6;
+pub const DEF_CONST: DefKind = 7;
+pub const DEF_STATIC: DefKind = 8;
+pub const DEF_IMPL: DefKind = 9;
+pub const DEF_ASSOC_FN: DefKind = 10;
+pub const DEF_ASSOC_CONST: DefKind = 11;
+pub const DEF_ASSOC_TYPE: DefKind = 12;
+pub const DEF_TYPE_PARAM: DefKind = 13;
+pub const DEF_EXTERN_FN: DefKind = 14;
+pub const DEF_EXTERN_STATIC: DefKind = 15;
+
+const DEF_KIND_NAMES: [&str; 16] = ["module", "struct", "enum", "variant", "trait", "type alias", "function",
+    "constant", "static", "impl", "associated function", "associated constant", "associated type",
+    "type parameter", "extern function", "extern static"];
+
+pub fn def_kind_name(k: DefKind) -> &str { DEF_KIND_NAMES[k as usize] }
+
+/// The declaring AST node of a definition or local.
+#[derive(Clone)]
+pub enum Node {
+    None,
+    Item(Item),
+    Variant(&Variant),
+    Param(&GenericParam),
+    Expr(&Expr),
+    Type(&Type),
+}
+
+impl Node {
+    pub fn id(&self) -> u32 {
+        match self {
+            Node::None => 0,
+            Node::Item(it) => it.id(),
+            Node::Variant(v) => v.id,
+            Node::Param(p) => p.id,
+            Node::Expr(x) => x.id,
+            Node::Type(t) => t.id,
+        }
+    }
+
+    pub fn is_none(&self) -> bool { match self { Node::None => true, _ => false } }
+
+    pub fn fn_decl(&self) -> Option<&mut FnDecl> {
+        match self { Node::Item(Item::Fn(f)) => Some(*f), _ => None }
+    }
+}
+
+/// A named (or, for impls, anonymous) definition.
+pub struct Def {
+    pub id: u32,
+    pub kind: DefKind,
+    pub name: String,
+    pub krate: &mut Crate,
+    pub file: Option<&File>,
+    pub pos: Pos,
+    pub node: Node,
+    pub parent: Option<&mut Def>,
+    pub vis: Visibility,
+    pub module: Option<&mut Module>,
+    pub ctor: bool,
+}
+
+impl Def {
+    pub fn is(&self, other: &Def) -> bool { self.id == other.id }
+}
+
+pub fn same_def(a: Option<&mut Def>, b: Option<&mut Def>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.id == y.id,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+pub type Namespace = usize;
+pub const TYPE_NS: Namespace = 0;
+pub const VALUE_NS: Namespace = 1;
+
+/// Where a definition or import can be named from: anywhere (pub) or
+/// inside a module and its descendants.
+#[derive(Clone)]
+pub struct Visibility {
+    pub restricted: Option<&mut Module>,
+}
+
+pub fn public() -> Visibility { Visibility { restricted: None } }
+
+impl Visibility {
+    pub fn accessible_from(&self, m: &Module) -> bool {
+        match self.restricted {
+            None => true,
+            Some(r) => m.is_descendant_of(r),
+        }
+    }
+}
+
+/// A module, a crate root, an enum (holding its variants) or the
+/// anonymous scope of a block that declares items.
+pub struct Module {
+    pub id: u32,
+    pub def: Option<&mut Def>,
+    pub krate: &mut Crate,
+    pub parent: Option<&mut Module>,
+    pub name: String,
+    pub anonymous: bool,
+    pub is_enum: bool,
+    pub dir: String,
+    pub bindings: Vec<HashMap<String, &mut Binding>>,
+    pub globs: Vec<HashMap<String, Vec<&mut Binding>>>,
+    pub glob_srcs: Vec<&mut Import>,
+    pub children: Vec<&mut Module>,
+    pub file: Option<&File>,
+    pub items: Vec<Item>,
+    pub underscore_traits: Vec<&mut Def>,
+}
+
+static mut NEXT_MODULE: u32 = 1;
+
+pub fn new_module(c: &mut Crate, parent: Option<&mut Module>, name: &str) -> &mut Module {
+    let mut b = Vec::new();
+    b.push(HashMap::new());
+    b.push(HashMap::new());
+    let mut g = Vec::new();
+    g.push(HashMap::new());
+    g.push(HashMap::new());
+    let m = &mut Module { id: NEXT_MODULE, def: None, krate: c, parent, name: name.to_string(), anonymous: false,
+        is_enum: false, dir: String::new(), bindings: b, globs: g, glob_srcs: Vec::new(), children: Vec::new(),
+        file: None, items: Vec::new(), underscore_traits: Vec::new() };
+    NEXT_MODULE += 1;
+    if let Some(p) = parent { p.children.push(m); }
+    m
+}
+
+impl Module {
+    pub fn is(&self, other: &Module) -> bool { self.id == other.id }
+
+    /// The module's path such as std::fmt.
+    pub fn path(&self) -> String {
+        match self.parent {
+            None => self.krate.name.clone(),
+            Some(p) => if self.anonymous { `${p.path()}::{block}` } else { `${p.path()}::${self.name}` },
+        }
+    }
+
+    pub fn is_descendant_of(&self, anc: &Module) -> bool {
+        if self.id == anc.id { return true; }
+        let mut x = self.parent;
+        while let Some(m) = x {
+            if m.id == anc.id { return true; }
+            x = m.parent;
+        }
+        false
+    }
+
+    /// m, or the closest enclosing non-block module.
+    pub fn nearest_named(&mut self) -> &mut Module {
+        let mut m = self;
+        while m.anonymous { m = m.parent.unwrap(); }
+        m
+    }
+
+    /// The binding of name in ns, ignoring visibility: an item or single
+    /// import, else an unambiguous glob import.
+    pub fn lookup(&self, name: &str, ns: Namespace) -> Option<&mut Binding> {
+        if let Some(b) = self.bindings[ns].get(&name.to_string()) { return Some(*b); }
+        if let Some(gs) = self.globs[ns].get(&name.to_string()) {
+            if gs.len() > 0 {
+                let mut i = 1;
+                while i < gs.len() {
+                    if !same_res(&gs[i].res, &gs[0].res) { return None; }
+                    i += 1;
+                }
+                return Some(gs[0]);
+            }
+        }
+        None
+    }
+
+    /// The traits whose methods can be called in m: traits named in m (and
+    /// enclosing block scopes), imported with `as _`, or in the prelude.
+    /// Sorted by definition id for a stable order.
+    pub fn traits_in_scope(&mut self) -> Vec<&mut Def> {
+        let mut seen: HashMap<u32, bool> = HashMap::new();
+        let mut out: Vec<&mut Def> = Vec::new();
+        let mut x: Option<&mut Module> = Some(self);
+        while let Some(m) = x {
+            add_module_traits(m, &mut seen, &mut out);
+            if !m.anonymous { break; }
+            x = m.parent;
+        }
+        if let Some(p) = self.krate.prelude { add_module_traits(p, &mut seen, &mut out); }
+        out.sort_by_key(|d| d.id);
+        out
+    }
+}
+
+fn add_module_traits(x: &Module, seen: &mut HashMap<u32, bool>, out: &mut Vec<&mut Def>) {
+    for (_, b) in x.bindings[TYPE_NS].iter() { add_trait(b.res.def, seen, out); }
+    for (_, bs) in x.globs[TYPE_NS].iter() {
+        for b in bs.iter() { add_trait(b.res.def, seen, out); }
+    }
+    for d in x.underscore_traits.iter() { add_trait(Some(*d), seen, out); }
+}
+
+fn add_trait(d: Option<&mut Def>, seen: &mut HashMap<u32, bool>, out: &mut Vec<&mut Def>) {
+    if let Some(def) = d {
+        if def.kind == DEF_TRAIT && !seen.contains_key(&def.id) {
+            seen.insert(def.id, true);
+            out.push(def);
+        }
+    }
+}
+
+/// The module a definition is declared in.
+pub fn module_of(d: &Def) -> Option<&mut Module> {
+    let mut x = d.parent;
+    while let Some(p) = x {
+        if p.kind == DEF_MOD {
+            if let Some(m) = p.module { return Some(m); }
+        }
+        x = p.parent;
+    }
+    if d.kind == DEF_MOD { return d.module; }
+    None
+}
+
+/// A name bound in a module: an item defined there, or an import.
+pub struct Binding {
+    pub res: Res,
+    pub vis: Visibility,
+    pub import: Option<&mut Import>,
+}
+
+/// One leaf of a use tree.
+pub struct Import {
+    pub module: &mut Module,
+    pub file: &File,
+    pub segs: Vec<&Name>,
+    pub name: String,
+    pub pos: Pos,
+    pub glob: bool,
+    pub vis: Visibility,
+    pub done: bool,
+}
+
+pub type ResKind = u8;
+pub const RES_ERR: ResKind = 0;
+pub const RES_DEF: ResKind = 1;
+pub const RES_LOCAL: ResKind = 2;
+pub const RES_PRIM: ResKind = 3;
+pub const RES_SELF_TY: ResKind = 4;
+pub const RES_CRATE: ResKind = 5;
+pub const RES_QUALIFIED: ResKind = 6;
+
+/// The result of resolving a path. rest holds trailing segments naming
+/// associated items (Vec::new, T::Item); the type checker resolves them.
+#[derive(Clone)]
+pub struct Res {
+    pub kind: ResKind,
+    pub def: Option<&mut Def>,
+    pub local: Option<&mut Local>,
+    pub prim: String,
+    pub rest: Vec<&PathSegment>,
+}
+
+pub fn res_err() -> Res { Res { kind: RES_ERR, def: None, local: None, prim: String::new(), rest: Vec::new() } }
+pub fn res_def(d: &mut Def) -> Res { Res { kind: RES_DEF, def: Some(d), local: None, prim: String::new(), rest: Vec::new() } }
+pub fn res_kind_def(kind: ResKind, d: &mut Def) -> Res { Res { kind, def: Some(d), local: None, prim: String::new(), rest: Vec::new() } }
+
+pub fn same_res(a: &Res, b: &Res) -> bool {
+    a.kind == b.kind && same_def(a.def, b.def) && a.prim == b.prim
+}
+
+/// A local variable, parameter or pattern binding.
+pub struct Local {
+    pub id: u32,
+    pub name: String,
+    pub pos: Pos,
+    pub is_mut: bool,
+    /// The function or closure that declares the local.
+    pub fn_node: Node,
+}
+
+pub fn is_primitive(name: &str) -> bool {
+    name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "isize" || name == "u8" || name == "u16"
+        || name == "u32" || name == "u64" || name == "usize" || name == "f32" || name == "f64" || name == "bool"
+        || name == "char" || name == "str"
+}
+
+/// A crate to load: Root is the path of the root file inside FsRoot.
+pub struct CrateSpec {
+    pub name: String,
+    pub fs_root: String,
+    pub root: String,
+    pub deps: Vec<String>,
+    pub dir: String,
+}
+
+/// A loaded crate.
+pub struct Crate {
+    pub name: String,
+    pub dir: String,
+    pub fs_root: String,
+    pub root: Option<&mut Module>,
+    pub files: Vec<&SourceFile>,
+    pub deps: HashMap<String, &mut Crate>,
+    pub is_std: bool,
+    pub prelude: Option<&mut Module>,
+}
+
+/// The results of name resolution.
+pub struct Info {
+    pub crates: Vec<&mut Crate>,
+    pub defs: Vec<&mut Def>,
+    pub def_of: HashMap<u32, &mut Def>,
+    pub paths: HashMap<u32, Res>,
+    pub path_files: HashMap<u32, &File>,
+    pub bindings: HashMap<u32, &mut Local>,
+    pub pat_consts: HashMap<u32, Res>,
+    pub self_locals: HashMap<u32, &mut Local>,
+    pub labels: HashMap<u32, Node>,
+}
+
+/// The #[cfg] settings.
+#[derive(Clone)]
+pub struct Config {
+    pub target_os: String,
+    pub target_arch: String,
+    pub test: bool,
+    pub debug: bool,
+}
+
+pub struct Resolver {
+    pub cfg: Config,
+    pub info: &mut Info,
+    pub errs: &mut Sink,
+    pub crates: HashMap<String, &mut Crate>,
+    pub imports: Vec<&mut Import>,
+    pub next_local: u32,
+}
+
+impl Resolver {
+    pub fn errorf(&mut self, f: Option<&File>, pos: Pos, msg: String) { self.errs.errorf(f, pos, msg); }
+
+    pub fn new_def(&mut self, kind: DefKind, name: &str, file: Option<&File>, node: Node, pos: Pos, parent: Option<&mut Def>, c: &mut Crate) -> &mut Def {
+        let d = &mut Def { id: self.info.defs.len() as u32, kind, name: name.to_string(), krate: c, file, pos, node: node.clone(),
+            parent, vis: public(), module: None, ctor: false };
+        self.info.defs.push(d);
+        if !node.is_none() { self.info.def_of.insert(node.id(), d); }
+        d
+    }
+
+    pub fn new_local(&mut self, name: &str, pos: Pos, is_mut: bool, fn_node: Node) -> &mut Local {
+        self.next_local += 1;
+        &mut Local { id: self.next_local, name: name.to_string(), pos, is_mut, fn_node }
+    }
+}
+
+/// Loads the given crates and resolves all names. The std crate must be
+/// among the specs (named "std"); every other crate depends on it.
+pub fn resolve(cfg: Config, specs: &Vec<&CrateSpec>) -> (&mut Info, Vec<Error>) {
+    let info = &mut Info { crates: Vec::new(), defs: Vec::new(), def_of: HashMap::new(), paths: HashMap::new(),
+        path_files: HashMap::new(), bindings: HashMap::new(), pat_consts: HashMap::new(), self_locals: HashMap::new(),
+        labels: HashMap::new() };
+    let mut r = Resolver { cfg, info, errs: Sink::new(), crates: HashMap::new(), imports: Vec::new(), next_local: 0 };
+    for spec in specs.iter() {
+        let dir = if spec.dir.len() == 0 { spec.name.clone() } else { spec.dir.clone() };
+        let c = &mut Crate { name: spec.name.clone(), dir, fs_root: spec.fs_root.clone(), root: None, files: Vec::new(),
+            deps: HashMap::new(), is_std: spec.name == "std", prelude: None };
+        r.crates.insert(spec.name.clone(), c);
+        r.info.crates.push(c);
+        r.load(c, spec.root.as_str());
+    }
+    let std = r.crates.get(&"std".to_string()).map(|c| *c);
+    for spec in specs.iter() {
+        let c = r.crates[&spec.name];
+        for d in spec.deps.iter() {
+            match r.crates.get(d) {
+                Some(dc) => { c.deps.insert(d.clone(), *dc); }
+                None => { r.errorf(None, 0, `crate ${spec.name}: unknown dependency ${crate::util::quote(d.as_str())}`); }
+            }
+        }
+        if let Some(s) = std {
+            if s.name != c.name { c.deps.insert("std".to_string(), s); }
+        }
+    }
+    r.resolve_imports();
+    if let Some(s) = std {
+        if let Some(root) = s.root {
+            if let Some(b) = root.bindings[TYPE_NS].get(&"prelude".to_string()) {
+                if let Some(d) = b.res.def {
+                    if let Some(pm) = d.module {
+                        for c in r.info.crates.iter_mut() { c.prelude = Some(pm); }
+                    }
+                }
+            }
+        }
+    }
+    let crates = r.info.crates.clone();
+    for c in crates.iter() {
+        if let Some(root) = c.root { r.resolve_module(root); }
+    }
+    (r.info, r.errs.sorted())
+}

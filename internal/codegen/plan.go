@@ -100,6 +100,8 @@ type Inst struct {
 	// sites lists the keys of targets and vtables in walk order (slot
 	// assignment follows it, so output does not depend on map order).
 	sites []any
+	// statics lists the statics the code reads.
+	statics []*resolve.Def
 }
 
 // Concrete substitutes the instance's type arguments in t.
@@ -197,6 +199,7 @@ func Build(prog *mir.Program, main *resolve.Def) *Plan {
 		}
 	}
 	p.Main = p.inst(main, nil, nil, prog.Func(main))
+	p.orderStatics()
 	p.assignSlots()
 	sort.Slice(p.Groups, func(i, j int) bool { return p.Groups[i].Sym < p.Groups[j].Sym })
 	return p
@@ -299,6 +302,7 @@ func (p *Plan) walk(in *Inst, f *mir.Func) {
 			in.targets[op.Const] = p.resolve(in, op.Const.Fn)
 		case mir.CStatic:
 			p.static(op.Const.Static)
+			in.statics = append(in.statics, op.Const.Static)
 		case mir.CStr, mir.CBytes:
 			p.str(op.Const.Str)
 		}
@@ -600,6 +604,50 @@ func sanitize(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// orderStatics sorts the statics so that each is initialized after the
+// statics its initializer (and everything it calls) reads.
+func (p *Plan) orderStatics() {
+	var order []*resolve.Def
+	state := map[*resolve.Def]int{}
+	seen := map[*Inst]bool{}
+	var visitStatic func(d *resolve.Def)
+	var visitInst func(in *Inst)
+	visitInst = func(in *Inst) {
+		if in == nil || seen[in] {
+			return
+		}
+		seen[in] = true
+		for _, d := range in.statics {
+			visitStatic(d)
+		}
+		for _, k := range in.sites {
+			if t := in.targets[k]; t != nil && t.Kind == TInst {
+				visitInst(t.Inst)
+			}
+			if v := in.vtables[k]; v != nil {
+				for _, m := range v.Methods {
+					if m.Kind == TInst {
+						visitInst(m.Inst)
+					}
+				}
+			}
+		}
+	}
+	visitStatic = func(d *resolve.Def) {
+		if state[d] != 0 {
+			return
+		}
+		state[d] = 1
+		visitInst(p.StaticInit[d])
+		state[d] = 2
+		order = append(order, d)
+	}
+	for _, d := range p.Statics {
+		visitStatic(d)
+	}
+	p.Statics = order
 }
 
 // assignSlots finds, for every group, the sites whose target or vtable

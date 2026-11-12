@@ -66,6 +66,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runCrate(args[1:], stdout, stderr)
 	case "build":
 		return buildCrate(args[1:], stdout, stderr)
+	case "resolve-dump":
+		return resolveDump(args[1:], stdout, stderr)
 	case "test":
 		return testCrate(args[1:], stdout, stderr)
 	default:

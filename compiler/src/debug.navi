@@ -1,0 +1,275 @@
+//! Debugging dumps that mirror stage0's (to check the port).
+
+use crate::resolve::{self, Res, Def};
+use crate::driver;
+
+fn def_pos(d: Option<&mut Def>) -> String {
+    match d {
+        None => "<nil>".to_string(),
+        Some(def) => match def.file {
+            None => `${resolve::def_kind_name(def.kind)} ${def.name}`,
+            Some(f) => `${resolve::def_kind_name(def.kind)} ${def.name} @${f.position(def.pos)}`,
+        },
+    }
+}
+
+fn desc(r: &Res) -> String {
+    let mut s = match r.kind {
+        resolve::RES_ERR => "err".to_string(),
+        resolve::RES_DEF => `def ${def_pos(r.def)}`,
+        resolve::RES_LOCAL => { let l = r.local.unwrap(); `local ${l.name}@${l.pos}` }
+        resolve::RES_PRIM => `prim ${r.prim}`,
+        resolve::RES_SELF_TY => `Self ${def_pos(r.def)}`,
+        resolve::RES_CRATE => `crate ${r.def.unwrap().name}`,
+        _ => "qualified".to_string(),
+    };
+    if r.rest.len() > 0 { s.push_str(&` rest=${r.rest.len()}`); }
+    s
+}
+
+pub fn resolve_dump(args: &Vec<String>) -> i32 {
+    if args.len() != 1 {
+        eprintln("usage: navic resolve-dump <crate or file>");
+        return 2;
+    }
+    let spec = match driver::load_crate(args[0].as_str()) {
+        Ok(s) => s,
+        Err(e) => { eprintln(e); return 1; }
+    };
+    let mut specs = Vec::new();
+    specs.push(driver::std_crate());
+    specs.push(spec);
+    let (info, errs) = resolve::resolve(driver::host_config(), &specs);
+    for e in errs.iter() { println(`error ${e}`); }
+    let mut lines: Vec<String> = Vec::new();
+    // Paths: the pattern files are found through the paths of the same file.
+    for (id, r) in info.paths.iter() {
+        let f = info.path_files[id];
+        let _ = f;
+        lines.push(`${id}|${desc(r)}`);
+    }
+    lines.clear();
+    resolve_lines(info, &mut lines);
+    lines.sort();
+    let mut out = lines.join("\n");
+    out.push('\n');
+    print(out);
+    println(`defs ${info.defs.len()}`);
+    0
+}
+
+fn resolve_lines(info: &mut resolve::Info, lines: &mut Vec<String>) {
+    for c in info.crates.iter() {
+        for sf in c.files.iter() {
+            let mut w = Walker { info, file: sf.file, lines };
+            for it in sf.items.iter() { w.item(it); }
+        }
+    }
+}
+
+use crate::syntax::ast::*;
+use crate::syntax::source::File;
+
+// Walker visits the paths and identifier patterns of a file (the same
+// nodes stage0's syntax.Inspect reaches).
+struct Walker {
+    info: &mut resolve::Info,
+    file: &File,
+    lines: &mut Vec<String>,
+}
+
+impl Walker {
+    fn path(&mut self, p: &Path) {
+        if let Some(r) = self.info.paths.get(&p.id) {
+            let pos = self.file.position(p.pos());
+            self.lines.push(`${pos}: path ${desc(r)}`);
+        }
+        if let Some(q) = p.qself {
+            self.ty(q.ty);
+            if let Some(tp) = q.trait_path { self.path(tp); }
+        }
+        for s in p.segments.iter() {
+            if let Some(a) = s.args {
+                for t in a.args.iter() { self.ty(*t); }
+                for b in a.bindings.iter() { self.ty(b.ty); }
+            }
+        }
+    }
+
+    fn paths(&mut self, ps: &Vec<&Path>) { for p in ps.iter() { self.path(*p); } }
+
+    fn generics(&mut self, g: &Generics) {
+        for p in g.params.iter() {
+            self.paths(&p.bounds);
+            if let Some(d) = p.default { self.ty(d); }
+        }
+        for w in g.wheres.iter() {
+            self.ty(w.ty);
+            self.paths(&w.bounds);
+        }
+    }
+
+    fn ty(&mut self, t: &Type) {
+        match &t.kind {
+            TypeKind::Path(p) => self.path(*p),
+            TypeKind::Ref { elem, .. } | TypeKind::Ptr { elem, .. } | TypeKind::Slice { elem, .. } => self.ty(*elem),
+            TypeKind::Array { elem, len, .. } => { self.ty(*elem); self.expr(*len); }
+            TypeKind::Tuple { elems, .. } => { for e in elems.iter() { self.ty(*e); } }
+            TypeKind::Fn { params, result, .. } => {
+                for p in params.iter() { self.ty(*p); }
+                if let Some(r) = result { self.ty(*r); }
+            }
+            TypeKind::Dyn { bounds, .. } | TypeKind::Impl { bounds, .. } => self.paths(bounds),
+            _ => {}
+        }
+    }
+
+    fn opt(&mut self, x: Option<&Expr>) { if let Some(e) = x { self.expr(e); } }
+
+    fn expr(&mut self, x: &Expr) {
+        match &x.kind {
+            ExprKind::Template { parts, .. } => { for p in parts.iter() { self.opt(p.x); } }
+            ExprKind::Path(p) => self.path(*p),
+            ExprKind::Unary { x, .. } | ExprKind::Ref { x, .. } | ExprKind::Field { x, .. } | ExprKind::Try { x, .. } | ExprKind::Paren { x, .. } => self.expr(*x),
+            ExprKind::Binary { x, y, .. } | ExprKind::Assign { x, y, .. } => { self.expr(*x); self.expr(*y); }
+            ExprKind::Cast { x, ty } => { self.expr(*x); self.ty(*ty); }
+            ExprKind::Range { lo, hi, .. } => { self.opt(*lo); self.opt(*hi); }
+            ExprKind::Call { fun, args, .. } => { self.expr(*fun); for a in args.iter() { self.expr(*a); } }
+            ExprKind::MethodCall { recv, type_args, args, .. } => {
+                self.expr(*recv);
+                if let Some(ta) = type_args {
+                    for t in ta.args.iter() { self.ty(*t); }
+                    for b in ta.bindings.iter() { self.ty(b.ty); }
+                }
+                for a in args.iter() { self.expr(*a); }
+            }
+            ExprKind::Index { x, index, .. } => { self.expr(*x); self.expr(*index); }
+            ExprKind::StructLit { path, fields, base } => {
+                self.path(*path);
+                for f in fields.iter() { self.expr(f.value); }
+                self.opt(*base);
+            }
+            ExprKind::Tuple { elems, .. } | ExprKind::Array { elems, .. } => { for e in elems.iter() { self.expr(*e); } }
+            ExprKind::ArrayRepeat { value, count, .. } => { self.expr(*value); self.expr(*count); }
+            ExprKind::Block(b) => self.block(*b),
+            ExprKind::If { cond, then, els, .. } => { self.expr(*cond); self.expr(*then); self.opt(*els); }
+            ExprKind::Let { pat, x, .. } => { self.pat(*pat); self.expr(*x); }
+            ExprKind::Match { x, arms, .. } => {
+                self.expr(*x);
+                for a in arms.iter() { self.pat(a.pat); self.opt(a.guard); self.expr(a.body); }
+            }
+            ExprKind::Loop { body, .. } => self.expr(*body),
+            ExprKind::While { cond, body, .. } => { self.expr(*cond); self.expr(*body); }
+            ExprKind::For { pat, iter, body, .. } => { self.pat(*pat); self.expr(*iter); self.expr(*body); }
+            ExprKind::Break { value, .. } | ExprKind::Return { value, .. } => self.opt(*value),
+            ExprKind::Closure { params, result, body, .. } => {
+                for p in params.iter() {
+                    self.pat(p.pat);
+                    if let Some(t) = p.ty { self.ty(t); }
+                }
+                if let Some(r) = result { self.ty(*r); }
+                self.expr(*body);
+            }
+            ExprKind::Select { arms, .. } => {
+                for a in arms.iter() {
+                    if let Some(p) = a.pat { self.pat(p); }
+                    self.opt(a.op);
+                    self.expr(a.body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn block(&mut self, b: &Block) {
+        for s in b.stmts.iter() {
+            match *s {
+                Stmt::Let(l) => {
+                    self.pat(l.pat);
+                    if let Some(t) = l.ty { self.ty(t); }
+                    self.opt(l.init);
+                    self.opt(l.els);
+                }
+                Stmt::Expr { x, .. } => self.expr(*x),
+                Stmt::Item(it) => self.item(it),
+                Stmt::Defer { x, .. } => self.expr(*x),
+                _ => {}
+            }
+        }
+        self.opt(b.tail);
+    }
+
+    fn pat(&mut self, p: &Pat) {
+        match &p.kind {
+            PatKind::Ident { is_mut, name, sub } => {
+                let pos = self.file.position(p.pos());
+                if let Some(l) = self.info.bindings.get(&p.id) {
+                    self.lines.push(`${pos}: bind ${l.name}@${l.pos} mut=${l.is_mut}`);
+                }
+                if let Some(r) = self.info.pat_consts.get(&p.id) {
+                    self.lines.push(`${pos}: patconst ${desc(r)}`);
+                }
+                if let Some(s) = sub { self.pat(*s); }
+            }
+            PatKind::Lit(x) => self.expr(*x),
+            PatKind::Range { lo, hi, .. } => { self.opt(*lo); self.opt(*hi); }
+            PatKind::Path(path) => self.path(*path),
+            PatKind::Tuple { elems, .. } | PatKind::Slice { elems, .. } => { for e in elems.iter() { self.pat(*e); } }
+            PatKind::TupleStruct { path, elems } => { self.path(*path); for e in elems.iter() { self.pat(*e); } }
+            PatKind::Struct { path, fields, .. } => { self.path(*path); for f in fields.iter() { self.pat(f.pat); } }
+            PatKind::Ref { pat, .. } => self.pat(*pat),
+            PatKind::Or(alts) => { for a in alts.iter() { self.pat(*a); } }
+            _ => {}
+        }
+    }
+
+    fn item(&mut self, it: &Item) {
+        for a in it.base().attrs.iter() {
+            self.path(a.path);
+            self.opt(a.value);
+        }
+        match it {
+            Item::Fn(f) => {
+                self.generics(f.generics);
+                for p in f.params.iter() {
+                    self.pat(p.pat);
+                    if let Some(t) = p.ty { self.ty(t); }
+                }
+                if let Some(r) = f.result { self.ty(r); }
+                self.opt(f.body);
+            }
+            Item::Struct(s) => {
+                self.generics(s.generics);
+                for f in s.fields.iter() { self.ty(f.ty); }
+            }
+            Item::Enum(e) => {
+                self.generics(e.generics);
+                for v in e.variants.iter() {
+                    for f in v.fields.iter() { self.ty(f.ty); }
+                    self.opt(v.discriminant);
+                }
+            }
+            Item::TypeAlias(t) => {
+                self.generics(t.generics);
+                self.paths(&t.bounds);
+                if let Some(x) = t.ty { self.ty(x); }
+            }
+            Item::Const(c) => { self.ty(c.ty); self.opt(c.value); }
+            Item::Static(s) => { self.ty(s.ty); self.opt(s.value); }
+            Item::Impl(im) => {
+                self.generics(im.generics);
+                if let Some(tp) = im.trait_path { self.path(tp); }
+                self.ty(im.ty);
+                for i in im.items.iter() { self.item(i); }
+            }
+            Item::Trait(t) => {
+                self.generics(t.generics);
+                self.paths(&t.supers);
+                for i in t.items.iter() { self.item(i); }
+            }
+            Item::Mod(m) => { for i in m.items.iter() { self.item(i); } }
+            Item::Use(_) => {}
+            Item::Extern(e) => { for i in e.items.iter() { self.item(i); } }
+        }
+    }
+}

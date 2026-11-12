@@ -3,6 +3,8 @@
 package resolve
 
 import (
+	"sort"
+
 	"navi/internal/syntax"
 )
 
@@ -51,6 +53,8 @@ func (k DefKind) String() string { return defKindNames[k] }
 
 // Def is a named (or, for impls, anonymous) definition.
 type Def struct {
+	// ID is the definition's index in Info.Defs (creation order).
+	ID     int
 	Kind   DefKind
 	Name   string
 	Crate  *Crate
@@ -281,6 +285,7 @@ func (m *Module) TraitsInScope() []*Def {
 	if p := m.Crate.prelude; p != nil {
 		addModule(p)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 

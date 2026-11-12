@@ -129,7 +129,7 @@ func Resolve(cfg Config, specs []*CrateSpec) (*Info, ErrorList) {
 }
 
 func (r *resolver) newDef(kind DefKind, name string, file *syntax.File, node syntax.Node, pos syntax.Pos, parent *Def, c *Crate) *Def {
-	d := &Def{Kind: kind, Name: name, Crate: c, File: file, Pos: pos, Node: node, Parent: parent}
+	d := &Def{ID: len(r.info.Defs), Kind: kind, Name: name, Crate: c, File: file, Pos: pos, Node: node, Parent: parent}
 	r.info.Defs = append(r.info.Defs, d)
 	if node != nil {
 		r.info.DefOf[node] = d

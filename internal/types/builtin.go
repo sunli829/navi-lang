@@ -103,7 +103,9 @@ func (fc *fnCtx) builtin(tr *TraitRef, self *Type, depth int) (*selection, bool)
 		switch {
 		case isScalarT(self), self.Kind == KPtr, self.Kind == KFn, self.Kind == KNever:
 			return sel, true
-		case self.Kind == KRef && !self.Mut:
+		case self.Kind == KRef:
+			// &mut T is Clone too: every navi value can be copied, and
+			// cloning a reference copies the reference.
 			return sel, true
 		case self.Kind == KTuple:
 			elemwise(tr.Trait, self.Elems)

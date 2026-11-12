@@ -305,8 +305,7 @@ func (g *gen) genMain() {
 	m.Load(8, V1, SP, 8)
 	m.AdrSym(I1, "_navi_argv")
 	m.Store(8, V1, I1, 0)
-	for i := len(g.p.Statics) - 1; i >= 0; i-- {
-		d := g.p.Statics[i]
+	for _, d := range g.p.Statics {
 		in := g.p.StaticInit[d]
 		if in == nil {
 			continue

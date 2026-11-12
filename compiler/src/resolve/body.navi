@@ -1,0 +1,803 @@
+//! Resolving items and bodies: lexical scopes, paths, types, expressions
+//! and patterns.
+
+use std::collections::HashMap;
+use crate::syntax::ast::*;
+use crate::syntax::source::{File, Pos};
+use crate::resolve::*;
+use crate::resolve::imports::*;
+
+pub struct Rib {
+    pub types: HashMap<String, Res>,
+    pub values: HashMap<String, &mut Local>,
+}
+
+fn new_rib() -> &mut Rib { &mut Rib { types: HashMap::new(), values: HashMap::new() } }
+
+struct Label { name: String, node: Node }
+
+pub struct Scope {
+    pub module: &mut Module,
+    pub file: &File,
+    ribs: Vec<&mut Rib>,
+    self_res: Option<Res>,
+    fn_node: Node,
+    labels: Vec<Label>,
+    loops: i32,
+}
+
+impl Scope {
+    fn push(&mut self) -> &mut Rib {
+        let rb = new_rib();
+        self.ribs.push(rb);
+        rb
+    }
+    fn pop(&mut self) { self.ribs.pop(); }
+    fn top(&self) -> &mut Rib { self.ribs[self.ribs.len() - 1] }
+}
+
+fn fresh_scope(m: &mut Module) -> Scope {
+    Scope { module: m, file: m.file.unwrap(), ribs: Vec::new(), self_res: None, fn_node: Node::None, labels: Vec::new(), loops: 0 }
+}
+
+fn is_type_like(res: &Res) -> bool {
+    if res.kind == RES_PRIM || res.kind == RES_SELF_TY || res.kind == RES_QUALIFIED { return true; }
+    if res.kind == RES_DEF {
+        let k = res.def.unwrap().kind;
+        return k == DEF_STRUCT || k == DEF_ENUM || k == DEF_TRAIT || k == DEF_TYPE_ALIAS || k == DEF_TYPE_PARAM || k == DEF_ASSOC_TYPE;
+    }
+    false
+}
+
+pub fn describe(res: &Res) -> String {
+    match res.kind {
+        RES_LOCAL => `local variable ${res.local.unwrap().name}`,
+        RES_PRIM => `primitive type ${res.prim}`,
+        RES_SELF_TY => "Self".to_string(),
+        RES_QUALIFIED => "qualified path".to_string(),
+        RES_CRATE => `crate ${res.def.unwrap().name}`,
+        RES_DEF => { let d = res.def.unwrap(); `${def_kind_name(d.kind)} ${d.name}` }
+        _ => "unresolved name".to_string(),
+    }
+}
+
+fn ns_word(ns: Namespace) -> &str { if ns == TYPE_NS { "type" } else { "value" } }
+
+// The names in a that are missing from b, sorted and comma separated.
+fn diff_keys(a: &HashMap<String, &mut Local>, b: &HashMap<String, &mut Local>) -> String {
+    let mut missing: Vec<String> = Vec::new();
+    for (n, _) in a.iter() { if !b.contains_key(n) { missing.push(n.clone()); } }
+    missing.sort();
+    missing.join(", ")
+}
+
+impl Resolver {
+    /// Resolves every item of m and of its child modules.
+    pub fn resolve_module(&mut self, m: &mut Module) {
+        let mut s = fresh_scope(m);
+        let items = m.items.clone();
+        for it in items.iter() { self.resolve_item(&mut s, it); }
+    }
+
+    fn resolve_item(&mut self, s: &mut Scope, it: &Item) {
+        match it {
+            Item::Fn(f) => self.resolve_fn(s, *f),
+            Item::Struct(st) => {
+                s.push();
+                self.generic_params(s, st.generics);
+                for f in st.fields.iter() { self.resolve_type(s, f.ty); }
+                s.pop();
+            }
+            Item::Enum(e) => {
+                s.push();
+                self.generic_params(s, e.generics);
+                for v in e.variants.iter() {
+                    for f in v.fields.iter() { self.resolve_type(s, f.ty); }
+                    if let Some(d) = v.discriminant { self.const_expr(s, d, Node::Variant(*v)); }
+                }
+                s.pop();
+            }
+            Item::TypeAlias(t) => {
+                s.push();
+                self.generic_params(s, t.generics);
+                for b in t.bounds.iter() { self.resolve_bound(s, *b); }
+                if let Some(x) = t.ty { self.resolve_type(s, x); }
+                s.pop();
+            }
+            Item::Const(c) => {
+                self.resolve_type(s, c.ty);
+                if let Some(v) = c.value { self.const_expr(s, v, Node::Item(it.clone())); }
+            }
+            Item::Static(st) => {
+                self.resolve_type(s, st.ty);
+                if let Some(v) = st.value { self.const_expr(s, v, Node::Item(it.clone())); }
+            }
+            Item::Impl(im) => {
+                let d = self.info.def_of[&it.id()];
+                s.push();
+                self.generic_params(s, im.generics);
+                if let Some(tp) = im.trait_path { self.resolve_bound(s, tp); }
+                self.resolve_type(s, im.ty);
+                let old = s.self_res.clone();
+                s.self_res = Some(res_kind_def(RES_SELF_TY, d));
+                for ai in im.items.iter() {
+                    if self.cfg_enabled_quiet(&ai.base().attrs) { self.resolve_item(s, ai); }
+                }
+                s.self_res = old;
+                s.pop();
+            }
+            Item::Trait(t) => {
+                let d = self.info.def_of[&it.id()];
+                s.push();
+                let old = s.self_res.clone();
+                s.self_res = Some(res_kind_def(RES_SELF_TY, d));
+                self.generic_params(s, t.generics);
+                for b in t.supers.iter() { self.resolve_bound(s, *b); }
+                for ai in t.items.iter() {
+                    if self.cfg_enabled_quiet(&ai.base().attrs) { self.resolve_item(s, ai); }
+                }
+                s.self_res = old;
+                s.pop();
+            }
+            Item::Mod(_) => {
+                if let Some(d) = self.info.def_of.get(&it.id()) {
+                    if let Some(m) = d.module { self.resolve_module(m); }
+                }
+            }
+            Item::Extern(eb) => {
+                for ei in eb.items.iter() {
+                    if self.cfg_enabled_quiet(&ei.base().attrs) { self.resolve_item(s, ei); }
+                }
+            }
+            Item::Use(_) => {}
+        }
+    }
+
+    // const_expr resolves an expression evaluated at compile time.
+    fn const_expr(&mut self, s: &mut Scope, x: &Expr, owner: Node) {
+        let old_fn = s.fn_node.clone();
+        let old_labels = std::mem::take(&mut s.labels);
+        let old_loops = s.loops;
+        s.fn_node = owner;
+        s.loops = 0;
+        s.push();
+        self.expr(s, x);
+        s.pop();
+        s.fn_node = old_fn;
+        s.labels = old_labels;
+        s.loops = old_loops;
+    }
+
+    fn generic_params(&mut self, s: &mut Scope, g: &Generics) {
+        let top = s.top();
+        for gp in g.params.iter() {
+            if top.types.contains_key(&gp.name.value) {
+                self.errorf(Some(s.file), gp.name.pos, `the name ${gp.name.value} is already used for a generic parameter`);
+                continue;
+            }
+            let d = self.new_def(DEF_TYPE_PARAM, gp.name.value.as_str(), Some(s.file), Node::Param(*gp), gp.name.pos, None, s.module.krate);
+            top.types.insert(gp.name.value.clone(), res_def(d));
+        }
+        let mut saw_default = false;
+        for gp in g.params.iter() {
+            for b in gp.bounds.iter() { self.resolve_bound(s, *b); }
+            match gp.default {
+                Some(d) => {
+                    saw_default = true;
+                    self.resolve_type(s, d);
+                }
+                None => {
+                    if saw_default {
+                        self.errorf(Some(s.file), gp.name.pos, "generic parameters with a default must come after those without one".to_string());
+                    }
+                }
+            }
+        }
+        for wp in g.wheres.iter() {
+            self.resolve_type(s, wp.ty);
+            for b in wp.bounds.iter() { self.resolve_bound(s, *b); }
+        }
+    }
+
+    fn resolve_fn(&mut self, s: &mut Scope, f: &mut FnDecl) {
+        s.push();
+        self.generic_params(s, f.generics);
+        for p in f.params.iter() { self.resolve_type(s, p.ty.unwrap()); }
+        if let Some(r) = f.result { self.resolve_type(s, r); }
+        if let Some(sp) = f.self_param {
+            if s.self_res.is_none() {
+                self.errorf(Some(s.file), sp.pos, "self parameter is only allowed in impl and trait methods".to_string());
+            }
+        }
+        if let Some(body) = f.body {
+            let old_fn = s.fn_node.clone();
+            let old_labels = std::mem::take(&mut s.labels);
+            let old_loops = s.loops;
+            s.fn_node = Node::Item(Item::Fn(f));
+            s.loops = 0;
+            let params = s.push();
+            if let Some(sp) = f.self_param {
+                let l = self.new_local("self", sp.pos, sp.is_mut && !sp.is_ref, Node::Item(Item::Fn(f)));
+                params.values.insert("self".to_string(), l);
+                self.info.self_locals.insert(f.base.id, l);
+            }
+            let mut names: HashMap<String, &mut Local> = HashMap::new();
+            let empty: HashMap<String, &mut Local> = HashMap::new();
+            for p in f.params.iter() { self.pat(s, p.pat, &mut names, &empty); }
+            for (n, l) in names.iter() { params.values.insert(n.clone(), *l); }
+            self.block(s, body);
+            s.pop();
+            s.fn_node = old_fn;
+            s.labels = old_labels;
+            s.loops = old_loops;
+        }
+        s.pop();
+    }
+
+    // --- Paths --------------------------------------------------------------------
+
+    // lexical looks up a single name: locals and generic parameters, then
+    // the module and its enclosing block scopes, the prelude, extern crates
+    // and primitive types.
+    fn lexical(&self, s: &mut Scope, name: &str, ns: Namespace, locals: bool) -> Option<Res> {
+        if locals {
+            let mut i = s.ribs.len();
+            while i > 0 {
+                i -= 1;
+                if ns == VALUE_NS {
+                    if let Some(l) = s.ribs[i].values.get(&name.to_string()) {
+                        return Some(Res { kind: RES_LOCAL, def: None, local: Some(*l), prim: String::new(), rest: Vec::new() });
+                    }
+                } else if let Some(r) = s.ribs[i].types.get(&name.to_string()) {
+                    return Some(r.clone());
+                }
+            }
+        }
+        let mut x: Option<&mut Module> = Some(s.module);
+        while let Some(m) = x {
+            let (b, st) = self.lookup_in(m, name, ns, s.module);
+            if st == FOUND { return Some(b.unwrap().res.clone()); }
+            if st == AMBIGUOUS { return None; }
+            if !m.anonymous { break; }
+            x = m.parent;
+        }
+        if let Some(p) = s.module.krate.prelude {
+            let (b, st) = self.lookup_in(p, name, ns, s.module);
+            if st == FOUND { return Some(b.unwrap().res.clone()); }
+        }
+        if ns == TYPE_NS {
+            if let Some(c) = s.module.krate.deps.get(&name.to_string()) {
+                if let Some(root) = c.root { return Some(res_kind_def(RES_CRATE, root.def.unwrap())); }
+            }
+            if s.module.krate.is_std && name == "std" {
+                return Some(res_kind_def(RES_CRATE, s.module.krate.root.unwrap().def.unwrap()));
+            }
+            if is_primitive(name) {
+                return Some(Res { kind: RES_PRIM, def: None, local: None, prim: name.to_string(), rest: Vec::new() });
+            }
+        }
+        None
+    }
+
+    /// Resolves a path in namespace ns and records the result.
+    fn resolve_path(&mut self, s: &mut Scope, p: &Path, ns: Namespace) -> Res {
+        let res = self.resolve_path_inner(s, p, ns);
+        self.info.paths.insert(p.id, res.clone());
+        self.info.path_files.insert(p.id, s.file);
+        res
+    }
+
+    fn resolve_path_inner(&mut self, s: &mut Scope, p: &Path, ns: Namespace) -> Res {
+        for seg in p.segments.iter() {
+            if let Some(a) = seg.args {
+                for t in a.args.iter() { self.resolve_type(s, *t); }
+                for b in a.bindings.iter() { self.resolve_type(s, b.ty); }
+            }
+        }
+        if let Some(q) = p.qself {
+            self.resolve_type(s, q.ty);
+            if let Some(tp) = q.trait_path { self.resolve_bound(s, tp); }
+            return Res { kind: RES_QUALIFIED, def: None, local: None, prim: String::new(), rest: p.segments.clone() };
+        }
+        let segs = &p.segments;
+        let single = segs.len() == 1;
+        let first = segs[0].name;
+        let first_ns = if single { ns } else { TYPE_NS };
+        let mut res: Res;
+        let mut i = 1;
+        let fv = first.value.as_str();
+        if fv == "Self" {
+            match s.self_res.clone() {
+                None => {
+                    self.errorf(Some(s.file), first.pos, "Self is only available in impls and traits".to_string());
+                    return res_err();
+                }
+                Some(r) => { res = r; }
+            }
+        } else if fv == "self" && single && ns == VALUE_NS {
+            if let Some(rs) = self.lexical(s, "self", VALUE_NS, true) {
+                if rs.kind == RES_LOCAL { return rs; }
+            }
+            self.errorf(Some(s.file), first.pos, "self value is only available in methods with a self parameter".to_string());
+            return res_err();
+        } else if fv == "self" || fv == "crate" || fv == "super" {
+            let mut j = 0;
+            while j < segs.len() && is_module_keyword(segs[j].name.value.as_str()) { j += 1; }
+            let mut names: Vec<&Name> = Vec::new();
+            let mut k = 0;
+            while k < j { names.push(segs[k].name); k += 1; }
+            match self.module_path(s.module, &names) {
+                Err(e) => {
+                    self.errorf(Some(s.file), e.pos, e.msg);
+                    return res_err();
+                }
+                Ok(m) => { res = res_def(m.def.unwrap()); }
+            }
+            i = j;
+        } else {
+            match self.lexical(s, fv, first_ns, true) {
+                None => {
+                    self.not_found(s, first, first_ns, single);
+                    return res_err();
+                }
+                Some(rs) => { res = rs; }
+            }
+        }
+        while i < segs.len() {
+            let seg = segs[i].name;
+            if let Some(m) = module_of_res(&res) {
+                let ns_here = if i == segs.len() - 1 { ns } else { TYPE_NS };
+                let (b, st) = self.lookup_in(m, seg.value.as_str(), ns_here, s.module);
+                if st == FOUND {
+                    res = b.unwrap().res.clone();
+                    i += 1;
+                    continue;
+                }
+                if st == PRIVATE {
+                    self.errorf(Some(s.file), seg.pos, `${seg.value} is private in ${m.path()}`);
+                } else if st == AMBIGUOUS {
+                    self.errorf(Some(s.file), seg.pos, `${seg.value} is ambiguous (imported by more than one glob)`);
+                } else {
+                    let other = if ns_here == TYPE_NS { VALUE_NS } else { TYPE_NS };
+                    let (ob, ost) = self.lookup_in(m, seg.value.as_str(), other, s.module);
+                    if ost == FOUND {
+                        self.errorf(Some(s.file), seg.pos, `expected ${ns_word(ns_here)}, found ${describe(&ob.unwrap().res)}`);
+                    } else {
+                        self.errorf(Some(s.file), seg.pos, `cannot find ${seg.value} in ${m.path()}`);
+                    }
+                }
+                return res_err();
+            }
+            if is_type_like(&res) {
+                let mut rest = Vec::new();
+                let mut k = i;
+                while k < segs.len() { rest.push(segs[k]); k += 1; }
+                res.rest = rest;
+                return res;
+            }
+            self.errorf(Some(s.file), seg.pos, `${describe(&res)} is not a module or type, so it has no item ${seg.value}`);
+            return res_err();
+        }
+        res
+    }
+
+    fn not_found(&mut self, s: &mut Scope, name: &Name, ns: Namespace, single: bool) {
+        if !single {
+            self.errorf(Some(s.file), name.pos, `cannot find module or type ${name.value} in this scope`);
+            return;
+        }
+        let other = if ns == TYPE_NS { VALUE_NS } else { TYPE_NS };
+        if let Some(res) = self.lexical(s, name.value.as_str(), other, true) {
+            self.errorf(Some(s.file), name.pos, `expected ${ns_word(ns)}, found ${describe(&res)}`);
+            return;
+        }
+        self.errorf(Some(s.file), name.pos, `cannot find ${ns_word(ns)} ${name.value} in this scope`);
+    }
+
+    /// Resolves the names in a type expression.
+    fn resolve_type(&mut self, s: &mut Scope, t: &Type) {
+        match &t.kind {
+            TypeKind::Path(p) => {
+                let res = self.resolve_path(s, *p, TYPE_NS);
+                if res.kind == RES_ERR || res.rest.len() > 0 { return; }
+                if p.segments.len() == 1 && module_of_res(&res).is_some() && is_primitive(p.segments[0].name.value.as_str()) {
+                    self.info.paths.insert(p.id, Res { kind: RES_PRIM, def: None, local: None, prim: p.segments[0].name.value.clone(), rest: Vec::new() });
+                    return;
+                }
+                if !is_type_like(&res) {
+                    self.errorf(Some(s.file), t.pos(), `expected type, found ${describe(&res)}`);
+                } else if res.kind == RES_DEF && res.def.unwrap().kind == DEF_TRAIT {
+                    let n = res.def.unwrap().name.clone();
+                    self.errorf(Some(s.file), t.pos(), `trait ${n} used as a type; write dyn ${n} or impl ${n}`);
+                }
+            }
+            TypeKind::Ref { elem, .. } => self.resolve_type(s, *elem),
+            TypeKind::Ptr { elem, .. } => self.resolve_type(s, *elem),
+            TypeKind::Slice { elem, .. } => self.resolve_type(s, *elem),
+            TypeKind::Array { elem, len, .. } => {
+                self.resolve_type(s, *elem);
+                self.const_expr(s, *len, Node::Type(t));
+            }
+            TypeKind::Tuple { elems, .. } => { for e in elems.iter() { self.resolve_type(s, *e); } }
+            TypeKind::Fn { params, result, .. } => {
+                for p in params.iter() { self.resolve_type(s, *p); }
+                if let Some(r) = result { self.resolve_type(s, *r); }
+            }
+            TypeKind::Dyn { bounds, .. } => { for b in bounds.iter() { self.resolve_bound(s, *b); } }
+            TypeKind::Impl { bounds, .. } => { for b in bounds.iter() { self.resolve_bound(s, *b); } }
+            _ => {}
+        }
+    }
+
+    fn resolve_bound(&mut self, s: &mut Scope, p: &Path) {
+        let res = self.resolve_path(s, p, TYPE_NS);
+        if res.kind == RES_ERR { return; }
+        if res.kind != RES_DEF || res.def.unwrap().kind != DEF_TRAIT || res.rest.len() > 0 {
+            self.errorf(Some(s.file), p.pos(), `expected trait, found ${describe(&res)}`);
+        }
+    }
+
+    // --- Blocks and statements -----------------------------------------------------------
+
+    fn block(&mut self, s: &mut Scope, bx: &Expr) {
+        let b = bx.block();
+        let old_module = s.module;
+        if let Some(m) = self.block_module(s, b) { s.module = m; }
+        s.push();
+        for st in b.stmts.iter() {
+            match *st {
+                Stmt::Let(l) => {
+                    if let Some(t) = l.ty { self.resolve_type(s, t); }
+                    if let Some(i) = l.init { self.expr(s, i); }
+                    if let Some(e) = l.els { self.block(s, e); }
+                    self.bind_pattern(s, l.pat);
+                }
+                Stmt::Expr { x, .. } => self.expr(s, *x),
+                Stmt::Defer { x, .. } => self.expr(s, *x),
+                _ => {}
+            }
+        }
+        if let Some(t) = b.tail { self.expr(s, t); }
+        s.pop();
+        s.module = old_module;
+    }
+
+    // block_module creates the anonymous module of a block that declares
+    // items (None if it has none).
+    fn block_module(&mut self, s: &mut Scope, b: &Block) -> Option<&mut Module> {
+        let mut has_items = false;
+        for st in b.stmts.iter() { if let Stmt::Item(_) = *st { has_items = true; } }
+        if !has_items { return None; }
+        let m = new_module(s.module.krate, Some(s.module), "");
+        m.anonymous = true;
+        m.dir = s.module.dir.clone();
+        m.def = s.module.nearest_named().def;
+        let first_import = self.imports.len();
+        let mut no_files: HashMap<String, &SourceFile> = HashMap::new();
+        for st in b.stmts.iter() {
+            if let Stmt::Item(it) = *st {
+                if let Item::Mod(md) = it {
+                    if !md.inline {
+                        self.errorf(Some(s.file), it.pos(), "mod declarations with a file are not allowed inside functions".to_string());
+                        continue;
+                    }
+                }
+                self.collect_item(m, s.file, it, &mut no_files);
+            }
+        }
+        m.file = Some(s.file);
+        let mut local: Vec<&mut Import> = Vec::new();
+        let mut i = first_import;
+        while i < self.imports.len() { local.push(self.imports[i]); i += 1; }
+        self.resolve_import_list(local, false);
+        self.resolve_module(m);
+        Some(m)
+    }
+
+    // --- Expressions --------------------------------------------------------------
+
+    fn opt_expr(&mut self, s: &mut Scope, x: Option<&Expr>) {
+        if let Some(e) = x { self.expr(s, e); }
+    }
+
+    fn expr(&mut self, s: &mut Scope, x: &Expr) {
+        match &x.kind {
+            ExprKind::Lit { .. } | ExprKind::Bad(_) => {}
+            ExprKind::Template { parts, .. } => {
+                for p in parts.iter() { if let Some(e) = p.x { self.expr(s, e); } }
+            }
+            ExprKind::Path(p) => {
+                let res = self.resolve_path(s, *p, VALUE_NS);
+                self.check_value(s, *p, &res);
+            }
+            ExprKind::Unary { x, .. } => self.expr(s, *x),
+            ExprKind::Ref { x, .. } => self.expr(s, *x),
+            ExprKind::Binary { x, y, .. } => { self.expr(s, *x); self.expr(s, *y); }
+            ExprKind::Assign { x, y, .. } => { self.expr(s, *x); self.expr(s, *y); }
+            ExprKind::Cast { x, ty } => { self.expr(s, *x); self.resolve_type(s, *ty); }
+            ExprKind::Range { lo, hi, .. } => { self.opt_expr(s, *lo); self.opt_expr(s, *hi); }
+            ExprKind::Call { fun, args, .. } => {
+                self.expr(s, *fun);
+                for a in args.iter() { self.expr(s, *a); }
+            }
+            ExprKind::MethodCall { recv, type_args, args, .. } => {
+                self.expr(s, *recv);
+                if let Some(ta) = type_args { for t in ta.args.iter() { self.resolve_type(s, *t); } }
+                for a in args.iter() { self.expr(s, *a); }
+            }
+            ExprKind::Field { x, .. } => self.expr(s, *x),
+            ExprKind::Index { x, index, .. } => { self.expr(s, *x); self.expr(s, *index); }
+            ExprKind::Try { x, .. } => self.expr(s, *x),
+            ExprKind::StructLit { path, fields, base } => {
+                let res = self.resolve_path(s, *path, TYPE_NS);
+                self.check_struct_path(s, *path, &res);
+                for f in fields.iter() { self.expr(s, f.value); }
+                self.opt_expr(s, *base);
+            }
+            ExprKind::Tuple { elems, .. } => { for e in elems.iter() { self.expr(s, *e); } }
+            ExprKind::Paren { x, .. } => self.expr(s, *x),
+            ExprKind::Array { elems, .. } => { for e in elems.iter() { self.expr(s, *e); } }
+            ExprKind::ArrayRepeat { value, count, .. } => { self.expr(s, *value); self.expr(s, *count); }
+            ExprKind::Block(_) => self.block(s, x),
+            ExprKind::If { cond, then, els, .. } => {
+                s.push();
+                self.cond(s, *cond);
+                self.block(s, *then);
+                s.pop();
+                self.opt_expr(s, *els);
+            }
+            ExprKind::Let { pos, x, .. } => {
+                self.errorf(Some(s.file), *pos, "let expressions are only allowed as the condition of if and while".to_string());
+                self.expr(s, *x);
+            }
+            ExprKind::Match { x, arms, .. } => {
+                self.expr(s, *x);
+                for a in arms.iter() {
+                    s.push();
+                    self.bind_pattern(s, a.pat);
+                    self.opt_expr(s, a.guard);
+                    self.expr(s, a.body);
+                    s.pop();
+                }
+            }
+            ExprKind::Loop { label, body, .. } => {
+                self.enter_loop(s, *label, x);
+                self.block(s, *body);
+                self.exit_loop(s, *label);
+            }
+            ExprKind::While { label, cond, body, .. } => {
+                self.enter_loop(s, *label, x);
+                s.push();
+                self.cond(s, *cond);
+                self.block(s, *body);
+                s.pop();
+                self.exit_loop(s, *label);
+            }
+            ExprKind::For { label, pat, iter, body, .. } => {
+                self.expr(s, *iter);
+                self.enter_loop(s, *label, x);
+                s.push();
+                self.bind_pattern(s, *pat);
+                self.block(s, *body);
+                s.pop();
+                self.exit_loop(s, *label);
+            }
+            ExprKind::Break { pos, label, value } => {
+                self.jump(s, "break", *pos, *label, x);
+                self.opt_expr(s, *value);
+            }
+            ExprKind::Continue { pos, label } => self.jump(s, "continue", *pos, *label, x),
+            ExprKind::Return { value, .. } => self.opt_expr(s, *value),
+            ExprKind::Closure { params, result, body, .. } => {
+                let old_fn = s.fn_node.clone();
+                let old_labels = std::mem::take(&mut s.labels);
+                let old_loops = s.loops;
+                s.fn_node = Node::Expr(x);
+                s.loops = 0;
+                let prib = s.push();
+                let mut names: HashMap<String, &mut Local> = HashMap::new();
+                let empty: HashMap<String, &mut Local> = HashMap::new();
+                for p in params.iter() {
+                    if let Some(t) = p.ty { self.resolve_type(s, t); }
+                    self.pat(s, p.pat, &mut names, &empty);
+                }
+                for (n, l) in names.iter() { prib.values.insert(n.clone(), *l); }
+                if let Some(r) = result { self.resolve_type(s, *r); }
+                self.expr(s, *body);
+                s.pop();
+                s.fn_node = old_fn;
+                s.labels = old_labels;
+                s.loops = old_loops;
+            }
+            ExprKind::Select { arms, .. } => {
+                for a in arms.iter() {
+                    self.opt_expr(s, a.op);
+                    s.push();
+                    if let Some(p) = a.pat { self.bind_pattern(s, p); }
+                    self.expr(s, a.body);
+                    s.pop();
+                }
+            }
+        }
+    }
+
+    // cond resolves an if/while condition; `let pat = x` binds into the top
+    // rib so that the body sees the bindings.
+    fn cond(&mut self, s: &mut Scope, c: &Expr) {
+        if let ExprKind::Let { pat, x, .. } = &c.kind {
+            self.expr(s, *x);
+            self.bind_pattern(s, *pat);
+            return;
+        }
+        self.expr(s, c);
+    }
+
+    fn enter_loop(&mut self, s: &mut Scope, lbl: Option<&Name>, node: &Expr) {
+        if let Some(l) = lbl {
+            for o in s.labels.iter() {
+                if o.name == l.value {
+                    self.errorf(Some(s.file), l.pos, `label '${l.value} shadows a label with the same name`);
+                }
+            }
+            s.labels.push(Label { name: l.value.clone(), node: Node::Expr(node) });
+            self.info.labels.insert(node.id, Node::Expr(node));
+        }
+        s.loops += 1;
+    }
+
+    fn exit_loop(&mut self, s: &mut Scope, lbl: Option<&Name>) {
+        s.loops -= 1;
+        if lbl.is_some() { s.labels.pop(); }
+    }
+
+    // jump records the loop a labeled break/continue refers to (keyed by the
+    // break/continue expression).
+    fn jump(&mut self, s: &mut Scope, kw: &str, pos: Pos, lbl: Option<&Name>, x: &Expr) {
+        if let Some(l) = lbl {
+            let mut i = s.labels.len();
+            while i > 0 {
+                i -= 1;
+                if s.labels[i].name == l.value {
+                    self.info.labels.insert(x.id, s.labels[i].node.clone());
+                    return;
+                }
+            }
+            self.errorf(Some(s.file), l.pos, `use of undeclared label '${l.value}`);
+            return;
+        }
+        if s.loops == 0 { self.errorf(Some(s.file), pos, `${kw} outside of a loop`); }
+    }
+
+    fn check_value(&mut self, s: &Scope, p: &Path, res: &Res) {
+        if res.kind == RES_ERR || res.rest.len() > 0 || res.kind == RES_LOCAL || res.kind == RES_SELF_TY || res.kind == RES_QUALIFIED { return; }
+        if res.kind == RES_DEF {
+            let d = res.def.unwrap();
+            let k = d.kind;
+            if k == DEF_FN || k == DEF_CONST || k == DEF_STATIC || k == DEF_EXTERN_FN || k == DEF_EXTERN_STATIC || k == DEF_ASSOC_FN || k == DEF_ASSOC_CONST {
+                return;
+            }
+            if (k == DEF_STRUCT || k == DEF_VARIANT) && d.ctor { return; }
+        }
+        self.errorf(Some(s.file), p.pos(), `expected value, found ${describe(res)}`);
+    }
+
+    fn check_struct_path(&mut self, s: &Scope, p: &Path, res: &Res) {
+        if res.kind == RES_ERR || res.kind == RES_SELF_TY || res.rest.len() > 0 { return; }
+        if res.kind == RES_DEF {
+            let k = res.def.unwrap().kind;
+            if k == DEF_STRUCT || k == DEF_VARIANT || k == DEF_TYPE_ALIAS { return; }
+        }
+        self.errorf(Some(s.file), p.pos(), `expected struct or variant, found ${describe(res)}`);
+    }
+
+    // --- Patterns ------------------------------------------------------------------
+
+    fn bind_pattern(&mut self, s: &mut Scope, p: &Pat) {
+        let mut names: HashMap<String, &mut Local> = HashMap::new();
+        let empty: HashMap<String, &mut Local> = HashMap::new();
+        self.pat(s, p, &mut names, &empty);
+        let top = s.top();
+        for (n, l) in names.iter() { top.values.insert(n.clone(), *l); }
+    }
+
+    // pat resolves p, adding new bindings to names; shared holds the
+    // bindings of the first alternative of an enclosing or-pattern.
+    fn pat(&mut self, s: &mut Scope, p: &Pat, names: &mut HashMap<String, &mut Local>, shared: &HashMap<String, &mut Local>) {
+        match &p.kind {
+            PatKind::Wild(_) | PatKind::Rest(_) => {}
+            PatKind::Ident { is_mut, name, sub } => {
+                if sub.is_none() && !*is_mut {
+                    if let Some(res) = self.pat_const(s, name.value.as_str()) {
+                        self.info.pat_consts.insert(p.id, res);
+                        return;
+                    }
+                }
+                if names.contains_key(&name.value) {
+                    self.errorf(Some(s.file), name.pos, `identifier ${name.value} is bound more than once in the same pattern`);
+                } else {
+                    let l = match shared.get(&name.value) {
+                        Some(l) => *l,
+                        None => self.new_local(name.value.as_str(), name.pos, *is_mut, s.fn_node.clone()),
+                    };
+                    names.insert(name.value.clone(), l);
+                    self.info.bindings.insert(p.id, l);
+                }
+                if let Some(sp) = sub { self.pat(s, *sp, names, shared); }
+            }
+            PatKind::Lit(x) => self.expr(s, *x),
+            PatKind::Range { lo, hi, .. } => { self.opt_expr(s, *lo); self.opt_expr(s, *hi); }
+            PatKind::Path(path) => {
+                let res = self.resolve_path(s, *path, VALUE_NS);
+                self.check_value(s, *path, &res);
+            }
+            PatKind::TupleStruct { path, elems } => {
+                let res = self.resolve_path(s, *path, VALUE_NS);
+                if res.kind == RES_DEF {
+                    let k = res.def.unwrap().kind;
+                    if !(k == DEF_STRUCT || k == DEF_VARIANT) {
+                        self.errorf(Some(s.file), path.pos(), `expected tuple struct or variant, found ${describe(&res)}`);
+                    }
+                }
+                for e in elems.iter() { self.pat(s, *e, names, shared); }
+            }
+            PatKind::Struct { path, fields, .. } => {
+                let res = self.resolve_path(s, *path, TYPE_NS);
+                self.check_struct_path(s, *path, &res);
+                for f in fields.iter() { self.pat(s, f.pat, names, shared); }
+            }
+            PatKind::Tuple { elems, .. } => { for e in elems.iter() { self.pat(s, *e, names, shared); } }
+            PatKind::Slice { elems, .. } => { for e in elems.iter() { self.pat(s, *e, names, shared); } }
+            PatKind::Ref { pat, .. } => self.pat(s, *pat, names, shared),
+            PatKind::Or(alts) => {
+                let mut first: HashMap<String, &mut Local> = HashMap::new();
+                self.pat(s, alts[0], &mut first, shared);
+                let mut i = 1;
+                while i < alts.len() {
+                    let alt = alts[i];
+                    let mut other: HashMap<String, &mut Local> = HashMap::new();
+                    self.pat(s, alt, &mut other, &first);
+                    let missing = diff_keys(&first, &other);
+                    if missing.len() > 0 {
+                        self.errorf(Some(s.file), alt.pos(), `variable ${missing} is not bound in all alternatives of this pattern`);
+                    }
+                    let extra = diff_keys(&other, &first);
+                    if extra.len() > 0 {
+                        self.errorf(Some(s.file), alt.pos(), `variable ${extra} is not bound in all alternatives of this pattern`);
+                    }
+                    i += 1;
+                }
+                let mut keys: Vec<String> = first.keys().map(|k| k.clone()).collect();
+                keys.sort();
+                for n in keys.iter() {
+                    let l = first[n];
+                    if names.contains_key(n) {
+                        self.errorf(Some(s.file), l.pos, `identifier ${n} is bound more than once in the same pattern`);
+                        continue;
+                    }
+                    names.insert(n.clone(), l);
+                }
+            }
+        }
+    }
+
+    // pat_const: whether a lone identifier in a pattern names a constant,
+    // static, or unit struct/variant.
+    fn pat_const(&self, s: &mut Scope, name: &str) -> Option<Res> {
+        let res = self.lexical(s, name, VALUE_NS, false)?;
+        if res.kind != RES_DEF { return None; }
+        let d = res.def.unwrap();
+        let k = d.kind;
+        if k == DEF_CONST || k == DEF_STATIC || k == DEF_ASSOC_CONST { return Some(res); }
+        if k == DEF_STRUCT {
+            if let Node::Item(Item::Struct(sd)) = &d.node {
+                if sd.kind == StructKind::Unit { return Some(res); }
+            }
+        }
+        if k == DEF_VARIANT {
+            if let Node::Variant(v) = &d.node {
+                if v.kind == StructKind::Unit { return Some(res); }
+            }
+        }
+        None
+    }
+}

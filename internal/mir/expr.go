@@ -108,7 +108,10 @@ func (b *builder) rawOperand(x syntax.Expr) Operand {
 			switch d.Kind {
 			case resolve.DefFn, resolve.DefExternFn, resolve.DefAssocFn:
 				return ConstOp(&Const{Kind: CFn, Fn: &FnRef{Def: d, Args: cl.Args, Self: cl.Self}, Type: b.typeOf(x)})
-			case resolve.DefConst, resolve.DefAssocConst:
+			case resolve.DefConst:
+				// Free constants are computed once, like statics.
+				return Copy(b.staticPlace(d))
+			case resolve.DefAssocConst:
 				out := b.temp(b.typeOf(x))
 				b.call(ConstOp(&Const{Kind: CFn, Fn: &FnRef{Def: d, Args: cl.Args, Self: cl.Self}}), nil, out, x.Pos())
 				return Copy(out)

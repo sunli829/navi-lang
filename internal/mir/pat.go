@@ -108,7 +108,10 @@ func (b *builder) testPat(p syntax.Pat, sp Place, fail int) {
 			return
 		}
 		lt := b.body.Locals[l]
-		dst := b.declare(l, lt)
+		dst, ok := b.orBound[l]
+		if !ok {
+			dst = b.declare(l, lt)
+		}
 		if b.body.RefBindings[p] {
 			b.assign(dst, Ref{Mut: lt.Kind == types.KRef && lt.Mut, Place: sp})
 		} else {
@@ -119,6 +122,25 @@ func (b *builder) testPat(p syntax.Pat, sp Place, fail int) {
 		b.testPat(p.Pat, sp.Deref(), fail)
 		return
 	case *syntax.OrPat:
+		// Every alternative binds the same variables: declare them once,
+		// before branching, and let each alternative assign them.
+		outer := b.orBound
+		if outer == nil {
+			b.orBound = map[*resolve.Local]Place{}
+			syntax.Inspect(p, func(n syntax.Node) bool {
+				if ip, ok := n.(*syntax.IdentPat); ok {
+					if _, isConst := b.res.PatConsts[ip]; !isConst {
+						if l := b.res.Bindings[ip]; l != nil {
+							if _, done := b.orBound[l]; !done {
+								b.orBound[l] = b.declare(l, b.body.Locals[l])
+							}
+						}
+					}
+				}
+				return true
+			})
+			defer func() { b.orBound = nil }()
+		}
 		success := b.newBlock()
 		for i, alt := range p.Alts {
 			next := fail
@@ -271,7 +293,11 @@ func (b *builder) constTest(def *resolve.Def, sp Place, t *types.Type, fail int,
 		return
 	}
 	v := b.temp(t)
-	b.call(ConstOp(&Const{Kind: CFn, Fn: &FnRef{Def: def}}), nil, v, pos)
+	if def.Kind == resolve.DefConst || def.Kind == resolve.DefStatic {
+		b.assign(v, Use{X: Copy(b.staticPlace(def))})
+	} else {
+		b.call(ConstOp(&Const{Kind: CFn, Fn: &FnRef{Def: def}}), nil, v, pos)
+	}
 	ok := b.temp(ctx.Bool)
 	if isPrim(t) {
 		b.assign(ok, Bin{Op: Eq, X: Copy(sp), Y: Copy(v), Type: t})

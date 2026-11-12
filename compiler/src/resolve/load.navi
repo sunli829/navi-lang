@@ -1,0 +1,301 @@
+//! Loading a crate's files and collecting its items into modules.
+
+use std::collections::HashMap;
+use crate::syntax::ast::*;
+use crate::syntax::source::File;
+use crate::syntax::parser;
+use crate::resolve::*;
+use crate::util;
+
+impl Resolver {
+    /// Parses the crate's files and builds its module tree, following Rust's
+    /// rules for `mod name;`.
+    pub fn load(&mut self, c: &mut Crate, root: &str) {
+        let mut files: HashMap<String, &SourceFile> = HashMap::new();
+        self.parse_tree(c, root, util::path_dir(root).as_str(), &mut files);
+        let root_file = match files.get(&root.to_string()) { Some(f) => *f, None => return };
+        let rm = new_module(c, None, c.name.as_str());
+        c.root = Some(rm);
+        rm.dir = util::path_dir(root);
+        let root_def = self.new_def(DEF_MOD, c.name.as_str(), Some(root_file.file), Node::None, 0, None, c);
+        root_def.module = Some(rm);
+        rm.def = Some(root_def);
+        rm.file = Some(root_file.file);
+        c.files.push(root_file);
+        if self.cfg_enabled(root_file.file, &root_file.attrs) {
+            self.collect_items(rm, root_file.file, &root_file.items, &mut files);
+        }
+    }
+
+    // parse_tree parses p and every file reachable through mod declarations.
+    fn parse_tree(&mut self, c: &mut Crate, p: &str, dir: &str, files: &mut HashMap<String, &SourceFile>) {
+        let full = util::path_join(c.fs_root.as_str(), p);
+        let src = match std::fs::read_to_string(&full) {
+            Ok(s) => s,
+            Err(e) => {
+                self.errorf(None, 0, `crate ${c.name}: open ${p}: no such file or directory`);
+                return;
+            }
+        };
+        let f = File::new(util::path_join(c.dir.as_str(), p).as_str(), src);
+        let (sf, errs) = parser::parse_file(f);
+        for d in errs.diags.iter() { self.errorf(Some(sf.file), d.pos, d.msg.clone()); }
+        files.insert(p.to_string(), sf);
+        if !self.cfg_enabled_quiet(&sf.attrs) { return; }
+        let mut found: Vec<(String, String)> = Vec::new();
+        self.find_mod_files(c, &sf.items, dir, &mut found);
+        for (child, child_dir) in found.iter() {
+            if !files.contains_key(child) {
+                self.parse_tree(c, child.as_str(), child_dir.as_str(), files);
+            }
+        }
+    }
+
+    fn find_mod_files(&self, c: &Crate, items: &Vec<Item>, dir: &str, found: &mut Vec<(String, String)>) {
+        for it in items.iter() {
+            if let Item::Mod(m) = it {
+                if !self.cfg_enabled_quiet(&m.base.attrs) { continue; }
+                if m.inline {
+                    self.find_mod_files(c, &m.items, util::path_join(dir, m.name.value.as_str()).as_str(), found);
+                    continue;
+                }
+                let (p, _) = mod_file(c, dir, m.name.value.as_str());
+                if p.len() > 0 {
+                    let cd = child_dir(p.as_str(), false);
+                    found.push((p, cd));
+                }
+            }
+        }
+    }
+
+    pub fn collect_items(&mut self, m: &mut Module, file: &File, items: &Vec<Item>, files: &mut HashMap<String, &SourceFile>) {
+        m.file = Some(file);
+        for it in items.iter() { self.collect_item(m, file, it, files); }
+    }
+
+    fn define(&mut self, m: &mut Module, file: &File, it: &Item, kind: DefKind, name: &Name, vis: &Visibility, nss: &[Namespace]) -> &mut Def {
+        let d = self.new_def(kind, name.value.as_str(), Some(file), Node::Item(it.clone()), name.pos, m.def, m.krate);
+        d.vis = vis.clone();
+        for ns in nss.iter() { self.bind(m, file, *ns, name, res_def(d), vis.clone()); }
+        d
+    }
+
+    pub fn collect_item(&mut self, m: &mut Module, file: &File, it: &Item, files: &mut HashMap<String, &SourceFile>) {
+        let base = it.base();
+        if !self.cfg_enabled(file, &base.attrs) { return; }
+        m.items.push(it.clone());
+        let c = m.krate;
+        let vis = self.visibility(m, file, base);
+        match it {
+            Item::Fn(f) => { self.define(m, file, it, DEF_FN, f.name, &vis, &[VALUE_NS]); }
+            Item::Struct(s) => {
+                if s.kind == StructKind::Named {
+                    self.define(m, file, it, DEF_STRUCT, s.name, &vis, &[TYPE_NS]);
+                } else {
+                    let d = self.define(m, file, it, DEF_STRUCT, s.name, &vis, &[TYPE_NS, VALUE_NS]);
+                    d.ctor = true;
+                }
+            }
+            Item::Enum(e) => {
+                let d = self.define(m, file, it, DEF_ENUM, e.name, &vis, &[TYPE_NS]);
+                let em = new_module(c, Some(m), e.name.value.as_str());
+                em.is_enum = true;
+                em.def = Some(d);
+                d.module = Some(em);
+                for v in e.variants.iter() {
+                    let vd = self.new_def(DEF_VARIANT, v.name.value.as_str(), Some(file), Node::Variant(*v), v.name.pos, Some(d), c);
+                    vd.vis = vis.clone();
+                    self.bind(em, file, TYPE_NS, v.name, res_def(vd), public());
+                    if v.kind != StructKind::Named {
+                        vd.ctor = true;
+                        self.bind(em, file, VALUE_NS, v.name, res_def(vd), public());
+                    }
+                }
+            }
+            Item::Trait(t) => {
+                let d = self.define(m, file, it, DEF_TRAIT, t.name, &vis, &[TYPE_NS]);
+                self.collect_assoc(m, d, file, &t.items);
+            }
+            Item::TypeAlias(t) => { self.define(m, file, it, DEF_TYPE_ALIAS, t.name, &vis, &[TYPE_NS]); }
+            Item::Const(k) => {
+                if k.name.value == "_" {
+                    self.new_def(DEF_CONST, "_", Some(file), Node::Item(it.clone()), k.name.pos, m.def, c);
+                } else {
+                    self.define(m, file, it, DEF_CONST, k.name, &vis, &[VALUE_NS]);
+                }
+            }
+            Item::Static(s) => { self.define(m, file, it, DEF_STATIC, s.name, &vis, &[VALUE_NS]); }
+            Item::Impl(im) => {
+                let d = self.new_def(DEF_IMPL, "", Some(file), Node::Item(it.clone()), it.pos(), m.def, c);
+                d.vis = public();
+                self.collect_assoc(m, d, file, &im.items);
+            }
+            Item::Extern(eb) => {
+                for ei in eb.items.iter() {
+                    if !self.cfg_enabled(file, &ei.base().attrs) { continue; }
+                    let evis = self.visibility(m, file, ei.base());
+                    match ei {
+                        Item::Fn(f) => {
+                            let d = self.new_def(DEF_EXTERN_FN, f.name.value.as_str(), Some(file), Node::Item(ei.clone()), f.name.pos, m.def, c);
+                            d.vis = evis.clone();
+                            self.bind(m, file, VALUE_NS, f.name, res_def(d), evis);
+                        }
+                        Item::Static(s) => {
+                            let d = self.new_def(DEF_EXTERN_STATIC, s.name.value.as_str(), Some(file), Node::Item(ei.clone()), s.name.pos, m.def, c);
+                            d.vis = evis.clone();
+                            self.bind(m, file, VALUE_NS, s.name, res_def(d), evis);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Item::Mod(md) => {
+                let d = self.define(m, file, it, DEF_MOD, md.name, &vis, &[TYPE_NS]);
+                let child = new_module(c, Some(m), md.name.value.as_str());
+                child.def = Some(d);
+                d.module = Some(child);
+                if md.inline {
+                    child.dir = util::path_join(m.dir.as_str(), md.name.value.as_str());
+                    self.collect_items(child, file, &md.items, files);
+                    return;
+                }
+                let (p, candidates) = mod_file(c, m.dir.as_str(), md.name.value.as_str());
+                if p.len() == 0 {
+                    if candidates.len() == 2 && file_exists(c, candidates[0].as_str()) {
+                        self.errorf(Some(file), md.name.pos, `module ${md.name.value} is defined in both ${candidates[0]} and ${candidates[1]}`);
+                    } else {
+                        self.errorf(Some(file), md.name.pos, `file not found for module ${md.name.value} (looked for ${candidates[0]} and ${candidates[1]})`);
+                    }
+                    return;
+                }
+                let pf = match files.get(&p) { Some(f) => *f, None => return };
+                child.dir = child_dir(p.as_str(), false);
+                child.file = Some(pf.file);
+                c.files.push(pf);
+                if self.cfg_enabled(pf.file, &pf.attrs) {
+                    self.collect_items(child, pf.file, &pf.items, files);
+                }
+            }
+            Item::Use(u) => {
+                self.collect_use(m, file, u.tree, &Vec::new(), &vis);
+            }
+        }
+    }
+
+    // collect_assoc creates defs for the items of an impl or trait.
+    fn collect_assoc(&mut self, m: &mut Module, parent: &mut Def, file: &File, items: &Vec<Item>) {
+        for it in items.iter() {
+            let base = it.base();
+            if !self.cfg_enabled(file, &base.attrs) { continue; }
+            let mut vis = public();
+            if parent.kind == DEF_IMPL && !is_trait_impl(parent) { vis = self.visibility(m, file, base); }
+            let d = match it {
+                Item::Fn(f) => self.new_def(DEF_ASSOC_FN, f.name.value.as_str(), Some(file), Node::Item(it.clone()), f.name.pos, Some(parent), parent.krate),
+                Item::Const(k) => self.new_def(DEF_ASSOC_CONST, k.name.value.as_str(), Some(file), Node::Item(it.clone()), k.name.pos, Some(parent), parent.krate),
+                Item::TypeAlias(t) => self.new_def(DEF_ASSOC_TYPE, t.name.value.as_str(), Some(file), Node::Item(it.clone()), t.name.pos, Some(parent), parent.krate),
+                _ => {
+                    self.errorf(Some(file), it.pos(), `only functions, constants and types are allowed in ${def_kind_name(parent.kind)} blocks`);
+                    continue;
+                }
+            };
+            d.vis = vis;
+        }
+    }
+
+    pub fn visibility(&mut self, m: &mut Module, file: &File, base: &ItemBase) -> Visibility {
+        let named = m.nearest_named();
+        match base.vis {
+            Vis::Pub => public(),
+            Vis::Crate => Visibility { restricted: m.krate.root },
+            Vis::Super => match named.parent {
+                None => {
+                    self.errorf(Some(file), base.start, "pub(super) is not allowed in the crate root".to_string());
+                    Visibility { restricted: Some(named) }
+                }
+                Some(p) => Visibility { restricted: Some(p.nearest_named()) },
+            },
+            Vis::Private => Visibility { restricted: Some(m) },
+        }
+    }
+
+    pub fn bind(&mut self, m: &mut Module, file: &File, ns: Namespace, name: &Name, res: Res, vis: Visibility) {
+        if m.bindings[ns].contains_key(&name.value) {
+            self.errorf(Some(file), name.pos, `the name ${name.value} is defined multiple times in ${m.path()}`);
+            return;
+        }
+        m.bindings[ns].insert(name.value.clone(), &mut Binding { res, vis, import: None });
+    }
+
+    // collect_use flattens a use tree into imports.
+    fn collect_use(&mut self, m: &mut Module, file: &File, t: &UseTree, prefix: &Vec<&Name>, vis: &Visibility) {
+        let mut segs: Vec<&Name> = prefix.clone();
+        if let Some(p) = t.prefix {
+            for s in p.segments.iter() { segs.push(s.name); }
+        }
+        if t.glob {
+            if segs.len() == 0 {
+                let rp = m.krate.root.unwrap().def.unwrap().pos;
+                self.errorf(Some(file), rp, "glob import needs a path".to_string());
+                return;
+            }
+            let imp = &mut Import { module: m, file, segs: segs.clone(), name: String::new(), pos: segs[0].pos, glob: true, vis: vis.clone(), done: false };
+            self.imports.push(imp);
+            m.glob_srcs.push(imp);
+            return;
+        }
+        if t.group {
+            for ch in t.children.iter() { self.collect_use(m, file, *ch, &segs, vis); }
+            return;
+        }
+        let mut last = segs[segs.len() - 1];
+        if last.value == "self" {
+            if segs.len() == 1 {
+                self.errorf(Some(file), last.pos, "self import can only appear in a group with a non-empty prefix".to_string());
+                return;
+            }
+            segs.pop();
+            last = segs[segs.len() - 1];
+        }
+        let name = match t.alias { Some(a) => a.value.clone(), None => last.value.clone() };
+        self.imports.push(&mut Import { module: m, file, segs, name, pos: last.pos, glob: false, vis: vis.clone(), done: false });
+    }
+}
+
+pub fn is_trait_impl(d: &Def) -> bool {
+    match &d.node {
+        Node::Item(Item::Impl(im)) => im.trait_path.is_some(),
+        _ => false,
+    }
+}
+
+fn file_exists(c: &Crate, p: &str) -> bool {
+    std::path::Path::new(util::path_join(c.fs_root.as_str(), p).as_str()).exists()
+}
+
+// mod_file returns the file holding module name declared in a module whose
+// child directory is dir, or "" and the candidates if none or both exist.
+fn mod_file(c: &Crate, dir: &str, name: &str) -> (String, Vec<String>) {
+    let a = util::path_join(dir, `${name}.navi`.as_str());
+    let b = util::path_join(util::path_join(dir, name).as_str(), "mod.navi");
+    let ea = file_exists(c, a.as_str());
+    let eb = file_exists(c, b.as_str());
+    let mut cands = Vec::new();
+    if ea && eb {
+        cands.push(a);
+        cands.push(b);
+        return (String::new(), cands);
+    }
+    if ea { return (a, cands); }
+    if eb { return (b, cands); }
+    cands.push(a);
+    cands.push(b);
+    (String::new(), cands)
+}
+
+// child_dir is the directory for modules declared in the file at p.
+fn child_dir(p: &str, is_root: bool) -> String {
+    if is_root || util::path_base(p) == "mod.navi" { return util::path_dir(p); }
+    let base = util::path_base(p);
+    let stem = &base[0..base.len() - 5];
+    util::path_join(util::path_dir(p).as_str(), stem)
+}

@@ -1,0 +1,273 @@
+//! use declarations: resolved to a fixed point.
+
+use crate::syntax::ast::Name;
+use crate::syntax::source::Pos;
+use crate::resolve::*;
+
+pub type LookupStatus = u8;
+pub const FOUND: LookupStatus = 0;
+pub const NOT_FOUND: LookupStatus = 1;
+pub const PRIVATE: LookupStatus = 2;
+pub const AMBIGUOUS: LookupStatus = 3;
+
+/// Why a module path failed to resolve.
+pub struct PathError { pub pos: Pos, pub msg: String }
+
+pub fn is_module_keyword(s: &str) -> bool { s == "crate" || s == "self" || s == "super" }
+
+/// The module-like scope a resolution names: a module, an enum or a crate
+/// root.
+pub fn module_of_res(res: &Res) -> Option<&mut Module> {
+    if res.kind == RES_CRATE || (res.kind == RES_DEF && (res.def.unwrap().kind == DEF_MOD || res.def.unwrap().kind == DEF_ENUM)) {
+        return res.def.unwrap().module;
+    }
+    None
+}
+
+impl Resolver {
+    /// Looks a name up in module m as seen from module from.
+    pub fn lookup_in(&self, m: &Module, name: &str, ns: Namespace, from: &Module) -> (Option<&mut Binding>, LookupStatus) {
+        if let Some(b) = m.bindings[ns].get(&name.to_string()) {
+            if !b.vis.accessible_from(from) { return (Some(*b), PRIVATE); }
+            return (Some(*b), FOUND);
+        }
+        let mut hit: Option<&mut Binding> = None;
+        let mut saw_private = false;
+        if let Some(gs) = m.globs[ns].get(&name.to_string()) {
+            for b in gs.iter() {
+                if !b.vis.accessible_from(from) {
+                    saw_private = true;
+                    continue;
+                }
+                if let Some(h) = hit {
+                    if !same_res(&h.res, &b.res) { return (hit, AMBIGUOUS); }
+                }
+                hit = Some(*b);
+            }
+        }
+        if hit.is_some() { return (hit, FOUND); }
+        if saw_private { return (None, PRIVATE); }
+        (None, NOT_FOUND)
+    }
+
+    // import_scope resolves the first segment of a use path.
+    pub fn import_scope(&self, from: &mut Module, name: &str, ns: Namespace) -> Option<Res> {
+        let mut x: Option<&mut Module> = Some(from);
+        while let Some(m) = x {
+            let (b, st) = self.lookup_in(m, name, ns, from);
+            if st == FOUND { return Some(b.unwrap().res.clone()); }
+            if !m.anonymous { break; }
+            x = m.parent;
+        }
+        if ns == TYPE_NS {
+            if let Some(c) = from.krate.deps.get(&name.to_string()) {
+                if let Some(root) = c.root { return Some(res_kind_def(RES_CRATE, root.def.unwrap())); }
+            }
+            if from.krate.is_std && name == "std" {
+                return Some(res_kind_def(RES_CRATE, from.krate.root.unwrap().def.unwrap()));
+            }
+        }
+        None
+    }
+
+    /// Resolves segs to a module-like scope.
+    pub fn module_path(&self, from: &mut Module, segs: &Vec<&Name>) -> Result<&mut Module, PathError> {
+        let mut cur: Option<&mut Module> = None;
+        let mut i = 0;
+        while i < segs.len() {
+            let seg = segs[i];
+            let v = seg.value.as_str();
+            if v == "crate" {
+                if i != 0 { return Err(PathError { pos: seg.pos, msg: "crate can only appear at the start of a path".to_string() }); }
+                cur = from.krate.root;
+                i += 1;
+                continue;
+            }
+            if v == "self" {
+                if i != 0 { return Err(PathError { pos: seg.pos, msg: "self can only appear at the start of a path".to_string() }); }
+                cur = Some(from.nearest_named());
+                i += 1;
+                continue;
+            }
+            if v == "super" {
+                if i == 0 {
+                    cur = Some(from.nearest_named());
+                } else if segs[i - 1].value != "super" && segs[i - 1].value != "self" {
+                    return Err(PathError { pos: seg.pos, msg: "super can only follow self or super at the start of a path".to_string() });
+                }
+                match cur.unwrap().parent {
+                    None => return Err(PathError { pos: seg.pos, msg: "there are too many leading super keywords".to_string() }),
+                    Some(p) => { cur = Some(p.nearest_named()); }
+                }
+                i += 1;
+                continue;
+            }
+            let res = if i == 0 {
+                match self.import_scope(from, v, TYPE_NS) {
+                    Some(r) => r,
+                    None => return Err(PathError { pos: seg.pos, msg: `cannot find module or crate ${v} in this scope` }),
+                }
+            } else {
+                let c = cur.unwrap();
+                let (b, st) = self.lookup_in(c, v, TYPE_NS, from);
+                if st == NOT_FOUND { return Err(PathError { pos: seg.pos, msg: `cannot find ${v} in ${c.path()}` }); }
+                if st == PRIVATE { return Err(PathError { pos: seg.pos, msg: `${v} is private in ${c.path()}` }); }
+                if st == AMBIGUOUS { return Err(PathError { pos: seg.pos, msg: `${v} is ambiguous (imported by more than one glob)` }); }
+                b.unwrap().res.clone()
+            };
+            cur = module_of_res(&res);
+            if cur.is_none() { return Err(PathError { pos: seg.pos, msg: `${v} is not a module or enum` }); }
+            i += 1;
+        }
+        Ok(cur.unwrap())
+    }
+
+    /// Resolves all use declarations to a fixed point.
+    pub fn resolve_imports(&mut self) {
+        let imports = self.imports.clone();
+        self.resolve_import_list(imports, true);
+    }
+
+    pub fn resolve_import_list(&mut self, mut imports: Vec<&mut Import>, report_globs: bool) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for imp in imports.iter_mut() {
+                if imp.glob {
+                    if self.propagate_glob(*imp) { changed = true; }
+                    continue;
+                }
+                if !imp.done && self.try_single_import(*imp) {
+                    imp.done = true;
+                    changed = true;
+                }
+            }
+        }
+        for imp in imports.iter_mut() {
+            if imp.glob {
+                if report_globs {
+                    if let Err(e) = self.module_path(imp.module, &imp.segs) {
+                        self.errorf(Some(imp.file), e.pos, `unresolved import: ${e.msg}`);
+                    }
+                }
+                continue;
+            }
+            if !imp.done { self.report_import(*imp); }
+        }
+    }
+
+    // propagate_glob copies the bindings visible through a glob import into
+    // the importing module; true if anything new was added.
+    pub fn propagate_glob(&mut self, imp: &mut Import) -> bool {
+        let src = match self.module_path(imp.module, &imp.segs) { Ok(m) => m, Err(_) => return false };
+        imp.done = true;
+        let dst = imp.module;
+        let mut added = false;
+        let mut ns = 0;
+        while ns < 2 {
+            let mut cands: Vec<(String, &mut Binding)> = Vec::new();
+            for (name, b) in src.bindings[ns].iter() { cands.push((name.clone(), *b)); }
+            for (name, bs) in src.globs[ns].iter() {
+                for b in bs.iter() { cands.push((name.clone(), *b)); }
+            }
+            for (name, b) in cands.iter() {
+                if !b.vis.accessible_from(dst) { continue; }
+                let mut dup = false;
+                if let Some(olds) = dst.globs[ns].get(name) {
+                    for old in olds.iter() { if same_res(&old.res, &b.res) { dup = true; } }
+                }
+                if dup { continue; }
+                let nb = &mut Binding { res: b.res.clone(), vis: imp.vis.clone(), import: Some(imp) };
+                if !dst.globs[ns].contains_key(name) { dst.globs[ns].insert(name.clone(), Vec::new()); }
+                dst.globs[ns].get_mut(name).unwrap().push(nb);
+                added = true;
+            }
+            ns += 1;
+        }
+        added
+    }
+
+    // try_single_import resolves a non-glob import if its target is
+    // available.
+    fn try_single_import(&mut self, imp: &mut Import) -> bool {
+        let last = imp.segs[imp.segs.len() - 1];
+        let mut hits: Vec<Option<&mut Binding>> = Vec::new();
+        hits.push(None);
+        hits.push(None);
+        if imp.segs.len() == 1 || is_module_keyword(last.value.as_str()) {
+            if is_module_keyword(last.value.as_str()) {
+                let m = match self.module_path(imp.module, &imp.segs) { Ok(m) => m, Err(_) => return false };
+                hits[TYPE_NS] = Some(&mut Binding { res: res_def(m.def.unwrap()), vis: public(), import: None });
+            } else {
+                let mut ns = 0;
+                while ns < 2 {
+                    if let Some(res) = self.import_scope(imp.module, last.value.as_str(), ns) {
+                        hits[ns] = Some(&mut Binding { res, vis: public(), import: None });
+                    }
+                    ns += 1;
+                }
+            }
+        } else {
+            let mut prefix = imp.segs.clone();
+            prefix.pop();
+            let src = match self.module_path(imp.module, &prefix) { Ok(m) => m, Err(_) => return false };
+            let mut ns = 0;
+            while ns < 2 {
+                let (b, st) = self.lookup_in(src, last.value.as_str(), ns, imp.module);
+                if st == FOUND { hits[ns] = b; }
+                ns += 1;
+            }
+        }
+        let mut any = false;
+        let mut ns = 0;
+        while ns < 2 {
+            if let Some(b) = hits[ns] {
+                any = true;
+                if imp.name == "_" {
+                    if b.res.kind == RES_DEF && b.res.def.unwrap().kind == DEF_TRAIT {
+                        imp.module.underscore_traits.push(b.res.def.unwrap());
+                    }
+                } else if let Some(old) = imp.module.bindings[ns].get(&imp.name) {
+                    if !same_res(&old.res, &b.res) {
+                        self.errorf(Some(imp.file), imp.pos, `the name ${imp.name} is defined multiple times in ${imp.module.path()}`);
+                    }
+                } else {
+                    imp.module.bindings[ns].insert(imp.name.clone(), &mut Binding { res: b.res.clone(), vis: imp.vis.clone(), import: Some(imp) });
+                }
+            }
+            ns += 1;
+        }
+        any
+    }
+
+    // report_import explains why a single import could not be resolved.
+    fn report_import(&mut self, imp: &mut Import) {
+        let last = imp.segs[imp.segs.len() - 1];
+        if imp.segs.len() == 1 {
+            self.errorf(Some(imp.file), last.pos, `unresolved import: cannot find ${last.value} in this scope`);
+            return;
+        }
+        let mut prefix = imp.segs.clone();
+        prefix.pop();
+        let src = match self.module_path(imp.module, &prefix) {
+            Ok(m) => m,
+            Err(e) => {
+                self.errorf(Some(imp.file), e.pos, `unresolved import: ${e.msg}`);
+                return;
+            }
+        };
+        let mut ns = 0;
+        while ns < 2 {
+            let (_, st) = self.lookup_in(src, last.value.as_str(), ns, imp.module);
+            if st == PRIVATE {
+                self.errorf(Some(imp.file), last.pos, `${last.value} is private in ${src.path()}`);
+                return;
+            } else if st == AMBIGUOUS {
+                self.errorf(Some(imp.file), last.pos, `${last.value} is ambiguous (imported by more than one glob)`);
+                return;
+            }
+            ns += 1;
+        }
+        self.errorf(Some(imp.file), last.pos, `unresolved import: cannot find ${last.value} in ${src.path()}`);
+    }
+}
