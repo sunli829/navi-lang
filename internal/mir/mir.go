@@ -21,8 +21,11 @@ type Func struct {
 	File     *syntax.File
 	Closure  bool // argument 1 is the environment pointer
 	Captures []*types.Type
-	// Unwind marks locals whose defers must run at return (set by PushDefer).
+	// HasDefer is set when the function registers deferred calls.
 	HasDefer bool
+	// Shim marks compiler-generated impl bodies; they are transparent for
+	// #[track_caller] locations.
+	Shim bool
 }
 
 // Local is a local variable or temporary.

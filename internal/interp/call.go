@@ -124,15 +124,10 @@ func (m *Machine) resolveRef(cur *fnInst, ref *mir.FnRef) *fnInst {
 		if in == nil {
 			m.fatal("no impl of %s::%s for %s", def.Parent.Name, def.Name, self)
 		}
-		switch {
-		case in.Virtual:
+		if in.Virtual {
 			return &fnInst{shim: "virtual", shimDef: def, shimArgs: args, key: fmt.Sprintf("virt%p<%s>", def, typesKey(args))}
-		case in.Builtin != "":
-			return &fnInst{shim: "builtin", shimTrait: in.Builtin, shimDef: def, shimSelf: self, shimArgs: args, key: fmt.Sprintf("bi%p%p<%s>", def, self, typesKey(args))}
-		case in.Derived != "":
-			return &fnInst{shim: "derived", shimTrait: in.Derived, shimDef: def, shimSelf: self, shimArgs: args, key: fmt.Sprintf("dv%p%p<%s>", def, self, typesKey(args))}
 		}
-		return m.instFor(in.Def, in.Args, in.Self)
+		return m.instForResolved(in, def, self, args)
 	}
 	return m.instFor(def, args, self)
 }
@@ -201,22 +196,28 @@ func (t *thread) callShim(inst *fnInst, args []val) val {
 		if in == nil {
 			m.fatal("no impl of %s for %s", inst.shimDef.Name, concrete)
 		}
-		var target *fnInst
-		switch {
-		case in.Builtin != "":
-			target = &fnInst{shim: "builtin", shimTrait: in.Builtin, shimDef: inst.shimDef, shimSelf: concrete, shimArgs: inst.shimArgs}
-		case in.Derived != "":
-			target = &fnInst{shim: "derived", shimTrait: in.Derived, shimDef: inst.shimDef, shimSelf: concrete, shimArgs: inst.shimArgs}
-		default:
-			target = m.instFor(in.Def, in.Args, in.Self)
-		}
+		target := m.instForResolved(in, inst.shimDef, concrete, inst.shimArgs)
 		args = append([]val{ptrVal(recv.ptrAt(0))}, args[1:]...)
 		return t.call(target, args)
-	case inst.shim == "builtin":
-		return t.builtin(inst, args)
-	case inst.shim == "derived":
-		return t.derived(inst, args)
 	}
 	m.fatal("cannot call %v", inst.key)
 	return val{}
+}
+
+// instForResolved turns a resolved trait method into an instance: an impl
+// method, a trait default method, or a generated shim for builtin and
+// derived impls.
+func (m *Machine) instForResolved(in *types.Instance, method *resolve.Def, self *types.Type, args []*types.Type) *fnInst {
+	trait := in.Builtin
+	if trait == "" {
+		trait = in.Derived
+	}
+	if trait == "" {
+		return m.instFor(in.Def, in.Args, in.Self)
+	}
+	if !mir.UsesShim(trait, method.Name) {
+		return m.instFor(method, args, self)
+	}
+	f := m.prog.Shim(trait, method, self, args)
+	return &fnInst{f: f, subst: map[*resolve.Def]*types.Type{}, key: f.Name}
 }

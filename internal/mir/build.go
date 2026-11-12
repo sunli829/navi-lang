@@ -17,11 +17,13 @@ type Program struct {
 	langFns map[string]*resolve.Def
 	// closures lists the closure bodies created while lowering.
 	closures []*Func
+	// shims caches generated builtin/derived impl bodies.
+	shims map[string]*Func
 }
 
 // Build lowers every body that type-checked.
 func Build(info *types.Info) *Program {
-	p := &Program{Info: info, Res: info.Res, Funcs: map[*resolve.Def]*Func{}, langFns: map[string]*resolve.Def{}}
+	p := &Program{Info: info, Res: info.Res, Funcs: map[*resolve.Def]*Func{}, langFns: map[string]*resolve.Def{}, shims: map[string]*Func{}}
 	p.findLangFns()
 	for def := range info.Bodies {
 		p.Func(def)

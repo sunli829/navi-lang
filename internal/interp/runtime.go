@@ -175,7 +175,11 @@ func (t *thread) intrinsic(inst *fnInst, args []val) val {
 		prec := int(u64arg(args[1]))
 		hasPrec := args[2].b[0] != 0
 		style := args[3].b[0]
-		s := formatFloat(x, prec, hasPrec, style)
+		bits := 64
+		if style&16 != 0 {
+			bits, style = 32, style&^16
+		}
+		s := formatFloatBits(x, prec, hasPrec, style, bits)
 		m.write(args[4].ptrAt(0), val{b: []byte(s)})
 		return intVal(8, int64(len(s)))
 	}
@@ -262,7 +266,7 @@ func (m *Machine) optionVal(elem *types.Type, v val, ok bool) val {
 func (t *thread) callerLocation() val {
 	m := t.m
 	j := len(t.stack) - 1
-	for j > 0 && t.stack[j].fn.Def != nil && hasAttr(t.stack[j].fn.Def, "track_caller") {
+	for j > 0 && (t.stack[j].fn.Shim || t.stack[j].fn.Def != nil && hasAttr(t.stack[j].fn.Def, "track_caller")) {
 		j--
 	}
 	fr := t.stack[j]
