@@ -343,3 +343,8 @@ func (m *Machine) SwapContext() {
 	a.Ldr(8, LR, X1, 16)
 	a.Ret()
 }
+
+func (m *Machine) EntryArgs() {
+	m.a.Str(8, X0, SP, 0)
+	m.a.Str(8, X1, SP, 8)
+}

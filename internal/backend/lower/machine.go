@@ -98,6 +98,9 @@ type Machine interface {
 	// which also preserves the C callee-saved registers and returns 0.
 	EntryPrologue(frame int64)
 	EntryReturn0()
+	// EntryArgs stores the entry point's C arguments (argc, argv) to the
+	// outgoing argument area at sp+0 and sp+8; call it first.
+	EntryArgs()
 
 	MovImm(r Reg, v int64)
 	Mov(dst, src Reg)

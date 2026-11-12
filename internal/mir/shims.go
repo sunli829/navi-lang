@@ -27,7 +27,7 @@ var ShimMethods = map[string]map[string]bool{
 	"Binary": {"fmt": true}, "LowerExp": {"fmt": true}, "UpperExp": {"fmt": true},
 	"Deref": {"deref": true}, "DerefMut": {"deref_mut": true},
 	"Index": {"index": true}, "IndexMut": {"index_mut": true},
-	"Step": {"forward": true},
+	"Step": {"forward": true, "backward": true},
 }
 
 // UsesShim reports whether method of a builtin/derived impl of trait is
@@ -241,7 +241,11 @@ func (s *sb) gen(trait, method string, self *types.Type, targs []*types.Type, pa
 	case "Step":
 		n := s.local(self)
 		s.assign(n, Cast{Kind: CastNumeric, X: Copy(a2), From: ctx.Ints[types.Usize], To: self})
-		s.assign(ret, Bin{Op: Add, X: Copy(a1), Y: Copy(n), Type: self})
+		op := Add
+		if method == "backward" {
+			op = Sub
+		}
+		s.assign(ret, Bin{Op: op, X: Copy(a1), Y: Copy(n), Type: self})
 		s.ret()
 	default:
 		panic("mir: no shim for builtin " + trait)

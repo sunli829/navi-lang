@@ -613,3 +613,12 @@ func (m *Machine) SwapContext() {
 	a.Load(8, RAX, load, 16)
 	a.JmpR(RAX)
 }
+
+func (m *Machine) EntryArgs() {
+	argc, argv := RDI, RSI
+	if m.Win64 {
+		argc, argv = RCX, RDX
+	}
+	m.a.Store(8, argc, RSP, 0)
+	m.a.Store(8, argv, RSP, 8)
+}

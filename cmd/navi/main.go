@@ -150,9 +150,13 @@ func dumpMIR(paths []string, stdout, stderr io.Writer) int {
 // runCrate type-checks a crate and runs its main function in the MIR
 // interpreter.
 func runCrate(args []string, stdout, stderr io.Writer) int {
-	var paths []string
+	var paths, progArgs []string
 	useInterp := !build.NativeSupported()
-	for _, a := range args {
+	for i, a := range args {
+		if a == "--" {
+			progArgs = args[i+1:]
+			break
+		}
 		if a == "--interp" {
 			useInterp = true
 		} else {
@@ -160,7 +164,7 @@ func runCrate(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if len(paths) != 1 {
-		fmt.Fprintln(stderr, "usage: navi run [--interp] <crate or file>")
+		fmt.Fprintln(stderr, "usage: navi run [--interp] <crate or file> [-- args...]")
 		return 2
 	}
 	spec, err := build.LoadCrate(paths[0])
@@ -187,15 +191,16 @@ func runCrate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if !useInterp {
-		return runNative(info, main, stdout, stderr)
+		return runNative(info, main, progArgs, stdout, stderr)
 	}
 	m := interp.New(mir.Build(info))
 	m.Stdout, m.Stderr = stdout, stderr
+	m.Args = append([]string{paths[0]}, progArgs...)
 	return m.Run(main)
 }
 
 // runNative builds a temporary executable and runs it.
-func runNative(info *types.Info, main *resolve.Def, stdout, stderr io.Writer) int {
+func runNative(info *types.Info, main *resolve.Def, args []string, stdout, stderr io.Writer) int {
 	dir, err := os.MkdirTemp("", "navi-run")
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -207,7 +212,7 @@ func runNative(info *types.Info, main *resolve.Def, stdout, stderr io.Writer) in
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	cmd := exec.Command(exe)
+	cmd := exec.Command(exe, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

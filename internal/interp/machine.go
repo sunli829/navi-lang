@@ -24,6 +24,10 @@ type Machine struct {
 	ctx    *types.Ctx
 	Stdout io.Writer
 	Stderr io.Writer
+	// Args are the program's command line arguments (std::env::args).
+	Args []string
+
+	files []*os.File
 
 	nextID   int
 	statics  map[*resolve.Def]*Alloc

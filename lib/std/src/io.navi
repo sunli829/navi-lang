@@ -1,12 +1,13 @@
-//! Input and output. This version only has printing; readers and writers
-//! come with the full standard library.
+//! Input and output: printing, the Read and Write traits, errors.
 
-use crate::fmt::{self, Display, Write};
+use crate::fmt::{self, Display, Debug, Formatter};
 use crate::string::String;
 
-struct Stdout { fd: i32 }
+// --- Printing ---------------------------------------------------------------------
 
-impl Write for Stdout {
+struct FdWriter { fd: i32 }
+
+impl fmt::Write for FdWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let b = s.as_bytes();
         crate::rt::write(self.fd, crate::rt::slice_ptr(b), b.len());
@@ -26,3 +27,136 @@ pub fn print(value: impl Display) { emit(1, value, false); }
 pub fn println(value: impl Display) { emit(1, value, true); }
 pub fn eprint(value: impl Display) { emit(2, value, false); }
 pub fn eprintln(value: impl Display) { emit(2, value, true); }
+
+// --- Errors -------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    InvalidInput,
+    InvalidData,
+    UnexpectedEof,
+    Other,
+}
+
+/// An I/O error: a kind and a message.
+#[derive(Debug, Clone)]
+pub struct Error {
+    kind: ErrorKind,
+    msg: String,
+}
+
+impl Error {
+    pub fn new(kind: ErrorKind, msg: &str) -> Error { Error { kind, msg: msg.to_string() } }
+    pub fn other(msg: &str) -> Error { Error::new(ErrorKind::Other, msg) }
+    pub fn kind(&self) -> ErrorKind { self.kind.clone() }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.msg.as_str()) }
+}
+
+pub type Result<T> = crate::result::Result<T, Error>;
+
+// --- Read and Write -------------------------------------------------------------------
+
+pub trait Read {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
+        let mut chunk = [0u8; 8192];
+        let mut total = 0;
+        loop {
+            let n = self.read(&mut chunk)?;
+            if n == 0 { return Ok(total); }
+            buf.extend_from_slice(&chunk[0..n]);
+            total += n;
+        }
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
+        let mut bytes = Vec::new();
+        let n = self.read_to_end(&mut bytes)?;
+        match String::from_utf8(bytes) {
+            Ok(s) => { buf.push_str(s.as_str()); Ok(n) }
+            Err(_) => Err(Error::new(ErrorKind::InvalidData, "stream did not contain valid UTF-8")),
+        }
+    }
+}
+
+pub trait Write {
+    fn write(&mut self, buf: &[u8]) -> Result<usize>;
+    fn flush(&mut self) -> Result<()>;
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            let n = self.write(&buf[done..buf.len()])?;
+            if n == 0 { return Err(Error::new(ErrorKind::Other, "failed to write whole buffer")); }
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn write_str(&mut self, s: &str) -> Result<()> { self.write_all(s.as_bytes()) }
+}
+
+/// The standard output stream (unbuffered).
+pub struct Stdout { fd: i32 }
+/// The standard error stream.
+pub struct Stderr { fd: i32 }
+
+pub fn stdout() -> Stdout { Stdout { fd: 1 } }
+pub fn stderr() -> Stderr { Stderr { fd: 2 } }
+
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        crate::rt::write(self.fd, crate::rt::slice_ptr(buf), buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<()> { Ok(()) }
+}
+
+impl Write for Stderr {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        crate::rt::write(self.fd, crate::rt::slice_ptr(buf), buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<()> { Ok(()) }
+}
+
+/// Buffers writes to an inner writer. navi has no Drop: call flush()
+/// (or into_inner) before the writer goes away.
+pub struct BufWriter<W: Write> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> BufWriter<W> {
+    pub fn new(inner: W) -> BufWriter<W> { BufWriter { inner, buf: Vec::with_capacity(8192) } }
+    pub fn get_ref(&self) -> &W { &self.inner }
+    pub fn into_inner(mut self) -> Result<W> {
+        self.flush()?;
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for BufWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        if self.buf.len() + buf.len() > 8192 { self.flush()?; }
+        if buf.len() >= 8192 {
+            return self.inner.write(buf);
+        }
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<()> {
+        if self.buf.len() > 0 {
+            self.inner.write_all(self.buf.as_slice())?;
+            self.buf.clear();
+        }
+        self.inner.flush()
+    }
+}

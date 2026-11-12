@@ -301,8 +301,9 @@ func (fc *fnCtx) applyBindings(tr *TraitRef, sel *selection, pos syntax.Pos) {
 			fc.pending = append(fc.pending, &obligation{tr: fc.c.traitRefFor(&TraitRef{Trait: tr.Trait, Self: tr.Self, Args: tr.Args}, assoc.Parent), pos: pos, proj: &pendingProj{assoc: assoc, target: v}})
 			got = v
 		}
-		if !fc.in.unify(got, b.Type) {
-			fc.errorf(pos, "type mismatch resolving %s::%s: expected %s, found %s", fc.in.resolve(tr.Self), b.Name, fc.in.resolve(b.Type), fc.in.resolve(got))
+		want := fc.normalize(b.Type)
+		if !fc.in.unify(got, want) {
+			fc.errorf(pos, "type mismatch resolving %s::%s: expected %s, found %s", fc.in.resolve(tr.Self), b.Name, fc.in.resolve(want), fc.in.resolve(got))
 		}
 	}
 }

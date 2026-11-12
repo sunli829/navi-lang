@@ -1,7 +1,11 @@
 package interp
 
 import (
+	"io"
 	"math"
+	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +90,85 @@ func (t *thread) intrinsic(inst *fnInst, args []val) val {
 			return intVal(size, a-b)
 		}
 		return intVal(size, a*b)
+	case "os_arg_count":
+		return intVal(8, int64(len(m.Args)))
+	case "os_arg":
+		return fatVal(Ptr{A: m.strAlloc(m.Args[u64arg(args[0])])}, Ptr{Off: int64(len(m.Args[u64arg(args[0])]))})
+	case "os_getenv":
+		v, ok := os.LookupEnv(m.readStr(args[0]))
+		strTy := m.ctx.Ref(false, m.ctx.Str)
+		return m.optionVal(strTy, fatVal(Ptr{A: m.strAlloc(v)}, Ptr{Off: int64(len(v))}), ok)
+	case "os_system":
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/C", m.readStr(args[0]))
+		} else {
+			cmd = exec.Command("/bin/sh", "-c", m.readStr(args[0]))
+		}
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, m.Stdout, m.Stderr
+		code := 0
+		m.block(func() {
+			if err := cmd.Run(); err != nil {
+				code = 127
+				if ee, ok := err.(*exec.ExitError); ok {
+					code = ee.ExitCode()
+				}
+			}
+		})
+		return intVal(4, int64(code))
+	case "fs_open":
+		path := m.readStr(args[0])
+		var f *os.File
+		var err error
+		switch args[1].b[0] {
+		case 0:
+			f, err = os.Open(path)
+		case 1:
+			f, err = os.Create(path)
+		default:
+			f, err = os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		}
+		if err != nil {
+			return intVal(8, 0)
+		}
+		m.files = append(m.files, f)
+		return intVal(8, int64(len(m.files)))
+	case "fs_read":
+		f := m.files[u64arg(args[0])-1]
+		n := int64(u64arg(args[2]))
+		buf := make([]byte, n)
+		k, _ := io.ReadFull(f, buf)
+		if k > 0 {
+			m.write(args[1].ptrAt(0), val{b: buf[:k]})
+		}
+		return intVal(8, int64(k))
+	case "fs_write":
+		f := m.files[u64arg(args[0])-1]
+		n := int64(u64arg(args[2]))
+		if n == 0 {
+			return intVal(8, 0)
+		}
+		k, _ := f.Write(m.read(args[1].ptrAt(0), n).b)
+		return intVal(8, int64(k))
+	case "fs_close":
+		if i := u64arg(args[0]); i > 0 && m.files[i-1] != nil {
+			m.files[i-1].Close()
+			m.files[i-1] = nil
+		}
+		return newVal(0)
+	case "fs_kind":
+		st, err := os.Stat(m.readStr(args[0]))
+		switch {
+		case err != nil:
+			return intVal(1, 0)
+		case st.IsDir():
+			return intVal(1, 2)
+		}
+		return intVal(1, 1)
+	case "fs_mkdir":
+		return boolVal(os.Mkdir(m.readStr(args[0]), 0o777) == nil)
+	case "fs_remove":
+		return boolVal(os.Remove(m.readStr(args[0])) == nil)
 	case "float_op":
 		x := readFloat(args[1].b, true)
 		switch args[0].b[0] {

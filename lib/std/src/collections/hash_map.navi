@@ -1,0 +1,320 @@
+//! A hash map with open addressing (linear probing, tombstones).
+
+use crate::hash::{Hash, Hasher, DefaultHasher};
+use crate::fmt::{self, Debug, Formatter};
+use crate::ops::Index;
+
+pub struct HashMap<K, V> {
+    t: &mut Table<K, V>,
+}
+
+enum Slot<K, V> {
+    Empty,
+    Deleted,
+    Full(K, V),
+}
+
+struct Table<K, V> {
+    slots: Vec<Slot<K, V>>,
+    len: usize,
+    used: usize, // full + deleted
+}
+
+fn hash_of<K: Hash>(k: &K) -> u64 {
+    let mut h = DefaultHasher::new();
+    k.hash(&mut h);
+    h.finish()
+}
+
+impl<K: Hash + Eq, V> HashMap<K, V> {
+    pub fn new() -> HashMap<K, V> {
+        HashMap { t: &mut Table { slots: Vec::new(), len: 0, used: 0 } }
+    }
+
+    pub fn with_capacity(capacity: usize) -> HashMap<K, V> {
+        let m = HashMap::new();
+        if capacity > 0 { m.t.resize(capacity * 2); }
+        m
+    }
+
+    pub fn len(&self) -> usize { self.t.len }
+    pub fn is_empty(&self) -> bool { self.t.len == 0 }
+
+    pub fn clear(&mut self) {
+        self.t.slots = Vec::new();
+        self.t.len = 0;
+        self.t.used = 0;
+    }
+
+    /// Inserts a value, returning the previous value of the key.
+    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
+        let i = self.t.find_or_slot(&k);
+        match &mut self.t.slots[i] {
+            Slot::Full(_, old) => {
+                let prev = crate::mem::replace(old, v);
+                return Some(prev);
+            }
+            Slot::Deleted => {}
+            Slot::Empty => { self.t.used += 1; }
+        }
+        self.t.slots[i] = Slot::Full(k, v);
+        self.t.len += 1;
+        if self.t.used * 4 >= self.t.slots.len() * 3 { self.t.grow(); }
+        None
+    }
+
+    pub fn get(&self, k: &K) -> Option<&V> {
+        match self.t.find(k) {
+            Some(i) => match &self.t.slots[i] { Slot::Full(_, v) => Some(v), _ => None },
+            None => None,
+        }
+    }
+
+    pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        match self.t.find(k) {
+            Some(i) => match &mut self.t.slots[i] { Slot::Full(_, v) => Some(v), _ => None },
+            None => None,
+        }
+    }
+
+    pub fn get_key_value(&self, k: &K) -> Option<(&K, &V)> {
+        match self.t.find(k) {
+            Some(i) => match &self.t.slots[i] { Slot::Full(key, v) => Some((key, v)), _ => None },
+            None => None,
+        }
+    }
+
+    pub fn contains_key(&self, k: &K) -> bool { self.t.find(k).is_some() }
+
+    pub fn remove(&mut self, k: &K) -> Option<V> {
+        match self.t.find(k) {
+            Some(i) => {
+                let old = crate::mem::replace(&mut self.t.slots[i], Slot::Deleted);
+                self.t.len -= 1;
+                match old { Slot::Full(_, v) => Some(v), _ => None }
+            }
+            None => None,
+        }
+    }
+
+    pub fn entry(&mut self, k: K) -> Entry<K, V> {
+        let i = self.t.find_or_slot(&k);
+        let occupied = match &self.t.slots[i] { Slot::Full(_, _) => true, _ => false };
+        Entry { map: HashMap { t: self.t }, key: k, index: i, occupied }
+    }
+
+    pub fn iter(&self) -> Iter<K, V> { Iter { t: self.t, i: 0 } }
+    pub fn iter_mut(&mut self) -> IterMut<K, V> { IterMut { t: self.t, i: 0 } }
+    pub fn keys(&self) -> Keys<K, V> { Keys { it: self.iter() } }
+    pub fn values(&self) -> Values<K, V> { Values { it: self.iter() } }
+    pub fn values_mut(&mut self) -> ValuesMut<K, V> { ValuesMut { it: self.iter_mut() } }
+
+    pub fn retain(&mut self, f: fn(&K, &mut V) -> bool) {
+        let mut i = 0;
+        while i < self.t.slots.len() {
+            let keep = match &mut self.t.slots[i] { Slot::Full(k, v) => f(k, v), _ => true };
+            if !keep {
+                self.t.slots[i] = Slot::Deleted;
+                self.t.len -= 1;
+            }
+            i += 1;
+        }
+    }
+}
+
+impl<K: Hash + Eq, V> Table<K, V> {
+    // Index of the slot holding k.
+    fn find(&self, k: &K) -> Option<usize> {
+        let n = self.slots.len();
+        if n == 0 { return None; }
+        let mut i = (hash_of(k) as usize) & (n - 1);
+        loop {
+            match &self.slots[i] {
+                Slot::Empty => return None,
+                Slot::Full(key, _) => { if key == k { return Some(i); } }
+                Slot::Deleted => {}
+            }
+            i = (i + 1) & (n - 1);
+        }
+    }
+
+    // Index of the slot holding k, or of the slot where it would go.
+    fn find_or_slot(&mut self, k: &K) -> usize {
+        if self.slots.len() == 0 { self.resize(8); }
+        let n = self.slots.len();
+        let mut i = (hash_of(k) as usize) & (n - 1);
+        let mut first_deleted = n;
+        loop {
+            match &self.slots[i] {
+                Slot::Empty => return if first_deleted < n { first_deleted } else { i },
+                Slot::Full(key, _) => { if key == k { return i; } }
+                Slot::Deleted => { if first_deleted == n { first_deleted = i; } }
+            }
+            i = (i + 1) & (n - 1);
+        }
+    }
+
+    fn grow(&mut self) {
+        let n = if self.len * 2 >= self.slots.len() { self.slots.len() * 2 } else { self.slots.len() };
+        self.resize(n);
+    }
+
+    fn resize(&mut self, want: usize) {
+        let mut n = 8;
+        while n < want { n = n * 2; }
+        let old = crate::mem::replace(&mut self.slots, Vec::with_capacity(n));
+        let mut i = 0;
+        while i < n { self.slots.push(Slot::Empty); i += 1; }
+        self.len = 0;
+        self.used = 0;
+        for s in old.iter() {
+            if let Slot::Full(k, v) = s {
+                let mut j = (hash_of(k) as usize) & (n - 1);
+                loop {
+                    let empty = match &self.slots[j] { Slot::Empty => true, _ => false };
+                    if empty { break; }
+                    j = (j + 1) & (n - 1);
+                }
+                self.slots[j] = Slot::Full(k.clone_shallow(), v.clone_shallow());
+                self.len += 1;
+                self.used += 1;
+            }
+        }
+    }
+}
+
+// Moving entries between tables copies them (values are copied by
+// assignment in navi; no Clone bound is needed).
+trait CloneShallow { fn clone_shallow(&self) -> Self; }
+impl<T> CloneShallow for T {
+    fn clone_shallow(&self) -> T { unsafe { *(self as *const T) } }
+}
+
+/// A view into a single entry of a map.
+pub struct Entry<K, V> {
+    map: HashMap<K, V>,
+    key: K,
+    index: usize,
+    occupied: bool,
+}
+
+impl<K: Hash + Eq, V> Entry<K, V> {
+    pub fn or_insert(mut self, default: V) -> &mut V {
+        if !self.occupied { self.map.insert(self.key.clone_shallow(), default); }
+        self.map.get_mut(&self.key).unwrap()
+    }
+    pub fn or_insert_with(mut self, f: fn() -> V) -> &mut V {
+        if !self.occupied { self.map.insert(self.key.clone_shallow(), f()); }
+        self.map.get_mut(&self.key).unwrap()
+    }
+    pub fn and_modify(mut self, f: fn(&mut V)) -> Entry<K, V> {
+        if self.occupied {
+            match self.map.get_mut(&self.key) { Some(v) => f(v), None => {} }
+        }
+        self
+    }
+    pub fn key(&self) -> &K { &self.key }
+}
+
+impl<K: Hash + Eq, V: Default> Entry<K, V> {
+    pub fn or_default(mut self) -> &mut V {
+        if !self.occupied { self.map.insert(self.key.clone_shallow(), V::default()); }
+        self.map.get_mut(&self.key).unwrap()
+    }
+}
+
+pub struct Iter<K, V> { t: &Table<K, V>, i: usize }
+impl<K, V> Iterator for Iter<K, V> {
+    type Item = (&K, &V);
+    fn next(&mut self) -> Option<(&K, &V)> {
+        while self.i < self.t.slots.len() {
+            let i = self.i;
+            self.i += 1;
+            if let Slot::Full(k, v) = &self.t.slots[i] { return Some((k, v)); }
+        }
+        None
+    }
+}
+
+pub struct IterMut<K, V> { t: &mut Table<K, V>, i: usize }
+impl<K, V> Iterator for IterMut<K, V> {
+    type Item = (&K, &mut V);
+    fn next(&mut self) -> Option<(&K, &mut V)> {
+        while self.i < self.t.slots.len() {
+            let i = self.i;
+            self.i += 1;
+            if let Slot::Full(k, v) = &mut self.t.slots[i] { return Some((k, v)); }
+        }
+        None
+    }
+}
+
+pub struct Keys<K, V> { it: Iter<K, V> }
+impl<K, V> Iterator for Keys<K, V> {
+    type Item = &K;
+    fn next(&mut self) -> Option<&K> { match self.it.next() { Some((k, _)) => Some(k), None => None } }
+}
+
+pub struct Values<K, V> { it: Iter<K, V> }
+impl<K, V> Iterator for Values<K, V> {
+    type Item = &V;
+    fn next(&mut self) -> Option<&V> { match self.it.next() { Some((_, v)) => Some(v), None => None } }
+}
+
+pub struct ValuesMut<K, V> { it: IterMut<K, V> }
+impl<K, V> Iterator for ValuesMut<K, V> {
+    type Item = &mut V;
+    fn next(&mut self) -> Option<&mut V> { match self.it.next() { Some((_, v)) => Some(v), None => None } }
+}
+
+impl<K: Hash + Eq, V> Index<&K> for HashMap<K, V> {
+    type Output = V;
+    #[track_caller]
+    fn index(&self, k: &K) -> &V {
+        match self.get(k) { Some(v) => v, None => panic("key not found in HashMap") }
+    }
+}
+
+impl<K: Hash + Eq + Clone, V: Clone> Clone for HashMap<K, V> {
+    fn clone(&self) -> HashMap<K, V> {
+        let mut m = HashMap::new();
+        for (k, v) in self.iter() { m.insert(k.clone(), v.clone()); }
+        m
+    }
+}
+
+impl<K: Hash + Eq, V> Default for HashMap<K, V> {
+    fn default() -> HashMap<K, V> { HashMap::new() }
+}
+
+impl<K: Hash + Eq + Debug, V: Debug> Debug for HashMap<K, V> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut m = f.debug_map();
+        for (k, v) in self.iter() { m.entry(k, v); }
+        m.finish()
+    }
+}
+
+impl<K: Hash + Eq, V: PartialEq> PartialEq for HashMap<K, V> {
+    fn eq(&self, other: &HashMap<K, V>) -> bool {
+        if self.len() != other.len() { return false; }
+        for (k, v) in self.iter() {
+            match other.get(k) { Some(w) => { if v != w { return false; } } None => return false }
+        }
+        true
+    }
+}
+
+impl<K: Hash + Eq, V> FromIterator<(K, V)> for HashMap<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> HashMap<K, V> {
+        let mut m = HashMap::new();
+        for (k, v) in iter { m.insert(k, v); }
+        m
+    }
+}
+
+impl<K: Hash + Eq, V> Extend<(K, V)> for HashMap<K, V> {
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (k, v) in iter { self.insert(k, v); }
+    }
+}

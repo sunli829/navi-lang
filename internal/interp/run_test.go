@@ -58,6 +58,7 @@ func TestRun(t *testing.T) {
 			m := interp.New(mir.Build(info))
 			var stdout, stderr bytes.Buffer
 			m.Stdout, m.Stderr = &stdout, &stderr
+			m.Args = []string{f}
 			code := m.Run(main)
 			got := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
 			if stdout.Len() == 0 {

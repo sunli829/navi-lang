@@ -186,7 +186,7 @@ func Build(prog *mir.Program, main *resolve.Def) *Plan {
 		Runtime:    map[string]*Inst{},
 	}
 	p.findNative()
-	for _, name := range []string{"panic_raw", "panic_bounds", "gc_alloc", "sched_init", "gmain"} {
+	for _, name := range []string{"panic_raw", "panic_bounds", "gc_alloc", "sched_init", "gmain", "set_args"} {
 		if d := p.nativeFn(name); d != nil {
 			p.Runtime[name] = p.inst(d, nil, nil, prog.Func(d))
 		} else {

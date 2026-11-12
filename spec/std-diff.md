@@ -57,3 +57,18 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `std::panic::{panic, assert, assert_eq, assert_ne}` | 代替对应的宏，带 `#[track_caller]` |
 | `Sender::close()` | 见第 3 节 |
 | `std::gc`（以后） | `collect()`、`Weak<T>`、finalizer 等 GC 语言特有的功能 |
+
+## 5. M7 补充标准库时新增的偏离
+
+| 项目 | Rust | navi | 原因 |
+|---|---|---|---|
+| 文件关闭 | `File` drop 时关闭 | `File::close()`；`fs::read`/`fs::write` 等整文件函数自己关闭 | 没有 Drop |
+| `io::BufWriter` | drop 时 flush | 必须显式 `flush()` 或 `into_inner()` | 没有 Drop |
+| `Path`/`PathBuf` | 基于 `OsStr`，`Path` 是 unsized 类型 | 基于 UTF-8 字符串；`Path` 是持有 `&str` 的普通结构体；`file_name`/`extension`/`file_stem` 返回 `Option<&str>` 而不是 `Option<&OsStr>` | 没有 `OsStr`；unsized 结构体暂不支持 |
+| `process::Command` | 直接 fork/exec，可配置 stdin/stdout | 通过系统 shell（`/bin/sh -c`、`cmd /C`）执行，参数自动加引号；只有 `status()` | 先满足自举（调用链接器）；完整实现留到以后 |
+| `Vec::drain` | 返回 `Drain<'_, T>` 惰性迭代器 | 立即移走元素，返回 `vec::IntoIter<T>` | 没有生命周期绑定的借用迭代器 |
+| `hash::DefaultHasher` | SipHash-1-3（抗哈希洪水） | FxHash（快，但不抗攻击） | 编译器式负载优先速度 |
+| `HashMap` 迭代顺序 | 随机种子 | 确定（取决于插入历史） | 便于编译器输出稳定 |
+| `str` 的模式参数 | `Pattern` 支持 `&str`、`char`、`&[char]`、闭包 | `std::str::pattern::Pattern` 支持 `&str`、`&String`、`char`、`fn(char) -> bool` | 未实现 `&[char]` |
+| `f32` 解析 | 精确舍入 | 先精确解析成 `f64` 再转换（极少数情况下有两次舍入） | 简化 |
+| `str::matches` | 返回迭代器 | 只提供 `matches_count` | 简化 |

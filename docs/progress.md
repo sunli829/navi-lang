@@ -9,6 +9,7 @@
 | M0 | 完成 | spec、std-diff、CLI 骨架、CI |
 | M1 | 完成 | parser、名称解析、签名收集、函数体类型检查、穷尽性检查、impl 一致性、`navi check` |
 | M2 | 基本完成 | MIR、解释器、std 子集实现、GC shape 实例分析、`navi run` / `navi test`；未做：MIR 优化（常量折叠/DCE/内联）、编译期 const 求值（目前 const 在运行时求值，数组长度用 AST 常量折叠） |
+| M7 | 完成（自举所需部分） | 整数/浮点方法（`tools/gennum` 生成 `num.navi`）、精确浮点解析（与 strconv 逐位一致）、`collections::{HashMap, HashSet}`、`hash::DefaultHasher`、`fs`、`path`、`env`、`process::Command`、`io::{Read, Write, BufWriter, Error}`、`str::pattern::Pattern` 及大量 str/String/slice/Vec/Option/Result/Iterator 方法（rev、zip、chain、flat_map、sum、sort_by 等）；OS 功能经 `std::rt` 的 intrinsic，解释器用 Go 实现，原生用 libc；修了两个 stage0 类型检查 bug（发散的 then 分支、绑定类型未规范化）；偏离记录在 spec/std-diff.md 第 5 节 |
 | M6 | 完成（M:1） | `std::rt::sched`（navi 写）：绿色线程 G、FIFO 运行队列、`swapcontext` 式切换（arm64/amd64 各一段汇编）、每个 G 独立的懒提交栈（spawn 的 1MB，主线程 64MB）、函数序言检查栈界限（溢出报 `fatal error: stack overflow`）；`thread::spawn/join`、mpmc channel（有界/无界/无缓冲）、`select` 原生实现，算法与解释器一致；死锁检测；GC 扫描所有 G 的栈；golden 测试含 2 万线程、百万元素流水线、跨线程 GC |
 | M5 | 完成（Linux/Windows 未在本机实测） | 与架构无关的 lowering（`backend/lower` + `Machine` 接口）、arm64 和 amd64 两套 Machine（编码器都与系统汇编器逐条对拍）、Mach-O/ELF/COFF 写出器、`--target`（macos-arm64、macos-x64、linux-x64、linux-arm64、windows-x64）和 `-c`；macos-x64 在 Rosetta 下通过全部 golden 测试；Linux/Windows 目标文件用 llvm-readobj/objdump 校验了结构、重定位和未定义符号，实际运行交给 CI 矩阵 |
 | M4 | 完成 | `std::rt::gc`（navi 写）：按尺寸分级的 span、非移动 mark-sweep、支持内部指针、无指针类型的 noscan span、GOGC=100 式触发、大对象 span 复用；panic 沿帧指针链展开并执行每帧的 defer；MIR 新增 `StorageLive`，被取地址的局部变量在声明处装箱（每次循环迭代是新变量，和 Go 一致，解释器也修正了）；GC 压力测试（约 2GB 分配，峰值 RSS 约 7.5MB） |
@@ -47,4 +48,4 @@
 
 ## 下一步
 
-M7：补全标准库（自举需要的 fs、env::args、process、collections::HashMap、io 读写、数值方法等）。
+M8：自举——用 navi 重写编译器（按 stage0 的包结构移植），stage1 → stage2 → stage3，stage2 与 stage3 逐字节相同。

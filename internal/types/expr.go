@@ -870,7 +870,12 @@ func (fc *fnCtx) ifExpr(x *syntax.IfExpr, hint *Type) *Type {
 		return ctx.Unit
 	}
 	then := fc.checkBlock(x.Then, hint)
-	els := fc.infer(x.Else, then)
+	// A diverging then-branch says nothing about the else-branch's type.
+	elseHint := then
+	if fc.in.shallow(then).Kind == KNever {
+		elseHint = hint
+	}
+	els := fc.infer(x.Else, elseHint)
 	if hint != nil && fc.in.shallow(hint).Kind != KInfer {
 		fc.coerceTo(x.Then, then, hint, x.Then.Rbrace)
 		fc.coerceTo(x.Else, els, hint, x.Else.Pos())

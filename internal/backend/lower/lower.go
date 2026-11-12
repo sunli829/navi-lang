@@ -208,7 +208,7 @@ func (g *gen) genData() {
 	// the entry point runs their initializers). The collector scans from
 	// _navi_data_start to _navi_data_end.
 	o.Define("_navi_data_start", obj.Data, 8, false)
-	for _, sym := range []string{"_navi_stack_top", "_navi_stack_lo", "_navi_os_sp"} {
+	for _, sym := range []string{"_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv"} {
 		o.Define(sym, obj.Data, 8, false)
 		o.Sects[obj.Data] = append(o.Sects[obj.Data], make([]byte, 8)...)
 	}
@@ -287,7 +287,7 @@ func (g *gen) genMain() {
 	m := g.m
 	m.Begin()
 	main := g.p.Main
-	retSize := int64(16)
+	retSize := int64(32)
 	if s := g.sizeOf(main.Concrete(g.p, main.Func.Locals[0].Type)); s > retSize {
 		retSize = s
 	}
@@ -296,6 +296,15 @@ func (g *gen) genMain() {
 	m.AdrSym(I1, "_navi_stack_top")
 	m.Store(8, FP, I1, 0)
 	mainLoc := g.locAt("<main>", 0, 0)
+	// Keep argc and argv for std::rt::native::set_args (called after the
+	// statics are initialized).
+	m.EntryArgs()
+	m.Load(8, V1, SP, 0)
+	m.AdrSym(I1, "_navi_argc")
+	m.Store(8, V1, I1, 0)
+	m.Load(8, V1, SP, 8)
+	m.AdrSym(I1, "_navi_argv")
+	m.Store(8, V1, I1, 0)
 	for i := len(g.p.Statics) - 1; i >= 0; i-- {
 		d := g.p.Statics[i]
 		in := g.p.StaticInit[d]
@@ -307,6 +316,17 @@ func (g *gen) genMain() {
 		m.AdrSym(CTX, in.Dict)
 		m.Call(in.Group.Sym)
 	}
+	setArgs := g.p.Runtime["set_args"]
+	m.AdrSym(I1, "_navi_argc")
+	m.Load(8, V1, I1, 0)
+	m.Store(8, V1, SP, 0)
+	m.AdrSym(I1, "_navi_argv")
+	m.Load(8, V1, I1, 0)
+	m.Store(8, V1, SP, 8)
+	m.AddrOf(RET, SP, 16)
+	m.AdrSym(LOC, mainLoc)
+	m.AdrSym(CTX, setArgs.Dict)
+	m.Call(setArgs.Group.Sym)
 	// Create the main green thread and continue on its stack.
 	init := g.p.Runtime["sched_init"]
 	m.AddrOf(RET, SP, 0)
