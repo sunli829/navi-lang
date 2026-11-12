@@ -1,6 +1,10 @@
 package mir
 
-import "navi/internal/types"
+import (
+	"sort"
+
+	"navi/internal/types"
+)
 
 // boxAddressTaken moves every local whose address is taken into a heap
 // cell, allocated where the local starts its life (its StorageLive), so a
@@ -21,6 +25,12 @@ func boxAddressTaken(ctx *types.Ctx, f *Func) {
 			}
 		}
 	}
+	// In local order, so that the result is deterministic.
+	var takenOrder []int
+	for l := range taken {
+		takenOrder = append(takenOrder, l)
+	}
+	sort.Ints(takenOrder)
 	firstArg := 1
 	if f.Closure {
 		firstArg = 2
@@ -31,7 +41,7 @@ func boxAddressTaken(ctx *types.Ctx, f *Func) {
 	var entry []Stmt
 	var exit []Stmt
 	live := map[int]bool{}
-	for l := range taken {
+	for _, l := range takenOrder {
 		if l == 0 || l >= firstArg && l <= f.NArgs || f.Closure && l == 1 {
 			t := f.Locals[l].Type
 			cell := len(f.Locals)
@@ -60,7 +70,7 @@ func boxAddressTaken(ctx *types.Ctx, f *Func) {
 		}
 	}
 	elem := map[int]*types.Type{}
-	for l := range taken {
+	for _, l := range takenOrder {
 		if _, ok := redirect[l]; ok {
 			continue
 		}

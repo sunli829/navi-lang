@@ -1,0 +1,443 @@
+//! Lowering patterns, let statements and match to MIR.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def};
+use crate::syntax::ast::{self, Expr, ExprKind, LetStmt, MatchArm, Pat, PatKind};
+use crate::syntax::source::Pos;
+use crate::syntax::walk::{self, Visit};
+use crate::types::{self, Type};
+use crate::mir::*;
+use crate::mir::build::*;
+use crate::mir::expr::*;
+
+fn is_plain_rest(p: &Pat) -> bool { match &p.kind { PatKind::Rest(_) => true, _ => false } }
+
+fn is_rest_pat(p: &Pat) -> bool {
+    match &p.kind {
+        PatKind::Rest(_) => true,
+        PatKind::Ident { sub, .. } => match sub { Some(s) => is_plain_rest(*s), None => false },
+        _ => false,
+    }
+}
+
+impl Builder {
+    /// Matches an irrefutable pattern against the value at sp.
+    pub fn bind_pattern(&mut self, p: &Pat, sp: Place) {
+        let fail = self.new_block();
+        self.test_pat(p, sp, fail);
+        let saved = self.cur;
+        self.cur = fail as i64;
+        self.terminate(Term::Unreachable);
+        self.cur = saved;
+    }
+
+    pub fn let_stmt(&mut self, st: &LetStmt) {
+        let t = self.body.pats[&st.pat.id];
+        let init = match st.init {
+            None => {
+                let mut binds: Vec<&mut resolve::Local> = Vec::new();
+                let bindings = self.info.res.bindings;
+                walk::inspect_pat(st.pat, |v| {
+                    if let Visit::Pat(p) = v {
+                        if let PatKind::Ident { .. } = &p.kind {
+                            if let Some(l) = bindings.get(&p.id) { binds.push(*l); }
+                        }
+                    }
+                    true
+                });
+                for l in binds.iter() {
+                    let lt = self.body.locals[&l.id];
+                    self.declare(*l, lt);
+                }
+                return;
+            }
+            Some(i) => i,
+        };
+        if let Some(els) = st.els {
+            let sp = self.place_or_temp(init);
+            let else_blk = self.new_block();
+            self.test_pat(st.pat, sp, else_blk);
+            let saved = self.cur;
+            self.cur = else_blk as i64;
+            let never = self.ctx().never;
+            let tmp = self.temp(never);
+            self.expr_into(els, tmp);
+            if self.cur >= 0 { self.terminate(Term::Unreachable); }
+            self.cur = saved;
+            return;
+        }
+        if let PatKind::Ident { sub, .. } = &st.pat.kind {
+            if sub.is_none() && !self.body.ref_bindings.contains_key(&st.pat.id) {
+                if let Some(l) = self.info.res.bindings.get(&st.pat.id) {
+                    let lt = self.body.locals[&l.id];
+                    let dst = self.declare(*l, lt);
+                    self.expr_into(init, dst);
+                    return;
+                }
+            }
+        }
+        let tmp = self.temp(t);
+        self.expr_into(init, tmp.clone());
+        self.bind_pattern(st.pat, tmp);
+    }
+
+    pub fn match_expr(&mut self, scrut: &Expr, arms: &Vec<&MatchArm>, dest: Place) {
+        let sp = self.place_or_temp(scrut);
+        let join = self.new_block();
+        for arm in arms.iter() {
+            if self.cur < 0 { break; }
+            let next = self.new_block();
+            self.test_pat(arm.pat, sp.clone(), next);
+            if let Some(g) = arm.guard {
+                let c = self.operand(g);
+                let body = self.new_block();
+                self.switch_bool(c, next, body);
+                self.cur = body as i64;
+            }
+            self.expr_into(arm.body, dest.clone());
+            if self.cur >= 0 { self.terminate(Term::Goto(join)); }
+            self.cur = next as i64;
+        }
+        self.terminate(Term::Unreachable);
+        self.cur = join as i64;
+    }
+
+    /// Jumps to zero if c is false, else to els.
+    fn switch_bool(&mut self, c: Operand, zero: usize, els: usize) {
+        let b = self.ctx().bool_;
+        let mut vals = Vec::new();
+        vals.push(0i64);
+        let mut targets = Vec::new();
+        targets.push(zero);
+        self.terminate(Term::Switch { x: c, ty: b, vals, targets, els });
+    }
+
+    /// Emits code that checks whether the value at sp matches p, binding its
+    /// variables, and jumps to fail if not. The current block continues on
+    /// success.
+    pub fn test_pat(&mut self, p: &Pat, sp0: Place, fail: usize) {
+        if self.cur < 0 { return; }
+        let mut sp = sp0;
+        let mut t = self.body.pats[&p.id];
+        match &p.kind {
+            PatKind::Wild(_) | PatKind::Rest(_) => return,
+            PatKind::Ident { sub, .. } => {
+                if let Some(res) = self.info.res.pat_consts.get(&p.id) {
+                    while t.kind == types::K_REF {
+                        sp = sp.deref();
+                        t = t.el();
+                    }
+                    self.const_test(res.def.unwrap(), sp, t, fail, p.pos());
+                    return;
+                }
+                if let Some(s) = sub { self.test_pat(*s, sp.clone(), fail); }
+                let l = match self.info.res.bindings.get(&p.id) { Some(l) => *l, None => return };
+                let lt = self.body.locals[&l.id];
+                let bound = match self.or_bound { Some(m) => match m.get(&l.id) { Some(pl) => Some(pl.clone()), None => None }, None => None };
+                let dst = match bound { Some(d) => d, None => self.declare(l, lt) };
+                if self.body.ref_bindings.contains_key(&p.id) {
+                    self.assign(dst, Rvalue::Ref { is_mut: lt.kind == types::K_REF && lt.is_mut, place: sp });
+                } else {
+                    self.assign(dst, Rvalue::Use(copy(sp)));
+                }
+                return;
+            }
+            PatKind::Ref { pat, .. } => {
+                self.test_pat(*pat, sp.deref(), fail);
+                return;
+            }
+            PatKind::Or(alts) => {
+                // Every alternative binds the same variables: declare them once,
+                // before branching, and let each alternative assign them.
+                let outer = self.or_bound.is_some();
+                if !outer {
+                    let mut binds: Vec<&mut resolve::Local> = Vec::new();
+                    let bindings = self.info.res.bindings;
+                    let consts = self.info.res.pat_consts;
+                    walk::inspect_pat(p, |v| {
+                        if let Visit::Pat(ip) = v {
+                            if let PatKind::Ident { .. } = &ip.kind {
+                                if !consts.contains_key(&ip.id) {
+                                    if let Some(l) = bindings.get(&ip.id) { binds.push(*l); }
+                                }
+                            }
+                        }
+                        true
+                    });
+                    let mut m: HashMap<u32, Place> = HashMap::new();
+                    self.or_bound = Some(m);
+                    for l in binds.iter() {
+                        if !m.contains_key(&l.id) {
+                            let lt = self.body.locals[&l.id];
+                            let pl = self.declare(*l, lt);
+                            m.insert(l.id, pl);
+                        }
+                    }
+                }
+                let success = self.new_block();
+                let mut i = 0;
+                while i < alts.len() {
+                    let next = if i < alts.len() - 1 { self.new_block() } else { fail };
+                    self.test_pat(alts[i], sp.clone(), next);
+                    if self.cur >= 0 { self.terminate(Term::Goto(success)); }
+                    self.cur = next as i64;
+                    if next == fail { break; }
+                    i += 1;
+                }
+                self.cur = success as i64;
+                if !outer { self.or_bound = None; }
+                return;
+            }
+            PatKind::Lit(x) => {
+                let lt = self.type_of(*x);
+                while !types::same(t, lt) && t.kind == types::K_REF {
+                    sp = sp.deref();
+                    t = t.el();
+                }
+                let lit = self.operand(*x);
+                let b = self.ctx().bool_;
+                let ok = self.temp(b);
+                if is_prim(lt) {
+                    self.assign(ok.clone(), Rvalue::Bin { op: EQ, x: copy(sp), y: lit, ty: lt, pos: 0 });
+                } else {
+                    let f = self.p.lang_fn("str_eq").unwrap();
+                    let mut args = Vec::new();
+                    args.push(copy(sp));
+                    args.push(lit);
+                    self.call(self.fn_const(f, Vec::new()), args, ok.clone(), p.pos());
+                }
+                self.branch(ok, fail);
+                return;
+            }
+            _ => {}
+        }
+        // Non-reference patterns match through references (match ergonomics).
+        while t.kind == types::K_REF {
+            sp = sp.deref();
+            t = t.el();
+        }
+        match &p.kind {
+            PatKind::Range { lo, hi, inclusive, .. } => {
+                let b = self.ctx().bool_;
+                if let Some(l) = lo {
+                    let ok = self.temp(b);
+                    let lv = self.operand(*l);
+                    self.assign(ok.clone(), Rvalue::Bin { op: LE, x: lv, y: copy(sp.clone()), ty: t, pos: 0 });
+                    self.branch(ok, fail);
+                }
+                if let Some(h) = hi {
+                    let op = if *inclusive { LE } else { LT };
+                    let ok = self.temp(b);
+                    let hv = self.operand(*h);
+                    self.assign(ok.clone(), Rvalue::Bin { op, x: copy(sp.clone()), y: hv, ty: t, pos: 0 });
+                    self.branch(ok, fail);
+                }
+            }
+            PatKind::Path(path) => {
+                let res = self.info.res.paths[&path.id].clone();
+                let mut def = res.def;
+                if res.rest.len() == 1 && t.kind == types::K_ADT { def = self.variant_by_name(t, res.rest[0].name.value.as_str()); }
+                if let Some(d) = def { self.const_test(d, sp, t, fail, p.pos()); }
+            }
+            PatKind::TupleStruct { path, elems } => {
+                let res = self.info.res.paths[&path.id].clone();
+                let mut def = res.def;
+                if res.rest.len() == 1 && t.kind == types::K_ADT { def = self.variant_by_name(t, res.rest[0].name.value.as_str()); }
+                let mut fp = sp.clone();
+                let mut n = 0;
+                let is_variant = match def { Some(d) => d.kind == resolve::DEF_VARIANT, None => false };
+                if is_variant {
+                    let vi = variant_index(self.info, def.unwrap());
+                    self.discr_test(sp.clone(), t, vi, fail);
+                    fp = sp.downcast(vi);
+                    n = self.info.adts[&t.d().id].variants[vi].fields.len();
+                } else if t.kind == types::K_ADT {
+                    n = self.info.adts[&t.d().id].fields.len();
+                }
+                self.positional(elems, fp, n, fail);
+            }
+            PatKind::Struct { path, fields: fps, .. } => {
+                let res = self.info.res.paths[&path.id].clone();
+                let mut def = res.def;
+                if res.rest.len() == 1 && t.kind == types::K_ADT { def = self.variant_by_name(t, res.rest[0].name.value.as_str()); }
+                if t.kind != types::K_ADT { return; }
+                let ai = self.info.adts[&t.d().id];
+                let mut fp = sp.clone();
+                let is_variant = match def { Some(d) => d.kind == resolve::DEF_VARIANT, None => false };
+                let fields = if is_variant {
+                    let vi = variant_index(self.info, def.unwrap());
+                    self.discr_test(sp.clone(), t, vi, fail);
+                    fp = sp.downcast(vi);
+                    ai.variants[vi].fields
+                } else {
+                    ai.fields
+                };
+                for f in fps.iter() {
+                    let mut i = 0;
+                    while i < fields.len() {
+                        if fields[i].name == f.name.value { self.test_pat(f.pat, fp.field(i), fail); }
+                        i += 1;
+                    }
+                }
+            }
+            PatKind::Tuple { elems, .. } => {
+                let n = t.elems.len();
+                self.positional(elems, sp, n, fail);
+            }
+            PatKind::Slice { elems, .. } => self.slice_pat(elems, sp, t, fail),
+            _ => {}
+        }
+    }
+
+    fn variant_by_name(&self, t: &Type, name: &str) -> Option<&mut Def> {
+        let ai = self.info.adts[&t.d().id];
+        for v in ai.variants.iter_mut() {
+            if v.def.name == name { return Some(v.def); }
+        }
+        None
+    }
+
+    /// Continues if cond is true and jumps to fail otherwise.
+    pub fn branch(&mut self, cond: Place, fail: usize) {
+        let next = self.new_block();
+        self.switch_bool(copy(cond), fail, next);
+        self.cur = next as i64;
+    }
+
+    fn discr_test(&mut self, sp: Place, t: &Type, variant: usize, fail: usize) {
+        if self.info.adts[&t.d().id].variants.len() == 1 { return; }
+        let isize_ = self.ctx().int(types::ISIZE);
+        let d = self.temp(isize_);
+        self.assign(d.clone(), Rvalue::Discr(sp));
+        let next = self.new_block();
+        let mut vals = Vec::new();
+        vals.push(variant as i64);
+        let mut targets = Vec::new();
+        targets.push(next);
+        self.terminate(Term::Switch { x: copy(d), ty: isize_, vals, targets, els: fail });
+        self.cur = next as i64;
+    }
+
+    /// Compares the value at sp with a unit struct/variant or constant.
+    fn const_test(&mut self, def: &mut Def, sp: Place, t: &Type, fail: usize, pos: Pos) {
+        if def.kind == resolve::DEF_STRUCT { return; }
+        if def.kind == resolve::DEF_VARIANT {
+            let vi = variant_index(self.info, def);
+            self.discr_test(sp, t, vi, fail);
+            return;
+        }
+        let v = self.temp(t);
+        if def.kind == resolve::DEF_CONST || def.kind == resolve::DEF_STATIC {
+            let sp2 = self.static_place(def);
+            self.assign(v.clone(), Rvalue::Use(copy(sp2)));
+        } else {
+            let r = &FnRef { def: Some(def), args: Vec::new(), self_ty: None, closure: None, ctor: false };
+            self.call(fn_op(r, None), Vec::new(), v.clone(), pos);
+        }
+        let b = self.ctx().bool_;
+        let ok = self.temp(b);
+        if is_prim(t) {
+            self.assign(ok.clone(), Rvalue::Bin { op: EQ, x: copy(sp), y: copy(v), ty: t, pos: 0 });
+        } else {
+            let eq = self.info.trait_item("PartialEq", "eq").unwrap();
+            let mut targs = Vec::new();
+            targs.push(t);
+            let a = self.ref_to(copy(sp), t);
+            let bb = self.ref_to(copy(v), t);
+            let mut args = Vec::new();
+            args.push(a);
+            args.push(bb);
+            self.call(self.trait_fn(eq, t, targs), args, ok.clone(), pos);
+        }
+        self.branch(ok, fail);
+    }
+
+    /// Matches tuple-like subpatterns (with an optional ..) against the n
+    /// fields of the place.
+    fn positional(&mut self, elems: &Vec<&Pat>, sp: Place, n: usize, fail: usize) {
+        let mut rest: i64 = -1;
+        let mut i = 0;
+        while i < elems.len() {
+            if is_plain_rest(elems[i]) { rest = i as i64; }
+            i += 1;
+        }
+        if rest < 0 {
+            i = 0;
+            while i < elems.len() {
+                self.test_pat(elems[i], sp.field(i), fail);
+                i += 1;
+            }
+            return;
+        }
+        let r = rest as usize;
+        i = 0;
+        while i < r {
+            self.test_pat(elems[i], sp.field(i), fail);
+            i += 1;
+        }
+        let after = elems.len() - r - 1;
+        i = 0;
+        while i < after {
+            self.test_pat(elems[r + 1 + i], sp.field(n - after + i), fail);
+            i += 1;
+        }
+    }
+
+    fn slice_pat(&mut self, elems: &Vec<&Pat>, sp: Place, t: &Type, fail: usize) {
+        let usize_ = self.ctx().usize_();
+        let mut rest: i64 = -1;
+        let mut nfixed = 0;
+        let mut i = 0;
+        while i < elems.len() {
+            if is_rest_pat(elems[i]) {
+                rest = i as i64;
+            } else {
+                nfixed += 1;
+            }
+            i += 1;
+        }
+        let n = self.temp(usize_);
+        self.assign(n.clone(), Rvalue::Len(sp.clone()));
+        if t.kind == types::K_SLICE {
+            let b = self.ctx().bool_;
+            let ok = self.temp(b);
+            let op = if rest >= 0 { GE } else { EQ };
+            self.assign(ok.clone(), Rvalue::Bin { op, x: copy(n.clone()), y: int_const(C_INT, nfixed as i64, usize_), ty: usize_, pos: 0 });
+            self.branch(ok, fail);
+        }
+        if rest < 0 {
+            i = 0;
+            while i < elems.len() {
+                let ip = self.slice_index(sp.clone(), n.clone(), i as i64, false);
+                self.test_pat(elems[i], ip, fail);
+                i += 1;
+            }
+            return;
+        }
+        let r = rest as usize;
+        i = 0;
+        while i < r {
+            let ip = self.slice_index(sp.clone(), n.clone(), i as i64, false);
+            self.test_pat(elems[i], ip, fail);
+            i += 1;
+        }
+        let after = elems.len() - r - 1;
+        i = 0;
+        while i < after {
+            let ip = self.slice_index(sp.clone(), n.clone(), (after - i) as i64, true);
+            self.test_pat(elems[r + 1 + i], ip, fail);
+            i += 1;
+        }
+    }
+
+    fn slice_index(&mut self, sp: Place, n: Place, i: i64, from_end: bool) -> Place {
+        let usize_ = self.ctx().usize_();
+        let idx = self.temp(usize_);
+        if from_end {
+            self.assign(idx.clone(), Rvalue::Bin { op: SUB, x: copy(n), y: int_const(C_INT, i, usize_), ty: usize_, pos: 0 });
+        } else {
+            self.assign(idx.clone(), Rvalue::Use(int_const(C_INT, i, usize_)));
+        }
+        sp.index(idx.local)
+    }
+}

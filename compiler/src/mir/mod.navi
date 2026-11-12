@@ -1,0 +1,443 @@
+//! navi's mid-level IR: functions made of basic blocks over typed locals
+//! and places, close to Rust's MIR. Functions are generic; the backend
+//! instantiates them per GC shape.
+
+pub mod build;
+pub mod expr;
+pub mod pat;
+pub mod closure;
+pub mod boxing;
+
+use crate::resolve::{self, Def};
+use crate::syntax::source::{File, Pos};
+use crate::types::{self, Type, type_string};
+use crate::util;
+
+/// A function body.
+pub struct Func {
+    pub name: String,
+    /// The item (none for closures and shims).
+    pub def: Option<&mut Def>,
+    /// Whose generic parameters are in scope.
+    pub owner: Option<&mut Def>,
+    /// 0 is the return place, 1..=nargs the arguments.
+    pub locals: Vec<&mut Local>,
+    pub nargs: usize,
+    pub blocks: Vec<&mut Block>,
+    pub file: Option<&File>,
+    /// Argument 1 is the environment pointer.
+    pub closure: bool,
+    pub captures: Vec<&Type>,
+    /// Set when the function registers deferred calls.
+    pub has_defer: bool,
+    /// Compiler-generated impl bodies; transparent for #[track_caller].
+    pub shim: bool,
+}
+
+pub fn new_func(name: String, def: Option<&mut Def>, owner: Option<&mut Def>, file: Option<&File>) -> &mut Func {
+    &mut Func { name, def, owner, locals: Vec::new(), nargs: 0, blocks: Vec::new(), file, closure: false, captures: Vec::new(),
+        has_defer: false, shim: false }
+}
+
+/// A local variable or temporary.
+pub struct Local {
+    pub ty: &Type,
+    /// "" for temporaries.
+    pub name: String,
+    /// Boxed locals live in a heap cell and the local holds a pointer to it.
+    pub boxed: bool,
+}
+
+/// A basic block.
+pub struct Block {
+    pub stmts: Vec<Stmt>,
+    pub term: Term,
+}
+
+pub type ProjKind = u8;
+/// *place
+pub const P_DEREF: ProjKind = 0;
+/// place.N (structs, tuples, closure envs)
+pub const P_FIELD: ProjKind = 1;
+/// place[local]
+pub const P_INDEX: ProjKind = 2;
+/// place as variant V (then fields of V)
+pub const P_DOWNCAST: ProjKind = 3;
+
+/// One projection step.
+#[derive(Clone)]
+pub struct Proj {
+    pub kind: ProjKind,
+    pub field: usize,
+    /// The local holding the index (P_INDEX).
+    pub index: usize,
+    pub variant: usize,
+}
+
+pub fn proj(kind: ProjKind) -> Proj { Proj { kind, field: 0, index: 0, variant: 0 } }
+
+/// A memory location: a local followed by projections. The projection list
+/// is never changed after creation (places share it freely).
+#[derive(Clone)]
+pub struct Place {
+    pub local: usize,
+    pub proj: Vec<Proj>,
+}
+
+pub fn local_place(l: usize) -> Place { Place { local: l, proj: Vec::new() } }
+
+impl Place {
+    /// p extended by a projection.
+    pub fn with(&self, pr: Proj) -> Place {
+        let mut ps = Vec::new();
+        for x in self.proj.iter() { ps.push(x.clone()); }
+        ps.push(pr);
+        Place { local: self.local, proj: ps }
+    }
+    pub fn deref(&self) -> Place { self.with(proj(P_DEREF)) }
+    pub fn field(&self, i: usize) -> Place {
+        let mut p = proj(P_FIELD);
+        p.field = i;
+        self.with(p)
+    }
+    pub fn index(&self, l: usize) -> Place {
+        let mut p = proj(P_INDEX);
+        p.index = l;
+        self.with(p)
+    }
+    pub fn downcast(&self, v: usize) -> Place {
+        let mut p = proj(P_DOWNCAST);
+        p.variant = v;
+        self.with(p)
+    }
+}
+
+pub type ConstKind = u8;
+pub const C_INT: ConstKind = 0;
+pub const C_FLOAT: ConstKind = 1;
+pub const C_BOOL: ConstKind = 2;
+pub const C_CHAR: ConstKind = 3;
+/// A &str literal.
+pub const C_STR: ConstKind = 4;
+/// A &[u8] literal.
+pub const C_BYTES: ConstKind = 5;
+pub const C_UNIT: ConstKind = 6;
+/// A function value (FnRef).
+pub const C_FN: ConstKind = 7;
+/// The address of a static: &STATIC.
+pub const C_STATIC: ConstKind = 8;
+/// The zero value of the type (unit structs, never used values).
+pub const C_ZERO: ConstKind = 9;
+
+/// A constant operand.
+pub struct Const {
+    pub kind: ConstKind,
+    pub int: i64,
+    pub float: f64,
+    pub bytes: Vec<u8>,
+    pub fn_ref: Option<&FnRef>,
+    pub static_def: Option<&mut Def>,
+    pub ty: Option<&Type>,
+}
+
+pub fn cnst(kind: ConstKind, ty: Option<&Type>) -> &mut Const {
+    &mut Const { kind, int: 0, float: 0.0, bytes: Vec::new(), fn_ref: None, static_def: None, ty }
+}
+
+pub fn int_const(kind: ConstKind, v: i64, ty: &Type) -> Operand {
+    let c = cnst(kind, Some(ty));
+    c.int = v;
+    const_op(c)
+}
+
+/// A function instance: an item with generic arguments, a trait method
+/// (resolved to an impl when types are concrete), a closure body or a
+/// compiler-generated shim.
+pub struct FnRef {
+    pub def: Option<&mut Def>,
+    /// Arguments for all generics in scope of def.
+    pub args: Vec<&Type>,
+    /// The self type for trait methods.
+    pub self_ty: Option<&Type>,
+    pub closure: Option<&mut Func>,
+    /// Struct/variant constructors used as functions.
+    pub ctor: bool,
+}
+
+pub fn fn_ref(def: &mut Def, args: Vec<&Type>, self_ty: Option<&Type>) -> &FnRef {
+    &FnRef { def: Some(def), args, self_ty, closure: None, ctor: false }
+}
+
+/// A function constant operand.
+pub fn fn_op(r: &FnRef, ty: Option<&Type>) -> Operand {
+    let c = cnst(C_FN, ty);
+    c.fn_ref = Some(r);
+    const_op(c)
+}
+
+pub type OperandKind = u8;
+pub const OP_COPY: OperandKind = 0;
+pub const OP_CONST: OperandKind = 1;
+
+/// An input to an rvalue or call.
+#[derive(Clone)]
+pub struct Operand {
+    pub kind: OperandKind,
+    pub place: Place,
+    pub cnst: Option<&Const>,
+}
+
+/// An operand that reads p.
+pub fn copy(p: Place) -> Operand { Operand { kind: OP_COPY, place: p, cnst: None } }
+
+/// A constant operand.
+pub fn const_op(c: &Const) -> Operand { Operand { kind: OP_CONST, place: local_place(0), cnst: Some(c) } }
+
+pub type BinOp = u8;
+pub const ADD: BinOp = 0;
+pub const SUB: BinOp = 1;
+pub const MUL: BinOp = 2;
+pub const DIV: BinOp = 3;
+pub const REM: BinOp = 4;
+pub const BIT_AND: BinOp = 5;
+pub const BIT_OR: BinOp = 6;
+pub const BIT_XOR: BinOp = 7;
+pub const SHL: BinOp = 8;
+pub const SHR: BinOp = 9;
+pub const EQ: BinOp = 10;
+pub const NE: BinOp = 11;
+pub const LT: BinOp = 12;
+pub const LE: BinOp = 13;
+pub const GT: BinOp = 14;
+pub const GE: BinOp = 15;
+/// Pointer + n elements.
+pub const OFFSET: BinOp = 16;
+
+const BIN_NAMES: [&str; 17] = ["add", "sub", "mul", "div", "rem", "and", "or", "xor", "shl", "shr", "eq", "ne", "lt", "le", "gt", "ge", "offset"];
+
+pub fn bin_name(op: BinOp) -> &str { BIN_NAMES[op as usize] }
+
+pub type UnOp = u8;
+pub const NEG: UnOp = 0;
+pub const NOT: UnOp = 1;
+
+pub type CastKind = u8;
+/// Between integer/float/char/bool types.
+pub const CAST_NUMERIC: CastKind = 0;
+/// Pointer to pointer, ref to pointer.
+pub const CAST_PTR: CastKind = 1;
+pub const CAST_PTR_INT: CastKind = 2;
+pub const CAST_INT_PTR: CastKind = 3;
+/// Fieldless enum to integer.
+pub const CAST_ENUM: CastKind = 4;
+/// extern "C" fn to pointer/integer.
+pub const CAST_FN_PTR: CastKind = 5;
+
+pub type AggKind = u8;
+pub const AGG_TUPLE: AggKind = 0;
+pub const AGG_ADT: AggKind = 1;
+pub const AGG_ARRAY: AggKind = 2;
+pub const AGG_CLOSURE: AggKind = 3;
+
+/// Computes a value.
+#[derive(Clone)]
+pub enum Rvalue {
+    /// A plain operand.
+    Use(Operand),
+    /// The address of a place (&, &mut and raw pointers).
+    Ref { is_mut: bool, place: Place },
+    /// A primitive binary operation on operands of type ty; pos is the
+    /// operator, for overflow panics.
+    Bin { op: BinOp, x: Operand, y: Operand, ty: &Type, pos: Pos },
+    Un { op: UnOp, x: Operand, ty: &Type, pos: Pos },
+    Cast { kind: CastKind, x: Operand, from: &Type, to: &Type },
+    /// A tuple, struct, enum variant, array or closure.
+    Aggregate { kind: AggKind, ty: &Type, variant: usize, ops: Vec<Operand>, closure: Option<&mut Func> },
+    /// The variant index of an enum place.
+    Discr(Place),
+    /// The length of a slice or array place.
+    Len(Place),
+    /// A pointer to an array as a slice pointer.
+    Unsize { x: Operand, len: i64, to: &Type },
+    /// &T as &dyn Trait (pointer plus vtable for T).
+    MakeDyn { x: Operand, concrete: &Type, to: &Type },
+}
+
+pub fn aggregate(kind: AggKind, ty: &Type, variant: usize, ops: Vec<Operand>) -> Rvalue {
+    Rvalue::Aggregate { kind, ty, variant, ops, closure: None }
+}
+
+/// A statement.
+#[derive(Clone)]
+pub enum Stmt {
+    Assign { place: Place, rv: Rvalue },
+    /// Sets the variant of an enum place (after its fields are written).
+    SetDiscr { place: Place, variant: usize },
+    /// Allocates a heap cell for a local and stores its address in it.
+    Box { local: usize, ty: &Type },
+    /// Registers a call to run when the function returns or unwinds.
+    PushDefer { fn_op: Operand, args: Vec<Operand> },
+    /// Where a local starts a new life; removed by boxing.
+    StorageLive(usize),
+}
+
+/// Ends a basic block.
+#[derive(Clone)]
+pub enum Term {
+    None,
+    Goto(usize),
+    /// Jumps on an integer (or bool/char) value.
+    Switch { x: Operand, ty: &Type, vals: Vec<i64>, targets: Vec<usize>, els: usize },
+    /// Returns from the function (after running defers).
+    Return,
+    Unreachable,
+    /// Calls fn_op and stores the result in dest, then continues at target
+    /// (-1 if the callee never returns).
+    Call { fn_op: Operand, args: Vec<Operand>, dest: Place, target: i64, pos: Pos },
+    /// Panics with msg unless cond is true, else continues at target. For
+    /// bounds checks len and index are set and the message names them.
+    Assert { cond: Operand, msg: String, target: usize, pos: Pos, bounds: bool, len: Operand, index: Operand },
+}
+
+// --- Printing --------------------------------------------------------------------------
+
+impl Func {
+    /// The function for debugging.
+    pub fn to_string(&self) -> String {
+        let mut b = `fn ${self.name}(`;
+        let mut i = 1;
+        while i <= self.nargs && i < self.locals.len() {
+            if i > 1 { b.push_str(", "); }
+            b.push_str(&`_${i}: ${self.locals[i].ty}`);
+            i += 1;
+        }
+        b.push_str(&`) -> ${self.locals[0].ty} {\n`);
+        i = self.nargs + 1;
+        while i < self.locals.len() {
+            let l = self.locals[i];
+            b.push_str(&`    let _${i}: ${l.ty}`);
+            if l.name.len() > 0 { b.push_str(&` // ${l.name}`); }
+            if l.boxed { b.push_str(" (boxed)"); }
+            b.push('\n');
+            i += 1;
+        }
+        i = 0;
+        while i < self.blocks.len() {
+            let blk = self.blocks[i];
+            b.push_str(&`  bb${i}:\n`);
+            for s in blk.stmts.iter() {
+                b.push_str("    ");
+                b.push_str(stmt_string(s).as_str());
+                b.push('\n');
+            }
+            b.push_str("    ");
+            b.push_str(term_string(&blk.term).as_str());
+            b.push('\n');
+            i += 1;
+        }
+        b.push_str("}\n");
+        b
+    }
+}
+
+pub fn place_string(p: &Place) -> String {
+    let mut s = `_${p.local}`;
+    for pr in p.proj.iter() {
+        if pr.kind == P_DEREF {
+            s = `(*${s})`;
+        } else if pr.kind == P_FIELD {
+            s = `${s}.${pr.field}`;
+        } else if pr.kind == P_INDEX {
+            s = `${s}[_${pr.index}]`;
+        } else {
+            s = `(${s} as v${pr.variant})`;
+        }
+    }
+    s
+}
+
+pub fn operand_string(o: &Operand) -> String {
+    if o.kind == OP_COPY { return place_string(&o.place); }
+    let c = o.cnst.unwrap();
+    let k = c.kind;
+    if k == C_INT || k == C_CHAR { return `${c.int}`; }
+    if k == C_BOOL { return if c.int != 0 { "true".to_string() } else { "false".to_string() }; }
+    if k == C_FLOAT { return util::format_g(c.float); }
+    if k == C_STR { return util::quote_go_bytes(c.bytes.as_slice()); }
+    if k == C_BYTES { return `b${util::quote_go_bytes(c.bytes.as_slice())}`; }
+    if k == C_UNIT { return "()".to_string(); }
+    if k == C_FN { return fn_ref_string(c.fn_ref.unwrap()); }
+    if k == C_STATIC { return `&${c.static_def.unwrap().name}`; }
+    "zero".to_string()
+}
+
+pub fn fn_ref_string(r: &FnRef) -> String {
+    if let Some(c) = r.closure { return c.name.clone(); }
+    let d = r.def.unwrap();
+    let mut s = build::qual_name(Some(d));
+    if let Some(st) = r.self_ty { s = `<${st}>::${d.name}`; }
+    if r.args.len() > 0 {
+        let mut parts: Vec<String> = Vec::new();
+        for a in r.args.iter() { parts.push(type_string(*a)); }
+        s.push_str(&`::<${parts.join(", ")}>`);
+    }
+    s
+}
+
+fn ops_string(ops: &Vec<Operand>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for o in ops.iter() { parts.push(operand_string(o)); }
+    parts.join(", ")
+}
+
+pub fn rv_string(rv: &Rvalue) -> String {
+    match rv {
+        Rvalue::Use(x) => operand_string(x),
+        Rvalue::Ref { is_mut, place } => if *is_mut { `&mut ${place_string(place)}` } else { `&${place_string(place)}` },
+        Rvalue::Bin { op, x, y, .. } => `${bin_name(*op)}(${operand_string(x)}, ${operand_string(y)})`,
+        Rvalue::Un { op, x, .. } => if *op == NEG { `neg ${operand_string(x)}` } else { `not ${operand_string(x)}` },
+        Rvalue::Cast { x, to, .. } => `${operand_string(x)} as ${to}`,
+        Rvalue::Aggregate { kind, ty, variant, ops, closure } => {
+            if *kind == AGG_CLOSURE { return `closure ${closure.unwrap().name} [${ops_string(ops)}]`; }
+            if *kind == AGG_ADT { return `${ty}#${variant} {${ops_string(ops)}}`; }
+            `(${ops_string(ops)})`
+        }
+        Rvalue::Discr(p) => `discr ${place_string(p)}`,
+        Rvalue::Len(p) => `len ${place_string(p)}`,
+        Rvalue::Unsize { x, len, .. } => `unsize ${operand_string(x)} len ${len}`,
+        Rvalue::MakeDyn { x, to, .. } => `dyn ${operand_string(x)} as ${to}`,
+    }
+}
+
+pub fn stmt_string(s: &Stmt) -> String {
+    match s {
+        Stmt::Assign { place, rv } => `${place_string(place)} = ${rv_string(rv)}`,
+        Stmt::SetDiscr { place, variant } => `discr ${place_string(place)} = ${variant}`,
+        Stmt::Box { local, ty } => `_${local} = box ${ty}`,
+        Stmt::PushDefer { fn_op, args } => `defer ${operand_string(fn_op)}(${ops_string(args)})`,
+        _ => "?".to_string(),
+    }
+}
+
+pub fn term_string(t: &Term) -> String {
+    match t {
+        Term::Goto(target) => `goto bb${target}`,
+        Term::Switch { x, vals, targets, els, .. } => {
+            let mut parts: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < vals.len() {
+                parts.push(`${vals[i]}: bb${targets[i]}`);
+                i += 1;
+            }
+            `switch ${operand_string(x)} [${parts.join(", ")}, else: bb${els}]`
+        }
+        Term::Return => "return".to_string(),
+        Term::Unreachable => "unreachable".to_string(),
+        Term::Call { fn_op, args, dest, target, .. } => {
+            if *target < 0 { return `${place_string(dest)} = ${operand_string(fn_op)}(${ops_string(args)}) -> !`; }
+            `${place_string(dest)} = ${operand_string(fn_op)}(${ops_string(args)}) -> bb${target}`
+        }
+        Term::Assert { cond, msg, target, .. } => `assert ${operand_string(cond)} ${util::quote(msg.as_str())} -> bb${target}`,
+        Term::None => "<no terminator>".to_string(),
+    }
+}

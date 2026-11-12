@@ -9,7 +9,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 go build -o "$tmp/navi0" ./cmd/navi
 "$tmp/navi0" build -o "$tmp/navic" compiler
-cmds=${*:-"resolve-dump types-dump"}
+cmds=${*:-"resolve-dump types-dump mir-dump"}
 crates=$( (find tests/syntax tests/resolve tests/types tests/check tests/run -name '*.navi'; echo compiler) | sort)
 fail=0
 for cmd in $cmds; do

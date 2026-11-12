@@ -25,8 +25,10 @@ type Program struct {
 func Build(info *types.Info) *Program {
 	p := &Program{Info: info, Res: info.Res, Funcs: map[*resolve.Def]*Func{}, langFns: map[string]*resolve.Def{}, shims: map[string]*Func{}}
 	p.findLangFns()
-	for def := range info.Bodies {
-		p.Func(def)
+	for _, def := range info.Res.Defs {
+		if info.Bodies[def] != nil {
+			p.Func(def)
+		}
 	}
 	return p
 }

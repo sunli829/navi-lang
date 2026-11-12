@@ -185,3 +185,6 @@ func termString(t Term) string {
 	}
 	return "?"
 }
+
+// Closures lists the closure bodies created so far, in creation order.
+func (p *Program) Closures() []*Func { return p.closures }

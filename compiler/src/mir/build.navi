@@ -1,0 +1,390 @@
+//! Lowering type-checked bodies to MIR: the program, the builder and its
+//! locals and blocks.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def, Local as RLocal, Node};
+use crate::syntax::ast::{self, Expr, ExprKind, Item, Stmt as AStmt};
+use crate::syntax::source::Pos;
+use crate::syntax::walk::{self, Visit};
+use crate::types::{self, Type};
+use crate::types::collect::Info;
+use crate::types::body::BodyInfo;
+use crate::mir::*;
+use crate::mir::boxing::box_address_taken;
+
+/// The MIR of all crates.
+pub struct Program {
+    pub info: &mut Info,
+    /// Functions, methods, consts and statics by definition id.
+    pub funcs: HashMap<u32, &mut Func>,
+    /// Lang functions used by lowering, found by std path.
+    lang_fns: HashMap<String, &mut Def>,
+    /// The closure bodies created while lowering, in creation order.
+    pub closures: Vec<&mut Func>,
+    /// Generated builtin/derived impl bodies.
+    pub shims: HashMap<String, &mut Func>,
+}
+
+/// Lowers every body that type-checked.
+pub fn build_program(info: &mut Info) -> &mut Program {
+    let p = &mut Program { info, funcs: HashMap::new(), lang_fns: HashMap::new(), closures: Vec::new(), shims: HashMap::new() };
+    p.find_lang_fns();
+    let defs = info.res.defs.clone();
+    for d in defs.iter() {
+        if info.bodies.contains_key(&d.id) { p.func(*d); }
+    }
+    p
+}
+
+const LANG_FNS: [&str; 3] = ["format=fmt::format", "str_eq=str::str_eq", "select=sync::mpmc::select_cases"];
+
+impl Program {
+    /// The MIR of a body, building it on first use.
+    pub fn func(&mut self, def: &mut Def) -> Option<&mut Func> {
+        if let Some(f) = self.funcs.get(&def.id) { return Some(*f); }
+        let body = match self.info.bodies.get(&def.id) { Some(b) => *b, None => return None };
+        let f = new_builder(self, body).build();
+        self.funcs.insert(def.id, f);
+        Some(f)
+    }
+
+    /// Records std functions that lowering calls directly.
+    fn find_lang_fns(&mut self) {
+        let mut std: Option<&mut resolve::Crate> = None;
+        for c in self.info.res.crates.iter() {
+            if c.is_std { std = Some(*c); }
+        }
+        let s = match std { Some(s) => s, None => return };
+        for entry in LANG_FNS.iter() {
+            let (name, path) = entry.split_once('=').unwrap();
+            let segs: Vec<&str> = path.split("::").collect();
+            let mut m = s.root.unwrap();
+            let mut i = 0;
+            while i < segs.len() {
+                let ns = if i == segs.len() - 1 { resolve::VALUE_NS } else { resolve::TYPE_NS };
+                let b = match m.lookup(segs[i], ns) { Some(b) => b, None => break };
+                let d = match b.res.def { Some(d) => d, None => break };
+                if i == segs.len() - 1 {
+                    self.lang_fns.insert(name.to_string(), d);
+                } else {
+                    m = d.module.unwrap();
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// A std function used by lowering.
+    pub fn lang_fn(&self, name: &str) -> Option<&mut Def> {
+        match self.lang_fns.get(&name.to_string()) { Some(d) => Some(*d), None => None }
+    }
+
+    /// A non-generic std type by path.
+    pub fn std_type(&mut self, path: &[&str]) -> &Type {
+        for c in self.info.res.crates.iter() {
+            if !c.is_std { continue; }
+            let mut m = c.root.unwrap();
+            let mut i = 0;
+            while i < path.len() {
+                let bd = match m.lookup(path[i], resolve::TYPE_NS) { Some(b) => b, None => return self.info.ctx.err };
+                let d = match bd.res.def { Some(d) => d, None => return self.info.ctx.err };
+                if i == path.len() - 1 { return self.info.ctx.adt(d, Vec::new()); }
+                m = d.module.unwrap();
+                i += 1;
+            }
+        }
+        self.info.ctx.err
+    }
+}
+
+/// The qualified name of a definition for MIR function names.
+pub fn qual_name(od: Option<&mut Def>) -> String {
+    let d = match od { Some(d) => d, None => return "?".to_string() };
+    let mut name = d.name.clone();
+    if let Some(p) = d.parent {
+        if p.kind == resolve::DEF_IMPL { name = `impl::${name}`; }
+    }
+    let mut x = d.parent;
+    while let Some(p) = x {
+        if p.kind == resolve::DEF_MOD || p.kind == resolve::DEF_TRAIT { name = `${p.name}::${name}`; }
+        x = p.parent;
+    }
+    name
+}
+
+pub struct LoopScope {
+    pub node: u32,
+    /// The block to go to on break.
+    pub brk: usize,
+    /// The block to go to on continue.
+    pub cont: usize,
+    pub dest: Place,
+    pub has_value: bool,
+}
+
+pub struct Builder {
+    pub p: &mut Program,
+    pub info: &mut Info,
+    pub body: &mut BodyInfo,
+    pub fn_: &mut Func,
+    /// The current block (-1: unreachable code).
+    pub cur: i64,
+    /// Resolver locals (by id) -> MIR locals.
+    pub locals: HashMap<u32, usize>,
+    pub boxed: HashMap<u32, bool>,
+    /// For closures: captured local -> index in the environment.
+    pub captures: HashMap<u32, usize>,
+    pub env_local: usize,
+    pub loops: Vec<&mut LoopScope>,
+    /// The closure being lowered (none for the item body).
+    pub closure_node: Option<&Expr>,
+    /// For each closure in the body (by expr id), the locals it uses from
+    /// outside.
+    pub closure_caps: HashMap<u32, Vec<&mut RLocal>>,
+    /// The closures standing for `defer { ... }` blocks (by block expr id).
+    pub defer_closures: HashMap<u32, &Expr>,
+    /// The places of the bindings of the or-pattern being lowered.
+    pub or_bound: Option<HashMap<u32, Place>>,
+}
+
+fn new_builder(p: &mut Program, body: &mut BodyInfo) -> &mut Builder {
+    let def = body.owner;
+    let f = new_func(qual_name(Some(def)), Some(def), Some(def), def.file);
+    &mut Builder { p, info: p.info, body, fn_: f, cur: -1, locals: HashMap::new(), boxed: HashMap::new(), captures: HashMap::new(),
+        env_local: 0, loops: Vec::new(), closure_node: None, closure_caps: HashMap::new(), defer_closures: HashMap::new(), or_bound: None }
+}
+
+impl Builder {
+    pub fn ctx(&mut self) -> &mut types::Ctx { self.info.ctx }
+
+    fn build(&mut self) -> &mut Func {
+        let def = self.body.owner;
+        self.analyze_captures(&def.node);
+        let unit = self.ctx().unit;
+        self.new_local(unit, ""); // return place
+        self.cur = self.new_block() as i64;
+        match &def.node {
+            Node::Item(Item::Fn(n)) => {
+                let sig = self.info.fns[&def.id];
+                self.fn_.locals[0].ty = self.ret_type(sig);
+                if let Some(l) = self.info.res.self_locals.get(&n.base.id) {
+                    if let Some(st) = sig.self_ty {
+                        self.fn_.nargs += 1;
+                        let idx = self.new_local(st, "self");
+                        self.bind_arg(*l, idx);
+                    }
+                }
+                let mut arg_locals: Vec<usize> = Vec::new();
+                let mut i = 0;
+                while i < n.params.len() {
+                    self.fn_.nargs += 1;
+                    arg_locals.push(self.new_local(sig.params[i], `arg${i}`.as_str()));
+                    i += 1;
+                }
+                i = 0;
+                while i < n.params.len() {
+                    self.bind_pattern(n.params[i].pat, local_place(arg_locals[i]));
+                    i += 1;
+                }
+                self.expr_into(n.body.unwrap(), local_place(0));
+            }
+            Node::Item(Item::Const(n)) => {
+                self.fn_.locals[0].ty = self.info.consts[&def.id].ty;
+                self.expr_into(n.value.unwrap(), local_place(0));
+            }
+            Node::Item(Item::Static(n)) => {
+                self.fn_.locals[0].ty = self.info.consts[&def.id].ty;
+                self.expr_into(n.value.unwrap(), local_place(0));
+            }
+            _ => {}
+        }
+        self.terminate(Term::Return);
+        box_address_taken(self.info.ctx, self.fn_);
+        self.fn_
+    }
+
+    /// The declared return type, with opaque types replaced by the hidden
+    /// type the body returns.
+    fn ret_type(&self, sig: &types::FnSig) -> &Type {
+        match self.info.hidden.get(&sig.ret.id) { Some(h) => *h, None => sig.ret }
+    }
+
+    // --- Locals and blocks ---------------------------------------------------------
+
+    pub fn new_local(&mut self, t: &Type, name: &str) -> usize {
+        self.fn_.locals.push(&mut Local { ty: t, name: name.to_string(), boxed: false });
+        self.fn_.locals.len() - 1
+    }
+
+    pub fn temp(&mut self, t: &Type) -> Place {
+        let l = self.new_local(t, "");
+        self.emit(Stmt::StorageLive(l));
+        local_place(l)
+    }
+
+    pub fn new_block(&mut self) -> usize {
+        self.fn_.blocks.push(&mut Block { stmts: Vec::new(), term: Term::None });
+        self.fn_.blocks.len() - 1
+    }
+
+    pub fn emit(&mut self, s: Stmt) {
+        if self.cur < 0 { return; } // unreachable code
+        let mut stmts = self.fn_.blocks[self.cur as usize].stmts;
+        stmts.push(s);
+    }
+
+    pub fn assign(&mut self, p: Place, rv: Rvalue) { self.emit(Stmt::Assign { place: p, rv }); }
+
+    pub fn terminate(&mut self, t: Term) {
+        if self.cur < 0 { return; }
+        self.fn_.blocks[self.cur as usize].term = t;
+        self.cur = -1;
+    }
+
+    pub fn goto_block(&mut self, target: usize) {
+        self.terminate(Term::Goto(target));
+        self.cur = target as i64;
+    }
+
+    /// Emits a call and continues in a new block.
+    pub fn call(&mut self, fn_op: Operand, args: Vec<Operand>, dest: Place, pos: Pos) {
+        if self.cur < 0 { return; }
+        let next = self.new_block();
+        self.terminate(Term::Call { fn_op, args, dest, target: next as i64, pos });
+        self.cur = next as i64;
+    }
+
+    /// Emits a call that never returns.
+    pub fn call_diverging(&mut self, fn_op: Operand, args: Vec<Operand>, pos: Pos) {
+        if self.cur < 0 { return; }
+        let never = self.ctx().never;
+        let dest = self.temp(never);
+        self.terminate(Term::Call { fn_op, args, dest, target: -1, pos });
+    }
+
+    /// Makes resolver local l live in argument local idx (copying to a heap
+    /// cell if it is captured).
+    pub fn bind_arg(&mut self, l: &RLocal, idx: usize) {
+        if self.boxed.contains_key(&l.id) {
+            let t = self.fn_.locals[idx].ty;
+            let rt = self.ctx().reference(true, t);
+            let cell = self.new_local(rt, l.name.as_str());
+            self.fn_.locals[cell].boxed = true;
+            self.emit(Stmt::Box { local: cell, ty: t });
+            self.assign(local_place(cell).deref(), Rvalue::Use(copy(local_place(idx))));
+            self.locals.insert(l.id, cell);
+            return;
+        }
+        self.locals.insert(l.id, idx);
+    }
+
+    /// Creates the local for a resolver local of type t and returns the
+    /// place where its value lives.
+    pub fn declare(&mut self, l: &RLocal, t: &Type) -> Place {
+        if self.boxed.contains_key(&l.id) {
+            let rt = self.ctx().reference(true, t);
+            let cell = self.new_local(rt, l.name.as_str());
+            self.fn_.locals[cell].boxed = true;
+            self.emit(Stmt::Box { local: cell, ty: t });
+            self.locals.insert(l.id, cell);
+            return local_place(cell).deref();
+        }
+        let idx = self.new_local(t, l.name.as_str());
+        self.emit(Stmt::StorageLive(idx));
+        self.locals.insert(l.id, idx);
+        local_place(idx)
+    }
+
+    /// The place of a resolver local.
+    pub fn local_place_of(&mut self, l: &RLocal) -> Place {
+        if let Some(i) = self.captures.get(&l.id) {
+            // env -> cell pointer -> value
+            return local_place(self.env_local).deref().field(*i).deref();
+        }
+        let idx = match self.locals.get(&l.id) { Some(i) => *i, None => panic(`mir: local ${l.name} has no slot`) };
+        if self.fn_.locals[idx].boxed { return local_place(idx).deref(); }
+        local_place(idx)
+    }
+
+    /// An operand with the address of a captured local's heap cell (for
+    /// building a closure environment).
+    pub fn cell_pointer(&mut self, l: &RLocal) -> Operand {
+        if let Some(i) = self.captures.get(&l.id) {
+            return copy(local_place(self.env_local).deref().field(*i));
+        }
+        copy(local_place(self.locals[&l.id]))
+    }
+
+    /// The checked type of an expression.
+    pub fn type_of(&self, x: &Expr) -> &Type {
+        if let Some(t) = self.body.types.get(&x.id) { return *t; }
+        if let ExprKind::Paren { x: inner, .. } = &x.kind { return self.type_of(*inner); }
+        self.info.ctx.err
+    }
+
+    /// Finds the locals each closure in the body uses from outside and marks
+    /// them boxed.
+    fn analyze_captures(&mut self, root: &Node) {
+        self.closure_caps = HashMap::new();
+        let it = match root { Node::Item(it) => it.clone(), _ => return };
+        let mut closures: Vec<&Expr> = Vec::new();
+        self.defer_closures = HashMap::new();
+        let unit = self.ctx().unit;
+        let fn_unit = self.ctx().func(Vec::new(), unit, "");
+        let mut defer_closures = self.defer_closures;
+        let body = self.body;
+        walk::inspect_item(&it, |v| {
+            match v {
+                Visit::Expr(x) => {
+                    if let ExprKind::Closure { .. } = &x.kind { closures.push(x); }
+                }
+                Visit::Stmt(s) => {
+                    if let AStmt::Defer { x, .. } = s {
+                        if let ExprKind::Block(blk) = &x.kind {
+                            // defer { ... } runs the block later, like a closure.
+                            let c = ast::expr(ExprKind::Closure { pos: blk.lbrace, params: Vec::new(), result: None, body: *x });
+                            defer_closures.insert(x.id, c);
+                            body.types.insert(c.id, fn_unit);
+                            closures.push(c);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            true
+        });
+        for c in closures.iter() {
+            let cbody = match &c.kind { ExprKind::Closure { body, .. } => *body, _ => continue };
+            let mut inside: HashMap<u32, bool> = HashMap::new();
+            inside.insert(c.id, true);
+            walk::inspect_expr(cbody, |v| {
+                if let Visit::Expr(x) = v {
+                    if let ExprKind::Closure { .. } = &x.kind { inside.insert(x.id, true); }
+                }
+                true
+            });
+            let mut seen: HashMap<u32, bool> = HashMap::new();
+            let mut caps: Vec<&mut RLocal> = Vec::new();
+            let paths = self.info.res.paths;
+            let mut boxed = self.boxed;
+            walk::inspect_expr(cbody, |v| {
+                if let Visit::Expr(x) = v {
+                    if let ExprKind::Path(p) = &x.kind {
+                        if let Some(res) = paths.get(&p.id) {
+                            if res.kind == resolve::RES_LOCAL {
+                                let l = res.local.unwrap();
+                                if !inside.contains_key(&l.fn_node.id()) && !seen.contains_key(&l.id) {
+                                    seen.insert(l.id, true);
+                                    caps.push(l);
+                                    boxed.insert(l.id, true);
+                                }
+                            }
+                        }
+                    }
+                }
+                true
+            });
+            if caps.len() > 0 { self.closure_caps.insert(c.id, caps); }
+        }
+    }
+}

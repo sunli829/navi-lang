@@ -1,0 +1,248 @@
+//! A preorder walk over expressions, statements and patterns in the same
+//! order as stage0's syntax.Inspect (later phases depend on the order).
+
+use crate::syntax::ast::*;
+
+/// A node reached by the walk.
+pub enum Visit {
+    Expr(&Expr),
+    Stmt(&Stmt),
+    Pat(&Pat),
+}
+
+/// Calls f for every node under the item it (in preorder); the children
+/// of a node are skipped when f returns false.
+pub fn inspect_item(it: &Item, f: fn(Visit) -> bool) {
+    match it {
+        Item::Fn(n) => {
+            generics(n.generics, f);
+            for p in n.params.iter() {
+                inspect_pat(p.pat, f);
+                if let Some(t) = p.ty { ty(t, f); }
+            }
+            if let Some(r) = n.result { ty(r, f); }
+            if let Some(b) = n.body { inspect_expr(b, f); }
+        }
+        Item::Struct(n) => {
+            generics(n.generics, f);
+            for fd in n.fields.iter() { ty(fd.ty, f); }
+        }
+        Item::Enum(n) => {
+            generics(n.generics, f);
+            for v in n.variants.iter() {
+                for fd in v.fields.iter() { ty(fd.ty, f); }
+                if let Some(d) = v.discriminant { inspect_expr(d, f); }
+            }
+        }
+        Item::TypeAlias(n) => {
+            generics(n.generics, f);
+            paths(&n.bounds, f);
+            if let Some(t) = n.ty { ty(t, f); }
+        }
+        Item::Const(n) => {
+            ty(n.ty, f);
+            if let Some(v) = n.value { inspect_expr(v, f); }
+        }
+        Item::Static(n) => {
+            ty(n.ty, f);
+            if let Some(v) = n.value { inspect_expr(v, f); }
+        }
+        Item::Impl(n) => {
+            generics(n.generics, f);
+            if let Some(p) = n.trait_path { path(p, f); }
+            ty(n.ty, f);
+            for x in n.items.iter() { inspect_item(x, f); }
+        }
+        Item::Trait(n) => {
+            generics(n.generics, f);
+            paths(&n.supers, f);
+            for x in n.items.iter() { inspect_item(x, f); }
+        }
+        Item::Mod(n) => { for x in n.items.iter() { inspect_item(x, f); } }
+        Item::Use(_) => {}
+        Item::Extern(n) => { for x in n.items.iter() { inspect_item(x, f); } }
+    }
+}
+
+fn generics(g: &Generics, f: fn(Visit) -> bool) {
+    for p in g.params.iter() {
+        paths(&p.bounds, f);
+        if let Some(d) = p.default { ty(d, f); }
+    }
+    for w in g.wheres.iter() {
+        ty(w.ty, f);
+        paths(&w.bounds, f);
+    }
+}
+
+fn paths(ps: &Vec<&Path>, f: fn(Visit) -> bool) { for p in ps.iter() { path(*p, f); } }
+
+fn path(p: &Path, f: fn(Visit) -> bool) {
+    if let Some(q) = p.qself {
+        ty(q.ty, f);
+        if let Some(tp) = q.trait_path { path(tp, f); }
+    }
+    for s in p.segments.iter() {
+        if let Some(a) = s.args {
+            for t in a.args.iter() { ty(*t, f); }
+            for b in a.bindings.iter() { ty(b.ty, f); }
+        }
+    }
+}
+
+fn ty(t: &Type, f: fn(Visit) -> bool) {
+    match &t.kind {
+        TypeKind::Path(p) => path(*p, f),
+        TypeKind::Ref { elem, .. } | TypeKind::Ptr { elem, .. } | TypeKind::Slice { elem, .. } => ty(*elem, f),
+        TypeKind::Array { elem, len, .. } => {
+            ty(*elem, f);
+            inspect_expr(*len, f);
+        }
+        TypeKind::Tuple { elems, .. } => { for e in elems.iter() { ty(*e, f); } }
+        TypeKind::Fn { params, result, .. } => {
+            for p in params.iter() { ty(*p, f); }
+            if let Some(r) = result { ty(*r, f); }
+        }
+        TypeKind::Dyn { bounds, .. } | TypeKind::Impl { bounds, .. } => paths(bounds, f),
+        _ => {}
+    }
+}
+
+fn opt(x: Option<&Expr>, f: fn(Visit) -> bool) { if let Some(e) = x { inspect_expr(e, f); } }
+
+/// Calls f for x and every node under it (in preorder).
+pub fn inspect_expr(x: &Expr, f: fn(Visit) -> bool) {
+    if !f(Visit::Expr(x)) { return; }
+    match &x.kind {
+        ExprKind::Template { parts, .. } => { for p in parts.iter() { opt(p.x, f); } }
+        ExprKind::Path(p) => path(*p, f),
+        ExprKind::Unary { x: e, .. } | ExprKind::Ref { x: e, .. } | ExprKind::Field { x: e, .. } | ExprKind::Try { x: e, .. }
+            | ExprKind::Paren { x: e, .. } => inspect_expr(*e, f),
+        ExprKind::Binary { x: a, y: b, .. } | ExprKind::Assign { x: a, y: b, .. } => {
+            inspect_expr(*a, f);
+            inspect_expr(*b, f);
+        }
+        ExprKind::Cast { x: e, ty: t } => {
+            inspect_expr(*e, f);
+            ty(*t, f);
+        }
+        ExprKind::Range { lo, hi, .. } => {
+            opt(*lo, f);
+            opt(*hi, f);
+        }
+        ExprKind::Call { fun, args, .. } => {
+            inspect_expr(*fun, f);
+            for a in args.iter() { inspect_expr(*a, f); }
+        }
+        ExprKind::MethodCall { recv, type_args, args, .. } => {
+            inspect_expr(*recv, f);
+            if let Some(ta) = type_args { for t in ta.args.iter() { ty(*t, f); } }
+            for a in args.iter() { inspect_expr(*a, f); }
+        }
+        ExprKind::Index { x: e, index, .. } => {
+            inspect_expr(*e, f);
+            inspect_expr(*index, f);
+        }
+        ExprKind::StructLit { path: p, fields, base } => {
+            path(*p, f);
+            for fi in fields.iter() { inspect_expr(fi.value, f); }
+            opt(*base, f);
+        }
+        ExprKind::Tuple { elems, .. } | ExprKind::Array { elems, .. } => { for e in elems.iter() { inspect_expr(*e, f); } }
+        ExprKind::ArrayRepeat { value, count, .. } => {
+            inspect_expr(*value, f);
+            inspect_expr(*count, f);
+        }
+        ExprKind::Block(b) => {
+            for s in b.stmts.iter() { inspect_stmt(*s, f); }
+            opt(b.tail, f);
+        }
+        ExprKind::If { cond, then, els, .. } => {
+            inspect_expr(*cond, f);
+            inspect_expr(*then, f);
+            opt(*els, f);
+        }
+        ExprKind::Let { pat, x: e, .. } => {
+            inspect_pat(*pat, f);
+            inspect_expr(*e, f);
+        }
+        ExprKind::Match { x: e, arms, .. } => {
+            inspect_expr(*e, f);
+            for a in arms.iter() {
+                inspect_pat(a.pat, f);
+                opt(a.guard, f);
+                inspect_expr(a.body, f);
+            }
+        }
+        ExprKind::Loop { body, .. } => inspect_expr(*body, f),
+        ExprKind::While { cond, body, .. } => {
+            inspect_expr(*cond, f);
+            inspect_expr(*body, f);
+        }
+        ExprKind::For { pat, iter, body, .. } => {
+            inspect_pat(*pat, f);
+            inspect_expr(*iter, f);
+            inspect_expr(*body, f);
+        }
+        ExprKind::Break { value, .. } => opt(*value, f),
+        ExprKind::Return { value, .. } => opt(*value, f),
+        ExprKind::Closure { params, result, body, .. } => {
+            for p in params.iter() {
+                inspect_pat(p.pat, f);
+                if let Some(t) = p.ty { ty(t, f); }
+            }
+            if let Some(r) = result { ty(*r, f); }
+            inspect_expr(*body, f);
+        }
+        ExprKind::Select { arms, .. } => {
+            for a in arms.iter() {
+                if let Some(p) = a.pat { inspect_pat(p, f); }
+                opt(a.op, f);
+                inspect_expr(a.body, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn inspect_stmt(s: &Stmt, f: fn(Visit) -> bool) {
+    if !f(Visit::Stmt(s)) { return; }
+    match s {
+        Stmt::Let(l) => {
+            inspect_pat(l.pat, f);
+            if let Some(t) = l.ty { ty(t, f); }
+            opt(l.init, f);
+            opt(l.els, f);
+        }
+        Stmt::Expr { x, .. } => inspect_expr(*x, f),
+        Stmt::Item(it) => inspect_item(it, f),
+        Stmt::Defer { x, .. } => inspect_expr(*x, f),
+        _ => {}
+    }
+}
+
+/// Calls f for p and every node under it (in preorder).
+pub fn inspect_pat(p: &Pat, f: fn(Visit) -> bool) {
+    if !f(Visit::Pat(p)) { return; }
+    match &p.kind {
+        PatKind::Ident { sub, .. } => { if let Some(s) = sub { inspect_pat(*s, f); } }
+        PatKind::Lit(x) => inspect_expr(*x, f),
+        PatKind::Range { lo, hi, .. } => {
+            opt(*lo, f);
+            opt(*hi, f);
+        }
+        PatKind::Path(pp) => path(*pp, f),
+        PatKind::Tuple { elems, .. } | PatKind::Slice { elems, .. } => { for e in elems.iter() { inspect_pat(*e, f); } }
+        PatKind::TupleStruct { path: pp, elems } => {
+            path(*pp, f);
+            for e in elems.iter() { inspect_pat(*e, f); }
+        }
+        PatKind::Struct { path: pp, fields, .. } => {
+            path(*pp, f);
+            for fp in fields.iter() { inspect_pat(fp.pat, f); }
+        }
+        PatKind::Ref { pat, .. } => inspect_pat(*pat, f),
+        PatKind::Or(alts) => { for a in alts.iter() { inspect_pat(*a, f); } }
+        _ => {}
+    }
+}

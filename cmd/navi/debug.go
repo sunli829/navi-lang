@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"navi/internal/build"
+	"navi/internal/mir"
 	"navi/internal/resolve"
 	"navi/internal/syntax"
 )
@@ -131,5 +132,38 @@ func typesDump(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, l)
 		}
 	}
+	return 0
+}
+
+// mirDump prints the MIR of every body of a crate and std, then the
+// closures in creation order.
+func mirDump(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, "usage: navi mir-dump <crate or file>")
+		return 2
+	}
+	spec, err := build.LoadCrate(args[0])
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	info, errs := build.CheckSpecs(build.HostConfig(), []*resolve.CrateSpec{build.StdCrate(), spec})
+	if len(errs) > 0 {
+		for _, e := range errs {
+			fmt.Fprintln(stdout, "error", e.Error())
+		}
+		return 1
+	}
+	p := mir.Build(info)
+	var b strings.Builder
+	for _, d := range info.Res.Defs {
+		if f := p.Funcs[d]; f != nil {
+			b.WriteString(f.String())
+		}
+	}
+	for _, f := range p.Closures() {
+		b.WriteString(f.String())
+	}
+	io.WriteString(stdout, b.String())
 	return 0
 }

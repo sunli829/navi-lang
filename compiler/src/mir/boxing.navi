@@ -1,0 +1,167 @@
+//! Moves every local whose address is taken into a heap cell, allocated
+//! where the local starts its life (its StorageLive), so a reference stays
+//! valid after the function returns and a variable declared in a loop is
+//! a new variable in every iteration (as in Go). Arguments and the return
+//! place get a cell at function entry. All StorageLive statements are
+//! removed. There is no escape analysis yet: every address-taken local is
+//! boxed.
+
+use std::collections::HashMap;
+use crate::types::{Ctx, Type};
+use crate::mir::*;
+
+struct Fixer {
+    redirect: HashMap<usize, usize>,
+    elem: HashMap<usize, &Type>,
+}
+
+impl Fixer {
+    fn place(&self, p: &Place) -> Place {
+        let base = if let Some(c) = self.redirect.get(&p.local) { Some(*c) } else if self.elem.contains_key(&p.local) { Some(p.local) } else { None };
+        match base {
+            None => p.clone(),
+            Some(l) => {
+                let mut ps = Vec::new();
+                ps.push(proj(P_DEREF));
+                for x in p.proj.iter() { ps.push(x.clone()); }
+                Place { local: l, proj: ps }
+            }
+        }
+    }
+
+    fn op(&self, o: &Operand) -> Operand {
+        if o.kind == OP_COPY { return copy(self.place(&o.place)); }
+        o.clone()
+    }
+
+    fn ops(&self, os: &Vec<Operand>) -> Vec<Operand> {
+        let mut out = Vec::new();
+        for o in os.iter() { out.push(self.op(o)); }
+        out
+    }
+
+    fn rv(&self, rv: &Rvalue) -> Rvalue {
+        match rv {
+            Rvalue::Use(x) => Rvalue::Use(self.op(x)),
+            Rvalue::Ref { is_mut, place } => Rvalue::Ref { is_mut: *is_mut, place: self.place(place) },
+            Rvalue::Bin { op, x, y, ty, pos } => Rvalue::Bin { op: *op, x: self.op(x), y: self.op(y), ty: *ty, pos: *pos },
+            Rvalue::Un { op, x, ty, pos } => Rvalue::Un { op: *op, x: self.op(x), ty: *ty, pos: *pos },
+            Rvalue::Cast { kind, x, from, to } => Rvalue::Cast { kind: *kind, x: self.op(x), from: *from, to: *to },
+            Rvalue::Aggregate { kind, ty, variant, ops, closure } =>
+                Rvalue::Aggregate { kind: *kind, ty: *ty, variant: *variant, ops: self.ops(ops), closure: *closure },
+            Rvalue::Discr(p) => Rvalue::Discr(self.place(p)),
+            Rvalue::Len(p) => Rvalue::Len(self.place(p)),
+            Rvalue::Unsize { x, len, to } => Rvalue::Unsize { x: self.op(x), len: *len, to: *to },
+            Rvalue::MakeDyn { x, concrete, to } => Rvalue::MakeDyn { x: self.op(x), concrete: *concrete, to: *to },
+        }
+    }
+}
+
+pub fn box_address_taken(ctx: &mut Ctx, f: &mut Func) {
+    let mut taken: HashMap<usize, bool> = HashMap::new();
+    for b in f.blocks.iter() {
+        for s in b.stmts.iter() {
+            if let Stmt::Assign { rv, .. } = s {
+                if let Rvalue::Ref { place, .. } = rv {
+                    if place.proj.len() == 0 || place.proj[0].kind != P_DEREF { taken.insert(place.local, true); }
+                }
+            }
+        }
+    }
+    // In local order, so that the result is deterministic.
+    let mut taken_order: Vec<usize> = taken.keys().map(|k| *k).collect();
+    taken_order.sort();
+    let first_arg = if f.closure { 2 } else { 1 };
+    // Locals that start their life at entry (arguments, the return place)
+    // are redirected to a new cell local.
+    let mut redirect: HashMap<usize, usize> = HashMap::new();
+    let mut entry: Vec<Stmt> = Vec::new();
+    let mut exit: Vec<Stmt> = Vec::new();
+    let mut live: HashMap<usize, bool> = HashMap::new();
+    for l in taken_order.iter() {
+        let l = *l;
+        if l == 0 || l >= first_arg && l <= f.nargs || f.closure && l == 1 {
+            let t = f.locals[l].ty;
+            let cell = f.locals.len();
+            let name = f.locals[l].name.clone();
+            f.locals.push(&mut Local { ty: ctx.reference(true, t), name, boxed: true });
+            redirect.insert(l, cell);
+            entry.push(Stmt::Box { local: cell, ty: t });
+            if l == 0 {
+                exit.push(Stmt::Assign { place: local_place(0), rv: Rvalue::Use(copy(local_place(cell).deref())) });
+            } else {
+                entry.push(Stmt::Assign { place: local_place(cell).deref(), rv: Rvalue::Use(copy(local_place(l))) });
+            }
+        }
+    }
+    if taken.len() == 0 {
+        strip_storage(f);
+        return;
+    }
+    // Other locals become pointers to cells allocated at each StorageLive.
+    for b in f.blocks.iter() {
+        for s in b.stmts.iter() {
+            if let Stmt::StorageLive(l) = s {
+                if taken.contains_key(l) && !redirect.contains_key(l) { live.insert(*l, true); }
+            }
+        }
+    }
+    let mut elem: HashMap<usize, &Type> = HashMap::new();
+    for l in taken_order.iter() {
+        let l = *l;
+        if redirect.contains_key(&l) { continue; }
+        let t = f.locals[l].ty;
+        elem.insert(l, t);
+        f.locals[l].ty = ctx.reference(true, t);
+        f.locals[l].boxed = true;
+        if !live.contains_key(&l) {
+            // No declaration point (generated code): allocate at entry.
+            entry.push(Stmt::Box { local: l, ty: t });
+        }
+    }
+    let fx = Fixer { redirect, elem };
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        let mut out: Vec<Stmt> = Vec::new();
+        if bi == 0 { for s in entry.iter() { out.push(s.clone()); } }
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::StorageLive(l) => {
+                    if let Some(t) = fx.elem.get(l) {
+                        if live.contains_key(l) { out.push(Stmt::Box { local: *l, ty: *t }); }
+                    }
+                }
+                Stmt::Assign { place, rv } => out.push(Stmt::Assign { place: fx.place(place), rv: fx.rv(rv) }),
+                Stmt::SetDiscr { place, variant } => out.push(Stmt::SetDiscr { place: fx.place(place), variant: *variant }),
+                Stmt::PushDefer { fn_op, args } => out.push(Stmt::PushDefer { fn_op: fx.op(fn_op), args: fx.ops(args) }),
+                _ => out.push(s.clone()),
+            }
+        }
+        match &b.term {
+            Term::Switch { x, ty, vals, targets, els } =>
+                b.term = Term::Switch { x: fx.op(x), ty: *ty, vals: vals.clone(), targets: targets.clone(), els: *els },
+            Term::Call { fn_op, args, dest, target, pos } =>
+                b.term = Term::Call { fn_op: fx.op(fn_op), args: fx.ops(args), dest: fx.place(dest), target: *target, pos: *pos },
+            Term::Assert { cond, msg, target, pos, bounds, len, index } =>
+                b.term = Term::Assert { cond: fx.op(cond), msg: msg.clone(), target: *target, pos: *pos, bounds: *bounds, len: fx.op(len), index: fx.op(index) },
+            Term::Return => { for s in exit.iter() { out.push(s.clone()); } }
+            _ => {}
+        }
+        b.stmts = out;
+        bi += 1;
+    }
+}
+
+fn strip_storage(f: &mut Func) {
+    for b in f.blocks.iter_mut() {
+        let mut out: Vec<Stmt> = Vec::new();
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::StorageLive(_) => {}
+                _ => out.push(s.clone()),
+            }
+        }
+        b.stmts = out;
+    }
+}

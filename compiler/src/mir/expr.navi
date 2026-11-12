@@ -1,0 +1,1195 @@
+//! Lowering expressions to MIR.
+
+use std::collections::HashMap;
+use crate::resolve::{self, Def};
+use crate::syntax::ast::{self, Expr, ExprKind, LitKind, Stmt as AStmt, FieldInit, Name};
+use crate::syntax::source::Pos;
+use crate::syntax::token;
+use crate::types::{self, Type, TraitRef};
+use crate::types::collect::Info;
+use crate::mir::*;
+use crate::mir::build::*;
+
+fn unit_const(ctx: &types::Ctx) -> Operand { const_op(cnst(C_UNIT, Some(ctx.unit))) }
+
+pub fn zero_const(t: &Type) -> Operand { const_op(cnst(C_ZERO, Some(t))) }
+
+pub fn is_prim(t: &Type) -> bool {
+    t.kind == types::K_INT || t.kind == types::K_FLOAT || t.kind == types::K_BOOL || t.kind == types::K_CHAR
+}
+
+pub fn variant_index(info: &Info, d: &Def) -> usize {
+    let ai = info.adts[&d.parent.unwrap().id];
+    let mut i = 0;
+    while i < ai.variants.len() {
+        if ai.variants[i].def.id == d.id { return i; }
+        i += 1;
+    }
+    0xFFFFFFFF
+}
+
+fn bin_op_of(k: token::Kind) -> BinOp {
+    if k == token::PLUS { return ADD; }
+    if k == token::MINUS { return SUB; }
+    if k == token::STAR { return MUL; }
+    if k == token::SLASH { return DIV; }
+    if k == token::PERCENT { return REM; }
+    if k == token::AND { return BIT_AND; }
+    if k == token::OR { return BIT_OR; }
+    if k == token::CARET { return BIT_XOR; }
+    if k == token::SHL { return SHL; }
+    if k == token::SHR { return SHR; }
+    if k == token::EQ_EQ { return EQ; }
+    if k == token::NE { return NE; }
+    if k == token::LT { return LT; }
+    if k == token::LE { return LE; }
+    if k == token::GT { return GT; }
+    if k == token::GE { return GE; }
+    ADD
+}
+
+/// The operator trait and method of a binary operator token.
+fn op_trait(k: token::Kind) -> (&str, &str) {
+    if k == token::PLUS { return ("Add", "add"); }
+    if k == token::MINUS { return ("Sub", "sub"); }
+    if k == token::STAR { return ("Mul", "mul"); }
+    if k == token::SLASH { return ("Div", "div"); }
+    if k == token::PERCENT { return ("Rem", "rem"); }
+    if k == token::AND { return ("BitAnd", "bitand"); }
+    if k == token::OR { return ("BitOr", "bitor"); }
+    if k == token::CARET { return ("BitXor", "bitxor"); }
+    if k == token::SHL { return ("Shl", "shl"); }
+    if k == token::SHR { return ("Shr", "shr"); }
+    ("", "")
+}
+
+fn assign_base(op: token::Kind) -> token::Kind {
+    if op == token::PLUS_EQ { return token::PLUS; }
+    if op == token::MINUS_EQ { return token::MINUS; }
+    if op == token::STAR_EQ { return token::STAR; }
+    if op == token::SLASH_EQ { return token::SLASH; }
+    if op == token::PERCENT_EQ { return token::PERCENT; }
+    if op == token::AND_EQ { return token::AND; }
+    if op == token::OR_EQ { return token::OR; }
+    if op == token::CARET_EQ { return token::CARET; }
+    if op == token::SHL_EQ { return token::SHL; }
+    if op == token::SHR_EQ { return token::SHR; }
+    token::EOF
+}
+
+fn is_place_expr(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::Path(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Paren { .. } | ExprKind::Unary { .. } => true,
+        _ => false,
+    }
+}
+
+impl Builder {
+    /// Lowers x to a value, applying recorded coercions.
+    pub fn operand(&mut self, x: &Expr) -> Operand {
+        let op = self.raw_operand(x);
+        self.coerce(x, op)
+    }
+
+    /// Applies the implicit conversion recorded for x.
+    pub fn coerce(&mut self, x: &Expr, op: Operand) -> Operand {
+        let a = match self.body.adjust.get(&x.id) { Some(a) => *a, None => return op };
+        if a.autoref == 0 && !a.unsize && a.to_dyn.is_none() { return op; }
+        let t = self.type_of(x);
+        if a.autoref > 0 && a.derefs > 0 {
+            // Deref coercion: &T -> &U through Deref.
+            let tmp = self.temp(t);
+            self.assign(tmp.clone(), Rvalue::Use(op));
+            let mut p = tmp.deref();
+            let mut pt = t.el();
+            let mut i = 1;
+            while i < a.derefs {
+                let (np, nt) = self.deref_place(p, pt, a.autoref == 2, x.pos());
+                p = np;
+                pt = nt;
+                i += 1;
+            }
+            let rt = self.ctx().reference(a.autoref == 2, pt);
+            let out = self.temp(rt);
+            self.assign(out.clone(), Rvalue::Ref { is_mut: a.autoref == 2, place: p });
+            return copy(out);
+        }
+        if a.unsize {
+            if t.kind == types::K_REF && t.el().kind == types::K_ARRAY {
+                let s = self.ctx().slice(t.el().el());
+                let to = self.ctx().reference(t.is_mut, s);
+                let out = self.temp(to);
+                self.assign(out.clone(), Rvalue::Unsize { x: op, len: t.el().len, to });
+                return copy(out);
+            }
+            return op;
+        }
+        if let Some(td) = a.to_dyn {
+            let out = self.temp(td);
+            self.assign(out.clone(), Rvalue::MakeDyn { x: op, concrete: t.el(), to: td });
+            return copy(out);
+        }
+        op
+    }
+
+    /// Dereferences p of type t once: through a reference or raw pointer, or
+    /// by calling Deref::deref (DerefMut::deref_mut if is_mut).
+    pub fn deref_place(&mut self, p: Place, t: &Type, is_mut: bool, pos: Pos) -> (Place, &Type) {
+        if t.kind == types::K_REF || t.kind == types::K_PTR { return (p.deref(), t.el()); }
+        let target = match self.info.deref_target(Some(self.body.owner), t) { Some(x) => x, None => self.ctx().err };
+        let (trait_name, method) = if is_mut { ("DerefMut", "deref_mut") } else { ("Deref", "deref") };
+        let m = self.info.trait_item(trait_name, method).unwrap();
+        let rt = self.ctx().reference(is_mut, t);
+        let r = self.temp(rt);
+        self.assign(r.clone(), Rvalue::Ref { is_mut, place: p });
+        let ot = self.ctx().reference(is_mut, target);
+        let out = self.temp(ot);
+        let mut args = Vec::new();
+        args.push(copy(r));
+        self.call(self.trait_fn(m, t, Vec::new()), args, out.clone(), pos);
+        (out.deref(), target)
+    }
+
+    pub fn trait_fn(&self, method: &mut Def, self_ty: &Type, args: Vec<&Type>) -> Operand {
+        fn_op(fn_ref(method, args, Some(self_ty)), None)
+    }
+
+    pub fn fn_const(&self, def: &mut Def, args: Vec<&Type>) -> Operand { fn_op(fn_ref(def, args, None), None) }
+
+    /// Lowers x without coercion.
+    pub fn raw_operand(&mut self, x: &Expr) -> Operand {
+        match &x.kind {
+            ExprKind::Lit { kind, value, .. } => return self.literal(x, kind.clone(), value.as_str()),
+            ExprKind::Paren { x: inner, .. } => return self.raw_operand(*inner),
+            ExprKind::Path(p) => {
+                let res = self.info.res.paths.get(&p.id);
+                if let Some(r) = res {
+                    if r.kind == resolve::RES_LOCAL { return copy(self.local_place_of(r.local.unwrap())); }
+                }
+                if let Some(clr) = self.body.callees.get(&x.id) {
+                    let cl = *clr;
+                    let d = cl.def;
+                    let k = d.kind;
+                    if k == resolve::DEF_FN || k == resolve::DEF_EXTERN_FN || k == resolve::DEF_ASSOC_FN {
+                        return fn_op(fn_ref(d, cl.args.clone(), cl.self_ty), Some(self.type_of(x)));
+                    }
+                    if k == resolve::DEF_CONST {
+                        // Free constants are computed once, like statics.
+                        return copy(self.static_place(d));
+                    }
+                    if k == resolve::DEF_ASSOC_CONST {
+                        let out = self.temp(self.type_of(x));
+                        self.call(fn_op(fn_ref(d, cl.args.clone(), cl.self_ty), None), Vec::new(), out.clone(), x.pos());
+                        return copy(out);
+                    }
+                    if k == resolve::DEF_STATIC || k == resolve::DEF_EXTERN_STATIC { return copy(self.static_place(d)); }
+                    if k == resolve::DEF_STRUCT || k == resolve::DEF_VARIANT {
+                        let t = self.type_of(x);
+                        if t.kind == types::K_FN {
+                            let r = &FnRef { def: Some(d), args: cl.args.clone(), self_ty: None, closure: None, ctor: true };
+                            return fn_op(r, Some(t));
+                        }
+                        let out = self.temp(t);
+                        self.aggregate_ctor(d, t, Vec::new(), out.clone());
+                        return copy(out);
+                    }
+                }
+                let t = self.type_of(x);
+                if t.kind == types::K_ADT {
+                    // Self as a unit struct value.
+                    let out = self.temp(t);
+                    self.assign(out.clone(), aggregate(AGG_ADT, t, 0, Vec::new()));
+                    return copy(out);
+                }
+                return zero_const(t);
+            }
+            _ => {}
+        }
+        let t = self.type_of(x);
+        if t.kind == types::K_NEVER {
+            let tmp = self.temp(t);
+            self.expr_into_raw(x, tmp);
+            return zero_const(t);
+        }
+        let tmp = self.temp(t);
+        self.expr_into_raw(x, tmp.clone());
+        copy(tmp)
+    }
+
+    pub fn static_place(&mut self, d: &mut Def) -> Place {
+        let t = self.info.consts[&d.id].ty;
+        let rt = self.ctx().reference(true, t);
+        let ptr = self.temp(rt);
+        let c = cnst(C_STATIC, Some(rt));
+        c.static_def = Some(d);
+        self.assign(ptr.clone(), Rvalue::Use(const_op(c)));
+        ptr.deref()
+    }
+
+    fn literal(&mut self, x: &Expr, kind: LitKind, value: &str) -> Operand {
+        let t = self.type_of(x);
+        match kind {
+            LitKind::Int => {
+                let (v, _) = parse_int(value);
+                if t.kind == types::K_FLOAT {
+                    let c = cnst(C_FLOAT, Some(t));
+                    c.float = v as f64;
+                    return const_op(c);
+                }
+                int_const(C_INT, v, t)
+            }
+            LitKind::Float => {
+                let mut s = value.replace("_", "");
+                if s.ends_with("f64") || s.ends_with("f32") { s = s[0..s.len() - 3].to_string(); }
+                let c = cnst(C_FLOAT, Some(t));
+                c.float = match s.parse::<f64>() { Ok(f) => f, Err(_) => 0.0 };
+                const_op(c)
+            }
+            LitKind::Bool => int_const(C_BOOL, if value == "true" { 1 } else { 0 }, t),
+            LitKind::Char => int_const(C_CHAR, char_lit(value), t),
+            LitKind::Byte => int_const(C_INT, char_lit(&value[1..]), t),
+            LitKind::Str => {
+                let c = cnst(C_STR, Some(t));
+                c.bytes = unquote(value);
+                const_op(c)
+            }
+            LitKind::ByteStr => {
+                let c = cnst(C_BYTES, Some(t));
+                c.bytes = unquote(&value[1..]);
+                const_op(c)
+            }
+        }
+    }
+
+    /// Lowers a place expression. is_mut requests a place that will be
+    /// mutated or mutably borrowed (selecting DerefMut/IndexMut).
+    pub fn place(&mut self, x: &Expr, is_mut: bool) -> Place {
+        match &x.kind {
+            ExprKind::Paren { x: inner, .. } => return self.place(*inner, is_mut),
+            ExprKind::Path(p) => {
+                if let Some(r) = self.info.res.paths.get(&p.id) {
+                    if r.kind == resolve::RES_LOCAL { return self.local_place_of(r.local.unwrap()); }
+                }
+                if let Some(clr) = self.body.callees.get(&x.id) {
+                    let cl = *clr;
+                    if cl.def.kind == resolve::DEF_STATIC || cl.def.kind == resolve::DEF_EXTERN_STATIC { return self.static_place(cl.def); }
+                }
+            }
+            ExprKind::Field { x: base, .. } => {
+                let (bp, _) = self.autoderef_base(*base, is_mut);
+                let idx = self.body.fields[&x.id];
+                return bp.field(idx as usize);
+            }
+            ExprKind::Index { x: base, lbrack, index } => return self.index_place(x, *base, *lbrack, *index, is_mut),
+            ExprKind::Unary { op, op_pos, x: inner } => {
+                if *op == token::STAR {
+                    if let Some(a) = self.body.adjust.get(&x.id) {
+                        if a.derefs == 1 {
+                            let ip = self.place(*inner, is_mut);
+                            let (p, _) = self.deref_place(ip, self.type_of(*inner), is_mut, *op_pos);
+                            return p;
+                        }
+                    }
+                    let t = self.type_of(*inner);
+                    if t.kind == types::K_REF || t.kind == types::K_PTR { return self.place_or_temp(*inner).deref(); }
+                }
+            }
+            _ => {}
+        }
+        let t = self.type_of(x);
+        let tmp = self.temp(t);
+        self.expr_into(x, tmp.clone());
+        tmp
+    }
+
+    /// The place of x if it is a place expression, else a temporary holding
+    /// its value.
+    pub fn place_or_temp(&mut self, x: &Expr) -> Place {
+        if is_place_expr(x) { return self.place(x, false); }
+        let tmp = self.temp(self.type_of(x));
+        self.expr_into(x, tmp.clone());
+        tmp
+    }
+
+    /// Lowers the base of a field or index expression, applying the
+    /// autoderef steps recorded by the type checker.
+    pub fn autoderef_base(&mut self, x: &Expr, is_mut: bool) -> (Place, &Type) {
+        let mut p = self.place_or_temp_mut(x, is_mut);
+        let mut t = self.type_of(x);
+        if let Some(a) = self.body.adjust.get(&x.id) {
+            if a.autoref == 0 {
+                let mut i = 0;
+                while i < a.derefs {
+                    let (np, nt) = self.deref_place(p, t, is_mut, x.pos());
+                    p = np;
+                    t = nt;
+                    i += 1;
+                }
+            }
+        }
+        (p, t)
+    }
+
+    pub fn place_or_temp_mut(&mut self, x: &Expr, is_mut: bool) -> Place {
+        if is_place_expr(x) { return self.place(x, is_mut); }
+        let tmp = self.temp(self.type_of(x));
+        self.expr_into(x, tmp.clone());
+        tmp
+    }
+
+    fn index_place(&mut self, x: &Expr, base_x: &Expr, lbrack: Pos, index_x: &Expr, is_mut: bool) -> Place {
+        let (base, bt) = self.autoderef_base(base_x, is_mut);
+        let it = self.type_of(index_x);
+        let usize_ = self.ctx().usize_();
+        if (bt.kind == types::K_ARRAY || bt.kind == types::K_SLICE) && it.kind == types::K_INT {
+            let idx = self.temp(usize_);
+            let iv = self.operand(index_x);
+            self.assign(idx.clone(), Rvalue::Use(iv));
+            let n = self.temp(usize_);
+            self.assign(n.clone(), Rvalue::Len(base.clone()));
+            let b = self.ctx().bool_;
+            let ok = self.temp(b);
+            self.assign(ok.clone(), Rvalue::Bin { op: LT, x: copy(idx.clone()), y: copy(n.clone()), ty: usize_, pos: 0 });
+            let next = self.new_block();
+            self.terminate(Term::Assert { cond: copy(ok), msg: "index out of bounds".to_string(), target: next, pos: lbrack, bounds: true,
+                len: copy(n), index: copy(idx.clone()) });
+            self.cur = next as i64;
+            return base.index(idx.local);
+        }
+        // Overloaded (or builtin range) indexing: *Index::index(&base, idx).
+        let (trait_name, method) = if is_mut { ("IndexMut", "index_mut") } else { ("Index", "index") };
+        let m = self.info.trait_item(trait_name, method).unwrap();
+        let rt = self.ctx().reference(is_mut, bt);
+        let r = self.temp(rt);
+        self.assign(r.clone(), Rvalue::Ref { is_mut, place: base });
+        let ot = self.ctx().reference(is_mut, self.type_of(x));
+        let out = self.temp(ot);
+        let mut targs = Vec::new();
+        targs.push(it);
+        let iv = self.operand(index_x);
+        let mut args = Vec::new();
+        args.push(copy(r));
+        args.push(iv);
+        self.call(self.trait_fn(m, bt, targs), args, out.clone(), lbrack);
+        out.deref()
+    }
+
+    /// Builds a struct/variant value from positional operands.
+    pub fn aggregate_ctor(&mut self, d: &Def, t: &Type, ops: Vec<Operand>, dest: Place) {
+        if d.kind == resolve::DEF_VARIANT {
+            let vi = variant_index(self.info, d);
+            self.assign(dest, aggregate(AGG_ADT, t, vi, ops));
+            return;
+        }
+        self.assign(dest, aggregate(AGG_ADT, t, 0, ops));
+    }
+
+    /// Lowers x (with its recorded coercion) and stores the value in dest.
+    pub fn expr_into(&mut self, x: &Expr, dest: Place) {
+        if self.cur < 0 { return; }
+        if let Some(a) = self.body.adjust.get(&x.id) {
+            if a.autoref > 0 || a.unsize || a.to_dyn.is_some() {
+                let tmp = self.temp(self.type_of(x));
+                self.expr_into_raw(x, tmp.clone());
+                let v = self.coerce(x, copy(tmp));
+                self.assign(dest, Rvalue::Use(v));
+                return;
+            }
+        }
+        self.expr_into_raw(x, dest);
+    }
+
+    /// Lowers x without its coercion.
+    pub fn expr_into_raw(&mut self, x: &Expr, dest: Place) {
+        if self.cur < 0 { return; }
+        let unit = unit_const(self.info.ctx);
+        match &x.kind {
+            ExprKind::Lit { .. } | ExprKind::Path(_) => {
+                let v = self.raw_operand(x);
+                self.assign(dest, Rvalue::Use(v));
+            }
+            ExprKind::Paren { x: inner, .. } => self.expr_into(*inner, dest),
+            ExprKind::Template { parts, pos } => self.template(x, parts, *pos, dest),
+            ExprKind::Unary { op, op_pos, x: inner } => self.unary(x, *op, *op_pos, *inner, dest),
+            ExprKind::Ref { is_mut, x: inner, .. } => {
+                let p = self.place(*inner, *is_mut);
+                self.assign(dest, Rvalue::Ref { is_mut: *is_mut, place: p });
+            }
+            ExprKind::Binary { op, op_pos, x: l, y } => self.binary(*op, *op_pos, *l, *y, dest),
+            ExprKind::Assign { op, op_pos, x: l, y } => {
+                self.assign_expr(*op, *op_pos, *l, *y);
+                self.assign(dest, Rvalue::Use(unit));
+            }
+            ExprKind::Cast { x: inner, .. } => self.cast(x, *inner, dest),
+            ExprKind::Range { lo, hi, .. } => {
+                let mut ops = Vec::new();
+                if let Some(l) = lo { ops.push(self.operand(l)); }
+                if let Some(h) = hi { ops.push(self.operand(h)); }
+                self.assign(dest, aggregate(AGG_ADT, self.type_of(x), 0, ops));
+            }
+            ExprKind::Call { fun, lparen, args } => self.call_expr(x, *fun, *lparen, args, dest),
+            ExprKind::MethodCall { recv, name, args, .. } => self.method_call(x, *recv, *name, args, dest),
+            ExprKind::Field { .. } | ExprKind::Index { .. } => {
+                let p = self.place(x, false);
+                self.assign(dest, Rvalue::Use(copy(p)));
+            }
+            ExprKind::Try { x: inner, question } => self.try_expr(*inner, *question, dest),
+            ExprKind::StructLit { path, fields, base } => self.struct_lit(x, *path, fields, *base, dest),
+            ExprKind::Tuple { elems, .. } => {
+                let mut ops = Vec::new();
+                for e in elems.iter() { ops.push(self.operand(*e)); }
+                self.assign(dest, aggregate(AGG_TUPLE, self.type_of(x), 0, ops));
+            }
+            ExprKind::Array { elems, .. } => {
+                let mut ops = Vec::new();
+                for e in elems.iter() { ops.push(self.operand(*e)); }
+                self.assign(dest, aggregate(AGG_ARRAY, self.type_of(x), 0, ops));
+            }
+            ExprKind::ArrayRepeat { value, .. } => {
+                let t = self.type_of(x);
+                let v = self.temp(t.el());
+                self.expr_into(*value, v.clone());
+                let mut ops = Vec::new();
+                let mut i = 0;
+                while i < t.len { ops.push(copy(v.clone())); i += 1; }
+                self.assign(dest, aggregate(AGG_ARRAY, t, 0, ops));
+            }
+            ExprKind::Block(_) => self.block(x, dest),
+            ExprKind::If { cond, then, els, .. } => self.if_expr(*cond, *then, *els, dest),
+            ExprKind::Match { x: scrut, arms, .. } => self.match_expr(*scrut, arms, dest),
+            ExprKind::Loop { body, .. } => self.loop_expr(x, *body, dest),
+            ExprKind::While { cond, body, .. } => {
+                self.while_expr(x, *cond, *body);
+                self.assign(dest, Rvalue::Use(unit));
+            }
+            ExprKind::For { pos, pat, iter, body, .. } => {
+                self.for_expr(x, *pos, *pat, *iter, *body);
+                self.assign(dest, Rvalue::Use(unit));
+            }
+            ExprKind::Break { label, value, .. } => self.break_expr(x, *label, *value),
+            ExprKind::Continue { label, .. } => {
+                if let Some(i) = self.loop_for(x, *label) {
+                    let c = self.loops[i].cont;
+                    self.terminate(Term::Goto(c));
+                }
+            }
+            ExprKind::Return { value, .. } => {
+                match value {
+                    Some(v) => self.expr_into(*v, local_place(0)),
+                    None => self.assign(local_place(0), Rvalue::Use(unit)),
+                }
+                self.terminate(Term::Return);
+            }
+            ExprKind::Closure { .. } => self.closure(x, dest),
+            ExprKind::Select { pos, arms } => self.select_expr(*pos, arms, dest),
+            _ => {
+                let z = zero_const(self.type_of(x));
+                self.assign(dest, Rvalue::Use(z));
+            }
+        }
+    }
+
+    // --- Operators -------------------------------------------------------------------
+
+    fn unary(&mut self, x: &Expr, op: token::Kind, op_pos: Pos, inner: &Expr, dest: Place) {
+        let t = self.type_of(inner);
+        if op == token::STAR {
+            let p = self.place(x, false);
+            self.assign(dest, Rvalue::Use(copy(p)));
+            return;
+        }
+        if op == token::MINUS || op == token::NOT {
+            let (uop, trait_name, method) = if op == token::NOT { (NOT, "Not", "not") } else { (NEG, "Neg", "neg") };
+            let v = self.operand(inner);
+            if is_prim(t) {
+                self.assign(dest, Rvalue::Un { op: uop, x: v, ty: t, pos: op_pos });
+                return;
+            }
+            let m = self.info.trait_item(trait_name, method).unwrap();
+            let mut args = Vec::new();
+            args.push(v);
+            self.call(self.trait_fn(m, t, Vec::new()), args, dest, op_pos);
+        }
+    }
+
+    fn binary(&mut self, op: token::Kind, op_pos: Pos, xl: &Expr, xr: &Expr, dest: Place) {
+        let b = self.ctx().bool_;
+        if op == token::AND_AND || op == token::OR_OR {
+            // Short-circuit: dest = x; if (x is false for &&) skip y.
+            self.expr_into(xl, dest.clone());
+            let rhs = self.new_block();
+            let join = self.new_block();
+            let mut vals = Vec::new();
+            vals.push(0i64);
+            let mut targets = Vec::new();
+            if op == token::AND_AND {
+                targets.push(join);
+                self.terminate(Term::Switch { x: copy(dest.clone()), ty: b, vals, targets, els: rhs });
+            } else {
+                targets.push(rhs);
+                self.terminate(Term::Switch { x: copy(dest.clone()), ty: b, vals, targets, els: join });
+            }
+            self.cur = rhs as i64;
+            self.expr_into(xr, dest);
+            self.goto_block(join);
+            return;
+        }
+        let lt = self.type_of(xl);
+        let rt = self.type_of(xr);
+        let l = self.operand(xl);
+        let r = self.operand(xr);
+        if op == token::EQ_EQ || op == token::NE || op == token::LT || op == token::LE || op == token::GT || op == token::GE {
+            if is_prim(lt) || lt.kind == types::K_PTR {
+                self.assign(dest, Rvalue::Bin { op: bin_op_of(op), x: l, y: r, ty: lt, pos: 0 });
+                return;
+            }
+            let (trait_name, method) = if op == token::NE { ("PartialEq", "ne") } else if op == token::LT { ("PartialOrd", "lt") }
+                else if op == token::LE { ("PartialOrd", "le") } else if op == token::GT { ("PartialOrd", "gt") }
+                else if op == token::GE { ("PartialOrd", "ge") } else { ("PartialEq", "eq") };
+            let lref = self.ref_to(l, lt);
+            let rref = self.ref_to(r, rt);
+            let m = self.info.trait_item(trait_name, method).unwrap();
+            let mut targs = Vec::new();
+            targs.push(rt);
+            let mut args = Vec::new();
+            args.push(lref);
+            args.push(rref);
+            self.call(self.trait_fn(m, lt, targs), args, dest, op_pos);
+            return;
+        }
+        if is_prim(lt) && is_prim(rt) {
+            self.prim_bin(bin_op_of(op), l, r, lt, dest, op_pos);
+            return;
+        }
+        let (tn, mn) = op_trait(op);
+        let m = self.info.trait_item(tn, mn).unwrap();
+        let mut targs = Vec::new();
+        targs.push(rt);
+        let mut args = Vec::new();
+        args.push(l);
+        args.push(r);
+        self.call(self.trait_fn(m, lt, targs), args, dest, op_pos);
+    }
+
+    /// A primitive arithmetic operation with the checks Rust performs:
+    /// division by zero always, overflow in debug builds.
+    fn prim_bin(&mut self, op: BinOp, l: Operand, r: Operand, t: &Type, dest: Place, pos: Pos) {
+        if (op == DIV || op == REM) && t.kind == types::K_INT {
+            let b = self.ctx().bool_;
+            let nz = self.temp(b);
+            self.assign(nz.clone(), Rvalue::Bin { op: NE, x: r.clone(), y: int_const(C_INT, 0, t), ty: t, pos: 0 });
+            let next = self.new_block();
+            self.terminate(Term::Assert { cond: copy(nz), msg: "attempt to divide by zero".to_string(), target: next, pos, bounds: false,
+                len: copy(local_place(0)), index: copy(local_place(0)) });
+            self.cur = next as i64;
+        }
+        self.assign(dest, Rvalue::Bin { op, x: l, y: r, ty: t, pos });
+    }
+
+    /// Stores an operand in a temporary and returns a reference to it.
+    pub fn ref_to(&mut self, op: Operand, t: &Type) -> Operand {
+        let p = if op.kind == OP_COPY {
+            op.place.clone()
+        } else {
+            let tmp = self.temp(t);
+            self.assign(tmp.clone(), Rvalue::Use(op));
+            tmp
+        };
+        let rt = self.ctx().reference(false, t);
+        let r = self.temp(rt);
+        self.assign(r.clone(), Rvalue::Ref { is_mut: false, place: p });
+        copy(r)
+    }
+
+    fn assign_expr(&mut self, op: token::Kind, op_pos: Pos, xl: &Expr, xr: &Expr) {
+        if op == token::EQ {
+            let v = self.operand(xr);
+            let p = self.place(xl, true);
+            self.assign(p, Rvalue::Use(v));
+            return;
+        }
+        let base = assign_base(op);
+        let lt = self.type_of(xl);
+        let rt = self.type_of(xr);
+        let r = self.operand(xr);
+        let p = self.place(xl, true);
+        if is_prim(lt) && is_prim(rt) {
+            self.prim_bin(bin_op_of(base), copy(p.clone()), r, lt, p, op_pos);
+            return;
+        }
+        let (tn, mn) = op_trait(base);
+        let m = self.info.trait_item(`${tn}Assign`.as_str(), `${mn}_assign`.as_str()).unwrap();
+        let mrt = self.ctx().reference(true, lt);
+        let rf = self.temp(mrt);
+        self.assign(rf.clone(), Rvalue::Ref { is_mut: true, place: p });
+        let mut targs = Vec::new();
+        targs.push(rt);
+        let mut args = Vec::new();
+        args.push(copy(rf));
+        args.push(r);
+        let unit = self.ctx().unit;
+        let d = self.temp(unit);
+        self.call(self.trait_fn(m, lt, targs), args, d, op_pos);
+    }
+
+    fn cast(&mut self, x: &Expr, inner: &Expr, dest: Place) {
+        let from = self.type_of(inner);
+        let to = self.type_of(x);
+        let v = self.operand(inner);
+        let kind = if (from.kind == types::K_REF || from.kind == types::K_PTR) && to.kind == types::K_PTR { CAST_PTR }
+            else if from.kind == types::K_PTR && to.kind == types::K_INT { CAST_PTR_INT }
+            else if from.kind == types::K_INT && to.kind == types::K_PTR { CAST_INT_PTR }
+            else if from.kind == types::K_ADT { CAST_ENUM }
+            else if from.kind == types::K_FN { CAST_FN_PTR }
+            else { CAST_NUMERIC };
+        self.assign(dest, Rvalue::Cast { kind, x: v, from, to });
+    }
+
+    // --- Calls -------------------------------------------------------------------------
+
+    fn call_expr(&mut self, x: &Expr, fun: &Expr, lparen: Pos, call_args: &Vec<&Expr>, dest: Place) {
+        // Constructors build the value directly.
+        if let ExprKind::Path(_) = &fun.kind {
+            if let Some(clr) = self.body.callees.get(&fun.id) {
+                    let cl = *clr;
+                if cl.def.kind == resolve::DEF_STRUCT || cl.def.kind == resolve::DEF_VARIANT {
+                    let mut ops = Vec::new();
+                    for a in call_args.iter() { ops.push(self.operand(*a)); }
+                    self.aggregate_ctor(cl.def, self.type_of(x), ops, dest);
+                    return;
+                }
+            }
+        }
+        let f = self.operand(fun);
+        let mut args = Vec::new();
+        for a in call_args.iter() { args.push(self.operand(*a)); }
+        if self.type_of(x).kind == types::K_NEVER {
+            self.call_diverging(f, args, lparen);
+            return;
+        }
+        self.call(f, args, dest, lparen);
+    }
+
+    fn method_call(&mut self, x: &Expr, recv_x: &Expr, name: &Name, call_args: &Vec<&Expr>, dest: Place) {
+        let cl = match self.body.callees.get(&x.id) {
+            Some(c) => *c,
+            None => {
+                let z = zero_const(self.type_of(x));
+                self.assign(dest, Rvalue::Use(z));
+                return;
+            }
+        };
+        let adj = cl.recv;
+        let is_mut = match adj { Some(a) => a.autoref == 2, None => false };
+        let rt = self.type_of(recv_x);
+        let plain = match adj { None => true, Some(a) => a.derefs == 0 && a.autoref == 0 && !a.unsize };
+        let recv = if plain {
+            self.operand(recv_x)
+        } else {
+            let a = adj.unwrap();
+            let mut p = self.place_or_temp_mut(recv_x, is_mut);
+            let mut t = rt;
+            let mut i = 0;
+            while i < a.derefs {
+                let (np, nt) = self.deref_place(p, t, is_mut, name.pos);
+                p = np;
+                t = nt;
+                i += 1;
+            }
+            if a.unsize {
+                // The receiver is an array reached by autoderef: borrow it as a slice.
+                let art = self.ctx().reference(is_mut, t);
+                let arr_ref = self.temp(art);
+                self.assign(arr_ref.clone(), Rvalue::Ref { is_mut, place: p });
+                let s = self.ctx().slice(t.el());
+                let st = if a.autoref == 0 { self.ctx().reference(false, s) } else { self.ctx().reference(is_mut, s) };
+                let sl = self.temp(st);
+                self.assign(sl.clone(), Rvalue::Unsize { x: copy(arr_ref), len: t.len, to: st });
+                copy(sl)
+            } else if a.autoref > 0 {
+                let r_t = self.ctx().reference(is_mut, t);
+                let r = self.temp(r_t);
+                self.assign(r.clone(), Rvalue::Ref { is_mut, place: p });
+                copy(r)
+            } else {
+                copy(p)
+            }
+        };
+        let mut args = Vec::new();
+        args.push(recv);
+        for a in call_args.iter() { args.push(self.operand(*a)); }
+        let f = fn_op(fn_ref(cl.def, cl.args.clone(), cl.self_ty), None);
+        if self.type_of(x).kind == types::K_NEVER {
+            self.call_diverging(f, args, name.pos);
+            return;
+        }
+        self.call(f, args, dest, name.pos);
+    }
+
+    // --- Aggregates --------------------------------------------------------------------
+
+    fn struct_lit(&mut self, x: &Expr, path: &ast::Path, fis: &Vec<&FieldInit>, base_x: Option<&Expr>, dest: Place) {
+        let t = self.type_of(x);
+        if t.kind != types::K_ADT { return; }
+        let ai = self.info.adts[&t.d().id];
+        let mut variant: i64 = -1;
+        let mut fields = ai.fields;
+        if ai.is_enum {
+            let mut name = String::new();
+            if let Some(res) = self.info.res.paths.get(&path.id) {
+                if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_VARIANT {
+                    name = res.def.unwrap().name.clone();
+                } else if res.rest.len() == 1 {
+                    name = res.rest[0].name.value.clone();
+                }
+            }
+            let mut i = 0;
+            while i < ai.variants.len() {
+                if ai.variants[i].def.name == name {
+                    variant = i as i64;
+                    fields = ai.variants[i].fields;
+                }
+                i += 1;
+            }
+        }
+        let mut given: HashMap<String, Operand> = HashMap::new();
+        for f in fis.iter() {
+            let v = self.operand(f.value);
+            given.insert(f.name.value.clone(), v);
+        }
+        let base = match base_x { Some(b) => self.place_or_temp(b), None => local_place(0) };
+        let mut ops = Vec::new();
+        let mut i = 0;
+        while i < fields.len() {
+            match given.get(&fields[i].name) {
+                Some(op) => ops.push(op.clone()),
+                None => ops.push(copy(base.field(i))),
+            }
+            i += 1;
+        }
+        if variant >= 0 {
+            self.assign(dest, aggregate(AGG_ADT, t, variant as usize, ops));
+            return;
+        }
+        self.assign(dest, aggregate(AGG_ADT, t, 0, ops));
+    }
+
+    // --- Control flow ------------------------------------------------------------------
+
+    fn block(&mut self, x: &Expr, dest: Place) {
+        let b = x.block();
+        for st in b.stmts.iter() {
+            if self.cur < 0 { return; }
+            match *st {
+                AStmt::Let(l) => self.let_stmt(*l),
+                AStmt::Expr { x: e, .. } => {
+                    let tmp = self.temp(self.type_of(*e));
+                    self.expr_into(*e, tmp);
+                }
+                AStmt::Defer { x: e, .. } => self.defer_stmt(*e),
+                _ => {}
+            }
+        }
+        if self.cur < 0 { return; }
+        if let Some(tail) = b.tail {
+            self.expr_into(tail, dest);
+            return;
+        }
+        let unit = unit_const(self.info.ctx);
+        self.assign(dest, Rvalue::Use(unit));
+    }
+
+    fn defer_stmt(&mut self, x: &Expr) {
+        self.fn_.has_defer = true;
+        match &x.kind {
+            ExprKind::Call { fun, args: call_args, .. } => {
+                let f = self.operand(*fun);
+                let mut args = Vec::new();
+                for a in call_args.iter() { args.push(self.operand(*a)); }
+                self.emit(Stmt::PushDefer { fn_op: f, args });
+            }
+            ExprKind::MethodCall { .. } => {
+                // Evaluate the receiver and arguments now; call later.
+                let cl = match self.body.callees.get(&x.id) { Some(c) => *c, None => return };
+                let args = self.method_args(x);
+                self.emit(Stmt::PushDefer { fn_op: fn_op(fn_ref(cl.def, cl.args.clone(), cl.self_ty), None), args });
+            }
+            ExprKind::Block(_) => {
+                // defer { ... }: run the block as a closure with no parameters.
+                let clo = self.defer_closures[&x.id];
+                let ft = self.type_of(clo);
+                let v = self.temp(ft);
+                self.closure(clo, v.clone());
+                self.emit(Stmt::PushDefer { fn_op: copy(v), args: Vec::new() });
+            }
+            _ => {}
+        }
+    }
+
+    /// Evaluates the receiver (with adjustments) and arguments of a method
+    /// call.
+    pub fn method_args(&mut self, x: &Expr) -> Vec<Operand> {
+        let (recv_x, name, call_args) = match &x.kind {
+            ExprKind::MethodCall { recv, name, args, .. } => (*recv, *name, args.clone()),
+            _ => panic("not a method call"),
+        };
+        let cl = self.body.callees[&x.id];
+        let adj = cl.recv;
+        let is_mut = match adj { Some(a) => a.autoref == 2, None => false };
+        let plain = match adj { None => true, Some(a) => a.derefs == 0 && a.autoref == 0 };
+        let recv = if plain {
+            self.operand(recv_x)
+        } else {
+            let a = adj.unwrap();
+            let mut p = self.place_or_temp_mut(recv_x, is_mut);
+            let mut t = self.type_of(recv_x);
+            let mut i = 0;
+            while i < a.derefs {
+                let (np, nt) = self.deref_place(p, t, is_mut, name.pos);
+                p = np;
+                t = nt;
+                i += 1;
+            }
+            if a.autoref > 0 {
+                let rt = self.ctx().reference(is_mut, t);
+                let r = self.temp(rt);
+                self.assign(r.clone(), Rvalue::Ref { is_mut, place: p });
+                copy(r)
+            } else {
+                copy(p)
+            }
+        };
+        let mut args = Vec::new();
+        args.push(recv);
+        for a in call_args.iter() { args.push(self.operand(*a)); }
+        args
+    }
+
+    fn bool_switch(&mut self, c: Operand, zero: usize, els: usize) {
+        let b = self.ctx().bool_;
+        let mut vals = Vec::new();
+        vals.push(0i64);
+        let mut targets = Vec::new();
+        targets.push(zero);
+        self.terminate(Term::Switch { x: c, ty: b, vals, targets, els });
+    }
+
+    fn if_expr(&mut self, cond: &Expr, then: &Expr, els: Option<&Expr>, dest: Place) {
+        let else_blk = self.new_block();
+        let join = self.new_block();
+        if let ExprKind::Let { pat, x: scrut, .. } = &cond.kind {
+            let sp = self.place_or_temp(*scrut);
+            self.test_pat(*pat, sp, else_blk);
+        } else {
+            let c = self.operand(cond);
+            let then_blk = self.new_block();
+            self.bool_switch(c, else_blk, then_blk);
+            self.cur = then_blk as i64;
+        }
+        self.expr_into(then, dest.clone());
+        if self.cur >= 0 { self.terminate(Term::Goto(join)); }
+        self.cur = else_blk as i64;
+        match els {
+            Some(e) => self.expr_into(e, dest),
+            None => {
+                let unit = unit_const(self.info.ctx);
+                self.assign(dest, Rvalue::Use(unit));
+            }
+        }
+        if self.cur >= 0 { self.terminate(Term::Goto(join)); }
+        self.cur = join as i64;
+    }
+
+    fn loop_for(&self, x: &Expr, label: Option<&Name>) -> Option<usize> {
+        if label.is_some() {
+            let node = match self.info.res.labels.get(&x.id) { Some(n) => n.id(), None => 0 };
+            let mut i = self.loops.len() as i64 - 1;
+            while i >= 0 {
+                if self.loops[i as usize].node == node { return Some(i as usize); }
+                i -= 1;
+            }
+            return None;
+        }
+        if self.loops.len() == 0 { return None; }
+        Some(self.loops.len() - 1)
+    }
+
+    fn loop_expr(&mut self, x: &Expr, body: &Expr, dest: Place) {
+        let head = self.new_block();
+        let exit = self.new_block();
+        self.goto_block(head);
+        self.loops.push(&mut LoopScope { node: x.id, brk: exit, cont: head, dest, has_value: true });
+        let unit = self.ctx().unit;
+        let tmp = self.temp(unit);
+        self.expr_into(body, tmp);
+        self.loops.pop();
+        if self.cur >= 0 { self.terminate(Term::Goto(head)); }
+        self.cur = exit as i64;
+    }
+
+    fn while_expr(&mut self, x: &Expr, cond: &Expr, body: &Expr) {
+        let head = self.new_block();
+        let body_blk = self.new_block();
+        let exit = self.new_block();
+        self.goto_block(head);
+        if let ExprKind::Let { pat, x: scrut, .. } = &cond.kind {
+            let sp = self.place_or_temp(*scrut);
+            self.test_pat(*pat, sp, exit);
+            self.goto_block(body_blk);
+        } else {
+            let c = self.operand(cond);
+            self.bool_switch(c, exit, body_blk);
+            self.cur = body_blk as i64;
+        }
+        self.loops.push(&mut LoopScope { node: x.id, brk: exit, cont: head, dest: local_place(0), has_value: false });
+        let unit = self.ctx().unit;
+        let tmp = self.temp(unit);
+        self.expr_into(body, tmp);
+        self.loops.pop();
+        if self.cur >= 0 { self.terminate(Term::Goto(head)); }
+        self.cur = exit as i64;
+    }
+
+    fn for_expr(&mut self, x: &Expr, for_pos: Pos, pat: &ast::Pat, iter_x: &Expr, body: &Expr) {
+        let mut iter_ty = self.type_of(iter_x);
+        if let Some(a) = self.body.adjust.get(&iter_x.id) {
+            if a.unsize && iter_ty.kind == types::K_REF {
+                let s = self.ctx().slice(iter_ty.el().el());
+                iter_ty = self.ctx().reference(iter_ty.is_mut, s);
+            }
+        }
+        let into_iter = self.info.trait_item("IntoIterator", "into_iter").unwrap();
+        let next = self.info.trait_item("Iterator", "next").unwrap();
+        let ii_def = self.info.lang_def("IntoIterator").unwrap();
+        let tr1 = &TraitRef { tdef: Some(ii_def), self_ty: Some(iter_ty), args: Vec::new(), bindings: Vec::new() };
+        let p1 = self.ctx().proj(self.assoc_type("IntoIterator", "IntoIter"), tr1);
+        let it_ty = self.info.normalize(Some(self.body.owner), p1);
+        let tr2 = &TraitRef { tdef: Some(ii_def), self_ty: Some(iter_ty), args: Vec::new(), bindings: Vec::new() };
+        let p2 = self.ctx().proj(self.assoc_type("IntoIterator", "Item"), tr2);
+        let item_ty = self.info.normalize(Some(self.body.owner), p2);
+        let mut oargs = Vec::new();
+        oargs.push(item_ty);
+        let opt_ty = self.ctx().adt(self.info.lang_def("Option").unwrap(), oargs);
+        let iter = self.temp(it_ty);
+        let mut args = Vec::new();
+        args.push(self.operand(iter_x));
+        self.call(self.trait_fn(into_iter, iter_ty, Vec::new()), args, iter.clone(), iter_x.pos());
+        let head = self.new_block();
+        let body_blk = self.new_block();
+        let exit = self.new_block();
+        self.goto_block(head);
+        let rt = self.ctx().reference(true, it_ty);
+        let r = self.temp(rt);
+        self.assign(r.clone(), Rvalue::Ref { is_mut: true, place: iter });
+        let opt = self.temp(opt_ty);
+        let mut nargs = Vec::new();
+        nargs.push(copy(r));
+        self.call(self.trait_fn(next, it_ty, Vec::new()), nargs, opt.clone(), for_pos);
+        let isize_ = self.ctx().int(types::ISIZE);
+        let d = self.temp(isize_);
+        self.assign(d.clone(), Rvalue::Discr(opt.clone()));
+        let some_idx = variant_index(self.info, self.some_def());
+        let mut vals = Vec::new();
+        vals.push(some_idx as i64);
+        let mut targets = Vec::new();
+        targets.push(body_blk);
+        self.terminate(Term::Switch { x: copy(d), ty: isize_, vals, targets, els: exit });
+        self.cur = body_blk as i64;
+        let item = opt.downcast(some_idx).field(0);
+        self.bind_pattern(pat, item);
+        self.loops.push(&mut LoopScope { node: x.id, brk: exit, cont: head, dest: local_place(0), has_value: false });
+        let unit = self.ctx().unit;
+        let tmp = self.temp(unit);
+        self.expr_into(body, tmp);
+        self.loops.pop();
+        if self.cur >= 0 { self.terminate(Term::Goto(head)); }
+        self.cur = exit as i64;
+    }
+
+    fn assoc_type(&self, trait_name: &str, name: &str) -> &mut Def {
+        let ti = self.info.traits[&self.info.lang_def(trait_name).unwrap().id];
+        ti.items[&name.to_string()]
+    }
+
+    pub fn some_def(&self) -> &mut Def {
+        let ai = self.info.adts[&self.info.lang_def("Option").unwrap().id];
+        for v in ai.variants.iter_mut() {
+            if v.def.name == "Some" { return v.def; }
+        }
+        panic("no Some")
+    }
+
+    fn break_expr(&mut self, x: &Expr, label: Option<&Name>, value: Option<&Expr>) {
+        let i = match self.loop_for(x, label) { Some(i) => i, None => return };
+        let ls = self.loops[i];
+        if value.is_some() && ls.has_value {
+            self.expr_into(value.unwrap(), ls.dest.clone());
+        } else if ls.has_value {
+            let unit = unit_const(self.info.ctx);
+            self.assign(ls.dest.clone(), Rvalue::Use(unit));
+        }
+        self.terminate(Term::Goto(ls.brk));
+    }
+
+    /// Lowers x?: Ok(v)/Some(v) continue with v; Err(e) returns
+    /// Err(From::from(e)); None returns None.
+    fn try_expr(&mut self, inner: &Expr, question: Pos, dest: Place) {
+        let t = self.type_of(inner);
+        let v = self.place_or_temp(inner);
+        let is_option = t.d().id == self.info.lang_def("Option").unwrap().id;
+        let ai = self.info.adts[&t.d().id];
+        let mut ok_idx = 0;
+        let mut err_idx = 1;
+        let mut i = 0;
+        while i < ai.variants.len() {
+            let n = ai.variants[i].def.name.as_str();
+            if n == "Ok" || n == "Some" { ok_idx = i; }
+            if n == "Err" || n == "None" { err_idx = i; }
+            i += 1;
+        }
+        let isize_ = self.ctx().int(types::ISIZE);
+        let d = self.temp(isize_);
+        self.assign(d.clone(), Rvalue::Discr(v.clone()));
+        let ok_blk = self.new_block();
+        let err_blk = self.new_block();
+        let mut vals = Vec::new();
+        vals.push(ok_idx as i64);
+        let mut targets = Vec::new();
+        targets.push(ok_blk);
+        self.terminate(Term::Switch { x: copy(d), ty: isize_, vals, targets, els: err_blk });
+        self.cur = err_blk as i64;
+        let ret_ty = self.fn_.locals[0].ty;
+        if is_option {
+            self.assign(local_place(0), aggregate(AGG_ADT, ret_ty, err_idx, Vec::new()));
+        } else {
+            let err_val = copy(v.downcast(err_idx).field(0));
+            let from_ty = t.args[1];
+            let to_ty = ret_ty.args[1];
+            let mut conv = err_val.clone();
+            if !types::same(from_ty, to_ty) {
+                let tmp = self.temp(to_ty);
+                let from = self.info.trait_item("From", "from").unwrap();
+                let mut targs = Vec::new();
+                targs.push(from_ty);
+                let mut args = Vec::new();
+                args.push(err_val);
+                self.call(self.trait_fn(from, to_ty, targs), args, tmp.clone(), question);
+                conv = copy(tmp);
+            }
+            let mut ret_err = 1;
+            let rai = self.info.adts[&ret_ty.d().id];
+            let mut j = 0;
+            while j < rai.variants.len() {
+                if rai.variants[j].def.name == "Err" { ret_err = j; }
+                j += 1;
+            }
+            let mut ops = Vec::new();
+            ops.push(conv);
+            self.assign(local_place(0), aggregate(AGG_ADT, ret_ty, ret_err, ops));
+        }
+        self.terminate(Term::Return);
+        self.cur = ok_blk as i64;
+        self.assign(dest, Rvalue::Use(copy(v.downcast(ok_idx).field(0))));
+    }
+}
+
+// --- Literal helpers -------------------------------------------------------------------
+
+pub fn parse_int(lit: &str) -> (i64, bool) {
+    let mut s = lit.replace("_", "");
+    let mut base = 10u32;
+    if s.starts_with("0x") {
+        base = 16;
+        s = s[2..].to_string();
+    } else if s.starts_with("0o") {
+        base = 8;
+        s = s[2..].to_string();
+    } else if s.starts_with("0b") {
+        base = 2;
+        s = s[2..].to_string();
+    }
+    let sufs = ["isize", "usize", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"];
+    for suf in sufs.iter() {
+        let hexy = suf.contains('a') || suf.contains('b') || suf.contains('c') || suf.contains('d') || suf.contains('e') || suf.contains('f');
+        if s.ends_with(*suf) && !(base == 16 && hexy) {
+            s = s[0..s.len() - suf.len()].to_string();
+            break;
+        }
+    }
+    match u64::from_str_radix(s.as_str(), base) {
+        Ok(u) => (u as i64, true),
+        Err(_) => (0, false),
+    }
+}
+
+/// Decodes a string literal (plain or raw) to its bytes.
+pub fn unquote(lit: &str) -> Vec<u8> {
+    if lit.starts_with("r") {
+        let s = lit[1..].trim_matches('#');
+        return s[1..s.len() - 1].as_bytes().to_vec();
+    }
+    decode_escapes(&lit[1..lit.len() - 1])
+}
+
+fn hex_val(c: u8) -> u32 {
+    if c >= b'0' && c <= b'9' { return (c - b'0') as u32; }
+    if c >= b'a' && c <= b'f' { return (c - b'a' + 10) as u32; }
+    if c >= b'A' && c <= b'F' { return (c - b'A' + 10) as u32; }
+    0
+}
+
+pub fn decode_escapes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c != b'\\' || i + 1 >= b.len() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let e = b[i];
+        if e == b'n' {
+            out.push(b'\n');
+        } else if e == b'r' {
+            out.push(b'\r');
+        } else if e == b't' {
+            out.push(b'\t');
+        } else if e == b'0' {
+            out.push(0);
+        } else if e == b'\\' || e == b'\'' || e == b'"' || e == b'`' || e == b'$' {
+            out.push(e);
+        } else if e == b'x' {
+            out.push((hex_val(b[i + 1]) * 16 + hex_val(b[i + 2])) as u8);
+            i += 2;
+        } else if e == b'u' {
+            let mut end = i;
+            while end < b.len() && b[end] != b'}' { end += 1; }
+            let mut v = 0u32;
+            let mut j = i + 2;
+            while j < end {
+                v = v * 16 + hex_val(b[j]);
+                j += 1;
+            }
+            let ch = match char::from_u32(v) { Some(c) => c, None => '\u{FFFD}' };
+            let mut tmp = String::new();
+            tmp.push(ch);
+            for x in tmp.bytes() { out.push(x); }
+            i = end;
+        }
+        i += 1;
+    }
+    out
+}
+
+pub fn char_lit(lit: &str) -> i64 {
+    let s = &lit[1..lit.len() - 1];
+    if !s.starts_with("\\") {
+        return match s.chars().next() { Some(c) => c as i64, None => 0 };
+    }
+    let d = decode_escapes(s);
+    let (c, _) = crate::util::decode_rune(d.as_slice(), 0);
+    c as i64
+}
