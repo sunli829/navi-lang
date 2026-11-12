@@ -69,7 +69,28 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
 ## M9（进行中）
 
 - 自研链接器（`compiler/src/link.navi`）：navic 直接产出 PIE 的 Mach-O arm64 可执行文件，导入函数经 stub + GOT 由 dyld 非惰性绑定，数据里的绝对指针由 dyld rebase（LC_DYLD_INFO_ONLY 的 opcode 格式），带 ad-hoc 代码签名（CodeDirectory，SHA-256 逐页哈希，`compiler/src/sha256.navi`），不再依赖 cc/ld；`NAVI_LINKER=cc` 仍可用系统链接器。自举（stage2 == stage3）和 22 个 golden 测试通过。
-- 性能：师傅定的目标是与 go build 持平，性能优先，其余 M9 特性延后。已做：GC 热路径手工内联、分级查表（自编译 48s → 33s）、lowering 的基址+偏移寻址和 switch 直落（→ 29.5s）。试过但回退：GOGC=200（快 15%，峰值内存 1.1GB → 1.5GB）、小函数内联（前端几乎无收益）。
+- 性能：师傅定的目标是与 go build 持平，性能优先。基准是 `go run ./bench/gen -lines 10000 -out /tmp/bp10`（约 9k 行 navi + 7k 行 std，等价的 Go 程序；两边都输出 `total 173105`），在 M 系列 Mac 上测：
+
+  | | navic | go build |
+  |---|---|---|
+  | 冷编译（navic 每次都编 std） | 42s → **2.5s** | 0.45s（std 已在缓存里）；清空缓存后 2.1s（含 std，5.4s CPU 并行） |
+  | 无改动重编译 | **0.03–0.06s**（构建缓存） | 0.07s |
+  | hello world | 0.59s（几乎全是 std 前端） | — |
+  | navic 自编译 | 48s → **6.3s** | — |
+
+  做过的事（按收益排）：
+  - trait 选择先按 self 类型的最外层构造器过滤 impl（types 阶段 −60%，存活堆 326 → 104 MiB）；
+  - 逃逸分析（Steensgaard 指向分析 + 过程间摘要；trait 调用按 self 类型头部只合并可能的 impl；extern C 不保留指针；摘要用依赖工作表求不动点）：装箱减少，HashMap 查找等热路径不再分配；
+  - 寄存器提升（callee-saved x19–x28）、基址+偏移寻址、switch 直落；
+  - 结构化类型驻留、normalize/deref/方法解析缓存、布局与 shape 缓存；
+  - 只为从 main、运行时和语言函数可达的函数体建 MIR、做逃逸分析（其余按需构建，保守装箱）；
+  - String 模板直接降级（不再生成闭包和堆单元）；`Vec::extend_from_slice` 对按位可复制的类型直接拷贝（新 intrinsic `is_copy_clone`，stage0 一律回答 false）；`DefaultHasher` 按字处理；
+  - GC：分配快路径、除法换乘法、`std::gc::set_min_heap`（navic 从 256 MiB 才开始回收，同 Go 编译器的做法）；
+  - 链接：镜像只哈希一次（UUID 由各页哈希导出）、SHA-256 轮函数展开；
+  - 构建缓存（`compiler/src/cache.navi`，同 Go 的 action cache）：键 = 编译器 UUID + 选项 + 路径 + 相关环境变量，命中条件是本次读过的每个源文件 SHA-256 不变；`-a` 强制重编，`NAVI_CACHE=off` 关闭。
+
+  还差的：冷编译仍是 go build（std 已缓存）的约 5.6 倍。剩余时间分布平坦（parse+resolve 0.37s、types 0.57s、mir 0.6s、plan 0.35s、codegen 0.42s、link 0.21s），其中约 0.55s 是每次重编 std 的前端。再往下要靠：std 前端结果的缓存（需要序列化类型和 MIR）、MIR 内联小函数、函数粒度并行（需要 M:N 多线程运行时和线程安全的编译器数据结构）。
+  试过但回退：GOGC=200（被 set_min_heap 取代）、早期的小函数内联实验。
 
 ## 下一步
 
