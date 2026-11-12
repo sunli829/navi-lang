@@ -14,6 +14,8 @@ import (
 	"navi/internal/codegen"
 	"navi/internal/mir"
 	"navi/internal/obj"
+	"navi/internal/obj/coff"
+	"navi/internal/obj/elf"
 	"navi/internal/obj/macho"
 	"navi/internal/resolve"
 	"navi/internal/types"
@@ -74,7 +76,13 @@ func (t Target) Config(debug bool) resolve.Config {
 
 // NativeSupported reports whether the host can build and run native
 // binaries for itself.
-func NativeSupported() bool { return runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" }
+func NativeSupported() bool {
+	switch runtime.GOOS + "/" + runtime.GOARCH {
+	case "darwin/arm64", "darwin/amd64", "linux/amd64", "linux/arm64", "windows/amd64":
+		return true
+	}
+	return false
+}
 
 // FindMain returns the main function of the crate named name.
 func FindMain(info *types.Info, name string) *resolve.Def {
@@ -117,6 +125,10 @@ func writeObject(o *obj.Object, t Target) ([]byte, error) {
 	switch t.OS {
 	case "macos":
 		return macho.Write(o)
+	case "linux":
+		return elf.Write(o)
+	case "windows":
+		return coff.Write(o)
 	}
 	return nil, fmt.Errorf("object files for %s are not implemented", t)
 }
@@ -152,6 +164,9 @@ func link(objPath, out string, t Target) error {
 			arch = "x86_64"
 		}
 		cmd = exec.Command("cc", "-arch", arch, "-o", out, objPath)
+	case t == host && t.OS == "windows":
+		// clang drives the MSVC linker (or lld-link) with the C runtime.
+		cmd = exec.Command("clang", "-o", out, objPath)
 	case t == host:
 		cmd = exec.Command("cc", "-o", out, objPath, "-lm")
 	default:

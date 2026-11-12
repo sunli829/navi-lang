@@ -2,12 +2,14 @@ package build
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"testing"
 
 	"navi/internal/resolve"
@@ -60,10 +62,15 @@ func TestNativeRun(t *testing.T) {
 				t.Fatalf("compile errors:\n%v", errs)
 			}
 			exe := filepath.Join(t.TempDir(), "prog")
+			if target.OS == "windows" {
+				exe += ".exe"
+			}
 			if err := Native(info, FindMain(info, spec.Name), exe, target, true); err != nil {
 				t.Fatal(err)
 			}
-			cmd := exec.Command("perl", "-e", "alarm 10; exec @ARGV", exe)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, exe)
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			err = cmd.Run()
@@ -72,6 +79,9 @@ func TestNativeRun(t *testing.T) {
 				code = ee.ExitCode()
 				if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 					code = 128 + int(ws.Signal())
+				}
+				if ctx.Err() != nil {
+					t.Fatalf("timed out; stderr:\n%s", stderr.String())
 				}
 			} else if err != nil {
 				t.Fatal(err)

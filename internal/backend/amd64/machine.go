@@ -47,6 +47,19 @@ func (m *Machine) Bind(l lower.Label)    { m.a.Bind(Label(l)) }
 func (m *Machine) Prologue(frame int64) {
 	m.a.Push(RBP)
 	m.a.MovRR(RBP, RSP)
+	m.reserve(frame)
+}
+
+// reserve lowers rsp by frame bytes. Windows commits the stack one guard
+// page at a time, so large frames touch every page on the way down.
+func (m *Machine) reserve(frame int64) {
+	if m.Win64 {
+		for frame >= 4096 {
+			m.a.SubImm(RSP, 4096)
+			m.a.Load(8, R11, RSP, 0)
+			frame -= 4096
+		}
+	}
 	if frame > 0 {
 		m.a.SubImm(RSP, frame)
 	}
@@ -68,7 +81,7 @@ func (m *Machine) EntryPrologue(frame int64) {
 	for _, s := range saved {
 		m.a.Push(s)
 	}
-	m.a.SubImm(RSP, 8+frame) // 7 pushes + 8 keep rsp 16-byte aligned
+	m.reserve(8 + frame) // 7 pushes + 8 keep rsp 16-byte aligned
 }
 
 func (m *Machine) EntryReturn0() {
