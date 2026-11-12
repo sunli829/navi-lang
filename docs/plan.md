@@ -698,6 +698,7 @@ runtime 是 std 的私有模块 `std::rt`，一开始就用 navi（`unsafe` + `s
 - **调用 C 函数前切换到系统栈**：绿色线程的栈很小，而且会被复制，C 代码不知道这些。所以调用 libSystem / kernel32 和用户的 `extern "C"` 函数时，先切换到 M 的系统栈（g0）再调用（同 Go 的 `asmcgocall`）；C 回调 navi 时反过来切换。这件事要和 M3 的 ABI 一起设计
 - **内存分配器**：size-class + 每个 P 一份缓存（tcmalloc / Go mallocgc 的思路）
 - **GC**：精确、不移动对象的 mark-sweep，**支持内部指针**（用于 `&mut v[i]`、字段引用、切片）
+  - 原始指针（`*const T` / `*mut T`）字段也当作可能指向堆的指针来扫描：std 内部要靠它实现通过 `&self` 修改的共享结构（channel 等，相当于 Rust 的 `UnsafeCell`）
   - v1：stop-the-world 精确标记（类型指针位图 + 编译器生成的 stack map）
   - v2：并发三色标记 + 写屏障（编译器在指针写入处插入屏障）
 - **调度器**：G-M-P 模型

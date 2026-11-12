@@ -104,6 +104,7 @@ func (c *collector) lowerImplTrait(e *env, t *syntax.ImplType) *Type {
 		def := &resolve.Def{Kind: resolve.DefTypeParam, Name: "impl " + syntax.Dump(t)[6:len(syntax.Dump(t))-1], Crate: e.crate, File: e.file, Pos: t.Pos()}
 		p := &TypeParam{Def: def, Type: ctx.Param(def)}
 		*e.implArg = append(*e.implArg, p)
+		c.paramOwner[p] = e.gen
 		for _, b := range t.Bounds {
 			if tr := c.lowerTraitRef(e, b, p.Type); tr != nil {
 				e.gen.Preds = append(e.gen.Preds, &Pred{Trait: tr})

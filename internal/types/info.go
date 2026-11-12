@@ -144,4 +144,10 @@ type Info struct {
 	ImplsOf map[*resolve.Def][]*ImplInfo
 	// Lang holds well-known std items by name (Option, Iterator, Deref, ...).
 	Lang map[string]*resolve.Def
+
+	// Bodies holds the type-checked bodies of functions, consts and statics.
+	Bodies map[*resolve.Def]*BodyInfo
+	// Hidden maps each opaque return type to the concrete type its function
+	// returns.
+	Hidden map[*Type]*Type
 }

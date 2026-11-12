@@ -247,6 +247,9 @@ func (r *resolver) trySingleImport(imp *Import) bool {
 		}
 		any = true
 		if imp.Name == "_" {
+			if b.Res.Kind == ResDef && b.Res.Def.Kind == DefTrait {
+				imp.Module.underscoreTraits = append(imp.Module.underscoreTraits, b.Res.Def)
+			}
 			continue
 		}
 		if old := imp.Module.bindings[ns][imp.Name]; old != nil {

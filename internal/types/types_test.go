@@ -6,6 +6,7 @@ import (
 
 	"navi/internal/build"
 	"navi/internal/resolve"
+	"navi/internal/syntax"
 	"navi/internal/testutil"
 	"navi/internal/types"
 )
@@ -76,6 +77,74 @@ func TestSignatures(t *testing.T) {
 
 func TestErrors(t *testing.T) {
 	files, _ := filepath.Glob(filepath.Join("..", "..", "tests", "types", "err", "*.navi"))
+	if len(files) == 0 {
+		t.Fatal("no error tests")
+	}
+	for _, f := range files {
+		spec, err := build.LoadCrate(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, errs := build.CheckSpecs(testCfg, []*resolve.CrateSpec{build.StdCrate(), spec})
+		testutil.CheckErrors(t, f, errs)
+	}
+}
+
+func TestCheckOK(t *testing.T) {
+	files, _ := filepath.Glob(filepath.Join("..", "..", "tests", "check", "ok", "*.navi"))
+	if len(files) == 0 {
+		t.Fatal("no ok tests")
+	}
+	for _, f := range files {
+		info, crate, errs := check(t, f)
+		for _, e := range errs {
+			t.Errorf("unexpected error: %v", e)
+		}
+		want := testutil.Annotations(t, f, "type")
+		got := map[int]string{}
+		for def, body := range info.Bodies {
+			if def.Crate != crate {
+				continue
+			}
+			fn, ok := def.Node.(*syntax.FnDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			syntax.Inspect(fn.Body, func(n syntax.Node) bool {
+				ls, ok := n.(*syntax.LetStmt)
+				if !ok {
+					return true
+				}
+				line := def.File.Position(ls.Let).Line
+				if _, seen := got[line]; seen {
+					return true
+				}
+				var first *syntax.IdentPat
+				syntax.Inspect(ls.Pat, func(n syntax.Node) bool {
+					if ip, ok := n.(*syntax.IdentPat); ok && first == nil {
+						first = ip
+					}
+					return first == nil
+				})
+				if first == nil {
+					return true
+				}
+				if l := info.Res.Bindings[first]; l != nil && body.Locals[l] != nil {
+					got[line] = body.Locals[l].String()
+				}
+				return true
+			})
+		}
+		for line, w := range want {
+			if got[line] != w {
+				t.Errorf("%s:%d: type %q, got %q", f, line, w, got[line])
+			}
+		}
+	}
+}
+
+func TestCheckErrors(t *testing.T) {
+	files, _ := filepath.Glob(filepath.Join("..", "..", "tests", "check", "err", "*.navi"))
 	if len(files) == 0 {
 		t.Fatal("no error tests")
 	}

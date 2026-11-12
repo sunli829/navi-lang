@@ -60,7 +60,7 @@ func (r *resolver) collectItem(m *Module, file *syntax.File, it syntax.Item, fil
 		}
 	case *syntax.TraitDecl:
 		d := define(DefTrait, it.Name, TypeNS)
-		r.collectAssoc(d, file, it.Items)
+		r.collectAssoc(m, d, file, it.Items)
 	case *syntax.TypeAlias:
 		define(DefTypeAlias, it.Name, TypeNS)
 	case *syntax.ConstDecl:
@@ -73,7 +73,8 @@ func (r *resolver) collectItem(m *Module, file *syntax.File, it syntax.Item, fil
 		define(DefStatic, it.Name, ValueNS)
 	case *syntax.ImplDecl:
 		d := r.newDef(DefImpl, "", file, it, it.Pos(), m.Def, c)
-		r.collectAssoc(d, file, it.Items)
+		d.Vis = Public
+		r.collectAssoc(m, d, file, it.Items)
 	case *syntax.ExternBlock:
 		for _, ei := range it.Items {
 			if !r.cfgEnabled(file, itemBase(ei).Attrs) {
@@ -160,22 +161,37 @@ func itemBase(it syntax.Item) *syntax.ItemBase {
 
 // collectAssoc creates defs for the items of an impl or trait. They are not
 // bound in any module; the type checker looks them up through their parent.
-func (r *resolver) collectAssoc(parent *Def, file *syntax.File, items []syntax.Item) {
+func (r *resolver) collectAssoc(m *Module, parent *Def, file *syntax.File, items []syntax.Item) {
 	for _, it := range items {
-		if !r.cfgEnabled(file, itemBase(it).Attrs) {
+		base := itemBase(it)
+		if !r.cfgEnabled(file, base.Attrs) {
 			continue
 		}
+		// Trait items are as visible as the trait; impl items carry their own
+		// visibility (trait impl items are public).
+		vis := Public
+		if parent.Kind == DefImpl && !isTraitImpl(parent) {
+			vis = r.visibility(m, file, base)
+		}
+		var d *Def
 		switch it := it.(type) {
 		case *syntax.FnDecl:
-			r.newDef(DefAssocFn, it.Name.Value, file, it, it.Name.NamePos, parent, parent.Crate)
+			d = r.newDef(DefAssocFn, it.Name.Value, file, it, it.Name.NamePos, parent, parent.Crate)
 		case *syntax.ConstDecl:
-			r.newDef(DefAssocConst, it.Name.Value, file, it, it.Name.NamePos, parent, parent.Crate)
+			d = r.newDef(DefAssocConst, it.Name.Value, file, it, it.Name.NamePos, parent, parent.Crate)
 		case *syntax.TypeAlias:
-			r.newDef(DefAssocType, it.Name.Value, file, it, it.Name.NamePos, parent, parent.Crate)
+			d = r.newDef(DefAssocType, it.Name.Value, file, it, it.Name.NamePos, parent, parent.Crate)
 		default:
 			r.errorf(file, it.Pos(), "only functions, constants and types are allowed in %s blocks", parent.Kind)
+			continue
 		}
+		d.Vis = vis
 	}
+}
+
+func isTraitImpl(d *Def) bool {
+	n, ok := d.Node.(*syntax.ImplDecl)
+	return ok && n.Trait != nil
 }
 
 // visibility computes the visibility of an item declared in module m.

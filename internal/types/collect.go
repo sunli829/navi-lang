@@ -17,6 +17,11 @@ type collector struct {
 	implSelf map[*resolve.Def]*Type
 	busy     map[*resolve.Def]bool // aliases and consts being computed
 	consts   map[*resolve.Def]int64
+
+	langOf      map[*resolve.Def]string // reverse of Info.Lang
+	deriveCache map[*resolve.Def]map[string]bool
+	paramOwner  map[*TypeParam]*Generics
+	inherent    map[string][]*ImplInfo // inherent impls by implKey of the self type
 }
 
 func (c *collector) errorf(f *syntax.File, pos syntax.Pos, format string, args ...any) {
@@ -50,6 +55,10 @@ func Collect(res *resolve.Info, errs *diag.Sink) *Info {
 		implSelf: map[*resolve.Def]*Type{},
 		busy:     map[*resolve.Def]bool{},
 		consts:   map[*resolve.Def]int64{},
+
+		langOf:      map[*resolve.Def]string{},
+		deriveCache: map[*resolve.Def]map[string]bool{},
+		paramOwner:  map[*TypeParam]*Generics{},
 	}
 	for _, d := range res.Defs {
 		switch d.Kind {
@@ -65,12 +74,14 @@ func Collect(res *resolve.Info, errs *diag.Sink) *Info {
 		switch d.Kind {
 		case resolve.DefStruct, resolve.DefEnum:
 			c.checkAdt(d)
+			c.derives(d)
 		case resolve.DefImpl:
 			c.checkImpl(d)
 		case resolve.DefTrait:
 			c.checkTrait(d)
 		}
 	}
+	c.checkBodies()
 	return info
 }
 
@@ -124,7 +135,18 @@ func (c *collector) findLang() {
 		"Hash": {"hash", "Hash"}, "From": {"convert", "From"},
 		"Display": {"fmt", "Display"}, "Debug": {"fmt", "Debug"},
 		"Arguments": {"fmt", "Arguments"}, "Formatter": {"fmt", "Formatter"},
-		"Location": {"panic", "Location"},
+		"Location":  {"panic", "Location"},
+		"AddAssign": {"ops", "AddAssign"}, "SubAssign": {"ops", "SubAssign"},
+		"MulAssign": {"ops", "MulAssign"}, "DivAssign": {"ops", "DivAssign"},
+		"RemAssign": {"ops", "RemAssign"}, "BitAndAssign": {"ops", "BitAndAssign"},
+		"BitOrAssign": {"ops", "BitOrAssign"}, "BitXorAssign": {"ops", "BitXorAssign"},
+		"ShlAssign": {"ops", "ShlAssign"}, "ShrAssign": {"ops", "ShrAssign"},
+		"LowerHex": {"fmt", "LowerHex"}, "UpperHex": {"fmt", "UpperHex"},
+		"Octal": {"fmt", "Octal"}, "Binary": {"fmt", "Binary"},
+		"LowerExp": {"fmt", "LowerExp"}, "UpperExp": {"fmt", "UpperExp"},
+		"Ordering": {"cmp", "Ordering"}, "Step": {"iter", "Step"},
+		"RecvError": {"sync", "mpmc", "RecvError"}, "Sender": {"sync", "mpmc", "Sender"},
+		"Receiver": {"sync", "mpmc", "Receiver"},
 	}
 	for name, path := range paths {
 		m := std.Root
@@ -144,6 +166,7 @@ func (c *collector) findLang() {
 		}
 		if def != nil {
 			c.info.Lang[name] = def
+			c.langOf[def] = name
 		}
 	}
 }
@@ -230,7 +253,9 @@ func (c *collector) genericsOf(d *resolve.Def) *Generics {
 		if pd == nil {
 			continue
 		}
-		g.Params = append(g.Params, &TypeParam{Def: pd, Type: c.info.Ctx.Param(pd)})
+		tp := &TypeParam{Def: pd, Type: c.info.Ctx.Param(pd)}
+		c.paramOwner[tp] = g
+		g.Params = append(g.Params, tp)
 	}
 	e := &env{file: d.File, crate: d.Crate, gen: g, implNote: "generic bounds"}
 	switch {

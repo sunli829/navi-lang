@@ -117,6 +117,8 @@ type Module struct {
 
 	file  *syntax.File  // the file the module's items are declared in
 	items []syntax.Item // cfg-enabled items, in source order
+
+	underscoreTraits []*Def // traits imported with `as _`
 }
 
 func newModule(c *Crate, parent *Module, name string) *Module {
@@ -244,3 +246,57 @@ func (m *Module) Lookup(name string, ns Namespace) *Binding {
 	}
 	return nil
 }
+
+// TraitsInScope returns the traits whose methods can be called in m: traits
+// named in m (and enclosing block scopes), imported with `as _`, or in the
+// prelude.
+func (m *Module) TraitsInScope() []*Def {
+	seen := map[*Def]bool{}
+	var out []*Def
+	add := func(d *Def) {
+		if d != nil && d.Kind == DefTrait && !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	addModule := func(x *Module) {
+		for _, b := range x.bindings[TypeNS] {
+			add(b.Res.Def)
+		}
+		for _, bs := range x.globs[TypeNS] {
+			for _, b := range bs {
+				add(b.Res.Def)
+			}
+		}
+		for _, d := range x.underscoreTraits {
+			add(d)
+		}
+	}
+	for x := m; x != nil; x = x.Parent {
+		addModule(x)
+		if !x.Anonymous {
+			break
+		}
+	}
+	if p := m.Crate.prelude; p != nil {
+		addModule(p)
+	}
+	return out
+}
+
+// ModuleOf returns the module a definition is declared in.
+func ModuleOf(d *Def) *Module {
+	for x := d.Parent; x != nil; x = x.Parent {
+		if x.Module != nil && x.Kind == DefMod {
+			return x.Module
+		}
+	}
+	if d.Module != nil && d.Kind == DefMod {
+		return d.Module
+	}
+	return nil
+}
+
+// AccessibleFrom reports whether something with visibility v can be named
+// from module m.
+func (v Visibility) AccessibleFrom(m *Module) bool { return v.accessibleFrom(m) }
