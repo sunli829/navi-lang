@@ -35,7 +35,7 @@ type Plan struct {
 	// StaticInit holds the initializer instance of each static.
 	StaticInit map[*resolve.Def]*Inst
 	// Runtime holds the std::rt::native functions the backend calls
-	// directly (panic_raw, panic_bounds, alloc).
+	// directly (panic_raw, panic_bounds, gc_alloc).
 	Runtime map[string]*Inst
 
 	groups map[string]*Group
@@ -47,7 +47,8 @@ type Plan struct {
 var Inline = map[string]bool{
 	"size_of": true, "align_of": true, "ptr_offset": true, "slice_from_raw": true,
 	"slice_from_raw_mut": true, "str_from_raw": true, "slice_len": true, "slice_ptr": true,
-	"str_as_bytes": true, "caller_location": true, "abort": true,
+	"str_as_bytes": true, "caller_location": true, "abort": true, "has_pointers": true,
+	"frame_address": true, "stack_top": true, "data_start": true, "data_end": true, "run_defers": true,
 }
 
 // TargetKind is how a function reference is reached.
@@ -183,7 +184,7 @@ func Build(prog *mir.Program, main *resolve.Def) *Plan {
 		Runtime:    map[string]*Inst{},
 	}
 	p.findNative()
-	for _, name := range []string{"panic_raw", "panic_bounds", "alloc"} {
+	for _, name := range []string{"panic_raw", "panic_bounds", "gc_alloc"} {
 		if d := p.nativeFn(name); d != nil {
 			p.Runtime[name] = p.inst(d, nil, nil, prog.Func(d))
 		} else {

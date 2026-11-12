@@ -163,6 +163,7 @@ func (p *Program) Shim(trait string, method *resolve.Def, self *types.Type, targ
 	s.cur = s.block()
 	p.shims[key] = f
 	s.gen(trait, method.Name, self, targs, params)
+	boxAddressTaken(p.Info.Ctx, f)
 	return f
 }
 
@@ -907,6 +908,7 @@ func (p *Program) CtorThunk(def *resolve.Def, adt *types.Type) *Func {
 		Stmts: []Stmt{Assign{Place: LocalPlace(0), Rv: Aggregate{Kind: AggAdt, Type: adt, Variant: max(variant, 0), Ops: ops}}},
 		Term:  Return{},
 	}}
+	boxAddressTaken(p.Info.Ctx, f)
 	p.shims[key] = f
 	return f
 }

@@ -1,0 +1,328 @@
+//! The garbage collector of native programs: a non-moving mark-sweep
+//! collector over size-classed spans carved from one reserved arena.
+//!
+//! - Objects up to 8 KiB come from 64 KiB spans of one size class; larger
+//!   objects get a span of their own (reused after they die).
+//! - Spans holding types without pointers are marked noscan and never
+//!   scanned.
+//! - Roots are the stack (from the collector's frame up to main's frame)
+//!   and the writable data section (statics). Roots and heap objects are
+//!   scanned word by word: any word that points into an allocated object,
+//!   including its interior, keeps it alive. Generated code keeps no values
+//!   in registers across calls, so every live pointer is in memory.
+//! - A collection starts when the bytes allocated since the last one
+//!   reach the bytes that survived it (at least 4 MiB), like GOGC=100.
+//!
+//! Span metadata, mark bits and the mark stack live outside the arena
+//! (libc calloc), so the collector itself never allocates GC memory.
+
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn memset(p: *mut u8, c: i32, n: usize) -> *mut u8;
+    fn calloc(n: usize, size: usize) -> *mut u8;
+    fn realloc(p: *mut u8, size: usize) -> *mut u8;
+}
+
+#[cfg(target_os = "macos")]
+const MAP_FLAGS: i32 = 0x1002; // MAP_ANON | MAP_PRIVATE
+#[cfg(target_os = "linux")]
+const MAP_FLAGS: i32 = 0x4022; // MAP_NORESERVE | MAP_ANONYMOUS | MAP_PRIVATE
+#[cfg(target_os = "windows")]
+const MAP_FLAGS: i32 = 0;
+
+const PROT_RW: i32 = 3;
+const PAGE_SHIFT: usize = 13;
+const PAGE: usize = 8192;
+const SPAN_BYTES: usize = 65536;
+const ARENA_SIZE: usize = 34359738368; // 32 GiB of address space
+const MIN_GC: usize = 4194304;
+const NCLASS: usize = 32;
+const MAX_SMALL: usize = 8192;
+
+static CLASSES: [usize; 32] = [16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+    448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144,
+    7168, 8192];
+
+struct Span {
+    start: usize,
+    bytes: usize,
+    elem: usize,
+    nelems: usize,
+    noscan: bool,
+    // Free objects are linked through their first word.
+    freelist: usize,
+    nfree: usize,
+    // nelems allocation bytes followed by nelems mark bytes.
+    bits: *mut u8,
+    next_all: *mut Span,
+    next_free: *mut Span,
+    in_free: bool,
+    list: usize, // index into FREE (small spans), or NCLASS * 2 for large spans
+}
+
+static mut ARENA: usize = 0;
+static mut ARENA_NEXT: usize = 0;
+static mut ARENA_END: usize = 0;
+static mut PAGES: usize = 0; // *mut *mut Span, one entry per page of the arena
+static mut ALL: usize = 0; // *mut Span: every span
+static mut FREE: [usize; 65] = [0; 65]; // spans with free objects per class and noscan; [64]: dead large spans
+static mut ALLOCATED: usize = 0;
+static mut NEXT_GC: usize = 4194304;
+static mut LIVE: usize = 0;
+static mut COLLECTIONS: usize = 0;
+static mut MARK: usize = 0; // *mut usize
+static mut MARK_LEN: usize = 0;
+static mut MARK_CAP: usize = 0;
+
+fn ld(p: usize) -> usize { unsafe { *(p as *const usize) } }
+fn st(p: usize, v: usize) { unsafe { *(p as *mut usize) = v; } }
+fn ldb(p: usize) -> u8 { unsafe { *(p as *const u8) } }
+fn stb(p: usize, v: u8) { unsafe { *(p as *mut u8) = v; } }
+
+fn out_of_memory() -> ! {
+    crate::rt::native::fatal("out of memory")
+}
+
+fn init() {
+    let base = unsafe { mmap(0 as *mut u8, ARENA_SIZE, PROT_RW, MAP_FLAGS, -1, 0) } as usize;
+    if base == 0 || base == 18446744073709551615 { out_of_memory(); }
+    // Align the arena to a page.
+    let aligned = (base + PAGE - 1) / PAGE * PAGE;
+    ARENA = aligned;
+    ARENA_NEXT = aligned;
+    ARENA_END = base + ARENA_SIZE;
+    let table = unsafe { mmap(0 as *mut u8, (ARENA_SIZE >> PAGE_SHIFT) * 8, PROT_RW, MAP_FLAGS, -1, 0) } as usize;
+    if table == 0 || table == 18446744073709551615 { out_of_memory(); }
+    PAGES = table;
+    MARK_CAP = 4096;
+    MARK = unsafe { calloc(MARK_CAP, 8) } as usize;
+}
+
+/// Allocates size zeroed bytes. noscan objects hold no pointers.
+pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
+    if ARENA == 0 { init(); }
+    if ALLOCATED >= NEXT_GC { collect(); }
+    let n = if size == 0 { 1 } else { size };
+    let p = if n > MAX_SMALL { alloc_large(n, noscan) } else { alloc_small(class_of(n), noscan) };
+    p as *mut u8
+}
+
+fn class_of(size: usize) -> usize {
+    let mut c = 0;
+    while CLASSES[c] < size { c += 1; }
+    c
+}
+
+fn alloc_small(c: usize, noscan: bool) -> usize {
+    let list = c * 2 + if noscan { 1 } else { 0 };
+    loop {
+        let s = FREE[list] as *mut Span;
+        if s as usize == 0 { break; }
+        unsafe {
+            if (*s).nfree > 0 { return take(s); }
+            FREE[list] = (*s).next_free as usize;
+            (*s).in_free = false;
+        }
+    }
+    let s = new_span(CLASSES[c], SPAN_BYTES, noscan, list);
+    unsafe {
+        (*s).next_free = FREE[list] as *mut Span;
+        (*s).in_free = true;
+    }
+    FREE[list] = s as usize;
+    take(s)
+}
+
+// take pops a free object of s, zeroes it and marks it allocated.
+fn take(s: *mut Span) -> usize {
+    unsafe {
+        let p = (*s).freelist;
+        (*s).freelist = ld(p);
+        (*s).nfree -= 1;
+        let i = (p - (*s).start) / (*s).elem;
+        stb((*s).bits as usize + i, 1);
+        memset(p as *mut u8, 0, (*s).elem);
+        ALLOCATED += (*s).elem;
+        p
+    }
+}
+
+fn alloc_large(size: usize, noscan: bool) -> usize {
+    let bytes = (size + PAGE - 1) / PAGE * PAGE;
+    // Reuse a dead large span that fits (first fit, at most twice the size).
+    let mut prev = 0usize;
+    let mut s = FREE[64] as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            if (*s).bytes >= bytes && (*s).bytes <= 2 * bytes {
+                if prev == 0 { FREE[64] = (*s).next_free as usize; } else { (*(prev as *mut Span)).next_free = (*s).next_free; }
+                (*s).in_free = false;
+                (*s).noscan = noscan;
+                stb((*s).bits as usize, 1);
+                memset((*s).start as *mut u8, 0, (*s).bytes);
+                ALLOCATED += (*s).bytes;
+                return (*s).start;
+            }
+            prev = s as usize;
+            s = (*s).next_free;
+        }
+    }
+    let s = new_span(bytes, bytes, noscan, NCLASS * 2);
+    unsafe {
+        (*s).freelist = 0;
+        (*s).nfree = 0;
+        stb((*s).bits as usize, 1);
+        ALLOCATED += bytes;
+        (*s).start
+    }
+}
+
+fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
+    let start = ARENA_NEXT;
+    if start + bytes > ARENA_END { out_of_memory(); }
+    ARENA_NEXT = start + bytes;
+    let s = unsafe { calloc(1, crate::intrinsics::size_of::<Span>()) } as *mut Span;
+    let nelems = bytes / elem;
+    unsafe {
+        (*s).start = start;
+        (*s).bytes = bytes;
+        (*s).elem = elem;
+        (*s).nelems = nelems;
+        (*s).noscan = noscan;
+        (*s).bits = calloc(2 * nelems, 1);
+        (*s).list = list;
+        let mut i = nelems;
+        let mut free = 0usize;
+        while i > 0 {
+            i -= 1;
+            let p = start + i * elem;
+            st(p, free);
+            free = p;
+        }
+        (*s).freelist = free;
+        (*s).nfree = nelems;
+        (*s).next_all = ALL as *mut Span;
+    }
+    ALL = s as usize;
+    let mut pg = start;
+    while pg < start + bytes {
+        st(PAGES + ((pg - ARENA) >> PAGE_SHIFT) * 8, s as usize);
+        pg += PAGE;
+    }
+    s
+}
+
+// --- Marking -----------------------------------------------------------------
+
+fn mark_word(w: usize) {
+    if w < ARENA || w >= ARENA_NEXT { return; }
+    let s = ld(PAGES + ((w - ARENA) >> PAGE_SHIFT) * 8) as *mut Span;
+    if s as usize == 0 { return; }
+    unsafe {
+        let i = (w - (*s).start) / (*s).elem;
+        if i >= (*s).nelems { return; }
+        let bits = (*s).bits as usize;
+        if ldb(bits + i) == 0 { return; }
+        let m = bits + (*s).nelems + i;
+        if ldb(m) != 0 { return; }
+        stb(m, 1);
+        if (*s).noscan { return; }
+        push((*s).start + i * (*s).elem);
+    }
+}
+
+fn push(obj: usize) {
+    if MARK_LEN == MARK_CAP {
+        MARK_CAP = MARK_CAP * 2;
+        MARK = unsafe { realloc(MARK as *mut u8, MARK_CAP * 8) } as usize;
+        if MARK == 0 { out_of_memory(); }
+    }
+    st(MARK + MARK_LEN * 8, obj);
+    MARK_LEN += 1;
+}
+
+fn scan_range(lo: usize, hi: usize) {
+    let mut p = (lo + 7) / 8 * 8;
+    while p + 8 <= hi {
+        mark_word(ld(p));
+        p += 8;
+    }
+}
+
+fn drain() {
+    while MARK_LEN > 0 {
+        MARK_LEN -= 1;
+        let obj = ld(MARK + MARK_LEN * 8);
+        let s = ld(PAGES + ((obj - ARENA) >> PAGE_SHIFT) * 8) as *mut Span;
+        let elem = unsafe { (*s).elem };
+        scan_range(obj, obj + elem);
+    }
+}
+
+/// Runs a full collection.
+pub fn collect() {
+    COLLECTIONS += 1;
+    let lo = crate::rt::frame_address() as usize;
+    let hi = crate::rt::stack_top() as usize + 16;
+    scan_range(lo, hi);
+    scan_range(crate::rt::data_start() as usize, crate::rt::data_end() as usize);
+    drain();
+    sweep();
+}
+
+fn sweep() {
+    let mut live = 0usize;
+    let mut s = ALL as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            let n = (*s).nelems;
+            let bits = (*s).bits as usize;
+            if (*s).list == NCLASS * 2 {
+                if ldb(bits) != 0 && ldb(bits + 1) == 0 {
+                    stb(bits, 0);
+                    if !(*s).in_free {
+                        (*s).next_free = FREE[64] as *mut Span;
+                        FREE[64] = s as usize;
+                        (*s).in_free = true;
+                    }
+                } else if ldb(bits) != 0 {
+                    live += (*s).bytes;
+                }
+                stb(bits + 1, 0);
+            } else {
+                let mut free = 0usize;
+                let mut nfree = 0usize;
+                let mut i = n;
+                while i > 0 {
+                    i -= 1;
+                    if ldb(bits + i) != 0 && ldb(bits + n + i) == 0 {
+                        stb(bits + i, 0);
+                    }
+                    stb(bits + n + i, 0);
+                    if ldb(bits + i) == 0 {
+                        let p = (*s).start + i * (*s).elem;
+                        st(p, free);
+                        free = p;
+                        nfree += 1;
+                    }
+                }
+                (*s).freelist = free;
+                (*s).nfree = nfree;
+                live += (n - nfree) * (*s).elem;
+                if nfree > 0 && !(*s).in_free {
+                    (*s).next_free = FREE[(*s).list] as *mut Span;
+                    FREE[(*s).list] = s as usize;
+                    (*s).in_free = true;
+                }
+            }
+            s = (*s).next_all;
+        }
+    }
+    LIVE = live;
+    ALLOCATED = 0;
+    NEXT_GC = if live > MIN_GC { live } else { MIN_GC };
+}
+
+/// Statistics for tests: (collections, live bytes after the last one,
+/// bytes allocated since).
+pub fn stats() -> (usize, usize, usize) { (COLLECTIONS, LIVE, ALLOCATED) }

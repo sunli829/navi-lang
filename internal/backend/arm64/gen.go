@@ -121,6 +121,12 @@ func (g *gen) extern(name string) string {
 	return sym
 }
 
+// linkerSym declares a symbol the linker defines (section bounds).
+func (g *gen) linkerSym(sym string) string {
+	g.externs[sym] = true
+	return sym
+}
+
 // loc returns the symbol of a static Location.
 func (g *gen) loc(file *syntax.File, pos syntax.Pos) string {
 	name, line, col := "<unknown>", 0, 0
@@ -192,6 +198,8 @@ func (g *gen) genData() {
 			g.targetWords(uint32(off)+uint32(16*i), t)
 		}
 	}
+	o.Define("_navi_stack_top", macho.Data, 8, false)
+	o.Sects[macho.Data] = append(o.Sects[macho.Data], make([]byte, 8)...)
 	// Statics (zero-initialized; _main runs the initializers).
 	for _, d := range g.p.Statics {
 		ty := g.p.Info.Consts[d].Type
@@ -273,6 +281,9 @@ func (g *gen) genMain() {
 	frame := (retSize + 15) &^ 15
 	a.MovImm(X16, frame)
 	a.SubExt(SP, SP, X16)
+	// The collector scans the stack up to here; unwinding stops here.
+	a.AdrSym(X16, "_navi_stack_top")
+	a.Str(8, FP, X16, 0)
 	mainLoc := g.locAt("<main>", 0, 0)
 	for i := len(g.p.Statics) - 1; i >= 0; i-- {
 		d := g.p.Statics[i]
@@ -302,7 +313,12 @@ func (g *gen) genRunDefers() {
 	a := &Asm{}
 	a.StpPre(FP, LR, SP, -16)
 	a.MovSP(FP, SP)
-	a.StpPre(19, 20, SP, -16)
+	// Same fixed slots as generated functions: x19/x20 saved at -8/-16,
+	// an empty defer list at -32 (unwinding walks through this frame).
+	a.SubImm(SP, SP, 48)
+	a.Str(8, 19, FP, -8)
+	a.Str(8, 20, FP, -16)
+	a.Str(8, ZR, FP, slotDefers)
 	a.Mov(19, X0)
 	loop, done, copyLoop, copied := a.NewLabel(), a.NewLabel(), a.NewLabel(), a.NewLabel()
 	a.Bind(loop)
@@ -330,11 +346,13 @@ func (g *gen) genRunDefers() {
 	a.Ldr(8, X16, 19, 8)
 	a.Ldr(8, 20, 19, 0)
 	a.Blr(X16)
-	a.SubImm(SP, FP, 16)
+	a.SubImm(SP, FP, 48)
 	a.Mov(19, 20)
 	a.B(loop)
 	a.Bind(done)
-	a.LdpPost(19, 20, SP, 16)
+	a.Ldr(8, 19, FP, -8)
+	a.Ldr(8, 20, FP, -16)
+	a.MovSP(SP, FP)
 	a.LdpPost(FP, LR, SP, 16)
 	a.Ret()
 	g.emitFunc("_navi_rundefers", a, false)
@@ -441,18 +459,8 @@ func (f *fnGen) gen() {
 	fn := f.f
 	f.ltypes = make([]*types.Type, len(fn.Locals))
 	f.loff = make([]int64, len(fn.Locals))
-	f.heap = make([]bool, len(fn.Locals))
 	for i, l := range fn.Locals {
 		f.ltypes[i] = f.conc(l.Type)
-	}
-	for _, b := range fn.Blocks {
-		for _, st := range b.Stmts {
-			if as, ok := st.(mir.Assign); ok {
-				if r, ok := as.Rv.(mir.Ref); ok && (len(r.Place.Proj) == 0 || r.Place.Proj[0].Kind != mir.PDeref) {
-					f.heap[r.Place.Local] = true
-				}
-			}
-		}
 	}
 	// Incoming arguments.
 	off := int64(16)
@@ -482,17 +490,7 @@ func (f *fnGen) gen() {
 		if size == 0 {
 			size = 1
 		}
-		if f.heap[i] {
-			size, align = 8, 8
-		}
 		f.loff[i] = alloc(size, align)
-	}
-	// Heap cells of address-taken arguments get a frame slot too.
-	argCell := map[int]int64{}
-	for i := f.firstArg(); i <= fn.NArgs; i++ {
-		if f.heap[i] {
-			argCell[i] = alloc(8, 8)
-		}
 	}
 	// Buffers and the outgoing argument area.
 	maxRes, maxTmp, maxOut := int64(16), int64(16), int64(48)
@@ -546,23 +544,7 @@ func (f *fnGen) gen() {
 	}
 	a.Str(8, X8, FP, slotRet)
 	a.Str(8, X9, FP, slotLoc)
-	if fn.HasDefer {
-		a.Str(8, ZR, FP, slotDefers)
-	}
-	for i := range fn.Locals {
-		if !f.heap[i] {
-			continue
-		}
-		size := f.size(f.ltypes[i])
-		f.callAlloc(size)
-		a.Ldr(8, X15, FP, f.resOff)
-		if off, ok := argCell[i]; ok {
-			a.AddrOf(X10, FP, f.loff[i])
-			f.copyMem(X15, 0, X10, 0, size)
-			f.loff[i] = off
-		}
-		a.Str(8, X15, FP, f.loff[i])
-	}
+	a.Str(8, ZR, FP, slotDefers)
 
 	f.blocks = make([]Label, len(fn.Blocks))
 	for i := range f.blocks {
@@ -582,13 +564,7 @@ func (f *fnGen) gen() {
 
 // --- Places ----------------------------------------------------------------
 
-func (f *fnGen) localAddr(r Reg, l int) {
-	if f.heap[l] {
-		f.a.Ldr(8, r, FP, f.loff[l])
-		return
-	}
-	f.a.AddrOf(r, FP, f.loff[l])
-}
+func (f *fnGen) localAddr(r Reg, l int) { f.a.AddrOf(r, FP, f.loff[l]) }
 
 func (f *fnGen) fieldOf(ty *types.Type, variant, field int) (int64, *types.Type) {
 	l := f.g.lay.Of(ty)
@@ -921,7 +897,7 @@ func (f *fnGen) stmt(bi, si int, s mir.Stmt) {
 	case mir.Box:
 		ct := f.conc(s.Type)
 		l := f.g.lay.Of(ct)
-		f.callAlloc(l.Size)
+		f.callAlloc(l.Size, f.noscan(ct))
 		a.Ldr(8, X12, FP, f.resOff)
 		f.localAddr(X10, s.Local)
 		a.Str(8, X12, X10, 0)
@@ -930,15 +906,27 @@ func (f *fnGen) stmt(bi, si int, s mir.Stmt) {
 	}
 }
 
-// callAlloc calls std::rt::native::alloc(size, 8); the pointer is left
-// in the result buffer.
-func (f *fnGen) callAlloc(size int64) {
+// callAlloc calls std::rt::native::gc_alloc(size, noscan); the pointer
+// is left in the result buffer.
+func (f *fnGen) callAlloc(size int64, noscan bool) {
 	a := f.a
 	a.MovImm(X12, size)
 	a.Str(8, X12, SP, 0)
-	a.MovImm(X12, 8)
-	a.Str(8, X12, SP, 8)
-	f.callRuntime("alloc")
+	if noscan {
+		a.MovImm(X12, 1)
+		a.Str(1, X12, SP, 8)
+	} else {
+		a.Str(1, ZR, SP, 8)
+	}
+	f.callRuntime("gc_alloc")
+}
+
+// noscan reports whether values of t hold no pointers.
+func (f *fnGen) noscan(t *types.Type) bool {
+	if t.Kind == types.KNever {
+		return true
+	}
+	return len(f.g.lay.Of(t).Ptrs) == 0
 }
 
 func (f *fnGen) callRuntime(name string) {
@@ -1123,7 +1111,7 @@ func (f *fnGen) assign(bi, si int, s mir.Assign) {
 // closure value (code, env+8) in X12, X13.
 func (f *fnGen) closure(r mir.Aggregate) {
 	a := f.a
-	f.callAlloc(int64(8 + 8*len(r.Ops)))
+	f.callAlloc(int64(8+8*len(r.Ops)), false)
 	a.Ldr(8, X15, FP, f.resOff)
 	a.Ldr(8, X14, FP, slotCtx)
 	a.Str(8, X14, X15, 0)
@@ -1731,6 +1719,24 @@ func (f *fnGen) intrinsic(target *codegen.Target, t mir.Call, dt *types.Type) {
 		a.Bl(f.g.extern("abort"))
 		a.Brk(1)
 		return
+	case "has_pointers":
+		if f.noscan(targ(0)) {
+			a.MovImm(X12, 0)
+		} else {
+			a.MovImm(X12, 1)
+		}
+	case "frame_address":
+		a.Mov(X12, FP)
+	case "stack_top":
+		a.AdrSym(X12, "_navi_stack_top")
+		a.Ldr(8, X12, X12, 0)
+	case "data_start":
+		a.AdrSym(X12, f.g.linkerSym("section$start$__DATA$__data"))
+	case "data_end":
+		a.AdrSym(X12, f.g.linkerSym("section$end$__DATA$__data"))
+	case "run_defers":
+		f.loadScalar(t.Args[0], X0)
+		a.Bl("_navi_rundefers")
 	case "size_of":
 		a.MovImm(X12, f.size(targ(0)))
 	case "align_of":
@@ -1823,7 +1829,7 @@ func (f *fnGen) pushDefer(s mir.PushDefer) {
 			retSize = rs
 		}
 	}
-	f.callAlloc(48 + argSize)
+	f.callAlloc(48+argSize, false)
 	a.Ldr(8, X15, FP, f.resOff)
 	// Code and context.
 	switch {

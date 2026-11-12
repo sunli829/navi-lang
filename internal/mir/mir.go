@@ -297,12 +297,18 @@ type (
 		Fn   Operand
 		Args []Operand
 	}
+	// StorageLive marks where a local starts a new life (a declaration or
+	// a temporary's evaluation). Lowering turns it into a Box for locals
+	// whose address is taken and drops it otherwise, so backends never see
+	// it.
+	StorageLive struct{ Local int }
 )
 
 func (Assign) stmt()    {}
 func (SetDiscr) stmt()  {}
 func (Box) stmt()       {}
-func (PushDefer) stmt() {}
+func (PushDefer) stmt()   {}
+func (StorageLive) stmt() {}
 
 // Term ends a basic block.
 type Term interface{ term() }

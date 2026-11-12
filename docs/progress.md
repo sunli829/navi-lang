@@ -9,6 +9,7 @@
 | M0 | 完成 | spec、std-diff、CLI 骨架、CI |
 | M1 | 完成 | parser、名称解析、签名收集、函数体类型检查、穷尽性检查、impl 一致性、`navi check` |
 | M2 | 基本完成 | MIR、解释器、std 子集实现、GC shape 实例分析、`navi run` / `navi test`；未做：MIR 优化（常量折叠/DCE/内联）、编译期 const 求值（目前 const 在运行时求值，数组长度用 AST 常量折叠） |
+| M4 | 完成 | `std::rt::gc`（navi 写）：按尺寸分级的 span、非移动 mark-sweep、支持内部指针、无指针类型的 noscan span、GOGC=100 式触发、大对象 span 复用；panic 沿帧指针链展开并执行每帧的 defer；MIR 新增 `StorageLive`，被取地址的局部变量在声明处装箱（每次循环迭代是新变量，和 Go 一致，解释器也修正了）；GC 压力测试（约 2GB 分配，峰值 RSS 约 7.5MB） |
 | M3 | 完成（单线程） | codegen 规划（shape 分组、字典槽、vtable）、arm64 编码器（与系统汇编器逐条对拍）、MIR→arm64、Mach-O 目标文件、`cc` 链接、`navi build`、`navi run` 默认走原生；原生运行时 `std::rt::native`（navi 写，经 `extern "C"` 调 libc）、精确浮点格式化 `std::rt::float`；tests/run 全部 golden 测试原生通过（threads 除外，等 M6） |
 
 ## 与计划不同的地方（已在 spec / std-diff 中记录）
@@ -23,6 +24,7 @@
 - 关联类型上的约束（`type IntoIter: Iterator<...>`）作为隐含的 where 子句。
 - M3 的原生运行时暂时经 `extern "C"` 调 libc（calloc/write/exit/memmove/fmod），没有用计划里的 `.s` 汇编器；系统调用层的抽象和"调 C 前切换系统栈"随 M6 的可增长栈一起做。
 - 新增属性 `#[link_name = "..."]`（同 Rust），用于 extern 函数改名。
+- **GC 扫描是保守的**（计划写的是精确 GC + stack map）：栈、static 和需要扫描的堆对象都逐字检查"是否指向已分配对象（含内部）"；不含指针的类型（字符串缓冲、数值数组）放在 noscan span，不扫描。这样做可行，是因为生成的代码不在寄存器里跨调用保存值，且被取地址的局部变量都在堆上，栈上没有指向栈的指针（M6 移动栈时只需修正帧链和返回槽这两种已知位置）。代价是整数恰好像堆地址时会误保留对象。精确的类型位图留到 M9 性能阶段。
 - shape 分组的键除了各局部变量的 shape，还包含类型实参的 shape（同 Go）：泛型代码可能经指针访问 `S<T>` 的字段，偏移取决于 T，而局部变量看不出来。
 
 ## 设计要点（实现时的决定）
@@ -35,10 +37,10 @@
 
 - 原生 ABI（arm64）：x0 = 上下文（函数实例的字典；闭包是环境指针，字典在环境 -8 处），x8 = 返回槽地址，x9 = 调用者 Location（`#[track_caller]`），参数按 8 字节对齐放在调用者栈上；没有寄存器跨调用保存，所有 MIR 局部变量都在栈帧里。
 - 字典：每个槽 16 字节 = (代码, 上下文) 或 (vtable, 0)；vtable 每个 dyn 方法一项 (代码, 上下文)。
-- 被取地址的局部变量（M3 还没有逃逸分析）一律放进堆 cell；M4 的 GC 和 M6 的逃逸分析会改进。
-- defer：每次 `defer` 分配一条记录 [next, code, ctx, argsize, retsize, loc, args...] 挂在帧的链表上，返回时由 `_navi_rundefers` 依次调用；panic 时（M3）不执行 defer，M4 的栈展开补上。
+- 被取地址的局部变量（还没有逃逸分析）在 MIR 里一律装箱（`StorageLive` 处分配新 cell）；以后加逃逸分析减少堆分配。
+- defer：每次 `defer` 分配一条记录 [next, code, ctx, argsize, retsize, loc, args...] 挂在帧的链表上（每个帧 x29-32 处是链表头），返回时由 `_navi_rundefers` 依次调用；panic 时 `std::rt::native::unwind` 沿帧指针链到 main 的帧为止，逐帧执行 defer，然后打印 panic 信息并以 101 退出（与解释器、Go 的顺序相同）。
 - 算术溢出、除零、移位溢出的检查直接生成在代码里，失败时调 `std::rt::native::panic_raw`；越界调 `panic_bounds`。
 
 ## 下一步
 
-M4：分配器 + STW 精确 GC + stack map + panic 展开（执行 defer）。
+M5：amd64 后端 + ELF + COFF，覆盖 linux-x64/arm64、macos-x64、windows-x64。

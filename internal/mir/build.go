@@ -160,6 +160,7 @@ func (b *builder) build() *Func {
 		b.exprInto(n.Value, LocalPlace(0))
 	}
 	b.terminate(Return{})
+	boxAddressTaken(b.info.Ctx, b.fn)
 	return b.fn
 }
 
@@ -199,7 +200,11 @@ func (b *builder) newLocal(t *types.Type, name string) int {
 	return len(b.fn.Locals) - 1
 }
 
-func (b *builder) temp(t *types.Type) Place { return LocalPlace(b.newLocal(t, "")) }
+func (b *builder) temp(t *types.Type) Place {
+	l := b.newLocal(t, "")
+	b.emit(StorageLive{Local: l})
+	return LocalPlace(l)
+}
 
 func (b *builder) newBlock() int {
 	b.fn.Blocks = append(b.fn.Blocks, &Block{})
@@ -276,6 +281,7 @@ func (b *builder) declare(l *resolve.Local, t *types.Type) Place {
 		return LocalPlace(cell).Deref()
 	}
 	idx := b.newLocal(t, l.Name)
+	b.emit(StorageLive{Local: idx})
 	b.locals[l] = idx
 	return LocalPlace(idx)
 }

@@ -3,11 +3,9 @@
 //! generator calls the function with the intrinsic's name; the simple ones
 //! (size_of, slice and pointer primitives) are generated inline instead.
 //!
-//! M3: single-threaded, memory is never freed (the GC arrives in M4),
-//! panics exit the process without running defers of other frames.
+//! Single-threaded for now (green threads arrive in M6).
 
 extern "C" {
-    fn calloc(n: usize, size: usize) -> *mut u8;
     #[link_name = "write"]
     fn c_write(fd: i32, buf: *const u8, n: usize) -> isize;
     #[link_name = "exit"]
@@ -16,11 +14,17 @@ extern "C" {
 }
 
 pub fn alloc(size: usize, align: usize) -> *mut u8 {
-    unsafe { calloc(1, if size == 0 { 1 } else { size }) }
+    crate::rt::gc::alloc(size, false)
 }
 
 pub fn alloc_array<T>(n: usize) -> *mut T {
-    alloc(n * crate::intrinsics::size_of::<T>(), 8) as *mut T
+    crate::rt::gc::alloc(n * crate::intrinsics::size_of::<T>(), !crate::rt::has_pointers::<T>()) as *mut T
+}
+
+/// Allocation entry point of generated code (cells, closure environments,
+/// defer records).
+pub fn gc_alloc(size: usize, noscan: bool) -> *mut u8 {
+    crate::rt::gc::alloc(size, noscan)
 }
 
 pub fn copy<T>(src: *const T, dst: *mut T, n: usize) {
@@ -62,7 +66,31 @@ fn panic_header(file: &str, line: u32, col: u32) {
     put(2, ":\n");
 }
 
+/// Runs the deferred calls of every frame on the stack, innermost first
+/// (a panic unwinding to the top: there is no catch_unwind yet).
+fn unwind() {
+    let top = crate::rt::stack_top() as usize;
+    let mut fp = crate::rt::frame_address() as usize;
+    while fp != 0 && fp != top {
+        let slot = (fp - 32) as *mut usize;
+        unsafe {
+            let head = *slot;
+            if head != 0 {
+                *slot = 0;
+                crate::rt::run_defers(head as *mut u8);
+            }
+            fp = *(fp as *const usize);
+        }
+    }
+}
+
+static mut PANICKING: bool = false;
+
 pub fn panic_raw(msg: &str, file: &str, line: u32, col: u32) -> ! {
+    if !PANICKING {
+        PANICKING = true;
+        unwind();
+    }
     panic_header(file, line, col);
     put(2, msg);
     put(2, "\n");
@@ -71,6 +99,10 @@ pub fn panic_raw(msg: &str, file: &str, line: u32, col: u32) -> ! {
 
 /// Called by generated code when a bounds check fails.
 pub fn panic_bounds(len: usize, index: usize, file: &str, line: u32, col: u32) -> ! {
+    if !PANICKING {
+        PANICKING = true;
+        unwind();
+    }
     panic_header(file, line, col);
     put(2, "index out of bounds: the len is ");
     put_u64(2, len as u64);
@@ -78,6 +110,14 @@ pub fn panic_bounds(len: usize, index: usize, file: &str, line: u32, col: u32) -
     put_u64(2, index as u64);
     put(2, "\n");
     exit(101)
+}
+
+/// Reports a fatal runtime error and exits.
+pub fn fatal(msg: &str) -> ! {
+    put(2, "fatal error: ");
+    put(2, msg);
+    put(2, "\n");
+    exit(2)
 }
 
 fn unsupported(what: &str) -> ! {

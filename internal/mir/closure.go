@@ -49,6 +49,7 @@ func (b *builder) closure(x *syntax.ClosureExpr, dest Place) {
 	}
 	child.exprInto(x.Body, LocalPlace(0))
 	child.terminate(Return{})
+	boxAddressTaken(b.info.Ctx, f)
 	ops := make([]Operand, len(caps))
 	for i, l := range caps {
 		ops[i] = b.cellPointer(l)
