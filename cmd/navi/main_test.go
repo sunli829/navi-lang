@@ -18,6 +18,9 @@ func TestRun(t *testing.T) {
 		{args: []string{"help"}, code: 0},
 		{args: []string{"check"}, code: 1, stderrPart: "planned for M1"},
 		{args: []string{"frobnicate"}, code: 2, stderrPart: `unknown command "frobnicate"`},
+		{args: []string{"parse"}, code: 2, stderrPart: "usage: navi parse"},
+		{args: []string{"parse", "../../tests/syntax/items.navi"}, code: 0, stdout: ""},
+		{args: []string{"parse", "missing.navi"}, code: 1, stderrPart: "missing.navi"},
 	}
 	for _, tt := range tests {
 		var stdout, stderr bytes.Buffer

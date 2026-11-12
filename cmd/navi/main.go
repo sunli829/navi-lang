@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"navi/internal/syntax"
 )
 
 const version = "0.0.0-m0"
@@ -17,6 +19,7 @@ commands:
   check     type-check a crate without generating code
   test      build and run #[test] functions
   bench     build and run #[bench] functions
+  parse     parse files and print their syntax trees (debugging)
   version   print the navi version
 `
 
@@ -46,6 +49,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
+	case "parse":
+		return parseFiles(args[1:], stdout, stderr)
 	default:
 		if milestone, ok := commands[cmd]; ok {
 			fmt.Fprintf(stderr, "navi %s: not implemented yet (planned for %s)\n", cmd, milestone)
@@ -54,4 +59,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "navi: unknown command %q\n\n%s", cmd, usage)
 		return 2
 	}
+}
+
+func parseFiles(paths []string, stdout, stderr io.Writer) int {
+	if len(paths) == 0 {
+		fmt.Fprintln(stderr, "usage: navi parse <file.navi>...")
+		return 2
+	}
+	code := 0
+	for _, path := range paths {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			code = 1
+			continue
+		}
+		sf, errs := syntax.ParseFile(syntax.NewFile(path, src))
+		if errs.Len() > 0 {
+			fmt.Fprintln(stderr, errs)
+			code = 1
+			continue
+		}
+		fmt.Fprintln(stdout, syntax.Dump(sf))
+	}
+	return code
 }
