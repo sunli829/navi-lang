@@ -43,7 +43,7 @@ func (fc *fnCtx) peel(t *Type, mode bindMode) (*Type, bindMode) {
 func (fc *fnCtx) pat(p syntax.Pat, exp *Type, mode bindMode) {
 	ctx := fc.in.ctx
 	in := fc.in
-	fc.body.Pats[p] = exp
+	fc.setPat(p, exp)
 	switch p := p.(type) {
 	case *syntax.WildPat, *syntax.RestPat:
 		return
@@ -73,7 +73,7 @@ func (fc *fnCtx) pat(p syntax.Pat, exp *Type, mode bindMode) {
 					fc.mismatch(p.Pos(), old, t)
 				}
 			} else {
-				fc.body.Locals[l] = t
+				fc.setLocal(l, t)
 			}
 		}
 		if p.Sub != nil {
@@ -246,7 +246,7 @@ func (fc *fnCtx) pat(p syntax.Pat, exp *Type, mode bindMode) {
 				if ip, ok := el.(*syntax.IdentPat); ok {
 					if l := fc.info.Res.Bindings[ip]; l != nil {
 						t := ctx.Slice(elem)
-						fc.body.Locals[l] = ctx.Ref(mode == byRefMut, t)
+						fc.setLocal(l, ctx.Ref(mode == byRefMut, t))
 						fc.body.RefBindings[ip] = true
 					}
 				}

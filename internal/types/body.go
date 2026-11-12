@@ -24,6 +24,12 @@ type BodyInfo struct {
 	RefBindings map[*syntax.IdentPat]bool
 	// Templates records whether a template string is a String or Arguments.
 	Templates map[*syntax.TemplateExpr]*Type
+
+	// Recording order of Types, Locals and Pats (for deterministic
+	// diagnostics).
+	typeOrder  []syntax.Expr
+	localOrder []*resolve.Local
+	patOrder   []syntax.Pat
 }
 
 // Callee is the resolved target of a path or method call.
@@ -72,6 +78,7 @@ type fnCtx struct {
 	unsafe      int
 	inConst     bool
 	opaques     map[*Type]*Type // opaque return types -> hidden-type variables
+	opaqueOrder []*Type
 	deferred    []func()        // checks that need resolved types (exhaustiveness)
 	errsAtStart int             // to suppress follow-on "annotations needed" errors
 }
@@ -158,11 +165,12 @@ func (c *collector) checkFnBody(d *resolve.Def, n *syntax.FnDecl) {
 	// hidden type that the body determines.
 	for _, o := range fs.Opaques {
 		fc.opaques[o] = fc.in.fresh()
+		fc.opaqueOrder = append(fc.opaqueOrder, o)
 	}
 	ret = fc.replaceOpaques(ret)
 	fc.ret = fc.normalize(ret)
 	if l := c.info.Res.SelfLocals[n]; l != nil && fs.Self != nil {
-		fc.body.Locals[l] = fc.normalize(fs.Self)
+		fc.setLocal(l, fc.normalize(fs.Self))
 	}
 	for i, p := range n.Params {
 		if i < len(fs.Params) {
@@ -171,14 +179,15 @@ func (c *collector) checkFnBody(d *resolve.Def, n *syntax.FnDecl) {
 	}
 	t := fc.checkBlock(n.Body, fc.ret)
 	fc.coerceTo(n.Body, t, fc.ret, n.Body.Rbrace)
-	for o, v := range fc.opaques {
+	for _, o := range fc.opaqueOrder {
+		v := fc.opaques[o]
 		for _, b := range o.Bounds {
 			fc.require(&TraitRef{Trait: b.Trait, Self: v, Args: b.Args, Bindings: b.Bindings}, n.Name.NamePos)
 		}
 	}
 	fc.finish()
-	for o, v := range fc.opaques {
-		c.info.Hidden[o] = fc.in.resolve(v)
+	for _, o := range fc.opaqueOrder {
+		c.info.Hidden[o] = fc.in.resolve(fc.opaques[o])
 	}
 }
 
@@ -245,8 +254,8 @@ func (fc *fnCtx) finish() {
 	}
 	// A function whose body never returns (todo(), loop {}) leaves its
 	// opaque return type undetermined; it is ! then.
-	for _, v := range fc.opaques {
-		if r := fc.in.shallow(v); r.Kind == KInfer {
+	for _, o := range fc.opaqueOrder {
+		if r := fc.in.shallow(fc.opaques[o]); r.Kind == KInfer {
 			fc.in.unify(r, fc.in.ctx.Never)
 		}
 	}
@@ -275,14 +284,14 @@ func (fc *fnCtx) finish() {
 		}
 		return r
 	}
-	for x, t := range fc.body.Types {
-		fc.body.Types[x] = res(t, x.Pos())
+	for _, x := range fc.body.typeOrder {
+		fc.body.Types[x] = res(fc.body.Types[x], x.Pos())
 	}
-	for l, t := range fc.body.Locals {
-		fc.body.Locals[l] = res(t, l.Pos)
+	for _, l := range fc.body.localOrder {
+		fc.body.Locals[l] = res(fc.body.Locals[l], l.Pos)
 	}
-	for p, t := range fc.body.Pats {
-		fc.body.Pats[p] = res(t, p.Pos())
+	for _, p := range fc.body.patOrder {
+		fc.body.Pats[p] = res(fc.body.Pats[p], p.Pos())
 	}
 	for x, t := range fc.body.Templates {
 		fc.body.Templates[x] = fc.in.resolve(t)
@@ -308,8 +317,27 @@ func (fc *fnCtx) finish() {
 
 // record stores the type of an expression.
 func (fc *fnCtx) record(x syntax.Expr, t *Type) *Type {
+	if _, ok := fc.body.Types[x]; !ok {
+		fc.body.typeOrder = append(fc.body.typeOrder, x)
+	}
 	fc.body.Types[x] = t
 	return t
+}
+
+// setLocal stores the type of a local variable.
+func (fc *fnCtx) setLocal(l *resolve.Local, t *Type) {
+	if _, ok := fc.body.Locals[l]; !ok {
+		fc.body.localOrder = append(fc.body.localOrder, l)
+	}
+	fc.body.Locals[l] = t
+}
+
+// setPat stores the type of a pattern.
+func (fc *fnCtx) setPat(p syntax.Pat, t *Type) {
+	if _, ok := fc.body.Pats[p]; !ok {
+		fc.body.patOrder = append(fc.body.patOrder, p)
+	}
+	fc.body.Pats[p] = t
 }
 
 // lower lowers a type written inside the body (let annotations, casts,
