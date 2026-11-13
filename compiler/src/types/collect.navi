@@ -2,6 +2,7 @@
 //! them, then runs the item-level checks and the body checker.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use crate::diag::Sink;
 use crate::resolve::{self, Def, Crate, Module, Node, Visibility};
 use crate::syntax::ast;
@@ -70,9 +71,36 @@ pub struct Collector {
     /// Inherent impls by impl_key of the self type.
     pub inherent: Option<HashMap<String, Vec<&mut ImplInfo>>>,
     next_synth: u32,
+    /// A worker checking bodies on its own thread (see check_bodies): the
+    /// bodies and hidden types it finds wait in these lists, constant
+    /// evaluation takes const_lock.
+    pub(crate) worker: bool,
+    pub(crate) new_bodies: Vec<(u32, &mut BodyInfo)>,
+    pub(crate) new_hidden: Vec<(u32, &Type)>,
+    pub(crate) const_lock: Option<&Mutex<u8>>,
+    pub(crate) const_depth: i32,
 }
 
 impl Collector {
+    /// A copy for a worker thread: the caches are shared (they are complete
+    /// before bodies are checked, and read only), the errors and results
+    /// are its own.
+    pub fn worker(&mut self, const_lock: &Mutex<u8>) -> &mut Collector {
+        &mut Collector { info: self.info, errs: Sink::new(), quiet: 0, children: self.children, gens: self.gens,
+            impl_self: self.impl_self, busy: self.busy, consts: self.consts, lang_of: self.lang_of,
+            derive_cache: self.derive_cache, param_owner: self.param_owner, inherent: self.inherent,
+            next_synth: self.next_synth, worker: true, new_bodies: Vec::new(), new_hidden: Vec::new(),
+            const_lock: Some(const_lock), const_depth: 0 }
+    }
+
+    pub fn set_body(&mut self, id: u32, b: &mut BodyInfo) {
+        if self.worker { self.new_bodies.push((id, b)); } else { self.info.bodies.insert(id, b); }
+    }
+
+    pub fn set_hidden(&mut self, id: u32, t: &Type) {
+        if self.worker { self.new_hidden.push((id, t)); } else { self.info.hidden.insert(id, t); }
+    }
+
     pub fn errorf(&mut self, f: Option<&File>, pos: Pos, msg: String) {
         if self.quiet > 0 { return; }
         self.errs.errorf(f, pos, msg);
@@ -106,7 +134,8 @@ pub fn collect(res: &mut resolve::Info, errs: &mut Sink) -> &mut Info {
         lazy_std: !crate::resolve::cfg::stage0_mode(), norm_cache: HashMap::new(), deref_cache: HashMap::new(), method_cache: HashMap::new() };
     let c = &mut Collector { info, errs, quiet: 0, children: HashMap::new(), gens: HashMap::new(), impl_self: HashMap::new(),
         busy: HashMap::new(), consts: HashMap::new(), lang_of: HashMap::new(), derive_cache: HashMap::new(),
-        param_owner: HashMap::new(), inherent: None, next_synth: 0 };
+        param_owner: HashMap::new(), inherent: None, next_synth: 0, worker: false, new_bodies: Vec::new(),
+        new_hidden: Vec::new(), const_lock: None, const_depth: 0 };
     info.c = Some(c);
     let defs = res.defs.clone();
     for d in defs.iter() {

@@ -1,6 +1,8 @@
 //! Body type checking: the per-body context and the stored results.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
+use crate::diag::Sink;
 use crate::resolve::{self, Def, Local, Module, Node};
 use crate::syntax::ast::{self, Expr, ExprKind, Item, Pat};
 use crate::syntax::source::{File, Pos};
@@ -133,11 +135,46 @@ impl FnCtx {
 
 impl Collector {
     /// Type-checks every function, constant and static body.
+    /// The bodies are checked by as many threads as can run, each with its
+    /// own Collector (see Collector::worker); type interning is the only
+    /// shared write. The results and errors are recorded in the order of
+    /// the definitions.
     pub fn check_bodies(&mut self) {
         let defs = self.info.res.defs.clone();
+        let mut todo: Vec<&mut Def> = Vec::new();
         for d in defs.iter() {
             if self.info.lazy_std && d.krate.is_std { continue; }
-            self.check_body_of(*d);
+            todo.push(*d);
+        }
+        let mut nw = match std::thread::available_parallelism() { Ok(n) => n, Err(_) => 1 };
+        if crate::resolve::cfg::stage0_mode() || nw > todo.len() / 16 { nw = if crate::resolve::cfg::stage0_mode() { 1 } else { todo.len() / 16 }; }
+        if nw <= 1 {
+            for d in todo.iter() { self.check_body_of(*d); }
+            return;
+        }
+        // Built once here: workers only read it.
+        self.inherent_impls(self.info.ctx.unit);
+        let const_lock = &Mutex::new(0u8);
+        let next = &Mutex::new(0usize);
+        self.info.ctx.par = true;
+        let mut hs = Vec::new();
+        let mut k = 0;
+        while k < nw {
+            let w = self.worker(const_lock);
+            hs.push(std::thread::spawn(|| check_some(w, &mut todo, next)));
+            k += 1;
+        }
+        let mut done: Vec<Option<&mut Checked>> = Vec::new();
+        for _ in todo.iter() { done.push(None); }
+        for h in hs.iter() {
+            for (i, r) in h.join().unwrap().iter() { done[*i] = Some(*r); }
+        }
+        self.info.ctx.par = false;
+        for r in done.iter() {
+            let c = r.unwrap();
+            for e in c.errs.sorted().iter() { self.errs.add(e.clone()); }
+            for (id, b) in c.bodies.iter() { self.info.bodies.insert(*id, *b); }
+            for (id, t) in c.hidden.iter() { self.info.hidden.insert(*id, *t); }
         }
     }
 
@@ -217,7 +254,7 @@ impl Collector {
         fc.finish();
         for o in fc.opaque_order.iter() {
             let h = fc.inf.resolve(fc.opaques[&o.id]);
-            self.info.hidden.insert(o.id, h);
+            self.set_hidden(o.id, h);
         }
     }
 
@@ -400,7 +437,7 @@ impl FnCtx {
             if let Some(td) = a.to_dyn { a.to_dyn = Some(self.inf.resolve(td)); }
         }
         if tainted { self.c.quiet -= 1; }
-        self.info.bodies.insert(self.owner.id, body);
+        self.c.set_body(self.owner.id, body);
     }
 
     fn res_final(&mut self, t: &Type, pos: Pos, reported: &mut bool) -> &Type {
@@ -492,5 +529,34 @@ impl FnCtx {
             i -= 1;
         }
         s
+    }
+}
+
+/// What checking one body produced (on a worker).
+pub struct Checked {
+    errs: &mut Sink,
+    bodies: Vec<(u32, &mut BodyInfo)>,
+    hidden: Vec<(u32, &Type)>,
+}
+
+// Checks bodies of todo, 8 at a time, until none is left.
+fn check_some(w: &mut Collector, todo: &mut Vec<&mut Def>, next: &Mutex<usize>) -> Vec<(usize, &mut Checked)> {
+    let mut res: Vec<(usize, &mut Checked)> = Vec::new();
+    loop {
+        let start = next.with_lock(|n| {
+            let s = *n;
+            *n = s + 8;
+            s
+        });
+        if start >= todo.len() { return res; }
+        let mut i = start;
+        while i < start + 8 && i < todo.len() {
+            w.errs = Sink::new();
+            w.new_bodies = Vec::new();
+            w.new_hidden = Vec::new();
+            w.check_body_of(todo[i]);
+            res.push((i, &mut Checked { errs: w.errs, bodies: w.new_bodies, hidden: w.new_hidden }));
+            i += 1;
+        }
     }
 }

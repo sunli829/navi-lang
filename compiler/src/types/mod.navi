@@ -20,6 +20,7 @@ pub mod query;
 pub mod dump;
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use crate::resolve::{self, Def, Visibility};
 use crate::syntax::ast::StructKind;
 use crate::syntax::source::Pos;
@@ -154,8 +155,14 @@ pub fn trait_ref(trait_def: &mut Def, self_ty: Option<&Type>, args: Vec<&Type>) 
 /// Interns types: structurally equal types (by kind and the ids of their
 /// parts) are the same object.
 pub struct Ctx {
-    types: HashMap<u64, Vec<&Type>>,
-    next: u32,
+    // The interned types in SHARDS tables by hash, each with its own lock
+    // (taken only while par: several threads intern). A type's id is its
+    // shard plus SHARDS + 1 times a count in the shard; inference variables
+    // use the remainder SHARDS.
+    shards: Vec<HashMap<u64, Vec<&Type>>>,
+    counts: Vec<u32>,
+    locks: Vec<&Mutex<u8>>,
+    pub par: bool,
     pub bool_: &Type,
     pub char_: &Type,
     pub str_: &Type,
@@ -267,42 +274,37 @@ fn type_eq(a: &Type, b: &Type) -> bool {
     }
 }
 
-fn intern_in(types: &mut HashMap<u64, Vec<&Type>>, next: &mut u32, t: Type) -> &Type {
-    let h = hash_type(&t);
-    match types.get(&h) {
-        Some(bucket) => {
-            for old in bucket.iter() {
-                if type_eq(&t, *old) { return *old; }
-            }
-        }
-        None => {}
-    }
-    *next += 1;
-    let r = &Type { id: *next, ..t };
-    if !types.contains_key(&h) { types.insert(h, Vec::new()); }
-    let mut bucket = types[&h];
-    bucket.push(r);
-    r
-}
+const SHARDS: usize = 64;
 
 pub fn new_ctx() -> &mut Ctx {
-    let mut types: HashMap<u64, Vec<&Type>> = HashMap::new();
-    let mut next = 0u32;
-    let err = intern_in(&mut types, &mut next, blank(K_ERROR));
-    let b = intern_in(&mut types, &mut next, blank(K_BOOL));
-    let c = intern_in(&mut types, &mut next, blank(K_CHAR));
-    let s = intern_in(&mut types, &mut next, blank(K_STR));
-    let nv = intern_in(&mut types, &mut next, blank(K_NEVER));
-    let u = intern_in(&mut types, &mut next, blank(K_TUPLE));
-    let f32 = intern_in(&mut types, &mut next, blank(K_FLOAT));
-    let f64 = intern_in(&mut types, &mut next, Type { f64: true, ..blank(K_FLOAT) });
-    let mut ints = Vec::new();
+    let mut shards: Vec<HashMap<u64, Vec<&Type>>> = Vec::new();
+    let mut counts: Vec<u32> = Vec::new();
+    let mut locks: Vec<&Mutex<u8>> = Vec::new();
+    let mut i = 0;
+    while i <= SHARDS {
+        shards.push(HashMap::new());
+        counts.push(0);
+        locks.push(&Mutex::new(0u8));
+        i += 1;
+    }
+    let x = &blank(K_ERROR);
+    let cx = &mut Ctx { shards, counts, locks, par: false, bool_: x, char_: x, str_: x, never: x, unit: x, err: x, f32: x, f64: x,
+        ints: Vec::new() };
+    cx.err = cx.intern(blank(K_ERROR));
+    cx.bool_ = cx.intern(blank(K_BOOL));
+    cx.char_ = cx.intern(blank(K_CHAR));
+    cx.str_ = cx.intern(blank(K_STR));
+    cx.never = cx.intern(blank(K_NEVER));
+    cx.unit = cx.intern(blank(K_TUPLE));
+    cx.f32 = cx.intern(blank(K_FLOAT));
+    cx.f64 = cx.intern(Type { f64: true, ..blank(K_FLOAT) });
     let mut k = 0u8;
     while k < NUM_INTS {
-        ints.push(intern_in(&mut types, &mut next, Type { int: k, ..blank(K_INT) }));
+        let t = cx.intern(Type { int: k, ..blank(K_INT) });
+        cx.ints.push(t);
         k += 1;
     }
-    &mut Ctx { types, next, bool_: b, char_: c, str_: s, never: nv, unit: u, err, f32, f64, ints }
+    cx
 }
 
 fn types_key(ts: &Vec<&Type>) -> String {
@@ -329,7 +331,27 @@ pub fn trait_key(tr: Option<&TraitRef>) -> String {
 }
 
 impl Ctx {
-    fn intern(&mut self, t: Type) -> &Type { intern_in(&mut self.types, &mut self.next, t) }
+    fn intern(&mut self, t: Type) -> &Type {
+        let h = hash_type(&t);
+        let sh = (h % SHARDS as u64) as usize;
+        if self.par { self.locks[sh].lock(); }
+        let mut types = self.shards[sh];
+        if let Some(bucket) = types.get(&h) {
+            for old in bucket.iter() {
+                if type_eq(&t, *old) {
+                    if self.par { self.locks[sh].unlock(); }
+                    return *old;
+                }
+            }
+        }
+        self.counts[sh] += 1;
+        let r = &Type { id: sh as u32 + (SHARDS as u32 + 1) * self.counts[sh], ..t };
+        if !types.contains_key(&h) { types.insert(h, Vec::new()); }
+        let mut bucket = types[&h];
+        bucket.push(r);
+        if self.par { self.locks[sh].unlock(); }
+        r
+    }
 
     pub fn int(&self, k: IntKind) -> &Type { self.ints[k as usize] }
     pub fn usize_(&self) -> &Type { self.ints[USIZE as usize] }
@@ -377,8 +399,11 @@ impl Ctx {
     }
     /// A fresh (not interned) inference variable.
     pub fn infer_var(&mut self, var: i32) -> &Type {
-        self.next += 1;
-        &Type { id: self.next, var, ..blank(K_INFER) }
+        if self.par { self.locks[SHARDS].lock(); }
+        self.counts[SHARDS] += 1;
+        let id = SHARDS as u32 + (SHARDS as u32 + 1) * self.counts[SHARDS];
+        if self.par { self.locks[SHARDS].unlock(); }
+        &Type { id, var, ..blank(K_INFER) }
     }
 }
 
