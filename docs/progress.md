@@ -94,6 +94,13 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   还差的：冷编译仍是 go build（std 已缓存）的约 7 倍。剩余时间分布平坦（parse+resolve 0.37s、types 0.57s、mir 0.6s、plan 0.35s、codegen 0.42s、link 0.21s），其中约 0.55s 是每次重编 std 的前端。再往下要靠：std 前端结果的缓存（需要序列化类型和 MIR）、MIR 内联小函数、函数粒度并行（需要 M:N 多线程运行时和线程安全的编译器数据结构）。
   试过但回退：GOGC=200（被 set_min_heap 取代）、早期的小函数内联实验。
 
+  编译器内部并行（M:N 运行时之后；navic 自己编出来的 navic 才是多线程的，stage0 编出来的 stage1 仍是 M:1）：
+  - 解析：按 `mod` 声明一层一层发现文件，同一层的文件在多个线程上解析；解析器有自己的 `IdGen`，每个文件按发现顺序和文件大小分到一段 id，id 与线程无关（`NAVI_STAGE0=1` 时保持串行编号，selfcheck 用）。
+  - 后端：函数按顺序排成作业，工作线程每次取 8 个；每个线程有自己的机器码缓冲和生成器，类型驻留、布局和类型检查器的缓存放在一把锁（`std::sync::Mutex`，新加的）后面，布局、字段类型按线程缓存，不含类型参数的类型不拿锁；函数用到的字符串和位置先用占位名（`%S<i>`/`%L<i>`），按函数顺序合并时才起正式的名字，闭包按组内编号——目标文件与线程数无关（`NAVI_MAXPROCS` 为 1、3、8 时逐字节相同）。
+  - 链接：代码签名的页哈希多线程计算。
+  - 结果（8 核）：bp10 1.75s → 1.57s；10 万行 20.8s（STW GC）→ 13.96s（并发 GC + 并行），其中 parse+resolve 1.0s → 0.7s、codegen 3.2s → 1.8s、link 1.8s → 0.96s；自编译 4.9s → 4.3s。
+  - 还没并行的：类型检查（3.9s）、MIR 构建和逃逸分析（3.8s）、plan（2.8s）——它们都在读写共享的 `Ctx`/`Info`（驻留新类型、惰性缓存、`Sink`），要把这些结构改成可以分片或冻结后再加线程本地层，工作量比后端大得多。
+
 - 语言和工具（都只在 navic 里，stage0 冻结；std 里 stage0 编不了的部分用 `#[cfg(feature = "navic")]` 藏起来，含新语法的放在单独的模块文件里，stage0 不会去读）：
   - `panic::catch_unwind` / `resume_unwind` / `PanicPayload`：每个 G 有一串 catch 记录，`try_call` 用 setjmp 式的上下文保存（`_navi_setjmp`/`_navi_longjmp`，存 x19–x28、fp、lr、sp），panic 先打印消息、执行到 catch 帧为止的 defer，再恢复上下文；`thread::spawn` 用它包住线程函数，`join()` 返回 `Err(PanicPayload)`；`tests/run/catch.navi`。
   - `i128` / `u128`：16 字节整数（对齐 8），MIR 降级时把 128 位的算术、比较、移位、取反、数值转换和 switch 改写成 `std::rt::int128` 的调用（两个 u64 半字实现，debug 构建检查溢出、除零）；Display/Debug/十六进制、Hash/Ord 等 shim、常用方法（MIN/MAX、wrapping/checked/saturating、pow、count_ones…）；`Duration::as_nanos` 等改回 `u128`；`tests/run/int128.navi`。字面量最大到 `u64::MAX`。
@@ -118,6 +125,6 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
 
 ## 下一步
 
-1. 冷编译提速：编译器内部并行（解析和后端按函数，Go 也是这样；需要线程安全的编译器数据结构）；std 的导出数据缓存。
+1. 冷编译提速：类型检查、MIR、plan 的并行（共享的 `Ctx`/`Info` 要先能并发访问）；GC 的并行标记；std 的导出数据缓存。
 2. 运行时：channel 的收发队列（只唤醒一个等待者）、每个 M 的运行队列、基于信号的抢占、并行标记、栈收缩。
 3. DWARF 的变量和类型信息；amd64/ELF/COFF 上的自研链接器和 DWARF（现在只有 macOS arm64）。
