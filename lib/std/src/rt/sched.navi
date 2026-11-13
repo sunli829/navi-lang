@@ -51,6 +51,9 @@ pub struct G {
     // First: the stack limit function prologues check (navic; see
     // backend::lower). The collector sets it to the maximum to stop the G.
     guard: usize,
+    // Second (navic): while non-zero the G does not stop for the collector
+    // at a prologue (a write barrier runs; generated code increments it).
+    nopreempt: usize,
     // Saved context (sp, fp, pc) while not running.
     sp: usize,
     fp: usize,
@@ -356,6 +359,10 @@ pub fn exit_blocked() {}
 #[cfg(not(feature = "navic"))]
 pub fn stop_the_world() {}
 #[cfg(not(feature = "navic"))]
+pub fn preempt_off() {}
+#[cfg(not(feature = "navic"))]
+pub fn preempt_on() {}
+#[cfg(not(feature = "navic"))]
 pub fn flush_caches() {}
 #[cfg(not(feature = "navic"))]
 pub fn start_the_world() {}
@@ -472,24 +479,35 @@ fn push(c: *mut Chan, src: *const u8) {
             let elem = if (*c).elem == 0 { 1 } else { (*c).elem };
             let nb = crate::rt::gc::alloc(slots * elem, false);
             let mut i = 0;
+            preempt_off();
             while i < (*c).len {
                 let from = ((*c).head + i) % (*c).slots;
                 copy_bytes(crate::rt::ptr_offset((*c).buf as *const u8, from * elem), crate::rt::ptr_offset(nb as *const u8, i * elem) as *mut u8, elem);
                 i += 1;
             }
+            crate::rt::gc::shade_range(nb as usize, (*c).len * elem);
+            preempt_on();
             (*c).buf = nb;
             (*c).head = 0;
             (*c).slots = slots;
         }
         let at = ((*c).head + (*c).len) % (*c).slots;
-        copy_bytes(src, crate::rt::ptr_offset((*c).buf as *const u8, at * (*c).elem) as *mut u8, (*c).elem);
+        let dst = crate::rt::ptr_offset((*c).buf as *const u8, at * (*c).elem) as *mut u8;
+        // The element may hold pointers (the copy is of bytes).
+        preempt_off();
+        copy_bytes(src, dst, (*c).elem);
+        crate::rt::gc::shade_range(dst as usize, (*c).elem);
+        preempt_on();
         (*c).len += 1;
     }
 }
 
 fn pop(c: *mut Chan, dst: *mut u8) {
     unsafe {
+        preempt_off();
         copy_bytes(crate::rt::ptr_offset((*c).buf as *const u8, (*c).head * (*c).elem), dst, (*c).elem);
+        crate::rt::gc::shade_range(dst as usize, (*c).elem);
+        preempt_on();
         (*c).head = ((*c).head + 1) % (*c).slots;
         (*c).len -= 1;
     }
@@ -910,6 +928,17 @@ fn obj_unlock(lk: *mut usize) { crate::rt::atomic_store(lk, 0); }
 #[cfg(feature = "navic")]
 fn spin_wait() { unsafe { sched_yield(); } }
 
+/// Keeps the running G from stopping for the collector until preempt_on:
+/// a store and the write barrier's marking happen in one step.
+#[cfg(feature = "navic")]
+pub fn preempt_off() { unsafe { (*current()).nopreempt += 1; } }
+#[cfg(feature = "navic")]
+pub fn preempt_on() { unsafe { (*current()).nopreempt -= 1; } }
+
+/// Gives the CPU to another thread while spinning.
+#[cfg(feature = "navic")]
+pub fn cpu_relax() { unsafe { sched_yield(); } }
+
 // Blocks the running G (its wait nodes are enlisted) until woken: it holds
 // the n object locks at locks, which its M's scheduler record releases
 // after the switch (so a waker cannot see it before it stopped); they are
@@ -971,7 +1000,14 @@ pub fn morestack() {
     let g = current();
     unsafe {
         if (*g).stack_hi == 0 { return; } // a thread's scheduler record: no limit
-        if crate::rt::atomic_load(&mut STW as *mut usize) != 0 && !(*g).is_g0 {
+        let stw = crate::rt::atomic_load(&mut STW as *mut usize) != 0;
+        if stw && !(*g).is_g0 && (*g).nopreempt != 0 {
+            // Stops at a prologue after preempt_on (the stub zeroed the
+            // limit: poisoned again).
+            (*g).guard = 18446744073709551615;
+            return;
+        }
+        if stw && !(*g).is_g0 {
             // The registers are saved below (by the stub), above SP.
             (*g).sp = crate::rt::stack_pointer() as usize;
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_STOPPED);

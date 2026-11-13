@@ -162,6 +162,7 @@ pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
             let elem = (*s).elem;
             let i = ((p - (*s).start) * (*s).div_mul) >> 32;
             *(((*s).bits as usize + i) as *mut u8) = 1;
+            if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; } // allocated black
             ALLOCATED += elem;
             // Zero the object (the free list link is in its first word).
             if elem <= 64 {
@@ -203,6 +204,7 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
                 let elem = (*s).elem;
                 let i = ((p - (*s).start) * (*s).div_mul) >> 32;
                 *(((*s).bits as usize + i) as *mut u8) = 1;
+                if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; }
                 let mut q = p;
                 while q < p + elem {
                     *(q as *mut usize) = 0;
@@ -258,6 +260,7 @@ fn take_owned(s: *mut Span) -> usize {
         let elem = (*s).elem;
         let i = ((p - (*s).start) * (*s).div_mul) >> 32;
         *(((*s).bits as usize + i) as *mut u8) = 1;
+        if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; }
         if elem <= 64 {
             let mut q = p;
             while q < p + elem {
@@ -305,6 +308,7 @@ fn take(s: *mut Span) -> usize {
         (*s).nfree -= 1;
         let i = ((p - (*s).start) * (*s).div_mul) >> 32;
         *(((*s).bits as usize + i) as *mut u8) = 1;
+        if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; }
         memset(p as *mut u8, 0, (*s).elem);
         ALLOCATED += (*s).elem;
         p
@@ -323,6 +327,7 @@ fn alloc_large(size: usize, noscan: bool) -> usize {
                 (*s).in_free = false;
                 (*s).noscan = noscan;
                 stb((*s).bits as usize, 1);
+                if MARKING { stb((*s).bits as usize + 1, 1); }
                 memset((*s).start as *mut u8, 0, (*s).bytes);
                 ALLOCATED += (*s).bytes;
                 return (*s).start;
@@ -336,6 +341,7 @@ fn alloc_large(size: usize, noscan: bool) -> usize {
         (*s).freelist = 0;
         (*s).nfree = 0;
         stb((*s).bits as usize, 1);
+        if MARKING { stb((*s).bits as usize + 1, 1); }
         ALLOCATED += bytes;
         (*s).start
     }
@@ -380,7 +386,11 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
 
 // --- Marking -----------------------------------------------------------------
 
+// The mark stack is shared by the collector and, during a concurrent
+// mark, the write barriers of all threads (mark_lock; no navi call while
+// it is held, so no G holding it stops for a collector).
 fn push(obj: usize) {
+    mark_lock();
     if MARK_LEN == MARK_CAP {
         MARK_CAP = MARK_CAP * 2;
         MARK = unsafe { realloc(MARK as *mut u8, MARK_CAP * 8) } as usize;
@@ -388,13 +398,27 @@ fn push(obj: usize) {
     }
     unsafe { *((MARK + MARK_LEN * 8) as *mut usize) = obj; }
     MARK_LEN += 1;
+    mark_unlock();
+}
+
+fn pop() -> usize {
+    mark_lock();
+    let mut obj = 0usize;
+    if MARK_LEN > 0 {
+        MARK_LEN -= 1;
+        obj = unsafe { *((MARK + MARK_LEN * 8) as *const usize) };
+    }
+    mark_unlock();
+    obj
 }
 
 /// Marks every object a word in [lo, hi) points into (the hot loop of the
 /// collector: memory accesses are written out instead of calling ld/ldb).
 pub(crate) fn scan_range(lo: usize, hi: usize) {
     let arena = ARENA;
-    let next = ARENA_NEXT;
+    // During a concurrent mark, spans made since it started hold only
+    // objects allocated black (or free ones): not read.
+    let next = if CYCLE { LIMIT } else { ARENA_NEXT };
     let pages = PAGES;
     let mut p = (lo + 7) / 8 * 8;
     while p + 8 <= hi {
@@ -420,14 +444,34 @@ pub(crate) fn scan_range(lo: usize, hi: usize) {
 }
 
 fn drain() {
-    while MARK_LEN > 0 {
-        MARK_LEN -= 1;
-        let obj = unsafe { *((MARK + MARK_LEN * 8) as *const usize) };
+    loop {
+        // The concurrent marker must not stop holding a popped object (a
+        // collection finishing then would not scan it).
+        crate::rt::sched::preempt_off();
+        let obj = pop();
+        if obj == 0 {
+            crate::rt::sched::preempt_on();
+            return;
+        }
         let s = unsafe { *((PAGES + ((obj - ARENA) >> PAGE_SHIFT) * 8) as *const usize) } as *mut Span;
         let elem = unsafe { (*s).elem };
         scan_range(obj, obj + elem);
+        crate::rt::sched::preempt_on();
     }
 }
+
+/// The write barrier's work (and that of runtime copies): while a
+/// concurrent mark runs, marks what the words in [p, p + n) point to.
+pub fn shade_range(p: usize, n: usize) {
+    if MARKING { scan_range(p, p + n); }
+}
+
+// Whether a concurrent mark runs (mirrors the word the generated write
+// barriers test), when it started, and the end of the arena then.
+static mut MARKING: bool = false;
+static mut CYCLE: bool = false;
+static mut LIMIT: usize = 0;
+static mut MARK_LK: usize = 0;
 
 static mut COLLECTING: bool = false;
 
@@ -438,13 +482,15 @@ static mut SAVED_REGS: [usize; 10] = [0; 10];
 /// Runs a full collection.
 pub fn collect() {
     crate::rt::sched::lock();
-    collect_locked();
+    if !full_concurrent() { collect_locked(); }
     crate::rt::sched::unlock();
 }
 
-// Collects with the runtime lock held; other OS threads' Gs are stopped
-// meanwhile. It must not allocate.
+// Collects with the runtime lock held: in navic builds a concurrent cycle
+// starts (or, if one runs, is finished: the heap grew too much meanwhile);
+// otherwise every G stops for the whole collection. It must not allocate.
 fn collect_locked() {
+    if step_concurrent() { return; }
     if COLLECTING { return; }
     COLLECTING = true;
     COLLECTIONS += 1;
@@ -530,3 +576,165 @@ static mut MIN_HEAP: usize = MIN_GC;
 /// Statistics for tests: (collections, live bytes after the last one,
 /// bytes allocated since).
 pub fn stats() -> (usize, usize, usize) { (COLLECTIONS, LIVE, ALLOCATED) }
+
+// --- Concurrent collection (navic) -------------------------------------------------
+//
+// A cycle: (1) the world stops briefly while the roots (stacks, saved
+// registers, statics) are marked and the write barrier is switched on; (2)
+// a marker G drains the mark stack while the program runs: the barrier
+// marks every pointer stored into the heap, and objects allocated meanwhile
+// are born marked; (3) the world stops again: the stacks and statics are
+// rescanned (they have no barrier), the rest drained, the heap swept.
+
+#[cfg(feature = "navic")]
+fn mark_lock() {
+    while !crate::rt::atomic_cas(&mut MARK_LK as *mut usize, 0, 1) { mark_spin(); }
+}
+#[cfg(feature = "navic")]
+fn mark_unlock() { crate::rt::atomic_store(&mut MARK_LK as *mut usize, 0); }
+#[cfg(feature = "navic")]
+fn mark_spin() { crate::rt::sched::cpu_relax(); }
+#[cfg(not(feature = "navic"))]
+fn mark_lock() {}
+#[cfg(not(feature = "navic"))]
+fn mark_unlock() {}
+
+#[cfg(not(feature = "navic"))]
+fn step_concurrent() -> bool { false }
+#[cfg(not(feature = "navic"))]
+fn full_concurrent() -> bool { false }
+
+// NAVI_GCSTW=1 keeps every collection stop-the-world; NAVI_GCVERIFY=1
+// checks after each concurrent mark that no reachable object was missed.
+#[cfg(feature = "navic")]
+static mut MODE: usize = 0; // 0 unknown, 1 concurrent, 2 stop-the-world
+#[cfg(feature = "navic")]
+static mut VERIFY: bool = false;
+
+#[cfg(feature = "navic")]
+fn concurrent_on() -> bool {
+    if MODE == 0 {
+        // Reading the environment allocates (a collection then is a
+        // stop-the-world one).
+        MODE = 2;
+        MODE = match crate::rt::native::os_getenv("NAVI_GCSTW") { Some(_) => 2, None => 1 };
+        VERIFY = crate::rt::native::os_getenv("NAVI_GCVERIFY").is_some();
+    }
+    MODE == 1
+}
+
+#[cfg(feature = "navic")]
+fn step_concurrent() -> bool {
+    if !concurrent_on() { return false; }
+    if CYCLE { finish_cycle(); } else { start_cycle(); }
+    true
+}
+
+#[cfg(feature = "navic")]
+fn full_concurrent() -> bool {
+    if !concurrent_on() { return false; }
+    if !CYCLE { start_cycle(); }
+    finish_cycle();
+    true
+}
+
+#[cfg(feature = "navic")]
+fn set_marking(on: bool) {
+    MARKING = on;
+    crate::rt::atomic_store(crate::rt::gc_marking_flag() as *mut usize, if on { 1 } else { 0 });
+}
+
+// Marks the roots: the running G's registers and stack, the other Gs'
+// stacks and saved registers, the statics.
+#[cfg(feature = "navic")]
+fn mark_roots() {
+    crate::rt::spill_registers(&mut SAVED_REGS as *mut [usize; 10] as *mut usize);
+    let lo = crate::rt::stack_pointer() as usize;
+    scan_range(lo, crate::rt::sched::current_stack_hi());
+    crate::rt::sched::scan_other_stacks();
+    scan_range(crate::rt::data_start() as usize, crate::rt::data_end() as usize);
+}
+
+// (1), with the runtime lock held.
+#[cfg(feature = "navic")]
+fn start_cycle() {
+    if COLLECTING { return; }
+    COLLECTING = true;
+    crate::rt::sched::stop_the_world();
+    CYCLE = true;
+    LIMIT = ARENA_NEXT;
+    set_marking(true);
+    mark_roots();
+    crate::rt::sched::start_the_world();
+    // If the program allocates as much again before the marker is done,
+    // the allocating G finishes the cycle itself.
+    NEXT_GC = ALLOCATED + if NEXT_GC > MIN_HEAP { NEXT_GC } else { MIN_HEAP };
+    COLLECTING = false;
+    crate::rt::sched::go(|| { mark_worker(); });
+}
+
+// (2): the marker G.
+#[cfg(feature = "navic")]
+fn mark_worker() {
+    drain();
+    crate::rt::sched::lock();
+    finish_cycle();
+    crate::rt::sched::unlock();
+}
+
+// (3), with the runtime lock held.
+#[cfg(feature = "navic")]
+fn finish_cycle() {
+    if !CYCLE || COLLECTING { return; }
+    COLLECTING = true;
+    COLLECTIONS += 1;
+    crate::rt::sched::stop_the_world();
+    mark_roots();
+    drain();
+    if VERIFY { verify_marks(); }
+    set_marking(false);
+    CYCLE = false;
+    crate::rt::sched::flush_caches();
+    sweep();
+    crate::rt::sched::start_the_world();
+    COLLECTING = false;
+}
+
+// Rescans every marked object: if that marks anything more, the
+// concurrent mark missed a reachable object (a missing write barrier).
+#[cfg(feature = "navic")]
+fn verify_marks() {
+    let mut before = 0usize;
+    let mut s = ALL as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            let n = (*s).nelems;
+            let bits = (*s).bits as usize;
+            let mut i = 0;
+            while i < n {
+                if ldb(bits + n + i) != 0 {
+                    before += 1;
+                    if !(*s).noscan { scan_range((*s).start + i * (*s).elem, (*s).start + (i + 1) * (*s).elem); }
+                }
+                i += 1;
+            }
+            s = (*s).next_all;
+        }
+    }
+    drain();
+    let mut after = 0usize;
+    s = ALL as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            let n = (*s).nelems;
+            let bits = (*s).bits as usize;
+            let mut i = 0;
+            while i < n {
+                if ldb(bits + n + i) != 0 { after += 1; }
+                i += 1;
+            }
+            s = (*s).next_all;
+        }
+    }
+    if after != before { crate::rt::native::fatal("concurrent mark missed reachable objects"); }
+}

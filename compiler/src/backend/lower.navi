@@ -246,7 +246,7 @@ impl Gen {
         // the entry point runs their initializers). The collector scans from
         // _navi_data_start to _navi_data_end.
         self.o.define("_navi_data_start", obj::DATA, 8, false);
-        for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv", "_navi_saved_greg"].iter() {
+        for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv", "_navi_saved_greg", "_navi_gc_marking"].iter() {
             self.o.define(*sym, obj::DATA, 8, false);
             self.o.zeros(obj::DATA, 8);
         }
@@ -639,14 +639,17 @@ impl FnGen {
         m.prologue(frame);
         // The stack check: the limit is the first word of the running G (a
         // collector stopping the world sets it to the maximum).
+        // morestack stops the G for the collector or fails on a real
+        // overflow; the function then goes on (a G that may not stop yet
+        // keeps its poisoned limit and passes here).
         let overflow = m.new_label();
-        let check = m.new_label();
-        m.bind(check);
+        let resume = m.new_label();
         m.load(8, I1, GREG, 0);
         m.mov(I2, SP);
         m.cmp(I2, I1);
         m.branch_if(LTU, overflow);
-        self.stub_list.push(Stub::Overflow(overflow, check));
+        m.bind(resume);
+        self.stub_list.push(Stub::Overflow(overflow, resume));
         for sv in self.saved.iter() { m.store(8, sv.0, FP, sv.1); }
         if f.closure {
             if self.preg[1] >= 0 { m.mov(self.preg[1] as Reg, CTX); } else { m.store(8, CTX, FP, self.loff[1]); }
@@ -690,10 +693,10 @@ impl FnGen {
         let mut k = 0;
         while k < self.stub_list.len() {
             match &self.stub_list[k] {
-                Stub::Overflow(l, check) => {
+                Stub::Overflow(l, resume) => {
                     m.bind(*l);
                     m.call("_navi_morestack");
-                    m.jump(*check);
+                    m.jump(*resume);
                 }
                 Stub::Panic { label, msg, pos } => {
                     m.bind(*label);
@@ -1316,6 +1319,43 @@ impl FnGen {
     }
 
     fn assign(&mut self, bi: usize, si: usize, place: &Place, rv: &Rvalue) {
+        self.assign_value(bi, si, place, rv);
+        self.write_barrier(place);
+    }
+
+    /// After a write of pointers to a place that may be in the heap: while
+    /// a concurrent collection marks, the runtime shades what was written
+    /// (Dijkstra's insertion barrier; stacks and statics are rescanned when
+    /// marking ends).
+    fn write_barrier(&mut self, pl: &Place) {
+        let mut heap = false;
+        for pj in pl.proj.iter() {
+            if pj.kind == mir::P_DEREF { heap = true; }
+        }
+        if !heap { return; }
+        let ty = self.place_type(pl);
+        if ty.kind == types::K_NEVER { return; }
+        let l = self.g.lay.of(ty);
+        if l.ptrs.len() == 0 || l.unsized { return; }
+        let m = self.m;
+        let skip = m.new_label();
+        m.adr_sym(I1, "_navi_gc_marking");
+        m.load(8, I1, I1, 0);
+        m.branch_zero(I1, skip);
+        // No stop for the collector until the marking is done: the G's
+        // nopreempt (its second word; gc_wb decrements it).
+        m.load(8, I1, GREG, 8);
+        m.add_imm(I1, 1);
+        m.store(8, I1, GREG, 8);
+        self.place(pl);
+        m.store(8, RA, SP, 0);
+        m.mov_imm(V1, l.size);
+        m.store(8, V1, SP, 8);
+        self.call_runtime("gc_wb");
+        m.bind(skip);
+    }
+
+    fn assign_value(&mut self, bi: usize, si: usize, place: &Place, rv: &Rvalue) {
         let m = self.m;
         let dt = self.place_type(place);
         if dt.kind == types::K_NEVER { return; }
@@ -1941,6 +1981,7 @@ impl FnGen {
                 let (b, o, _) = self.place_addr(dest);
                 self.copy_mem(b, o, FP, self.res_off, size);
             }
+            self.write_barrier(dest);
         }
         m.jump(self.blocks[target as usize]);
     }
@@ -1983,7 +2024,10 @@ impl FnGen {
             return;
         }
         let size = self.size(dt);
-        if size > 0 { self.store_regs(dest, size); }
+        if size > 0 {
+            self.store_regs(dest, size);
+            self.write_barrier(dest);
+        }
         m.jump(self.blocks[target as usize]);
     }
 
@@ -2091,6 +2135,9 @@ impl FnGen {
             "mstart_address" => {
                 m.adr_sym(V1, "_navi_mstart");
             }
+            "gc_marking_flag" => {
+                m.adr_sym(V1, "_navi_gc_marking");
+            }
             "atomic_load" => {
                 self.load_scalar(&args[0], I1);
                 m.atomic_load(V1, I1);
@@ -2183,6 +2230,7 @@ impl FnGen {
             }
         }
         self.store_regs(dest, size);
+        if size > 0 { self.write_barrier(dest); }
         if target >= 0 { m.jump(self.blocks[target as usize]); } else { m.trap(); }
     }
 
