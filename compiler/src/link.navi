@@ -514,18 +514,7 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     // Page hashes for the code directory; the UUID (in the first page) is
     // the hash of the first page and the other pages' hashes, so the image
     // is hashed once.
-    let mut page_hashes: Vec<[u8; 32]> = Vec::new();
-    let mut p = 0u64;
-    while p < n_pages {
-        let lo = (p * 4096) as usize;
-        let hi = if (p + 1) * 4096 < sig_off { ((p + 1) * 4096) as usize } else { sig_off as usize };
-        if p == 0 && uuid_at + 16 <= hi {
-            page_hashes.push([0u8; 32]);
-        } else {
-            page_hashes.push(sha256::sum(&w.b[lo..hi]));
-        }
-        p += 1;
-    }
+    let mut page_hashes = hash_pages(&w.b, n_pages, sig_off);
     let first_hi = if 4096 < sig_off { 4096usize } else { sig_off as usize };
     let digest = if uuid_at + 16 <= first_hi {
         let mut ub: Vec<u8> = Vec::new();
@@ -580,4 +569,49 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     for h in page_hashes.iter() { w.b.extend_from_slice(h); }
     w.pad_to(sig_off + sig_size);
     Ok(w.b)
+}
+
+// The SHA-256 of each 4 KiB page of b[..end] (several threads hash runs of
+// pages).
+fn hash_pages(b: &Vec<u8>, n_pages: u64, end: u64) -> Vec<[u8; 32]> {
+    let next = &std::sync::Mutex::new(0u64);
+    let work = || {
+        let mut res: Vec<(u64, [u8; 32])> = Vec::new();
+        loop {
+            let first = next.with_lock(|k| {
+                let f = *k;
+                *k = f + 64;
+                f
+            });
+            if first >= n_pages { return res; }
+            let mut p = first;
+            while p < first + 64 && p < n_pages {
+                let lo = (p * 4096) as usize;
+                let hi = if (p + 1) * 4096 < end { ((p + 1) * 4096) as usize } else { end as usize };
+                res.push((p, sha256::sum(&b[lo..hi])));
+                p += 1;
+            }
+        }
+    };
+    let mut nw = match std::thread::available_parallelism() { Ok(k) => k, Err(_) => 1 };
+    if nw as u64 > n_pages / 64 { nw = (n_pages / 64) as usize; }
+    let mut done: Vec<(u64, [u8; 32])> = Vec::new();
+    if nw <= 1 {
+        done = work();
+    } else {
+        let mut hs = Vec::new();
+        let mut k = 0;
+        while k < nw {
+            hs.push(std::thread::spawn(work));
+            k += 1;
+        }
+        for h in hs.iter() {
+            for d in h.join().unwrap().iter() { done.push(*d); }
+        }
+    }
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    let mut i = 0u64;
+    while i < n_pages { out.push([0u8; 32]); i += 1; }
+    for (p, h) in done.iter() { out[*p as usize] = *h; }
+    out
 }
