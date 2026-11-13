@@ -505,7 +505,7 @@ fn collect_closures(f: &Func, todo: &mut Vec<&mut Func>) {
 /// Out-of-line code emitted after the function body.
 enum Stub {
     /// The stack check's slow path (then the check again).
-    Overflow(Label, Label),
+    Overflow(Label, Label, i64),
     /// A panic with a message at a position.
     Panic { label: Label, msg: String, pos: Pos },
 }
@@ -636,20 +636,23 @@ impl FnGen {
         self.tmp_off = -cur;
         let frame = ((cur + 15) & !15) + ((max_out + 15) & !15);
 
-        m.prologue(frame);
-        // The stack check: the limit is the first word of the running G (a
-        // collector stopping the world sets it to the maximum).
-        // morestack stops the G for the collector or fails on a real
-        // overflow; the function then goes on (a G that may not stop yet
-        // keeps its poisoned limit and passes here).
+        // The stack check, before the frame is made: the stack must reach
+        // the frame (and the saved FP and LR) above the limit, the first
+        // word of the running G. A collector stopping the world sets the
+        // limit to the maximum. morestack grows the stack (copying it), stops
+        // the G for the collector or fails; the function then goes on (a G
+        // that may not stop yet keeps its poisoned limit and passes here).
         let overflow = m.new_label();
         let resume = m.new_label();
+        let need = frame + 16;
         m.load(8, I1, GREG, 0);
         m.mov(I2, SP);
+        m.add_imm(I2, -need);
         m.cmp(I2, I1);
         m.branch_if(LTU, overflow);
         m.bind(resume);
-        self.stub_list.push(Stub::Overflow(overflow, resume));
+        self.stub_list.push(Stub::Overflow(overflow, resume, need));
+        m.prologue(frame);
         for sv in self.saved.iter() { m.store(8, sv.0, FP, sv.1); }
         if f.closure {
             if self.preg[1] >= 0 { m.mov(self.preg[1] as Reg, CTX); } else { m.store(8, CTX, FP, self.loff[1]); }
@@ -693,9 +696,12 @@ impl FnGen {
         let mut k = 0;
         while k < self.stub_list.len() {
             match &self.stub_list[k] {
-                Stub::Overflow(l, resume) => {
+                Stub::Overflow(l, resume, need) => {
                     m.bind(*l);
-                    m.call("_navi_morestack");
+                    // The bytes needed (the G's third word).
+                    m.mov_imm(I1, *need);
+                    m.store(8, I1, GREG, 16);
+                    m.call_morestack();
                     m.jump(*resume);
                 }
                 Stub::Panic { label, msg, pos } => {
@@ -1339,8 +1345,7 @@ impl FnGen {
         if l.ptrs.len() == 0 || l.unsized { return; }
         let m = self.m;
         let skip = m.new_label();
-        m.adr_sym(I1, "_navi_gc_marking");
-        m.load(8, I1, I1, 0);
+        m.load_sym(I1, "_navi_gc_marking");
         m.branch_zero(I1, skip);
         // No stop for the collector until the marking is done: the G's
         // nopreempt (its second word; gc_wb decrements it).

@@ -19,11 +19,13 @@
 #[cfg(not(target_os = "windows"))]
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
 #[cfg(target_os = "windows")]
 extern "C" {
     fn VirtualAlloc(addr: *mut u8, size: usize, kind: u32, protect: u32) -> *mut u8;
+    fn VirtualFree(addr: *mut u8, size: usize, kind: u32) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -34,10 +36,13 @@ const MAP_FLAGS: i32 = 0x4022;
 const MAP_FLAGS: i32 = 0;
 
 const MAIN_STACK: usize = 67108864; // 64 MiB
-#[cfg(not(target_os = "windows"))]
-const STACK: usize = 1048576; // 1 MiB per spawned G
-#[cfg(target_os = "windows")]
-const STACK: usize = 262144; // committed up front on Windows
+// The first stack of a spawned G (navic: grown by copying, up to
+// MAX_STACK; stage0 builds keep it).
+#[cfg(not(feature = "navic"))]
+const STACK: usize = 1048576;
+#[cfg(feature = "navic")]
+const STACK: usize = 65536;
+const MAX_STACK: usize = 1073741824; // 1 GiB
 // The bottom of every stack is left for C calls made near the limit.
 const RED_ZONE: usize = 32768;
 
@@ -54,6 +59,15 @@ pub struct G {
     // Second (navic): while non-zero the G does not stop for the collector
     // at a prologue (a write barrier runs; generated code increments it).
     nopreempt: usize,
+    // Third and fourth (navic; see backend::lower): the bytes the function
+    // entering morestack needs below its SP, and the SP of morestack's stub
+    // (below it, the registers it saved).
+    need: usize,
+    entry_sp: usize,
+    // A stack left by growing (freed by the next morestack, which runs on
+    // the new one).
+    old_stack: usize,
+    old_size: usize,
     // Saved context (sp, fp, pc) while not running.
     sp: usize,
     fp: usize,
@@ -112,6 +126,12 @@ fn reserve_os(size: usize) -> usize {
     if p == 0 || p == 18446744073709551615 { crate::rt::native::fatal("cannot allocate a stack"); }
     p
 }
+
+#[cfg(not(target_os = "windows"))]
+fn release_os(p: usize, size: usize) { unsafe { munmap(p as *mut u8, size); } }
+
+#[cfg(target_os = "windows")]
+fn release_os(p: usize, size: usize) { unsafe { VirtualFree(p as *mut u8, 0, 0x8000); } }
 
 #[cfg(target_os = "windows")]
 fn reserve_os(size: usize) -> usize {
@@ -223,6 +243,12 @@ pub fn go(f: fn()) {
     let mut g = FREE_GS as *mut G;
     if g as usize != 0 {
         FREE_GS = unsafe { (*g).next } as usize;
+        unsafe {
+            if (*g).old_size != 0 {
+                release_os((*g).old_stack, (*g).old_size);
+                (*g).old_size = 0;
+            }
+        }
     } else {
         g = new_g();
         let stack = reserve(STACK);
@@ -992,20 +1018,22 @@ fn block_current() {
     }
 }
 
-/// The slow path of the stack check: the stack is exhausted, or a
-/// collector asked this G to stop (it scans the stack while the G waits).
-/// Called with the G's limit cleared.
+/// The slow path of the stack check: a collector asked this G to stop (it
+/// scans the stack while the G waits), or the stack is exhausted: a
+/// spawned G's moves to one twice as large (or more). Called with the G's
+/// limit cleared; returns how far the stack moved (its stub moves SP and
+/// FP as much).
 #[cfg(feature = "navic")]
-pub fn morestack() {
+pub fn morestack() -> usize {
     let g = current();
     unsafe {
-        if (*g).stack_hi == 0 { return; } // a thread's scheduler record: no limit
+        if (*g).stack_hi == 0 { return 0; } // a thread's scheduler record: no limit
         let stw = crate::rt::atomic_load(&mut STW as *mut usize) != 0;
         if stw && !(*g).is_g0 && (*g).nopreempt != 0 {
             // Stops at a prologue after preempt_on (the stub zeroed the
             // limit: poisoned again).
-            (*g).guard = 18446744073709551615;
-            return;
+            (*g).guard = POISON;
+            return 0;
         }
         if stw && !(*g).is_g0 {
             // The registers are saved below (by the stub), above SP.
@@ -1014,11 +1042,63 @@ pub fn morestack() {
             while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { sched_yield(); }
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_RUNNING);
         }
-        let lim = (*g).stack_lo + RED_ZONE;
-        if (crate::rt::stack_pointer() as usize) < lim {
-            crate::rt::native::fatal("stack overflow");
+        if (*g).old_size != 0 {
+            release_os((*g).old_stack, (*g).old_size);
+            (*g).old_size = 0;
         }
-        (*g).guard = lim;
+        let mut delta = 0usize;
+        if (*g).entry_sp < (*g).stack_lo + RED_ZONE + (*g).need {
+            if (*g).main || (*g).is_g0 { crate::rt::native::fatal("stack overflow"); }
+            delta = grow(g);
+        }
+        // A collector may have poisoned the limit meanwhile (it sets STW
+        // first): the G must still stop at its next prologue.
+        crate::rt::atomic_store(&mut (*g).guard as *mut usize, (*g).stack_lo + RED_ZONE);
+        if crate::rt::atomic_load(&mut STW as *mut usize) != 0 && !(*g).is_g0 {
+            crate::rt::atomic_store(&mut (*g).guard as *mut usize, POISON);
+        }
+        delta
+    }
+}
+
+const POISON: usize = 18446744073709551615;
+
+/// Moves the running G's stack (from its stub's SP up) to a new one with
+/// room for what the function entering morestack needs; returns how far it
+/// moved. Every word of the copy that points into the old stack (saved
+/// FPs, addresses of locals, the registers the stub saved) is moved as
+/// much, as are the catch_unwind records (on the heap). Nothing else
+/// points into a stack: escape analysis keeps such locals on the heap.
+#[cfg(feature = "navic")]
+fn grow(g: *mut G) -> usize {
+    unsafe {
+        let lo = (*g).stack_lo;
+        let hi = (*g).stack_hi;
+        let sp = (*g).entry_sp;
+        let used = hi - sp;
+        let mut size = hi - lo;
+        loop {
+            size = size * 2;
+            if size > MAX_STACK { crate::rt::native::fatal("stack overflow"); }
+            if size >= used + (*g).need + RED_ZONE + 4096 { break; }
+        }
+        let nlo = reserve(size);
+        let nhi = nlo + size;
+        let delta = nhi.wrapping_sub(hi);
+        let nsp = sp.wrapping_add(delta);
+        crate::rt::copy::<u8>(sp as *const u8, nsp as *mut u8, used);
+        let mut p = nsp;
+        while p < nhi {
+            let w = *(p as *const usize);
+            if w >= lo && w < hi { *(p as *mut usize) = w.wrapping_add(delta); }
+            p += 8;
+        }
+        crate::rt::native::move_catches((*g).catch, lo, hi, delta);
+        (*g).old_stack = lo;
+        (*g).old_size = hi - lo;
+        (*g).stack_lo = nlo;
+        (*g).stack_hi = nhi;
+        delta
     }
 }
 
