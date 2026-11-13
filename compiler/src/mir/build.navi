@@ -60,6 +60,8 @@ pub fn build_program(info: &mut Info, roots: Option<Vec<&mut Def>>) -> &mut Prog
     p
 }
 
+const RUNTIME_ROOTS: [&str; 6] = ["panic_raw", "panic_bounds", "gc_alloc", "sched_init", "gmain", "set_args"];
+
 const LANG_FNS: [&str; 3] = ["format=fmt::format", "str_eq=str::str_eq", "select=sync::mpmc::select_cases"];
 
 /// Whether d has a body to type-check and lower.
@@ -72,15 +74,26 @@ fn has_body(d: &Def) -> bool {
     }
 }
 
-/// Whether d is in std::rt, which the backend calls by name.
-fn in_runtime(d: &Def) -> bool {
-    if !d.krate.is_std { return false; }
-    let mut p = d.parent;
-    while let Some(x) = p {
-        if x.kind == resolve::DEF_MOD && x.name == "rt" { return true; }
-        p = x.parent;
+/// Whether d is a std helper that builtin and derived impls call: most
+/// free functions of std::fmt::rt and these of std::str and std::slice.
+fn shim_helper(d: &Def) -> bool {
+    let p = match d.parent { Some(p) => p, None => return false };
+    if p.kind != resolve::DEF_MOD { return false; }
+    let gp = match p.parent { Some(g) => g, None => return false };
+    if gp.parent.is_none() {
+        let n = d.name.as_str();
+        if p.name == "str" { return n == "str_eq" || n == "str_cmp" || n == "str_hash" || n == "str_index_range"; }
+        if p.name == "slice" {
+            return n == "eq_slices" || n == "hash_slice" || n == "cmp_slices" || n == "partial_cmp_slices" || n == "index_range"
+                || n == "index_range_mut" || n == "index_ref";
+        }
+        return false;
     }
-    false
+    // Float and 128-bit formatting pull in large parts of std::rt: they
+    // are built on first use.
+    let n = d.name.as_str();
+    if n == "fmt_float" || n == "fmt_u128" || n == "fmt_i128" || n == "fmt_radix128" { return false; }
+    p.name == "rt" && gp.name == "fmt" && match gp.parent { Some(r) => r.parent.is_none(), None => false }
 }
 
 impl Program {
@@ -92,8 +105,16 @@ impl Program {
         let mut work: Vec<&mut Def> = Vec::new();
         let mut seen: HashMap<u32, bool> = HashMap::new();
         let mut seen_traits: HashMap<u32, bool> = HashMap::new();
+        // The runtime functions generated code calls by name (see
+        // codegen::build_plan); the rest of std::rt is reached through
+        // calls, intrinsics included.
+        for name in RUNTIME_ROOTS.iter() {
+            if let Some(d) = self.native_fn(*name) { work.push(d); }
+        }
+        // The helpers that builtin and derived impls (built later, during
+        // planning) call, so that they get escape analysis and inlining.
         for d in self.info.res.defs.iter() {
-            if in_runtime(*d) && has_body(*d) { work.push(*d); }
+            if d.kind == resolve::DEF_FN && d.krate.is_std && has_body(*d) && shim_helper(*d) { work.push(*d); }
         }
         for entry in LANG_FNS.iter() {
             let name = entry.split('=').next().unwrap();
@@ -175,6 +196,24 @@ impl Program {
         if let Some(p) = d.parent {
             if p.kind == resolve::DEF_TRAIT { self.trait_method_refs(d, work); }
         }
+        // An intrinsic the backend does not expand calls its native
+        // implementation.
+        if let Node::Item(Item::Fn(fd)) = &d.node {
+            if crate::types::collect::has_attr(&fd.base.attrs, "intrinsic") && !crate::codegen::is_inline(d.name.as_str()) {
+                if let Some(nd) = self.native_fn(d.name.as_str()) { work.push(nd); }
+            }
+        }
+    }
+
+    /// std::rt::native::name, if it exists.
+    fn native_fn(&self, name: &str) -> Option<&mut Def> {
+        for c in self.info.res.crates.iter() {
+            if !c.is_std { continue; }
+            let rt = c.root.unwrap().lookup("rt", resolve::TYPE_NS)?.res.def?.module?;
+            let nat = rt.lookup("native", resolve::TYPE_NS)?.res.def?.module?;
+            return nat.lookup(name, resolve::VALUE_NS)?.res.def;
+        }
+        None
     }
 
     /// A trait method and its implementations in every impl.
