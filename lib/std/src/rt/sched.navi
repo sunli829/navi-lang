@@ -75,6 +75,10 @@ pub struct G {
     poisoned: bool,
     is_g0: bool,
     regs: [usize; 10],
+    // The object locks (addresses of lock words) its M's scheduler record
+    // releases once the G has switched away (see park_on).
+    release: usize,
+    release_n: usize,
 }
 
 // G.sys: running navi code; blocked in C (a system call or waiting for the
@@ -239,6 +243,7 @@ pub fn go(f: fn()) {
         (*g).lock_depth = 0;
         (*g).sys = SYS_RUNNING;
         (*g).poisoned = false;
+        (*g).release_n = 0;
     }
     ready(g);
     unlock();
@@ -328,6 +333,18 @@ fn ready(g: *mut G) { enqueue(g); }
 #[cfg(not(feature = "navic"))]
 fn block_current() { schedule(); }
 
+// Blocks the running G (its wait nodes are enlisted) until woken.
+#[cfg(not(feature = "navic"))]
+fn park_on(locks: *const usize, n: usize) {
+    let g = current();
+    unsafe { (*g).status = WAITING; }
+    schedule();
+}
+#[cfg(not(feature = "navic"))]
+fn obj_lock(lk: *mut usize) {}
+#[cfg(not(feature = "navic"))]
+fn obj_unlock(lk: *mut usize) {}
+
 #[cfg(not(feature = "navic"))]
 pub fn lock() {}
 #[cfg(not(feature = "navic"))]
@@ -359,24 +376,19 @@ pub fn enlist(w: *mut WaitList) {
     }
 }
 
-/// Blocks the running G until a list it is on is woken (the runtime lock
-/// is held, and held again when it returns).
-pub fn park() {
-    let g = current();
-    unsafe { (*g).status = WAITING; }
-    block_current();
-}
-
-/// Waits on one list.
-pub fn wait(w: *mut WaitList) {
+/// Waits on w, whose object lock lk is held (and held again on return).
+pub fn wait(w: *mut WaitList, lk: *mut usize) {
     enlist(w);
-    park();
+    let one = [lk as usize];
+    park_on(&one as *const [usize; 1] as *const usize, 1);
 }
 
-/// Wakes every G waiting on w.
+/// Wakes every G waiting on w (its object lock is held).
 pub fn broadcast(w: *mut WaitList) {
     let mut n = unsafe { (*w).head };
+    if n as usize == 0 { return; }
     unsafe { (*w).head = 0 as *mut WaitNode; }
+    lock();
     while n as usize != 0 {
         unsafe {
             let g = (*n).g;
@@ -387,33 +399,36 @@ pub fn broadcast(w: *mut WaitList) {
             n = (*n).next;
         }
     }
+    unlock();
 }
 
 // --- Threads -------------------------------------------------------------------
 
 /// A spawned thread: its result cell and the Gs joining it.
-pub struct Handle { done: bool, result: *mut u8, waiters: WaitList }
+pub struct Handle { lk: usize, done: bool, result: *mut u8, waiters: WaitList }
 
 pub fn new_handle(result: *mut u8) -> *mut Handle {
-    &mut Handle { done: false, result, waiters: new_wait_list() } as *mut Handle
+    &mut Handle { lk: 0, done: false, result, waiters: new_wait_list() } as *mut Handle
 }
 
 pub fn finish(h: *mut Handle) {
-    lock();
     unsafe {
+        let lk = &mut (*h).lk as *mut usize;
+        obj_lock(lk);
         (*h).done = true;
         broadcast(&mut (*h).waiters as *mut WaitList);
+        obj_unlock(lk);
     }
-    unlock();
 }
 
 pub fn join(h: *mut Handle) -> *mut u8 {
-    lock();
     unsafe {
-        while !(*h).done { wait(&mut (*h).waiters as *mut WaitList); }
+        let lk = &mut (*h).lk as *mut usize;
+        obj_lock(lk);
+        while !(*h).done { wait(&mut (*h).waiters as *mut WaitList, lk); }
+        obj_unlock(lk);
+        (*h).result
     }
-    unlock();
-    unsafe { (*h).result }
 }
 
 // --- Channels ------------------------------------------------------------------
@@ -422,6 +437,8 @@ const UNBOUNDED: usize = 18446744073709551615;
 
 /// A channel of elements of elem bytes, stored in a ring buffer.
 pub struct Chan {
+    // The channel's lock (see obj_lock).
+    lk: usize,
     elem: usize,
     cap: usize,
     buf: *mut u8,
@@ -438,11 +455,12 @@ pub struct Chan {
 }
 
 pub fn new_chan(elem: usize, cap: usize, write_result: fn(*mut u8, *const u8)) -> *mut Chan {
-    &mut Chan { elem, cap, buf: 0 as *mut u8, head: 0, len: 0, slots: 0, closed: false, send_seq: 0,
+    &mut Chan { lk: 0, elem, cap, buf: 0 as *mut u8, head: 0, len: 0, slots: 0, closed: false, send_seq: 0,
         recv_seq: 0, recv_waiter: 0, waiters: new_wait_list(), write_result } as *mut Chan
 }
 
 fn wl(c: *mut Chan) -> *mut WaitList { unsafe { &mut (*c).waiters as *mut WaitList } }
+fn lk(c: *mut Chan) -> *mut usize { unsafe { &mut (*c).lk as *mut usize } }
 
 fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) { crate::rt::copy::<u8>(src, dst, n); }
 
@@ -479,9 +497,9 @@ fn pop(c: *mut Chan, dst: *mut u8) {
 
 /// Sends the elem bytes at src; false if the channel is closed.
 pub fn send(c: *mut Chan, src: *const u8) -> bool {
-    lock();
+    obj_lock(lk(c));
     let ok = send_locked(c, src);
-    unlock();
+    obj_unlock(lk(c));
     ok
 }
 
@@ -490,14 +508,14 @@ fn send_locked(c: *mut Chan, src: *const u8) -> bool {
         loop {
             if (*c).closed { return false; }
             if (*c).cap == UNBOUNDED || (*c).len < (*c).cap || (*c).cap == 0 { break; }
-            wait(wl(c));
+            wait(wl(c), lk(c));
         }
         push(c, src);
         (*c).send_seq += 1;
         let seq = (*c).send_seq;
         broadcast(wl(c));
         if (*c).cap == 0 {
-            while (*c).recv_seq < seq && !(*c).closed { wait(wl(c)); }
+            while (*c).recv_seq < seq && !(*c).closed { wait(wl(c), lk(c)); }
         }
     }
     true
@@ -506,9 +524,9 @@ fn send_locked(c: *mut Chan, src: *const u8) -> bool {
 /// Receives into dst; false if the channel is closed and empty (or, when
 /// not blocking, empty).
 pub fn recv(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
-    lock();
+    obj_lock(lk(c));
     let ok = recv_locked(c, dst, block);
-    unlock();
+    obj_unlock(lk(c));
     ok
 }
 
@@ -516,7 +534,7 @@ fn recv_locked(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
     unsafe {
         (*c).recv_waiter += 1;
         broadcast(wl(c));
-        while (*c).len == 0 && !(*c).closed && block { wait(wl(c)); }
+        while (*c).len == 0 && !(*c).closed && block { wait(wl(c), lk(c)); }
         (*c).recv_waiter -= 1;
         if (*c).len > 0 {
             pop(c, dst);
@@ -529,29 +547,37 @@ fn recv_locked(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
 }
 
 pub fn close(c: *mut Chan) {
-    lock();
+    obj_lock(lk(c));
     unsafe { (*c).closed = true; }
     broadcast(wl(c));
-    unlock();
+    obj_unlock(lk(c));
 }
 
 pub fn closed(c: *mut Chan) -> bool {
-    lock();
+    obj_lock(lk(c));
     let r = unsafe { (*c).closed && (*c).len == 0 };
-    unlock();
+    obj_unlock(lk(c));
     r
 }
 
 /// Runs a select over cases; returns the index of the case that ran or
 /// cases.len() for the default case.
 pub fn run_select(cases: &[crate::sync::mpmc::SelectCase], has_default: bool) -> usize {
-    lock();
-    let i = select_locked(cases, has_default);
-    unlock();
+    // The locks of the distinct channels, in address order (no deadlock
+    // with another select).
+    let mut locks: Vec<usize> = Vec::new();
+    for c in cases.iter() {
+        let l = lk(case_chan(c)) as usize;
+        if !locks.contains(&l) { locks.push(l); }
+    }
+    locks.sort();
+    for l in locks.iter() { obj_lock(*l as *mut usize); }
+    let i = select_locked(cases, has_default, &locks);
+    for l in locks.iter() { obj_unlock(*l as *mut usize); }
     i
 }
 
-fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool) -> usize {
+fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool, locks: &Vec<usize>) -> usize {
     let n = cases.len();
     loop {
         let mut i = 0;
@@ -590,7 +616,7 @@ fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool) -> 
             enlist(wl(case_chan(&cases[j])));
             j += 1;
         }
-        park();
+        park_on(locks.as_ptr(), locks.len());
     }
 }
 
@@ -839,7 +865,11 @@ fn mloop() -> ! {
     let g0 = current();
     let m = unsafe { (*g0).m } as *mut M;
     // M0's loop starts when the main G first blocks.
-    unsafe { (*m).cur = 0 as *mut G; }
+    unsafe {
+        let first = (*m).cur;
+        if first as usize != 0 { release_locks(first); }
+        (*m).cur = 0 as *mut G;
+    }
     loop {
         let g = dequeue();
         if g as usize != 0 {
@@ -850,8 +880,10 @@ fn mloop() -> ! {
             }
             unlock();
             switch(g0, g);
-            // g blocked: it passed the lock to us.
+            // g blocked: it passed the lock to us; release the object locks
+            // it held.
             unsafe { (*m).cur = 0 as *mut G; }
+            release_locks(g);
             continue;
         }
         if !MULTI || IDLE + 1 >= NUM_M {
@@ -861,6 +893,55 @@ fn mloop() -> ! {
         IDLE += 1;
         unsafe { pthread_cond_wait(IDLE_CV as *mut u8, MU as *mut u8); }
         IDLE -= 1;
+    }
+}
+
+// An object lock (a word in a channel or thread handle; 0: free). A G
+// spinning on one calls a function each time round, a safepoint for a
+// collector.
+#[cfg(feature = "navic")]
+fn obj_lock(lk: *mut usize) {
+    while !crate::rt::atomic_cas(lk, 0, 1) { spin_wait(); }
+}
+
+#[cfg(feature = "navic")]
+fn obj_unlock(lk: *mut usize) { crate::rt::atomic_store(lk, 0); }
+
+#[cfg(feature = "navic")]
+fn spin_wait() { unsafe { sched_yield(); } }
+
+// Blocks the running G (its wait nodes are enlisted) until woken: it holds
+// the n object locks at locks, which its M's scheduler record releases
+// after the switch (so a waker cannot see it before it stopped); they are
+// held again on return.
+#[cfg(feature = "navic")]
+fn park_on(locks: *const usize, n: usize) {
+    lock();
+    let g = current();
+    unsafe {
+        (*g).status = WAITING;
+        (*g).release = locks as usize;
+        (*g).release_n = n;
+    }
+    block_current();
+    unlock();
+    let mut i = 0;
+    while i < n {
+        obj_lock(unsafe { *((locks as usize + 8 * i) as *const usize) } as *mut usize);
+        i += 1;
+    }
+}
+
+// Releases the object locks a G that just switched away held (park_on).
+#[cfg(feature = "navic")]
+fn release_locks(g: *mut G) {
+    unsafe {
+        let mut i = 0;
+        while i < (*g).release_n {
+            obj_unlock(*(((*g).release + 8 * i) as *const usize) as *mut usize);
+            i += 1;
+        }
+        (*g).release_n = 0;
     }
 }
 
