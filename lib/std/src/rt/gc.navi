@@ -146,23 +146,7 @@ static mut CLASS_OF: [u8; 513] = [0; 513];
 /// path (a free object in the first span of the size class) is written out
 /// in this one function.
 pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
-    if multi() {
-        crate::rt::sched::lock();
-        let p = alloc_fast(size, noscan);
-        crate::rt::sched::unlock();
-        return p;
-    }
-    alloc_fast(size, noscan)
-}
-
-// Whether other OS threads may allocate too (then the runtime lock guards
-// the heap).
-#[cfg(feature = "navic")]
-fn multi() -> bool { crate::rt::sched::multi() }
-#[cfg(not(feature = "navic"))]
-fn multi() -> bool { false }
-
-fn alloc_fast(size: usize, noscan: bool) -> *mut u8 {
+    if MULTI { return alloc_mt(size, noscan); }
     if ALLOCATED >= NEXT_GC {
         if ARENA == 0 { init(); } else { collect_locked(); }
     }
@@ -193,6 +177,98 @@ fn alloc_fast(size: usize, noscan: bool) -> *mut u8 {
         }
     }
     alloc_small(c, noscan) as *mut u8
+}
+
+/// Set (by the scheduler) once a second OS thread exists.
+pub static mut MULTI: bool = false;
+
+// With several OS threads (navic): small objects come from spans the M
+// keeps for itself (sched::m_cache), without the runtime lock; a span is
+// taken from the shared lists, and counted as allocated, under the lock
+// when the M's one is used up. Large objects are allocated under the lock.
+#[cfg(feature = "navic")]
+fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
+    if size <= MAX_SMALL {
+        let c = CLASS_OF[(size + 15) >> 4] as usize;
+        let list = c * 2 + if noscan { 1 } else { 0 };
+        let slot = crate::rt::sched::m_cache() + list * 8;
+        // No call (safepoint) from reading the cache to taking the object: a
+        // collector may empty the caches whenever this G stops.
+        unsafe {
+            let s = *(slot as *const usize) as *mut Span;
+            if s as usize != 0 && (*s).nfree > 0 {
+                let p = (*s).freelist;
+                (*s).freelist = *(p as *const usize);
+                (*s).nfree -= 1;
+                let elem = (*s).elem;
+                let i = ((p - (*s).start) * (*s).div_mul) >> 32;
+                *(((*s).bits as usize + i) as *mut u8) = 1;
+                let mut q = p;
+                while q < p + elem {
+                    *(q as *mut usize) = 0;
+                    q += 8;
+                }
+                return p as *mut u8;
+            }
+        }
+        crate::rt::sched::lock();
+        let ns = refill(c, list);
+        st(slot, ns as usize);
+        let p = take_owned(ns);
+        crate::rt::sched::unlock();
+        return p as *mut u8;
+    }
+    crate::rt::sched::lock();
+    if ALLOCATED >= NEXT_GC { collect_locked(); }
+    let p = alloc_large(size, noscan);
+    crate::rt::sched::unlock();
+    p as *mut u8
+}
+#[cfg(not(feature = "navic"))]
+fn alloc_mt(size: usize, noscan: bool) -> *mut u8 { 0 as *mut u8 }
+
+// A span of class c with free objects for an M's cache (the runtime lock
+// is held): taken off the shared list, its free objects counted as
+// allocated.
+fn refill(c: usize, list: usize) -> *mut Span {
+    if ALLOCATED >= NEXT_GC { collect_locked(); }
+    loop {
+        let s = FREE[list] as *mut Span;
+        if s as usize == 0 { break; }
+        unsafe {
+            FREE[list] = (*s).next_free as usize;
+            (*s).in_free = false;
+            if (*s).nfree > 0 {
+                ALLOCATED += (*s).nfree * (*s).elem;
+                return s;
+            }
+        }
+    }
+    let s = new_span(CLASSES[c], SPAN_BYTES, list & 1 == 1, list);
+    unsafe { ALLOCATED += (*s).nfree * (*s).elem; }
+    s
+}
+
+// Pops a free object of a span the M owns and zeroes it.
+fn take_owned(s: *mut Span) -> usize {
+    unsafe {
+        let p = (*s).freelist;
+        (*s).freelist = *(p as *const usize);
+        (*s).nfree -= 1;
+        let elem = (*s).elem;
+        let i = ((p - (*s).start) * (*s).div_mul) >> 32;
+        *(((*s).bits as usize + i) as *mut u8) = 1;
+        if elem <= 64 {
+            let mut q = p;
+            while q < p + elem {
+                *(q as *mut usize) = 0;
+                q += 8;
+            }
+        } else {
+            memset(p as *mut u8, 0, elem);
+        }
+        p
+    }
 }
 
 fn class_of(size: usize) -> usize {
@@ -373,6 +449,8 @@ fn collect_locked() {
     COLLECTING = true;
     COLLECTIONS += 1;
     crate::rt::sched::stop_the_world();
+    // The spans the Ms kept go back to the shared lists (sweep rebuilds them).
+    crate::rt::sched::flush_caches();
     crate::rt::spill_registers(&mut SAVED_REGS as *mut [usize; 10] as *mut usize);
     // From the stack pointer: this frame holds the callers' registers saved
     // by its prologue.
