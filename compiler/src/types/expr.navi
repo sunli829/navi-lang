@@ -360,12 +360,15 @@ impl FnCtx {
         if op == token::STAR {
             let it = self.infer(inner, None);
             let t = self.inf.shallow(it);
-            if t.kind == K_REF { return t.el(); }
-            if t.kind == K_PTR {
-                self.require_unsafe(op_pos, "dereference of raw pointer".to_string());
-                return t.el();
+            match t.kind {
+                K_REF => return t.el(),
+                K_PTR => {
+                    self.require_unsafe(op_pos, "dereference of raw pointer".to_string());
+                    return t.el();
+                }
+                K_ERROR => return self.ctx().err,
+                _ => {}
             }
-            if t.kind == K_ERROR { return self.ctx().err; }
             if let Some(target) = self.overloaded_deref(t) {
                 self.adjust_of(x).derefs = 1;
                 return target;
@@ -383,12 +386,15 @@ impl FnCtx {
                     return t;
                 }
             }
-            if op == token::MINUS && (is_float_t(t) || is_int_t(t) && int_signed(t.int)) { return t; }
-            if op == token::MINUS && is_int_t(t) {
-                self.errorf(op_pos, `cannot negate unsigned integer type ${t}`);
-                return t;
+            match op {
+                token::MINUS if (is_float_t(t) || is_int_t(t) && int_signed(t.int)) => return t,
+                token::MINUS if is_int_t(t) => {
+                    self.errorf(op_pos, `cannot negate unsigned integer type ${t}`);
+                    return t;
+                }
+                token::NOT if (is_int_t(t) || t.kind == K_BOOL) => return t,
+                _ => {}
             }
-            if op == token::NOT && (is_int_t(t) || t.kind == K_BOOL) { return t; }
             let name = if op == token::NOT { "Not" } else { "Neg" };
             return self.op_trait(name, t, None, op_pos);
         }
@@ -1127,16 +1133,18 @@ impl FnCtx {
         if derefs > 0 {
             if let Some(t0) = self.body.types.get(&x.id) {
                 let t = self.inf.shallow(*t0);
-                if t.kind == K_REF && !t.is_mut {
-                    self.errorf(pos, `cannot ${what} data behind a & reference`);
-                    return;
+                match t.kind {
+                    K_REF if !t.is_mut => {
+                        self.errorf(pos, `cannot ${what} data behind a & reference`);
+                        return;
+                    }
+                    K_REF => { return; }
+                    K_PTR => {
+                        if !t.is_mut { self.errorf(pos, `cannot ${what} data behind a *const pointer`); }
+                        return;
+                    }
+                    _ => {}
                 }
-                if t.kind == K_REF { return; }
-                if t.kind == K_PTR {
-                    if !t.is_mut { self.errorf(pos, `cannot ${what} data behind a *const pointer`); }
-                    return;
-                }
-                // Overloaded deref (Vec, String): the place itself must be mutable.
             }
         }
         let (ok, why) = self.is_mut_place(x);
@@ -1158,17 +1166,20 @@ impl FnCtx {
             ExprKind::Paren { x: inner, .. } => return self.is_mut_place(*inner),
             ExprKind::Path(p) => {
                 let res = match self.info.res.paths.get(&p.id) { Some(r) => r.clone(), None => resolve::res_err() };
-                if res.kind == resolve::RES_LOCAL {
-                    let l = res.local.unwrap();
-                    if l.is_mut { return (true, String::new()); }
-                    return (false, `immutable variable ${l.name} (declare it with let mut)`);
+                match res.kind {
+                    resolve::RES_LOCAL => {
+                        let l = res.local.unwrap();
+                        if l.is_mut { return (true, String::new()); }
+                        return (false, `immutable variable ${l.name} (declare it with let mut)`);
+                    }
+                    resolve::RES_DEF if res.def.unwrap().kind == resolve::DEF_STATIC => {
+                        let d = res.def.unwrap();
+                        if self.c.const_info(d).is_mut { return (true, String::new()); }
+                        return (false, `immutable static ${d.name}`);
+                    }
+                    resolve::RES_DEF if res.def.unwrap().kind == resolve::DEF_EXTERN_STATIC => return (true, String::new()),
+                    _ => {}
                 }
-                if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_STATIC {
-                    let d = res.def.unwrap();
-                    if self.c.const_info(d).is_mut { return (true, String::new()); }
-                    return (false, `immutable static ${d.name}`);
-                }
-                if res.kind == resolve::RES_DEF && res.def.unwrap().kind == resolve::DEF_EXTERN_STATIC { return (true, String::new()); }
                 return (false, "this expression".to_string());
             }
             ExprKind::Field { x: base, .. } | ExprKind::Index { x: base, .. } => {
@@ -1185,9 +1196,12 @@ impl FnCtx {
             ExprKind::Unary { op, x: inner, .. } => {
                 if *op == token::STAR {
                     let t = match self.type_of(*inner) { Some(t) => t, None => return (true, String::new()) };
-                    if t.kind == K_REF && !t.is_mut { return (false, "data behind a & reference".to_string()); }
-                    if t.kind == K_PTR && !t.is_mut { return (false, "data behind a *const pointer".to_string()); }
-                    if t.kind == K_ADT { return self.is_mut_place(*inner); }
+                    match t.kind {
+                        K_REF if !t.is_mut => return (false, "data behind a & reference".to_string()),
+                        K_PTR if !t.is_mut => return (false, "data behind a *const pointer".to_string()),
+                        K_ADT => return self.is_mut_place(*inner),
+                        _ => {}
+                    }
                     return (true, String::new());
                 }
             }
