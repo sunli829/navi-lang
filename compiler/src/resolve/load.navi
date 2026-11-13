@@ -1,8 +1,10 @@
 //! Loading a crate's files and collecting its items into modules.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::thread;
 use crate::syntax::ast::*;
-use crate::syntax::source::File;
+use crate::syntax::source::{File, Errors};
 use crate::syntax::parser;
 use crate::resolve::*;
 use crate::util;
@@ -12,7 +14,12 @@ impl Resolver {
     /// rules for `mod name;`.
     pub fn load(&mut self, c: &mut Crate, root: &str) {
         let mut files: HashMap<String, &SourceFile> = HashMap::new();
-        self.parse_tree(c, root, util::path_dir(root).as_str(), &mut files);
+        if crate::resolve::cfg::stage0_mode() {
+            // Node ids as stage0 numbers them (dumps compare).
+            self.parse_tree(c, root, util::path_dir(root).as_str(), &mut files);
+        } else {
+            self.parse_levels(c, root, util::path_dir(root).as_str(), &mut files);
+        }
         let root_file = match files.get(&root.to_string()) { Some(f) => *f, None => return };
         let rm = new_module(c, None, c.name.as_str());
         c.root = Some(rm);
@@ -49,6 +56,58 @@ impl Resolver {
             if !files.contains_key(child) {
                 self.parse_tree(c, child.as_str(), child_dir.as_str(), files);
             }
+        }
+    }
+
+    // Parses root, then the files its mod declarations name, and so on, a
+    // level at a time: the files of a level are parsed on several threads.
+    // Each file numbers its nodes from its own range of ids, given in order
+    // and sized by the file, so the ids do not depend on the threads.
+    fn parse_levels(&mut self, c: &mut Crate, root: &str, dir: &str, files: &mut HashMap<String, &SourceFile>) {
+        let mut level: Vec<(String, String)> = Vec::new();
+        level.push((root.to_string(), dir.to_string()));
+        let mut queued: HashMap<String, bool> = HashMap::new();
+        queued.insert(root.to_string(), true);
+        while level.len() > 0 {
+            let mut srcs: Vec<&File> = Vec::new();
+            let mut paths: Vec<(String, String)> = Vec::new();
+            let mut bases: Vec<u32> = Vec::new();
+            for (p, d) in level.iter() {
+                let full = util::path_join(c.fs_root.as_str(), p.as_str());
+                let src = match std::fs::read_to_string(&full) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        self.errorf(None, 0, `crate ${c.name}: open ${p}: no such file or directory`);
+                        continue;
+                    }
+                };
+                crate::cache::note(full.as_str(), &src);
+                let base = next_id();
+                set_next_id(base + id_bound(src.len()));
+                srcs.push(File::new(util::path_join(c.dir.as_str(), p.as_str()).as_str(), src));
+                paths.push((p.clone(), d.clone()));
+                bases.push(base);
+            }
+            let parsed = parse_all(&srcs, &bases);
+            let mut next: Vec<(String, String)> = Vec::new();
+            let mut i = 0;
+            while i < parsed.len() {
+                let (sf, errs, end) = parsed[i];
+                if end > bases[i] + id_bound(srcs[i].src.len()) { panic("parse: more nodes than ids reserved for the file"); }
+                for d in errs.diags.iter() { self.errorf(Some(sf.file), d.pos, d.msg.clone()); }
+                let (p, d) = &paths[i];
+                files.insert(p.clone(), sf);
+                i += 1;
+                if !self.cfg_enabled_quiet(&sf.attrs) { continue; }
+                let mut found: Vec<(String, String)> = Vec::new();
+                self.find_mod_files(c, &sf.items, d.as_str(), &mut found);
+                for (child, child_dir) in found.iter() {
+                    if queued.contains_key(child) { continue; }
+                    queued.insert(child.clone(), true);
+                    next.push((child.clone(), child_dir.clone()));
+                }
+            }
+            level = next;
         }
     }
 
@@ -299,4 +358,52 @@ fn child_dir(p: &str, is_root: bool) -> String {
     let base = util::path_base(p);
     let stem = &base[0..base.len() - 5];
     util::path_join(util::path_dir(p).as_str(), stem)
+}
+
+// The ids a file of n bytes may use (a node per byte is far more than any
+// file has).
+fn id_bound(n: usize) -> u32 { (2 * n + 64) as u32 }
+
+// Parses srcs[i] with ids from bases[i], on as many threads as can run;
+// (file, errors, the id after its last) in order.
+fn parse_all(srcs: &Vec<&File>, bases: &Vec<u32>) -> Vec<(&SourceFile, &mut Errors, u32)> {
+    let n = srcs.len();
+    let mut nw = match thread::available_parallelism() { Ok(k) => k, Err(_) => 1 };
+    if nw > n { nw = n; }
+    let next = &Mutex::new(0usize);
+    let mut done: Vec<(usize, &SourceFile, &mut Errors, u32)> = Vec::new();
+    if nw <= 1 {
+        done = parse_some(srcs, bases, next);
+    } else {
+        let mut hs = Vec::new();
+        let mut k = 0;
+        while k < nw {
+            hs.push(thread::spawn(|| parse_some(srcs, bases, next)));
+            k += 1;
+        }
+        for h in hs.iter() {
+            for d in h.join().unwrap().iter() { done.push(*d); }
+        }
+    }
+    let mut out: Vec<Option<(&SourceFile, &mut Errors, u32)>> = Vec::new();
+    for _ in srcs.iter() { out.push(None); }
+    for (i, sf, e, end) in done.iter() { out[*i] = Some((*sf, *e, *end)); }
+    let mut res = Vec::new();
+    for o in out.iter() { res.push(o.unwrap()); }
+    res
+}
+
+fn parse_some(srcs: &Vec<&File>, bases: &Vec<u32>, next: &Mutex<usize>) -> Vec<(usize, &SourceFile, &mut Errors, u32)> {
+    let mut res = Vec::new();
+    loop {
+        let i = next.with_lock(|k| {
+            let i = *k;
+            *k = i + 1;
+            i
+        });
+        if i >= srcs.len() { return res; }
+        let ids = &mut IdGen { next: bases[i] };
+        let (sf, errs) = parser::parse_file_ids(srcs[i], ids);
+        res.push((i, sf, errs, ids.next));
+    }
 }

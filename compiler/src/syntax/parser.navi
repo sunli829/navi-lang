@@ -8,9 +8,18 @@ use crate::util;
 
 /// Parses one source file; errors are left in the returned Errors.
 pub fn parse_file(f: &File) -> (&SourceFile, &mut Errors) {
+    let ids = &mut IdGen { next: next_id() };
+    let r = parse_file_ids(f, ids);
+    set_next_id(ids.next);
+    r
+}
+
+/// Parses one source file numbering its nodes from ids (files may be
+/// parsed on several threads, each with its own range of ids).
+pub fn parse_file_ids(f: &File, ids: &mut IdGen) -> (&SourceFile, &mut Errors) {
     let errs = Errors::new(f);
     let toks = lexer::tokenize(f.src.as_str(), errs);
-    let mut p = Parser { file: f, toks, i: 0, errs, no_struct_lit: false, last_err_pos: NO_POS };
+    let mut p = Parser { file: f, toks, i: 0, errs, no_struct_lit: false, last_err_pos: NO_POS, ids };
     let attrs = p.inner_attrs();
     let items = p.items(EOF);
     p.errs.diags.sort_by(|a, b| a.pos.cmp(&b.pos));
@@ -24,6 +33,7 @@ pub struct Parser {
     errs: &mut Errors,
     no_struct_lit: bool,
     last_err_pos: Pos,
+    ids: &mut IdGen,
 }
 
 const PREC_OR_OR: i32 = 1;
@@ -65,6 +75,22 @@ fn is_path_start(k: Kind) -> bool {
 fn is_digit(c: u8) -> bool { c >= b'0' && c <= b'9' }
 
 impl Parser {
+    fn id(&mut self) -> u32 {
+        let i = self.ids.next;
+        self.ids.next = i + 1;
+        i
+    }
+
+    fn mk_expr(&mut self, kind: ExprKind) -> &Expr { &Expr { id: self.id(), kind } }
+    fn mk_ty(&mut self, kind: TypeKind) -> &Type { &Type { id: self.id(), kind } }
+    fn mk_pat(&mut self, kind: PatKind) -> &Pat { &Pat { id: self.id(), kind } }
+
+    fn mk_simple_path(&mut self, n: &Name) -> &Path {
+        let mut segs = Vec::new();
+        segs.push(&PathSegment { name: n, args: None });
+        &Path { id: self.id(), segments: segs, qself: None }
+    }
+
     fn tok(&self) -> Token { self.toks[self.i].clone() }
     fn kind(&self) -> Kind { self.toks[self.i].kind }
     fn pos(&self) -> Pos { self.toks[self.i].pos }
@@ -273,7 +299,7 @@ impl Parser {
         let start = self.pos();
         let vis = self.visibility();
         let has_attrs = attrs.len() > 0;
-        let base = ItemBase { id: new_id(), attrs, vis: vis.clone(), start };
+        let base = ItemBase { id: self.id(), attrs, vis: vis.clone(), start };
         let k = self.kind();
         match k {
             KW_FN => return Some(Item::Fn(self.fn_decl(base, ""))),
@@ -434,7 +460,7 @@ impl Parser {
                 let nm = self.name();
                 self.expect(COLON);
                 let t = self.typ();
-                g.params.push(&GenericParam { id: new_id(), name: nm, bounds: Vec::new(), default: None, ty: Some(t) });
+                g.params.push(&GenericParam { id: self.id(), name: nm, bounds: Vec::new(), default: None, ty: Some(t) });
                 if !self.got(COMMA) { break; }
                 continue;
             }
@@ -443,7 +469,7 @@ impl Parser {
             let mut default = None;
             if self.got(COLON) { bounds = self.bounds(); }
             if self.got(EQ) { default = Some(self.typ()); }
-            g.params.push(&GenericParam { id: new_id(), name: nm, bounds, default, ty: None });
+            g.params.push(&GenericParam { id: self.id(), name: nm, bounds, default, ty: None });
             if !self.got(COMMA) { break; }
         }
         self.expect_gt();
@@ -509,7 +535,7 @@ impl Parser {
             let nm = self.name();
             self.expect(COLON);
             let t = self.typ();
-            fields.push(&Field { id: new_id(), attrs, vis, name: Some(nm), ty: t });
+            fields.push(&Field { id: self.id(), attrs, vis, name: Some(nm), ty: t });
             if !self.got(COMMA) { break; }
         }
         self.expect(R_BRACE);
@@ -523,7 +549,7 @@ impl Parser {
             let attrs = self.outer_attrs();
             let vis = self.visibility();
             let t = self.typ();
-            fields.push(&Field { id: new_id(), attrs, vis, name: None, ty: t });
+            fields.push(&Field { id: self.id(), attrs, vis, name: None, ty: t });
             if !self.got(COMMA) { break; }
         }
         self.expect(R_PAREN);
@@ -555,7 +581,7 @@ impl Parser {
             }
             let mut disc = None;
             if self.got(EQ) { disc = Some(self.expr()); }
-            e.variants.push(&Variant { id: new_id(), attrs, name: vn, kind, fields, discriminant: disc });
+            e.variants.push(&Variant { id: self.id(), attrs, name: vn, kind, fields, discriminant: disc });
             if !self.got(COMMA) { break; }
         }
         self.expect(R_BRACE);
@@ -680,7 +706,7 @@ impl Parser {
                 break;
             }
         }
-        t.prefix = Some(&Path { id: new_id(), segments: segs, qself: None });
+        t.prefix = Some(&Path { id: self.id(), segments: segs, qself: None });
         if !t.glob && !t.group && self.got(KW_AS) {
             if self.kind() == UNDERSCORE {
                 t.alias = Some(name(self.next().pos, "_"));
@@ -709,7 +735,7 @@ impl Parser {
             let attrs = self.outer_attrs();
             let start = self.pos();
             let vis = self.visibility();
-            let ib = ItemBase { id: new_id(), attrs, vis, start };
+            let ib = ItemBase { id: self.id(), attrs, vis, start };
             let k = self.kind();
             match k {
                 KW_FN => {
@@ -766,7 +792,7 @@ impl Parser {
         let mut segs = Vec::new();
         loop {
             segs.push(&PathSegment { name: self.path_name(), args: None });
-            if !self.got(PATH_SEP) { return &Path { id: new_id(), segments: segs, qself: None }; }
+            if !self.got(PATH_SEP) { return &Path { id: self.id(), segments: segs, qself: None }; }
         }
     }
 
@@ -796,7 +822,7 @@ impl Parser {
         }
         let mut out: Vec<&PathSegment> = Vec::new();
         for s in segs.iter() { out.push(*s); }
-        &Path { id: new_id(), segments: out, qself }
+        &Path { id: self.id(), segments: out, qself }
     }
 
     fn qself(&mut self) -> &QSelf {
@@ -824,11 +850,11 @@ impl Parser {
                 INT | MINUS | KW_TRUE | KW_FALSE | CHAR => {
                     // A const argument.
                     let x = self.unary();
-                    ga.args.push(ty(TypeKind::Const(x)));
+                    ga.args.push(self.mk_ty(TypeKind::Const(x)));
                 }
                 L_BRACE => {
                     let x = self.block();
-                    ga.args.push(ty(TypeKind::Const(x)));
+                    ga.args.push(self.mk_ty(TypeKind::Const(x)));
                 }
                 _ => {
                     ga.args.push(self.typ());
@@ -850,7 +876,7 @@ impl Parser {
                 self.got_amp();
                 let is_mut = self.got(KW_MUT);
                 let elem = self.typ();
-                return ty(TypeKind::Ref { amp: t.pos, is_mut, elem });
+                return self.mk_ty(TypeKind::Ref { amp: t.pos, is_mut, elem });
             }
             STAR => {
                 self.next();
@@ -863,7 +889,7 @@ impl Parser {
                     self.errorf(p, "expected 'const' or 'mut' after '*' in a pointer type".to_string());
                 }
                 let elem = self.typ();
-                return ty(TypeKind::Ptr { star: t.pos, is_mut, elem });
+                return self.mk_ty(TypeKind::Ptr { star: t.pos, is_mut, elem });
             }
             L_BRACKET => {
                 self.next();
@@ -871,10 +897,10 @@ impl Parser {
                 if self.got(SEMI) {
                     let n = self.expr();
                     self.expect(R_BRACKET);
-                    return ty(TypeKind::Array { lbrack: t.pos, elem, len: n });
+                    return self.mk_ty(TypeKind::Array { lbrack: t.pos, elem, len: n });
                 }
                 self.expect(R_BRACKET);
-                return ty(TypeKind::Slice { lbrack: t.pos, elem });
+                return self.mk_ty(TypeKind::Slice { lbrack: t.pos, elem });
             }
             L_PAREN => {
                 self.next();
@@ -887,7 +913,7 @@ impl Parser {
                 }
                 self.expect(R_PAREN);
                 if elems.len() == 1 && !trailing { return elems[0]; }
-                return ty(TypeKind::Tuple { lparen: t.pos, elems });
+                return self.mk_ty(TypeKind::Tuple { lparen: t.pos, elems });
             }
             KW_FN => return self.fn_type(t.pos, ""),
             KW_EXTERN => {
@@ -898,28 +924,28 @@ impl Parser {
             KW_DYN => {
                 self.next();
                 let bounds = self.bounds();
-                return ty(TypeKind::Dyn { pos: t.pos, bounds });
+                return self.mk_ty(TypeKind::Dyn { pos: t.pos, bounds });
             }
             KW_IMPL => {
                 self.next();
                 let bounds = self.bounds();
-                return ty(TypeKind::Impl { pos: t.pos, bounds });
+                return self.mk_ty(TypeKind::Impl { pos: t.pos, bounds });
             }
             NOT => {
                 self.next();
-                return ty(TypeKind::Never(t.pos));
+                return self.mk_ty(TypeKind::Never(t.pos));
             }
             UNDERSCORE => {
                 self.next();
-                return ty(TypeKind::Infer(t.pos));
+                return self.mk_ty(TypeKind::Infer(t.pos));
             }
             _ => {}
         }
-        if is_path_start(k) { return ty(TypeKind::Path(self.type_path())); }
+        if is_path_start(k) { return self.mk_ty(TypeKind::Path(self.type_path())); }
         let d = self.describe(&t);
         self.errorf(t.pos, `expected type, found ${d}`);
         self.next();
-        ty(TypeKind::Infer(t.pos))
+        self.mk_ty(TypeKind::Infer(t.pos))
     }
 
     fn fn_type(&mut self, start: Pos, abi: &str) -> &Type {
@@ -933,7 +959,7 @@ impl Parser {
         self.expect(R_PAREN);
         let mut result = None;
         if self.got(R_ARROW) { result = Some(self.typ()); }
-        ty(TypeKind::Fn { start, abi: abi.to_string(), params, result })
+        self.mk_ty(TypeKind::Fn { start, abi: abi.to_string(), params, result })
     }
 
     // --- Statements and blocks ----------------------------------------------------------
@@ -957,7 +983,7 @@ impl Parser {
         }
         b.rbrace = self.expect(R_BRACE);
         self.no_struct_lit = old;
-        expr(ExprKind::Block(b))
+        self.mk_expr(ExprKind::Block(b))
     }
 
     fn sync_stmt(&mut self) {
@@ -1101,7 +1127,7 @@ impl Parser {
         if is_assign_op(self.kind()) {
             let t = self.next();
             let y = self.assign();
-            return expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y });
+            return self.mk_expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y });
         }
         x
     }
@@ -1113,7 +1139,7 @@ impl Parser {
         if is_assign_op(self.kind()) {
             let t = self.next();
             let y = self.assign();
-            return expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y });
+            return self.mk_expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y });
         }
         x
     }
@@ -1137,7 +1163,7 @@ impl Parser {
             let p = self.pos();
             self.errorf(p, "inclusive range '..=' needs an upper bound".to_string());
         }
-        expr(ExprKind::Range { op_pos: t.pos, lo, hi, inclusive })
+        self.mk_expr(ExprKind::Range { op_pos: t.pos, lo, hi, inclusive })
     }
 
     fn starts_expr(&self) -> bool {
@@ -1167,11 +1193,11 @@ impl Parser {
             self.next();
             if t.kind == KW_AS {
                 let ct = self.typ();
-                x = expr(ExprKind::Cast { x, ty: ct });
+                x = self.mk_expr(ExprKind::Cast { x, ty: ct });
                 continue;
             }
             let y = self.binary(prec + 1);
-            x = expr(ExprKind::Binary { op: t.kind, op_pos: t.pos, x, y });
+            x = self.mk_expr(ExprKind::Binary { op: t.kind, op_pos: t.pos, x, y });
             if prec == PREC_COMPARE && binary_prec(self.kind()) == PREC_COMPARE {
                 let p = self.pos();
                 self.errorf(p, "comparison operators cannot be chained; use parentheses".to_string());
@@ -1185,13 +1211,13 @@ impl Parser {
         if k == MINUS || k == NOT || k == STAR {
             self.next();
             let x = self.unary();
-            return expr(ExprKind::Unary { op_pos: t.pos, op: k, x });
+            return self.mk_expr(ExprKind::Unary { op_pos: t.pos, op: k, x });
         }
         if k == AND || k == AND_AND {
             self.got_amp();
             let is_mut = self.got(KW_MUT);
             let x = self.unary();
-            return expr(ExprKind::Ref { amp: t.pos, is_mut, x });
+            return self.mk_expr(ExprKind::Ref { amp: t.pos, is_mut, x });
         }
         let p = self.primary();
         self.postfix(p)
@@ -1207,7 +1233,7 @@ impl Parser {
                     let t = self.tok();
                     if t.kind == INT {
                         self.next();
-                        x = expr(ExprKind::Field { x, name: name(t.pos, t.text) });
+                        x = self.mk_expr(ExprKind::Field { x, name: name(t.pos, t.text) });
                         continue;
                     } else if t.kind == IDENT {
                         self.next();
@@ -1224,18 +1250,18 @@ impl Parser {
                     }
                     if self.kind() == L_PAREN {
                         let args = self.call_args();
-                        x = expr(ExprKind::MethodCall { recv: x, name: nm, type_args: targs, args });
+                        x = self.mk_expr(ExprKind::MethodCall { recv: x, name: nm, type_args: targs, args });
                     } else {
                         if let Some(ta) = targs {
                             self.errorf(ta.lt, "field access cannot have generic arguments".to_string());
                         }
-                        x = expr(ExprKind::Field { x, name: nm });
+                        x = self.mk_expr(ExprKind::Field { x, name: nm });
                     }
                 }
                 L_PAREN => {
                     let lp = self.pos();
                     let args = self.call_args();
-                    x = expr(ExprKind::Call { fun: x, lparen: lp, args });
+                    x = self.mk_expr(ExprKind::Call { fun: x, lparen: lp, args });
                 }
                 L_BRACKET => {
                     let lb = self.next().pos;
@@ -1244,11 +1270,11 @@ impl Parser {
                     let idx = self.expr();
                     self.no_struct_lit = old;
                     self.expect(R_BRACKET);
-                    x = expr(ExprKind::Index { x, lbrack: lb, index: idx });
+                    x = self.mk_expr(ExprKind::Index { x, lbrack: lb, index: idx });
                 }
                 QUESTION => {
                     let q = self.next().pos;
-                    x = expr(ExprKind::Try { x, question: q });
+                    x = self.mk_expr(ExprKind::Try { x, question: q });
                 }
                 _ => {
                     return x;
@@ -1273,7 +1299,7 @@ impl Parser {
 
     fn lit(&mut self, t: &Token, kind: LitKind) -> &Expr {
         self.next();
-        expr(ExprKind::Lit { pos: t.pos, kind, value: t.text.to_string() })
+        self.mk_expr(ExprKind::Lit { pos: t.pos, kind, value: t.text.to_string() })
     }
 
     fn primary(&mut self) -> &Expr {
@@ -1290,7 +1316,7 @@ impl Parser {
         }
         if k == KW_TRUE || k == KW_FALSE {
             self.next();
-            return expr(ExprKind::Lit { pos: t.pos, kind: LitKind::Bool, value: kind_name(k).to_string() });
+            return self.mk_expr(ExprKind::Lit { pos: t.pos, kind: LitKind::Bool, value: kind_name(k).to_string() });
         }
         if k == TEMPLATE {
             self.next();
@@ -1307,7 +1333,7 @@ impl Parser {
                 self.next();
                 let mut value = None;
                 if self.starts_expr() { value = Some(self.expr()); }
-                return expr(ExprKind::Return { pos: t.pos, value });
+                return self.mk_expr(ExprKind::Return { pos: t.pos, value });
             }
             KW_BREAK => {
                 self.next();
@@ -1318,7 +1344,7 @@ impl Parser {
                 }
                 let mut value = None;
                 if self.starts_expr() { value = Some(self.expr()); }
-                return expr(ExprKind::Break { pos: t.pos, label, value });
+                return self.mk_expr(ExprKind::Break { pos: t.pos, label, value });
             }
             KW_CONTINUE => {
                 self.next();
@@ -1327,7 +1353,7 @@ impl Parser {
                     let lt = self.next();
                     label = Some(name(lt.pos, lt.text));
                 }
-                return expr(ExprKind::Continue { pos: t.pos, label });
+                return self.mk_expr(ExprKind::Continue { pos: t.pos, label });
             }
             _ => {}
         }
@@ -1335,12 +1361,12 @@ impl Parser {
         if is_path_start(k) {
             let path = self.expr_path();
             if self.kind() == L_BRACE && !self.no_struct_lit { return self.struct_lit(path); }
-            return expr(ExprKind::Path(path));
+            return self.mk_expr(ExprKind::Path(path));
         }
         let d = self.describe(&t);
         self.errorf(t.pos, `expected expression, found ${d}`);
         if k != EOF && k != R_BRACE && k != R_PAREN && k != R_BRACKET && k != SEMI { self.next(); }
-        expr(ExprKind::Bad(t.pos))
+        self.mk_expr(ExprKind::Bad(t.pos))
     }
 
     fn block_like_expr(&mut self) -> &Expr {
@@ -1368,13 +1394,13 @@ impl Parser {
             KW_LOOP => {
                 self.next();
                 let body = self.block();
-                return expr(ExprKind::Loop { label, pos: t.pos, body });
+                return self.mk_expr(ExprKind::Loop { label, pos: t.pos, body });
             }
             KW_WHILE => {
                 self.next();
                 let cond = self.cond();
                 let body = self.block();
-                return expr(ExprKind::While { label, pos: t.pos, cond, body });
+                return self.mk_expr(ExprKind::While { label, pos: t.pos, cond, body });
             }
             KW_FOR => {
                 self.next();
@@ -1382,14 +1408,14 @@ impl Parser {
                 self.expect(KW_IN);
                 let iter = self.expr_no_struct();
                 let body = self.block();
-                return expr(ExprKind::For { label, pos: t.pos, pat: pt, iter, body });
+                return self.mk_expr(ExprKind::For { label, pos: t.pos, pat: pt, iter, body });
             }
             KW_SELECT => return self.select_expr(),
             _ => {}
         }
         let d = self.describe(&t);
         self.errorf(t.pos, `expected loop after label, found ${d}`);
-        expr(ExprKind::Bad(t.pos))
+        self.mk_expr(ExprKind::Bad(t.pos))
     }
 
     fn cond(&mut self) -> &Expr {
@@ -1398,7 +1424,7 @@ impl Parser {
             let pt = self.pat();
             self.expect(EQ);
             let x = self.expr_no_struct();
-            return expr(ExprKind::Let { pos, pat: pt, x });
+            return self.mk_expr(ExprKind::Let { pos, pat: pt, x });
         }
         self.expr_no_struct()
     }
@@ -1411,7 +1437,7 @@ impl Parser {
         if self.got(KW_ELSE) {
             if self.kind() == KW_IF { els = Some(self.if_expr()); } else { els = Some(self.block()); }
         }
-        expr(ExprKind::If { pos, cond, then, els })
+        self.mk_expr(ExprKind::If { pos, cond, then, els })
     }
 
     fn match_expr(&mut self) -> &Expr {
@@ -1439,7 +1465,7 @@ impl Parser {
         }
         self.no_struct_lit = old;
         self.expect(R_BRACE);
-        expr(ExprKind::Match { pos, x, arms })
+        self.mk_expr(ExprKind::Match { pos, x, arms })
     }
 
     fn select_expr(&mut self) -> &Expr {
@@ -1479,7 +1505,7 @@ impl Parser {
         }
         self.no_struct_lit = old;
         self.expect(R_BRACE);
-        expr(ExprKind::Select { pos, arms })
+        self.mk_expr(ExprKind::Select { pos, arms })
     }
 
     fn select_binding(&self) -> bool {
@@ -1495,19 +1521,19 @@ impl Parser {
         self.no_struct_lit = false;
         if self.got(R_PAREN) {
             self.no_struct_lit = old;
-            return expr(ExprKind::Tuple { lparen: lp, elems: Vec::new() });
+            return self.mk_expr(ExprKind::Tuple { lparen: lp, elems: Vec::new() });
         }
         let first = self.expr();
         if self.got(R_PAREN) {
             self.no_struct_lit = old;
-            return expr(ExprKind::Paren { lparen: lp, x: first });
+            return self.mk_expr(ExprKind::Paren { lparen: lp, x: first });
         }
         let mut elems = Vec::new();
         elems.push(first);
         while self.got(COMMA) && self.kind() != R_PAREN { elems.push(self.expr()); }
         self.expect(R_PAREN);
         self.no_struct_lit = old;
-        expr(ExprKind::Tuple { lparen: lp, elems })
+        self.mk_expr(ExprKind::Tuple { lparen: lp, elems })
     }
 
     fn array(&mut self) -> &Expr {
@@ -1516,21 +1542,21 @@ impl Parser {
         self.no_struct_lit = false;
         if self.got(R_BRACKET) {
             self.no_struct_lit = old;
-            return expr(ExprKind::Array { lbrack: lb, elems: Vec::new() });
+            return self.mk_expr(ExprKind::Array { lbrack: lb, elems: Vec::new() });
         }
         let first = self.expr();
         if self.got(SEMI) {
             let count = self.expr();
             self.expect(R_BRACKET);
             self.no_struct_lit = old;
-            return expr(ExprKind::ArrayRepeat { lbrack: lb, value: first, count });
+            return self.mk_expr(ExprKind::ArrayRepeat { lbrack: lb, value: first, count });
         }
         let mut elems = Vec::new();
         elems.push(first);
         while self.got(COMMA) && self.kind() != R_BRACKET { elems.push(self.expr()); }
         self.expect(R_BRACKET);
         self.no_struct_lit = old;
-        expr(ExprKind::Array { lbrack: lb, elems })
+        self.mk_expr(ExprKind::Array { lbrack: lb, elems })
     }
 
     fn struct_lit(&mut self, path: &Path) -> &Expr {
@@ -1549,12 +1575,12 @@ impl Parser {
             } else {
                 self.name()
             };
-            let value = if self.got(COLON) { self.expr() } else { expr(ExprKind::Path(simple_path(nm))) };
+            let value = if self.got(COLON) { self.expr() } else { self.mk_expr(ExprKind::Path(self.mk_simple_path(nm))) };
             fields.push(&FieldInit { name: nm, value });
             if !self.got(COMMA) { break; }
         }
         self.expect(R_BRACE);
-        expr(ExprKind::StructLit { path, fields, base })
+        self.mk_expr(ExprKind::StructLit { path, fields, base })
     }
 
     fn closure(&mut self) -> &Expr {
@@ -1578,10 +1604,10 @@ impl Parser {
                 self.errorf(p, "closure with a return type needs a block body".to_string());
             }
             let body = self.block();
-            return expr(ExprKind::Closure { pos, params, result, body });
+            return self.mk_expr(ExprKind::Closure { pos, params, result, body });
         }
         let body = self.expr();
-        expr(ExprKind::Closure { pos, params, result: None, body })
+        self.mk_expr(ExprKind::Closure { pos, params, result: None, body })
     }
 
     // --- Template strings ----------------------------------------------------------
@@ -1618,7 +1644,7 @@ impl Parser {
         if text.len() > 0 {
             parts.push(&TemplatePart { text: String::from_utf8_lossy(text.as_slice()), x: None, spec: String::new() });
         }
-        expr(ExprKind::Template { pos: t.pos, parts })
+        self.mk_expr(ExprKind::Template { pos: t.pos, parts })
     }
 
     fn template_hole(&mut self, start: usize) -> (&TemplatePart, usize) {
@@ -1632,7 +1658,7 @@ impl Parser {
             let tk = l.next();
             if tk.kind == EOF {
                 self.errorf(start as Pos, "unterminated ${ in template string".to_string());
-                return (&TemplatePart { text: String::new(), x: Some(expr(ExprKind::Bad(start as Pos))), spec: String::new() }, self.file.src.len());
+                return (&TemplatePart { text: String::new(), x: Some(self.mk_expr(ExprKind::Bad(start as Pos))), spec: String::new() }, self.file.src.len());
             }
             let k = tk.kind;
             match k {
@@ -1669,11 +1695,11 @@ impl Parser {
     fn sub_expr(&mut self, start: Pos, toks: Vec<Token>, end: Pos) -> &Expr {
         if toks.len() == 0 {
             self.errorf(start, "empty ${} in template string".to_string());
-            return expr(ExprKind::Bad(start));
+            return self.mk_expr(ExprKind::Bad(start));
         }
         let mut all = toks;
         all.push(Token { kind: EOF, pos: end, end, text: "" });
-        let mut sp = Parser { file: self.file, toks: all, i: 0, errs: self.errs, no_struct_lit: false, last_err_pos: 0 };
+        let mut sp = Parser { file: self.file, toks: all, i: 0, errs: self.errs, no_struct_lit: false, last_err_pos: 0, ids: self.ids };
         let x = sp.expr();
         if sp.kind() != EOF {
             let t = sp.tok();
@@ -1721,7 +1747,7 @@ impl Parser {
         let mut alts = Vec::new();
         alts.push(first);
         while self.got(OR) { alts.push(self.pat_no_top_alt()); }
-        pat(PatKind::Or(alts))
+        self.mk_pat(PatKind::Or(alts))
     }
 
     fn pat_no_top_alt(&mut self) -> &Pat {
@@ -1730,21 +1756,21 @@ impl Parser {
         match k {
             UNDERSCORE => {
                 self.next();
-                return pat(PatKind::Wild(t.pos));
+                return self.mk_pat(PatKind::Wild(t.pos));
             }
             DOT_DOT => {
                 self.next();
-                return pat(PatKind::Rest(t.pos));
+                return self.mk_pat(PatKind::Rest(t.pos));
             }
             DOT_DOT_EQ => {
                 self.next();
                 let hi = self.pat_range_end();
-                return pat(PatKind::Range { lo: None, hi: Some(hi), inclusive: true, op_pos: t.pos });
+                return self.mk_pat(PatKind::Range { lo: None, hi: Some(hi), inclusive: true, op_pos: t.pos });
             }
             AND | AND_AND => {
                 self.got_amp();
                 let inner = self.pat_no_top_alt();
-                return pat(PatKind::Ref { amp: t.pos, pat: inner });
+                return self.mk_pat(PatKind::Ref { amp: t.pos, pat: inner });
             }
             L_PAREN => {
                 self.next();
@@ -1760,7 +1786,7 @@ impl Parser {
                     let is_rest = match &elems[0].kind { PatKind::Rest(_) => true, _ => false };
                     if !is_rest { return elems[0]; }
                 }
-                return pat(PatKind::Tuple { lparen: t.pos, elems });
+                return self.mk_pat(PatKind::Tuple { lparen: t.pos, elems });
             }
             L_BRACKET => {
                 self.next();
@@ -1770,14 +1796,14 @@ impl Parser {
                     if !self.got(COMMA) { break; }
                 }
                 self.expect(R_BRACKET);
-                return pat(PatKind::Slice { lbrack: t.pos, elems });
+                return self.mk_pat(PatKind::Slice { lbrack: t.pos, elems });
             }
             KW_MUT => {
                 self.next();
                 let nm = self.name();
                 let mut sub = None;
                 if self.got(AT) { sub = Some(self.pat_no_top_alt()); }
-                return pat(PatKind::Ident { is_mut: true, name: nm, sub });
+                return self.mk_pat(PatKind::Ident { is_mut: true, name: nm, sub });
             }
             _ => {}
         }
@@ -1786,7 +1812,7 @@ impl Parser {
             let lit = self.pat_lit();
             let n = self.kind();
             if n == DOT_DOT || n == DOT_DOT_EQ { return self.pat_range(lit); }
-            return pat(PatKind::Lit(lit));
+            return self.mk_pat(PatKind::Lit(lit));
         }
         if is_path_start(k) {
             let n = self.peek(1).kind;
@@ -1795,7 +1821,7 @@ impl Parser {
                 let nm = name(t.pos, t.text);
                 let mut sub = None;
                 if self.got(AT) { sub = Some(self.pat_no_top_alt()); }
-                return pat(PatKind::Ident { is_mut: false, name: nm, sub });
+                return self.mk_pat(PatKind::Ident { is_mut: false, name: nm, sub });
             }
             let path = self.expr_path();
             let n2 = self.kind();
@@ -1808,18 +1834,18 @@ impl Parser {
                         if !self.got(COMMA) { break; }
                     }
                     self.expect(R_PAREN);
-                    return pat(PatKind::TupleStruct { path, elems });
+                    return self.mk_pat(PatKind::TupleStruct { path, elems });
                 }
                 L_BRACE => return self.struct_pat(path),
-                DOT_DOT | DOT_DOT_EQ => return self.pat_range(expr(ExprKind::Path(path))),
+                DOT_DOT | DOT_DOT_EQ => return self.pat_range(self.mk_expr(ExprKind::Path(path))),
                 _ => {}
             }
-            return pat(PatKind::Path(path));
+            return self.mk_pat(PatKind::Path(path));
         }
         let d = self.describe(&t);
         self.errorf(t.pos, `expected pattern, found ${d}`);
         if k != EOF && k != R_BRACE { self.next(); }
-        pat(PatKind::Wild(t.pos))
+        self.mk_pat(PatKind::Wild(t.pos))
     }
 
     fn pat_lit(&mut self) -> &Expr {
@@ -1828,7 +1854,7 @@ impl Parser {
         if k == MINUS {
             self.next();
             let lit = self.pat_lit();
-            return expr(ExprKind::Unary { op_pos: t.pos, op: MINUS, x: lit });
+            return self.mk_expr(ExprKind::Unary { op_pos: t.pos, op: MINUS, x: lit });
         }
         if k == INT || k == FLOAT || k == CHAR || k == BYTE || k == STRING || k == RAW_STRING || k == BYTE_STRING
             || k == KW_TRUE || k == KW_FALSE {
@@ -1836,7 +1862,7 @@ impl Parser {
         }
         let d = self.describe(&t);
         self.errorf(t.pos, `expected literal, found ${d}`);
-        expr(ExprKind::Bad(t.pos))
+        self.mk_expr(ExprKind::Bad(t.pos))
     }
 
     fn pat_range(&mut self, lo: &Expr) -> &Pat {
@@ -1850,11 +1876,11 @@ impl Parser {
             let p = self.pos();
             self.errorf(p, "inclusive range pattern needs an upper bound".to_string());
         }
-        pat(PatKind::Range { lo: Some(lo), hi, inclusive, op_pos: t.pos })
+        self.mk_pat(PatKind::Range { lo: Some(lo), hi, inclusive, op_pos: t.pos })
     }
 
     fn pat_range_end(&mut self) -> &Expr {
-        if is_path_start(self.kind()) { return expr(ExprKind::Path(self.expr_path())); }
+        if is_path_start(self.kind()) { return self.mk_expr(ExprKind::Path(self.expr_path())); }
         self.pat_lit()
     }
 
@@ -1870,7 +1896,7 @@ impl Parser {
             if self.kind() == KW_MUT {
                 self.next();
                 let nm = self.name();
-                fields.push(&FieldPat { name: nm, pat: pat(PatKind::Ident { is_mut: true, name: nm, sub: None }) });
+                fields.push(&FieldPat { name: nm, pat: self.mk_pat(PatKind::Ident { is_mut: true, name: nm, sub: None }) });
             } else {
                 let t = self.tok();
                 let nm = if t.kind == INT {
@@ -1879,12 +1905,12 @@ impl Parser {
                 } else {
                     self.name()
                 };
-                let fp = if self.got(COLON) { self.pat() } else { pat(PatKind::Ident { is_mut: false, name: nm, sub: None }) };
+                let fp = if self.got(COLON) { self.pat() } else { self.mk_pat(PatKind::Ident { is_mut: false, name: nm, sub: None }) };
                 fields.push(&FieldPat { name: nm, pat: fp });
             }
             if !self.got(COMMA) { break; }
         }
         self.expect(R_BRACE);
-        pat(PatKind::Struct { path, fields, rest })
+        self.mk_pat(PatKind::Struct { path, fields, rest })
     }
 }
