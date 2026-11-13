@@ -389,20 +389,6 @@ pub fn enter_blocked() {}
 pub fn exit_blocked() {}
 #[cfg(not(feature = "navic"))]
 pub fn stop_the_world() {}
-// One OS thread: a G only switches when it blocks.
-#[cfg(not(feature = "navic"))]
-pub fn mutex_lock(w: *mut usize) {
-    while unsafe { *w } != 0 { crate::rt::yield_now(); }
-    unsafe { *w = 1; }
-}
-#[cfg(not(feature = "navic"))]
-pub fn mutex_try_lock(w: *mut usize) -> bool {
-    if unsafe { *w } != 0 { return false; }
-    unsafe { *w = 1; }
-    true
-}
-#[cfg(not(feature = "navic"))]
-pub fn mutex_unlock(w: *mut usize) { unsafe { *w = 0; } }
 #[cfg(not(feature = "navic"))]
 pub fn preempt_off() {}
 #[cfg(not(feature = "navic"))]
@@ -1171,26 +1157,43 @@ pub fn word_cas(w: *mut usize, old: usize, new: usize) -> bool {
     true
 }
 
-/// The lock word of a std::sync::Mutex: spins a little, then lets other Gs
-/// run until it is free.
-#[cfg(feature = "navic")]
-pub fn mutex_lock(w: *mut usize) {
-    // Spins, then gives the CPU to other threads, then to other Gs (which
-    // takes the runtime lock).
-    let mut n = 0;
-    while !crate::rt::atomic_cas(w, 0, 1) {
-        n += 1;
-        if n > 1000 {
-            crate::rt::yield_now();
-        } else if n > 50 {
-            unsafe { sched_yield(); }
+/// A std::sync::Mutex (as Go's sync.Mutex): its word is 0 (free), 1
+/// (held) or 2 (held, Gs may wait); lk guards the wait list q. A locker
+/// spins a little, then sleeps on q; an unlock with waiters wakes one.
+pub fn mutex_lock(w: *mut usize, lk: *mut usize, q: *mut WaitList) {
+    let mut i = 0;
+    while i < 30 {
+        if word_cas(w, 0, 1) { return; }
+        i += 1;
+    }
+    loop {
+        obj_lock(lk);
+        // Taken now, or marked contended (so that unlock wakes a waiter).
+        loop {
+            let v = word_load(w);
+            if v == 0 {
+                if word_cas(w, 0, 2) {
+                    obj_unlock(lk);
+                    return;
+                }
+                continue;
+            }
+            if v == 2 || word_cas(w, 1, 2) { break; }
         }
+        wait(q, lk);
+        obj_unlock(lk);
     }
 }
-#[cfg(feature = "navic")]
-pub fn mutex_try_lock(w: *mut usize) -> bool { crate::rt::atomic_cas(w, 0, 1) }
-#[cfg(feature = "navic")]
-pub fn mutex_unlock(w: *mut usize) { crate::rt::atomic_store(w, 0); }
+
+pub fn mutex_try_lock(w: *mut usize) -> bool { word_cas(w, 0, 1) }
+
+pub fn mutex_unlock(w: *mut usize, lk: *mut usize, q: *mut WaitList) {
+    if word_cas(w, 1, 0) { return; }
+    obj_lock(lk);
+    word_store(w, 0);
+    signal(q);
+    obj_unlock(lk);
+}
 
 /// Gives the CPU to another thread while spinning.
 #[cfg(feature = "navic")]
