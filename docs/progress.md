@@ -94,12 +94,15 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   还差的：冷编译仍是 go build（std 已缓存）的约 7 倍。剩余时间分布平坦（parse+resolve 0.37s、types 0.57s、mir 0.6s、plan 0.35s、codegen 0.42s、link 0.21s），其中约 0.55s 是每次重编 std 的前端。再往下要靠：std 前端结果的缓存（需要序列化类型和 MIR）、MIR 内联小函数、函数粒度并行（需要 M:N 多线程运行时和线程安全的编译器数据结构）。
   试过但回退：GOGC=200（被 set_min_heap 取代）、早期的小函数内联实验。
 
-  编译器内部并行（M:N 运行时之后；navic 自己编出来的 navic 才是多线程的，stage0 编出来的 stage1 仍是 M:1）：
-  - 解析：按 `mod` 声明一层一层发现文件，同一层的文件在多个线程上解析；解析器有自己的 `IdGen`，每个文件按发现顺序和文件大小分到一段 id，id 与线程无关（`NAVI_STAGE0=1` 时保持串行编号，selfcheck 用）。
-  - 后端：函数按顺序排成作业，工作线程每次取 8 个；每个线程有自己的机器码缓冲和生成器，类型驻留、布局和类型检查器的缓存放在一把锁（`std::sync::Mutex`，新加的）后面，布局、字段类型按线程缓存，不含类型参数的类型不拿锁；函数用到的字符串和位置先用占位名（`%S<i>`/`%L<i>`），按函数顺序合并时才起正式的名字，闭包按组内编号——目标文件与线程数无关（`NAVI_MAXPROCS` 为 1、3、8 时逐字节相同）。
+  编译器内部并行（M:N 运行时之后；navic 自己编出来的 navic 才是多线程的，stage0 编出来的 stage1 仍是 M:1）。输出与线程数无关：`NAVI_MAXPROCS` 为 1、3、8、16 时编出的编译器和 10 万行项目逐字节相同，这是每次改动都要做的检查。
+  - 解析：按 `mod` 声明一层一层发现文件，同一层的文件在多个线程上解析；解析器有自己的 `IdGen`，每个文件按发现顺序和文件大小分到一段 id（`NAVI_STAGE0=1` 时保持串行编号，selfcheck 用）。
+  - 类型检查：函数体分给多个线程，每个线程一份 `Collector` 浅拷贝（错误、BodyInfo、隐藏类型各自收集，结束后按定义顺序合并；常量求值加锁；inherent 表事先建好）。`Ctx` 的驻留表分成 64 片，并行时每片一把锁，类型 id 改成"分片 + 65 × 序号"（id 只用作身份，不影响输出顺序）。
+  - MIR：从根出发一层一层构建可达函数，同一层在多个线程上构建（每个函数一份 `Program` 浅拷贝，闭包在函数内编号）；每层先并行检查这一层里还没检查的 std 函数体；`Info` 的惰性查询（body、hidden_of、normalize、deref_target）在并行时持一把可重入锁（用新加的 `std::thread::current().id()`）；MIR 和 AST 的 id 改用新加的 `std::sync::atomic::AtomicUsize`。逃逸分析的摘要不动点保持串行（Gauss-Seidel 式，结果依赖顺序），其后的 keep 和装箱并行（`util::par_for`）。
+  - plan：仍是串行的。没有类型参数的实例直接用函数 id 作组键（不再逐个局部变量算形状）。要并行化，需要 trait 求解（`normalize`、`resolve_method`）本身能并发，并把 plan 拆成"并行解析 + 串行编号"，还没做。
+  - 后端：函数按顺序排成作业，工作线程每次取 8 个；类型驻留、布局和类型检查器的缓存在锁后面，布局、字段类型按线程缓存，不含类型参数的类型不拿锁；字符串和位置先用占位名（`%S<i>`/`%L<i>`），按函数顺序合并时才起正式名字，闭包按组内编号。
   - 链接：代码签名的页哈希多线程计算。
-  - 结果（8 核）：bp10 1.75s → 1.57s；10 万行 20.8s（STW GC）→ 13.96s（并发 GC + 并行），其中 parse+resolve 1.0s → 0.7s、codegen 3.2s → 1.8s、link 1.8s → 0.96s；自编译 4.9s → 4.3s。
-  - 还没并行的：类型检查（3.9s）、MIR 构建和逃逸分析（3.8s）、plan（2.8s）——它们都在读写共享的 `Ctx`/`Info`（驻留新类型、惰性缓存、`Sink`），要把这些结构改成可以分片或冻结后再加线程本地层，工作量比后端大得多。
+  - 顺带发现并修掉的编译器 bug：闭包捕获 `self` 时，`self` 的堆单元会占掉下一个参数的局部变量槽（stage0 和 navic 都有；stage0 冻结，所以编译器源码里不让闭包捕获 self）。`tests/run/closure_self.navi`。
+  - 结果（8 核）：bp10 1.75s → 1.08s（go build 0.38s）；10 万行 20.8s（STW GC）→ 10.4s（go build 约 3s），其中 parse+resolve 1.0s → 0.75s、types 3.9s → 1.1s、mir 3.8s → 2.9s、plan 2.9s → 2.7s、codegen 3.2s → 1.7s、link 1.8s → 0.93s；自编译 4.9s → 3.1s。
 
 - 语言和工具（都只在 navic 里，stage0 冻结；std 里 stage0 编不了的部分用 `#[cfg(feature = "navic")]` 藏起来，含新语法的放在单独的模块文件里，stage0 不会去读）：
   - `panic::catch_unwind` / `resume_unwind` / `PanicPayload`：每个 G 有一串 catch 记录，`try_call` 用 setjmp 式的上下文保存（`_navi_setjmp`/`_navi_longjmp`，存 x19–x28、fp、lr、sp），panic 先打印消息、执行到 catch 帧为止的 defer，再恢复上下文；`thread::spawn` 用它包住线程函数，`join()` 返回 `Err(PanicPayload)`；`tests/run/catch.navi`。
@@ -117,7 +120,10 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   - 可增长的栈：spawn 的 G 的栈从 64KB 开始（主线程固定 64MB）。栈检查放在建帧之前，比较的是 `SP - 帧大小`；不够时 `_navi_morestack` 保存全部寄存器、把自己的 SP 和所需字节数记在 G 里，`sched::morestack` 分配至少两倍大的新栈，把已用部分复制过去，把复制出的每个落在旧栈范围内的字（保存的 FP、局部变量的地址、桩保存的寄存器）平移，再平移堆上 catch_unwind 记录里的栈地址；桩按返回的位移量移动 SP 和 FP 后恢复寄存器。旧栈在下一次 morestack 时释放。逃逸分析保证别的堆对象不会指向栈。上限 1GB。
   - 新 intrinsic：`current_g`/`set_current_g`、原子操作（casal/ldaddal/ldar/stlr）、`mstart_address`。
   - 实测：8 个线程的纯计算 2.31s → 0.34s；8 个线程同时大量分配 1.88s → 0.55s（每次都正确，连续 30 次）。并发 GC：100k 行项目的编译 20.8s（STW）→ 16.9s，峰值内存 1.89GB → 2.39GB（周期进行中堆还在长）；8 个线程大量改写老对象里指针的压力测试 3.7s → 2.4s，打开校验连续几十次都没有漏标。写屏障让 bp10 这类小项目慢约 4%（1.75s → 1.82s）。`tests/run/parallel.navi`、`gc_mutate.navi`、`stack_grow.navi`，golden 测试在 `NAVI_MAXPROCS` 为 1/2/3/4/16、`NAVI_GCVERIFY=1`、`NAVI_GCSTW=1` 下都通过。
-  - 限制：没有调用的死循环会让 GC 一直等（Go 1.14 之前也这样）；用户自己的 `extern "C"` 阻塞调用没有进出协议；标记只有一个标记 G；channel 的等待是"广播后各自重查"，大量 G 等在同一个 channel 上时每次操作都唤醒全部（1 万个 G 等同一个无缓冲 channel 要 17 秒，Go 是毫秒级），要改成 Go 那样的收发队列和直接交接；全局运行队列。
+  - 限制：没有调用的死循环会让 GC 一直等（Go 1.14 之前也这样）；用户自己的 `extern "C"` 阻塞调用没有进出协议；标记只有一个标记 G；全局运行队列。
+  - channel 的等待分三个 FIFO 队列（等元素的接收者、等空位的发送者、等元素被取走的无缓冲发送者），一个元素只唤醒一个接收者、取走一个元素只唤醒一个发送者，close 唤醒全部；select 等待过之后会把用不上的唤醒转给它的其他 channel。1 万个 G 等同一个无缓冲 channel：17 秒 → 0.45 秒，10 万个 1.65 秒（`tests/run/chan_many.navi`）。
+  - 并行标记：一半的线程做并发标记，各有自己的标记栈，多的工作放进共享池，空闲的标记 G 等一会儿没活就退出，最后一个收尾；最后一次 STW 把各标记栈、池和写屏障队列一起排空。多线程大量改写指针的压力测试 2.39s → 1.97s。
+  - std：`sync::Mutex`、`sync::atomic::AtomicUsize`、`thread::current().id()`、`thread::available_parallelism`。
   - 顺带修的：macOS 会杀掉被原地覆盖写的已签名可执行文件，navic 现在先删再写输出。
 - 没做的：
   - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
@@ -125,6 +131,6 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
 
 ## 下一步
 
-1. 冷编译提速：类型检查、MIR、plan 的并行（共享的 `Ctx`/`Info` 要先能并发访问）；GC 的并行标记；std 的导出数据缓存。
-2. 运行时：channel 的收发队列（只唤醒一个等待者）、每个 M 的运行队列、基于信号的抢占、并行标记、栈收缩。
+1. 冷编译提速：plan 的并行（trait 求解要能并发）；逃逸分析摘要的并行（需要按版本复现串行的迭代顺序）；std 的导出数据缓存。
+2. 运行时：每个 M 的运行队列、基于信号的抢占、栈收缩、最后一次 STW 的并行排空。
 3. DWARF 的变量和类型信息；amd64/ELF/COFF 上的自研链接器和 DWARF（现在只有 macOS arm64）。
