@@ -81,12 +81,11 @@ static mut ALLOCATED: usize = 0;
 static mut NEXT_GC: usize = 0;
 static mut LIVE: usize = 0;
 static mut COLLECTIONS: usize = 0;
-static mut MARK: usize = 0; // *mut usize
-static mut MARK_LEN: usize = 0;
-static mut MARK_CAP: usize = 0;
 
 fn ld(p: usize) -> usize { unsafe { *(p as *const usize) } }
 fn st(p: usize, v: usize) { unsafe { *(p as *mut usize) = v; } }
+fn wget(p: usize) -> usize { unsafe { *(p as *const usize) } }
+fn wset(p: usize, v: usize) { unsafe { *(p as *mut usize) = v; } }
 fn ldb(p: usize) -> u8 { unsafe { *(p as *const u8) } }
 fn stb(p: usize, v: u8) { unsafe { *(p as *mut u8) = v; } }
 
@@ -129,8 +128,10 @@ fn init() {
     if table == 0 { out_of_memory(); }
     commit(table, table_size);
     PAGES = table;
-    MARK_CAP = 4096;
-    MARK = unsafe { calloc(MARK_CAP, 8) } as usize;
+    MAIN = new_stack();
+    POOL = new_stack();
+    SHARED = new_stack();
+    LOCAL = unsafe { calloc(MAX_MARKERS * 3, 8) } as usize;
     let mut k = 0;
     while k <= MAX_SMALL / 16 {
         CLASS_OF[k] = class_of(if k == 0 { 1 } else { k * 16 }) as u8;
@@ -386,69 +387,85 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
 
 // --- Marking -----------------------------------------------------------------
 
-// The mark stack belongs to the marker: the collector while the world is
-// stopped, otherwise the marker G (a batch of objects at a time, during
-// which it does not stop). No lock.
-fn push(obj: usize) {
-    if MARK_LEN == MARK_CAP {
-        MARK_CAP = MARK_CAP * 2;
-        MARK = unsafe { realloc(MARK as *mut u8, MARK_CAP * 8) } as usize;
-        if MARK == 0 { out_of_memory(); }
+// A mark stack is three words [buf, len, cap] (C memory). MAIN is the
+// collector's (used while the world is stopped); each concurrent marker G
+// has its own (LOCAL). A marker pops and scans an object, and moves objects
+// between stacks and the pool, only while it may not stop, so a stopped
+// marker leaves every grey object on a stack the collector can see.
+fn stack_push(sk: usize, obj: usize) {
+    let n = wget(sk + 8);
+    if n == wget(sk + 16) {
+        let cap = if n == 0 { 1024 } else { n * 2 };
+        let b = unsafe { realloc(wget(sk) as *mut u8, cap * 8) } as usize;
+        if b == 0 { out_of_memory(); }
+        wset(sk, b);
+        wset(sk + 16, cap);
     }
-    unsafe { *((MARK + MARK_LEN * 8) as *mut usize) = obj; }
-    MARK_LEN += 1;
+    wset(wget(sk) + n * 8, obj);
+    wset(sk + 8, n + 1);
 }
 
-fn pop() -> usize {
-    if MARK_LEN == 0 { return 0; }
-    MARK_LEN -= 1;
-    unsafe { *((MARK + MARK_LEN * 8) as *const usize) }
+fn stack_pop(sk: usize) -> usize {
+    let n = wget(sk + 8);
+    if n == 0 { return 0; }
+    wset(sk + 8, n - 1);
+    wget(wget(sk) + (n - 1) * 8)
 }
 
-// The objects the write barriers of other threads mark while the marker G
-// runs wait here for it (under mark_lock; no navi call while it is held).
-static mut SHARED: usize = 0; // *mut usize
-static mut SHARED_LEN: usize = 0;
-static mut SHARED_CAP: usize = 0;
+fn stack_len(sk: usize) -> usize { wget(sk + 8) }
+
+fn push(obj: usize) { stack_push(MAIN, obj); }
+fn pop() -> usize { stack_pop(MAIN) }
+
+// The objects the write barriers of other threads mark wait here for a
+// marker (under mark_lock; no navi call while it is held).
+static mut SHARED: usize = 0; // a stack
 
 fn push_shared(obj: usize) {
     mark_lock();
-    if SHARED_LEN == SHARED_CAP {
-        SHARED_CAP = if SHARED_CAP == 0 { 1024 } else { SHARED_CAP * 2 };
-        SHARED = unsafe { realloc(SHARED as *mut u8, SHARED_CAP * 8) } as usize;
-        if SHARED == 0 { out_of_memory(); }
-    }
-    unsafe { *((SHARED + SHARED_LEN * 8) as *mut usize) = obj; }
-    SHARED_LEN += 1;
+    stack_push(SHARED, obj);
     mark_unlock();
 }
 
-// Moves the shared objects onto the mark stack; false if there were none.
-fn take_shared() -> bool {
-    mark_lock();
-    let n = SHARED_LEN;
-    if MARK_LEN + n > MARK_CAP {
-        while MARK_LEN + n > MARK_CAP { MARK_CAP = MARK_CAP * 2; }
-        MARK = unsafe { realloc(MARK as *mut u8, MARK_CAP * 8) } as usize;
-        if MARK == 0 { out_of_memory(); }
-    }
+// Moves every object of stack from onto stack to (mark_lock held or the
+// world stopped).
+fn move_all(from: usize, to: usize) -> bool {
+    let n = stack_len(from);
     let mut i = 0;
     while i < n {
-        unsafe { *((MARK + (MARK_LEN + i) * 8) as *mut usize) = *((SHARED + i * 8) as *const usize); }
+        stack_push(to, wget(wget(from) + i * 8));
         i += 1;
     }
-    MARK_LEN += n;
-    SHARED_LEN = 0;
-    mark_unlock();
+    wset(from + 8, 0);
     n > 0
 }
 
-/// Marks every object a word in [lo, hi) points into (by the marker).
-pub(crate) fn scan_range(lo: usize, hi: usize) { scan(lo, hi, false); }
+// Moves what other marking left (the shared objects, the pool, the
+// markers' stacks) onto MAIN; false if there was nothing (the world is
+// stopped or no marker runs).
+fn take_shared() -> bool {
+    mark_lock();
+    let mut any = move_all(SHARED, MAIN);
+    if move_all(POOL, MAIN) { any = true; }
+    let mut k = 0;
+    while k < MAX_MARKERS {
+        if LOCAL != 0 && stack_len(LOCAL + k * 24) > 0 {
+            move_all(LOCAL + k * 24, MAIN);
+            any = true;
+        }
+        k += 1;
+    }
+    mark_unlock();
+    any
+}
+
+/// Marks every object a word in [lo, hi) points into (by the collector).
+pub(crate) fn scan_range(lo: usize, hi: usize) { scan(lo, hi, MAIN); }
 
 /// The hot loop of the collector (memory accesses are written out instead
-/// of calling ld/ldb); shared: found by a write barrier, not the marker.
-fn scan(lo: usize, hi: usize, shared: bool) {
+/// of calling ld/ldb); the grey objects go on stack dst, or 0: found by a
+/// write barrier, they go to SHARED.
+fn scan(lo: usize, hi: usize, dst: usize) {
     let arena = ARENA;
     // During a concurrent mark, spans made since it started hold only
     // objects allocated black (or free ones): not read.
@@ -470,20 +487,21 @@ fn scan(lo: usize, hi: usize, shared: bool) {
             if *((bits + i) as *const u8) == 0 { continue; }
             let m = (bits + n + i) as *mut u8;
             if *m != 0 { continue; }
+            // Two markers may both get here: the object is scanned twice.
             *m = 1;
             if (*s).noscan { continue; }
-            if shared { push_shared(start + i * (*s).elem); } else { push(start + i * (*s).elem); }
+            if dst == 0 { push_shared(start + i * (*s).elem); } else { stack_push(dst, start + i * (*s).elem); }
         }
     }
 }
 
-fn scan_object(obj: usize) {
+fn scan_object(obj: usize, dst: usize) {
     let s = unsafe { *((PAGES + ((obj - ARENA) >> PAGE_SHIFT) * 8) as *const usize) } as *mut Span;
     let elem = unsafe { (*s).elem };
-    scan(obj, obj + elem, false);
+    scan(obj, obj + elem, dst);
 }
 
-// Marks everything reachable from the mark stack (the world is stopped).
+// Marks everything reachable from the mark stacks (the world is stopped).
 fn drain() {
     loop {
         let obj = pop();
@@ -491,33 +509,123 @@ fn drain() {
             if take_shared() { continue; }
             return;
         }
-        scan_object(obj);
-    }
-}
-
-// The marker G's drain, concurrent with the program: it must not stop
-// holding a popped object (a collection finishing then would not scan it),
-// so it takes them in batches without stopping in between.
-fn drain_concurrent() {
-    loop {
-        crate::rt::sched::preempt_off();
-        let mut k = 0;
-        while k < 256 {
-            let obj = pop();
-            if obj == 0 { break; }
-            scan_object(obj);
-            k += 1;
-        }
-        let more = k == 256 || take_shared();
-        crate::rt::sched::preempt_on();
-        if !more { return; }
+        scan_object(obj, MAIN);
     }
 }
 
 /// The write barrier's work (and that of runtime copies): while a
 /// concurrent mark runs, marks what the words in [p, p + n) point to.
 pub fn shade_range(p: usize, n: usize) {
-    if MARKING { scan(p, p + n, true); }
+    if MARKING { scan(p, p + n, 0); }
+}
+
+// --- Parallel concurrent marking (navic) ---------------------------------------
+//
+// MARKERS marker Gs drain their own stacks; one with more than it needs
+// puts a part in the pool (a stack, under mark_lock), one without work
+// takes from the pool or SHARED, else it is idle. When all are idle and
+// both are empty, the first to see it finishes the cycle.
+
+const MAX_MARKERS: usize = 16;
+static mut MAIN: usize = 0; // a stack
+static mut POOL: usize = 0; // a stack
+static mut LOCAL: usize = 0; // MAX_MARKERS stacks
+static mut MARKERS: usize = 0;
+static mut IDLE_MARKERS: usize = 0;
+static mut MARK_DONE: bool = false;
+static mut CYCLE_NO: usize = 0;
+
+fn new_stack() -> usize {
+    let p = unsafe { calloc(3, 8) };
+    p as usize
+}
+
+// Takes up to half of the pool, else the shared objects, onto st; false if
+// both are empty (mark_lock held).
+fn take_work(sk: usize) -> bool {
+    let n = stack_len(POOL);
+    if n > 0 {
+        let mut k = (n + 1) / 2;
+        while k > 0 {
+            stack_push(sk, stack_pop(POOL));
+            k -= 1;
+        }
+        return true;
+    }
+    move_all(SHARED, sk)
+}
+
+#[cfg(feature = "navic")]
+fn mark_worker(k: usize, cyc: usize) {
+    let me = LOCAL + k * 24;
+    loop {
+        crate::rt::sched::preempt_off();
+        if !CYCLE || CYCLE_NO != cyc || MARK_DONE {
+            crate::rt::sched::preempt_on();
+            return;
+        }
+        let mut n = 0;
+        while n < 256 {
+            let obj = stack_pop(me);
+            if obj == 0 { break; }
+            scan_object(obj, me);
+            n += 1;
+        }
+        let mut idle = false;
+        let mut finish = false;
+        let len = stack_len(me);
+        if len > 2048 || len == 0 {
+            mark_lock();
+            if len > 2048 && stack_len(POOL) < 4096 {
+                // Share half.
+                let mut k2 = len / 2;
+                while k2 > 0 {
+                    stack_push(POOL, stack_pop(me));
+                    k2 -= 1;
+                }
+            } else if len == 0 && !take_work(me) {
+                IDLE_MARKERS += 1;
+                idle = true;
+            }
+            mark_unlock();
+        }
+        crate::rt::sched::preempt_on();
+        // Idle: waits a little for work, then leaves (the last marker to
+        // be idle finishes the cycle).
+        let mut spins = 0;
+        while idle {
+            crate::rt::sched::cpu_relax();
+            spins += 1;
+            crate::rt::sched::preempt_off();
+            if !CYCLE || CYCLE_NO != cyc || MARK_DONE {
+                crate::rt::sched::preempt_on();
+                return;
+            }
+            let mut leave = false;
+            mark_lock();
+            if take_work(me) {
+                IDLE_MARKERS -= 1;
+                idle = false;
+            } else if IDLE_MARKERS == MARKERS {
+                MARK_DONE = true;
+                finish = true;
+                idle = false;
+            } else if spins >= 100 {
+                MARKERS -= 1;
+                IDLE_MARKERS -= 1;
+                leave = true;
+            }
+            mark_unlock();
+            crate::rt::sched::preempt_on();
+            if leave { return; }
+        }
+        if finish {
+            crate::rt::sched::lock();
+            if CYCLE_NO == cyc { finish_cycle(); }
+            crate::rt::sched::unlock();
+            return;
+        }
+    }
 }
 
 /// Whether a concurrent mark runs.
@@ -723,17 +831,22 @@ fn start_cycle() {
     // If the program allocates as much again before the marker is done,
     // the allocating G finishes the cycle itself.
     NEXT_GC = ALLOCATED + if NEXT_GC > MIN_HEAP { NEXT_GC } else { MIN_HEAP };
+    // (2): the marker Gs (half the threads), starting from the roots.
+    CYCLE_NO += 1;
+    let cyc = CYCLE_NO;
+    move_all(MAIN, POOL);
+    MARKERS = crate::rt::sched::procs() / 2;
+    if MARKERS < 1 { MARKERS = 1; }
+    if MARKERS > MAX_MARKERS { MARKERS = MAX_MARKERS; }
+    IDLE_MARKERS = 0;
+    MARK_DONE = false;
     COLLECTING = false;
-    crate::rt::sched::go(|| { mark_worker(); });
-}
-
-// (2): the marker G.
-#[cfg(feature = "navic")]
-fn mark_worker() {
-    drain_concurrent();
-    crate::rt::sched::lock();
-    finish_cycle();
-    crate::rt::sched::unlock();
+    let mut k = 0;
+    while k < MARKERS {
+        let id = k;
+        crate::rt::sched::go(|| { mark_worker(id, cyc); });
+        k += 1;
+    }
 }
 
 // (3), with the runtime lock held.
