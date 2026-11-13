@@ -107,10 +107,10 @@ const SYS_BLOCKED: usize = 1;
 const SYS_CLAIMED: usize = 2;
 const SYS_STOPPED: usize = 3;
 
-struct WaitNode { g: *mut G, gen: usize, next: *mut WaitNode }
+struct WaitNode { g: *mut G, gen: usize, key: usize, next: *mut WaitNode }
 
-/// A list of Gs waiting for a change of some object.
-pub struct WaitList { head: *mut WaitNode }
+/// A list of Gs waiting for a change of some object, in arrival order.
+pub struct WaitList { head: *mut WaitNode, tail: *mut WaitNode }
 
 static mut CUR: usize = 0;
 static mut RUN_HEAD: usize = 0;
@@ -409,32 +409,93 @@ pub fn start_the_world() {}
 
 // --- Waiting -------------------------------------------------------------------
 
-pub fn new_wait_list() -> WaitList { WaitList { head: 0 as *mut WaitNode } }
+pub fn new_wait_list() -> WaitList { WaitList { head: 0 as *mut WaitNode, tail: 0 as *mut WaitNode } }
 
-/// Registers the running G on w (it may register on several lists).
-pub fn enlist(w: *mut WaitList) {
+/// Registers the running G at the end of w (it may register on several
+/// lists; once woken from one, its nodes on the others are stale).
+pub fn enlist(w: *mut WaitList) { enlist_key(w, 0); }
+
+fn enlist_key(w: *mut WaitList, key: usize) {
     let g = current();
     let n = crate::rt::gc::alloc(crate::intrinsics::size_of::<WaitNode>(), false) as *mut WaitNode;
     unsafe {
         (*n).g = g;
         (*n).gen = (*g).wait_gen;
-        (*n).next = (*w).head;
-        (*w).head = n;
+        (*n).key = key;
+        (*n).next = 0 as *mut WaitNode;
+        if (*w).head as usize == 0 { (*w).head = n; } else { (*(*w).tail).next = n; }
+        (*w).tail = n;
     }
 }
 
 /// Waits on w, whose object lock lk is held (and held again on return).
-pub fn wait(w: *mut WaitList, lk: *mut usize) {
-    enlist(w);
+pub fn wait(w: *mut WaitList, lk: *mut usize) { wait_key(w, lk, 0); }
+
+fn wait_key(w: *mut WaitList, lk: *mut usize, key: usize) {
+    enlist_key(w, key);
     let one = [lk as usize];
     park_on(&one as *const [usize; 1] as *const usize, 1);
+}
+
+// Whether n's G still waits for it (not woken through another list).
+fn live(n: *mut WaitNode) -> bool {
+    unsafe { (*n).gen == (*(*n).g).wait_gen && (*(*n).g).status == WAITING }
+}
+
+fn unlink_head(w: *mut WaitList) -> *mut WaitNode {
+    unsafe {
+        let n = (*w).head;
+        (*w).head = (*n).next;
+        if (*w).head as usize == 0 { (*w).tail = 0 as *mut WaitNode; }
+        n
+    }
+}
+
+// Wakes the G of n (the runtime lock is held).
+fn wake(n: *mut WaitNode) {
+    unsafe {
+        let g = (*n).g;
+        (*g).wait_gen += 1;
+        ready(g);
+    }
+}
+
+/// Wakes the first G still waiting on w, if any (its object lock is held).
+pub fn signal(w: *mut WaitList) {
+    if unsafe { (*w).head } as usize == 0 { return; }
+    lock();
+    while unsafe { (*w).head } as usize != 0 {
+        let n = unlink_head(w);
+        if live(n) {
+            wake(n);
+            break;
+        }
+    }
+    unlock();
+}
+
+// Wakes the Gs at the front of w whose key is at most k (w is in key
+// order).
+fn signal_upto(w: *mut WaitList, k: usize) {
+    if unsafe { (*w).head } as usize == 0 { return; }
+    lock();
+    while unsafe { (*w).head } as usize != 0 {
+        let h = unsafe { (*w).head };
+        if live(h) && unsafe { (*h).key } > k { break; }
+        let n = unlink_head(w);
+        if live(n) { wake(n); }
+    }
+    unlock();
 }
 
 /// Wakes every G waiting on w (its object lock is held).
 pub fn broadcast(w: *mut WaitList) {
     let mut n = unsafe { (*w).head };
     if n as usize == 0 { return; }
-    unsafe { (*w).head = 0 as *mut WaitNode; }
+    unsafe {
+        (*w).head = 0 as *mut WaitNode;
+        (*w).tail = 0 as *mut WaitNode;
+    }
     lock();
     while n as usize != 0 {
         unsafe {
@@ -496,17 +557,47 @@ pub struct Chan {
     send_seq: usize,
     recv_seq: usize,
     recv_waiter: usize,
-    waiters: WaitList,
+    // Receivers waiting for an element; senders waiting for room (and, on
+    // an unbuffered channel, selects waiting for a receiver); unbuffered
+    // senders waiting for their element to be taken (keyed by its send_seq).
+    // Each element wakes one receiver, each taken element one sender.
+    recvq: WaitList,
+    sendq: WaitList,
+    ackq: WaitList,
     // Writes Result<T, RecvError> for select: (slot, value or null).
     write_result: fn(*mut u8, *const u8),
 }
 
 pub fn new_chan(elem: usize, cap: usize, write_result: fn(*mut u8, *const u8)) -> *mut Chan {
     &mut Chan { lk: 0, elem, cap, buf: 0 as *mut u8, head: 0, len: 0, slots: 0, closed: false, send_seq: 0,
-        recv_seq: 0, recv_waiter: 0, waiters: new_wait_list(), write_result } as *mut Chan
+        recv_seq: 0, recv_waiter: 0, recvq: new_wait_list(), sendq: new_wait_list(),
+        ackq: new_wait_list(), write_result } as *mut Chan
 }
 
-fn wl(c: *mut Chan) -> *mut WaitList { unsafe { &mut (*c).waiters as *mut WaitList } }
+fn recvq(c: *mut Chan) -> *mut WaitList { unsafe { &mut (*c).recvq as *mut WaitList } }
+fn sendq(c: *mut Chan) -> *mut WaitList { unsafe { &mut (*c).sendq as *mut WaitList } }
+fn ackq(c: *mut Chan) -> *mut WaitList { unsafe { &mut (*c).ackq as *mut WaitList } }
+
+// After an element was taken: its unbuffered sender, or a sender waiting
+// for room.
+fn taken(c: *mut Chan) {
+    unsafe {
+        if (*c).cap == 0 { signal_upto(ackq(c), (*c).recv_seq); } else { signal(sendq(c)); }
+    }
+}
+
+// Passes on the wakes a select did not use: whoever may proceed on c.
+fn kick(c: *mut Chan) {
+    unsafe {
+        if (*c).closed {
+            broadcast(recvq(c));
+            broadcast(sendq(c));
+            return;
+        }
+        if (*c).len > 0 { signal(recvq(c)); }
+        if (*c).cap == UNBOUNDED || (*c).len < (*c).cap || (*c).cap == 0 && (*c).recv_waiter > (*c).len { signal(sendq(c)); }
+    }
+}
 fn lk(c: *mut Chan) -> *mut usize { unsafe { &mut (*c).lk as *mut usize } }
 
 fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) { crate::rt::copy::<u8>(src, dst, n); }
@@ -566,14 +657,14 @@ fn send_locked(c: *mut Chan, src: *const u8) -> bool {
         loop {
             if (*c).closed { return false; }
             if (*c).cap == UNBOUNDED || (*c).len < (*c).cap || (*c).cap == 0 { break; }
-            wait(wl(c), lk(c));
+            wait(sendq(c), lk(c));
         }
         push(c, src);
         (*c).send_seq += 1;
         let seq = (*c).send_seq;
-        broadcast(wl(c));
+        signal(recvq(c));
         if (*c).cap == 0 {
-            while (*c).recv_seq < seq && !(*c).closed { wait(wl(c), lk(c)); }
+            while (*c).recv_seq < seq && !(*c).closed { wait_key(ackq(c), lk(c), seq); }
         }
     }
     true
@@ -591,13 +682,14 @@ pub fn recv(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
 fn recv_locked(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
     unsafe {
         (*c).recv_waiter += 1;
-        broadcast(wl(c));
-        while (*c).len == 0 && !(*c).closed && block { wait(wl(c), lk(c)); }
+        // A select may send to an unbuffered channel once a receiver waits.
+        if (*c).cap == 0 { signal(sendq(c)); }
+        while (*c).len == 0 && !(*c).closed && block { wait(recvq(c), lk(c)); }
         (*c).recv_waiter -= 1;
         if (*c).len > 0 {
             pop(c, dst);
             (*c).recv_seq += 1;
-            broadcast(wl(c));
+            taken(c);
             return true;
         }
     }
@@ -607,7 +699,9 @@ fn recv_locked(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
 pub fn close(c: *mut Chan) {
     obj_lock(lk(c));
     unsafe { (*c).closed = true; }
-    broadcast(wl(c));
+    broadcast(recvq(c));
+    broadcast(sendq(c));
+    broadcast(ackq(c));
     obj_unlock(lk(c));
 }
 
@@ -637,6 +731,7 @@ pub fn run_select(cases: &[crate::sync::mpmc::SelectCase], has_default: bool) ->
 
 fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool, locks: &Vec<usize>) -> usize {
     let n = cases.len();
+    let mut waited = false;
     loop {
         let mut i = 0;
         while i < n {
@@ -649,7 +744,8 @@ fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool, loc
                     if !(*c).closed && ready {
                         push(c, slot as *const u8);
                         (*c).send_seq += 1;
-                        broadcast(wl(c));
+                        signal(recvq(c));
+                        if waited { kick_others(cases, i); }
                         return i;
                     }
                 } else if (*c).len > 0 || (*c).closed {
@@ -658,11 +754,12 @@ fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool, loc
                         let tmp = crate::rt::gc::alloc(elem, false);
                         pop(c, tmp);
                         (*c).recv_seq += 1;
-                        broadcast(wl(c));
+                        taken(c);
                         ((*c).write_result)(slot, tmp as *const u8);
                     } else {
                         ((*c).write_result)(slot, 0 as *const u8);
                     }
+                    if waited { kick_others(cases, i); }
                     return i;
                 }
             }
@@ -671,10 +768,24 @@ fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool, loc
         if has_default { return n; }
         let mut j = 0;
         while j < n {
-            enlist(wl(case_chan(&cases[j])));
+            let cj = case_chan(&cases[j]);
+            if case_send(&cases[j]) { enlist(sendq(cj)); } else { enlist(recvq(cj)); }
             j += 1;
         }
         park_on(locks.as_ptr(), locks.len());
+        waited = true;
+    }
+}
+
+// A woken select may have been the one woken for another case's channel:
+// those channels are kicked (all their locks are held).
+fn kick_others(cases: &[crate::sync::mpmc::SelectCase], chosen: usize) {
+    let mine = case_chan(&cases[chosen]);
+    let mut j = 0;
+    while j < cases.len() {
+        let c = case_chan(&cases[j]);
+        if c as usize != mine as usize { kick(c); }
+        j += 1;
     }
 }
 
