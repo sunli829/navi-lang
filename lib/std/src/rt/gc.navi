@@ -247,10 +247,7 @@ fn refill(c: usize, list: usize) -> *mut Span {
             }
         }
     }
-    if UNSWEPT != 0 {
-        sweep_for(list);
-        return refill(c, list);
-    }
+    if UNSWEPT != 0 && sweep_for(list) { return refill(c, list); }
     let s = new_span(CLASSES[c], SPAN_BYTES, list & 1 == 1, list);
     unsafe { ALLOCATED += (*s).nfree * (*s).elem; }
     s
@@ -296,10 +293,7 @@ fn alloc_small(c: usize, noscan: bool) -> usize {
             (*s).in_free = false;
         }
     }
-    if UNSWEPT != 0 {
-        sweep_for(list);
-        return alloc_small(c, noscan);
-    }
+    if UNSWEPT != 0 && sweep_for(list) { return alloc_small(c, noscan); }
     let s = new_span(CLASSES[c], SPAN_BYTES, noscan, list);
     unsafe {
         (*s).next_free = FREE[list] as *mut Span;
@@ -324,7 +318,10 @@ fn take(s: *mut Span) -> usize {
     }
 }
 
-fn alloc_large(size: usize, noscan: bool) -> usize {
+fn alloc_large(size: usize, noscan: bool) -> usize { alloc_large_in(size, noscan, 4) }
+
+// tries: how many more batches of spans may be swept for a fitting one.
+fn alloc_large_in(size: usize, noscan: bool, tries: usize) -> usize {
     let bytes = (size + PAGE - 1) / PAGE * PAGE;
     // Reuse a dead large span that fits (first fit, at most twice the size).
     let mut prev = 0usize;
@@ -345,10 +342,10 @@ fn alloc_large(size: usize, noscan: bool) -> usize {
             s = (*s).next_free;
         }
     }
-    if UNSWEPT != 0 {
+    if UNSWEPT != 0 && tries > 0 {
         // Sweep a little more and look again.
         sweep_some(64);
-        return alloc_large(size, noscan);
+        return alloc_large_in(size, noscan, tries - 1);
     }
     let s = new_span(bytes, bytes, noscan, NCLASS * 2);
     unsafe {
@@ -460,6 +457,13 @@ fn take_shared() -> bool {
     mark_lock();
     let mut any = move_all(SHARED, MAIN);
     if move_all(POOL, MAIN) { any = true; }
+    let mut w = 0;
+    loop {
+        let b = crate::rt::sched::wbuf_at(w);
+        if b == crate::rt::sched::WBUF_END { break; }
+        if b != 0 && move_all(b, MAIN) { any = true; }
+        w += 1;
+    }
     let mut k = 0;
     while k < MAX_MARKERS {
         if LOCAL != 0 && stack_len(LOCAL + k * 32) > 0 {
@@ -502,10 +506,22 @@ fn scan(lo: usize, hi: usize, dst: usize) {
             if *m != 0 { continue; }
             // Two markers may both get here: the object is scanned twice.
             *m = 1;
-            // The bytes marked (the live heap of a lazily swept cycle).
-            if dst == 0 { count_shared((*s).elem); } else { wset(dst + 24, wget(dst + 24) + (*s).elem); }
+            // The bytes marked (the live heap of a lazily swept cycle). A
+            // write barrier's go to its M's buffer, shared when full.
+            let mut to = dst;
+            if dst == 0 { to = crate::rt::sched::m_wbuf(); }
+            if to == 0 { count_shared((*s).elem); } else { wset(to + 24, wget(to + 24) + (*s).elem); }
             if (*s).noscan { continue; }
-            if dst == 0 { push_shared(start + i * (*s).elem); } else { stack_push(dst, start + i * (*s).elem); }
+            if to == 0 {
+                push_shared(start + i * (*s).elem);
+            } else {
+                stack_push(to, start + i * (*s).elem);
+                if dst == 0 && stack_len(to) >= 256 {
+                    mark_lock();
+                    move_all(to, SHARED);
+                    mark_unlock();
+                }
+            }
         }
     }
 }
@@ -549,6 +565,8 @@ static mut MARKERS: usize = 0;
 static mut IDLE_MARKERS: usize = 0;
 static mut MARK_DONE: bool = false;
 static mut CYCLE_NO: usize = 0;
+
+pub(crate) fn new_mark_stack() -> usize { new_stack() }
 
 fn new_stack() -> usize {
     let p = unsafe { calloc(4, 8) };
@@ -795,13 +813,18 @@ fn sweep_some(n: usize) -> bool {
 
 fn finish_sweep() { while sweep_some(4096) {} }
 
-// Sweeps until free list list has a span with room (or none is left).
-fn sweep_for(list: usize) {
-    while UNSWEPT != 0 {
+// Sweeps until free list list has a span with room, at most 256 spans
+// (the runtime lock is held: the sweeper G does the rest); whether one was
+// found.
+fn sweep_for(list: usize) -> bool {
+    let mut budget = 16;
+    while UNSWEPT != 0 && budget > 0 {
         sweep_some(16);
+        budget -= 1;
         let f = FREE[list] as *mut Span;
-        if f as usize != 0 && (list == NCLASS * 2 || unsafe { (*f).nfree } > 0) { return; }
+        if f as usize != 0 && (list == NCLASS * 2 || unsafe { (*f).nfree } > 0) { return true; }
     }
+    false
 }
 
 // The sweeper G.
@@ -829,6 +852,16 @@ fn take_marked() -> usize {
     MARKED_SHARED = 0;
     t += wget(MAIN + 24);
     wset(MAIN + 24, 0);
+    let mut w = 0;
+    loop {
+        let b = crate::rt::sched::wbuf_at(w);
+        if b == crate::rt::sched::WBUF_END { break; }
+        if b != 0 {
+            t += wget(b + 24);
+            wset(b + 24, 0);
+        }
+        w += 1;
+    }
     let mut k = 0;
     while k < MAX_MARKERS {
         t += wget(LOCAL + k * 32 + 24);
