@@ -53,11 +53,21 @@ struct LocData {
 /// relocations name the strings and locations it uses as %S<i> and %L<i>
 /// (indexes into strs and locs): they get their symbols when the functions
 /// are merged in order, so the object does not depend on the threads.
+// A relocation of a worker's function: against symbol number id (numbered
+// before the workers started), else by name (strings, locations and the
+// rest get their numbers when merged).
+struct OutReloc {
+    off: u32,
+    kind: obj::RelocKind,
+    id: i64,
+    name: String,
+}
+
 struct FuncOut {
     sym: String,
     name: String,
     code: Vec<u8>,
-    relocs: Vec<obj::Reloc>,
+    relocs: Vec<OutReloc>,
     /// (offset in code, file, line) in debug builds.
     lines: Vec<(u64, String, u32)>,
     strs: Vec<Vec<u8>>,
@@ -73,6 +83,11 @@ struct Job {
     f: &mut Func,
     sym: String,
 }
+
+// The runtime symbols generated code refers to by name.
+const RUNTIME_SYMS: [&str; 18] = ["_navi_argc", "_navi_argv", "_navi_data_end", "_navi_data_start", "_navi_g0boot", "_navi_gc_marking",
+    "_navi_gstart", "_navi_longjmp", "_navi_morestack", "_navi_mstart", "_navi_os_sp", "_navi_overflow", "_navi_rundefers",
+    "_navi_saved_greg", "_navi_setjmp", "_navi_stack_lo", "_navi_stack_top", "_navi_swapctx"];
 
 // The functions a worker takes at a time.
 const CHUNK: usize = 4;
@@ -112,6 +127,8 @@ pub struct Gen {
     flocs: Vec<LocData>,
     floc_ix: HashMap<String, usize>,
     fundef: Vec<String>,
+    /// The symbol numbers given before the workers started (read only).
+    main_ids: HashMap<String, u32>,
 }
 
 fn round8(n: i64) -> i64 { (n + 7) & !7 }
@@ -163,7 +180,7 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
     &mut Gen { p, o: obj::new_object(arch), m, tgt, debug, lay: p.lay, locs: HashMap::new(), loc_list: Vec::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
-        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new() }
+        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new() }
 }
 
 /// Lowers the plan into a new object for arch, with a machine from new_m
@@ -198,6 +215,16 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
             k += 1;
         }
     }
+    // Number the symbols functions refer to, so that workers give their
+    // relocations numbers (the linker then looks nothing up by name).
+    for grp in p.groups.iter() {
+        g.o.id(grp.sym.as_str());
+        for inst in grp.insts.iter() { g.o.id(inst.dict.as_str()); }
+    }
+    for j in jobs.iter() { g.o.id(j.sym.as_str()); }
+    for v in p.vtable_list.iter() { g.o.id(v.sym.as_str()); }
+    for (_, sym) in g.statics.iter() { g.o.id(sym.as_str()); }
+    for sym in RUNTIME_SYMS.iter() { g.o.id(*sym); }
     let mut nw = match thread::available_parallelism() { Ok(n) => n, Err(_) => 1 };
     if nw > jobs.len() / CHUNK { nw = jobs.len() / CHUNK; }
     let next = &Mutex::new(0usize);
@@ -310,6 +337,7 @@ impl Gen {
         w.lay = layout::new_computer(self.p.info);
         w.statics = self.statics;
         w.closure = self.closure;
+        w.main_ids = self.o.ids;
         w
     }
 
@@ -332,8 +360,8 @@ impl Gen {
             }
         }
         for r in out.relocs.iter() {
-            let sym = placeholder(&r.sym, &strs, &locs);
-            self.o.reloc(obj::TEXT, off as u32 + r.off, r.kind, sym.as_str());
+            let id = if r.id >= 0 { r.id as u32 } else { self.o.id(placeholder(&r.name, &strs, &locs).as_str()) };
+            self.o.reloc_id(obj::TEXT, off as u32 + r.off, r.kind, id);
         }
     }
 
@@ -341,7 +369,12 @@ impl Gen {
     fn emit_out(&mut self, sym: &str) {
         let c = self.m.finish();
         let name = if self.cur_name.len() > 0 { self.cur_name.clone() } else { sym.to_string() };
-        let out = &mut FuncOut { sym: sym.to_string(), name, code: c.code, relocs: c.relocs, lines: Vec::new(), strs: self.fstrs,
+        let mut relocs: Vec<OutReloc> = Vec::new();
+        for r in c.relocs.iter() {
+            let id = match self.main_ids.get(&r.sym) { Some(i) => *i as i64, None => -1 };
+            relocs.push(OutReloc { off: r.off, kind: r.kind, id, name: if id >= 0 { String::new() } else { r.sym.clone() } });
+        }
+        let out = &mut FuncOut { sym: sym.to_string(), name, code: c.code, relocs, lines: Vec::new(), strs: self.fstrs,
             locs: self.flocs, undef: self.fundef, errs: self.errs, failed: false };
         if c.err.len() > 0 {
             out.errs.push(`${sym}: ${c.err}`);
