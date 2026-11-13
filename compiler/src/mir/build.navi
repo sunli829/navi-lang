@@ -21,6 +21,9 @@ pub struct Program {
     lang_fns: HashMap<String, &mut Def>,
     /// The closure bodies created while lowering, in creation order.
     pub closures: Vec<&mut Func>,
+    /// Where the numbers of this Program's closures start (a worker's are
+    /// numbered within its function, or after all others as stage0 does).
+    pub closure_base: usize,
     /// Generated builtin/derived impl bodies.
     pub shims: HashMap<String, &mut Func>,
     /// Whether boxing waits for escape analysis of the whole program.
@@ -35,7 +38,7 @@ pub struct Program {
 /// without escape analysis).
 pub fn build_program(info: &mut Info, roots: Option<Vec<&mut Def>>) -> &mut Program {
     let escape = std::env::var("NAVI_NOESCAPE").is_err() && !crate::resolve::cfg::stage0_mode();
-    let p = &mut Program { info, funcs: HashMap::new(), lang_fns: HashMap::new(), closures: Vec::new(), shims: HashMap::new(), escape, direct_templates: escape };
+    let p = &mut Program { info, funcs: HashMap::new(), lang_fns: HashMap::new(), closures: Vec::new(), closure_base: 0, shims: HashMap::new(), escape, direct_templates: escape };
     p.find_lang_fns();
     let defs = info.res.defs.clone();
     match roots {
@@ -123,12 +126,55 @@ impl Program {
             if let Some(d) = self.lang_fn(name) { work.push(d); }
         }
         for r in roots.iter() { work.push(*r); }
+        // A level at a time: the functions found are built on several
+        // threads, then (in order) recorded and scanned for the next level.
+        let par = !crate::resolve::cfg::stage0_mode();
         while work.len() > 0 {
-            let d = work.pop().unwrap();
-            if seen.contains_key(&d.id) { continue; }
-            seen.insert(d.id, true);
-            if let Some(f) = self.func(d) { self.refs(f, &mut work, &mut seen_traits); }
+            let mut level: Vec<&mut Def> = Vec::new();
+            for d in work.iter() {
+                if seen.contains_key(&d.id) { continue; }
+                seen.insert(d.id, true);
+                if !self.funcs.contains_key(&d.id) { level.push(*d); }
+            }
+            work = Vec::new();
+            if par { self.info.check_lazily(&level); }
+            let mut built: Vec<Option<(&mut Func, Vec<&mut Func>)>> = Vec::new();
+            for _ in level.iter() { built.push(None); }
+            if par { self.info.ctx.par = true; }
+            // (Closures must not capture self: stage0 miscompiles that.)
+            let me = self;
+            crate::util::par_for(level.len(), 4, |i| {
+                let w = me.worker();
+                match w.build(level[i]) {
+                    Some(f) => { built[i] = Some((f, w.closures)); }
+                    None => {}
+                }
+            });
+            self.info.ctx.par = false;
+            let mut i = 0;
+            while i < level.len() {
+                if let Some((f, cs)) = built[i] {
+                    self.funcs.insert(level[i].id, f);
+                    for c in cs.iter() { self.closures.push(*c); }
+                    self.refs(f, &mut work, &mut seen_traits);
+                }
+                i += 1;
+            }
         }
+    }
+
+    // A copy for building one function on a thread: its closures are its
+    // own (numbered within the function); the rest is shared, read only.
+    fn worker(&mut self) -> &mut Program {
+        let base = if crate::resolve::cfg::stage0_mode() { self.closure_base + self.closures.len() } else { 0 };
+        &mut Program { info: self.info, funcs: self.funcs, lang_fns: self.lang_fns, closures: Vec::new(), closure_base: base,
+            shims: self.shims, escape: self.escape, direct_templates: self.direct_templates }
+    }
+
+    // The MIR of def's body (not recorded).
+    fn build(&mut self, def: &mut Def) -> Option<&mut Func> {
+        let body = match self.info.body(def) { Some(b) => b, None => return None };
+        Some(new_builder(self, body).build())
     }
 
     fn refs(&mut self, f: &Func, work: &mut Vec<&mut Def>, seen_traits: &mut HashMap<u32, bool>) {
@@ -230,8 +276,9 @@ impl Program {
     /// The MIR of a body, building it on first use.
     pub fn func(&mut self, def: &mut Def) -> Option<&mut Func> {
         if let Some(f) = self.funcs.get(&def.id) { return Some(*f); }
-        let body = match self.info.body(def) { Some(b) => b, None => return None };
-        let f = new_builder(self, body).build();
+        let w = self.worker();
+        let f = w.build(def)?;
+        for c in w.closures.iter() { self.closures.push(*c); }
         self.funcs.insert(def.id, f);
         Some(f)
     }

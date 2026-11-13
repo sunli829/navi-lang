@@ -45,8 +45,48 @@ fn has_proj_or_opaque(t: &Type) -> bool {
 impl Info {
     fn col(&self) -> &mut Collector { self.c.unwrap() }
 
+    /// Takes the query lock while threads share Info (re-entrant).
+    pub fn enter(&mut self) {
+        if !self.ctx.par { return; }
+        let me = std::thread::current().id();
+        if self.qowner == Some(me.clone()) {
+            self.qdepth += 1;
+            return;
+        }
+        self.qlock.lock();
+        self.qowner = Some(me);
+        self.qdepth = 1;
+    }
+
+    pub fn leave(&mut self) {
+        if self.qdepth == 0 { return; }
+        self.qdepth -= 1;
+        if self.qdepth == 0 {
+            self.qowner = None;
+            self.qlock.unlock();
+        }
+    }
+
+    /// Checks the std bodies among defs not checked yet (on several
+    /// threads), before they are asked for.
+    pub fn check_lazily(&mut self, defs: &Vec<&mut Def>) {
+        if !self.lazy_std { return; }
+        let mut todo: Vec<&mut Def> = Vec::new();
+        for d in defs.iter() {
+            if d.krate.is_std && !self.bodies.contains_key(&d.id) { todo.push(*d); }
+        }
+        if todo.len() > 0 { self.col().check_defs(todo); }
+    }
+
     /// The type-checked body of d (std bodies are checked on first use).
     pub fn body(&mut self, d: &mut Def) -> Option<&mut BodyInfo> {
+        self.enter();
+        let r = self.body_now(d);
+        self.leave();
+        r
+    }
+
+    fn body_now(&mut self, d: &mut Def) -> Option<&mut BodyInfo> {
         if let Some(b) = self.bodies.get(&d.id) { return Some(*b); }
         if !self.lazy_std || !d.krate.is_std { return None; }
         self.col().check_body_of(d);
@@ -56,6 +96,13 @@ impl Info {
     /// The concrete type behind an opaque type (checking its function's
     /// body first if needed).
     pub fn hidden_of(&mut self, t: &Type) -> Option<&Type> {
+        self.enter();
+        let r = self.hidden_of_now(t);
+        self.leave();
+        r
+    }
+
+    fn hidden_of_now(&mut self, t: &Type) -> Option<&Type> {
         if let Some(h) = self.hidden.get(&t.id) { return Some(*h); }
         if !self.lazy_std { return None; }
         if let Some(d) = t.def { self.body(d); }
@@ -73,9 +120,14 @@ impl Info {
     /// <t as Deref>::Target, or none if t does not implement Deref.
     pub fn deref_target(&mut self, owner: Option<&mut Def>, t: &Type) -> Option<&Type> {
         let key = cache_key(owner, t);
-        if let Some(r) = self.deref_cache.get(&key) { return *r; }
+        self.enter();
+        if let Some(r) = self.deref_cache.get(&key) {
+            self.leave();
+            return *r;
+        }
         let r = self.deref_target_uncached(owner, t);
         self.deref_cache.insert(key, r);
+        self.leave();
         r
     }
 
@@ -92,9 +144,14 @@ impl Info {
     pub fn normalize(&mut self, owner: Option<&mut Def>, t: &Type) -> &Type {
         if !has_proj_or_opaque(t) { return t; }
         let key = cache_key(owner, t);
-        if let Some(r) = self.norm_cache.get(&key) { return *r; }
+        self.enter();
+        if let Some(r) = self.norm_cache.get(&key) {
+            self.leave();
+            return *r;
+        }
         let r = self.normalize_uncached(owner, t);
         self.norm_cache.insert(key, r);
+        self.leave();
         r
     }
 
