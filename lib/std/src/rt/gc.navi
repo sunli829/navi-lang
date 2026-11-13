@@ -278,9 +278,7 @@ fn refill(c: usize, list: usize) -> *mut Span {
         }
         break;
     }
-    spin_lock(&mut HEAP_LK as *mut usize);
     let s = new_span(CLASSES[c], SPAN_BYTES, list & 1 == 1, list);
-    spin_unlock(&mut HEAP_LK as *mut usize);
     add_allocated(unsafe { (*s).nfree * (*s).elem });
     s
 }
@@ -413,9 +411,7 @@ fn alloc_large_in(size: usize, noscan: bool, tries: usize) -> usize {
         sweep_some(64);
         return alloc_large_in(size, noscan, tries - 1);
     }
-    spin_lock(&mut HEAP_LK as *mut usize);
     let s = new_span(bytes, bytes, noscan, NCLASS * 2);
-    spin_unlock(&mut HEAP_LK as *mut usize);
     unsafe {
         (*s).freelist = 0;
         (*s).nfree = 0;
@@ -426,10 +422,15 @@ fn alloc_large_in(size: usize, noscan: bool, tries: usize) -> usize {
     }
 }
 
+// A new span: the heap lock only to cut its pages off the arena and to put
+// it on the span list (it is set up in between: no other thread sees it
+// before; a concurrent mark ignores pages past its LIMIT).
 fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
+    spin_lock(&mut HEAP_LK as *mut usize);
     let start = ARENA_NEXT;
     if start + bytes > ARENA_END { out_of_memory(); }
     ARENA_NEXT = start + bytes;
+    spin_unlock(&mut HEAP_LK as *mut usize);
     commit(start, bytes);
     let s = unsafe { calloc(1, crate::intrinsics::size_of::<Span>()) } as *mut Span;
     let nelems = bytes / elem;
@@ -452,14 +453,16 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
         }
         (*s).freelist = free;
         (*s).nfree = nelems;
-        (*s).next_all = ALL as *mut Span;
     }
-    ALL = s as usize;
     let mut pg = start;
     while pg < start + bytes {
         st(PAGES + ((pg - ARENA) >> PAGE_SHIFT) * 8, s as usize);
         pg += PAGE;
     }
+    spin_lock(&mut HEAP_LK as *mut usize);
+    unsafe { (*s).next_all = ALL as *mut Span; }
+    ALL = s as usize;
+    spin_unlock(&mut HEAP_LK as *mut usize);
     s
 }
 
@@ -702,6 +705,12 @@ fn mark_worker(k: usize, cyc: usize) {
                 crate::rt::sched::preempt_on();
                 return;
             }
+            // A look without the lock first (a hint): nothing to take and
+            // not everyone idle, so keep waiting.
+            if stack_len(POOL) == 0 && stack_len(SHARED) == 0 && IDLE_MARKERS != MARKERS && spins < 100 {
+                crate::rt::sched::preempt_on();
+                continue;
+            }
             let mut leave = false;
             mark_lock();
             if take_work(me) {
@@ -792,18 +801,34 @@ fn sweep() {
 // Frees the unmarked objects of s, clears its marks and puts it on its
 // free list if it has room; returns its live bytes.
 fn sweep_span(s: *mut Span) -> usize {
+    let (live, free) = sweep_bits(s);
+    if free { put_free(s); }
+    live
+}
+
+// Puts s on its free list (if not there).
+fn put_free(s: *mut Span) {
+    unsafe {
+        if !(*s).in_free {
+            (*s).next_free = FREE[(*s).list] as *mut Span;
+            FREE[(*s).list] = s as usize;
+            (*s).in_free = true;
+        }
+    }
+}
+
+// Frees the unmarked objects of s and clears its marks (s is the caller's
+// alone); its live bytes, and whether it has room now.
+fn sweep_bits(s: *mut Span) -> (usize, bool) {
     let mut live = 0usize;
+    let mut room = false;
     unsafe {
         let n = (*s).nelems;
         let bits = (*s).bits as usize;
         if (*s).list == NCLASS * 2 {
             if ldb(bits) != 0 && ldb(bits + 1) == 0 {
                 stb(bits, 0);
-                if !(*s).in_free {
-                    (*s).next_free = FREE[64] as *mut Span;
-                    FREE[64] = s as usize;
-                    (*s).in_free = true;
-                }
+                room = true;
             } else if ldb(bits) != 0 {
                 live += (*s).bytes;
             }
@@ -830,14 +855,10 @@ fn sweep_span(s: *mut Span) -> usize {
             (*s).freelist = free;
             (*s).nfree = nfree;
             live += (n - nfree) * (*s).elem;
-            if nfree > 0 && !(*s).in_free {
-                (*s).next_free = FREE[(*s).list] as *mut Span;
-                FREE[(*s).list] = s as usize;
-                (*s).in_free = true;
-            }
+            room = nfree > 0;
         }
     }
-    live
+    (live, room)
 }
 
 // --- Lazy sweeping (concurrent collections) ----------------------------------
@@ -881,10 +902,15 @@ fn sweep_some(n: usize) -> bool {
             crate::rt::sched::preempt_on();
             return false;
         }
-        let l = list_lk(unsafe { (*s).list });
-        spin_lock(l);
-        sweep_span(s);
-        spin_unlock(l);
+        // Swept unlocked (claimed: no one else has it); the list lock only
+        // to put it on its free list.
+        let (_, room) = sweep_bits(s);
+        if room {
+            let l = list_lk(unsafe { (*s).list });
+            spin_lock(l);
+            put_free(s);
+            spin_unlock(l);
+        }
         crate::rt::sched::preempt_on();
         k += 1;
     }
