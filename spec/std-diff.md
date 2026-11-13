@@ -30,7 +30,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | Rust | navi | 说明 |
 |---|---|---|
 | channel 在所有 `Sender` 被 drop 后关闭 | `Sender::close()` | 新增 API |
-| `Mutex::lock()` 返回 guard，drop 时解锁 | `lock()` / `unlock()`，另有 `with_lock(\|v\| ..)` | 这一版未实现 `Mutex` |
+| `Mutex::lock()` 返回 guard，drop 时解锁 | `lock()` / `unlock()`，另有 `with_lock(\|v\| ..)`、`try_lock() -> bool`；没有锁中毒 | 共享时用 `&Mutex<T>` |
 | 文件、socket 在 drop 时关闭 | `close()`，配合 `defer` | 这一版未实现 |
 
 ## 4. 行为差异
@@ -40,6 +40,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | 集合（`Vec`、`String`、`HashMap` …）的赋值 | move | 拷贝句柄，两者共享同一个容器；要独立副本用 `.clone()` |
 | channel 模块 | 常用 `std::sync::mpsc`（单消费者） | `std::sync::mpmc`（`Receiver` 可以被多个线程共享） |
 | `thread::spawn` | 操作系统线程 | 绿色线程（M:N 调度） |
+| `thread::available_parallelism` | `io::Result<NonZero<usize>>` | `io::Result<usize>`（调度器同时使用的 OS 线程数：`NAVI_MAXPROCS`，否则 CPU 数） |
 | 线程里 panic | 只结束该线程，`join()` 返回 `Err` | 相同（M9 起）。只有 native 后端；stage0 的解释器不捕获 panic，仍结束整个进程 |
 | panic 的载荷 | `Box<dyn Any + Send>`，通常装着消息 | `std::panic::PanicPayload`：`message()` 和 `location()`；`thread::Result<T> = Result<T, PanicPayload>` |
 | `Duration::as_nanos` / `as_micros` / `as_millis` | `u128` | 相同；只有用 stage0 编译 std 时是 `u64`（stage0 没有 128 位整数） |
