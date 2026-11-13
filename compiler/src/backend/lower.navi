@@ -100,6 +100,8 @@ pub struct Gen {
     lock: &Mutex<u8>,
     /// The layouts this generator has used (read without the lock).
     lays: HashMap<u32, &mut Layout>,
+    /// Field types by (type id, variant).
+    ftypes: HashMap<u64, Vec<&Type>>,
     loc_ty: &Type,
     /// A worker lowers functions into outs; the current function's strings,
     /// locations and C symbols are collected for its FuncOut.
@@ -160,7 +162,7 @@ fn link_name(d: &Def) -> String {
 fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug: bool, lock: &Mutex<u8>, loc_ty: &Type) -> &mut Gen {
     &mut Gen { p, o: obj::new_object(arch), m, tgt, debug, lay: p.lay, locs: HashMap::new(), loc_list: Vec::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
-        lock, lays: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
+        lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
         flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new() }
 }
 
@@ -245,6 +247,26 @@ fn run_jobs(w: &mut Gen, jobs: &mut Vec<Job>, next: &Mutex<usize>) -> Vec<(usize
             j += 1;
         }
     }
+}
+
+// Whether t is its own concrete type in every instance: no type
+// parameters, projections or opaque types in it (read only: types never
+// change).
+fn ground(t: &Type) -> bool {
+    match t.kind {
+        types::K_PARAM | types::K_PROJ | types::K_OPAQUE | types::K_DYN | types::K_INFER | types::K_CONST => false,
+        types::K_REF | types::K_PTR | types::K_SLICE => ground(t.el()),
+        types::K_ARRAY => t.ret.is_none() && ground(t.el()),
+        types::K_TUPLE => ground_list(&t.elems),
+        types::K_FN => ground_list(&t.elems) && ground(t.ret.unwrap()),
+        types::K_ADT => ground_list(&t.args),
+        _ => true,
+    }
+}
+
+fn ground_list(ts: &Vec<&Type>) -> bool {
+    for t in ts.iter() { if !ground(*t) { return false; } }
+    true
 }
 
 fn placeholder(s: &String, strs: &Vec<String>, locs: &Vec<String>) -> String {
@@ -337,9 +359,12 @@ impl Gen {
     }
 
     fn field_types(&mut self, t: &Type, variant: i64) -> Vec<&Type> {
+        let k = (t.id as u64) << 24 | (variant + 1) as u64;
+        if let Some(r) = self.ftypes.get(&k) { return *r; }
         self.lock.lock();
         let r = self.lay.field_types(t, variant);
         self.lock.unlock();
+        self.ftypes.insert(k, r);
         r
     }
 
@@ -351,6 +376,7 @@ impl Gen {
     }
 
     fn concrete(&mut self, i: &Inst, t: &Type) -> &Type {
+        if ground(t) { return t; }
         self.lock.lock();
         let r = i.concrete(self.p.info, t);
         self.lock.unlock();
