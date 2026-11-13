@@ -98,11 +98,12 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   - 解析：按 `mod` 声明一层一层发现文件，同一层的文件在多个线程上解析；解析器有自己的 `IdGen`，每个文件按发现顺序和文件大小分到一段 id（`NAVI_STAGE0=1` 时保持串行编号，selfcheck 用）。
   - 类型检查：函数体分给多个线程，每个线程一份 `Collector` 浅拷贝（错误、BodyInfo、隐藏类型各自收集，结束后按定义顺序合并；常量求值加锁；inherent 表事先建好）。`Ctx` 的驻留表分成 64 片，并行时每片一把锁，类型 id 改成"分片 + 65 × 序号"（id 只用作身份，不影响输出顺序）。
   - MIR：从根出发一层一层构建可达函数，同一层在多个线程上构建（每个函数一份 `Program` 浅拷贝，闭包在函数内编号）；每层先并行检查这一层里还没检查的 std 函数体；`Info` 的惰性查询（body、hidden_of、normalize、deref_target）在并行时持一把可重入锁（用新加的 `std::thread::current().id()`）；MIR 和 AST 的 id 改用新加的 `std::sync::atomic::AtomicUsize`。逃逸分析的摘要不动点保持串行（Gauss-Seidel 式，结果依赖顺序），其后的 keep 和装箱并行（`util::par_for`）。
-  - plan：仍是串行的。没有类型参数的实例直接用函数 id 作组键（不再逐个局部变量算形状）。要并行化，需要 trait 求解（`normalize`、`resolve_method`）本身能并发，并把 plan 拆成"并行解析 + 串行编号"，还没做。
+  - trait 求解：`Info` 的查询（normalize、resolve_method、deref_target）只在读写缓存时持锁，求解本身在锁外、用 Collector 的一份副本做（两个线程可能算同一个查询，结果相同）。
+  - plan：实例按层遍历（运行时的实例先走完，它们的静态变量先初始化——生成代码经运行时分配内存，实例图里看不到这条依赖）；每层先在多个线程上做一遍只读的遍历，把具体类型、方法解析的缓存填好、算出每个实例的形状键，然后按顺序真正遍历和分组。没有类型参数的实例直接用函数 id 作组键。
   - 后端：函数按顺序排成作业，工作线程每次取 8 个；类型驻留、布局和类型检查器的缓存在锁后面，布局、字段类型按线程缓存，不含类型参数的类型不拿锁；字符串和位置先用占位名（`%S<i>`/`%L<i>`），按函数顺序合并时才起正式名字，闭包按组内编号。
   - 链接：代码签名的页哈希多线程计算。
   - 顺带发现并修掉的编译器 bug：闭包捕获 `self` 时，`self` 的堆单元会占掉下一个参数的局部变量槽（stage0 和 navic 都有；stage0 冻结，所以编译器源码里不让闭包捕获 self）。`tests/run/closure_self.navi`。
-  - 结果（8 核）：bp10 1.75s → 1.08s（go build 0.38s）；10 万行 20.8s（STW GC）→ 10.4s（go build 约 3s），其中 parse+resolve 1.0s → 0.75s、types 3.9s → 1.1s、mir 3.8s → 2.9s、plan 2.9s → 2.7s、codegen 3.2s → 1.7s、link 1.8s → 0.93s；自编译 4.9s → 3.1s。
+  - 结果（8 核）：bp10 1.75s → 0.93s（go build 0.37s）；10 万行 20.8s（STW GC）→ 8.4s（go build 2.7s），其中 parse+resolve 1.0s → 0.73s、types 3.9s → 1.3s、mir 3.8s → 2.1s、plan 2.9s → 1.6s、codegen 3.2s → 1.8s、link 1.8s → 0.9s；自编译 4.9s → 3.0s。见 `docs/bench.md` 第三轮。
 
 - 语言和工具（都只在 navic 里，stage0 冻结；std 里 stage0 编不了的部分用 `#[cfg(feature = "navic")]` 藏起来，含新语法的放在单独的模块文件里，stage0 不会去读）：
   - `panic::catch_unwind` / `resume_unwind` / `PanicPayload`：每个 G 有一串 catch 记录，`try_call` 用 setjmp 式的上下文保存（`_navi_setjmp`/`_navi_longjmp`，存 x19–x28、fp、lr、sp），panic 先打印消息、执行到 catch 帧为止的 defer，再恢复上下文；`thread::spawn` 用它包住线程函数，`join()` 返回 `Err(PanicPayload)`；`tests/run/catch.navi`。
@@ -131,6 +132,6 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
 
 ## 下一步
 
-1. 冷编译提速：plan 的并行（trait 求解要能并发）；逃逸分析摘要的并行（需要按版本复现串行的迭代顺序）；std 的导出数据缓存。
+1. 冷编译提速：剩下的串行部分（逃逸分析摘要的不动点、plan 的按序遍历、各阶段之间的合并）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。
 2. 运行时：每个 M 的运行队列、基于信号的抢占、栈收缩、最后一次 STW 的并行排空。
 3. DWARF 的变量和类型信息；amd64/ELF/COFF 上的自研链接器和 DWARF（现在只有 macOS arm64）。
