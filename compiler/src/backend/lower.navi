@@ -246,10 +246,13 @@ impl Gen {
         // the entry point runs their initializers). The collector scans from
         // _navi_data_start to _navi_data_end.
         self.o.define("_navi_data_start", obj::DATA, 8, false);
-        for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv"].iter() {
+        for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv", "_navi_saved_greg"].iter() {
             self.o.define(*sym, obj::DATA, 8, false);
             self.o.zeros(obj::DATA, 8);
         }
+        // The G record in use before the scheduler starts (no stack limit).
+        self.o.define("_navi_g0boot", obj::DATA, 16, false);
+        self.o.zeros(obj::DATA, 512);
         for d in self.p.statics.iter() {
             let ty = self.p.info.consts[&d.id].ty;
             let l = self.lay.of(ty);
@@ -300,6 +303,11 @@ impl Gen {
         if s > ret_size { ret_size = s; }
         let frame = (ret_size + 15) & !15;
         m.entry_prologue(frame);
+        // The G register (callee-saved in C: kept for our caller) points to
+        // a blank G record until the scheduler starts.
+        m.adr_sym(I1, "_navi_saved_greg");
+        m.store(8, GREG, I1, 0);
+        m.adr_sym(GREG, "_navi_g0boot");
         m.adr_sym(I1, "_navi_stack_top");
         m.store(8, FP, I1, 0);
         let main_loc = self.loc_at("<main>", 0, 0);
@@ -349,6 +357,8 @@ impl Gen {
         m.adr_sym(I1, "_navi_os_sp");
         m.load(8, V1, I1, 0);
         m.mov(SP, V1);
+        m.adr_sym(I1, "_navi_saved_greg");
+        m.load(8, GREG, I1, 0);
         m.entry_return0();
         let name = `${self.tgt.c_prefix}main`;
         self.emit_func(name.as_str(), true);
@@ -358,6 +368,17 @@ impl Gen {
     /// new green thread and the stack overflow handler.
     fn gen_sched(&mut self) {
         let m = self.m;
+        let rt_loc = self.loc_at("<runtime>", 0, 0);
+        let ms = self.p.runtime[&"morestack".to_string()];
+        m.begin();
+        m.morestack(ms.grp().sym.as_str(), ms.dict.as_str(), rt_loc.as_str());
+        self.emit_func("_navi_morestack", false);
+
+        let mst = self.p.runtime[&"mstart".to_string()];
+        m.begin();
+        m.mstart(mst.grp().sym.as_str(), mst.dict.as_str(), rt_loc.as_str());
+        self.emit_func("_navi_mstart", false);
+
         m.begin();
         m.swap_context();
         self.emit_func("_navi_swapctx", false);
@@ -477,8 +498,8 @@ fn collect_closures(f: &Func, todo: &mut Vec<&mut Func>) {
 
 /// Out-of-line code emitted after the function body.
 enum Stub {
-    /// The stack overflow check's slow path.
-    Overflow(Label),
+    /// The stack check's slow path (then the check again).
+    Overflow(Label, Label),
     /// A panic with a message at a position.
     Panic { label: Label, msg: String, pos: Pos },
 }
@@ -610,13 +631,16 @@ impl FnGen {
         let frame = ((cur + 15) & !15) + ((max_out + 15) & !15);
 
         m.prologue(frame);
+        // The stack check: the limit is the first word of the running G (a
+        // collector stopping the world sets it to the maximum).
         let overflow = m.new_label();
-        m.adr_sym(I1, "_navi_stack_lo");
-        m.load(8, I1, I1, 0);
+        let check = m.new_label();
+        m.bind(check);
+        m.load(8, I1, GREG, 0);
         m.mov(I2, SP);
         m.cmp(I2, I1);
         m.branch_if(LTU, overflow);
-        self.stub_list.push(Stub::Overflow(overflow));
+        self.stub_list.push(Stub::Overflow(overflow, check));
         for sv in self.saved.iter() { m.store(8, sv.0, FP, sv.1); }
         if f.closure {
             if self.preg[1] >= 0 { m.mov(self.preg[1] as Reg, CTX); } else { m.store(8, CTX, FP, self.loff[1]); }
@@ -660,10 +684,10 @@ impl FnGen {
         let mut k = 0;
         while k < self.stub_list.len() {
             match &self.stub_list[k] {
-                Stub::Overflow(l) => {
+                Stub::Overflow(l, check) => {
                     m.bind(*l);
-                    m.call("_navi_overflow");
-                    m.trap();
+                    m.call("_navi_morestack");
+                    m.jump(*check);
                 }
                 Stub::Panic { label, msg, pos } => {
                     m.bind(*label);
@@ -1960,9 +1984,44 @@ impl FnGen {
                 k += 1;
             }
         } else if name == "set_stack_limit" {
+            // The running G's limit (the first word of its record).
             self.load_scalar(&args[0], V1);
-            m.adr_sym(I1, "_navi_stack_lo");
-            m.store(8, V1, I1, 0);
+            m.store(8, V1, GREG, 0);
+        } else if name == "current_g" {
+            m.mov(V1, GREG);
+        } else if name == "set_current_g" {
+            self.load_scalar(&args[0], GREG);
+        } else if name == "mstart_address" {
+            m.adr_sym(V1, "_navi_mstart");
+        } else if name == "atomic_load" {
+            self.load_scalar(&args[0], I1);
+            m.atomic_load(V1, I1);
+        } else if name == "atomic_store" {
+            self.load_scalar(&args[1], V1);
+            m.store(8, V1, FP, self.res_off);
+            self.load_scalar(&args[0], I1);
+            m.load(8, V1, FP, self.res_off);
+            m.atomic_store(V1, I1);
+        } else if name == "atomic_add" {
+            self.load_scalar(&args[1], V2);
+            m.store(8, V2, FP, self.res_off);
+            self.load_scalar(&args[0], I1);
+            m.load(8, V2, FP, self.res_off);
+            m.atomic_add(V1, V2, I1);
+        } else if name == "atomic_cas" {
+            // V1 = old (replaced by the word read), V2 = new; true if the
+            // word was old.
+            self.load_scalar(&args[2], V2);
+            m.store(8, V2, FP, self.res_off);
+            self.load_scalar(&args[1], V1);
+            m.store(8, V1, FP, self.res_off + 8);
+            self.load_scalar(&args[0], I1);
+            m.load(8, V2, FP, self.res_off);
+            m.load(8, V1, FP, self.res_off + 8);
+            m.mov(T1, V1);
+            m.atomic_cas(V1, V2, I1);
+            m.cmp(V1, T1);
+            m.set_cond(V1, EQ);
         } else if name == "wrapping_add" || name == "wrapping_sub" || name == "wrapping_mul" {
             self.load_scalar(&args[1], V2);
             m.store(8, V2, FP, self.res_off);

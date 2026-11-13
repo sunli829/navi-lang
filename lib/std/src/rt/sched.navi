@@ -41,6 +41,9 @@ const DEAD: u8 = 3;
 
 /// A green thread.
 pub struct G {
+    // First: the stack limit function prologues check (navic; see
+    // backend::lower). The collector sets it to the maximum to stop the G.
+    guard: usize,
     // Saved context (sp, fp, pc) while not running.
     sp: usize,
     fp: usize,
@@ -106,13 +109,44 @@ pub fn init() -> usize {
         (*g).status = RUNNING;
         (*g).main = true;
         (*g).entry = || {};
+        (*g).guard = base + RED_ZONE;
     }
-    CUR = g as usize;
-    crate::rt::set_stack_limit(base + RED_ZONE);
+    set_current(g);
     base + MAIN_STACK
 }
 
+// The running G: navic keeps it in a register (each OS thread has its own),
+// stage0 in CUR.
+#[cfg(feature = "navic")]
+pub fn current() -> *mut G { crate::rt::current_g() as *mut G }
+#[cfg(not(feature = "navic"))]
 pub fn current() -> *mut G { CUR as *mut G }
+
+#[cfg(feature = "navic")]
+fn set_current(g: *mut G) { crate::rt::set_current_g(g as usize); }
+#[cfg(not(feature = "navic"))]
+fn set_current(g: *mut G) {
+    CUR = g as usize;
+    unsafe { crate::rt::set_stack_limit((*g).guard); }
+}
+
+// Switches from prev to next. navic's context switch also switches the G
+// register; stage0 code reads CUR and the global stack limit.
+#[cfg(feature = "navic")]
+fn switch(prev: *mut G, next: *mut G) {
+    unsafe { crate::rt::swap_context(&mut (*prev).sp as *mut usize as *mut u8, &mut (*next).sp as *mut usize as *mut u8); }
+}
+#[cfg(not(feature = "navic"))]
+fn switch(prev: *mut G, next: *mut G) {
+    set_current(next);
+    unsafe { crate::rt::swap_context(&mut (*prev).sp as *mut usize as *mut u8, &mut (*next).sp as *mut usize as *mut u8); }
+}
+
+// Whether the scheduler has not started (the running G is a blank record).
+fn booting() -> bool {
+    let g = current();
+    g as usize == 0 || unsafe { (*g).stack_hi } == 0
+}
 
 /// The current G's innermost catch_unwind record (0: none).
 pub fn catch_top() -> usize { unsafe { (*current()).catch } }
@@ -120,15 +154,15 @@ pub fn set_catch_top(r: usize) { unsafe { (*current()).catch = r; } }
 
 /// Whether the running G is the main thread (for panic messages).
 pub fn is_main() -> bool {
-    if CUR == 0 { return true; }
-    unsafe { (*(CUR as *mut G)).main }
+    if booting() { return true; }
+    unsafe { (*current()).main }
 }
 
 /// The stack range of the running G that the collector must scan, and
 /// calls f for the saved stack of every other live G.
 pub fn current_stack_hi() -> usize {
-    if CUR == 0 { return crate::rt::stack_top() as usize + 16; }
-    unsafe { (*(CUR as *mut G)).stack_hi }
+    if booting() { return crate::rt::stack_top() as usize + 16; }
+    unsafe { (*current()).stack_hi }
 }
 
 /// Scans the saved stack of every other live G.
@@ -136,7 +170,7 @@ pub fn scan_other_stacks() {
     let mut g = ALL as *mut G;
     while g as usize != 0 {
         unsafe {
-            if (*g).status != DEAD && g as usize != CUR {
+            if (*g).status != DEAD && g as usize != current() as usize {
                 crate::rt::gc::scan_range((*g).sp, (*g).stack_hi);
             }
             g = (*g).all_next;
@@ -165,6 +199,10 @@ pub fn go(f: fn()) {
         (*g).pc = crate::rt::gstart_address() as usize;
         (*g).entry = f;
         (*g).catch = 0;
+        (*g).guard = (*g).stack_lo + RED_ZONE;
+        // The G register (x28, the last of the saved registers) of the
+        // first context.
+        *(((*g).stack_hi - 8) as *mut usize) = g as usize;
     }
     ready(g);
 }
@@ -217,13 +255,9 @@ fn schedule() {
         if RUN_HEAD == 0 { RUN_TAIL = 0; }
         (*next).status = RUNNING;
     }
-    let prev = CUR as *mut G;
+    let prev = current();
     if next as usize == prev as usize { return; }
-    CUR = next as usize;
-    unsafe {
-        crate::rt::set_stack_limit((*next).stack_lo + RED_ZONE);
-        crate::rt::swap_context(&mut (*prev).sp as *mut usize as *mut u8, &mut (*next).sp as *mut usize as *mut u8);
-    }
+    switch(prev, next);
 }
 
 /// Lets other Gs run.
@@ -458,3 +492,26 @@ fn case_chan(c: &crate::sync::mpmc::SelectCase) -> *mut Chan {
 
 fn case_slot(c: &crate::sync::mpmc::SelectCase) -> *mut u8 { crate::sync::mpmc::select_case_slot(c) }
 fn case_send(c: &crate::sync::mpmc::SelectCase) -> bool { crate::sync::mpmc::select_case_send(c) }
+
+// --- navic: the stack check's slow path and other OS threads ------------------
+
+#[cfg(feature = "navic")]
+pub fn morestack() {
+    let g = current();
+    unsafe {
+        if (*g).stack_hi == 0 {
+            // A thread's scheduler record: no limit.
+            return;
+        }
+        let lim = (*g).stack_lo + RED_ZONE;
+        if (crate::rt::stack_pointer() as usize) < lim {
+            crate::rt::native::fatal("stack overflow");
+        }
+        (*g).guard = lim;
+    }
+}
+
+#[cfg(feature = "navic")]
+pub fn mstart() -> ! {
+    crate::rt::native::fatal("no OS threads yet")
+}
