@@ -146,8 +146,25 @@ static mut CLASS_OF: [u8; 513] = [0; 513];
 /// path (a free object in the first span of the size class) is written out
 /// in this one function.
 pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
+    if multi() {
+        crate::rt::sched::lock();
+        let p = alloc_fast(size, noscan);
+        crate::rt::sched::unlock();
+        return p;
+    }
+    alloc_fast(size, noscan)
+}
+
+// Whether other OS threads may allocate too (then the runtime lock guards
+// the heap).
+#[cfg(feature = "navic")]
+fn multi() -> bool { crate::rt::sched::multi() }
+#[cfg(not(feature = "navic"))]
+fn multi() -> bool { false }
+
+fn alloc_fast(size: usize, noscan: bool) -> *mut u8 {
     if ALLOCATED >= NEXT_GC {
-        if ARENA == 0 { init(); } else { collect(); }
+        if ARENA == 0 { init(); } else { collect_locked(); }
     }
     if size > MAX_SMALL { return alloc_large(size, noscan) as *mut u8; }
     let c = CLASS_OF[(size + 15) >> 4] as usize;
@@ -342,11 +359,20 @@ static mut COLLECTING: bool = false;
 /// the data section sees them.
 static mut SAVED_REGS: [usize; 10] = [0; 10];
 
-/// Runs a full collection. It must not allocate.
+/// Runs a full collection.
 pub fn collect() {
+    crate::rt::sched::lock();
+    collect_locked();
+    crate::rt::sched::unlock();
+}
+
+// Collects with the runtime lock held; other OS threads' Gs are stopped
+// meanwhile. It must not allocate.
+fn collect_locked() {
     if COLLECTING { return; }
     COLLECTING = true;
     COLLECTIONS += 1;
+    crate::rt::sched::stop_the_world();
     crate::rt::spill_registers(&mut SAVED_REGS as *mut [usize; 10] as *mut usize);
     // From the stack pointer: this frame holds the callers' registers saved
     // by its prologue.
@@ -356,6 +382,7 @@ pub fn collect() {
     scan_range(crate::rt::data_start() as usize, crate::rt::data_end() as usize);
     drain();
     sweep();
+    crate::rt::sched::start_the_world();
     COLLECTING = false;
 }
 
