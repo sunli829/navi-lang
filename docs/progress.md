@@ -10,7 +10,7 @@
 | M1 | 完成 | parser、名称解析、签名收集、函数体类型检查、穷尽性检查、impl 一致性、`navi check` |
 | M2 | 基本完成 | MIR、解释器、std 子集实现、GC shape 实例分析、`navi run` / `navi test`；未做：MIR 优化（常量折叠/DCE/内联）、编译期 const 求值（目前 const 在运行时求值，数组长度用 AST 常量折叠） |
 | M7 | 完成（自举所需部分） | 整数/浮点方法（`tools/gennum` 生成 `num.navi`）、精确浮点解析（与 strconv 逐位一致）、`collections::{HashMap, HashSet}`、`hash::DefaultHasher`、`fs`、`path`、`env`、`process::Command`、`io::{Read, Write, BufWriter, Error}`、`str::pattern::Pattern` 及大量 str/String/slice/Vec/Option/Result/Iterator 方法（rev、zip、chain、flat_map、sum、sort_by 等）；OS 功能经 `std::rt` 的 intrinsic，解释器用 Go 实现，原生用 libc；修了两个 stage0 类型检查 bug（发散的 then 分支、绑定类型未规范化）；偏离记录在 spec/std-diff.md 第 5 节 |
-| M6 | 完成（M:1） | `std::rt::sched`（navi 写）：绿色线程 G、FIFO 运行队列、`swapcontext` 式切换（arm64/amd64 各一段汇编）、每个 G 独立的懒提交栈（spawn 的 1MB，主线程 64MB）、函数序言检查栈界限（溢出报 `fatal error: stack overflow`）；`thread::spawn/join`、mpmc channel（有界/无界/无缓冲）、`select` 原生实现，算法与解释器一致；死锁检测；GC 扫描所有 G 的栈；golden 测试含 2 万线程、百万元素流水线、跨线程 GC |
+| M6 | 完成（stage0 构建 M:1；navic 构建 M9 起 M:N） | `std::rt::sched`（navi 写）：绿色线程 G、FIFO 运行队列、`swapcontext` 式切换（arm64/amd64 各一段汇编）、每个 G 独立的懒提交栈（spawn 的 1MB，主线程 64MB）、函数序言检查栈界限（溢出报 `fatal error: stack overflow`）；`thread::spawn/join`、mpmc channel（有界/无界/无缓冲）、`select` 原生实现，算法与解释器一致；死锁检测；GC 扫描所有 G 的栈；golden 测试含 2 万线程、百万元素流水线、跨线程 GC |
 | M5 | 完成（Linux/Windows 未在本机实测） | 与架构无关的 lowering（`backend/lower` + `Machine` 接口）、arm64 和 amd64 两套 Machine（编码器都与系统汇编器逐条对拍）、Mach-O/ELF/COFF 写出器、`--target`（macos-arm64、macos-x64、linux-x64、linux-arm64、windows-x64）和 `-c`；macos-x64 在 Rosetta 下通过全部 golden 测试；Linux/Windows 目标文件用 llvm-readobj/objdump 校验了结构、重定位和未定义符号，实际运行交给 CI 矩阵 |
 | M4 | 完成 | `std::rt::gc`（navi 写）：按尺寸分级的 span、非移动 mark-sweep、支持内部指针、无指针类型的 noscan span、GOGC=100 式触发、大对象 span 复用；panic 沿帧指针链展开并执行每帧的 defer；MIR 新增 `StorageLive`，被取地址的局部变量在声明处装箱（每次循环迭代是新变量，和 Go 一致，解释器也修正了）；GC 压力测试（约 2GB 分配，峰值 RSS 约 7.5MB） |
 | M3 | 完成（单线程） | codegen 规划（shape 分组、字典槽、vtable）、arm64 编码器（与系统汇编器逐条对拍）、MIR→arm64、Mach-O 目标文件、`cc` 链接、`navi build`、`navi run` 默认走原生；原生运行时 `std::rt::native`（navi 写，经 `extern "C"` 调 libc）、精确浮点格式化 `std::rt::float`；tests/run 全部 golden 测试原生通过（threads 除外，等 M6） |
@@ -28,7 +28,7 @@
 - M3 的原生运行时暂时经 `extern "C"` 调 libc（calloc/write/exit/memmove/fmod），没有用计划里的 `.s` 汇编器；系统调用层的抽象和"调 C 前切换系统栈"随 M6 的可增长栈一起做。
 - M5：Linux 也经 libc（`cc` 链接）而不是直接 syscall；交叉编译只生成目标文件（`navi build --target T -c`），链接需要目标平台的工具链，M9 的自研链接器解决。Windows 运行时用 `_write`、`VirtualAlloc`（先保留地址空间再按 span 提交），大于 4KB 的栈帧逐页探测。外部 C 函数的地址作为值（`extern "C" fn` 指针）在 Linux PIE 下需要 GOT 重定位，暂不支持。
 - 新增属性 `#[link_name = "..."]`（同 Rust），用于 extern 函数改名。
-- **M6 是 M:1 调度**（计划是 G-M-P 多 OS 线程并行 + 并发 GC + 写屏障）：所有 G 在一个 OS 线程上协作调度，语义和解释器的 GIL 一致，没有并行；栈是固定大小的懒提交虚拟内存，不做复制增长，所以每个活着的 G 至少占一页物理内存（macOS arm64 一页 16KB），百万级线程做不到。并行调度（M:N）、可增长小栈（栈复制）和并发 GC 都需要更多的运行时机制（原子操作、线程本地 G、STW 协调、写屏障），留到 M9 之后，等自举完成再做。
+- **M6 是 M:1 调度**（计划是 G-M-P 多 OS 线程并行 + 并发 GC + 写屏障）：所有 G 在一个 OS 线程上协作调度，语义和解释器的 GIL 一致，没有并行。M9 起 navic 构建的程序是 M:N（见 M9 一节），stage0 构建的仍是 M:1；GC 仍是 stop-the-world，不是并发的；栈是固定大小的懒提交虚拟内存，不做复制增长，所以每个活着的 G 至少占一页物理内存（macOS arm64 一页 16KB），百万级线程做不到。并行调度（M:N）、可增长小栈（栈复制）和并发 GC 都需要更多的运行时机制（原子操作、线程本地 G、STW 协调、写屏障），留到 M9 之后，等自举完成再做。
 - **GC 扫描是保守的**（计划写的是精确 GC + stack map）：栈、static 和需要扫描的堆对象都逐字检查"是否指向已分配对象（含内部）"；不含指针的类型（字符串缓冲、数值数组）放在 noscan span，不扫描。这样做可行，是因为生成的代码不在寄存器里跨调用保存值，且被取地址的局部变量都在堆上，栈上没有指向栈的指针（M6 移动栈时只需修正帧链和返回槽这两种已知位置）。代价是整数恰好像堆地址时会误保留对象。精确的类型位图留到 M9 性能阶段。
 - shape 分组的键除了各局部变量的 shape，还包含类型实参的 shape（同 Go）：泛型代码可能经指针访问 `S<T>` 的字段，偏移取决于 T，而局部变量看不出来。
 
@@ -66,7 +66,7 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
 - Go 里遍历 map 会产生输出差异的地方，stage0 改成按记录顺序遍历（不改变行为，只让结果确定）：类型检查的结果记录、MIR 按定义顺序构建（闭包编号因此固定）、装箱时被取地址的局部变量按编号处理。
 - 发现并修正的 stage0 bug：发散的 then 分支、绑定类型未规范化、or 模式的绑定（每个分支一个新局部变量）、`&mut T: Clone`、const 每次使用都求值、静态初始化顺序。
 
-## M9（基本完成；未达成与 go build 持平，未做 M:N 和函数粒度增量缓存）
+## M9（基本完成；未达成与 go build 持平，未做函数粒度增量缓存）
 
 - 自研链接器（`compiler/src/link.navi`）：navic 直接产出 PIE 的 Mach-O arm64 可执行文件，导入函数经 stub + GOT 由 dyld 非惰性绑定，数据里的绝对指针由 dyld rebase（LC_DYLD_INFO_ONLY 的 opcode 格式），带 ad-hoc 代码签名（CodeDirectory，SHA-256 逐页哈希，`compiler/src/sha256.navi`），不再依赖 cc/ld；`NAVI_LINKER=cc` 仍可用系统链接器。自举（stage2 == stage3）和 22 个 golden 测试通过。
 - 性能：师傅定的目标是与 go build 持平，性能优先。基准是 `go run ./bench/gen -lines 10000 -out /tmp/bp10`（约 9k 行 navi + 7k 行 std，等价的 Go 程序；两边都输出 `total 173105`），在 M 系列 Mac 上测：
@@ -101,13 +101,21 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   - DWARF：debug 构建写 `__DWARF` 段（DWARF 4：编译单元、每个函数一个 subprogram、行号表——行号来自调用、带检查的算术和函数入口），lldb 可以按 `文件:行` 下断点、看源码和带行号的回溯；还没有变量和类型信息。
   - `navic test` / `navic bench`：编译器为 `#[test]` / `#[bench]` 函数合成入口，调用 `std::rt::testing` 的运行器；测试在 `catch_unwind` 里跑，可按名字过滤；基准用 `std::bench::Bencher::iter`（约 0.5 秒自适应迭代），也支持无参的 `#[bench] fn`；`std::hint::black_box`；`tests/harness`。
   - 构建缓存、`std::gc::{collect, stats, set_min_heap}`、`-timings` 显示 GC 统计、`NAVI_STAGE0=1`（让 navic 的 dump 与 stage0 可比，selfcheck 用）、测试标记 `// stage0: skip`。
+- **M:N 调度**（navic 构建的程序；`lib/std/src/rt/sched.navi`）：
+  - G 跑在最多每个 CPU 一个的 OS 线程（M）上（`NAVI_MAXPROCS` 可改）；每个 M 在自己的调度记录 g0 上跑调度循环，G 阻塞时把运行时锁交给 g0，g0 取下一个可运行的 G，没有就在条件变量上睡。只有一个 OS 线程时不加锁，所以 navic 自己这类单线程程序几乎没有开销。
+  - x28 固定指向当前 G（寄存器提升改用 x19–x27），函数序言比较的栈界限是 G 记录的第一个字；栈检查失败走可恢复的 `_navi_morestack`。
+  - 一把运行时锁（pthread mutex）保护调度器、channel 和堆；小对象从每个 M 自己缓存的 span 分配，不加锁（Go 的 mcache 思路），span 用完才在锁下换。
+  - GC 是 stop-the-world：收集者持锁，把正在运行的 G 的栈界限改成毒值，G 在下一个函数序言进入 morestack 停下；阻塞在锁、`write`、`system`、文件读写里的 G 在进入前保存了栈指针和寄存器，收集者用 CAS 认领；全部停下后标记、清扫，再恢复。
+  - 新 intrinsic：`current_g`/`set_current_g`、原子操作（casal/ldaddal/ldar/stlr）、`mstart_address`。
+  - 实测：8 个线程的纯计算 2.31s → 0.34s；8 个线程同时大量分配 1.88s → 0.55s（每次都正确，连续 30 次）；channel 密集的流水线多线程反而慢（0.09s → 0.24s，全局锁争用）。`tests/run/parallel.navi`，golden 测试在 `NAVI_MAXPROCS` 为 1/2/4/16 下都通过。
+  - 限制：没有调用的死循环会让 GC 一直等（Go 1.14 之前也这样）；channel 用全局锁；用户自己的 `extern "C"` 阻塞调用没有进出协议；栈仍是固定大小；GC 不是并发的。
+  - 顺带修的：macOS 会杀掉被原地覆盖写的已签名可执行文件，navic 现在先删再写输出。
 - 没做的：
-  - **M:N 并行调度**。需要：保留 x28 作当前 G 寄存器（寄存器提升少一个）、每个 M 一个 g0 和 pthread、原子指令 intrinsic、调度器和堆的锁、GC 的 STW 协议（把各 G 的栈界限改成毒值，让下一个函数序言进入安全点；可能阻塞的 C 调用前后要有进出协议并把寄存器存进 G）。一千行量级、出错就是内存损坏，这次没有做，保持 M:1。
   - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
   - 冷编译与 go build 持平（见上面的数字）。
 
 ## 下一步
 
-1. 冷编译提速：std 前端结果缓存；MIR 层小函数内联；之后才是并行（依赖 M:N 和线程安全的编译器数据结构）。
-2. M:N 调度和并发 GC（设计见上）。
+1. 冷编译提速：编译器内部并行（解析和后端按函数，Go 也是这样；需要线程安全的编译器数据结构）；std 的导出数据缓存。
+2. 运行时：每个 channel 一把锁、并发 GC、可增长的栈、基于信号的抢占。
 3. DWARF 的变量和类型信息；amd64/ELF/COFF 上的自研链接器和 DWARF（现在只有 macOS arm64）。
