@@ -214,17 +214,28 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
                 return p as *mut u8;
             }
         }
-        crate::rt::sched::lock();
+        // The shared lists have locks of their own (as Go's mcentral); the
+        // runtime lock only for a collection.
+        if ALLOCATED >= NEXT_GC {
+            crate::rt::sched::lock();
+            collect_locked();
+            crate::rt::sched::unlock();
+        }
+        crate::rt::sched::preempt_off();
         let ns = refill(c, list);
-        st(slot, ns as usize);
+        st(crate::rt::sched::m_cache() + list * 8, ns as usize);
         let p = take_owned(ns);
-        crate::rt::sched::unlock();
+        crate::rt::sched::preempt_on();
         return p as *mut u8;
     }
-    crate::rt::sched::lock();
-    if ALLOCATED >= NEXT_GC { collect_locked(); }
+    if ALLOCATED >= NEXT_GC {
+        crate::rt::sched::lock();
+        collect_locked();
+        crate::rt::sched::unlock();
+    }
+    crate::rt::sched::preempt_off();
     let p = alloc_large(size, noscan);
-    crate::rt::sched::unlock();
+    crate::rt::sched::preempt_on();
     p as *mut u8
 }
 #[cfg(not(feature = "navic"))]
@@ -234,24 +245,66 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 { 0 as *mut u8 }
 // is held): taken off the shared list, its free objects counted as
 // allocated.
 fn refill(c: usize, list: usize) -> *mut Span {
-    if ALLOCATED >= NEXT_GC { collect_locked(); }
+    let mut budget = 16;
     loop {
-        let s = FREE[list] as *mut Span;
-        if s as usize == 0 { break; }
-        unsafe {
-            FREE[list] = (*s).next_free as usize;
-            (*s).in_free = false;
-            if (*s).nfree > 0 {
-                ALLOCATED += (*s).nfree * (*s).elem;
-                return s;
+        let l = list_lk(list);
+        spin_lock(l);
+        let mut found = 0usize;
+        loop {
+            let s = FREE[list] as *mut Span;
+            if s as usize == 0 { break; }
+            unsafe {
+                FREE[list] = (*s).next_free as usize;
+                (*s).in_free = false;
+                if (*s).nfree > 0 {
+                    found = s as usize;
+                    break;
+                }
             }
         }
+        spin_unlock(l);
+        if found != 0 {
+            let s = found as *mut Span;
+            add_allocated(unsafe { (*s).nfree * (*s).elem });
+            return s;
+        }
+        // Sweep a little (others' spans go to their lists), at most 256.
+        if UNSWEPT != 0 && budget > 0 {
+            sweep_some(16);
+            budget -= 1;
+            continue;
+        }
+        break;
     }
-    if UNSWEPT != 0 && sweep_for(list) { return refill(c, list); }
+    spin_lock(&mut HEAP_LK as *mut usize);
     let s = new_span(CLASSES[c], SPAN_BYTES, list & 1 == 1, list);
-    unsafe { ALLOCATED += (*s).nfree * (*s).elem; }
+    spin_unlock(&mut HEAP_LK as *mut usize);
+    add_allocated(unsafe { (*s).nfree * (*s).elem });
     s
 }
+
+// The locks of the shared span lists and of the heap (new spans, the
+// unswept cursor): spin locks taken only while the G may not stop, so that
+// no stopped G holds one when a collector runs.
+static mut LIST_LK: [usize; 65] = [0; 65];
+static mut HEAP_LK: usize = 0;
+
+fn list_lk(list: usize) -> *mut usize { (&mut LIST_LK as *mut [usize; 65] as usize + list * 8) as *mut usize }
+
+#[cfg(feature = "navic")]
+fn spin_lock(p: *mut usize) {
+    while !crate::rt::atomic_cas(p, 0, 1) { crate::rt::sched::cpu_relax(); }
+}
+#[cfg(feature = "navic")]
+fn spin_unlock(p: *mut usize) { crate::rt::atomic_store(p, 0); }
+#[cfg(feature = "navic")]
+fn add_allocated(n: usize) { crate::rt::atomic_add(&mut ALLOCATED as *mut usize, n); }
+#[cfg(not(feature = "navic"))]
+fn spin_lock(p: *mut usize) {}
+#[cfg(not(feature = "navic"))]
+fn spin_unlock(p: *mut usize) {}
+#[cfg(not(feature = "navic"))]
+fn add_allocated(n: usize) { ALLOCATED += n; }
 
 // Pops a free object of a span the M owns and zeroes it.
 fn take_owned(s: *mut Span) -> usize {
@@ -324,22 +377,33 @@ fn alloc_large(size: usize, noscan: bool) -> usize { alloc_large_in(size, noscan
 fn alloc_large_in(size: usize, noscan: bool, tries: usize) -> usize {
     let bytes = (size + PAGE - 1) / PAGE * PAGE;
     // Reuse a dead large span that fits (first fit, at most twice the size).
+    let l = list_lk(64);
+    spin_lock(l);
     let mut prev = 0usize;
     let mut s = FREE[64] as *mut Span;
+    let mut found = 0usize;
     while s as usize != 0 {
         unsafe {
             if (*s).bytes >= bytes && (*s).bytes <= 2 * bytes {
                 if prev == 0 { FREE[64] = (*s).next_free as usize; } else { (*(prev as *mut Span)).next_free = (*s).next_free; }
                 (*s).in_free = false;
-                (*s).noscan = noscan;
-                stb((*s).bits as usize, 1);
-                if MARKING { stb((*s).bits as usize + 1, 1); }
-                memset((*s).start as *mut u8, 0, (*s).bytes);
-                ALLOCATED += (*s).bytes;
-                return (*s).start;
+                found = s as usize;
+                break;
             }
             prev = s as usize;
             s = (*s).next_free;
+        }
+    }
+    spin_unlock(l);
+    if found != 0 {
+        let s = found as *mut Span;
+        unsafe {
+            (*s).noscan = noscan;
+            stb((*s).bits as usize, 1);
+            if MARKING { stb((*s).bits as usize + 1, 1); }
+            memset((*s).start as *mut u8, 0, (*s).bytes);
+            add_allocated((*s).bytes);
+            return (*s).start;
         }
     }
     if UNSWEPT != 0 && tries > 0 {
@@ -347,13 +411,15 @@ fn alloc_large_in(size: usize, noscan: bool, tries: usize) -> usize {
         sweep_some(64);
         return alloc_large_in(size, noscan, tries - 1);
     }
+    spin_lock(&mut HEAP_LK as *mut usize);
     let s = new_span(bytes, bytes, noscan, NCLASS * 2);
+    spin_unlock(&mut HEAP_LK as *mut usize);
     unsafe {
         (*s).freelist = 0;
         (*s).nfree = 0;
         stb((*s).bits as usize, 1);
         if MARKING { stb((*s).bits as usize + 1, 1); }
-        ALLOCATED += bytes;
+        add_allocated(bytes);
         (*s).start
     }
 }
@@ -799,13 +865,25 @@ fn begin_lazy_sweep() {
     UNSWEPT = ALL;
 }
 
-// Sweeps up to n spans (the runtime lock is held); whether any is left.
+// Sweeps up to n spans (several threads may: each span is claimed under
+// the heap lock, swept under its list's); whether any is left.
 fn sweep_some(n: usize) -> bool {
     let mut k = 0;
-    while k < n && UNSWEPT != 0 {
+    while k < n {
+        crate::rt::sched::preempt_off();
+        spin_lock(&mut HEAP_LK as *mut usize);
         let s = UNSWEPT as *mut Span;
-        UNSWEPT = unsafe { (*s).next_all } as usize;
+        if s as usize != 0 { UNSWEPT = unsafe { (*s).next_all } as usize; }
+        spin_unlock(&mut HEAP_LK as *mut usize);
+        if s as usize == 0 {
+            crate::rt::sched::preempt_on();
+            return false;
+        }
+        let l = list_lk(unsafe { (*s).list });
+        spin_lock(l);
         sweep_span(s);
+        spin_unlock(l);
+        crate::rt::sched::preempt_on();
         k += 1;
     }
     UNSWEPT != 0
@@ -830,10 +908,7 @@ fn sweep_for(list: usize) -> bool {
 // The sweeper G.
 fn sweeper() {
     loop {
-        crate::rt::sched::lock();
-        let more = sweep_some(64);
-        crate::rt::sched::unlock();
-        if !more { return; }
+        if !sweep_some(64) { return; }
         crate::rt::yield_now();
     }
 }
