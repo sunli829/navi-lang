@@ -39,9 +39,9 @@ pub struct Info {
     /// all at once: a program uses a small part of std.
     pub lazy_std: bool,
     /// Memoized queries of later phases (see query.navi).
-    pub norm_cache: HashMap<u64, &Type>,
-    pub deref_cache: HashMap<u64, Option<&Type>>,
-    pub method_cache: HashMap<String, Option<&mut crate::types::query::Instance>>,
+    pub norm_cache: &mut Cache<u64, &Type>,
+    pub deref_cache: &mut Cache<u64, Option<&Type>>,
+    pub method_cache: &mut Cache<String, Option<&mut crate::types::query::Instance>>,
     /// While threads build MIR (ctx.par), the queries that check bodies
     /// lazily or fill caches hold this lock (re-entered by its owner).
     pub qlock: &Mutex<u8>,
@@ -51,7 +51,46 @@ pub struct Info {
     pub clock: &Mutex<u8>,
     /// Selections of trait refs without variables, parameters or
     /// projections (the same in every body), by trait_key.
-    pub sel_cache: HashMap<String, &mut crate::types::solve::Selection>,
+    pub sel_cache: &mut Cache<String, &mut crate::types::solve::Selection>,
+}
+
+/// A memo table threads share (while ctx.par): 16 shards, each a map with
+/// its own lock, chosen by the key's hash.
+pub struct Cache<K, V> {
+    maps: Vec<HashMap<K, V>>,
+    locks: Vec<&Mutex<u8>>,
+}
+
+pub fn new_cache<K: std::hash::Hash + Eq, V>() -> &mut Cache<K, V> {
+    let mut maps: Vec<HashMap<K, V>> = Vec::new();
+    let mut locks: Vec<&Mutex<u8>> = Vec::new();
+    let mut i = 0;
+    while i < 16 {
+        maps.push(HashMap::new());
+        locks.push(&Mutex::new(0u8));
+        i += 1;
+    }
+    &mut Cache { maps, locks }
+}
+
+impl<K: std::hash::Hash + Eq, V> Cache<K, V> {
+    fn shard(&self, k: &K) -> usize { (std::hash::hash_one(k) >> 11) as usize & 15 }
+
+    pub fn get(&mut self, k: &K, par: bool) -> Option<V> {
+        let i = self.shard(k);
+        if par { self.locks[i].lock(); }
+        let r = match self.maps[i].get(k) { Some(v) => Some(*v), None => None };
+        if par { self.locks[i].unlock(); }
+        r
+    }
+
+    pub fn insert(&mut self, k: K, v: V, par: bool) {
+        let i = self.shard(&k);
+        if par { self.locks[i].lock(); }
+        let mut m = self.maps[i];
+        m.insert(k, v);
+        if par { self.locks[i].unlock(); }
+    }
 }
 
 impl Info {
@@ -145,9 +184,9 @@ pub fn collect(res: &mut resolve::Info, errs: &mut Sink) -> &mut Info {
     let info = &mut Info { ctx: new_ctx(), res, adts: HashMap::new(), fns: HashMap::new(), traits: HashMap::new(),
         impls: HashMap::new(), assoc: HashMap::new(), consts: HashMap::new(), aliases: HashMap::new(),
         impls_of: HashMap::new(), lang: HashMap::new(), bodies: HashMap::new(), hidden: HashMap::new(), c: None,
-        lazy_std: !crate::resolve::cfg::stage0_mode(), norm_cache: HashMap::new(), deref_cache: HashMap::new(), method_cache: HashMap::new(),
+        lazy_std: !crate::resolve::cfg::stage0_mode(), norm_cache: new_cache(), deref_cache: new_cache(), method_cache: new_cache(),
         qlock: &Mutex::new(0u8), qowner: None, qdepth: 0, clock: &Mutex::new(0u8),
-        sel_cache: HashMap::new() };
+        sel_cache: new_cache() };
     let c = &mut Collector { info, errs, quiet: 0, children: HashMap::new(), gens: HashMap::new(), impl_self: HashMap::new(),
         busy: HashMap::new(), consts: HashMap::new(), lang_of: HashMap::new(), derive_cache: HashMap::new(),
         param_owner: HashMap::new(), inherent: None, next_synth: 0, worker: false, new_bodies: Vec::new(),
