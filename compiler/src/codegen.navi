@@ -163,6 +163,8 @@ pub struct Plan {
     groups_by_key: HashMap<String, &mut Group>,
     native: Option<&mut Module>,
     shapes: HashMap<u64, String>,
+    /// Instances created but not walked yet (see walk_pending).
+    pending: Vec<&mut Inst>,
 }
 
 fn args_key(ts: &Vec<&Type>) -> String {
@@ -178,7 +180,7 @@ pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> 
     let p = &mut Plan { mir: prog, info: prog.info, lay: layout::new_computer(prog.info), groups: Vec::new(), insts: HashMap::new(),
         main: None, statics: Vec::new(), static_ok: HashMap::new(), vtables: HashMap::new(), vtable_list: Vec::new(),
         strings: HashMap::new(), string_list: Vec::new(), errors: Vec::new(), static_init: HashMap::new(), runtime: HashMap::new(),
-        groups_by_key: HashMap::new(), native: None, shapes: HashMap::new() };
+        groups_by_key: HashMap::new(), native: None, shapes: HashMap::new(), pending: Vec::new() };
     p.find_native();
     for name in ["panic_raw", "panic_bounds", "gc_alloc", "sched_init", "gmain", "set_args", "morestack", "mstart", "gc_wb"].iter() {
         match p.native_fn(*name) {
@@ -190,7 +192,12 @@ pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> 
             None => p.errors.push(`std::rt::native::${name} is missing`),
         }
     }
+    // Everything the runtime reaches first: its statics are initialized
+    // before main's (whose initializers allocate through the runtime, which
+    // the instance graph does not show).
+    p.walk_pending();
     p.main = Some(p.inst(main, Vec::new(), None, mf));
+    p.walk_pending();
     p.order_statics();
     p.assign_slots();
     p.groups.sort_by(|a, b| a.sym.cmp(&b.sym));
@@ -316,9 +323,111 @@ impl Plan {
         }
         if f.shim { inst.track_caller = true; }
         self.insts.insert(key, inst);
-        self.walk(inst, f);
-        self.add_to_group(inst);
+        self.pending.push(inst);
         inst
+    }
+
+    /// Walks the instances created so far and those their walks create, a
+    /// level at a time: first, on several threads, a walk that only reads
+    /// fills the type checker's caches (concrete types, method resolution)
+    /// and computes each instance's shape key; then the instances are
+    /// walked and grouped in order, finding those caches filled.
+    fn walk_pending(&mut self) {
+        while self.pending.len() > 0 {
+            let level = self.pending.clone();
+            self.pending = Vec::new();
+            let mut keys: Vec<String> = Vec::new();
+            for _ in level.iter() { keys.push(String::new()); }
+            let par = !crate::resolve::cfg::stage0_mode();
+            if par { self.info.ctx.par = true; }
+            let me = self;
+            crate::util::par_for(level.len(), 4, |i| {
+                let w = me.warm_copy();
+                w.warm(level[i], level[i].func);
+                keys[i] = w.shape_key(level[i]);
+            });
+            self.info.ctx.par = false;
+            let mut i = 0;
+            while i < level.len() {
+                let inst = level[i];
+                self.walk(inst, inst.func);
+                self.add_to_group(inst, keys[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    // A copy for a warming thread: its own layouts and shapes; the rest is
+    // only read.
+    fn warm_copy(&mut self) -> &mut Plan {
+        &mut Plan { mir: self.mir, info: self.info, lay: layout::new_computer(self.info), groups: Vec::new(), insts: self.insts,
+            main: None, statics: Vec::new(), static_ok: self.static_ok, vtables: self.vtables, vtable_list: Vec::new(),
+            strings: self.strings, string_list: Vec::new(), errors: Vec::new(), static_init: self.static_init,
+            runtime: self.runtime, groups_by_key: self.groups_by_key, native: self.native, shapes: HashMap::new(),
+            pending: Vec::new() }
+    }
+
+    // walk without changing the plan: the queries resolve and vtable make.
+    fn warm(&mut self, inst: &Inst, f: &Func) {
+        for b in f.blocks.iter() {
+            for st in b.stmts.iter() {
+                match st {
+                    Stmt::Assign { rv, .. } => {
+                        self.warm_rv(inst, rv);
+                        if let Rvalue::MakeDyn { concrete, to, .. } = rv {
+                            let c = inst.concrete(self.info, *concrete);
+                            inst.concrete(self.info, *to);
+                        }
+                    }
+                    Stmt::PushDefer { fn_op, args } => {
+                        self.warm_op(inst, fn_op);
+                        for a in args.iter() { self.warm_op(inst, a); }
+                    }
+                    _ => {}
+                }
+            }
+            match &b.term {
+                Term::Call { fn_op, args, .. } => {
+                    self.warm_op(inst, fn_op);
+                    for a in args.iter() { self.warm_op(inst, a); }
+                }
+                Term::Switch { x, .. } => self.warm_op(inst, x),
+                Term::Assert { cond, .. } => self.warm_op(inst, cond),
+                _ => {}
+            }
+        }
+    }
+
+    fn warm_rv(&mut self, inst: &Inst, rv: &Rvalue) {
+        match rv {
+            Rvalue::Use(x) => self.warm_op(inst, x),
+            Rvalue::Bin { x, y, .. } => {
+                self.warm_op(inst, x);
+                self.warm_op(inst, y);
+            }
+            Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => self.warm_op(inst, x),
+            Rvalue::Aggregate { ops, closure, .. } => {
+                for o in ops.iter() { self.warm_op(inst, o); }
+                if let Some(cf) = closure { self.warm(inst, *cf); }
+            }
+            _ => {}
+        }
+    }
+
+    fn warm_op(&mut self, inst: &Inst, op: &Operand) {
+        if op.kind != mir::OP_CONST { return; }
+        let c = op.cnst.unwrap();
+        if c.kind != mir::C_FN { return; }
+        let r = c.fn_ref.unwrap();
+        let mut args: Vec<&Type> = Vec::new();
+        for a in r.args.iter() { args.push(inst.concrete(self.info, *a)); }
+        let self_ty = inst.concrete_opt(self.info, r.self_ty);
+        let def = r.def.unwrap();
+        if r.ctor { return; }
+        let in_trait = match def.parent { Some(p) => p.kind == resolve::DEF_TRAIT, None => false };
+        if (def.kind == resolve::DEF_ASSOC_FN || def.kind == resolve::DEF_ASSOC_CONST) && in_trait {
+            if let Some(st) = self_ty { self.info.resolve_method(def, st, &args); }
+        }
     }
 
     fn visit_op(&mut self, inst: &mut Inst, op: &Operand) {
@@ -618,8 +727,7 @@ impl Plan {
         types::type_string(t)
     }
 
-    fn add_to_group(&mut self, inst: &mut Inst) {
-        let key = self.shape_key(inst);
+    fn add_to_group(&mut self, inst: &mut Inst, key: String) {
         let g = match self.groups_by_key.get(&key) {
             Some(g) => *g,
             None => {

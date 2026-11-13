@@ -109,8 +109,13 @@ impl Info {
         match self.hidden.get(&t.id) { Some(h) => Some(*h), None => None }
     }
 
-    fn scratch(&mut self, owner: Option<&mut Def>) -> &mut FnCtx {
-        let c = self.col();
+    // The Collector a query solves with: while threads share Info, a copy
+    // of its own (the caches it reads are complete; its errors are dropped).
+    fn solver(&mut self) -> &mut Collector {
+        if self.ctx.par { self.col().worker(self.clock) } else { self.col() }
+    }
+
+    fn scratch(&mut self, c: &mut Collector, owner: Option<&mut Def>) -> &mut FnCtx {
         match owner {
             Some(o) => c.new_fn_ctx(o),
             None => bare_ctx(c, self.res.defs[0], None),
@@ -120,20 +125,22 @@ impl Info {
     /// <t as Deref>::Target, or none if t does not implement Deref.
     pub fn deref_target(&mut self, owner: Option<&mut Def>, t: &Type) -> Option<&Type> {
         let key = cache_key(owner, t);
+        // The caches are locked while threads share Info; the solving is not
+        // (two threads may solve the same query: same answer).
         self.enter();
-        if let Some(r) = self.deref_cache.get(&key) {
-            self.leave();
-            return *r;
-        }
+        let hit = match self.deref_cache.get(&key) { Some(r) => Some(*r), None => None };
+        self.leave();
+        if let Some(r) = hit { return r; }
         let r = self.deref_target_uncached(owner, t);
+        self.enter();
         self.deref_cache.insert(key, r);
         self.leave();
         r
     }
 
     fn deref_target_uncached(&mut self, owner: Option<&mut Def>, t: &Type) -> Option<&Type> {
-        let fc = self.scratch(owner);
-        let c = self.col();
+        let c = self.solver();
+        let fc = self.scratch(c, owner);
         c.quiet += 1;
         let r = match fc.overloaded_deref(t) { Some(x) => Some(fc.inf.resolve(x)), None => None };
         c.quiet -= 1;
@@ -145,19 +152,19 @@ impl Info {
         if !has_proj_or_opaque(t) { return t; }
         let key = cache_key(owner, t);
         self.enter();
-        if let Some(r) = self.norm_cache.get(&key) {
-            self.leave();
-            return *r;
-        }
+        let hit = match self.norm_cache.get(&key) { Some(r) => Some(*r), None => None };
+        self.leave();
+        if let Some(r) = hit { return r; }
         let r = self.normalize_uncached(owner, t);
+        self.enter();
         self.norm_cache.insert(key, r);
         self.leave();
         r
     }
 
     fn normalize_uncached(&mut self, owner: Option<&mut Def>, t: &Type) -> &Type {
-        let fc = self.scratch(owner);
-        let c = self.col();
+        let c = self.solver();
+        let fc = self.scratch(c, owner);
         c.quiet += 1;
         let n = fc.normalize(t);
         let r = fc.inf.resolve(n);
@@ -177,14 +184,19 @@ impl Info {
     pub fn resolve_method(&mut self, method: &mut Def, self_ty: &Type, args: &Vec<&Type>) -> Option<&mut Instance> {
         let mut key = `${method.id}/${self_ty.id}`;
         for a in args.iter() { key.push_str(&`,${a.id}`); }
-        if let Some(r) = self.method_cache.get(&key) { return *r; }
+        self.enter();
+        let hit = match self.method_cache.get(&key) { Some(r) => Some(*r), None => None };
+        self.leave();
+        if let Some(r) = hit { return r; }
         let r = self.resolve_method_uncached(method, self_ty, args);
+        self.enter();
         self.method_cache.insert(key, r);
+        self.leave();
         r
     }
 
     fn resolve_method_uncached(&mut self, method: &mut Def, self_ty: &Type, args: &Vec<&Type>) -> Option<&mut Instance> {
-        let c = self.col();
+        let c = self.solver();
         let trait_def = method.parent.unwrap();
         let ti = self.traits[&trait_def.id];
         let n_trait = ti.generics.params.len();
@@ -208,7 +220,7 @@ impl Info {
                 }
             }
         }
-        let fc = self.scratch(None);
+        let fc = self.scratch(c, None);
         c.quiet += 1;
         let tr = &TraitRef { tdef: Some(trait_def), self_ty: Some(self_ty), args: trait_args.clone(), bindings: Vec::new() };
         // The method may be defined in a supertrait's impl when called
