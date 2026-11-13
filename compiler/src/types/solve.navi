@@ -46,6 +46,24 @@ pub struct Selection {
     pub assoc: HashMap<String, &Type>,
 }
 
+fn copy_selection(s: &Selection) -> &mut Selection {
+    &mut Selection { kind: s.kind, impl_info: s.impl_info, args: s.args.clone(), pred: s.pred, nested: s.nested.clone(), assoc: s.assoc.clone() }
+}
+
+// Whether tr mentions no inference variable, parameter, projection,
+// opaque or error type.
+fn concrete_trait_ref(tr: &TraitRef) -> bool {
+    if tr.bindings.len() > 0 { return false; }
+    if !concrete_type(tr.self_ty.unwrap()) { return false; }
+    for a in tr.args.iter() { if !concrete_type(*a) { return false; } }
+    true
+}
+
+fn concrete_type(t: &Type) -> bool {
+    let m = crate::types::lower::mentions;
+    !(m(t, K_INFER, false) || m(t, K_PARAM, false) || m(t, K_PROJ, false) || m(t, K_OPAQUE, false) || m(t, K_ERROR, false))
+}
+
 pub fn selection(kind: SelKind) -> &mut Selection {
     &mut Selection { kind, impl_info: None, args: Vec::new(), pred: None, nested: Vec::new(), assoc: HashMap::new() }
 }
@@ -154,6 +172,41 @@ impl FnCtx {
     /// Finds how tr is satisfied. On success the inference variables are
     /// bound as needed (callers wanting a probe use snapshots).
     pub fn select_trait(&mut self, tr: &TraitRef, depth: i32) -> (Option<&mut Selection>, SelStatus) {
+        // A trait ref without variables, parameters or projections selects
+        // the same in every body: cached (when nothing was reported).
+        if !concrete_trait_ref(tr) { return self.select_trait_now(tr, depth); }
+        let key = trait_key(Some(tr));
+        self.info.enter();
+        let hit = match self.info.sel_cache.get(&key) { Some(s) => Some(*s), None => None };
+        self.info.leave();
+        if let Some(s) = hit { return (Some(copy_selection(s)), SEL_YES); }
+        let before = self.c.attempts;
+        let (sel, st) = self.select_trait_now(tr, depth);
+        if st == SEL_YES && self.c.attempts == before {
+            if let Some(s) = sel {
+                if s.kind != SEL_PARAM {
+                    let c = copy_selection(s);
+                    let mut args: Vec<&Type> = Vec::new();
+                    for a in s.args.iter() { args.push(self.inf.resolve(*a)); }
+                    c.args = args;
+                    let mut nested: Vec<&TraitRef> = Vec::new();
+                    for n in s.nested.iter() { nested.push(self.inf.resolve_trait_ref(*n)); }
+                    c.nested = nested;
+                    let mut ok = true;
+                    for a in c.args.iter() { if has_infer(*a) { ok = false; } }
+                    for n in c.nested.iter() { if trait_ref_has_infer(*n) { ok = false; } }
+                    if ok {
+                        self.info.enter();
+                        self.info.sel_cache.insert(key, c);
+                        self.info.leave();
+                    }
+                }
+            }
+        }
+        (sel, st)
+    }
+
+    fn select_trait_now(&mut self, tr: &TraitRef, depth: i32) -> (Option<&mut Selection>, SelStatus) {
         if depth > MAX_SOLVE_DEPTH { return (None, SEL_AMBIG); }
         let self_ty = self.inf.shallow(tr.self_ty.unwrap());
         if self_ty.kind == K_ERROR || self_ty.kind == K_NEVER {
