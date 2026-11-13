@@ -131,7 +131,7 @@ fn init() {
     MAIN = new_stack();
     POOL = new_stack();
     SHARED = new_stack();
-    LOCAL = unsafe { calloc(MAX_MARKERS * 3, 8) } as usize;
+    LOCAL = unsafe { calloc(MAX_MARKERS * 4, 8) } as usize;
     let mut k = 0;
     while k <= MAX_SMALL / 16 {
         CLASS_OF[k] = class_of(if k == 0 { 1 } else { k * 16 }) as u8;
@@ -247,6 +247,10 @@ fn refill(c: usize, list: usize) -> *mut Span {
             }
         }
     }
+    if UNSWEPT != 0 {
+        sweep_for(list);
+        return refill(c, list);
+    }
     let s = new_span(CLASSES[c], SPAN_BYTES, list & 1 == 1, list);
     unsafe { ALLOCATED += (*s).nfree * (*s).elem; }
     s
@@ -292,6 +296,10 @@ fn alloc_small(c: usize, noscan: bool) -> usize {
             (*s).in_free = false;
         }
     }
+    if UNSWEPT != 0 {
+        sweep_for(list);
+        return alloc_small(c, noscan);
+    }
     let s = new_span(CLASSES[c], SPAN_BYTES, noscan, list);
     unsafe {
         (*s).next_free = FREE[list] as *mut Span;
@@ -336,6 +344,11 @@ fn alloc_large(size: usize, noscan: bool) -> usize {
             prev = s as usize;
             s = (*s).next_free;
         }
+    }
+    if UNSWEPT != 0 {
+        // Sweep a little more and look again.
+        sweep_some(64);
+        return alloc_large(size, noscan);
     }
     let s = new_span(bytes, bytes, noscan, NCLASS * 2);
     unsafe {
@@ -387,7 +400,7 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
 
 // --- Marking -----------------------------------------------------------------
 
-// A mark stack is three words [buf, len, cap] (C memory). MAIN is the
+// A mark stack is four words [buf, len, cap, bytes marked] (C memory). MAIN is the
 // collector's (used while the world is stopped); each concurrent marker G
 // has its own (LOCAL). A marker pops and scans an object, and moves objects
 // between stacks and the pool, only while it may not stop, so a stopped
@@ -449,8 +462,8 @@ fn take_shared() -> bool {
     if move_all(POOL, MAIN) { any = true; }
     let mut k = 0;
     while k < MAX_MARKERS {
-        if LOCAL != 0 && stack_len(LOCAL + k * 24) > 0 {
-            move_all(LOCAL + k * 24, MAIN);
+        if LOCAL != 0 && stack_len(LOCAL + k * 32) > 0 {
+            move_all(LOCAL + k * 32, MAIN);
             any = true;
         }
         k += 1;
@@ -489,6 +502,8 @@ fn scan(lo: usize, hi: usize, dst: usize) {
             if *m != 0 { continue; }
             // Two markers may both get here: the object is scanned twice.
             *m = 1;
+            // The bytes marked (the live heap of a lazily swept cycle).
+            if dst == 0 { count_shared((*s).elem); } else { wset(dst + 24, wget(dst + 24) + (*s).elem); }
             if (*s).noscan { continue; }
             if dst == 0 { push_shared(start + i * (*s).elem); } else { stack_push(dst, start + i * (*s).elem); }
         }
@@ -536,7 +551,7 @@ static mut MARK_DONE: bool = false;
 static mut CYCLE_NO: usize = 0;
 
 fn new_stack() -> usize {
-    let p = unsafe { calloc(3, 8) };
+    let p = unsafe { calloc(4, 8) };
     p as usize
 }
 
@@ -557,7 +572,7 @@ fn take_work(sk: usize) -> bool {
 
 #[cfg(feature = "navic")]
 fn mark_worker(k: usize, cyc: usize) {
-    let me = LOCAL + k * 24;
+    let me = LOCAL + k * 32;
     loop {
         crate::rt::sched::preempt_off();
         if !CYCLE || CYCLE_NO != cyc || MARK_DONE {
@@ -655,6 +670,7 @@ pub fn collect() {
 // starts (or, if one runs, is finished: the heap grew too much meanwhile);
 // otherwise every G stops for the whole collection. It must not allocate.
 fn collect_locked() {
+    finish_sweep();
     if step_concurrent() { return; }
     if COLLECTING { return; }
     COLLECTING = true;
@@ -679,55 +695,147 @@ fn sweep() {
     let mut live = 0usize;
     let mut s = ALL as *mut Span;
     while s as usize != 0 {
-        unsafe {
-            let n = (*s).nelems;
-            let bits = (*s).bits as usize;
-            if (*s).list == NCLASS * 2 {
-                if ldb(bits) != 0 && ldb(bits + 1) == 0 {
-                    stb(bits, 0);
-                    if !(*s).in_free {
-                        (*s).next_free = FREE[64] as *mut Span;
-                        FREE[64] = s as usize;
-                        (*s).in_free = true;
-                    }
-                } else if ldb(bits) != 0 {
-                    live += (*s).bytes;
-                }
-                stb(bits + 1, 0);
-            } else {
-                let mut free = 0usize;
-                let mut nfree = 0usize;
-                let start = (*s).start;
-                let elem = (*s).elem;
-                let mut i = n;
-                while i > 0 {
-                    i -= 1;
-                    let a = (bits + i) as *mut u8;
-                    let m = (bits + n + i) as *mut u8;
-                    if *a != 0 && *m == 0 { *a = 0; }
-                    *m = 0;
-                    if *a == 0 {
-                        let p = start + i * elem;
-                        *(p as *mut usize) = free;
-                        free = p;
-                        nfree += 1;
-                    }
-                }
-                (*s).freelist = free;
-                (*s).nfree = nfree;
-                live += (n - nfree) * (*s).elem;
-                if nfree > 0 && !(*s).in_free {
-                    (*s).next_free = FREE[(*s).list] as *mut Span;
-                    FREE[(*s).list] = s as usize;
-                    (*s).in_free = true;
-                }
-            }
-            s = (*s).next_all;
-        }
+        live += sweep_span(s);
+        s = unsafe { (*s).next_all };
     }
     LIVE = live;
     ALLOCATED = 0;
     NEXT_GC = if live > MIN_HEAP { live } else { MIN_HEAP };
+}
+
+// Frees the unmarked objects of s, clears its marks and puts it on its
+// free list if it has room; returns its live bytes.
+fn sweep_span(s: *mut Span) -> usize {
+    let mut live = 0usize;
+    unsafe {
+        let n = (*s).nelems;
+        let bits = (*s).bits as usize;
+        if (*s).list == NCLASS * 2 {
+            if ldb(bits) != 0 && ldb(bits + 1) == 0 {
+                stb(bits, 0);
+                if !(*s).in_free {
+                    (*s).next_free = FREE[64] as *mut Span;
+                    FREE[64] = s as usize;
+                    (*s).in_free = true;
+                }
+            } else if ldb(bits) != 0 {
+                live += (*s).bytes;
+            }
+            stb(bits + 1, 0);
+        } else {
+            let mut free = 0usize;
+            let mut nfree = 0usize;
+            let start = (*s).start;
+            let elem = (*s).elem;
+            let mut i = n;
+            while i > 0 {
+                i -= 1;
+                let a = (bits + i) as *mut u8;
+                let m = (bits + n + i) as *mut u8;
+                if *a != 0 && *m == 0 { *a = 0; }
+                *m = 0;
+                if *a == 0 {
+                    let p = start + i * elem;
+                    *(p as *mut usize) = free;
+                    free = p;
+                    nfree += 1;
+                }
+            }
+            (*s).freelist = free;
+            (*s).nfree = nfree;
+            live += (n - nfree) * (*s).elem;
+            if nfree > 0 && !(*s).in_free {
+                (*s).next_free = FREE[(*s).list] as *mut Span;
+                FREE[(*s).list] = s as usize;
+                (*s).in_free = true;
+            }
+        }
+    }
+    live
+}
+
+// --- Lazy sweeping (concurrent collections) ----------------------------------
+//
+// A concurrent cycle ends without sweeping (as Go does): the free lists are
+// emptied and UNSWEPT walks the span list; the allocator sweeps spans
+// before it makes a new one, and a sweeper G sweeps the rest. The next
+// cycle starts after the last span is swept. Spans made since the cycle
+// ended are ahead of UNSWEPT and need none.
+static mut UNSWEPT: usize = 0;
+static mut ALLOC_AT_START: usize = 0;
+
+// Lets every span be swept again (the world is stopped).
+fn begin_lazy_sweep() {
+    let mut i = 0;
+    while i <= NCLASS * 2 {
+        FREE[i] = 0;
+        i += 1;
+    }
+    let mut s = ALL as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            (*s).in_free = false;
+            s = (*s).next_all;
+        }
+    }
+    UNSWEPT = ALL;
+}
+
+// Sweeps up to n spans (the runtime lock is held); whether any is left.
+fn sweep_some(n: usize) -> bool {
+    let mut k = 0;
+    while k < n && UNSWEPT != 0 {
+        let s = UNSWEPT as *mut Span;
+        UNSWEPT = unsafe { (*s).next_all } as usize;
+        sweep_span(s);
+        k += 1;
+    }
+    UNSWEPT != 0
+}
+
+fn finish_sweep() { while sweep_some(4096) {} }
+
+// Sweeps until free list list has a span with room (or none is left).
+fn sweep_for(list: usize) {
+    while UNSWEPT != 0 {
+        sweep_some(16);
+        let f = FREE[list] as *mut Span;
+        if f as usize != 0 && (list == NCLASS * 2 || unsafe { (*f).nfree } > 0) { return; }
+    }
+}
+
+// The sweeper G.
+fn sweeper() {
+    loop {
+        crate::rt::sched::lock();
+        let more = sweep_some(64);
+        crate::rt::sched::unlock();
+        if !more { return; }
+        crate::rt::yield_now();
+    }
+}
+
+// Bytes marked by write barriers (the markers count on their stacks).
+static mut MARKED_SHARED: usize = 0;
+
+#[cfg(feature = "navic")]
+fn count_shared(n: usize) { crate::rt::atomic_add(&mut MARKED_SHARED as *mut usize, n); }
+#[cfg(not(feature = "navic"))]
+fn count_shared(n: usize) { MARKED_SHARED += n; }
+
+// The bytes marked this cycle, and the counts reset.
+fn take_marked() -> usize {
+    let mut t = MARKED_SHARED;
+    MARKED_SHARED = 0;
+    t += wget(MAIN + 24);
+    wset(MAIN + 24, 0);
+    let mut k = 0;
+    while k < MAX_MARKERS {
+        t += wget(LOCAL + k * 32 + 24);
+        wset(LOCAL + k * 32 + 24, 0);
+        k += 1;
+    }
+    t
 }
 
 /// Sets the heap size below which no collection starts.
@@ -821,8 +929,11 @@ fn mark_roots() {
 #[cfg(feature = "navic")]
 fn start_cycle() {
     if COLLECTING { return; }
+    finish_sweep();
     COLLECTING = true;
     crate::rt::sched::stop_the_world();
+    take_marked();
+    ALLOC_AT_START = ALLOCATED;
     CYCLE = true;
     LIMIT = ARENA_NEXT;
     set_marking(true);
@@ -862,9 +973,16 @@ fn finish_cycle() {
     set_marking(false);
     CYCLE = false;
     crate::rt::sched::flush_caches();
-    sweep();
+    // The live heap: what was marked, and what was allocated meanwhile
+    // (allocated black).
+    let live = take_marked() + (ALLOCATED - ALLOC_AT_START);
+    LIVE = live;
+    ALLOCATED = 0;
+    NEXT_GC = if live > MIN_HEAP { live } else { MIN_HEAP };
+    begin_lazy_sweep();
     crate::rt::sched::start_the_world();
     COLLECTING = false;
+    crate::rt::sched::go(|| { sweeper(); });
 }
 
 // Rescans every marked object: if that marks anything more, the
