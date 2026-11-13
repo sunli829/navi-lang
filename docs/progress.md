@@ -124,7 +124,10 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   - 可增长的栈：spawn 的 G 的栈从 64KB 开始（主线程固定 64MB）。栈检查放在建帧之前，比较的是 `SP - 帧大小`；不够时 `_navi_morestack` 保存全部寄存器、把自己的 SP 和所需字节数记在 G 里，`sched::morestack` 分配至少两倍大的新栈，把已用部分复制过去，把复制出的每个落在旧栈范围内的字（保存的 FP、局部变量的地址、桩保存的寄存器）平移，再平移堆上 catch_unwind 记录里的栈地址；桩按返回的位移量移动 SP 和 FP 后恢复寄存器。旧栈在下一次 morestack 时释放。逃逸分析保证别的堆对象不会指向栈。上限 1GB。
   - 新 intrinsic：`current_g`/`set_current_g`、原子操作（casal/ldaddal/ldar/stlr）、`mstart_address`。
   - 实测：8 个线程的纯计算 2.31s → 0.34s；8 个线程同时大量分配 1.88s → 0.55s（每次都正确，连续 30 次）。并发 GC：100k 行项目的编译 20.8s（STW）→ 16.9s，峰值内存 1.89GB → 2.39GB（周期进行中堆还在长）；8 个线程大量改写老对象里指针的压力测试 3.7s → 2.4s，打开校验连续几十次都没有漏标。写屏障让 bp10 这类小项目慢约 4%（1.75s → 1.82s）。`tests/run/parallel.navi`、`gc_mutate.navi`、`stack_grow.navi`，golden 测试在 `NAVI_MAXPROCS` 为 1/2/3/4/16、`NAVI_GCVERIFY=1`、`NAVI_GCSTW=1` 下都通过。
-  - 限制：没有调用的死循环会让 GC 一直等（Go 1.14 之前也这样）；用户自己的 `extern "C"` 阻塞调用没有进出协议；标记只有一个标记 G；全局运行队列。
+  - 限制：没有调用的死循环会让 GC 一直等（Go 1.14 之前也这样）；用户自己的 `extern "C"` 阻塞调用没有进出协议；标记只有一个标记 G。
+  - 调度器照 Go 的 GMP：每个 M 有自己的运行队列和 runnext 槽（被唤醒的 G 下一个就在唤醒它的 M 上跑），yield 的 G 进全局队列，没事做的 M 从别的 M 偷；空闲的 M 睡在自己的 note（互斥锁 + 条件变量）上，只有没有 M 在找活时才唤醒一个；这些路径都不拿运行时锁（G 停下时切到 M 的调度记录，由它释放 G 的对象锁、把 G 放回队列或回收），唤醒用 CAS 认领 G。channel 来回传的 pairs 1.6s → 0.2s（sys 7s → 0.1s）。
+  - std::sync::Mutex 照 Go 的 sync.Mutex：自旋一会儿，再睡在锁自己的等待队列上，解锁时唤醒一个（原来把 G 放回运行队列空转，每圈都拿运行时锁）。
+  - 分配器照 Go 的 mcentral/mheap：每个空闲 span 列表一把锁，堆一把锁，都只在 G 不会停下时持有，持锁时间缩到最短（新 span 在锁外初始化，领到的 span 在锁外清扫）；分配只在要收集时拿运行时锁，并在锁内再查一次。
   - channel 的等待分三个 FIFO 队列（等元素的接收者、等空位的发送者、等元素被取走的无缓冲发送者），一个元素只唤醒一个接收者、取走一个元素只唤醒一个发送者，close 唤醒全部；select 等待过之后会把用不上的唤醒转给它的其他 channel。1 万个 G 等同一个无缓冲 channel：17 秒 → 0.45 秒，10 万个 1.65 秒（`tests/run/chan_many.navi`）。
   - 并行标记：一半的线程做并发标记，各有自己的标记栈，多的工作放进共享池，空闲的标记 G 等一会儿没活就退出，最后一个收尾；最后一次 STW 把各标记栈、池和写屏障队列一起排空。多线程大量改写指针的压力测试 2.39s → 1.97s。
   - std：`sync::Mutex`、`sync::atomic::AtomicUsize`、`thread::current().id()`、`thread::available_parallelism`。
