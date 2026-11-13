@@ -225,6 +225,9 @@ fn head(t: &Type) -> i64 {
 
 struct Escape {
     summaries: HashMap<u32, Summary>,
+    /// The summaries of finished functions, read under this (a worker's
+    /// summaries are its own).
+    shared: Option<HashMap<u32, Summary>>,
     by_def: HashMap<u32, &mut Func>,
     impls: HashMap<String, Vec<(&mut Func, i64)>>,
     lang_of: HashMap<u32, String>,
@@ -258,6 +261,12 @@ fn merge(s: &mut Summary, t: Summary) {
 }
 
 impl Escape {
+    // A worker's copy: its own summaries over the finished ones.
+    fn copy(&mut self) -> &mut Escape {
+        &mut Escape { summaries: HashMap::new(), shared: Some(self.summaries), by_def: self.by_def, impls: self.impls,
+            lang_of: self.lang_of, changed: false, used: Vec::new(), users: self.users, debug: self.debug.clone() }
+    }
+
     /// The summary of a call through fn_op with nargs arguments (None:
     /// unknown callee).
     fn callee(&mut self, fn_op: &Operand, nargs: usize) -> Option<Summary> {
@@ -321,8 +330,15 @@ impl Escape {
 
     fn summary_of(&mut self, f: &Func, nargs: usize) -> Summary {
         self.used.push(f.id);
-        match self.summaries.get(&f.id) {
-            Some(s) => if s.esc.len() == nargs + 1 { s.clone() } else { unknown_summary(nargs) },
+        let found = match self.summaries.get(&f.id) {
+            Some(s) => Some(s.clone()),
+            None => match self.shared {
+                Some(sh) => match sh.get(&f.id) { Some(s) => Some(s.clone()), None => None },
+                None => None,
+            },
+        };
+        match found {
+            Some(s) => if s.esc.len() == nargs + 1 { s } else { unknown_summary(nargs) },
             None => empty_summary(nargs),
         }
     }
@@ -687,7 +703,7 @@ fn loop_blocks(f: &Func) -> Vec<bool> {
 /// Runs the analysis over all functions and returns, per function id, the
 /// locals whose address may stay in the frame.
 pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<bool>> {
-    let e = &mut Escape { summaries: HashMap::new(), by_def: HashMap::new(), impls: HashMap::new(), lang_of: HashMap::new(), changed: true, used: Vec::new(), users: HashMap::new(),
+    let e = &mut Escape { summaries: HashMap::new(), shared: None, by_def: HashMap::new(), impls: HashMap::new(), lang_of: HashMap::new(), changed: true, used: Vec::new(), users: HashMap::new(),
         debug: match std::env::var("NAVI_ESCDEBUG") { Ok(v) => v, Err(_) => String::new() } };
     for (name, d) in info.lang.iter() { e.lang_of.insert(d.id, name.clone()); }
     for f in funcs.iter() {
@@ -715,47 +731,84 @@ pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<
             }
         }
     }
-    // Summaries to a fixed point; after the first round only the users of
-    // changed summaries are recomputed.
-    let mut by_id: HashMap<u32, &mut Func> = HashMap::new();
-    for f in funcs.iter() { by_id.insert(f.id, *f); }
-    let mut todo: Vec<&mut Func> = funcs.clone();
-    let mut rounds = 0;
-    while todo.len() > 0 && rounds < 30 {
-        let mut changed: Vec<u32> = Vec::new();
-        for f in todo.iter() {
-            e.used = Vec::new();
-            e.changed = false;
-            e.summarize(*f);
-            if rounds == 0 {
-                for u in e.used.iter() {
-                    if !e.users.contains_key(u) { e.users.insert(*u, Vec::new()); }
-                    let mut us = e.users[u];
-                    if us.len() == 0 || us[us.len() - 1] != f.id { us.push(f.id); }
-                }
-            }
-            if e.changed { changed.push(f.id); }
+    // Summaries bottom-up over the call graph (as Go does): the functions
+    // whose summaries a function's graph uses do not depend on summary
+    // values, so they are found first (on several threads); then each
+    // strongly connected component is summarized after the components it
+    // calls, a single function once, a recursive set until no summary
+    // changes. Components at the same depth are summarized on several
+    // threads.
+    let n = funcs.len();
+    let mut index: HashMap<u32, usize> = HashMap::new();
+    let mut fi = 0;
+    while fi < n {
+        index.insert(funcs[fi].id, fi);
+        fi += 1;
+    }
+    let mut deps: Vec<Vec<usize>> = Vec::new();
+    for _ in funcs.iter() { deps.push(Vec::new()); }
+    crate::util::par_for(n, 16, |i| {
+        let w = e.copy();
+        w.graph(funcs[i]);
+        let mut ds: Vec<usize> = Vec::new();
+        for u in w.used.iter() {
+            if let Some(j) = index.get(u) { if !ds.contains(j) { ds.push(*j); } }
         }
-        let mut seen: HashMap<u32, bool> = HashMap::new();
-        todo = Vec::new();
-        for c in changed.iter() {
-            if let Some(us) = e.users.get(c) {
-                for u in us.iter() {
-                    if seen.contains_key(u) { continue; }
-                    seen.insert(*u, true);
-                    if let Some(f) = by_id.get(u) { todo.push(*f); }
-                }
+        deps[i] = ds;
+    });
+    let sccs = components(&deps);
+    let mut comp: Vec<usize> = Vec::new();
+    for _ in funcs.iter() { comp.push(0); }
+    let mut ci = 0;
+    while ci < sccs.len() {
+        for m in sccs[ci].iter() { comp[*m] = ci; }
+        ci += 1;
+    }
+    // Depth: 1 + the deepest component called (components come callees
+    // first).
+    let mut depth: Vec<usize> = Vec::new();
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    ci = 0;
+    while ci < sccs.len() {
+        let mut d = 0;
+        for m in sccs[ci].iter() {
+            for j in deps[*m].iter() {
+                if comp[*j] != ci && depth[comp[*j]] + 1 > d { d = depth[comp[*j]] + 1; }
             }
         }
-        rounds += 1;
+        depth.push(d);
+        while levels.len() <= d { levels.push(Vec::new()); }
+        let mut lv = levels[d];
+        lv.push(ci);
+        ci += 1;
+    }
+    for lv in levels.iter() {
+        let mut out: Vec<HashMap<u32, Summary>> = Vec::new();
+        for _ in lv.iter() { out.push(HashMap::new()); }
+        crate::util::par_for(lv.len(), 4, |k| {
+            let w = e.copy();
+            let members = sccs[lv[k]];
+            let recursive = members.len() > 1 || deps[members[0]].contains(&members[0]);
+            let mut rounds = 0;
+            loop {
+                w.changed = false;
+                for m in members.iter() { w.summarize(funcs[*m]); }
+                rounds += 1;
+                if !recursive || !w.changed || rounds >= 30 { break; }
+            }
+            out[k] = w.summaries;
+        });
+        for o in out.iter() {
+            for (id, sm) in o.iter() { e.summaries.insert(*id, sm.clone()); }
+        }
     }
     // What each function keeps in its frame, on several threads (each with
     // its own scratch; the summaries are final).
     let mut ks: Vec<Vec<bool>> = Vec::new();
     for _ in funcs.iter() { ks.push(Vec::new()); }
     crate::util::par_for(funcs.len(), 16, |i| {
-        let w = &mut Escape { summaries: e.summaries, by_def: e.by_def, impls: e.impls, lang_of: e.lang_of, changed: false,
-            used: Vec::new(), users: e.users, debug: e.debug.clone() };
+        let w = &mut Escape { summaries: e.summaries, shared: None, by_def: e.by_def, impls: e.impls, lang_of: e.lang_of,
+            changed: false, used: Vec::new(), users: e.users, debug: e.debug.clone() };
         ks[i] = w.keep(funcs[i]);
     });
     let mut keep: HashMap<u32, Vec<bool>> = HashMap::new();
@@ -777,4 +830,61 @@ pub fn analyze_program(info: &Info, funcs: &Vec<&mut Func>) -> HashMap<u32, Vec<
         keep.insert(f.id, k);
     }
     keep
+}
+
+// The strongly connected components of the graph i -> deps[i] (Tarjan),
+// each listed after the components it reaches (callees first), members in
+// index order.
+fn components(deps: &Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+    let n = deps.len();
+    let t = &mut Tarjan { index: Vec::new(), low: Vec::new(), on: Vec::new(), stack: Vec::new(), next: 0, out: Vec::new() };
+    for _ in deps.iter() {
+        t.index.push(-1);
+        t.low.push(0);
+        t.on.push(false);
+    }
+    let mut i = 0;
+    while i < n {
+        if t.index[i] < 0 { t.visit(deps, i); }
+        i += 1;
+    }
+    t.out
+}
+
+struct Tarjan {
+    index: Vec<i64>,
+    low: Vec<i64>,
+    on: Vec<bool>,
+    stack: Vec<usize>,
+    next: i64,
+    out: Vec<Vec<usize>>,
+}
+
+impl Tarjan {
+    fn visit(&mut self, deps: &Vec<Vec<usize>>, v: usize) {
+        self.index[v] = self.next;
+        self.low[v] = self.next;
+        self.next += 1;
+        self.stack.push(v);
+        self.on[v] = true;
+        for w in deps[v].iter() {
+            if self.index[*w] < 0 {
+                self.visit(deps, *w);
+                if self.low[*w] < self.low[v] { self.low[v] = self.low[*w]; }
+            } else if self.on[*w] && self.index[*w] < self.low[v] {
+                self.low[v] = self.index[*w];
+            }
+        }
+        if self.low[v] == self.index[v] {
+            let mut c: Vec<usize> = Vec::new();
+            loop {
+                let w = self.stack.pop().unwrap();
+                self.on[w] = false;
+                c.push(w);
+                if w == v { break; }
+            }
+            c.sort();
+            self.out.push(c);
+        }
+    }
 }
