@@ -103,10 +103,63 @@ impl Info {
     }
 
     fn hidden_of_now(&mut self, t: &Type) -> Option<&Type> {
+        let d = t.def?;
+        if d.kind == resolve::DEF_ASSOC_FN && d.parent.unwrap().kind == resolve::DEF_TRAIT { return self.trait_hidden(t, d); }
         if let Some(h) = self.hidden.get(&t.id) { return Some(*h); }
-        if !self.lazy_std { return None; }
-        if let Some(d) = t.def { self.body(d); }
-        match self.hidden.get(&t.id) { Some(h) => Some(*h), None => None }
+        if d.kind != resolve::DEF_FN && d.kind != resolve::DEF_ASSOC_FN {
+            if self.lazy_std { self.body(d); }
+            return match self.hidden.get(&t.id) { Some(h) => Some(*h), None => None };
+        }
+        // The opaque type of d's signature (its own parameters as arguments)
+        // holds the hidden type; t has d's generic arguments.
+        let sig = self.fn_sig_of(d);
+        if t.index < 0 || t.index as usize >= sig.opaques.len() { return None; }
+        let ident = sig.opaques[t.index as usize];
+        if !self.hidden.contains_key(&ident.id) && self.lazy_std { self.body(d); }
+        let h = match self.hidden.get(&ident.id) { Some(h) => *h, None => return None };
+        if same(ident, t) { return Some(h); }
+        let g = self.generics_of(d);
+        let map = crate::types::lower::param_map(Some(g), &t.args);
+        Some(crate::types::lower::subst(self.ctx, h, &map, None))
+    }
+
+    /// t with every impl Trait type replaced by the type behind it.
+    pub fn reveal_all(&mut self, t: &Type) -> &Type {
+        let mut cur = t;
+        let mut rounds = 0;
+        while rounds < 16 {
+            let mut ops: Vec<&Type> = Vec::new();
+            crate::types::lower::visit(cur, |x| { if x.kind == K_OPAQUE { ops.push(x); } });
+            if ops.len() == 0 { return cur; }
+            let mut changed = false;
+            for o in ops.iter() {
+                if let Some(h) = self.hidden_of(*o) {
+                    cur = crate::types::body::replace_type(self.ctx, cur, *o, h);
+                    changed = true;
+                }
+            }
+            if !changed { return cur; }
+            rounds += 1;
+        }
+        cur
+    }
+
+    // The impl Trait trait method m returns for the Self and generic
+    // arguments in t: what the impl's method returns (its own impl Trait
+    // revealed), with the impl's generic arguments.
+    fn trait_hidden(&mut self, t: &Type, m: &mut Def) -> Option<&Type> {
+        let st = t.args[0];
+        let rest: Vec<&Type> = t.args[1..].to_vec();
+        let r = self.resolve_method(m, st, &rest)?;
+        if r.def.id == m.id { return None; }
+        let sig = self.fn_sig_of(r.def);
+        let g = self.generics_of(r.def);
+        let map = crate::types::lower::param_map(Some(g), &r.args);
+        if sig.ret.kind == K_OPAQUE && sig.ret.args.len() == 0 {
+            let h = self.hidden_of(sig.ret)?;
+            return Some(crate::types::lower::subst(self.ctx, h, &map, r.self_ty));
+        }
+        Some(crate::types::lower::subst(self.ctx, sig.ret, &map, r.self_ty))
     }
 
     // The Collector a query solves with: while threads share Info, a copy
