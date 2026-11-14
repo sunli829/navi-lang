@@ -219,6 +219,7 @@ for x in &mut v { *x += 1; }                // 得到指向元素的 &mut（GC �
 if let Some(x) = opt { ... } else { ... }
 while let Some(x) = stack.pop() { ... }
 let Some(x) = opt else { return; };         // let-else
+if let Some(x) = a && let Ok(y) = f(x) && y > 0 { ... }   // let 链（同 Rust 2024），while 里也可以用
 
 // 闭包（按引用捕获，被捕获的变量会逃逸到堆上，同 Go；没有 move 关键字）
 let add = |a: i32, b: i32| -> i32 { a + b };
@@ -278,7 +279,7 @@ match opt_ref { Some(&Point { x, .. }) => ..., None => ... }
 match name { "admin" => ..., _ => ... }     // 字符串字面量模式
 ```
 
-- `match` 必须穷尽，编译器做穷尽性检查和不可达分支检查
+- `match` 必须穷尽，编译器做穷尽性检查；前面的分支已经覆盖的分支给出警告 `unreachable pattern`（不影响编译，同 Rust）。有守卫的分支不算覆盖；或模式只要有一个分支可达就不警告。std 里的警告不显示；命中构建缓存时照样再打印一遍
 - 模式可以用在 `let`、函数参数、`if let`、`while let`、`let-else`、`for` 里
 - 没有 `matches!`，判断"是否匹配"用 `if let` 或 `match`
 

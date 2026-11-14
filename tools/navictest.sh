@@ -21,6 +21,12 @@ for f in tests/run/*.navi; do
 	got_out=$(cd "$tmp" && "./$n" 2>"$tmp/$n.err")
 	code=$?
 	set -e
+	# // warn: line:col msg lists the build's warnings.
+	want_warn=$(grep -E '^// warn:' "$f" | sed -E 's#^// warn: ?##')
+	got_warn=$(grep ': warning: ' "$tmp/$n.build" | sed -E 's#^[^:]*:([0-9]+:[0-9]+): warning: #\1 #')
+	if [ "$got_warn" != "$want_warn" ]; then
+		echo "FAIL $f (warnings)"; cat "$tmp/$n.build"; fail=1; continue
+	fi
 	if [ "$got_out" = "$want_out" ] && [ "$code" = "$want_code" ]; then
 		echo "ok   $f"
 	else
