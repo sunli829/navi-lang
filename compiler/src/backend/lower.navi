@@ -109,7 +109,9 @@ pub struct Gen {
     cur_all: u64,
     /// The functions placed with stack maps: (symbol, text offset, size,
     /// map symbol), in text order.
-    ftab: Vec<(String, u64, u64, String)>,
+    ftab: Vec<(u64, u64, u64)>,
+    /// The stack maps, one after another (ftab has each one's offset).
+    fmeta: Vec<u8>,
     /// Placeholder names (%S<k>, %L<k>), made once for each k.
     ph_s: Vec<String>,
     ph_l: Vec<String>,
@@ -214,7 +216,7 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         loc_ids: HashMap::new(), str_ids: HashMap::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
-        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live(), cur_meta: Vec::new(), cur_masks: Vec::new(), cur_all: 0, ftab: Vec::new(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
+        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live(), cur_meta: Vec::new(), cur_masks: Vec::new(), cur_all: 0, ftab: Vec::new(), fmeta: Vec::new(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
         file_sym: HashMap::new(), floc_pos: HashMap::new(),
         sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string() }
 }
@@ -293,6 +295,8 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
         }
         k += 1;
     }
+    // The start of the text (the stack map table counts from it).
+    g.o.define("_navi_text0", obj::TEXT, 4, false);
     let mut outs: Vec<Option<&mut FuncOut>> = Vec::new();
     for _ in jobs.iter() { outs.push(None); }
     for j in order.iter() {
@@ -419,18 +423,15 @@ impl Gen {
         let off = self.o.define(out.sym.as_str(), obj::TEXT, align, false);
         self.o.append(obj::TEXT, out.code.as_slice());
         if out.meta.len() > 0 {
-            let ms = `_navi_fm${self.ftab.len()}`;
-            self.o.define(ms.as_str(), obj::DATA_CONST, 8, false);
-            let mut buf: Vec<u8> = Vec::with_capacity(8 * out.meta.len());
+            let mo = self.fmeta.len() as u64;
             for w in out.meta.iter() {
                 let mut b = 0;
                 while b < 8 {
-                    buf.push((*w >> (8 * b) as u32) as u8);
+                    self.fmeta.push((*w >> (8 * b) as u32) as u8);
                     b += 1;
                 }
             }
-            self.o.append(obj::DATA_CONST, buf.as_slice());
-            self.ftab.push((out.sym.clone(), off, out.code.len() as u64, ms));
+            self.ftab.push((off, out.code.len() as u64, mo));
         }
         if self.debug {
             self.o.funcs.push(obj::FuncRange { name: out.name.clone(), off, size: out.code.len() as u64 });
@@ -643,44 +644,57 @@ impl Gen {
         self.cur_meta = Vec::new();
         if fm.len() == 0 { return fm; }
         let conservative = fm[1] & 1 != 0;
+        // Each call: (return offset / 4) << 9 | mask, two in a word.
         fm.push(calls.len() as u64);
-        for c in calls.iter() {
-            let ret = *c >> 32;
-            let tag = (*c & 0xffffffff) as i64 - 1;
+        let mut half = 0u64;
+        let mut ci = 0;
+        while ci < calls.len() {
+            let c = calls[ci];
+            let ret = c >> 32;
+            let tag = (c & 0xffffffff) as i64 - 1;
             let mask = if conservative || tag < 0 || tag as usize >= self.cur_masks.len() { self.cur_all } else { self.cur_masks[tag as usize] as u64 };
-            fm.push(ret << 32 | mask);
+            let e = (ret / 4) << 9 | mask;
+            if ci % 2 == 0 { half = e; } else { fm.push(half | e << 32); }
+            ci += 1;
         }
+        if calls.len() % 2 == 1 { fm.push(half); }
         fm
     }
 
     /// Writes strings, locations, dictionaries, vtables and statics.
     fn gen_data(&mut self) {
-        // The stack maps by code address: [count, then start, size, map for
-        // each function, by address].
+        // The stack maps by code address: [count, the text's start, where
+        // the maps start (from the table), then for each function by
+        // address its offset in the text, size and map offset (u32 each)],
+        // then the maps.
         let off = self.o.define("_navi_ftab", obj::DATA_CONST, 8, false);
-        let mut hdr: Vec<u8> = Vec::new();
-        let n = self.ftab.len() as u64;
+        let mut t: Vec<u8> = Vec::new();
+        let n = self.ftab.len();
         let mut b = 0;
-        while b < 8 {
-            hdr.push((n >> (8 * b) as u32) as u8);
+        while b < 24 {
+            t.push(if b < 8 { ((n as u64) >> (8 * b) as u32) as u8 } else { 0 });
             b += 1;
         }
-        self.o.append(obj::DATA_CONST, hdr.as_slice());
-        let mut ti = 0;
-        while ti < self.ftab.len() {
-            let (fsym, _, size, ms) = self.ftab[ti];
-            let at = off + 8 + 24 * ti as u64;
-            let mut e: Vec<u8> = Vec::new();
-            let mut k = 0;
-            while k < 24 {
-                e.push(if k >= 8 && k < 16 { (size >> (8 * (k - 8)) as u32) as u8 } else { 0 });
-                k += 1;
+        for e in self.ftab.iter() {
+            let (fo, size, mo) = *e;
+            for v in [fo, size, mo].iter() {
+                let mut k = 0;
+                while k < 4 {
+                    t.push((*v >> (8 * k) as u32) as u8);
+                    k += 1;
+                }
             }
-            self.o.append(obj::DATA_CONST, e.as_slice());
-            self.o.reloc(obj::DATA_CONST, at as u32, obj::ABS64, fsym.as_str());
-            self.o.reloc(obj::DATA_CONST, (at + 16) as u32, obj::ABS64, ms.as_str());
-            ti += 1;
         }
+        while t.len() % 8 != 0 { t.push(0); }
+        let moff = t.len() as u64;
+        let mut b2 = 0;
+        while b2 < 8 {
+            t[16 + b2] = (moff >> (8 * b2) as u32) as u8;
+            b2 += 1;
+        }
+        self.o.append(obj::DATA_CONST, t.as_slice());
+        self.o.append(obj::DATA_CONST, self.fmeta.as_slice());
+        self.o.reloc(obj::DATA_CONST, (off + 8) as u32, obj::ABS64, "_navi_text0");
         // Locations: { file: &str, line: u32, col: u32 }.
         let loc_def = self.p.info.lang_def("Location").unwrap();
         let loc_ty = self.p.info.ctx.adt(loc_def, Vec::new());
@@ -1250,29 +1264,31 @@ impl FnGen {
     /// The function's stack map (for moving stacks; Go's stack maps, with
     /// the saved registers): [frame size, flags (1: any word or register
     /// may be a pointer: the runtime, which keeps addresses in integers),
-    /// bitmap length, a bit for each frame word from SP up to FP that may
-    /// hold a pointer, then the number of saved registers and for each its
-    /// index (x19 + k) and FP offset]. The calls are added by finish_meta,
-    /// with masks of the saved registers holding pointers at each position
-    /// (cur_masks).
+    /// the number of words from SP that may all hold pointers (the buffers
+    /// and the outgoing area), the length of a bitmap of the words above
+    /// them that may, the bitmap, then the number of saved registers and
+    /// for each its index (x19 + k) << 32 | its FP offset]. The calls are
+    /// added by finish_meta, with masks of the saved registers holding
+    /// pointers at each position (cur_masks).
     fn stack_meta(&mut self) {
         let frame = self.frame;
-        let nw = (frame / 8) as usize;
+        let nw = frame / 8;
         let rt = match self.f.def {
             Some(d) => crate::mir::inline::in_runtime(d),
             None => match self.f.owner { Some(d) => crate::mir::inline::in_runtime(d), None => false },
         };
+        let any = if rt { nw } else { (frame + self.buf_top) / 8 };
         let mut bits: Vec<u64> = Vec::new();
         let mut k = 0;
-        while k < (nw + 63) / 64 {
-            bits.push(if rt { 0xffffffffffffffff } else { 0 });
+        while k < (nw - any + 63) / 64 {
+            bits.push(0);
             k += 1;
         }
         if !rt {
             let mut set = |off: i64| {
                 let w = frame + off;
-                if w >= 0 && w < frame && w % 8 == 0 {
-                    let i = (w / 8) as usize;
+                if w >= 0 && w < frame && w % 8 == 0 && w / 8 >= any {
+                    let i = (w / 8 - any) as usize;
                     bits[i / 64] = bits[i / 64] | 1u64 << (i % 64) as u32;
                 }
             };
@@ -1280,12 +1296,6 @@ impl FnGen {
             set(SLOT_RET);
             set(SLOT_LOC);
             set(SLOT_DEFERS);
-            // The buffers and the outgoing area: any word.
-            let mut o = -frame;
-            while o < self.buf_top {
-                set(o);
-                o += 8;
-            }
             let n = self.f.locals.len();
             let mut i = 0;
             while i < n {
@@ -1303,6 +1313,7 @@ impl FnGen {
         meta.clear();
         meta.push(frame as u64);
         meta.push(if rt { 1 } else { 0 });
+        meta.push(any as u64);
         meta.push(bits.len() as u64);
         for b in bits.iter() { meta.push(*b); }
         meta.push(self.saved.len() as u64);
@@ -1310,8 +1321,7 @@ impl FnGen {
         for sv in self.saved.iter() {
             let k = (sv.0 - S0) as u64;
             all = all | 1u64 << k as u32;
-            meta.push(k);
-            meta.push(sv.1 as u64);
+            meta.push(k << 32 | (sv.1 as u64 & 0xffffffff));
         }
         self.g.cur_all = all;
         // Masks by position: the saved registers holding a live pointer
