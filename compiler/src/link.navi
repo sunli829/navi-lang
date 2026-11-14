@@ -1,7 +1,7 @@
-//! A linker for macOS arm64: turns the object model into a position
-//! independent Mach-O executable that imports its C functions from
-//! libSystem, with an ad-hoc code signature (the kernel requires one on
-//! Apple silicon). It replaces `cc`/`ld` for navic's own output.
+//! A linker for macOS (arm64 and x86-64): turns the object model into a
+//! position independent Mach-O executable that imports its C functions
+//! from libSystem, with an ad-hoc code signature (the kernel requires one
+//! on Apple silicon). It replaces `cc`/`ld` for navic's own output.
 //!
 //! Layout (16 KiB pages): __PAGEZERO; __TEXT (header and load commands,
 //! __text, __stubs, __const); __DATA_CONST (__got, __const); __DATA
@@ -16,7 +16,6 @@ use crate::sha256;
 
 const PAGE: u64 = 16384;
 const BASE: u64 = 0x100000000;
-const STUB_SIZE: u64 = 12;
 
 fn align_up(x: u64, a: u64) -> u64 { (x + a - 1) / a * a }
 
@@ -155,9 +154,21 @@ struct Sect {
     flags: u32,
 }
 
-/// Links o (arm64) into an executable; identifier names it in the code
-/// signature (the output's file name, as ld does).
+/// Patches a rel32 field at pc (x86-64 call or rip-relative operand,
+/// relative to the field's end).
+fn patch_rel32(code: &mut Vec<u8>, at: usize, pc: u64, target: u64) -> Result<(), String> {
+    let delta = target as i64 - (pc as i64 + 4);
+    if delta >= 1 << 31 || delta < -(1 << 31) { return Err("link: rel32 out of range".to_string()); }
+    set32(code, at, delta as u32);
+    Ok(())
+}
+
+/// Links o into an executable; identifier names it in the code signature
+/// (the output's file name, as ld does).
 pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
+    let x64 = o.arch == "amd64";
+    // Stubs: arm64 adrp/ldr/br (12 bytes), x86-64 jmp [rip + got] (6).
+    let stub_size: u64 = if x64 { 6 } else { 12 };
     // Imports: undefined symbols, sorted.
     let mut imports: Vec<String> = o.undef.keys().map(|k| k.clone()).collect();
     imports.sort();
@@ -196,14 +207,14 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     }
 
     // __TEXT: header, commands, __text, __stubs, __const.
-    let text = &mut Sect { seg: "__TEXT", name: "__text", data: o.sects[obj::TEXT].clone(), addr: 0, off: 0, align: 2, flags: 0x80000400 };
-    let stubs = &mut Sect { seg: "__TEXT", name: "__stubs", data: Vec::new(), addr: 0, off: 0, align: 2, flags: 0x80000400 };
+    let text = &mut Sect { seg: "__TEXT", name: "__text", data: o.sects[obj::TEXT].clone(), addr: 0, off: 0, align: if x64 { 4 } else { 2 }, flags: 0x80000400 };
+    let stubs = &mut Sect { seg: "__TEXT", name: "__stubs", data: Vec::new(), addr: 0, off: 0, align: if x64 { 1 } else { 2 }, flags: 0x80000400 };
     let cstr = &mut Sect { seg: "__TEXT", name: "__const", data: o.sects[obj::RO_DATA].clone(), addr: 0, off: 0, align: 3, flags: 0 };
     let got = &mut Sect { seg: "__DATA_CONST", name: "__got", data: Vec::new(), addr: 0, off: 0, align: 3, flags: 0 };
     let dconst = &mut Sect { seg: "__DATA_CONST", name: "__const", data: o.sects[obj::DATA_CONST].clone(), addr: 0, off: 0, align: 3, flags: 0 };
     let data = &mut Sect { seg: "__DATA", name: "__data", data: o.sects[obj::DATA].clone(), addr: 0, off: 0, align: 3, flags: 0 };
     let mut k = 0;
-    while k < nimp * STUB_SIZE { stubs.data.push(0); k += 1; }
+    while k < nimp * stub_size { stubs.data.push(0); k += 1; }
     k = 0;
     while k < nimp * 8 { got.data.push(0); k += 1; }
 
@@ -277,12 +288,20 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     }
     let entry = match addr_of.get(&"_main".to_string()) { Some(a) => *a, None => return Err("link: no _main".to_string()) };
 
-    // Stubs: adrp x16, got@PAGE; ldr x16, [x16, got@PAGEOFF]; br x16.
+    // Stubs: adrp x16, got@PAGE; ldr x16, [x16, got@PAGEOFF]; br x16 (or
+    // jmp [rip + got]).
     let mut i = 0u64;
     while i < nimp {
-        let at = (i * STUB_SIZE) as usize;
-        let pc = stubs.addr + i * STUB_SIZE;
+        let at = (i * stub_size) as usize;
+        let pc = stubs.addr + i * stub_size;
         let slot = got.addr + i * 8;
+        if x64 {
+            stubs.data[at] = 0xFF;
+            stubs.data[at + 1] = 0x25;
+            patch_rel32(&mut stubs.data, at + 2, pc + 2, slot)?;
+            i += 1;
+            continue;
+        }
         set32(&mut stubs.data, at, 0x90000010);
         patch_page21(&mut stubs.data, at, pc, slot)?;
         set32(&mut stubs.data, at + 4, 0xF9400210 | (((slot & 0xfff) >> 3) as u32) << 10);
@@ -304,7 +323,7 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
         let target = if defined[sid] {
             addr_by[sid]
         } else if import_by[sid] >= 0 {
-            stubs.addr + (import_by[sid] as u64) * STUB_SIZE
+            stubs.addr + (import_by[sid] as u64) * stub_size
         } else {
             return Err(`link: undefined symbol ${o.names[sid]}`);
         };
@@ -320,6 +339,9 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
                 }
                 obj::PAGE_OFF12 => {
                     patch_pageoff12(&mut text.data, at, target);
+                }
+                obj::CALL32 | obj::PC32 => {
+                    patch_rel32(&mut text.data, at, pc, target)?;
                 }
                 _ => {
                     return Err("link: unsupported code relocation".to_string());
@@ -415,8 +437,13 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     // Header and load commands.
     let w = &mut Buf { b: Vec::new() };
     w.u32(0xfeedfacf);
-    w.u32(0x0100000c);
-    w.u32(0);
+    if x64 {
+        w.u32(0x01000007);
+        w.u32(3);
+    } else {
+        w.u32(0x0100000c);
+        w.u32(0);
+    }
     w.u32(2); // MH_EXECUTE
     w.u32(ncmds);
     w.u32(cmds_size);
