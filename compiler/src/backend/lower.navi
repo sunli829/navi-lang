@@ -75,6 +75,8 @@ struct FuncOut {
     /// (offset in code, file, line) in debug builds.
     // Offset and line, in file.
     lines: Vec<(u64, u32)>,
+    /// The stack map (see stack_meta), with the calls' masks.
+    meta: Vec<u64>,
     file: Option<&File>,
     strs: Vec<Vec<u8>>,
     locs: Vec<LocData>,
@@ -99,6 +101,15 @@ const RUNTIME_SYMS: [&str; 19] = ["_navi_argc", "_navi_argv", "_navi_data_end", 
 const CHUNK: usize = 4;
 
 pub struct Gen {
+    /// The function being made's stack map (without its calls), its saved
+    /// registers' pointer masks by position, and the mask of every saved
+    /// register it uses.
+    cur_meta: Vec<u64>,
+    cur_masks: Vec<u16>,
+    cur_all: u64,
+    /// The functions placed with stack maps: (symbol, text offset, size,
+    /// map symbol), in text order.
+    ftab: Vec<(String, u64, u64, String)>,
     /// Placeholder names (%S<k>, %L<k>), made once for each k.
     ph_s: Vec<String>,
     ph_l: Vec<String>,
@@ -203,7 +214,7 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         loc_ids: HashMap::new(), str_ids: HashMap::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
-        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
+        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live(), cur_meta: Vec::new(), cur_masks: Vec::new(), cur_all: 0, ftab: Vec::new(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
         file_sym: HashMap::new(), floc_pos: HashMap::new(),
         sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string() }
 }
@@ -407,6 +418,20 @@ impl Gen {
         let align = if self.o.arch == "amd64" { 16 } else { 4 };
         let off = self.o.define(out.sym.as_str(), obj::TEXT, align, false);
         self.o.append(obj::TEXT, out.code.as_slice());
+        if out.meta.len() > 0 {
+            let ms = `_navi_fm${self.ftab.len()}`;
+            self.o.define(ms.as_str(), obj::DATA_CONST, 8, false);
+            let mut buf: Vec<u8> = Vec::with_capacity(8 * out.meta.len());
+            for w in out.meta.iter() {
+                let mut b = 0;
+                while b < 8 {
+                    buf.push((*w >> (8 * b) as u32) as u8);
+                    b += 1;
+                }
+            }
+            self.o.append(obj::DATA_CONST, buf.as_slice());
+            self.ftab.push((out.sym.clone(), off, out.code.len() as u64, ms));
+        }
         if self.debug {
             self.o.funcs.push(obj::FuncRange { name: out.name.clone(), off, size: out.code.len() as u64 });
             if let Some(f) = out.file {
@@ -445,7 +470,8 @@ impl Gen {
             let id = match self.main_ids.get(&r.sym) { Some(i) => *i as i64, None => -1 };
             relocs.push(OutReloc { off: r.off, kind: r.kind, id, ph: 0, ix: 0, name: r.sym });
         }
-        let out = &mut FuncOut { sym: sym.to_string(), name, code: c.code, relocs, lines: Vec::new(), file: self.cur_file, strs: self.fstrs,
+        let meta = self.finish_meta(&c.calls);
+        let out = &mut FuncOut { sym: sym.to_string(), name, code: c.code, relocs, lines: Vec::new(), meta, file: self.cur_file, strs: self.fstrs,
             locs: self.flocs, undef: self.fundef, errs: self.errs, failed: false };
         if c.err.len() > 0 {
             out.errs.push(`${sym}: ${c.err}`);
@@ -610,8 +636,51 @@ impl Gen {
         self.str_sym(name.as_str())
     }
 
+    // The stack map of the function just made: its frame part (stack_meta)
+    // and each call's return offset and saved-register pointer mask.
+    fn finish_meta(&mut self, calls: &Vec<u64>) -> Vec<u64> {
+        let mut fm = self.cur_meta;
+        self.cur_meta = Vec::new();
+        if fm.len() == 0 { return fm; }
+        let conservative = fm[1] & 1 != 0;
+        fm.push(calls.len() as u64);
+        for c in calls.iter() {
+            let ret = *c >> 32;
+            let tag = (*c & 0xffffffff) as i64 - 1;
+            let mask = if conservative || tag < 0 || tag as usize >= self.cur_masks.len() { self.cur_all } else { self.cur_masks[tag as usize] as u64 };
+            fm.push(ret << 32 | mask);
+        }
+        fm
+    }
+
     /// Writes strings, locations, dictionaries, vtables and statics.
     fn gen_data(&mut self) {
+        // The stack maps by code address: [count, then start, size, map for
+        // each function, by address].
+        let off = self.o.define("_navi_ftab", obj::DATA_CONST, 8, false);
+        let mut hdr: Vec<u8> = Vec::new();
+        let n = self.ftab.len() as u64;
+        let mut b = 0;
+        while b < 8 {
+            hdr.push((n >> (8 * b) as u32) as u8);
+            b += 1;
+        }
+        self.o.append(obj::DATA_CONST, hdr.as_slice());
+        let mut ti = 0;
+        while ti < self.ftab.len() {
+            let (fsym, _, size, ms) = self.ftab[ti];
+            let at = off + 8 + 24 * ti as u64;
+            let mut e: Vec<u8> = Vec::new();
+            let mut k = 0;
+            while k < 24 {
+                e.push(if k >= 8 && k < 16 { (size >> (8 * (k - 8)) as u32) as u8 } else { 0 });
+                k += 1;
+            }
+            self.o.append(obj::DATA_CONST, e.as_slice());
+            self.o.reloc(obj::DATA_CONST, at as u32, obj::ABS64, fsym.as_str());
+            self.o.reloc(obj::DATA_CONST, (at + 16) as u32, obj::ABS64, ms.as_str());
+            ti += 1;
+        }
         // Locations: { file: &str, line: u32, col: u32 }.
         let loc_def = self.p.info.lang_def("Location").unwrap();
         let loc_ty = self.p.info.ctx.adt(loc_def, Vec::new());
@@ -899,8 +968,10 @@ impl Gen {
             if let Some(d) = f.def { self.cur_lines.push((0, d.pos)); }
         }
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
-            res_off: 0, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), saved: Vec::new(), concs: HashMap::new() };
+            res_off: 0, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
+            frame: 0, buf_top: 0 };
         fg.gen();
+        fg.stack_meta();
         self.emit_func(sym.as_str(), false);
     }
 }
@@ -951,6 +1022,10 @@ struct FnGen {
     saved: Vec<(Reg, i64)>,
     /// conc's results, by type id.
     concs: HashMap<u32, &Type>,
+    /// The frame's size, and where (from FP) the saved registers end: below
+    /// are the buffers and the outgoing area (any word may be a pointer).
+    frame: i64,
+    buf_top: i64,
 }
 
 fn is_signed(t: &Type) -> bool { t.kind == types::K_INT && types::int_signed(t.int) }
@@ -979,6 +1054,7 @@ impl FnGen {
     fn gen(&mut self) {
         let m = self.m;
         let f = self.f;
+        m.set_tag(0);
         let n = f.locals.len();
         let mut i = 0;
         while i < n {
@@ -1052,11 +1128,13 @@ impl FnGen {
                 if na > max_out { max_out = na; }
             }
         }
+        self.buf_top = -cur;
         cur = (cur + max_res + 7) / 8 * 8;
         self.res_off = -cur;
         cur = (cur + max_tmp + 7) / 8 * 8;
         self.tmp_off = -cur;
         let frame = ((cur + 15) & !15) + ((max_out + 15) & !15);
+        self.frame = frame;
 
         // The stack check, before the frame is made: the stack must reach
         // the frame (and the saved FP and LR) above the limit, the first
@@ -1102,6 +1180,7 @@ impl FnGen {
             i += 1;
         }
         let refs = local_refs(f);
+        let mut pos = 1i64;
         let mut bi = 0;
         while bi < f.blocks.len() {
             m.bind(self.blocks[bi]);
@@ -1113,17 +1192,25 @@ impl FnGen {
             let n = if fused { b.stmts.len() - 1 } else { b.stmts.len() };
             while si < n {
                 if self.g.debug { self.note_line(stmt_pos(&b.stmts[si])); }
+                // Calls are tagged with their position (as choose_registers
+                // counts: from 1, statements then the terminator).
+                m.set_tag(pos);
                 self.stmt(bi, si, &b.stmts[si]);
                 si += 1;
+                pos += 1;
             }
             if fused {
                 if self.g.debug { self.note_line(stmt_pos(&b.stmts[n])); }
+                m.set_tag(pos);
                 self.compare_branch(bi, &b.stmts[n], &b.term);
+                pos += 2;
                 bi += 1;
                 continue;
             }
             if self.g.debug { self.note_line(term_pos(&b.term)); }
+            m.set_tag(pos);
             self.term(bi, &b.term);
+            pos += 1;
             bi += 1;
         }
         let mut k = 0;
@@ -1131,6 +1218,7 @@ impl FnGen {
             match &self.stub_list[k] {
                 Stub::Overflow(l, resume, need) => {
                     m.bind(*l);
+                    m.set_tag(0);
                     // The bytes needed (the G's third word).
                     m.mov_imm(I1, *need);
                     m.store(8, I1, GREG, 16);
@@ -1139,6 +1227,7 @@ impl FnGen {
                 }
                 Stub::Panic { label, msg, pos } => {
                     m.bind(*label);
+                    m.set_tag(-1);
                     let ms = msg.clone();
                     self.call_panic(ms.as_str(), *pos);
                 }
@@ -1157,6 +1246,107 @@ impl FnGen {
         None
     }
 
+
+    /// The function's stack map (for moving stacks; Go's stack maps, with
+    /// the saved registers): [frame size, flags (1: any word or register
+    /// may be a pointer: the runtime, which keeps addresses in integers),
+    /// bitmap length, a bit for each frame word from SP up to FP that may
+    /// hold a pointer, then the number of saved registers and for each its
+    /// index (x19 + k) and FP offset]. The calls are added by finish_meta,
+    /// with masks of the saved registers holding pointers at each position
+    /// (cur_masks).
+    fn stack_meta(&mut self) {
+        let frame = self.frame;
+        let nw = (frame / 8) as usize;
+        let rt = match self.f.def {
+            Some(d) => crate::mir::inline::in_runtime(d),
+            None => match self.f.owner { Some(d) => crate::mir::inline::in_runtime(d), None => false },
+        };
+        let mut bits: Vec<u64> = Vec::new();
+        let mut k = 0;
+        while k < (nw + 63) / 64 {
+            bits.push(if rt { 0xffffffffffffffff } else { 0 });
+            k += 1;
+        }
+        if !rt {
+            let mut set = |off: i64| {
+                let w = frame + off;
+                if w >= 0 && w < frame && w % 8 == 0 {
+                    let i = (w / 8) as usize;
+                    bits[i / 64] = bits[i / 64] | 1u64 << (i % 64) as u32;
+                }
+            };
+            set(SLOT_CTX);
+            set(SLOT_RET);
+            set(SLOT_LOC);
+            set(SLOT_DEFERS);
+            // The buffers and the outgoing area: any word.
+            let mut o = -frame;
+            while o < self.buf_top {
+                set(o);
+                o += 8;
+            }
+            let n = self.f.locals.len();
+            let mut i = 0;
+            while i < n {
+                if self.loff[i] < 0 {
+                    let t = self.ltypes[i];
+                    if t.kind != types::K_NEVER {
+                        let l = self.g.lay_of(t);
+                        for p in l.ptrs.iter() { set(self.loff[i] + *p); }
+                    }
+                }
+                i += 1;
+            }
+        }
+        let mut meta = self.g.cur_meta;
+        meta.clear();
+        meta.push(frame as u64);
+        meta.push(if rt { 1 } else { 0 });
+        meta.push(bits.len() as u64);
+        for b in bits.iter() { meta.push(*b); }
+        meta.push(self.saved.len() as u64);
+        let mut all = 0u64;
+        for sv in self.saved.iter() {
+            let k = (sv.0 - S0) as u64;
+            all = all | 1u64 << k as u32;
+            meta.push(k);
+            meta.push(sv.1 as u64);
+        }
+        self.g.cur_all = all;
+        // Masks by position: the saved registers holding a live pointer
+        // (a local's range covers the position).
+        let lv = self.g.live;
+        let mut maxp = 0i64;
+        let n = self.f.locals.len();
+        let mut i = 0;
+        while i < n {
+            if self.preg[i] >= 0 && lv.hi[i] > maxp { maxp = lv.hi[i]; }
+            i += 1;
+        }
+        let mut masks = self.g.cur_masks;
+        masks.clear();
+        let mut p = 0;
+        while p <= maxp + 2 {
+            masks.push(0);
+            p += 1;
+        }
+        i = 0;
+        while i < n {
+            let t = self.ltypes[i];
+            if self.preg[i] >= 0 && (t.kind == types::K_REF || t.kind == types::K_PTR) {
+                let bit = 1u16 << (self.preg[i] - S0 as i64) as u32;
+                let mut q = lv.lo[i];
+                while q <= lv.hi[i] {
+                    if q >= 0 { masks[q as usize] = masks[q as usize] | bit; }
+                    q += 1;
+                }
+            }
+            i += 1;
+        }
+        self.g.cur_meta = meta;
+        self.g.cur_masks = masks;
+    }
 
     /// Gives scalar locals (used whole, or as pointers to dereference) the
     /// saved registers by linear scan over their live ranges: locals whose
@@ -2706,6 +2896,9 @@ impl FnGen {
                 let mut ca = Vec::new();
                 ca.push(int_arg());
                 m.call_c("_navi_setjmp", 0, &ca, false, false);
+            }
+            "func_table" => {
+                m.adr_sym(V1, &"_navi_ftab".to_string());
             }
             "scan_words" => {
                 let mut ca = Vec::new();
