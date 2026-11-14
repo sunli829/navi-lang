@@ -163,9 +163,64 @@ pub struct Plan {
     pub runtime: HashMap<String, &mut Inst>,
     groups_by_key: HashMap<String, &mut Group>,
     native: Option<&mut Module>,
-    shapes: HashMap<u64, String>,
+    shapes: &mut Shapes,
+    /// The shape numbers of types (by id and depth) this copy has met.
+    shape_cache: HashMap<u64, u32>,
+    /// The copies warming threads use (one per worker, kept for every level).
+    copies: Vec<&mut Plan>,
+    /// Set in a copy while it drafts: it resolves function references
+    /// without changing the plan, making instances it does not find but not
+    /// recording them (see walk_pending).
+    drafting: bool,
+    /// Set when a drafted reference needs what only the plan may do (build a
+    /// function or shim, report an error): the walk in order resolves it.
+    bail: bool,
+    /// The references of the instance being walked, as drafted (None:
+    /// resolve in order), and the next one to take.
+    pre: Vec<Option<&mut Target>>,
+    pre_at: usize,
     /// Instances created but not walked yet (see walk_pending).
     pending: Vec<&mut Inst>,
+}
+
+/// GC shapes by number, shared by the warming threads. A shape is
+/// described by its parts' numbers, so two types have the same number
+/// exactly when they have the same shape. The numbers depend on the order
+/// threads meet shapes in: they are only compared, never written out.
+struct Shapes {
+    maps: Vec<HashMap<String, u32>>,
+    locks: Vec<&std::sync::Mutex<u8>>,
+    next: &std::sync::atomic::AtomicUsize,
+}
+
+fn new_shapes() -> &mut Shapes {
+    let mut maps: Vec<HashMap<String, u32>> = Vec::new();
+    let mut locks: Vec<&std::sync::Mutex<u8>> = Vec::new();
+    let mut i = 0;
+    while i < 16 {
+        maps.push(HashMap::new());
+        locks.push(&std::sync::Mutex::new(0u8));
+        i += 1;
+    }
+    &mut Shapes { maps, locks, next: &std::sync::atomic::AtomicUsize::new(0) }
+}
+
+impl Shapes {
+    fn number(&mut self, s: String, par: bool) -> u32 {
+        let i = (std::hash::hash_one(&s) >> 11) as usize & 15;
+        if par { self.locks[i].lock(); }
+        let mut m = self.maps[i];
+        let n = match m.get(&s) {
+            Some(n) => *n,
+            None => {
+                let n = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32;
+                m.insert(s, n);
+                n
+            }
+        };
+        if par { self.locks[i].unlock(); }
+        n
+    }
 }
 
 fn args_key(ts: &Vec<&Type>) -> String {
@@ -181,7 +236,8 @@ pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> 
     let p = &mut Plan { mir: prog, info: prog.info, lay: layout::new_computer(prog.info), groups: Vec::new(), insts: HashMap::new(),
         main: None, statics: Vec::new(), static_ok: HashMap::new(), vtables: HashMap::new(), vtable_list: Vec::new(),
         strings: HashMap::new(), string_list: Vec::new(), errors: Vec::new(), static_init: HashMap::new(), runtime: HashMap::new(),
-        groups_by_key: HashMap::new(), native: None, shapes: HashMap::new(), pending: Vec::new() };
+        groups_by_key: HashMap::new(), native: None, shapes: new_shapes(), shape_cache: HashMap::new(), copies: Vec::new(), drafting: false, bail: false,
+        pre: Vec::new(), pre_at: 0, pending: Vec::new() };
     p.find_native();
     for name in ["panic_raw", "panic_bounds", "gc_alloc", "sched_init", "gmain", "set_args", "morestack", "mstart", "gc_wb"].iter() {
         match p.native_fn(*name) {
@@ -223,6 +279,11 @@ fn fn_has_attr(d: &Def, name: &str) -> bool {
 /// The GC shape of a concrete type argument: thin pointers to sized types
 /// share one shape, fat pointers another, closures a third; all other types
 /// are their own shape.
+fn push_num(b: &mut String, n: u32) {
+    if n >= 10 { push_num(b, n / 10); }
+    b.push((b'0' + (n % 10) as u8) as char);
+}
+
 pub fn shape_of(t: &Type) -> String {
     if t.kind == types::K_REF || t.kind == types::K_PTR {
         let e = t.el().kind;
@@ -293,7 +354,7 @@ impl Plan {
         let m = self.native?;
         let b = m.lookup(name, resolve::VALUE_NS)?;
         let d = b.res.def?;
-        if self.mir.func(d).is_none() { return None; }
+        if self.func_of(d).is_none() { return None; }
         Some(d)
     }
 
@@ -323,6 +384,8 @@ impl Plan {
             inst.track_caller = fn_has_attr(d, "track_caller");
         }
         if f.shim { inst.track_caller = true; }
+        // A draft: take_pre records it.
+        if self.drafting { return inst; }
         self.insts.insert(key, inst);
         self.pending.push(inst);
         inst
@@ -338,97 +401,48 @@ impl Plan {
             let level = self.pending.clone();
             self.pending = Vec::new();
             let mut keys: Vec<String> = Vec::new();
-            for _ in level.iter() { keys.push(String::new()); }
+            let mut pres: Vec<Vec<Option<&mut Target>>> = Vec::new();
+            for _ in level.iter() {
+                keys.push(String::new());
+                pres.push(Vec::new());
+            }
             let par = !crate::resolve::cfg::stage0_mode();
             if par { self.info.ctx.par = true; }
-            let me = self;
-            crate::util::par_for(level.len(), 4, |i| {
-                let w = me.warm_copy();
-                w.warm(level[i], level[i].func);
+            while self.copies.len() < crate::util::max_workers() {
+                let c = self.warm_copy();
+                self.copies.push(c);
+            }
+            let copies = self.copies;
+            crate::util::par_for_w(level.len(), 4, |k, i| {
+                let w = copies[k];
+                w.pre = Vec::new();
+                w.walk(level[i], level[i].func);
+                pres[i] = w.pre;
                 keys[i] = w.shape_key(level[i]);
             });
             self.info.ctx.par = false;
             let mut i = 0;
             while i < level.len() {
                 let inst = level[i];
+                self.pre = pres[i];
+                self.pre_at = 0;
                 self.walk(inst, inst.func);
+                self.pre = Vec::new();
                 self.add_to_group(inst, keys[i].clone());
                 i += 1;
             }
         }
     }
 
-    // A copy for a warming thread: its own layouts and shapes; the rest is
-    // only read.
+    // A copy for a warming thread: its own layouts; the shapes are shared
+    // and the rest is only read.
     fn warm_copy(&mut self) -> &mut Plan {
         &mut Plan { mir: self.mir, info: self.info, lay: layout::new_computer(self.info), groups: Vec::new(), insts: self.insts,
             main: None, statics: Vec::new(), static_ok: self.static_ok, vtables: self.vtables, vtable_list: Vec::new(),
             strings: self.strings, string_list: Vec::new(), errors: Vec::new(), static_init: self.static_init,
-            runtime: self.runtime, groups_by_key: self.groups_by_key, native: self.native, shapes: HashMap::new(),
+            runtime: self.runtime, groups_by_key: self.groups_by_key, native: self.native, shapes: self.shapes, shape_cache: HashMap::new(), copies: Vec::new(), drafting: true,
+            bail: false, pre: Vec::new(), pre_at: 0,
             pending: Vec::new() }
-    }
-
-    // walk without changing the plan: the queries resolve and vtable make.
-    fn warm(&mut self, inst: &Inst, f: &Func) {
-        for b in f.blocks.iter() {
-            for st in b.stmts.iter() {
-                match st {
-                    Stmt::Assign { rv, .. } => {
-                        self.warm_rv(inst, rv);
-                        if let Rvalue::MakeDyn { concrete, to, .. } = rv {
-                            let c = inst.concrete(self.info, *concrete);
-                            inst.concrete(self.info, *to);
-                        }
-                    }
-                    Stmt::PushDefer { fn_op, args } => {
-                        self.warm_op(inst, fn_op);
-                        for a in args.iter() { self.warm_op(inst, a); }
-                    }
-                    _ => {}
-                }
-            }
-            match &b.term {
-                Term::Call { fn_op, args, .. } => {
-                    self.warm_op(inst, fn_op);
-                    for a in args.iter() { self.warm_op(inst, a); }
-                }
-                Term::Switch { x, .. } => self.warm_op(inst, x),
-                Term::Assert { cond, .. } => self.warm_op(inst, cond),
-                _ => {}
-            }
-        }
-    }
-
-    fn warm_rv(&mut self, inst: &Inst, rv: &Rvalue) {
-        match rv {
-            Rvalue::Use(x) => self.warm_op(inst, x),
-            Rvalue::Bin { x, y, .. } => {
-                self.warm_op(inst, x);
-                self.warm_op(inst, y);
-            }
-            Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => self.warm_op(inst, x),
-            Rvalue::Aggregate { ops, closure, .. } => {
-                for o in ops.iter() { self.warm_op(inst, o); }
-                if let Some(cf) = closure { self.warm(inst, *cf); }
-            }
-            _ => {}
-        }
-    }
-
-    fn warm_op(&mut self, inst: &Inst, op: &Operand) {
-        if op.kind != mir::OP_CONST { return; }
-        let c = op.cnst.unwrap();
-        if c.kind != mir::C_FN { return; }
-        let r = c.fn_ref.unwrap();
-        let mut args: Vec<&Type> = Vec::new();
-        for a in r.args.iter() { args.push(inst.concrete(self.info, *a)); }
-        let self_ty = inst.concrete_opt(self.info, r.self_ty);
-        let def = r.def.unwrap();
-        if r.ctor { return; }
-        let in_trait = match def.parent { Some(p) => p.kind == resolve::DEF_TRAIT, None => false };
-        if (def.kind == resolve::DEF_ASSOC_FN || def.kind == resolve::DEF_ASSOC_CONST) && in_trait {
-            if let Some(st) = self_ty { self.info.resolve_method(def, st, &args); }
-        }
     }
 
     fn visit_op(&mut self, inst: &mut Inst, op: &Operand) {
@@ -436,11 +450,21 @@ impl Plan {
         let c = op.cnst.unwrap();
         match c.kind {
             mir::C_FN => {
+                if self.drafting {
+                    self.bail = false;
+                    let t = self.resolve(inst, c.fn_ref.unwrap());
+                    self.pre.push(if self.bail { None } else { Some(t) });
+                    return;
+                }
                 let k = const_site(c);
                 if !inst.targets.contains_key(&k) { inst.sites.push(k.clone()); }
-                let t = self.resolve(inst, c.fn_ref.unwrap());
+                let t = self.take_pre(inst, c.fn_ref.unwrap());
                 inst.targets.insert(k, t);
             }
+            _ => {}
+        }
+        if self.drafting { return; }
+        match c.kind {
             mir::C_STATIC => {
                 self.static_def(c.static_def.unwrap());
                 inst.statics.push(c.static_def.unwrap());
@@ -482,6 +506,10 @@ impl Plan {
                         if let Rvalue::MakeDyn { concrete, to, .. } = rv {
                             let c = inst.concrete(self.info, *concrete);
                             let t = inst.concrete(self.info, *to);
+                            if self.drafting {
+                                si += 1;
+                                continue;
+                            }
                             let key = dyn_site(f, bi, si);
                             if !inst.vtables.contains_key(&key) { inst.sites.push(key.clone()); }
                             let v = self.vtable(c, t.el());
@@ -504,7 +532,7 @@ impl Plan {
                 Term::Switch { x, .. } => self.visit_op(inst, x),
                 Term::Assert { cond, msg, .. } => {
                     self.visit_op(inst, cond);
-                    self.str_sym(&msg.as_bytes().to_vec());
+                    if !self.drafting { self.str_sym(&msg.as_bytes().to_vec()); }
                 }
                 _ => {}
             }
@@ -523,12 +551,58 @@ impl Plan {
     }
 
     /// Turns a function reference into a concrete target.
+    // The target of the next reference of the instance being walked: as
+    // drafted, with a drafted instance replaced by the plan's (or recorded,
+    // if it is the first).
+    fn take_pre(&mut self, inst: &mut Inst, r: &FnRef) -> &mut Target {
+        if self.pre_at < self.pre.len() {
+            let p = self.pre[self.pre_at];
+            self.pre_at += 1;
+            if let Some(t) = p {
+                if t.kind == T_INST {
+                    let d = t.inst.unwrap();
+                    match self.insts.get(&d.key) {
+                        Some(i) => t.inst = Some(*i),
+                        None => {
+                            self.insts.insert(d.key.clone(), d);
+                            self.pending.push(d);
+                        }
+                    }
+                }
+                return t;
+            }
+        }
+        self.resolve(inst, r)
+    }
+
+    // An error, or (while drafting) a reference to resolve in order, which
+    // reports it.
+    fn error(&mut self, msg: String) {
+        if self.drafting { self.bail = true; } else { self.errors.push(msg); }
+    }
+
+    // The function of def; while drafting only one already built.
+    fn func_of(&mut self, d: &mut Def) -> Option<&mut Func> {
+        if !self.drafting { return self.mir.func(d); }
+        match self.mir.funcs.get(&d.id) {
+            Some(f) => Some(*f),
+            None => {
+                self.bail = true;
+                None
+            }
+        }
+    }
+
     fn resolve(&mut self, inst: &mut Inst, r: &FnRef) -> &mut Target {
         let mut args: Vec<&Type> = Vec::new();
         for a in r.args.iter() { args.push(inst.concrete(self.info, *a)); }
         let self_ty = inst.concrete_opt(self.info, r.self_ty);
         let def = r.def.unwrap();
         if r.ctor {
+            if self.drafting {
+                self.bail = true;
+                return intrinsic_target("unreachable", def);
+            }
             let adt = if def.kind == resolve::DEF_VARIANT { self.info.ctx.adt(def.parent.unwrap(), args) } else { self.info.ctx.adt(def, args) };
             let f = self.mir.ctor_thunk(def, adt);
             let i = self.inst(None, Vec::new(), None, f);
@@ -538,7 +612,7 @@ impl Plan {
         if (def.kind == resolve::DEF_ASSOC_FN || def.kind == resolve::DEF_ASSOC_CONST) && in_trait {
             let st = match self_ty {
                 None => {
-                    self.errors.push(`trait item ${def.name} without a self type`);
+                    self.error(`trait item ${def.name} without a self type`);
                     return intrinsic_target("unreachable", def);
                 }
                 Some(s) => s,
@@ -546,7 +620,7 @@ impl Plan {
             let ri = self.info.resolve_method(def, st, &args);
             match ri {
                 None => {
-                    self.errors.push(`no impl of ${def.parent.unwrap().name}::${def.name} for ${st}`);
+                    self.error(`no impl of ${def.parent.unwrap().name}::${def.name} for ${st}`);
                     return intrinsic_target("unreachable", def);
                 }
                 Some(res) => {
@@ -562,7 +636,7 @@ impl Plan {
         if fn_has_attr(def, "intrinsic") {
             if !is_inline(def.name.as_str()) {
                 if let Some(nd) = self.native_fn(def.name.as_str()) {
-                    let f = self.mir.func(nd).unwrap();
+                    let f = self.func_of(nd).unwrap();
                     let i = self.inst(Some(nd), args, None, f);
                     return inst_target(i, nd);
                 }
@@ -572,9 +646,9 @@ impl Plan {
             return t;
         }
         if def.kind == resolve::DEF_EXTERN_FN { return intrinsic_target("extern", def); }
-        let f = match self.mir.func(def) {
+        let f = match self.func_of(def) {
             None => {
-                self.errors.push(`no body for ${def.name}`);
+                self.error(`no body for ${def.name}`);
                 return intrinsic_target("unreachable", def);
             }
             Some(f) => f,
@@ -586,13 +660,25 @@ impl Plan {
     fn resolved(&mut self, r: &mut types::query::Instance, method: &mut Def, self_ty: &Type, args: &Vec<&Type>) -> &mut Target {
         let trait_name = if r.builtin.len() > 0 { r.builtin.clone() } else { r.derived.clone() };
         if trait_name.len() == 0 {
-            let f = self.mir.func(r.def).unwrap();
+            let f = match self.func_of(r.def) { Some(f) => f, None => return intrinsic_target("unreachable", method) };
             let i = self.inst(Some(r.def), r.args.clone(), r.self_ty, f);
             return inst_target(i, r.def);
         }
         if !uses_shim(trait_name.as_str(), method.name.as_str()) {
-            let f = self.mir.func(method).unwrap();
+            let f = match self.func_of(method) { Some(f) => f, None => return intrinsic_target("unreachable", method) };
             let i = self.inst(Some(method), args.clone(), Some(self_ty), f);
+            return inst_target(i, method);
+        }
+        if self.drafting {
+            // Only a shim already made.
+            let f = match self.mir.shims.get(&crate::mir::shims::shim_key(trait_name.as_str(), method, self_ty, args)) {
+                Some(f) => *f,
+                None => {
+                    self.bail = true;
+                    return intrinsic_target("unreachable", method);
+                }
+            };
+            let i = self.inst(None, Vec::new(), None, f);
             return inst_target(i, method);
         }
         let f = self.mir.shim(trait_name.as_str(), method, self_ty, args);
@@ -621,7 +707,7 @@ impl Plan {
             if ms[i].id == m.id { return i; }
             i += 1;
         }
-        self.errors.push(`method ${m.name} is not callable through dyn`);
+        self.error(`method ${m.name} is not callable through dyn`);
         0
     }
 
@@ -656,11 +742,11 @@ impl Plan {
         // on layouts that no local exposes.
         for a in inst.args.iter() {
             b.push('<');
-            b.push_str(self.shape(*a, 0).as_str());
+            push_num(&mut b, self.shape(*a, 0));
         }
         if let Some(s) = inst.self_ty {
             b.push_str("<self ");
-            b.push_str(self.shape(s, 0).as_str());
+            push_num(&mut b, self.shape(s, 0));
         }
         self.shape_walk(inst, inst.func, &mut b);
         b
@@ -670,7 +756,7 @@ impl Plan {
         for l in f.locals.iter() {
             b.push('|');
             let t = inst.concrete(self.info, l.ty);
-            b.push_str(self.shape(t, 0).as_str());
+            push_num(b, self.shape(t, 0));
         }
         for blk in f.blocks.iter() {
             for s in blk.stmts.iter() {
@@ -687,14 +773,15 @@ impl Plan {
         }
     }
 
-    /// The layout-relevant structure of a type: thin pointers are all
-    /// alike, everything else is described structurally.
-    fn shape(&mut self, t: &Type, depth: i32) -> String {
+    /// The number of the layout-relevant structure of a type: thin
+    /// pointers are all alike, everything else is described structurally.
+    fn shape(&mut self, t: &Type, depth: i32) -> u32 {
         let key = (t.id as u64) << 8 | depth as u64;
-        if let Some(s) = self.shapes.get(&key) { return s.clone(); }
+        if let Some(n) = self.shape_cache.get(&key) { return *n; }
         let s = self.shape_uncached(t, depth);
-        self.shapes.insert(key, s.clone());
-        s
+        let n = self.shapes.number(s, self.info.ctx.par);
+        self.shape_cache.insert(key, n);
+        n
     }
 
     fn shape_uncached(&mut self, t: &Type, depth: i32) -> String {
@@ -702,26 +789,37 @@ impl Plan {
         match k {
             types::K_REF | types::K_PTR | types::K_FN => return shape_of(t),
             types::K_TUPLE => {
-                let mut parts: Vec<String> = Vec::new();
-                for e in t.elems.iter() { parts.push(self.shape(*e, depth + 1)); }
-                return `(${parts.join(",")})`;
+                let mut b = "(".to_string();
+                for e in t.elems.iter() {
+                    push_num(&mut b, self.shape(*e, depth + 1));
+                    b.push(',');
+                }
+                b.push(')');
+                return b;
             }
             types::K_ARRAY => return `[${self.shape(t.el(), depth + 1)};${t.len}]`,
             types::K_ADT => {
                 if depth > 8 { return `t${t.id}`; }
                 let ai = self.info.adts[&t.d().id];
-                let mut parts: Vec<String> = Vec::new();
+                let mut b = `d${t.d().id}{`;
                 if ai.is_enum {
                     let mut v = 0;
                     while v < ai.variants.len() {
-                        for ft in self.lay.field_types(t, v as i64).iter() { parts.push(self.shape(*ft, depth + 1)); }
-                        parts.push("|".to_string());
+                        for ft in self.lay.field_types(t, v as i64).iter() {
+                            push_num(&mut b, self.shape(*ft, depth + 1));
+                            b.push(',');
+                        }
+                        b.push('|');
                         v += 1;
                     }
                 } else {
-                    for ft in self.lay.field_types(t, -1).iter() { parts.push(self.shape(*ft, depth + 1)); }
+                    for ft in self.lay.field_types(t, -1).iter() {
+                        push_num(&mut b, self.shape(*ft, depth + 1));
+                        b.push(',');
+                    }
                 }
-                return `d${t.d().id}{${parts.join(",")}}`;
+                b.push('}');
+                return b;
             }
             _ => {}
         }
