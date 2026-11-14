@@ -225,13 +225,82 @@ pub fn current_stack_hi() -> usize {
     unsafe { (*current()).stack_hi }
 }
 
+/// Scans a stack [sp, hi) for the collector, its innermost frame at fp:
+/// the frames of user code by their stack maps (as Go's scanframe), the
+/// rest (the runtime, std, code without maps) conservatively, as are the
+/// registers the G saved when it stopped (below fp).
+#[cfg(feature = "navic")]
+pub fn scan_stack(sp: usize, fp0: usize, hi: usize) {
+    stack_mode();
+    if STACKMAP != 1 || fp0 < sp || fp0 >= hi {
+        crate::rt::gc::scan_range(sp, hi);
+        return;
+    }
+    let mut pend = [0usize; 9];
+    let mut top = sp;
+    let mut fp = fp0;
+    let mut pc = 0usize;
+    while fp >= top && fp < hi {
+        let prev = unsafe { *(fp as *const usize) };
+        let ret = unsafe { *((fp + 8) as *const usize) };
+        let (m, start) = if pc == 0 { (0, 0) } else { find_map(pc) };
+        let flags = if m == 0 { 3 } else { unsafe { *((m + 8) as *const usize) } };
+        if flags != 0 {
+            crate::rt::gc::scan_range(top, fp);
+            let mut k = 0;
+            while k < 9 {
+                if pend[k] != 0 { crate::rt::gc::scan_range(pend[k], pend[k] + 8); }
+                pend[k] = 0;
+                k += 1;
+            }
+        } else {
+            let frame = unsafe { *(m as *const usize) };
+            let any = unsafe { *((m + 16) as *const usize) };
+            let nb = unsafe { *((m + 24) as *const usize) };
+            let fsp = fp - frame;
+            if top < fsp { crate::rt::gc::scan_range(top, fsp); }
+            crate::rt::gc::scan_range(fsp, fsp + 8 * any);
+            let mut w = any;
+            while w < frame / 8 {
+                let i = w - any;
+                let bits = unsafe { *((m + 32 + 8 * (i / 64)) as *const usize) };
+                if (bits >> (i % 64) as u32) & 1 != 0 { crate::rt::gc::scan_range(fsp + 8 * w, fsp + 8 * w + 8); }
+                w += 1;
+            }
+            let sv = m + 32 + 8 * nb;
+            let ns = unsafe { *(sv as *const usize) };
+            let mask = call_mask(sv + 8 + 8 * ns, pc - start);
+            let mut j = 0;
+            while j < ns {
+                let e = unsafe { *((sv + 8 + 8 * j) as *const usize) };
+                let r = e >> 32;
+                let off = (e & 0xffffffff) as u32 as i32 as i64 as usize;
+                if pend[r] != 0 && (mask >> r as u32) & 1 != 0 { crate::rt::gc::scan_range(pend[r], pend[r] + 8); }
+                pend[r] = fp.wrapping_add(off);
+                j += 1;
+            }
+        }
+        top = fp + 16;
+        fp = prev;
+        pc = ret;
+    }
+    crate::rt::gc::scan_range(top, hi);
+    let mut k = 0;
+    while k < 9 {
+        if pend[k] != 0 { crate::rt::gc::scan_range(pend[k], pend[k] + 8); }
+        k += 1;
+    }
+}
+#[cfg(not(feature = "navic"))]
+pub fn scan_stack(sp: usize, fp0: usize, hi: usize) { crate::rt::gc::scan_range(sp, hi); }
+
 /// Scans the saved stack of every other live G.
 pub fn scan_other_stacks() {
     let mut g = ALL as *mut G;
     while g as usize != 0 {
         unsafe {
             if (*g).status != DEAD && !(*g).is_g0 && g as usize != current() as usize {
-                crate::rt::gc::scan_range((*g).sp, (*g).stack_hi);
+                scan_stack((*g).sp, (*g).fp, (*g).stack_hi);
                 let r = &(*g).regs as *const [usize; 10] as usize;
                 crate::rt::gc::scan_range(r, r + 80);
             }
@@ -1007,6 +1076,8 @@ pub fn enter_blocked() {
     let g = current();
     unsafe {
         (*g).sp = crate::rt::stack_pointer() as usize;
+        // The caller's frame (this one is gone while the G blocks).
+        (*g).fp = *(crate::rt::frame_address() as *const usize);
         crate::rt::spill_registers(&mut (*g).regs as *mut [usize; 10] as *mut usize);
         crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_BLOCKED);
     }
@@ -1587,6 +1658,7 @@ pub fn morestack() -> usize {
         if stw && !(*g).is_g0 {
             // The registers are saved below (by the stub), above SP.
             (*g).sp = crate::rt::stack_pointer() as usize;
+            (*g).fp = crate::rt::frame_address() as usize;
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_STOPPED);
             while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { sched_yield(); }
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_RUNNING);
@@ -1636,10 +1708,7 @@ fn grow(g: *mut G) -> usize {
         let delta = nhi.wrapping_sub(hi);
         let nsp = sp.wrapping_add(delta);
         crate::rt::copy::<u8>(sp as *const u8, nsp as *mut u8, used);
-        if STACKMAP == 0 {
-            STACKMAP = if crate::rt::native::env_set(b"NAVI_STACKCONS\0") { 2 } else { 1 };
-            if crate::rt::native::env_set(b"NAVI_STACKCHECK\0") { STACKCHECK = true; }
-        }
+        stack_mode();
         if STACKMAP == 1 {
             move_frames(sp, lo, hi, delta);
             if STACKCHECK { check_moved(nsp, nhi, lo, hi, delta); }
@@ -1666,6 +1735,14 @@ fn grow(g: *mut G) -> usize {
 static mut STACKMAP: usize = 0;
 #[cfg(feature = "navic")]
 static mut STACKCHECK: bool = false;
+
+#[cfg(feature = "navic")]
+fn stack_mode() {
+    if STACKMAP == 0 {
+        STACKMAP = if crate::rt::native::env_set(b"NAVI_STACKCONS\0") { 2 } else { 1 };
+        if crate::rt::native::env_set(b"NAVI_STACKCHECK\0") { STACKCHECK = true; }
+    }
+}
 
 // The word at old address a, in the copy.
 #[cfg(feature = "navic")]
