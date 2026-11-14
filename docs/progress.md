@@ -145,6 +145,8 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
     - `HashMap::clone` 按槽位顺序往一个从小长大的表里插，线性探测的链被堆得很长，10 万个符号要 1.3 秒。
   - GC 的扫描循环改成后端生成的叶子例程 `std::rt::scan_words`（arm64），只在碰到指向已分配、未标记对象的字时才回到 navi 代码，标记的 CPU 降了一半。代码签名和构建缓存的 SHA-256 在 macOS 上走 libSystem 的 `CC_SHA256`（用 CPU 的 SHA 指令），链接 0.55s → 0.34s。
   - plan 的线程在起草时就填好实例的 sites 和 targets，并按代码顺序列出会改动 plan 的事（实例、静态量、字符串、vtable）；按序那一遍只回放这个列表，不再走 MIR，产物逐字节相同。
+  - 新 span 的对象用 bump 指针分配：不通过对象内存链接，也不清零（从没用过），sweep 时再把剩下的链起来。trait 选择的缓存也收那些变量已经代表具体类型的查询（先 resolve）；缓存的 selection 里内建关联类型也要 resolve，并检查不含变量（之前会把一个推断上下文的变量带进别的上下文）。
+  - 修了 scan_words 引入的竞争：例程停下的那个字被并发运行的 mutator 改写了，回到 navi 代码重读后要再检查一遍。`tests/run/goroutines` 偶发的溢出 panic 和段错误就是它，修好后空闲时连跑 40 次全过。
   - 结果（tools/bench.sh，见 docs/bench.md 第五轮）：冷编译 1 万行 0.82s → 0.60s，10 万行 7.16s → 4.34s，是 go build 的约 1.6 倍（第四轮 2.2–2.7 倍）；自编译约 2.5s → 1.7s。
 - 没做的：
   - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
