@@ -11,6 +11,14 @@ trap 'rm -rf "$tmp"' EXIT
 fail=0
 for f in tests/run/*.navi; do
 	n=$(basename "$f" .navi)
+	# // error: line:col msg: the build fails with these errors.
+	want_err=$(grep -E '^// error:' "$f" | sed -E 's#^// error: ?##')
+	if [ -n "$want_err" ]; then
+		"$navic" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1 && { echo "FAIL $f (built)"; fail=1; continue; }
+		got_err=$(sed -E 's#^[^:]*:([0-9]+:[0-9]+): #\1 #' "$tmp/$n.build")
+		if [ "$got_err" = "$want_err" ]; then echo "ok   $f"; else echo "FAIL $f (errors)"; cat "$tmp/$n.build"; fail=1; fi
+		continue
+	fi
 	if ! "$navic" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1; then
 		echo "FAIL $f (build)"; cat "$tmp/$n.build"; fail=1; continue
 	fi

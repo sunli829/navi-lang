@@ -1127,7 +1127,7 @@ impl Parser {
         if is_assign_op(self.kind()) {
             let t = self.next();
             let y = self.assign();
-            return self.mk_expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y });
+            return self.assign_expr(&t, x, y);
         }
         x
     }
@@ -1139,9 +1139,74 @@ impl Parser {
         if is_assign_op(self.kind()) {
             let t = self.next();
             let y = self.assign();
-            return self.mk_expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y });
+            return self.assign_expr(&t, x, y);
         }
         x
+    }
+
+    // An assignment; one to a tuple, array, struct or tuple struct of
+    // places destructures as Rust's: (a, b) = e is
+    // { let ($d0, $d1) = e; a = $d0; b = $d1; }.
+    fn assign_expr(&mut self, t: &Token, x: &Expr, y: &Expr) -> &Expr {
+        if t.kind != EQ || !is_assignee(x) { return self.mk_expr(ExprKind::Assign { op: t.kind, op_pos: t.pos, x, y }); }
+        let mut places: Vec<&Expr> = Vec::new();
+        let pat = self.assignee_pat(x, &mut places);
+        let b = &mut Block { lbrace: x.pos(), rbrace: t.pos, is_unsafe: false, stmts: Vec::new(), tail: None };
+        b.stmts.push(&Stmt::Let(&LetStmt { pos: x.pos(), pat, ty: None, init: Some(y), els: None }));
+        let mut i = 0;
+        while i < places.len() {
+            let path = self.mk_simple_path(name(t.pos, `$d${i}`.as_str()));
+            let v = self.mk_expr(ExprKind::Path(path));
+            let a = self.mk_expr(ExprKind::Assign { op: EQ, op_pos: t.pos, x: places[i], y: v });
+            b.stmts.push(&Stmt::Expr { x: a, semi: true });
+            i += 1;
+        }
+        self.mk_expr(ExprKind::Block(b))
+    }
+
+    // The pattern of an assignee expression; its places go to places.
+    fn assignee_pat(&mut self, x: &Expr, places: &mut Vec<&Expr>) -> &Pat {
+        match &x.kind {
+            ExprKind::Path(p) => {
+                if is_underscore(*p) { return self.mk_pat(PatKind::Wild(p.pos())); }
+            }
+            ExprKind::Range { op_pos, lo, hi, inclusive } => {
+                if lo.is_none() && hi.is_none() && !*inclusive { return self.mk_pat(PatKind::Rest(*op_pos)); }
+            }
+            ExprKind::Paren { x: inner, .. } => return self.assignee_pat(*inner, places),
+            ExprKind::Tuple { lparen, elems } => {
+                let mut ps = Vec::new();
+                for e in elems.iter() { ps.push(self.assignee_pat(*e, places)); }
+                return self.mk_pat(PatKind::Tuple { lparen: *lparen, elems: ps });
+            }
+            ExprKind::Array { lbrack, elems } => {
+                let mut ps = Vec::new();
+                for e in elems.iter() { ps.push(self.assignee_pat(*e, places)); }
+                return self.mk_pat(PatKind::Slice { lbrack: *lbrack, elems: ps });
+            }
+            ExprKind::Call { fun, args, .. } => {
+                if let ExprKind::Path(p) = &fun.kind {
+                    let mut ps = Vec::new();
+                    for e in args.iter() { ps.push(self.assignee_pat(*e, places)); }
+                    return self.mk_pat(PatKind::TupleStruct { path: *p, elems: ps });
+                }
+            }
+            ExprKind::StructLit { path, fields, base } => {
+                let mut rest = false;
+                if let Some(b) = base {
+                    rest = true;
+                    let full = match &b.kind { ExprKind::Range { lo, hi, inclusive, .. } => lo.is_none() && hi.is_none() && !*inclusive, _ => false };
+                    if !full { self.errorf(b.pos(), "functional record updates are not allowed in destructuring assignments".to_string()); }
+                }
+                let mut fs = Vec::new();
+                for f in fields.iter() { fs.push(&FieldPat { name: f.name, pat: self.assignee_pat(f.value, places) }); }
+                return self.mk_pat(PatKind::Struct { path: *path, fields: fs, rest });
+            }
+            _ => {}
+        }
+        let n = name(x.pos(), `$d${places.len()}`.as_str());
+        places.push(x);
+        self.mk_pat(PatKind::Ident { is_mut: false, name: n, sub: None })
     }
 
     fn range_expr(&mut self) -> &Expr {
@@ -1321,6 +1386,12 @@ impl Parser {
         if k == TEMPLATE {
             self.next();
             return self.template(&t);
+        }
+        if k == UNDERSCORE {
+            // Only an assignee (see assign_expr); elsewhere resolve reports it.
+            self.next();
+            let path = self.mk_simple_path(name(t.pos, "_"));
+            return self.mk_expr(ExprKind::Path(path));
         }
         match k {
             L_PAREN => return self.paren_or_tuple(),
@@ -1585,6 +1656,12 @@ impl Parser {
         let mut fields = Vec::new();
         let mut base = None;
         while self.kind() != R_BRACE && self.kind() != EOF {
+            if self.kind() == DOT_DOT && self.peek(1).kind == R_BRACE {
+                // P { x, .. } (an assignee): the base is ..
+                let p = self.next().pos;
+                base = Some(self.mk_expr(ExprKind::Range { op_pos: p, lo: None, hi: None, inclusive: false }));
+                break;
+            }
             if self.got(DOT_DOT) {
                 base = Some(self.expr());
                 break;
@@ -1935,3 +2012,16 @@ impl Parser {
         self.mk_pat(PatKind::Struct { path, fields, rest })
     }
 }
+
+/// Whether x is destructured when assigned to (a tuple, array, struct,
+/// tuple struct or _).
+fn is_assignee(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::Tuple { .. } | ExprKind::Array { .. } | ExprKind::StructLit { .. } => true,
+        ExprKind::Call { fun, .. } => match &fun.kind { ExprKind::Path(_) => true, _ => false },
+        ExprKind::Path(p) => is_underscore(*p),
+        _ => false,
+    }
+}
+
+fn is_underscore(p: &Path) -> bool { p.qself.is_none() && p.segments.len() == 1 && p.segments[0].name.value == "_" }

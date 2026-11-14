@@ -245,6 +245,8 @@ let x = 5;                  // 不可变绑定
 let mut y: i64 = 0;         // 可变绑定
 let (a, b) = pair;          // 解构
 let x = x * 2;              // 允许遮蔽（shadowing）
+(a, b) = (b, a);            // 解构赋值（同 Rust）：元组、数组/切片、结构体、元组结构体，可以嵌套，可以用 _ 和 ..
+P { x, y: v[i], .. } = p;   // 目标可以是变量、字段、下标、*p；先求右边，再从左到右赋值
 defer file.close();         // 函数返回时执行（按 LIFO 顺序；panic 时也会执行）
 defer { log("exit"); }
 ```

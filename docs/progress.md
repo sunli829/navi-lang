@@ -199,6 +199,7 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   - 切片模式里 `..` 前的绑定（`[a, rest @ ..]`、`[first, mid @ .., last]`）原来会崩，现在绑定成切片；按值的数组绑定也支持。
   - `if let` / `while let` 支持 let 链：`if let Some(x) = a && let Some(y) = b && x < y`。不含 let 的条件照旧生成，MIR 与 stage0 一致。
   - 不可达分支警告：编译器有了警告（`diag::Error.warning`），只有错误才让构建失败；`tests/run` 里用 `// warn: 行:列 消息` 检查。i128/u128 的字面量和区间原来按 0 宽的值域算，会误判；现在当作不透明（不参与覆盖），和字符串一样。
+- 解构赋值（同 Rust）：`(a, b) = (b, a)`、`P { x, y: v[i], .. } = p`、`W(a, _) = w`、`[c, .., d] = arr`。原来能编译过，但什么都不赋值。parser 照 Rust 改写成 `{ let ($d0, $d1) = e; a = $d0; b = $d1; }`。顺带修了 `1 = 2` 这类非位置的赋值不报错（现在报 "invalid left-hand side of assignment"）；`tests/run` 加了 `// error: 行:列 消息`，用来检查编译应当失败的用例。
 - 没做的：
   - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
   - 冷编译与 go build 持平（见上面的数字）。
