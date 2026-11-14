@@ -175,10 +175,10 @@ pub struct Plan {
     /// Set when a drafted reference needs what only the plan may do (build a
     /// function or shim, report an error): the walk in order resolves it.
     bail: bool,
-    /// The references of the instance being walked, as drafted (None:
-    /// resolve in order), and the next one to take.
-    pre: Vec<Option<&mut Target>>,
-    pre_at: usize,
+    /// What the walk in order does for the instance being drafted.
+    evs: Vec<Ev>,
+    /// The dyn conversion sites the instance has (while drafting).
+    dyn_seen: HashMap<String, bool>,
     /// Instances created but not walked yet (see walk_pending).
     pending: Vec<&mut Inst>,
 }
@@ -223,6 +223,20 @@ impl Shapes {
     }
 }
 
+/// What the walk in order does for an instance a thread has drafted, in
+/// the order of the instance's code: what changes the plan (instances,
+/// statics, strings and vtables are numbered in this order).
+enum Ev {
+    /// A drafted target: its instance is the plan's (or recorded).
+    Fn(&mut Target),
+    /// A reference only the plan may resolve (site key, reference).
+    Ref(String, &FnRef),
+    Static(&mut Def),
+    Str(Vec<u8>),
+    /// A dyn conversion (site key, concrete type, dyn type).
+    Dyn(String, &Type, &Type),
+}
+
 fn args_key(ts: &Vec<&Type>) -> String {
     let mut parts: Vec<String> = Vec::new();
     for t in ts.iter() { parts.push(`${t.id}`); }
@@ -237,7 +251,7 @@ pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> 
         main: None, statics: Vec::new(), static_ok: HashMap::new(), vtables: HashMap::new(), vtable_list: Vec::new(),
         strings: HashMap::new(), string_list: Vec::new(), errors: Vec::new(), static_init: HashMap::new(), runtime: HashMap::new(),
         groups_by_key: HashMap::new(), native: None, shapes: new_shapes(), shape_cache: HashMap::new(), copies: Vec::new(), drafting: false, bail: false,
-        pre: Vec::new(), pre_at: 0, pending: Vec::new() };
+        evs: Vec::new(), dyn_seen: HashMap::new(), pending: Vec::new() };
     p.find_native();
     for name in ["panic_raw", "panic_bounds", "gc_alloc", "sched_init", "gmain", "set_args", "morestack", "mstart", "gc_wb"].iter() {
         match p.native_fn(*name) {
@@ -384,7 +398,7 @@ impl Plan {
             inst.track_caller = fn_has_attr(d, "track_caller");
         }
         if f.shim { inst.track_caller = true; }
-        // A draft: take_pre records it.
+        // A draft: replay records it.
         if self.drafting { return inst; }
         self.insts.insert(key, inst);
         self.pending.push(inst);
@@ -401,10 +415,10 @@ impl Plan {
             let level = self.pending.clone();
             self.pending = Vec::new();
             let mut keys: Vec<String> = Vec::new();
-            let mut pres: Vec<Vec<Option<&mut Target>>> = Vec::new();
+            let mut evs: Vec<Vec<Ev>> = Vec::new();
             for _ in level.iter() {
                 keys.push(String::new());
-                pres.push(Vec::new());
+                evs.push(Vec::new());
             }
             let par = !crate::resolve::cfg::stage0_mode();
             if par { self.info.ctx.par = true; }
@@ -415,19 +429,17 @@ impl Plan {
             let copies = self.copies;
             crate::util::par_for_w(level.len(), 4, |k, i| {
                 let w = copies[k];
-                w.pre = Vec::new();
+                w.evs = Vec::new();
+                w.dyn_seen = HashMap::new();
                 w.walk(level[i], level[i].func);
-                pres[i] = w.pre;
+                evs[i] = w.evs;
                 keys[i] = w.shape_key(level[i]);
             });
             self.info.ctx.par = false;
             let mut i = 0;
             while i < level.len() {
                 let inst = level[i];
-                self.pre = pres[i];
-                self.pre_at = 0;
-                self.walk(inst, inst.func);
-                self.pre = Vec::new();
+                self.replay(inst, &mut evs[i]);
                 self.add_to_group(inst, keys[i].clone());
                 i += 1;
             }
@@ -441,7 +453,7 @@ impl Plan {
             main: None, statics: Vec::new(), static_ok: self.static_ok, vtables: self.vtables, vtable_list: Vec::new(),
             strings: self.strings, string_list: Vec::new(), errors: Vec::new(), static_init: self.static_init,
             runtime: self.runtime, groups_by_key: self.groups_by_key, native: self.native, shapes: self.shapes, shape_cache: HashMap::new(), copies: Vec::new(), drafting: true,
-            bail: false, pre: Vec::new(), pre_at: 0,
+            bail: false, evs: Vec::new(), dyn_seen: HashMap::new(),
             pending: Vec::new() }
     }
 
@@ -450,28 +462,19 @@ impl Plan {
         let c = op.cnst.unwrap();
         match c.kind {
             mir::C_FN => {
-                if self.drafting {
-                    self.bail = false;
-                    let t = self.resolve(inst, c.fn_ref.unwrap());
-                    self.pre.push(if self.bail { None } else { Some(t) });
-                    return;
-                }
                 let k = const_site(c);
                 if !inst.targets.contains_key(&k) { inst.sites.push(k.clone()); }
-                let t = self.take_pre(inst, c.fn_ref.unwrap());
-                inst.targets.insert(k, t);
+                self.bail = false;
+                let r = c.fn_ref.unwrap();
+                let t = self.resolve(inst, r);
+                inst.targets.insert(k.clone(), t);
+                self.evs.push(if self.bail { Ev::Ref(k, r) } else { Ev::Fn(t) });
             }
-            _ => {}
-        }
-        if self.drafting { return; }
-        match c.kind {
             mir::C_STATIC => {
-                self.static_def(c.static_def.unwrap());
                 inst.statics.push(c.static_def.unwrap());
+                self.evs.push(Ev::Static(c.static_def.unwrap()));
             }
-            mir::C_STR | mir::C_BYTES => {
-                self.str_sym(&c.bytes);
-            }
+            mir::C_STR | mir::C_BYTES => self.evs.push(Ev::Str(c.bytes.clone())),
             _ => {}
         }
     }
@@ -492,8 +495,10 @@ impl Plan {
         }
     }
 
-    /// Resolves every function reference and dyn conversion in f (and the
-    /// closures it defines) for instance inst.
+    /// Drafts instance inst (a thread's copy): resolves every function
+    /// reference and dyn conversion in f and the closures it defines,
+    /// filling the instance's sites and targets, and lists what the walk in
+    /// order (replay) does.
     fn walk(&mut self, inst: &mut Inst, f: &mut Func) {
         let mut bi = 0;
         while bi < f.blocks.len() {
@@ -506,14 +511,12 @@ impl Plan {
                         if let Rvalue::MakeDyn { concrete, to, .. } = rv {
                             let c = inst.concrete(self.info, *concrete);
                             let t = inst.concrete(self.info, *to);
-                            if self.drafting {
-                                si += 1;
-                                continue;
-                            }
                             let key = dyn_site(f, bi, si);
-                            if !inst.vtables.contains_key(&key) { inst.sites.push(key.clone()); }
-                            let v = self.vtable(c, t.el());
-                            inst.vtables.insert(key, v);
+                            if !self.dyn_seen.contains_key(&key) {
+                                inst.sites.push(key.clone());
+                                self.dyn_seen.insert(key.clone(), true);
+                            }
+                            self.evs.push(Ev::Dyn(key, c, t.el()));
                         }
                     }
                     Stmt::PushDefer { fn_op, args } => {
@@ -532,7 +535,7 @@ impl Plan {
                 Term::Switch { x, .. } => self.visit_op(inst, x),
                 Term::Assert { cond, msg, .. } => {
                     self.visit_op(inst, cond);
-                    if !self.drafting { self.str_sym(&msg.as_bytes().to_vec()); }
+                    self.evs.push(Ev::Str(msg.as_bytes().to_vec()));
                 }
                 _ => {}
             }
@@ -551,28 +554,36 @@ impl Plan {
     }
 
     /// Turns a function reference into a concrete target.
-    // The target of the next reference of the instance being walked: as
-    // drafted, with a drafted instance replaced by the plan's (or recorded,
-    // if it is the first).
-    fn take_pre(&mut self, inst: &mut Inst, r: &FnRef) -> &mut Target {
-        if self.pre_at < self.pre.len() {
-            let p = self.pre[self.pre_at];
-            self.pre_at += 1;
-            if let Some(t) = p {
-                if t.kind == T_INST {
-                    let d = t.inst.unwrap();
-                    match self.insts.get(&d.key) {
-                        Some(i) => t.inst = Some(*i),
-                        None => {
-                            self.insts.insert(d.key.clone(), d);
-                            self.pending.push(d);
+    // Does in order what drafting instance inst left to the plan: a drafted
+    // instance becomes the plan's (or is recorded, the first time).
+    fn replay(&mut self, inst: &mut Inst, evs: &mut Vec<Ev>) {
+        for e in evs.iter_mut() {
+            match e {
+                Ev::Fn(tp) => {
+                    let t = *tp;
+                    if t.kind == T_INST {
+                        let d = t.inst.unwrap();
+                        match self.insts.get(&d.key) {
+                            Some(i) => t.inst = Some(*i),
+                            None => {
+                                self.insts.insert(d.key.clone(), d);
+                                self.pending.push(d);
+                            }
                         }
                     }
                 }
-                return t;
+                Ev::Ref(k, r) => {
+                    let t = self.resolve(inst, *r);
+                    inst.targets.insert((*k).clone(), t);
+                }
+                Ev::Static(d) => self.static_def(*d),
+                Ev::Str(b) => { self.str_sym(b); }
+                Ev::Dyn(k, c, te) => {
+                    let v = self.vtable(*c, *te);
+                    inst.vtables.insert((*k).clone(), v);
+                }
             }
         }
-        self.resolve(inst, r)
     }
 
     // An error, or (while drafting) a reference to resolve in order, which
