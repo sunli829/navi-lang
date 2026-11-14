@@ -71,7 +71,93 @@ fn diff_keys(a: &HashMap<String, &mut Local>, b: &HashMap<String, &mut Local>) -
     missing.join(", ")
 }
 
+// What a worker found resolving one item.
+struct UnitOut {
+    defs: Vec<&mut Def>,
+    errs: &mut Sink,
+    bail: bool,
+}
+
 impl Resolver {
+    /// Resolves every item of the crates: the items of all modules on
+    /// several threads, each with tables of its own (merged afterwards) and
+    /// keeping the definitions it makes (numbered afterwards in the order of
+    /// the items, so the result is the same on any number of threads). An
+    /// item whose body declares items (which makes modules and imports) is
+    /// resolved again afterwards by the resolver itself.
+    pub fn resolve_all(&mut self, crates: &Vec<&mut Crate>) {
+        if crate::resolve::cfg::stage0_mode() {
+            for c in crates.iter() {
+                if let Some(root) = c.root { self.resolve_module(root); }
+            }
+            return;
+        }
+        let mut mods: Vec<&mut Module> = Vec::new();
+        let mut items: Vec<Item> = Vec::new();
+        for c in crates.iter() {
+            if let Some(root) = c.root { self.units_of(root, &mut mods, &mut items); }
+        }
+        let mut outs: Vec<Option<&mut UnitOut>> = Vec::new();
+        for _ in items.iter() { outs.push(None); }
+        let mut workers: Vec<&mut Resolver> = Vec::new();
+        let mut k = 0;
+        while k < crate::util::max_workers() {
+            let info = &mut Info { crates: self.info.crates, defs: self.info.defs, def_of: self.info.def_of, paths: HashMap::new(),
+                path_files: HashMap::new(), bindings: HashMap::new(), pat_consts: HashMap::new(), self_locals: HashMap::new(),
+                labels: HashMap::new() };
+            workers.push(&mut Resolver { cfg: self.cfg.clone(), info, errs: Sink::new(), crates: self.crates, imports: self.imports,
+                par: true, bail: false, unit_defs: Vec::new() });
+            k += 1;
+        }
+        crate::util::par_for_w(items.len(), 16, |w, i| {
+            let r = workers[w];
+            r.errs = Sink::new();
+            r.unit_defs = Vec::new();
+            r.bail = false;
+            let mut s = fresh_scope(mods[i]);
+            r.resolve_item(&mut s, &items[i]);
+            outs[i] = Some(&mut UnitOut { defs: r.unit_defs, errs: r.errs, bail: r.bail });
+        });
+        for o in outs.iter() {
+            let u = o.unwrap();
+            if u.bail { continue; }
+            for d in u.defs.iter() { self.add_def(*d); }
+            self.errs.append(u.errs);
+        }
+        for r in workers.iter() {
+            let wi = r.info;
+            for (id, x) in wi.paths.iter() { self.info.paths.insert(*id, x.clone()); }
+            for (id, f) in wi.path_files.iter() { self.info.path_files.insert(*id, *f); }
+            for (id, l) in wi.bindings.iter() { self.info.bindings.insert(*id, *l); }
+            for (id, x) in wi.pat_consts.iter() { self.info.pat_consts.insert(*id, x.clone()); }
+            for (id, l) in wi.self_locals.iter() { self.info.self_locals.insert(*id, *l); }
+            for (id, n) in wi.labels.iter() { self.info.labels.insert(*id, n.clone()); }
+        }
+        let mut i = 0;
+        while i < items.len() {
+            if outs[i].unwrap().bail {
+                let mut s = fresh_scope(mods[i]);
+                self.resolve_item(&mut s, &items[i]);
+            }
+            i += 1;
+        }
+    }
+
+    // The items of m and of its child modules, in the order resolve_module
+    // takes them.
+    fn units_of(&mut self, m: &mut Module, mods: &mut Vec<&mut Module>, items: &mut Vec<Item>) {
+        for it in m.items.iter() {
+            if let Item::Mod(_) = it {
+                if let Some(d) = self.info.def_of.get(&it.id()) {
+                    if let Some(cm) = d.module { self.units_of(cm, mods, items); }
+                }
+                continue;
+            }
+            mods.push(m);
+            items.push(it.clone());
+        }
+    }
+
     /// Resolves every item of m and of its child modules.
     pub fn resolve_module(&mut self, m: &mut Module) {
         let mut s = fresh_scope(m);
@@ -218,7 +304,7 @@ impl Resolver {
             s.loops = 0;
             let params = s.push();
             if let Some(sp) = f.self_param {
-                let l = self.new_local("self", sp.pos, sp.is_mut && !sp.is_ref, Node::Item(Item::Fn(f)));
+                let l = self.new_local(f.base.id, "self", sp.pos, sp.is_mut && !sp.is_ref, Node::Item(Item::Fn(f)));
                 params.values.insert("self".to_string(), l);
                 self.info.self_locals.insert(f.base.id, l);
             }
@@ -480,6 +566,10 @@ impl Resolver {
         let mut has_items = false;
         for st in b.stmts.iter() { if let Stmt::Item(_) = *st { has_items = true; } }
         if !has_items { return None; }
+        if self.par {
+            self.bail = true;
+            return None;
+        }
         let m = new_module(s.module.krate, Some(s.module), "");
         m.anonymous = true;
         m.dir = s.module.dir.clone();
@@ -730,7 +820,7 @@ impl Resolver {
                 } else {
                     let l = match shared.get(&name.value) {
                         Some(l) => *l,
-                        None => self.new_local(name.value.as_str(), name.pos, *is_mut, s.fn_node.clone()),
+                        None => self.new_local(p.id, name.value.as_str(), name.pos, *is_mut, s.fn_node.clone()),
                     };
                     names.insert(name.value.clone(), l);
                     self.info.bindings.insert(p.id, l);

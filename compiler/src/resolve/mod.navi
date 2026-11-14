@@ -359,23 +359,38 @@ pub struct Resolver {
     pub errs: &mut Sink,
     pub crates: HashMap<String, &mut Crate>,
     pub imports: Vec<&mut Import>,
-    pub next_local: u32,
+    /// Set in a worker's copy (see resolve_all): definitions are kept in
+    /// unit_defs, numbered later in order; bail is set for what only the
+    /// resolver itself may do.
+    pub par: bool,
+    pub bail: bool,
+    pub unit_defs: Vec<&mut Def>,
 }
 
 impl Resolver {
     pub fn errorf(&mut self, f: Option<&File>, pos: Pos, msg: String) { self.errs.errorf(f, pos, msg); }
 
     pub fn new_def(&mut self, kind: DefKind, name: &str, file: Option<&File>, node: Node, pos: Pos, parent: Option<&mut Def>, c: &mut Crate) -> &mut Def {
-        let d = &mut Def { id: self.info.defs.len() as u32, kind, name: name.to_string(), krate: c, file, pos, node: node.clone(),
+        let d = &mut Def { id: 0, kind, name: name.to_string(), krate: c, file, pos, node: node.clone(),
             parent, vis: public(), module: None, ctor: false };
-        self.info.defs.push(d);
-        if !node.is_none() { self.info.def_of.insert(node.id(), d); }
+        if self.par {
+            self.unit_defs.push(d);
+            return d;
+        }
+        self.add_def(d);
         d
     }
 
-    pub fn new_local(&mut self, name: &str, pos: Pos, is_mut: bool, fn_node: Node) -> &mut Local {
-        self.next_local += 1;
-        &mut Local { id: self.next_local, name: name.to_string(), pos, is_mut, fn_node }
+    /// Numbers a definition and records it.
+    pub fn add_def(&mut self, d: &mut Def) {
+        d.id = self.info.defs.len() as u32;
+        self.info.defs.push(d);
+        if !d.node.is_none() { self.info.def_of.insert(d.node.id(), d); }
+    }
+
+    /// A local variable, numbered by the node that binds it.
+    pub fn new_local(&mut self, id: u32, name: &str, pos: Pos, is_mut: bool, fn_node: Node) -> &mut Local {
+        &mut Local { id, name: name.to_string(), pos, is_mut, fn_node }
     }
 }
 
@@ -385,7 +400,8 @@ pub fn resolve(cfg: Config, specs: &Vec<&CrateSpec>) -> (&mut Info, Vec<Error>) 
     let info = &mut Info { crates: Vec::new(), defs: Vec::new(), def_of: HashMap::new(), paths: HashMap::new(),
         path_files: HashMap::new(), bindings: HashMap::new(), pat_consts: HashMap::new(), self_locals: HashMap::new(),
         labels: HashMap::new() };
-    let mut r = Resolver { cfg, info, errs: Sink::new(), crates: HashMap::new(), imports: Vec::new(), next_local: 0 };
+    let mut r = Resolver { cfg, info, errs: Sink::new(), crates: HashMap::new(), imports: Vec::new(), par: false, bail: false,
+        unit_defs: Vec::new() };
     for spec in specs.iter() {
         let dir = if spec.dir.len() == 0 { spec.name.clone() } else { spec.dir.clone() };
         let c = &mut Crate { name: spec.name.clone(), dir, fs_root: spec.fs_root.clone(), root: None, files: Vec::new(),
@@ -420,8 +436,6 @@ pub fn resolve(cfg: Config, specs: &Vec<&CrateSpec>) -> (&mut Info, Vec<Error>) 
         }
     }
     let crates = r.info.crates.clone();
-    for c in crates.iter() {
-        if let Some(root) = c.root { r.resolve_module(root); }
-    }
+    r.resolve_all(&crates);
     (r.info, r.errs.sorted())
 }
