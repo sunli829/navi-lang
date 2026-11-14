@@ -61,8 +61,11 @@ struct Span {
     div_mul: usize,
     nelems: usize,
     noscan: bool,
-    // Free objects are linked through their first word.
+    // Free objects are linked through their first word; after them come
+    // the objects never used (zero), from bump to the end (bump 0 once a
+    // sweep has linked them all).
     freelist: usize,
+    bump: usize,
     nfree: usize,
     // nelems allocation bytes followed by nelems mark bytes.
     bits: *mut u8,
@@ -159,24 +162,29 @@ pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
     let s = FREE[list] as *mut Span;
     unsafe {
         if s as usize != 0 && (*s).nfree > 0 {
-            let p = (*s).freelist;
-            (*s).freelist = *(p as *const usize);
-            (*s).nfree -= 1;
             let elem = (*s).elem;
+            let mut p = (*s).freelist;
+            if p != 0 {
+                (*s).freelist = *(p as *const usize);
+                // Zero the object (the free list link is in its first word).
+                if elem <= 64 {
+                    let mut q = p;
+                    while q < p + elem {
+                        *(q as *mut usize) = 0;
+                        q += 8;
+                    }
+                } else {
+                    memset(p as *mut u8, 0, elem);
+                }
+            } else {
+                p = (*s).bump;
+                (*s).bump = p + elem;
+            }
+            (*s).nfree -= 1;
             let i = ((p - (*s).start) * (*s).div_mul) >> 32;
             *(((*s).bits as usize + i) as *mut u8) = 1;
             if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; } // allocated black
             ALLOCATED += elem;
-            // Zero the object (the free list link is in its first word).
-            if elem <= 64 {
-                let mut q = p;
-                while q < p + elem {
-                    *(q as *mut usize) = 0;
-                    q += 8;
-                }
-            } else {
-                memset(p as *mut u8, 0, elem);
-            }
             return p as *mut u8;
         }
     }
@@ -201,18 +209,24 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
         unsafe {
             let s = *(slot as *const usize) as *mut Span;
             if s as usize != 0 && (*s).nfree > 0 {
-                let p = (*s).freelist;
-                (*s).freelist = *(p as *const usize);
-                (*s).nfree -= 1;
                 let elem = (*s).elem;
+                let mut p = (*s).freelist;
+                if p != 0 {
+                    (*s).freelist = *(p as *const usize);
+                    let mut q = p;
+                    while q < p + elem {
+                        *(q as *mut usize) = 0;
+                        q += 8;
+                    }
+                } else {
+                    // A never used object: zero, not read.
+                    p = (*s).bump;
+                    (*s).bump = p + elem;
+                }
+                (*s).nfree -= 1;
                 let i = ((p - (*s).start) * (*s).div_mul) >> 32;
                 *(((*s).bits as usize + i) as *mut u8) = 1;
                 if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; }
-                let mut q = p;
-                while q < p + elem {
-                    *(q as *mut usize) = 0;
-                    q += 8;
-                }
                 return p as *mut u8;
             }
         }
@@ -311,22 +325,27 @@ fn add_allocated(n: usize) { ALLOCATED += n; }
 // Pops a free object of a span the M owns and zeroes it.
 fn take_owned(s: *mut Span) -> usize {
     unsafe {
-        let p = (*s).freelist;
-        (*s).freelist = *(p as *const usize);
-        (*s).nfree -= 1;
         let elem = (*s).elem;
+        let mut p = (*s).freelist;
+        if p != 0 {
+            (*s).freelist = *(p as *const usize);
+            if elem <= 64 {
+                let mut q = p;
+                while q < p + elem {
+                    *(q as *mut usize) = 0;
+                    q += 8;
+                }
+            } else {
+                memset(p as *mut u8, 0, elem);
+            }
+        } else {
+            p = (*s).bump;
+            (*s).bump = p + elem;
+        }
+        (*s).nfree -= 1;
         let i = ((p - (*s).start) * (*s).div_mul) >> 32;
         *(((*s).bits as usize + i) as *mut u8) = 1;
         if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; }
-        if elem <= 64 {
-            let mut q = p;
-            while q < p + elem {
-                *(q as *mut usize) = 0;
-                q += 8;
-            }
-        } else {
-            memset(p as *mut u8, 0, elem);
-        }
         p
     }
 }
@@ -361,13 +380,18 @@ fn alloc_small(c: usize, noscan: bool) -> usize {
 // take pops a free object of s, zeroes it and marks it allocated.
 fn take(s: *mut Span) -> usize {
     unsafe {
-        let p = (*s).freelist;
-        (*s).freelist = *(p as *const usize);
+        let mut p = (*s).freelist;
+        if p != 0 {
+            (*s).freelist = *(p as *const usize);
+            memset(p as *mut u8, 0, (*s).elem);
+        } else {
+            p = (*s).bump;
+            (*s).bump = p + (*s).elem;
+        }
         (*s).nfree -= 1;
         let i = ((p - (*s).start) * (*s).div_mul) >> 32;
         *(((*s).bits as usize + i) as *mut u8) = 1;
         if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; }
-        memset(p as *mut u8, 0, (*s).elem);
         ALLOCATED += (*s).elem;
         p
     }
@@ -416,6 +440,7 @@ fn alloc_large_in(size: usize, noscan: bool, tries: usize) -> usize {
     let s = new_span(bytes, bytes, noscan, NCLASS * 2);
     unsafe {
         (*s).freelist = 0;
+        (*s).bump = 0;
         (*s).nfree = 0;
         stb((*s).bits as usize, 1);
         if MARKING { stb((*s).bits as usize + 1, 1); }
@@ -445,15 +470,10 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
         (*s).noscan = noscan;
         (*s).bits = calloc(2 * nelems, 1);
         (*s).list = list;
-        let mut i = nelems;
-        let mut free = 0usize;
-        while i > 0 {
-            i -= 1;
-            let p = start + i * elem;
-            st(p, free);
-            free = p;
-        }
-        (*s).freelist = free;
+        // Its objects are taken from the bump pointer (not linked: their
+        // memory is not touched until used).
+        (*s).freelist = 0;
+        (*s).bump = start;
         (*s).nfree = nelems;
     }
     let mut pg = start;
@@ -898,6 +918,7 @@ fn sweep_bits(s: *mut Span) -> (usize, bool) {
                 }
             }
             (*s).freelist = free;
+            (*s).bump = 0;
             (*s).nfree = nfree;
             live += (n - nfree) * (*s).elem;
             room = nfree > 0;
