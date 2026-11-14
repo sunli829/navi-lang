@@ -97,6 +97,8 @@ const RUNTIME_SYMS: [&str; 19] = ["_navi_argc", "_navi_argv", "_navi_data_end", 
 const CHUNK: usize = 4;
 
 pub struct Gen {
+    /// choose_registers' buffers, reused from one function to the next.
+    live: &mut Live,
     p: &mut Plan,
     o: &mut Object,
     m: &mut dyn Machine,
@@ -188,7 +190,7 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         loc_ids: HashMap::new(), str_ids: HashMap::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
-        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new() }
+        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live() }
 }
 
 /// Lowers the plan into a new object for arch, with a machine from new_m
@@ -1110,7 +1112,13 @@ impl FnGen {
         let n = f.locals.len();
         let nb = f.blocks.len();
         let words = (n + 63) / 64;
-        let lv = &mut Live { lo: Vec::new(), hi: Vec::new(), bad: Vec::new(), words, gen: Vec::new(), kill: Vec::new(), b: 0, pos: 0 };
+        let lv = self.g.live;
+        lv.words = words;
+        lv.b = 0;
+        lv.pos = 0;
+        lv.lo.clear();
+        lv.hi.clear();
+        lv.bad.clear();
         let mut i = 0;
         while i < n {
             self.preg.push(-1);
@@ -1123,10 +1131,16 @@ impl FnGen {
             lv.bad.push(!scalar);
             i += 1;
         }
+        lv.gen.clear();
+        lv.kill.clear();
+        lv.live_in.clear();
+        lv.live_out.clear();
         i = 0;
         while i < nb * words {
             lv.gen.push(0);
             lv.kill.push(0);
+            lv.live_in.push(0);
+            lv.live_out.push(0);
             i += 1;
         }
         // Position 0: the entry, where the arguments arrive.
@@ -1135,9 +1149,16 @@ impl FnGen {
             lv.touch(i);
             i += 1;
         }
-        let mut starts: Vec<i64> = Vec::new();
-        let mut ends: Vec<i64> = Vec::new();
-        let mut succs: Vec<Vec<usize>> = Vec::new();
+        // Per block: its first and last positions, and its successors
+        // (succ[succ_at[b]..succ_at[b + 1]]).
+        let mut starts = lv.starts;
+        let mut ends = lv.ends;
+        let mut succ = lv.succ;
+        let mut succ_at = lv.succ_at;
+        starts.clear();
+        ends.clear();
+        succ.clear();
+        succ_at.clear();
         let mut pos = 1i64;
         let mut bi = 0;
         while bi < nb {
@@ -1172,43 +1193,37 @@ impl FnGen {
                 pos += 1;
             }
             lv.pos = pos;
-            let mut ss: Vec<usize> = Vec::new();
+            succ_at.push(succ.len());
             match &b.term {
-                Term::Goto(t) => ss.push(*t),
+                Term::Goto(t) => succ.push(*t),
                 Term::Switch { x, targets, els, .. } => {
                     lv.op(x);
-                    for t in targets.iter() { ss.push(*t); }
-                    ss.push(*els);
+                    for t in targets.iter() { succ.push(*t); }
+                    succ.push(*els);
                 }
                 Term::Call { fn_op, args, dest, target, .. } => {
                     lv.op(fn_op);
                     for a in args.iter() { lv.op(a); }
                     lv.place(dest, false, true);
-                    if *target >= 0 { ss.push(*target as usize); }
+                    if *target >= 0 { succ.push(*target as usize); }
                 }
                 Term::Assert { cond, len, index, target, .. } => {
                     lv.op(cond);
                     lv.op(len);
                     lv.op(index);
-                    ss.push(*target);
+                    succ.push(*target);
                 }
                 Term::Return => lv.use_(0),
                 _ => {}
             }
             ends.push(pos);
-            succs.push(ss);
             pos += 1;
             bi += 1;
         }
+        succ_at.push(succ.len());
         // Liveness: in = gen | (out & !kill), out = the successors' ins.
-        let mut live_in: Vec<u64> = Vec::new();
-        let mut live_out: Vec<u64> = Vec::new();
-        i = 0;
-        while i < nb * words {
-            live_in.push(0);
-            live_out.push(0);
-            i += 1;
-        }
+        let mut live_in = lv.live_in;
+        let mut live_out = lv.live_out;
         let mut changed = true;
         while changed {
             changed = false;
@@ -1219,7 +1234,11 @@ impl FnGen {
                 let mut w = 0;
                 while w < words {
                     let mut out = 0u64;
-                    for sb in succs[bj].iter() { out = out | live_in[*sb * words + w]; }
+                    let mut si = succ_at[bj];
+                    while si < succ_at[bj + 1] {
+                        out = out | live_in[succ[si] * words + w];
+                        si += 1;
+                    }
                     live_out[o + w] = out;
                     let inn = lv.gen[o + w] | (out & !lv.kill[o + w]);
                     if inn != live_in[o + w] {
@@ -1256,14 +1275,16 @@ impl FnGen {
         }
         // Linear scan by start; out of registers, the range ending last
         // stays in memory.
-        let mut order: Vec<usize> = Vec::new();
+        let mut order = lv.order;
+        order.clear();
         i = 0;
         while i < n {
             if !lv.bad[i] && lv.lo[i] >= 0 { order.push(i); }
             i += 1;
         }
         order.sort_by(|a, b| if lv.lo[*a] != lv.lo[*b] { lv.lo[*a].cmp(&lv.lo[*b]) } else { a.cmp(b) });
-        let mut active: Vec<usize> = Vec::new();
+        let mut active = lv.active;
+        active.clear();
         let mut free: Vec<Reg> = Vec::new();
         let mut used = [false; 9];
         let mut r = NUM_SAVED;
@@ -1274,11 +1295,19 @@ impl FnGen {
         for l in order.iter() {
             let cur = *l;
             // Ranges that ended before this one starts give their registers back.
-            let mut keep: Vec<usize> = Vec::new();
-            for a in active.iter() {
-                if lv.hi[*a] < lv.lo[cur] { free.push(self.preg[*a] as Reg); } else { keep.push(*a); }
+            let mut j = 0;
+            let mut kept = 0;
+            while j < active.len() {
+                let a = active[j];
+                if lv.hi[a] < lv.lo[cur] {
+                    free.push(self.preg[a] as Reg);
+                } else {
+                    active[kept] = a;
+                    kept += 1;
+                }
+                j += 1;
             }
-            active = keep;
+            active.truncate(kept);
             if free.len() > 0 {
                 let reg = free.pop().unwrap();
                 self.preg[cur] = reg as i64;
@@ -2895,7 +2924,21 @@ fn term_pos(t: &Term) -> Pos {
 }
 
 // The positions and liveness of a function's locals (choose_registers).
+fn new_live() -> &mut Live {
+    &mut Live { lo: Vec::new(), hi: Vec::new(), bad: Vec::new(), words: 0, gen: Vec::new(), kill: Vec::new(), b: 0, pos: 0,
+        live_in: Vec::new(), live_out: Vec::new(), starts: Vec::new(), ends: Vec::new(), succ: Vec::new(), succ_at: Vec::new(),
+        order: Vec::new(), active: Vec::new() }
+}
+
 struct Live {
+    live_in: Vec<u64>,
+    live_out: Vec<u64>,
+    starts: Vec<i64>,
+    ends: Vec<i64>,
+    succ: Vec<usize>,
+    succ_at: Vec<usize>,
+    order: Vec<usize>,
+    active: Vec<usize>,
     lo: Vec<i64>,
     hi: Vec<i64>,
     // Not a scalar, or its address is taken: stays in memory.
