@@ -1,0 +1,225 @@
+//! ELF64 relocatable object files for x86-64 and AArch64 Linux (linked by
+//! the system's cc).
+
+use std::collections::HashMap;
+use crate::obj::{self, Object};
+
+const SECT_NAMES: [&str; 4] = [".text", ".rodata", ".data.rel.ro", ".data"];
+
+const SHT_PROGBITS: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const SHT_RELA: u32 = 4;
+const SHF_WRITE: u64 = 1;
+const SHF_ALLOC: u64 = 2;
+const SHF_EXEC: u64 = 4;
+const SHF_INFO_LINK: u64 = 0x40;
+
+struct Sec {
+    name: String,
+    typ: u32,
+    flags: u64,
+    data: Vec<u8>,
+    link: u32,
+    info: u32,
+    align: u64,
+    entsize: u64,
+    name_off: u32,
+    offset: u64,
+}
+
+fn sec(name: &str, typ: u32, flags: u64, data: Vec<u8>, align: u64) -> &mut Sec {
+    &mut Sec { name: name.to_string(), typ, flags, data, link: 0, info: 0, align, entsize: 0, name_off: 0, offset: 0 }
+}
+
+fn put16(b: &mut Vec<u8>, v: u16) {
+    b.push(v as u8);
+    b.push((v >> 8) as u8);
+}
+
+fn put32(b: &mut Vec<u8>, v: u32) {
+    let mut i = 0;
+    while i < 4 {
+        b.push((v >> (8 * i) as u32) as u8);
+        i += 1;
+    }
+}
+
+fn put64(b: &mut Vec<u8>, v: u64) {
+    put32(b, v as u32);
+    put32(b, (v >> 32) as u32);
+}
+
+/// The ELF relocation type and addend of a relocation kind.
+fn reloc_type(arch: &str, k: obj::RelocKind) -> Result<(u32, i64), String> {
+    if arch == "amd64" {
+        if k == obj::CALL32 { return Ok((4, -4)); } // R_X86_64_PLT32
+        if k == obj::PC32 { return Ok((2, -4)); } // R_X86_64_PC32
+        if k == obj::ABS64 { return Ok((1, 0)); } // R_X86_64_64
+    } else {
+        if k == obj::BRANCH26 { return Ok((283, 0)); } // R_AARCH64_CALL26
+        if k == obj::PAGE21 { return Ok((275, 0)); } // R_AARCH64_ADR_PREL_PG_HI21
+        if k == obj::PAGE_OFF12 { return Ok((277, 0)); } // R_AARCH64_ADD_ABS_LO12_NC
+        if k == obj::PAGE_OFF12_LD64 { return Ok((286, 0)); } // R_AARCH64_LDST64_ABS_LO12_NC
+        if k == obj::ABS64 { return Ok((257, 0)); } // R_AARCH64_ABS64
+    }
+    Err(`elf: relocation kind ${k} not supported on ${arch}`)
+}
+
+/// Encodes o as an ELF64 relocatable object.
+pub fn write(o: &Object) -> Result<Vec<u8>, String> {
+    let machine: u16 = if o.arch == "arm64" { 183 } else { 62 }; // EM_AARCH64, EM_X86_64
+    let mut secs: Vec<&mut Sec> = Vec::new();
+    secs.push(sec("", 0, 0, Vec::new(), 0));
+    let mut s = 0;
+    while s < obj::NUM_SECTIONS {
+        let mut flags = SHF_ALLOC;
+        if s == obj::TEXT { flags = flags | SHF_EXEC; }
+        if s == obj::DATA_CONST || s == obj::DATA { flags = flags | SHF_WRITE; }
+        secs.push(sec(SECT_NAMES[s], SHT_PROGBITS, flags, o.sects[s].clone(), 1u64 << o.align[s]));
+        s += 1;
+    }
+    // Symbols: null, locals, then globals and undefined ones.
+    let mut strtab: Vec<u8> = Vec::new();
+    strtab.push(0);
+    let mut symtab: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < 24 {
+        symtab.push(0);
+        i += 1;
+    }
+    let mut sym_index: HashMap<String, u32> = HashMap::new();
+    let mut n = 1u32;
+    let mut first_global = 0u32;
+    for pass in [false, true].iter() {
+        if *pass { first_global = n; }
+        for sy in o.syms.iter() {
+            if sy.global != *pass { continue; }
+            sym_index.insert(sy.name.clone(), n);
+            n += 1;
+            put32(&mut symtab, strtab.len() as u32);
+            strtab.extend_from_slice(sy.name.as_bytes());
+            strtab.push(0);
+            let typ: u8 = if sy.sec == obj::TEXT { 2 } else { 1 }; // STT_FUNC, STT_OBJECT
+            let bind: u8 = if sy.global { 1 } else { 0 };
+            symtab.push(bind << 4 | typ);
+            symtab.push(0);
+            put16(&mut symtab, (sy.sec + 1) as u16);
+            put64(&mut symtab, sy.off);
+            put64(&mut symtab, 0);
+        }
+    }
+    let mut undef: Vec<String> = Vec::new();
+    for name in o.undef.keys() {
+        if !sym_index.contains_key(name) { undef.push(name.clone()); }
+    }
+    undef.sort();
+    for name in undef.iter() {
+        sym_index.insert(name.clone(), n);
+        n += 1;
+        put32(&mut symtab, strtab.len() as u32);
+        strtab.extend_from_slice(name.as_bytes());
+        strtab.push(0);
+        symtab.push(1 << 4); // STB_GLOBAL, STT_NOTYPE
+        symtab.push(0);
+        put16(&mut symtab, 0);
+        put64(&mut symtab, 0);
+        put64(&mut symtab, 0);
+    }
+    let symtab_idx = secs.len() as u32;
+    let st = sec(".symtab", SHT_SYMTAB, 0, symtab, 8);
+    st.info = first_global;
+    st.entsize = 24;
+    st.link = symtab_idx + 1;
+    secs.push(st);
+    secs.push(sec(".strtab", SHT_STRTAB, 0, strtab, 1));
+    // Relocation sections.
+    let mut rela: Vec<Vec<u8>> = Vec::new();
+    s = 0;
+    while s < obj::NUM_SECTIONS {
+        rela.push(Vec::new());
+        s += 1;
+    }
+    for r in o.relocs.iter() {
+        let name = o.names[r.sym as usize].clone();
+        let idx = match sym_index.get(&name) { Some(x) => *x, None => return Err(`elf: relocation against unknown symbol ${name}`) };
+        let (typ, addend) = reloc_type(o.arch.as_str(), r.kind)?;
+        let mut b = rela[r.sec];
+        put64(&mut b, r.off as u64);
+        put64(&mut b, (idx as u64) << 32 | typ as u64);
+        put64(&mut b, addend as u64);
+    }
+    s = 0;
+    while s < obj::NUM_SECTIONS {
+        if rela[s].len() > 0 {
+            let rs = sec(`.rela${SECT_NAMES[s]}`.as_str(), SHT_RELA, SHF_INFO_LINK, rela[s].clone(), 8);
+            rs.link = symtab_idx;
+            rs.info = (s + 1) as u32;
+            rs.entsize = 24;
+            secs.push(rs);
+        }
+        s += 1;
+    }
+    // A non-executable stack.
+    secs.push(sec(".note.GNU-stack", SHT_PROGBITS, 0, Vec::new(), 1));
+    let shstr_idx = secs.len();
+    secs.push(sec(".shstrtab", SHT_STRTAB, 0, Vec::new(), 1));
+    let mut shstr: Vec<u8> = Vec::new();
+    shstr.push(0);
+    i = 1;
+    while i < secs.len() {
+        secs[i].name_off = shstr.len() as u32;
+        shstr.extend_from_slice(secs[i].name.as_bytes());
+        shstr.push(0);
+        i += 1;
+    }
+    secs[shstr_idx].data = shstr;
+
+    // Layout: header, section contents, section headers.
+    let mut off = 64u64;
+    i = 1;
+    while i < secs.len() {
+        let a = if secs[i].align == 0 { 1 } else { secs[i].align };
+        off = (off + a - 1) / a * a;
+        secs[i].offset = off;
+        off += secs[i].data.len() as u64;
+        i += 1;
+    }
+    let shoff = (off + 7) / 8 * 8;
+
+    let mut b: Vec<u8> = Vec::new();
+    for x in [0x7fu8, 0x45, 0x4c, 0x46, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0].iter() { b.push(*x); }
+    put16(&mut b, 1); // ET_REL
+    put16(&mut b, machine);
+    put32(&mut b, 1);
+    put64(&mut b, 0); // entry
+    put64(&mut b, 0); // phoff
+    put64(&mut b, shoff);
+    put32(&mut b, 0); // flags
+    put16(&mut b, 64);
+    put16(&mut b, 0);
+    put16(&mut b, 0);
+    put16(&mut b, 64);
+    put16(&mut b, secs.len() as u16);
+    put16(&mut b, shstr_idx as u16);
+    i = 1;
+    while i < secs.len() {
+        while (b.len() as u64) < secs[i].offset { b.push(0); }
+        b.extend_from_slice(secs[i].data.as_slice());
+        i += 1;
+    }
+    while (b.len() as u64) < shoff { b.push(0); }
+    for sc in secs.iter() {
+        put32(&mut b, sc.name_off);
+        put32(&mut b, sc.typ);
+        put64(&mut b, sc.flags);
+        put64(&mut b, 0); // addr
+        put64(&mut b, sc.offset);
+        put64(&mut b, sc.data.len() as u64);
+        put32(&mut b, sc.link);
+        put32(&mut b, sc.info);
+        put64(&mut b, sc.align);
+        put64(&mut b, sc.entsize);
+    }
+    Ok(b)
+}
