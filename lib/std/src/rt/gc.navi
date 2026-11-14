@@ -85,6 +85,10 @@ static mut ALLOCATED: usize = 0;
 static mut NEXT_GC: usize = 0;
 static mut LIVE: usize = 0;
 static mut COLLECTIONS: usize = 0;
+// NAVI_GCPOISON=1 (debugging, with NAVI_GCSTW): freed objects are filled
+// with 0xab, a free object found written or a GC allocation on a scheduler
+// record (which a collector neither stops nor scans) is fatal.
+pub static mut POISON_FREE: bool = false;
 
 fn ld(p: usize) -> usize { unsafe { *(p as *const usize) } }
 fn st(p: usize, v: usize) { unsafe { *(p as *mut usize) = v; } }
@@ -152,7 +156,10 @@ static mut CLASS_OF: [u8; 513] = [0; 513];
 /// path (a free object in the first span of the size class) is written out
 /// in this one function.
 pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
-    if MULTI { return alloc_mt(size, noscan); }
+    if MULTI {
+        if POISON_FREE && crate::rt::sched::on_g0() { crate::rt::native::fatal("GC allocation on a scheduler record"); }
+        return alloc_mt(size, noscan);
+    }
     if ALLOCATED >= NEXT_GC {
         if ARENA == 0 { init(); } else { collect_locked(); }
     }
@@ -212,6 +219,12 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
                 let elem = (*s).elem;
                 let mut p = (*s).freelist;
                 if p != 0 {
+                    if POISON_FREE {
+                        // A free object's link points into its span (else a
+                        // live object was freed and written).
+                        let nx = *(p as *const usize);
+                        if nx != 0 && (nx < (*s).start || nx >= (*s).start + (*s).bytes) { crate::rt::native::fatal("a free object was written (NAVI_GCPOISON)"); }
+                    }
                     (*s).freelist = *(p as *const usize);
                     let mut q = p;
                     while q < p + elem {
@@ -916,7 +929,10 @@ fn sweep_bits(s: *mut Span) -> (usize, bool) {
                 i -= 1;
                 let a = (bits + i) as *mut u8;
                 let m = (bits + n + i) as *mut u8;
-                if *a != 0 && *m == 0 { *a = 0; }
+                if *a != 0 && *m == 0 {
+                    *a = 0;
+                    if POISON_FREE { memset((start + i * elem) as *mut u8, 0xab, elem); }
+                }
                 *m = 0;
                 if *a == 0 {
                     let p = start + i * elem;
@@ -1256,3 +1272,4 @@ fn verify_marks() {
     }
     if after != before { crate::rt::native::fatal("concurrent mark missed reachable objects"); }
 }
+

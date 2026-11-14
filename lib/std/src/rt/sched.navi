@@ -864,6 +864,7 @@ extern "C" {
     fn pthread_detach(t: usize) -> i32;
     fn sched_yield() -> i32;
     fn calloc(n: usize, size: usize) -> *mut u8;
+    fn free(p: *mut u8);
     fn sysconf(name: i32) -> i64;
 }
 
@@ -1067,6 +1068,12 @@ pub fn unlock() {
         if (*g).lock_depth == 0 && MULTI { pthread_mutex_unlock(MU as *mut u8); }
     }
 }
+
+/// Whether the running code is an M's scheduler record (navic).
+#[cfg(feature = "navic")]
+pub fn on_g0() -> bool { unsafe { (*current()).is_g0 } }
+#[cfg(not(feature = "navic"))]
+pub fn on_g0() -> bool { false }
 
 /// Before a call that may block outside navi code (waiting for the lock, a
 /// system call): saves the stack pointer and registers for a collector.
@@ -1470,9 +1477,11 @@ fn mloop() -> ! {
     let g0 = current();
     let m = unsafe { (*g0).m } as *mut M;
     loop {
-        // The G that switched here (M0's main G the first time) stopped.
-        do_after(m);
+        // The G that switched here (M0's main G the first time) stopped: its
+        // context is saved, a collector need not wait for it (do_after may
+        // wait for the runtime lock a collector holds).
         crate::rt::atomic_store(unsafe { &mut (*m).cur as *mut *mut G as *mut usize }, 0);
+        do_after(m);
         let g = find_runnable(m);
         // Running from now on, then visible to a collector, then a look at
         // whether one stops the world (it sets STW before looking at the
@@ -1620,20 +1629,23 @@ fn release_locks(g: *mut G) {
         let n = (*g).release_n;
         let base = (*g).release;
         (*g).release_n = 0;
+        // No GC memory here: this runs on the M's scheduler record, which a
+        // collector neither stops nor scans.
         let mut few = [0usize; 64];
-        let mut many: Vec<usize> = Vec::new();
+        let many = if n > 64 { calloc(n, 8) as usize } else { 0 };
         let mut i = 0;
         while i < n {
             let a = *((base + 8 * i) as *const usize);
-            if n <= 64 { few[i] = a; } else { many.push(a); }
+            if n <= 64 { few[i] = a; } else { *((many + 8 * i) as *mut usize) = a; }
             i += 1;
         }
         i = 0;
         while i < n {
-            let a = if n <= 64 { few[i] } else { many[i] };
+            let a = if n <= 64 { few[i] } else { *((many + 8 * i) as *const usize) };
             obj_unlock(a as *mut usize);
             i += 1;
         }
+        if many != 0 { free(many as *mut u8); }
     }
 }
 
@@ -1934,13 +1946,16 @@ fn check_moved(nsp: usize, nhi: usize, lo: usize, hi: usize, delta: usize) {
 #[cfg(feature = "navic")]
 pub fn stop_the_world() {
     if !MULTI { return; }
+    if crate::rt::native::env_set(b"NAVI_GCPOISON\0") { crate::rt::gc::POISON_FREE = true; }
     let me = current();
     crate::rt::atomic_store(&mut STW as *mut usize, 1);
+    // Every G on an M, whatever its status: a G changes its status before
+    // it switches away (yield, park), and runs until its context is saved.
     let mut m = MS as *mut M;
     while m as usize != 0 {
         unsafe {
             let g = (*m).cur;
-            if g as usize != 0 && g as usize != me as usize && (*g).status == RUNNING {
+            if g as usize != 0 && g as usize != me as usize {
                 (*g).poisoned = true;
                 crate::rt::atomic_store(&mut (*g).guard as *mut usize, 18446744073709551615);
             }
@@ -1953,7 +1968,7 @@ pub fn stop_the_world() {
         while m as usize != 0 {
             unsafe {
                 let g = (*m).cur;
-                if g as usize != 0 && g as usize != me as usize && (*g).status == RUNNING {
+                if g as usize != 0 && g as usize != me as usize {
                     let st = crate::rt::atomic_load(&mut (*g).sys as *mut usize);
                     if st == SYS_RUNNING {
                         waiting += 1;
