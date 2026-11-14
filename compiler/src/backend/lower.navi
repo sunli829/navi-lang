@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::mpmc::{channel, Sender};
 use std::thread;
 use crate::resolve::{Def, Node};
 use crate::syntax::ast::{ExprKind, Item, LitKind};
@@ -244,28 +245,33 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
     sizes.sort_by(|a, b| if a.0 != b.0 { b.0.cmp(&a.0) } else { a.1.cmp(&b.1) });
     let mut order: Vec<usize> = Vec::new();
     for (_, j) in sizes.iter() { order.push(*j); }
-    let mut done: Vec<(usize, &mut FuncOut)> = Vec::new();
-    if nw <= 1 {
-        let w = g.worker_gen(new_m(), arch);
-        done = run_jobs(w, &mut jobs, &order, next);
-    } else {
-        p.info.ctx.par = true;
-        let mut hs = Vec::new();
-        let mut k = 0;
-        while k < nw {
-            let w = g.worker_gen(new_m(), arch);
-            hs.push(thread::spawn(|| run_jobs(w, &mut jobs, &order, next)));
-            k += 1;
+    // Functions are placed in the order they are taken, each as soon as
+    // it is done (while the workers lower the rest).
+    let ids = g.o.ids.clone();
+    let (tx, rx) = channel::<Vec<(usize, &mut FuncOut)>>();
+    let mut hs = Vec::new();
+    if nw > 1 { p.info.ctx.par = true; }
+    let mut k = 0;
+    while k < nw || k == 0 {
+        let w = g.worker_gen(new_m(), arch, ids);
+        if nw <= 1 {
+            run_jobs(w, &mut jobs, &order, next, tx);
+        } else {
+            hs.push(thread::spawn(|| run_jobs(w, &mut jobs, &order, next, tx)));
         }
-        for h in hs.iter() {
-            for d in h.join().unwrap().iter() { done.push(*d); }
-        }
-        p.info.ctx.par = false;
+        k += 1;
     }
     let mut outs: Vec<Option<&mut FuncOut>> = Vec::new();
     for _ in jobs.iter() { outs.push(None); }
-    for (j, o) in done.iter() { outs[*j] = Some(*o); }
-    for o in outs.iter() { g.merge(o.unwrap()); }
+    for j in order.iter() {
+        while outs[*j].is_none() {
+            for (d, o) in rx.recv().unwrap().iter() { outs[*d] = Some(*o); }
+        }
+        g.merge(outs[*j].unwrap());
+        outs[*j] = None;
+    }
+    for h in hs.iter() { h.join().unwrap(); }
+    p.info.ctx.par = false;
     g.gen_main();
     g.gen_run_defers();
     g.gen_sched();
@@ -275,19 +281,20 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
 }
 
 // Lowers jobs, CHUNK at a time, until none is left.
-fn run_jobs(w: &mut Gen, jobs: &mut Vec<Job>, order: &Vec<usize>, next: &std::sync::atomic::AtomicUsize) -> Vec<(usize, &mut FuncOut)> {
-    let mut res: Vec<(usize, &mut FuncOut)> = Vec::new();
+fn run_jobs(w: &mut Gen, jobs: &mut Vec<Job>, order: &Vec<usize>, next: &std::sync::atomic::AtomicUsize, tx: Sender<Vec<(usize, &mut FuncOut)>>) {
     loop {
         let start = next.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
-        if start >= jobs.len() { return res; }
+        if start >= jobs.len() { return; }
         let mut k = start;
+        let mut done: Vec<(usize, &mut FuncOut)> = Vec::new();
         while k < start + CHUNK && k < jobs.len() {
             let j = order[k];
             let job = &mut jobs[j];
             w.gen_func(job.grp, job.f, job.sym.clone());
-            res.push((j, w.outs.pop().unwrap()));
+            done.push((j, w.outs.pop().unwrap()));
             k += 1;
         }
+        let _ = tx.send(done);
     }
 }
 
@@ -329,7 +336,7 @@ impl Gen {
 
     /// A generator for a worker thread (sharing the plan, the statics and
     /// the closure symbols, read only).
-    fn worker_gen(&mut self, m: &mut dyn Machine, arch: &str) -> &mut Gen {
+    fn worker_gen(&mut self, m: &mut dyn Machine, arch: &str, ids: HashMap<String, u32>) -> &mut Gen {
         let w = new_gen(self.p, arch, m, self.tgt.clone(), self.debug, self.lock, self.loc_ty);
         w.worker = true;
         // Its own layouts (the type context and the type checker's queries
@@ -337,7 +344,9 @@ impl Gen {
         w.lay = layout::new_computer(self.p.info);
         w.statics = self.statics;
         w.closure = self.closure;
-        w.main_ids = self.o.ids;
+        // The symbol numbers before any function is placed (the main
+        // thread numbers more while the workers run).
+        w.main_ids = ids;
         w
     }
 
