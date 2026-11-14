@@ -62,7 +62,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `std::io::{print, println, eprint, eprintln}` | 代替 `print!` 系列宏，参数类型 `impl Display` |
 | `std::panic::{panic, assert, assert_eq, assert_ne}` | 代替对应的宏，带 `#[track_caller]` |
 | `Sender::close()` | 见第 3 节 |
-| `std::gc` | `collect()`、`stats()`、`set_min_heap(bytes)`（M9）；`Weak<T>`、finalizer 以后再做 |
+| `std::gc` | `collect()`、`stats()`、`set_min_heap(bytes)`（M9）、`set_percent(percent)`（同 Go 的 `debug.SetGCPercent`）；`Weak<T>`、finalizer 以后再做 |
 | `std::bench::Bencher` | `navi bench` 用（Rust 里是不稳定的 `test::Bencher`）：`iter(f)` |
 
 ## 5. M7 补充标准库时新增的偏离
