@@ -192,37 +192,112 @@ fn target(t: &Term, by_def: &HashMap<u32, &mut Func>, ok: &HashMap<u32, bool>) -
     match by_def.get(&d.id) { Some(f) => Some(*f), None => None }
 }
 
-/// Inlines the small direct callees of every function in funcs.
+/// Inlines the small direct callees of every function in funcs, callees
+/// before their callers (as Go does): a callee is copied with its own
+/// callees already inlined. The functions of a level (whose callees are all
+/// on lower ones) are done on several threads, each making its new blocks
+/// and locals from the bodies as they were before the level; then they are
+/// installed. Within a cycle of calls the copies are of bodies not inlined
+/// into yet (so mutually recursive callees end).
 pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>) {
     let mut by_def: HashMap<u32, &mut Func> = HashMap::new();
+    let mut index: HashMap<u32, usize> = HashMap::new();
     let mut ok: HashMap<u32, bool> = HashMap::new();
-    for f in funcs.iter() {
+    let mut i = 0;
+    while i < funcs.len() {
+        let f = funcs[i];
         if let Some(d) = f.def {
-            by_def.insert(d.id, *f);
-            if inlinable(*f) { ok.insert(d.id, true); }
+            by_def.insert(d.id, f);
+            index.insert(f.id, i);
+            if inlinable(f) { ok.insert(d.id, true); }
         }
+        i += 1;
     }
+    // The calls to inline, and the levels: a cycle of calls (a component)
+    // is one above the highest of the components it calls.
+    let mut skip: Vec<bool> = Vec::new();
+    let mut deps: Vec<Vec<usize>> = Vec::new();
     for f in funcs.iter() {
         let caller = *f;
-        if let Some(d) = caller.def {
-            if in_runtime(d) { continue; }
+        let mut ds: Vec<usize> = Vec::new();
+        let rt = match caller.def { Some(d) => in_runtime(d), None => false };
+        skip.push(rt);
+        if !rt {
+            for b in caller.blocks.iter() {
+                if let Some(callee) = target(&b.term, &by_def, &ok) {
+                    if callee.id != caller.id {
+                        if let Some(j) = index.get(&callee.id) { ds.push(*j); }
+                    }
+                }
+            }
         }
-        // Only the caller's own calls: copies are not inlined into again
-        // (mutually recursive callees would never end).
-        let n = caller.blocks.len();
-        let mut bi = 0;
-        while bi < n {
-            let callee = match target(&caller.blocks[bi].term, &by_def, &ok) { Some(c) => c, None => { bi += 1; continue; } };
-            if callee.id == caller.id { bi += 1; continue; }
-            inline_call(info, caller, bi, callee);
-            bi += 1;
+        deps.push(ds);
+    }
+    let comps = crate::mir::escape::components(&deps);
+    let mut comp_of: Vec<usize> = Vec::new();
+    let mut level: Vec<usize> = Vec::new();
+    for _ in funcs.iter() { comp_of.push(0); }
+    let mut ci = 0;
+    while ci < comps.len() {
+        for v in comps[ci].iter() { comp_of[*v] = ci; }
+        ci += 1;
+    }
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    // Components come callees first.
+    ci = 0;
+    while ci < comps.len() {
+        let mut h = 0;
+        for v in comps[ci].iter() {
+            for w in deps[*v].iter() {
+                if comp_of[*w] != ci && level[comp_of[*w]] + 1 > h { h = level[comp_of[*w]] + 1; }
+            }
+        }
+        level.push(h);
+        while levels.len() <= h { levels.push(Vec::new()); }
+        for v in comps[ci].iter() {
+            if !skip[*v] && deps[*v].len() > 0 { levels[h].push(*v); }
+        }
+        ci += 1;
+    }
+    info.ctx.par = true;
+    for lv in levels.iter() {
+        let mut outs: Vec<Option<&mut Body>> = Vec::new();
+        for _ in lv.iter() { outs.push(None); }
+        crate::util::par_for(lv.len(), 16, |k| {
+            let caller = funcs[lv[k]];
+            let body = &mut Body { blocks: caller.blocks.clone(), locals: caller.locals.clone() };
+            let n = body.blocks.len();
+            let mut bi = 0;
+            while bi < n {
+                if let Some(callee) = target(&body.blocks[bi].term, &by_def, &ok) {
+                    if callee.id != caller.id { inline_call(info, body, bi, callee); }
+                }
+                bi += 1;
+            }
+            outs[k] = Some(body);
+        });
+        let mut k = 0;
+        while k < lv.len() {
+            let b = outs[k].unwrap();
+            funcs[lv[k]].blocks = b.blocks;
+            funcs[lv[k]].locals = b.locals;
+            k += 1;
         }
     }
+    info.ctx.par = false;
 }
 
-/// Replaces the call ending block bi of caller with a copy of callee.
-fn inline_call(info: &mut Info, caller: &mut Func, bi: usize, callee: &Func) {
-    let (fn_op, args, dest, target, pos) = match &caller.blocks[bi].term {
+// A caller's blocks and locals while calls are inlined (the function
+// itself is left as it is: others copy it meanwhile).
+struct Body {
+    blocks: Vec<&mut Block>,
+    locals: Vec<&mut Local>,
+}
+
+/// Replaces the call ending block bi of the body with a copy of callee.
+fn inline_call(info: &mut Info, body: &mut Body, bi: usize, callee: &Func) {
+    let call = body.blocks[bi];
+    let (fn_op, args, dest, target, pos) = match &call.term {
         Term::Call { fn_op, args, dest, target, pos } => (fn_op.clone(), args.clone(), dest.clone(), *target, *pos),
         _ => return,
     };
@@ -235,28 +310,29 @@ fn inline_call(info: &mut Info, caller: &mut Func, bi: usize, callee: &Func) {
         m.insert(all[i].def.id, r.args[i]);
         i += 1;
     }
-    let cp = &Copier { ctx: Some(info.ctx), m, base: caller.locals.len(), block_base: caller.blocks.len(), pos };
+    let cp = &Copier { ctx: Some(info.ctx), m, base: body.locals.len(), block_base: body.blocks.len(), pos };
     for l in callee.locals.iter() {
-        caller.locals.push(&mut Local { ty: cp.ty(l.ty), name: l.name.clone(), boxed: l.boxed });
+        body.locals.push(&mut Local { ty: cp.ty(l.ty), name: l.name.clone(), boxed: l.boxed });
     }
     // The continuation: the callee's result goes to dest.
-    let ret_blk = caller.blocks.len() + callee.blocks.len();
+    let ret_blk = body.blocks.len() + callee.blocks.len();
     for b in callee.blocks.iter() {
         let mut stmts = Vec::new();
         for s in b.stmts.iter() { stmts.push(cp.stmt(s)); }
-        caller.blocks.push(&mut Block { stmts, term: cp.term(&b.term, ret_blk) });
+        body.blocks.push(&mut Block { stmts, term: cp.term(&b.term, ret_blk) });
     }
     let mut rstmts = Vec::new();
     rstmts.push(Stmt::Assign { place: dest, rv: Rvalue::Use(copy(local_place(cp.base))) });
     let rterm = if target < 0 { Term::Unreachable } else { Term::Goto(target as usize) };
-    caller.blocks.push(&mut Block { stmts: rstmts, term: rterm });
-    // The call becomes the argument moves and a jump to the callee's entry.
-    let b = caller.blocks[bi];
+    body.blocks.push(&mut Block { stmts: rstmts, term: rterm });
+    // The call becomes the argument moves and a jump to the callee's entry
+    // (a new block: the old one may be read as a callee's).
+    let mut stmts = call.stmts.clone();
     let first = if callee.closure { 2 } else { 1 };
     let mut k = 0;
     while k < args.len() {
-        b.stmts.push(Stmt::Assign { place: local_place(cp.base + first + k), rv: Rvalue::Use(args[k].clone()) });
+        stmts.push(Stmt::Assign { place: local_place(cp.base + first + k), rv: Rvalue::Use(args[k].clone()) });
         k += 1;
     }
-    b.term = Term::Goto(cp.block_base);
+    body.blocks[bi] = &mut Block { stmts, term: Term::Goto(cp.block_base) };
 }
