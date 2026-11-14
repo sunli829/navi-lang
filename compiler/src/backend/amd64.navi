@@ -1,0 +1,1271 @@
+//! x86-64 code: an instruction encoder with labels and relocations, and
+//! the Machine implementation (System V, or Windows x64, for C calls).
+//!
+//! Registers: RA r10, RM r11, V1 rax, V2 rcx, T1 rdx, BASE rsi, I1 r8,
+//! I2 r9, CTX rdi, RET r13, LOC r15, FP rbp, SP rsp, F0/F1 xmm0/xmm1; the
+//! saved registers S0 rbx and S1 r12 and the G register r14 are
+//! callee-saved in the C ABIs too, so C calls keep them (as arm64's
+//! x19-x28). Hidden scratch: I2 (r9), T1 (rdx), xmm14 and xmm15.
+//!
+//! The routines the runtime knows the layout of keep arm64's: the
+//! morestack stub saves CTX at sp+0, RET at sp+64, LOC at sp+72, S k at
+//! sp+128+8k and G at sp+200 below its frame record at sp+256; the context
+//! switch area has S k at 8k and G at 72; the setjmp buffer S k at 8k, G at
+//! 72, FP at 80, the return address at 88 and SP at 96.
+
+use crate::obj::{self, Reloc};
+use crate::backend::machine::{self as lm, Machine, Code, CArg, Label as LLabel};
+
+/// A general purpose register (0-15) or an XMM register.
+pub type R = u32;
+const RAX: R = 0;
+const RCX: R = 1;
+const RDX: R = 2;
+const RBX: R = 3;
+const RSP: R = 4;
+const RBP: R = 5;
+const RSI: R = 6;
+const RDI: R = 7;
+const R8: R = 8;
+const R9: R = 9;
+const R10: R = 10;
+const R11: R = 11;
+const R12: R = 12;
+const R13: R = 13;
+const R14: R = 14;
+const R15: R = 15;
+const XMM14: R = 14;
+const XMM15: R = 15;
+
+/// A condition code.
+pub type C = u32;
+const CO: C = 0x0;
+const CB: C = 0x2;
+const CAE: C = 0x3;
+const CE: C = 0x4;
+const CNE: C = 0x5;
+const CBE: C = 0x6;
+const CA: C = 0x7;
+const CS: C = 0x8;
+const CNS: C = 0x9;
+const CP: C = 0xA;
+const CNP: C = 0xB;
+const CL: C = 0xC;
+const CGE: C = 0xD;
+const CLE: C = 0xE;
+const CG: C = 0xF;
+
+struct Fixup {
+    /// Offset of the rel32 field.
+    at: usize,
+    label: usize,
+}
+
+pub struct Asm {
+    code: Vec<u8>,
+    labels: Vec<i64>,
+    fixups: Vec<Fixup>,
+    relocs: Vec<Reloc>,
+    calls: Vec<u64>,
+    tag: i64,
+}
+
+pub struct Amd64 {
+    a: &mut Asm,
+    /// The Windows x64 C ABI (else System V).
+    win64: bool,
+}
+
+pub fn new_machine(win64: bool) -> &mut Amd64 {
+    let a = &mut Asm { code: Vec::new(), labels: Vec::new(), fixups: Vec::new(), relocs: Vec::new(), calls: Vec::new(), tag: 0 };
+    &mut Amd64 { a, win64 }
+}
+
+const REGS: [R; 25] = [R10, R11, RAX, RCX, RDX, RSI, R8, R9, RDI, R13, R15, RBP, RSP, 0, 1, RBX, R12, RBX, RBX, RBX, RBX, RBX, RBX, RBX, R14];
+
+fn r(x: lm::Reg) -> R { REGS[x as usize] }
+
+const CONDS: [C; 10] = [CE, CNE, CL, CLE, CG, CGE, CB, CBE, CA, CAE];
+
+fn cond(c: lm::Cond) -> C { CONDS[c as usize] }
+
+/// The integer argument registers of C calls.
+fn c_arg(win64: bool, i: usize) -> R {
+    if win64 {
+        if i == 0 { return RCX; }
+        if i == 1 { return RDX; }
+        if i == 2 { return R8; }
+        return R9;
+    }
+    if i == 0 { return RDI; }
+    if i == 1 { return RSI; }
+    if i == 2 { return RDX; }
+    if i == 3 { return RCX; }
+    if i == 4 { return R8; }
+    R9
+}
+
+impl Asm {
+    fn b(&mut self, x: u8) { self.code.push(x); }
+
+    fn u32(&mut self, v: u32) {
+        self.b(v as u8);
+        self.b((v >> 8) as u8);
+        self.b((v >> 16) as u8);
+        self.b((v >> 24) as u8);
+    }
+
+    fn u64(&mut self, v: u64) {
+        self.u32(v as u32);
+        self.u32((v >> 32) as u32);
+    }
+
+    /// Emits a 1-3 byte opcode (the first byte highest).
+    fn ops(&mut self, op: u32) {
+        if op > 0xffff { self.b((op >> 16) as u8); }
+        if op > 0xff { self.b((op >> 8) as u8); }
+        self.b(op as u8);
+    }
+
+    fn new_label(&mut self) -> usize {
+        self.labels.push(-1);
+        self.labels.len() - 1
+    }
+
+    fn bind(&mut self, l: usize) { self.labels[l] = self.code.len() as i64; }
+
+    /// Resolves label references.
+    fn finish(&mut self) -> String {
+        for f in self.fixups.iter() {
+            let to = self.labels[f.label];
+            if to < 0 { return "amd64: unbound label".to_string(); }
+            let d = (to - (f.at as i64 + 4)) as u32;
+            self.code[f.at] = d as u8;
+            self.code[f.at + 1] = (d >> 8) as u8;
+            self.code[f.at + 2] = (d >> 16) as u8;
+            self.code[f.at + 3] = (d >> 24) as u8;
+        }
+        String::new()
+    }
+
+    /// A REX prefix if needed (or forced, for the byte registers spl-dil).
+    fn rex(&mut self, w: bool, reg: R, index: R, base: R, force: bool) {
+        let mut v = 0x40u8;
+        if w { v = v | 8; }
+        if reg & 8 != 0 { v = v | 4; }
+        if index & 8 != 0 { v = v | 2; }
+        if base & 8 != 0 { v = v | 1; }
+        if v != 0x40 || force { self.b(v); }
+    }
+
+    fn modrm_reg(&mut self, reg: R, rm: R) { self.b((0xC0 | (reg & 7) << 3 | (rm & 7)) as u8); }
+
+    /// [base + disp] with reg in the reg field.
+    fn modrm_mem(&mut self, reg: R, base: R, disp: i64) {
+        let rr = (reg & 7) << 3;
+        let bb = base & 7;
+        if disp == 0 && bb != 5 {
+            self.b((rr | bb) as u8);
+            if bb == 4 { self.b(0x24); }
+        } else if disp >= -128 && disp < 128 {
+            self.b((0x40 | rr | bb) as u8);
+            if bb == 4 { self.b(0x24); }
+            self.b(disp as u8);
+        } else {
+            self.b((0x80 | rr | bb) as u8);
+            if bb == 4 { self.b(0x24); }
+            self.u32(disp as u32);
+        }
+    }
+
+    /// op with a register-register operand (w: 64 bits).
+    fn op_rr(&mut self, w: bool, op: u32, reg: R, rm: R) {
+        self.rex(w, reg, 0, rm, false);
+        self.ops(op);
+        self.modrm_reg(reg, rm);
+    }
+
+    /// op with a memory operand [base + disp].
+    fn op_rm(&mut self, w: bool, op: u32, reg: R, base: R, disp: i64, force: bool) {
+        self.rex(w, reg, 0, base, force);
+        self.ops(op);
+        self.modrm_mem(reg, base, disp);
+    }
+
+    /// op with a memory operand [base + index << scale] (index is not rsp).
+    fn op_rx(&mut self, w: bool, op: u32, reg: R, base: R, index: R, scale: u32) {
+        self.rex(w, reg, index, base, false);
+        self.ops(op);
+        if base & 7 == 5 {
+            self.b((0x44 | (reg & 7) << 3) as u8);
+            self.b((scale << 6 | (index & 7) << 3 | (base & 7)) as u8);
+            self.b(0);
+        } else {
+            self.b((0x04 | (reg & 7) << 3) as u8);
+            self.b((scale << 6 | (index & 7) << 3 | (base & 7)) as u8);
+        }
+    }
+
+    // --- Moves and memory ------------------------------------------------------------
+
+    fn mov_rr(&mut self, dst: R, src: R) { self.op_rr(true, 0x89, src, dst); }
+
+    fn mov_imm(&mut self, dst: R, v: i64) {
+        if v == 0 {
+            self.op_rr(false, 0x31, dst, dst); // xor r32, r32
+        } else if v > 0 && v <= 0xffffffff {
+            self.rex(false, 0, 0, dst, false);
+            self.b((0xB8 + (dst & 7)) as u8);
+            self.u32(v as u32);
+        } else if v >= -(1 << 31) && v < 0 {
+            self.rex(true, 0, 0, dst, false);
+            self.b(0xC7);
+            self.modrm_reg(0, dst);
+            self.u32(v as u32);
+        } else {
+            self.rex(true, 0, 0, dst, false);
+            self.b((0xB8 + (dst & 7)) as u8);
+            self.u64(v as u64);
+        }
+    }
+
+    /// Reads size bytes zero-extended.
+    fn load(&mut self, size: i64, dst: R, base: R, disp: i64) {
+        if size == 1 { self.op_rm(true, 0x0FB6, dst, base, disp, false); }
+        else if size == 2 { self.op_rm(true, 0x0FB7, dst, base, disp, false); }
+        else if size == 4 { self.op_rm(false, 0x8B, dst, base, disp, false); }
+        else { self.op_rm(true, 0x8B, dst, base, disp, false); }
+    }
+
+    fn store(&mut self, size: i64, src: R, base: R, disp: i64) {
+        if size == 1 { self.op_rm(false, 0x88, src, base, disp, src >= 4 && src < 8); }
+        else if size == 2 {
+            self.b(0x66);
+            self.op_rm(false, 0x89, src, base, disp, false);
+        } else if size == 4 { self.op_rm(false, 0x89, src, base, disp, false); }
+        else { self.op_rm(true, 0x89, src, base, disp, false); }
+    }
+
+    fn store_zero(&mut self, size: i64, base: R, disp: i64) {
+        if size == 1 {
+            self.op_rm(false, 0xC6, 0, base, disp, false);
+            self.b(0);
+        } else if size == 2 {
+            self.b(0x66);
+            self.op_rm(false, 0xC7, 0, base, disp, false);
+            self.b(0);
+            self.b(0);
+        } else {
+            self.op_rm(size == 8, 0xC7, 0, base, disp, false);
+            self.u32(0);
+        }
+    }
+
+    fn lea(&mut self, dst: R, base: R, disp: i64) { self.op_rm(true, 0x8D, dst, base, disp, false); }
+
+    fn reloc(&mut self, kind: obj::RelocKind, sym: &String) {
+        self.relocs.push(Reloc { sec: obj::TEXT, off: self.code.len() as u32, kind, sym: *sym });
+    }
+
+    /// op reg, [rip + sym].
+    fn op_sym(&mut self, op: u32, reg: R, sym: &String) {
+        self.rex(true, reg, 0, 0, false);
+        self.ops(op);
+        self.b(((reg & 7) << 3 | 5) as u8);
+        self.reloc(obj::PC32, sym);
+        self.u32(0);
+    }
+
+    // --- Arithmetic ------------------------------------------------------------------
+
+    fn add(&mut self, dst: R, src: R) { self.op_rr(true, 0x01, src, dst); }
+    fn sub(&mut self, dst: R, src: R) { self.op_rr(true, 0x29, src, dst); }
+    fn and(&mut self, dst: R, src: R) { self.op_rr(true, 0x21, src, dst); }
+    fn or(&mut self, dst: R, src: R) { self.op_rr(true, 0x09, src, dst); }
+    fn xor(&mut self, dst: R, src: R) { self.op_rr(true, 0x31, src, dst); }
+    fn cmp(&mut self, x: R, y: R) { self.op_rr(true, 0x39, y, x); }
+    fn test(&mut self, x: R, y: R) { self.op_rr(true, 0x85, y, x); }
+    fn imul(&mut self, dst: R, src: R) { self.op_rr(true, 0x0FAF, dst, src); }
+
+    /// F7 /ext: not 2, neg 3, mul 4, div 6, idiv 7.
+    fn group3(&mut self, ext: R, x: R) { self.op_rr(true, 0xF7, ext, x); }
+
+    fn cqo(&mut self) {
+        self.b(0x48);
+        self.b(0x99);
+    }
+
+    /// Shifts by cl: shl 4, shr 5, sar 7.
+    fn shift_cl(&mut self, ext: R, x: R) { self.op_rr(true, 0xD3, ext, x); }
+
+    fn shift_imm(&mut self, ext: R, x: R, n: u32) {
+        self.op_rr(true, 0xC1, ext, x);
+        self.b(n as u8);
+    }
+
+    fn btc(&mut self, x: R, n: u32) {
+        self.op_rr(true, 0x0FBA, 7, x);
+        self.b(n as u8);
+    }
+
+    /// Group 1 op x, imm: add 0, or 1, and 4, sub 5, xor 6, cmp 7.
+    fn imm81(&mut self, ext: R, x: R, v: i64) {
+        if v >= -128 && v < 128 {
+            self.op_rr(true, 0x83, ext, x);
+            self.b(v as u8);
+            return;
+        }
+        self.op_rr(true, 0x81, ext, x);
+        self.u32(v as u32);
+    }
+
+    fn add_imm(&mut self, x: R, v: i64) { if v != 0 { self.imm81(0, x, v); } }
+
+    fn movsx(&mut self, dst: R, src: R, size: i64) {
+        if size == 1 {
+            self.rex(true, dst, 0, src, false);
+            self.ops(0x0FBE);
+            self.modrm_reg(dst, src);
+        } else if size == 2 { self.op_rr(true, 0x0FBF, dst, src); }
+        else if size == 4 { self.op_rr(true, 0x63, dst, src); }
+        else if dst != src { self.mov_rr(dst, src); }
+    }
+
+    fn movzx(&mut self, dst: R, src: R, size: i64) {
+        if size == 1 {
+            self.rex(true, dst, 0, src, false);
+            self.ops(0x0FB6);
+            self.modrm_reg(dst, src);
+        } else if size == 2 { self.op_rr(true, 0x0FB7, dst, src); }
+        else if size == 4 { self.op_rr(false, 0x89, src, dst); }
+        else if dst != src { self.mov_rr(dst, src); }
+    }
+
+    /// Sets the low byte of x to the condition.
+    fn setcc_byte(&mut self, c: C, x: R) {
+        self.rex(false, 0, 0, x, x >= 4 && x < 8);
+        self.ops(0x0F90 + c);
+        self.modrm_reg(0, x);
+    }
+
+    fn setcc(&mut self, c: C, x: R) {
+        self.setcc_byte(c, x);
+        self.movzx(x, x, 1);
+    }
+
+    fn cmov(&mut self, c: C, dst: R, src: R) { self.op_rr(true, 0x0F40 + c, dst, src); }
+
+    // --- Control flow ----------------------------------------------------------------
+
+    fn fix(&mut self, l: usize) {
+        self.fixups.push(Fixup { at: self.code.len(), label: l });
+        self.u32(0);
+    }
+
+    fn jmp(&mut self, l: usize) {
+        self.b(0xE9);
+        self.fix(l);
+    }
+
+    fn jcc(&mut self, c: C, l: usize) {
+        self.b(0x0F);
+        self.b((0x80 + c) as u8);
+        self.fix(l);
+    }
+
+    fn call(&mut self, sym: &String) {
+        self.b(0xE8);
+        self.reloc(obj::CALL32, sym);
+        self.u32(0);
+        self.note_call();
+    }
+
+    fn call_r(&mut self, x: R) {
+        self.rex(false, 0, 0, x, false);
+        self.b(0xFF);
+        self.modrm_reg(2, x);
+        self.note_call();
+    }
+
+    fn jmp_r(&mut self, x: R) {
+        self.rex(false, 0, 0, x, false);
+        self.b(0xFF);
+        self.modrm_reg(4, x);
+    }
+
+    fn note_call(&mut self) { self.calls.push((self.code.len() as u64) << 32 | (self.tag + 1) as u64); }
+    fn ret(&mut self) { self.b(0xC3); }
+
+    fn ud2(&mut self) {
+        self.b(0x0F);
+        self.b(0x0B);
+    }
+
+    fn push(&mut self, x: R) {
+        self.rex(false, 0, 0, x, false);
+        self.b((0x50 + (x & 7)) as u8);
+    }
+
+    fn pop(&mut self, x: R) {
+        self.rex(false, 0, 0, x, false);
+        self.b((0x58 + (x & 7)) as u8);
+    }
+
+    // --- SSE -------------------------------------------------------------------------
+
+    /// movq xmm, r (movd for 32 bits).
+    fn movq_to_x(&mut self, x: R, g: R, f64: bool) {
+        self.b(0x66);
+        self.rex(f64, x, 0, g, false);
+        self.ops(0x0F6E);
+        self.modrm_reg(x, g);
+    }
+
+    fn movq_from_x(&mut self, g: R, x: R, f64: bool) {
+        self.b(0x66);
+        self.rex(f64, x, 0, g, false);
+        self.ops(0x0F7E);
+        self.modrm_reg(x, g);
+    }
+
+    fn sse(&mut self, prefix: u8, op: u32, w: bool, reg: R, rm: R) {
+        self.b(prefix);
+        self.rex(w, reg, 0, rm, false);
+        self.ops(0x0F00 | op);
+        self.modrm_reg(reg, rm);
+    }
+
+    /// movaps dst, src.
+    fn movaps(&mut self, dst: R, src: R) {
+        if dst == src { return; }
+        self.rex(false, dst, 0, src, false);
+        self.ops(0x0F28);
+        self.modrm_reg(dst, src);
+    }
+
+    /// addsd 0x58, mulsd 0x59, subsd 0x5C, divsd 0x5E (ss for f32).
+    fn farith(&mut self, op: u32, dst: R, src: R, f64: bool) { self.sse(if f64 { 0xF2 } else { 0xF3 }, op, false, dst, src); }
+
+    fn ucomis(&mut self, x: R, y: R, f64: bool) {
+        if f64 { self.b(0x66); }
+        self.rex(false, x, 0, y, false);
+        self.ops(0x0F2E);
+        self.modrm_reg(x, y);
+    }
+
+    fn cvtsi2s(&mut self, x: R, g: R, f64: bool) { self.sse(if f64 { 0xF2 } else { 0xF3 }, 0x2A, true, x, g); }
+    fn cvtts2si(&mut self, g: R, x: R, f64: bool) { self.sse(if f64 { 0xF2 } else { 0xF3 }, 0x2C, true, g, x); }
+}
+
+impl Amd64 {
+    /// Loads the C argument registers of a 6-argument internal routine
+    /// (scan_words) into rax, rsi, rdx, rcx, r8, r9.
+    fn routine_args6(&mut self) {
+        let a = self.a;
+        if self.win64 {
+            a.mov_rr(RAX, RCX);
+            a.mov_rr(RSI, RDX);
+            a.mov_rr(RDX, R8);
+            a.mov_rr(RCX, R9);
+            a.load(8, R8, RSP, 40);
+            a.load(8, R9, RSP, 48);
+        } else {
+            a.mov_rr(RAX, RDI);
+        }
+    }
+
+    // dst = a op b for add, sub, and, or, xor and mul.
+    fn alu(&mut self, op: lm::Op, d: R, x: R, y: R) {
+        let a = self.a;
+        let commutes = op != lm::SUB;
+        if d == x {
+            self.alu2(op, d, y);
+        } else if d == y {
+            if commutes {
+                self.alu2(op, d, x);
+            } else {
+                // d = x - d
+                a.group3(3, d);
+                a.add(d, x);
+            }
+        } else {
+            a.mov_rr(d, x);
+            self.alu2(op, d, y);
+        }
+    }
+
+    fn alu2(&mut self, op: lm::Op, d: R, y: R) {
+        let a = self.a;
+        if op == lm::ADD { a.add(d, y); }
+        else if op == lm::SUB { a.sub(d, y); }
+        else if op == lm::AND { a.and(d, y); }
+        else if op == lm::OR { a.or(d, y); }
+        else if op == lm::XOR { a.xor(d, y); }
+        else if op == lm::MUL { a.imul(d, y); }
+    }
+
+    // Shifts: the count must be in cl (rcx is V2).
+    fn shift(&mut self, ext: R, d: R, x: R, y: R) {
+        let a = self.a;
+        if y == RCX && d == x && d != RCX {
+            a.shift_cl(ext, d);
+            return;
+        }
+        // The value in r9 (rdx if r9 is the count); the count swapped into
+        // rcx and back.
+        let val = if y == R9 { RDX } else { R9 };
+        if x != val { a.mov_rr(val, x); }
+        if y != RCX { self.xchg(RCX, y); }
+        a.shift_cl(ext, val);
+        if y != RCX { self.xchg(RCX, y); }
+        if d != val { a.mov_rr(d, val); }
+    }
+
+    fn xchg(&mut self, x: R, y: R) { self.a.op_rr(true, 0x87, x, y); }
+
+    // Division: the dividend in rdx:rax. rax is kept unless it is the
+    // destination; a signed division by -1 does not trap (x86's idiv
+    // faults on MIN / -1): the quotient wraps, the remainder is 0.
+    fn divide(&mut self, signed: bool, rem: bool, d: R, x: R, y: R) {
+        let a = self.a;
+        let mut dv = y;
+        if dv == RAX || dv == RDX {
+            a.mov_rr(R9, dv);
+            dv = R9;
+        }
+        let done = a.new_label();
+        if signed {
+            let normal = a.new_label();
+            a.imm81(7, dv, -1);
+            a.jcc(CNE, normal);
+            if rem {
+                a.mov_imm(d, 0);
+            } else {
+                if d != x { a.mov_rr(d, x); }
+                a.group3(3, d);
+            }
+            a.jmp(done);
+            a.bind(normal);
+        }
+        if d != RAX { a.push(RAX); }
+        if x != RAX { a.mov_rr(RAX, x); }
+        if signed {
+            a.cqo();
+            a.group3(7, dv);
+        } else {
+            a.mov_imm(RDX, 0);
+            a.group3(6, dv);
+        }
+        let res = if rem { RDX } else { RAX };
+        if d != RAX {
+            a.mov_rr(d, res);
+            a.pop(RAX);
+        } else if res != RAX {
+            a.mov_rr(RAX, res);
+        }
+        a.bind(done);
+    }
+
+    /// Pushes nothing: reserves bytes below rsp (a multiple of 16).
+    fn sub_rsp(&mut self, n: i64) { if n > 0 { self.a.imm81(5, RSP, n); } }
+    fn add_rsp(&mut self, n: i64) { if n > 0 { self.a.imm81(0, RSP, n); } }
+}
+
+impl Machine for Amd64 {
+    // The buffers are reused from one function to the next.
+    fn begin(&mut self) {
+        self.a.code.clear();
+        self.a.labels.clear();
+        self.a.fixups.clear();
+        self.a.relocs = Vec::new();
+        self.a.calls = Vec::new();
+        self.a.tag = 0;
+    }
+
+    fn finish(&mut self) -> Code {
+        let err = self.a.finish();
+        if err.len() > 0 { return Code { code: Vec::new(), relocs: Vec::new(), calls: Vec::new(), err }; }
+        let relocs = self.a.relocs;
+        self.a.relocs = Vec::new();
+        let calls = self.a.calls;
+        self.a.calls = Vec::new();
+        Code { code: self.a.code.clone(), relocs, calls, err }
+    }
+
+    fn offset(&self) -> usize { self.a.code.len() }
+
+    fn set_tag(&mut self, tag: i64) { self.a.tag = tag; }
+
+    fn new_label(&mut self) -> LLabel { self.a.new_label() }
+    fn bind(&mut self, l: LLabel) { self.a.bind(l); }
+
+    fn prologue(&mut self, frame: i64) {
+        self.a.push(RBP);
+        self.a.mov_rr(RBP, RSP);
+        self.sub_rsp(frame);
+    }
+
+    fn ret(&mut self) {
+        self.a.mov_rr(RSP, RBP);
+        self.a.pop(RBP);
+        self.a.ret();
+    }
+
+    // The entry point never returns (it calls exit), so the C
+    // callee-saved registers need no saving.
+    fn entry_prologue(&mut self, frame: i64) { self.prologue(frame); }
+
+    fn entry_return0(&mut self) {
+        self.a.mov_imm(RAX, 0);
+        self.ret();
+    }
+
+    fn entry_args(&mut self) {
+        self.a.store(8, c_arg(self.win64, 0), RSP, 0);
+        self.a.store(8, c_arg(self.win64, 1), RSP, 8);
+    }
+
+    fn mov_imm(&mut self, x: lm::Reg, v: i64) { self.a.mov_imm(r(x), v); }
+
+    fn mov(&mut self, dst: lm::Reg, src: lm::Reg) { if r(dst) != r(src) { self.a.mov_rr(r(dst), r(src)); } }
+
+    fn load(&mut self, size: i64, dst: lm::Reg, base: lm::Reg, off: i64) { self.a.load(size, r(dst), r(base), off); }
+    fn store(&mut self, size: i64, src: lm::Reg, base: lm::Reg, off: i64) { self.a.store(size, r(src), r(base), off); }
+    fn store_zero(&mut self, size: i64, base: lm::Reg, off: i64) { self.a.store_zero(size, r(base), off); }
+
+    fn addr_of(&mut self, dst: lm::Reg, base: lm::Reg, off: i64) {
+        if off == 0 {
+            if r(dst) != r(base) { self.a.mov_rr(r(dst), r(base)); }
+            return;
+        }
+        self.a.lea(r(dst), r(base), off);
+    }
+
+    fn add_imm(&mut self, x: lm::Reg, v: i64) {
+        if v >= -(1 << 31) && v < 1 << 31 {
+            self.a.add_imm(r(x), v);
+            return;
+        }
+        if r(x) == R9 { panic("amd64: add_imm of r9 out of range"); }
+        self.a.mov_imm(R9, v);
+        self.a.add(r(x), R9);
+    }
+
+    fn adr_sym(&mut self, dst: lm::Reg, sym: &String) { self.a.op_sym(0x8D, r(dst), sym); }
+    fn load_sym(&mut self, dst: lm::Reg, sym: &String) { self.a.op_sym(0x8B, r(dst), sym); }
+    fn sign_ext(&mut self, dst: lm::Reg, src: lm::Reg, size: i64) { self.a.movsx(r(dst), r(src), size); }
+    fn zero_ext(&mut self, dst: lm::Reg, src: lm::Reg, size: i64) { self.a.movzx(r(dst), r(src), size); }
+
+    // dst = c + x*y through a clobberable register (I2 or T1).
+    fn mul_add(&mut self, dst: lm::Reg, x: lm::Reg, y: lm::Reg, c: lm::Reg) {
+        let a = self.a;
+        let d = r(dst);
+        let n = r(x);
+        let k = r(y);
+        let cc = r(c);
+        let mut t = R9;
+        if (k == R9 || k == RDX) && k != cc && k != d { t = k; }
+        else if (n == R9 || n == RDX) && n != cc && n != d { t = n; }
+        else if n == R9 || k == R9 || cc == R9 || d == R9 { t = RDX; }
+        if t == k { a.imul(t, n); }
+        else if t == n { a.imul(t, k); }
+        else {
+            a.mov_rr(t, n);
+            a.imul(t, k);
+        }
+        if d != cc { a.mov_rr(d, cc); }
+        a.add(d, t);
+    }
+
+    fn neg(&mut self, dst: lm::Reg, src: lm::Reg) {
+        if r(dst) != r(src) { self.a.mov_rr(r(dst), r(src)); }
+        self.a.group3(3, r(dst));
+    }
+
+    fn not(&mut self, dst: lm::Reg, src: lm::Reg) {
+        if r(dst) != r(src) { self.a.mov_rr(r(dst), r(src)); }
+        self.a.group3(2, r(dst));
+    }
+
+    fn cmp(&mut self, x: lm::Reg, y: lm::Reg) { self.a.cmp(r(x), r(y)); }
+
+    fn cmp_imm(&mut self, x: lm::Reg, v: i64) {
+        if v >= -(1 << 31) && v < 1 << 31 {
+            self.a.imm81(7, r(x), v);
+            return;
+        }
+        self.a.mov_imm(R9, v);
+        self.a.cmp(r(x), R9);
+    }
+
+    fn set_cond(&mut self, dst: lm::Reg, c: lm::Cond) { self.a.setcc(cond(c), r(dst)); }
+    fn branch_if(&mut self, c: lm::Cond, l: LLabel) { self.a.jcc(cond(c), l); }
+
+    fn select_reg(&mut self, dst: lm::Reg, x: lm::Reg, y: lm::Reg, c: lm::Cond) {
+        let a = self.a;
+        let d = r(dst);
+        let n = r(x);
+        let k = r(y);
+        let cc = cond(c);
+        if d == n && d == k { return; }
+        if d == n {
+            a.cmov(cc ^ 1, d, k);
+            return;
+        }
+        if d != k { a.mov_rr(d, k); }
+        a.cmov(cc, d, n);
+    }
+
+    fn jump(&mut self, l: LLabel) { self.a.jmp(l); }
+
+    fn branch_zero(&mut self, x: lm::Reg, l: LLabel) {
+        self.a.test(r(x), r(x));
+        self.a.jcc(CE, l);
+    }
+
+    fn branch_non_zero(&mut self, x: lm::Reg, l: LLabel) {
+        self.a.test(r(x), r(x));
+        self.a.jcc(CNE, l);
+    }
+
+    fn fmov_to(&mut self, f: lm::Reg, x: lm::Reg, f64: bool) { self.a.movq_to_x(r(f), r(x), f64); }
+    fn fmov_from(&mut self, x: lm::Reg, f: lm::Reg, f64: bool) { self.a.movq_from_x(r(x), r(f), f64); }
+
+    // Flips the sign bit through r9.
+    fn fneg(&mut self, dst: lm::Reg, src: lm::Reg, f64: bool) {
+        let a = self.a;
+        a.movq_from_x(R9, r(src), f64);
+        a.btc(R9, if f64 { 63 } else { 31 });
+        a.movq_to_x(r(dst), R9, f64);
+    }
+
+    fn call(&mut self, sym: &String) { self.a.call(sym); }
+    fn call_reg(&mut self, x: lm::Reg) { self.a.call_r(r(x)); }
+    fn trap(&mut self) { self.a.ud2(); }
+
+    // Unsigned values with the top bit set are halved (keeping the low
+    // bit for rounding), converted and doubled.
+    fn int_to_float(&mut self, f: lm::Reg, x: lm::Reg, signed: bool, f64: bool) {
+        let a = self.a;
+        let fr = r(f);
+        let n = r(x);
+        if signed {
+            a.cvtsi2s(fr, n, f64);
+            return;
+        }
+        let big = a.new_label();
+        let done = a.new_label();
+        a.test(n, n);
+        a.jcc(CS, big);
+        a.cvtsi2s(fr, n, f64);
+        a.jmp(done);
+        a.bind(big);
+        a.mov_rr(R9, n);
+        a.shift_imm(5, R9, 1);
+        a.mov_rr(RDX, n);
+        a.imm81(4, RDX, 1);
+        a.or(R9, RDX);
+        a.cvtsi2s(fr, R9, f64);
+        a.farith(0x58, fr, fr, f64);
+        a.bind(done);
+    }
+
+    // Rust's saturating conversion on top of cvttsd2si, which yields
+    // 0x8000000000000000 for NaN and values out of range. Clobbers r9,
+    // xmm14 and xmm15.
+    fn float_to_int(&mut self, x: lm::Reg, f: lm::Reg, signed: bool, f64: bool) {
+        let a = self.a;
+        let d = r(x);
+        let fr = r(f);
+        let done = a.new_label();
+        let zero = a.new_label();
+        if signed {
+            a.cvtts2si(d, fr, f64);
+            a.mov_imm(R9, -9223372036854775807 - 1);
+            a.cmp(d, R9);
+            a.jcc(CNE, done);
+            a.ucomis(fr, fr, f64);
+            a.jcc(CP, zero);
+            a.movq_from_x(R9, fr, f64);
+            if f64 { a.test(R9, R9); } else { a.op_rr(false, 0x85, R9, R9); }
+            a.jcc(CS, done); // negative: the minimum is right
+            a.mov_imm(d, 9223372036854775807);
+            a.jmp(done);
+            a.bind(zero);
+            a.mov_imm(d, 0);
+            a.bind(done);
+            return;
+        }
+        let big = a.new_label();
+        let max = a.new_label();
+        a.ucomis(fr, fr, f64);
+        a.jcc(CP, zero);
+        // xmm15 = 2^63
+        if f64 { a.mov_imm(R9, 0x43E0000000000000); } else { a.mov_imm(R9, 0x5F000000); }
+        a.movq_to_x(XMM15, R9, f64);
+        a.ucomis(fr, XMM15, f64);
+        a.jcc(CAE, big);
+        a.cvtts2si(d, fr, f64);
+        a.test(d, d);
+        a.jcc(CNS, done);
+        a.jmp(zero);
+        a.bind(big);
+        a.movaps(XMM14, fr);
+        a.farith(0x5C, XMM14, XMM15, f64);
+        a.cvtts2si(d, XMM14, f64);
+        a.mov_imm(R9, -9223372036854775807 - 1);
+        a.cmp(d, R9);
+        a.jcc(CE, max);
+        a.btc(d, 63);
+        a.jmp(done);
+        a.bind(max);
+        a.mov_imm(d, -1);
+        a.jmp(done);
+        a.bind(zero);
+        a.mov_imm(d, 0);
+        a.bind(done);
+    }
+
+    fn float_conv(&mut self, dst: lm::Reg, src: lm::Reg, to_f64: bool) {
+        if to_f64 { self.a.sse(0xF3, 0x5A, false, r(dst), r(src)); } else { self.a.sse(0xF2, 0x5A, false, r(dst), r(src)); }
+    }
+
+    fn arith(&mut self, op: lm::Op, dst: lm::Reg, x: lm::Reg, y: lm::Reg) {
+        let d = r(dst);
+        let n = r(x);
+        let k = r(y);
+        if op == lm::SHL { self.shift(4, d, n, k); }
+        else if op == lm::SHR_U { self.shift(5, d, n, k); }
+        else if op == lm::SHR_S { self.shift(7, d, n, k); }
+        else if op == lm::DIV_S { self.divide(true, false, d, n, k); }
+        else if op == lm::DIV_U { self.divide(false, false, d, n, k); }
+        else if op == lm::REM_S { self.divide(true, true, d, n, k); }
+        else if op == lm::REM_U { self.divide(false, true, d, n, k); }
+        else { self.alu(op, d, n, k); }
+    }
+
+    // The result is made in r9 (moves keep the flags).
+    fn arith_ovf(&mut self, op: lm::Op, signed: bool, dst: lm::Reg, x: lm::Reg, y: lm::Reg, ovf: LLabel) {
+        let a = self.a;
+        let d = r(dst);
+        let n = r(x);
+        let mut k = r(y);
+        if op == lm::MUL && !signed {
+            if k == RAX || k == RDX {
+                a.mov_rr(R9, k);
+                k = R9;
+            }
+            if d != RAX { a.push(RAX); }
+            if n != RAX { a.mov_rr(RAX, n); }
+            a.group3(4, k);
+            a.mov_rr(R9, RAX);
+            a.test(RDX, RDX);
+            if d != RAX { a.pop(RAX); }
+            a.mov_rr(d, R9);
+            a.jcc(CNE, ovf);
+            return;
+        }
+        let acc = if k == R9 && op == lm::SUB { RDX } else { R9 };
+        if k == acc {
+            // add or mul commute
+            if op == lm::ADD { a.add(acc, n); } else { a.imul(acc, n); }
+        } else {
+            if n != acc { a.mov_rr(acc, n); }
+            if op == lm::ADD { a.add(acc, k); } else if op == lm::SUB { a.sub(acc, k); } else { a.imul(acc, k); }
+        }
+        if d != acc { a.mov_rr(d, acc); }
+        if signed || op == lm::MUL { a.jcc(CO, ovf); } else { a.jcc(CB, ovf); }
+    }
+
+    fn farith(&mut self, op: lm::Op, dst: lm::Reg, x: lm::Reg, y: lm::Reg, f64: bool) {
+        let a = self.a;
+        let d = r(dst);
+        let n = r(x);
+        let k = r(y);
+        let code = if op == lm::ADD { 0x58 } else if op == lm::SUB { 0x5C } else if op == lm::MUL { 0x59 } else { 0x5E };
+        if d == n {
+            a.farith(code, d, k, f64);
+        } else if d == k {
+            a.movaps(XMM15, n);
+            a.farith(code, XMM15, k, f64);
+            a.movaps(d, XMM15);
+        } else {
+            a.movaps(d, n);
+            a.farith(code, d, k, f64);
+        }
+    }
+
+    // ucomis sets ZF, PF and CF for unordered: > is "above", >= "above or
+    // equal" (both false for NaN), < and <= swap the operands, == needs ZF
+    // and not PF, != ZF clear or PF.
+    fn fcompare(&mut self, dst: lm::Reg, c: lm::Cond, x: lm::Reg, y: lm::Reg, f64: bool) {
+        let a = self.a;
+        let d = r(dst);
+        let n = r(x);
+        let k = r(y);
+        if c == lm::GT {
+            a.ucomis(n, k, f64);
+            a.setcc(CA, d);
+        } else if c == lm::GE {
+            a.ucomis(n, k, f64);
+            a.setcc(CAE, d);
+        } else if c == lm::LT {
+            a.ucomis(k, n, f64);
+            a.setcc(CA, d);
+        } else if c == lm::LE {
+            a.ucomis(k, n, f64);
+            a.setcc(CAE, d);
+        } else if c == lm::EQ {
+            a.ucomis(n, k, f64);
+            a.setcc(CE, d);
+            a.setcc(CNP, R9);
+            a.and(d, R9);
+        } else {
+            a.ucomis(n, k, f64);
+            a.setcc(CNE, d);
+            a.setcc(CP, R9);
+            a.or(d, R9);
+        }
+    }
+
+    // The arguments are at sp+8*i. Stack arguments (beyond the registers;
+    // all from the fifth on Windows) go below them, with Windows' 32-byte
+    // shadow area; al counts the vector registers (System V varargs).
+    fn call_c(&mut self, sym: &str, fn_reg: lm::Reg, args: &Vec<CArg>, float_ret: bool, f64: bool) {
+        let a = self.a;
+        let win = self.win64;
+        if sym.len() == 0 && r(fn_reg) != R11 { a.mov_rr(R11, r(fn_reg)); }
+        // Where each argument goes: a register (>= 0) or a stack slot.
+        let mut nstack = 0;
+        let mut ints = 0;
+        let mut floats = 0;
+        let mut place: Vec<i64> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            if win {
+                if i < 4 { place.push(i as i64); } else {
+                    place.push(-1 - nstack);
+                    nstack += 1;
+                }
+            } else if args[i].float {
+                if floats < 8 {
+                    place.push(floats);
+                    floats += 1;
+                } else {
+                    place.push(-1 - nstack);
+                    nstack += 1;
+                }
+            } else if ints < 6 {
+                place.push(ints);
+                ints += 1;
+            } else {
+                place.push(-1 - nstack);
+                nstack += 1;
+            }
+            i += 1;
+        }
+        let shadow = if win { 32 } else { 0 };
+        let reserve = if nstack > 0 || win { (shadow + 8 * nstack + 15) / 16 * 16 } else { 0 };
+        self.sub_rsp(reserve);
+        i = 0;
+        while i < args.len() {
+            let src = reserve + (8 * i) as i64;
+            let p = place[i];
+            if p < 0 {
+                a.load(8, RAX, RSP, src);
+                a.store(8, RAX, RSP, shadow + 8 * (-1 - p));
+            } else if args[i].float {
+                a.load(8, RAX, RSP, src);
+                a.movq_to_x(p as R, RAX, args[i].f64);
+            } else {
+                a.load(8, c_arg(win, p as usize), RSP, src);
+            }
+            i += 1;
+        }
+        if !win { a.mov_imm(RAX, floats); }
+        if sym.len() > 0 { a.call(&sym.to_string()); } else { a.call_r(R11); }
+        self.add_rsp(reserve);
+        if float_ret { a.movq_from_x(RAX, 0, f64); }
+    }
+
+    fn copy_words(&mut self, dst: lm::Reg, src: lm::Reg, n: i64) {
+        let a = self.a;
+        let d = r(dst);
+        let s = r(src);
+        a.mov_imm(RCX, n);
+        let lp = a.new_label();
+        a.bind(lp);
+        a.load(8, RDX, s, 0);
+        a.store(8, RDX, d, 0);
+        a.add_imm(s, 8);
+        a.add_imm(d, 8);
+        a.imm81(5, RCX, 1);
+        a.jcc(CNE, lp);
+    }
+
+    // rdi (CTX) = list head. Uses rbx/r12 (saved) to survive the calls;
+    // the frame has the standard fixed slots, with an empty defer list at
+    // rbp-32 so unwinding can walk through it.
+    fn run_defers(&mut self) {
+        let a = self.a;
+        a.push(RBP);
+        a.mov_rr(RBP, RSP);
+        a.imm81(5, RSP, 48);
+        a.store(8, RBX, RBP, -8);
+        a.store(8, R12, RBP, -16);
+        a.store_zero(8, RBP, -32);
+        a.mov_rr(RBX, RDI);
+        let lp = a.new_label();
+        let done = a.new_label();
+        let copy_loop = a.new_label();
+        let copied = a.new_label();
+        a.bind(lp);
+        a.test(RBX, RBX);
+        a.jcc(CE, done);
+        a.load(8, R10, RBX, 24); // argsize
+        a.load(8, R11, RBX, 32); // retsize
+        a.mov_rr(RAX, R10);
+        a.add(RAX, R11);
+        a.add_imm(RAX, 15);
+        a.imm81(4, RAX, -16);
+        a.sub(RSP, RAX);
+        a.mov_rr(RDI, RSP);
+        a.lea(RSI, RBX, 48);
+        a.mov_rr(RCX, R10);
+        a.shift_imm(5, RCX, 3);
+        a.jcc(CE, copied);
+        a.bind(copy_loop);
+        a.load(8, RDX, RSI, 0);
+        a.store(8, RDX, RDI, 0);
+        a.add_imm(RSI, 8);
+        a.add_imm(RDI, 8);
+        a.imm81(5, RCX, 1);
+        a.jcc(CNE, copy_loop);
+        a.bind(copied);
+        a.mov_rr(R13, RSP);
+        a.add(R13, R10);
+        a.load(8, R15, RBX, 40);
+        a.load(8, RDI, RBX, 16);
+        a.load(8, RAX, RBX, 8);
+        a.load(8, R12, RBX, 0);
+        a.call_r(RAX);
+        a.lea(RSP, RBP, -48);
+        a.mov_rr(RBX, R12);
+        a.jmp(lp);
+        a.bind(done);
+        a.load(8, RBX, RBP, -8);
+        a.load(8, R12, RBP, -16);
+        a.mov_rr(RSP, RBP);
+        a.pop(RBP);
+        a.ret();
+    }
+
+    // V1 (rax) is always the old value's register.
+    fn atomic_cas(&mut self, old: lm::Reg, new: lm::Reg, addr: lm::Reg) {
+        let a = self.a;
+        if r(old) != RAX { panic("amd64: atomic_cas needs the old value in rax"); }
+        a.b(0xF0);
+        a.op_rm(true, 0x0FB1, r(new), r(addr), 0, false); // lock cmpxchg
+    }
+
+    fn atomic_add(&mut self, dst: lm::Reg, delta: lm::Reg, addr: lm::Reg) {
+        let a = self.a;
+        let d = r(dst);
+        if d == r(addr) { panic("amd64: atomic_add into its address register"); }
+        if d != r(delta) { a.mov_rr(d, r(delta)); }
+        a.b(0xF0);
+        a.op_rm(true, 0x0FC1, d, r(addr), 0, false); // lock xadd
+    }
+
+    fn atomic_load(&mut self, dst: lm::Reg, addr: lm::Reg) { self.a.load(8, r(dst), r(addr), 0); }
+
+    // xchg with memory is locked (sequentially consistent).
+    fn atomic_store(&mut self, src: lm::Reg, addr: lm::Reg) {
+        self.a.mov_rr(RDX, r(src));
+        self.a.op_rm(true, 0x87, RDX, r(addr), 0, false);
+    }
+
+    // Saves every general register in arm64's slots (see the top), records
+    // the stub's SP in the G (fourth word), clears the G's limit and calls
+    // sym; then moves SP and FP by the result and restores.
+    fn morestack(&mut self, sym: &str, dict: &str, loc: &str) {
+        let a = self.a;
+        a.push(RBP);
+        a.mov_rr(RBP, RSP);
+        a.imm81(5, RSP, 256);
+        self.morestack_slots(true);
+        a.store(8, RSP, R14, 24);
+        a.store_zero(8, R14, 0);
+        a.lea(R13, RSP, 240); // result slot: how far the stack moved
+        a.op_sym(0x8D, R15, &loc.to_string());
+        a.op_sym(0x8D, RDI, &dict.to_string());
+        a.call(&sym.to_string());
+        a.load(8, RAX, RSP, 240);
+        a.add(RSP, RAX);
+        a.add(RBP, RAX);
+        self.morestack_slots(false);
+        a.mov_rr(RSP, RBP);
+        a.pop(RBP);
+        a.ret();
+    }
+
+    // The entering function has not pushed its frame record yet: [rbp, the
+    // return address to its caller] becomes one here, as arm64's.
+    fn call_morestack(&mut self) {
+        self.a.push(RBP);
+        self.a.call(&"_navi_morestack".to_string());
+        self.a.pop(RBP);
+    }
+
+    fn mstart(&mut self, sym: &str, dict: &str, loc: &str) {
+        let a = self.a;
+        a.push(RBP);
+        a.mov_rr(RBP, RSP);
+        a.imm81(5, RSP, 64);
+        a.mov_rr(R14, c_arg(self.win64, 0));
+        a.mov_rr(R13, RSP);
+        a.op_sym(0x8D, R15, &loc.to_string());
+        a.op_sym(0x8D, RDI, &dict.to_string());
+        a.call(&sym.to_string());
+        a.ud2();
+    }
+
+    // buf: S k at 8k, G at 72, FP at 80, the return address at 88, SP (the
+    // caller's) at 96; returns 0.
+    fn set_jmp(&mut self) {
+        let a = self.a;
+        let buf = c_arg(self.win64, 0);
+        a.store(8, RBX, buf, 0);
+        a.store(8, R12, buf, 8);
+        a.store(8, R14, buf, 72);
+        a.store(8, RBP, buf, 80);
+        a.load(8, RAX, RSP, 0);
+        a.store(8, RAX, buf, 88);
+        a.lea(RAX, RSP, 8);
+        a.store(8, RAX, buf, 96);
+        a.mov_imm(RAX, 0);
+        a.ret();
+    }
+
+    // buf saved by set_jmp, v the value set_jmp returns again.
+    fn long_jmp(&mut self) {
+        let a = self.a;
+        let buf = c_arg(self.win64, 0);
+        a.mov_rr(RAX, c_arg(self.win64, 1));
+        a.load(8, RBX, buf, 0);
+        a.load(8, R12, buf, 8);
+        a.load(8, R14, buf, 72);
+        a.load(8, RBP, buf, 80);
+        a.load(8, R11, buf, 88);
+        a.load(8, RSP, buf, 96);
+        a.jmp_r(R11);
+    }
+
+    // std::rt::scan_words(p, hi, arena, next, pages, offs): returns the
+    // position after the next word in [p, hi) that points to an allocated,
+    // unmarked object, or 0. A leaf routine; rbx and r12 are pushed.
+    fn scan_words(&mut self) {
+        self.routine_args6();
+        let a = self.a;
+        // rax p, rsi hi, rdx arena, rcx next, r8 pages, r9 offs.
+        a.push(RBX);
+        a.push(R12);
+        a.mov_rr(R13, R9);
+        a.movzx(R13, R13, 1); // offsetof start
+        a.mov_rr(R15, R9);
+        a.shift_imm(5, R15, 8);
+        a.movzx(R15, R15, 1); // offsetof nelems
+        a.mov_rr(RBX, R9);
+        a.shift_imm(5, RBX, 24);
+        a.movzx(RBX, RBX, 1); // offsetof bits
+        a.shift_imm(5, R9, 16);
+        a.movzx(R9, R9, 1); // offsetof div_mul
+        let lp = a.new_label();
+        let one = a.new_label();
+        let have = a.new_label();
+        let done = a.new_label();
+        a.bind(lp);
+        a.lea(R10, RAX, 8);
+        a.cmp(R10, RSI);
+        a.jcc(CA, done);
+        a.load(8, R11, RAX, 0); // w
+        a.mov_rr(RAX, R10);
+        a.cmp(R11, RDX);
+        a.jcc(CB, lp);
+        a.cmp(R11, RCX);
+        a.jcc(CAE, lp);
+        a.mov_rr(R10, R11);
+        a.sub(R10, RDX);
+        a.shift_imm(5, R10, 13);
+        a.op_rx(true, 0x8B, R10, R8, R10, 3); // the span
+        a.test(R10, R10);
+        a.jcc(CE, lp);
+        a.op_rx(true, 0x8B, RDI, R10, R15, 0); // n
+        a.imm81(7, RDI, 1);
+        a.jcc(CE, one);
+        a.op_rx(true, 0x2B, R11, R10, R13, 0); // w - start
+        a.op_rx(true, 0x0FAF, R11, R10, R9, 0); // * div_mul
+        a.shift_imm(5, R11, 32); // the index
+        a.jmp(have);
+        a.bind(one);
+        a.mov_imm(R11, 0);
+        a.bind(have);
+        a.cmp(R11, RDI);
+        a.jcc(CAE, lp);
+        a.op_rx(true, 0x8B, R10, R10, RBX, 0); // bits
+        a.op_rx(true, 0x0FB6, R12, R10, R11, 0);
+        a.test(R12, R12);
+        a.jcc(CE, lp); // free
+        a.add(R10, RDI);
+        a.op_rx(true, 0x0FB6, R12, R10, R11, 0);
+        a.test(R12, R12);
+        a.jcc(CNE, lp); // marked
+        a.pop(R12);
+        a.pop(RBX);
+        a.ret();
+        a.bind(done);
+        a.mov_imm(RAX, 0);
+        a.pop(R12);
+        a.pop(RBX);
+        a.ret();
+    }
+
+    // save, load: (sp, fp, pc). The saved registers and the G register are
+    // kept in an 80-byte area on the stack being left and taken from the
+    // one resumed (a new thread starts with it reserved below its stack
+    // top, the G in its last word).
+    fn swap_context(&mut self) {
+        let a = self.a;
+        let save = c_arg(self.win64, 0);
+        let load = c_arg(self.win64, 1);
+        a.pop(RAX);
+        a.imm81(5, RSP, 80);
+        a.store(8, RBX, RSP, 0);
+        a.store(8, R12, RSP, 8);
+        a.store(8, R14, RSP, 72);
+        a.store(8, RSP, save, 0);
+        a.store(8, RBP, save, 8);
+        a.store(8, RAX, save, 16);
+        a.load(8, RSP, load, 0);
+        a.load(8, RBP, load, 8);
+        a.load(8, RAX, load, 16);
+        a.load(8, RBX, RSP, 0);
+        a.load(8, R12, RSP, 8);
+        a.load(8, R14, RSP, 72);
+        a.imm81(0, RSP, 80);
+        a.jmp_r(RAX);
+    }
+}
+
+impl Amd64 {
+    // The morestack stub's register slots (as arm64's x0-x17, x19-x28).
+    fn morestack_slots(&mut self, save: bool) {
+        let regs: [R; 15] = [RDI, RAX, RCX, RDX, RSI, R8, R9, R10, R13, R15, R11, RBX, R12, R14, RBP];
+        let offs: [i64; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 128, 136, 200, 208];
+        let mut i = 0;
+        while i < 14 {
+            if save { self.a.store(8, regs[i], RSP, offs[i]); } else { self.a.load(8, regs[i], RSP, offs[i]); }
+            i += 1;
+        }
+    }
+}

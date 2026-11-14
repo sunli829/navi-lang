@@ -7,9 +7,73 @@ use crate::diag::{Sink, Error};
 use crate::types;
 use std::path::Path;
 
-/// The #[cfg] settings for the host.
+/// The targets: os-arch.
+fn target_by_id(i: i64) -> &str {
+    match i {
+        0 => "macos-arm64",
+        1 => "macos-x64",
+        2 => "linux-x64",
+        3 => "linux-arm64",
+        4 => "windows-x64",
+        _ => "",
+    }
+}
+
+/// The target (an index of target_by_id): --target, else $NAVI_TARGET,
+/// else the host.
+static mut TARGET_ID: i64 = -1;
+
+/// Selects the target by name; false if there is no such target.
+pub fn set_target(name: &str) -> bool {
+    let mut i = 0;
+    while target_by_id(i).len() > 0 {
+        if target_by_id(i) == name {
+            TARGET_ID = i;
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The target's name (os-arch).
+pub fn target_name() -> String {
+    if TARGET_ID < 0 {
+        let host = `${host_os()}-${if host_arch() == "aarch64" { "arm64" } else { "x64" }}`;
+        let want = match std::env::var("NAVI_TARGET") { Ok(t) => t, Err(_) => host };
+        if !set_target(want.as_str()) {
+            eprintln(`navic: unknown target ${want} (${known_targets()})`);
+            std::process::exit(2);
+        }
+    }
+    target_by_id(TARGET_ID).to_string()
+}
+
+pub fn known_targets() -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while target_by_id(i).len() > 0 {
+        out.push(target_by_id(i).to_string());
+        i += 1;
+    }
+    out.join(", ")
+}
+
+/// The target's OS: macos, linux or windows.
+pub fn target_os() -> String {
+    let t = target_name();
+    t[0..t.find('-').unwrap()].to_string()
+}
+
+/// The target's architecture as objects name it: arm64 or amd64.
+pub fn target_arch() -> String {
+    if target_name().ends_with("-arm64") { "arm64".to_string() } else { "amd64".to_string() }
+}
+
+/// The #[cfg] settings for the target.
 pub fn host_config() -> Config {
-    Config { target_os: host_os().to_string(), target_arch: host_arch().to_string(), test: false, debug: true }
+    let arch = if target_arch() == "arm64" { "aarch64" } else { "x86_64" };
+    Config { target_os: target_os(), target_arch: arch.to_string(), test: false, debug: true }
 }
 
 #[cfg(target_os = "macos")]
@@ -169,7 +233,7 @@ pub struct Entry {
 
 pub fn main_entry(main: &mut resolve::Def) -> &Entry { &Entry { main: Some(main), tests: Vec::new(), bench: false } }
 
-/// Compiles a checked program into the object model for arm64 macOS.
+/// Compiles a checked program into the object model for the target.
 pub fn code(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Result<&mut crate::obj::Object, String> {
     let mut roots: Vec<&mut resolve::Def> = Vec::new();
     match entry.main {
@@ -184,23 +248,42 @@ pub fn code(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Resu
     phase("mir");
     let plan = crate::codegen::build_plan(prog, entry.main, mf);
     phase("plan");
-    let tgt = crate::backend::lower::TargetConv { c_prefix: "_".to_string(), write: "write".to_string() };
-    let o = crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine() }, tgt, debug);
+    let os = target_os();
+    let arm = target_arch() == "arm64";
+    let tgt = crate::backend::lower::TargetConv {
+        c_prefix: if os == "macos" { "_".to_string() } else { String::new() },
+        write: if os == "windows" { "_write".to_string() } else { "write".to_string() },
+        os: os.clone(),
+        num_saved: if arm { 9 } else { 2 },
+        code_unit: if arm { 4 } else { 1 },
+    };
+    let o = if arm {
+        crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine() }, tgt, debug)
+    } else if os == "windows" {
+        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(true) }, tgt, debug)
+    } else {
+        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(false) }, tgt, debug)
+    };
     phase("codegen");
     o
 }
 
-/// Compiles a checked program into a Mach-O object file for arm64 macOS.
+/// Compiles a checked program into an object file for the target.
 pub fn object(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Result<Vec<u8>, String> {
     let o = code(info, entry, debug)?;
-    crate::macho::write(o)
+    let os = target_os();
+    if os == "macos" { return crate::macho::write(o); }
+    Err(`navic: no object files for ${target_name()} yet`)
 }
 
 /// Compiles a checked program into the executable out with navic's own
-/// linker (NAVI_LINKER=cc uses the system linker instead).
+/// linker (NAVI_LINKER=cc, and targets it does not handle, use the system
+/// linker instead).
 pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, debug: bool) -> Result<(), String> {
     let use_cc = match std::env::var("NAVI_LINKER") { Ok(v) => v == "cc", Err(_) => false };
-    if !use_cc {
+    let os = target_os();
+    let own = os == "macos" && target_arch() == "arm64";
+    if own && !use_cc {
         let o = code(info, entry, debug)?;
         let exe = crate::link::link(o, util::path_base(out).as_str())?;
         if let Err(e) = write_new(out, exe.as_slice()) { return Err(`${e}`); }
@@ -209,10 +292,16 @@ pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, debug: 
         return Ok(());
     }
     let data = object(info, entry, debug)?;
-    let obj_path = `${out}.navi.o`;
+    let obj_path = if os == "windows" { `${out}.navi.obj` } else { `${out}.navi.o` };
     if let Err(e) = std::fs::write(obj_path.as_str(), data.as_slice()) { return Err(`${e}`); }
-    let st = std::process::Command::new("cc").arg("-arch").arg("arm64").arg("-o").arg(out).arg(obj_path.as_str()).status();
+    let _ = std::fs::remove_file(out);
+    let mut cmd = std::process::Command::new(if os == "windows" { "clang" } else { "cc" });
+    if os == "macos" { cmd.arg("-arch").arg(if target_arch() == "arm64" { "arm64" } else { "x86_64" }); }
+    cmd.arg("-o").arg(out).arg(obj_path.as_str());
+    if os == "linux" { cmd.arg("-lm"); }
+    let st = cmd.status();
     let _ = std::fs::remove_file(obj_path.as_str());
+    phase("link");
     match st {
         Ok(s) => if s.success() { Ok(()) } else { Err(`link: cc exited with status ${s.code().unwrap()}`) },
         Err(e) => Err(`link: ${e}`),
@@ -242,12 +331,21 @@ pub fn build_command(args: &Vec<String>) -> i32 {
             "-c" => obj_only = true,
             "-timings" => TIMINGS = true,
             "-a" => force = true,
+            "--target" => {
+                if i + 1 < args.len() {
+                    if !set_target(args[i + 1].as_str()) {
+                        eprintln(`navic: unknown target ${args[i + 1]} (${known_targets()})`);
+                        return 2;
+                    }
+                    i += 1;
+                }
+            }
             _ => paths.push(args[i].clone()),
         }
         i += 1;
     }
     if paths.len() != 1 {
-        eprintln("usage: navic build [-o output] [--release] [-c] [-a] [-timings] <crate or file>");
+        eprintln("usage: navic build [-o output] [--release] [--target os-arch] [-c] [-a] [-timings] <crate or file>");
         return 2;
     }
     let spec = match load_crate(paths[0].as_str()) {
@@ -255,7 +353,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
         Err(e) => { eprintln(e); return 1; }
     };
     if out.len() == 0 { out = if obj_only { `${spec.name}.o` } else { spec.name.clone() }; }
-    let key = crate::cache::key(`${if obj_only { "obj" } else { "exe" }} release=${release}`.as_str(), paths[0].as_str());
+    let key = crate::cache::key(`${if obj_only { "obj" } else { "exe" }} release=${release} target=${target_name()}`.as_str(), paths[0].as_str());
     if let Some(k) = key {
         if !force && crate::cache::lookup(k.as_str(), out.as_str()) {
             if !obj_only { chmod_x(out.as_str()); }
