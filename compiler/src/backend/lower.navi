@@ -1043,15 +1043,26 @@ impl FnGen {
             self.blocks.push(m.new_label());
             i += 1;
         }
+        let refs = local_refs(f);
         let mut bi = 0;
         while bi < f.blocks.len() {
             m.bind(self.blocks[bi]);
             let b = f.blocks[bi];
+            // A block ending in a comparison only its switch reads compares
+            // and branches (the bool is not made).
+            let fused = fused_compare(b, &refs);
             let mut si = 0;
-            while si < b.stmts.len() {
+            let n = if fused { b.stmts.len() - 1 } else { b.stmts.len() };
+            while si < n {
                 if self.g.debug { self.note_line(stmt_pos(&b.stmts[si])); }
                 self.stmt(bi, si, &b.stmts[si]);
                 si += 1;
+            }
+            if fused {
+                if self.g.debug { self.note_line(stmt_pos(&b.stmts[n])); }
+                self.compare_branch(bi, &b.stmts[n], &b.term);
+                bi += 1;
+                continue;
             }
             if self.g.debug { self.note_line(term_pos(&b.term)); }
             self.term(bi, &b.term);
@@ -1224,14 +1235,20 @@ impl FnGen {
             let o = bi * words;
             let mut w = 0;
             while w < words {
-                let mut k = 0;
-                while k < 64 {
-                    let l = w * 64 + k;
-                    if l < n {
-                        if (live_in[o + w] >> k as u32) & 1 != 0 { lv.touch_at(l, starts[bi]); }
-                        if (live_out[o + w] >> k as u32) & 1 != 0 { lv.touch_at(l, ends[bi]); }
-                    }
-                    k += 1;
+                // Only the set bits (most words are 0).
+                let mut bits = live_in[o + w];
+                let mut l = w * 64;
+                while bits != 0 {
+                    if bits & 1 != 0 { lv.touch_at(l, starts[bi]); }
+                    bits = bits >> 1;
+                    l += 1;
+                }
+                bits = live_out[o + w];
+                l = w * 64;
+                while bits != 0 {
+                    if bits & 1 != 0 { lv.touch_at(l, ends[bi]); }
+                    bits = bits >> 1;
+                    l += 1;
                 }
                 w += 1;
             }
@@ -2029,6 +2046,33 @@ impl FnGen {
         m.store(4, V1, SP, off + 16);
         m.mov_imm(V1, col);
         m.store(4, V1, SP, off + 24);
+    }
+
+    // A block's last statement `t = x op y` (an integer comparison) and its
+    // switch on t: compares and branches.
+    fn compare_branch(&mut self, bi: usize, st: &Stmt, t: &Term) {
+        let m = self.m;
+        let (op, x, y, ty0) = match st { Stmt::Assign { rv: Rvalue::Bin { op, x, y, ty, .. }, .. } => (*op, x, y, *ty), _ => return };
+        let (vals, targets, els) = match t { Term::Switch { vals, targets, els, .. } => (vals, targets, *els), _ => return };
+        let ty = self.conc(ty0);
+        self.load_scalar(x, V1);
+        self.load_scalar(y, V2);
+        let signed = is_signed(ty);
+        if signed {
+            let size = self.scalar_size(ty);
+            m.sign_ext(V1, V1, size);
+            m.sign_ext(V2, V2, size);
+        }
+        m.cmp(V1, V2);
+        let c = if op == mir::EQ { EQ } else if op == mir::NE { NE }
+            else if op == mir::LT { if signed { LT } else { LTU } }
+            else if op == mir::LE { if signed { LE } else { LEU } }
+            else if op == mir::GT { if signed { GT } else { GTU } }
+            else if signed { GE } else { GEU };
+        // switch t { v => target, _ => els }: v 1 jumps when c holds.
+        let jc = if vals[0] != 0 { c } else { invert(c) };
+        m.branch_if(jc, self.blocks[targets[0]]);
+        if els != bi + 1 { m.jump(self.blocks[els]); }
     }
 
     /// Leaves the result in V1.
@@ -2902,5 +2946,96 @@ impl Live {
 
     fn op(&mut self, x: &Operand) {
         if x.kind == mir::OP_COPY { self.place(&x.place, false, false); }
+    }
+}
+
+fn invert(c: Cond) -> Cond {
+    match c {
+        EQ => NE,
+        NE => EQ,
+        LT => GE,
+        GE => LT,
+        LE => GT,
+        GT => LE,
+        LTU => GEU,
+        GEU => LTU,
+        LEU => GTU,
+        _ => LEU,
+    }
+}
+
+// How many times each local appears in f (written or read, whole or in part).
+fn local_refs(f: &Func) -> Vec<u32> {
+    let mut n: Vec<u32> = Vec::new();
+    for _ in f.locals.iter() { n.push(0); }
+    for b in f.blocks.iter() {
+        for st in b.stmts.iter() {
+            match st {
+                Stmt::Assign { place, rv } => {
+                    ref_place(&mut n, place);
+                    match rv {
+                        Rvalue::Use(x) | Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => ref_op(&mut n, x),
+                        Rvalue::Ref { place: p, .. } | Rvalue::Discr(p) | Rvalue::Len(p) => ref_place(&mut n, p),
+                        Rvalue::Bin { x, y, .. } => {
+                            ref_op(&mut n, x);
+                            ref_op(&mut n, y);
+                        }
+                        Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { ref_op(&mut n, o); } }
+                    }
+                }
+                Stmt::SetDiscr { place, .. } => ref_place(&mut n, place),
+                Stmt::Box { local, .. } => { n[*local] += 1; }
+                Stmt::PushDefer { fn_op, args } => {
+                    ref_op(&mut n, fn_op);
+                    for a in args.iter() { ref_op(&mut n, a); }
+                }
+                Stmt::StorageLive(l) => { n[*l] += 1; }
+            }
+        }
+        match &b.term {
+            Term::Switch { x, .. } => ref_op(&mut n, x),
+            Term::Call { fn_op, args, dest, .. } => {
+                ref_op(&mut n, fn_op);
+                for a in args.iter() { ref_op(&mut n, a); }
+                ref_place(&mut n, dest);
+            }
+            Term::Assert { cond, len, index, .. } => {
+                ref_op(&mut n, cond);
+                ref_op(&mut n, len);
+                ref_op(&mut n, index);
+            }
+            Term::Return => { n[0] += 1; }
+            _ => {}
+        }
+    }
+    n
+}
+
+fn ref_place(n: &mut Vec<u32>, p: &Place) {
+    n[p.local] += 1;
+    for pr in p.proj.iter() { if pr.kind == mir::P_INDEX { n[pr.index] += 1; } }
+}
+
+fn ref_op(n: &mut Vec<u32>, x: &Operand) { if x.kind == mir::OP_COPY { ref_place(n, &x.place); } }
+
+// Whether b ends in `t = x cmp y` (integers, not 128-bit) and a switch with
+// one value on t, t appearing nowhere else.
+fn fused_compare(b: &mir::Block, refs: &Vec<u32>) -> bool {
+    if b.stmts.len() == 0 { return false; }
+    let (place, op, ty) = match &b.stmts[b.stmts.len() - 1] {
+        Stmt::Assign { place, rv: Rvalue::Bin { op, ty, .. } } => (place, *op, *ty),
+        _ => return false,
+    };
+    if place.proj.len() != 0 || refs[place.local] != 2 { return false; }
+    if !(op == mir::EQ || op == mir::NE || op == mir::LT || op == mir::LE || op == mir::GT || op == mir::GE) { return false; }
+    // Known integer-like types only (not a parameter that may be a float).
+    let k = ty.kind;
+    if !(k == types::K_INT || k == types::K_BOOL || k == types::K_CHAR) { return false; }
+    if k == types::K_INT && layout::int_size(ty.int) == 16 { return false; }
+    match &b.term {
+        Term::Switch { x, vals, .. } => {
+            vals.len() == 1 && (vals[0] == 0 || vals[0] == 1) && x.kind == mir::OP_COPY && x.place.local == place.local && x.place.proj.len() == 0
+        }
+        _ => false,
     }
 }
