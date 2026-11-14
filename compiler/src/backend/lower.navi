@@ -89,9 +89,9 @@ struct Job {
 }
 
 // The runtime symbols generated code refers to by name.
-const RUNTIME_SYMS: [&str; 18] = ["_navi_argc", "_navi_argv", "_navi_data_end", "_navi_data_start", "_navi_g0boot", "_navi_gc_marking",
+const RUNTIME_SYMS: [&str; 19] = ["_navi_argc", "_navi_argv", "_navi_data_end", "_navi_data_start", "_navi_g0boot", "_navi_gc_marking",
     "_navi_gstart", "_navi_longjmp", "_navi_morestack", "_navi_mstart", "_navi_os_sp", "_navi_overflow", "_navi_rundefers",
-    "_navi_saved_greg", "_navi_setjmp", "_navi_stack_lo", "_navi_stack_top", "_navi_swapctx"];
+    "_navi_saved_greg", "_navi_scanw", "_navi_setjmp", "_navi_stack_lo", "_navi_stack_top", "_navi_swapctx"];
 
 // The functions a worker takes at a time.
 const CHUNK: usize = 4;
@@ -105,6 +105,9 @@ pub struct Gen {
     lay: &mut Computer,
     locs: HashMap<String, String>,
     loc_list: Vec<LocData>,
+    /// Symbol numbers of locations (by key) and strings, for merge.
+    loc_ids: HashMap<String, u32>,
+    str_ids: HashMap<Vec<u8>, u32>,
     closure: HashMap<String, String>,
     statics: HashMap<u32, String>,
     errs: Vec<String>,
@@ -182,6 +185,7 @@ fn link_name(d: &Def) -> String {
 
 fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug: bool, lock: &Mutex<u8>, loc_ty: &Type) -> &mut Gen {
     &mut Gen { p, o: obj::new_object(arch), m, tgt, debug, lay: p.lay, locs: HashMap::new(), loc_list: Vec::new(),
+        loc_ids: HashMap::new(), str_ids: HashMap::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
         flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new() }
@@ -358,13 +362,29 @@ impl Gen {
         // once; relocations refer to them by index.
         let mut strs: Vec<u32> = Vec::new();
         for s in out.strs.iter() {
-            let sym = self.p.str_sym(s);
-            strs.push(self.o.id(sym.as_str()));
+            let id = match self.str_ids.get(s) {
+                Some(i) => *i,
+                None => {
+                    let sym = self.p.str_sym(s);
+                    let i = self.o.id_s(&sym);
+                    self.str_ids.insert(s.clone(), i);
+                    i
+                }
+            };
+            strs.push(id);
         }
         let mut locs: Vec<u32> = Vec::new();
         for l in out.locs.iter() {
-            let sym = self.loc_at(l.file.as_str(), l.line, l.col);
-            locs.push(self.o.id(sym.as_str()));
+            let id = match self.loc_ids.get(&l.sym) {
+                Some(i) => *i,
+                None => {
+                    let sym = self.loc_at(l.file.as_str(), l.line, l.col);
+                    let i = self.o.id_s(&sym);
+                    self.loc_ids.insert(l.sym.clone(), i);
+                    i
+                }
+            };
+            locs.push(id);
         }
         for u in out.undef.iter() { self.o.undefined(u.as_str()); }
         let align = if self.o.arch == "amd64" { 16 } else { 4 };
@@ -384,7 +404,7 @@ impl Gen {
             } else if r.ph == 2 {
                 locs[r.ix]
             } else {
-                self.o.id(r.name.as_str())
+                self.o.id_s(&r.name)
             };
             self.o.reloc_id(obj::TEXT, off as u32 + r.off, r.kind, id);
         }
@@ -509,7 +529,8 @@ impl Gen {
             if let Some(k) = self.floc_ix.get(&key) { return `%L${*k}`; }
             let k = self.flocs.len();
             self.floc_ix.insert(key, k);
-            self.flocs.push(LocData { sym: String::new(), file: file.to_string(), line, col });
+            // sym: the key, for merge.
+            self.flocs.push(LocData { sym: key.clone(), file: file.to_string(), line, col });
             return `%L${k}`;
         }
         if let Some(s) = self.locs.get(&key) { return s.clone(); }
@@ -730,6 +751,10 @@ impl Gen {
         m.begin();
         m.swap_context();
         self.emit_func("_navi_swapctx", false);
+
+        m.begin();
+        m.scan_words();
+        self.emit_func("_navi_scanw", false);
 
         m.begin();
         m.set_jmp();
@@ -2437,6 +2462,17 @@ impl FnGen {
                 let mut ca = Vec::new();
                 ca.push(int_arg());
                 m.call_c("_navi_setjmp", 0, &ca, false, false);
+            }
+            "scan_words" => {
+                let mut ca = Vec::new();
+                let mut k = 0;
+                while k < 6 {
+                    self.load_scalar(&args[k], V1);
+                    m.store(8, V1, SP, (8 * k) as i64);
+                    ca.push(int_arg());
+                    k += 1;
+                }
+                m.call_c("_navi_scanw", 0, &ca, false, false);
             }
             "resume_context" => {
                 self.load_scalar(&args[0], V1);

@@ -139,6 +139,7 @@ fn init() {
         k += 1;
     }
     NEXT_GC = MIN_HEAP;
+    span_offsets();
 }
 
 /// The size class of each size up to MAX_SMALL in 16-byte steps.
@@ -551,9 +552,11 @@ fn take_shared() -> bool {
 /// Marks every object a word in [lo, hi) points into (by the collector).
 pub(crate) fn scan_range(lo: usize, hi: usize) { scan(lo, hi, MAIN); }
 
-/// The hot loop of the collector (memory accesses are written out instead
-/// of calling ld/ldb); the grey objects go on stack dst, or 0: found by a
-/// write barrier, they go to SHARED.
+/// The hot loop of the collector: the objects the words in [lo, hi) point
+/// into get marked and (unless noscan) pushed on stack dst (MAIN in a
+/// stop-the-world collection), or with dst 0 (found by a write barrier) on
+/// the M's write barrier buffer, else SHARED.
+#[cfg(not(feature = "navic"))]
 fn scan(lo: usize, hi: usize, dst: usize) {
     let arena = ARENA;
     // During a concurrent mark, spans made since it started hold only
@@ -567,32 +570,73 @@ fn scan(lo: usize, hi: usize, dst: usize) {
         if w < arena || w >= next { continue; }
         let s = unsafe { *((pages + ((w - arena) >> PAGE_SHIFT) * 8) as *const usize) } as *mut Span;
         if s as usize == 0 { continue; }
-        unsafe {
-            let start = (*s).start;
-            let n = (*s).nelems;
-            let i = if n == 1 { 0 } else { ((w - start) * (*s).div_mul) >> 32 };
-            if i >= n { continue; }
-            let bits = (*s).bits as usize;
-            if *((bits + i) as *const u8) == 0 { continue; }
-            let m = (bits + n + i) as *mut u8;
-            if *m != 0 { continue; }
-            // Two markers may both get here: the object is scanned twice.
-            *m = 1;
-            // The bytes marked (the live heap of a lazily swept cycle). A
-            // write barrier's go to its M's buffer, shared when full.
-            let mut to = dst;
-            if dst == 0 { to = crate::rt::sched::m_wbuf(); }
-            if to == 0 { count_shared((*s).elem); } else { wset(to + 24, wget(to + 24) + (*s).elem); }
-            if (*s).noscan { continue; }
-            if to == 0 {
-                push_shared(start + i * (*s).elem);
-            } else {
-                stack_push(to, start + i * (*s).elem);
-                if dst == 0 && stack_len(to) >= 256 {
-                    mark_lock();
-                    move_all(to, SHARED);
-                    mark_unlock();
-                }
+        let n = unsafe { (*s).nelems };
+        let i = if n == 1 { 0 } else { unsafe { ((w - (*s).start) * (*s).div_mul) >> 32 } };
+        if i >= n { continue; }
+        let bits = unsafe { (*s).bits } as usize;
+        if ldb(bits + i) == 0 || ldb(bits + n + i) != 0 { continue; }
+        mark_found(s, i, dst);
+    }
+}
+
+// navic: the loop is the backend's leaf routine (generated navi code keeps
+// every value in memory; this loop runs over the whole live heap). It
+// stops at the words to mark.
+#[cfg(feature = "navic")]
+fn scan(lo: usize, hi: usize, dst: usize) {
+    let arena = ARENA;
+    // During a concurrent mark, spans made since it started hold only
+    // objects allocated black (or free ones): not read.
+    let next = if CYCLE { LIMIT } else { ARENA_NEXT };
+    let pages = PAGES;
+    let mut p = (lo + 7) / 8 * 8;
+    loop {
+        p = crate::rt::scan_words(p, hi, arena, next, pages, SPAN_OFFS);
+        if p == 0 { return; }
+        let w = ld(p - 8);
+        let s = ld(pages + ((w - arena) >> PAGE_SHIFT) * 8) as *mut Span;
+        let i = unsafe { if (*s).nelems == 1 { 0 } else { ((w - (*s).start) * (*s).div_mul) >> 32 } };
+        mark_found(s, i, dst);
+    }
+}
+
+/// The offsets of Span's start, nelems, div_mul and bits, a byte each (for
+/// scan_words).
+static mut SPAN_OFFS: usize = 0;
+
+fn span_offsets() {
+    let s = unsafe { calloc(1, crate::mem::size_of::<Span>()) } as *mut Span;
+    unsafe {
+        let start = &mut (*s).start as *mut usize as usize - s as usize;
+        let nelems = &mut (*s).nelems as *mut usize as usize - s as usize;
+        let div_mul = &mut (*s).div_mul as *mut usize as usize - s as usize;
+        let bits = &mut (*s).bits as *mut *mut u8 as usize - s as usize;
+        SPAN_OFFS = start | nelems << 8 | div_mul << 16 | bits << 24;
+    }
+}
+
+// Marks object i of s (allocated, seen unmarked) and queues it.
+fn mark_found(s: *mut Span, i: usize, dst: usize) {
+    unsafe {
+        let n = (*s).nelems;
+        let start = (*s).start;
+        let m = ((*s).bits as usize + n + i) as *mut u8;
+        // Two markers may both get here: the object is scanned twice.
+        *m = 1;
+        // The bytes marked (the live heap of a lazily swept cycle). A
+        // write barrier's go to its M's buffer, shared when full.
+        let mut to = dst;
+        if dst == 0 { to = crate::rt::sched::m_wbuf(); }
+        if to == 0 { count_shared((*s).elem); } else { wset(to + 24, wget(to + 24) + (*s).elem); }
+        if (*s).noscan { return; }
+        if to == 0 {
+            push_shared(start + i * (*s).elem);
+        } else {
+            stack_push(to, start + i * (*s).elem);
+            if dst == 0 && stack_len(to) >= 256 {
+                mark_lock();
+                move_all(to, SHARED);
+                mark_unlock();
             }
         }
     }
