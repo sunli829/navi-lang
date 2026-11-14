@@ -1088,29 +1088,18 @@ impl FnGen {
         None
     }
 
-    fn count_place(&mut self, pl: &Place, uses: &mut Vec<i64>, as_ref: bool) {
-        if pl.proj.len() == 0 {
-            if as_ref { uses[pl.local] = -1000000; } else { uses[pl.local] += 1; }
-        } else if pl.proj[0].kind == mir::P_DEREF {
-            uses[pl.local] += 1;
-        } else {
-            uses[pl.local] = -1000000;
-        }
-        for pr in pl.proj.iter() {
-            if pr.kind == mir::P_INDEX { uses[pr.index] += 1; }
-        }
-    }
 
-    fn count_op(&mut self, op: &Operand, uses: &mut Vec<i64>) {
-        if op.kind == mir::OP_COPY { self.count_place(&op.place, uses, false); }
-    }
-
-    /// Picks the scalar locals used most (whole, or as pointers to
-    /// dereference) for the saved registers.
+    /// Gives scalar locals (used whole, or as pointers to dereference) the
+    /// saved registers by linear scan over their live ranges: locals whose
+    /// ranges do not overlap share a register (calls preserve them). A
+    /// range runs from the first to the last position the local is live
+    /// at, in block order, with liveness from the blocks' data flow.
     fn choose_registers(&mut self) {
         let f = self.f;
         let n = f.locals.len();
-        let mut uses: Vec<i64> = Vec::new();
+        let nb = f.blocks.len();
+        let words = (n + 63) / 64;
+        let lv = &mut Live { lo: Vec::new(), hi: Vec::new(), bad: Vec::new(), words, gen: Vec::new(), kill: Vec::new(), b: 0, pos: 0 };
         let mut i = 0;
         while i < n {
             self.preg.push(-1);
@@ -1118,68 +1107,185 @@ impl FnGen {
             let k = t.kind;
             let scalar = k == types::K_INT && layout::int_size(t.int) <= 8 || k == types::K_BOOL || k == types::K_CHAR || k == types::K_FLOAT
                 || (k == types::K_REF || k == types::K_PTR) && !layout::is_fat(t.el()) || k == types::K_FN && t.abi == "C";
-            uses.push(if scalar { 0 } else { -1000000 });
+            lv.lo.push(-1);
+            lv.hi.push(-1);
+            lv.bad.push(!scalar);
             i += 1;
         }
-        for b in f.blocks.iter() {
+        i = 0;
+        while i < nb * words {
+            lv.gen.push(0);
+            lv.kill.push(0);
+            i += 1;
+        }
+        // Position 0: the entry, where the arguments arrive.
+        i = 1;
+        while i <= f.nargs && i < n {
+            lv.touch(i);
+            i += 1;
+        }
+        let mut starts: Vec<i64> = Vec::new();
+        let mut ends: Vec<i64> = Vec::new();
+        let mut succs: Vec<Vec<usize>> = Vec::new();
+        let mut pos = 1i64;
+        let mut bi = 0;
+        while bi < nb {
+            let b = f.blocks[bi];
+            lv.b = bi;
+            starts.push(pos);
             for st in b.stmts.iter() {
+                lv.pos = pos;
                 match st {
                     Stmt::Assign { place, rv } => {
-                        self.count_place(place, &mut uses, false);
                         match rv {
-                            Rvalue::Use(x) => self.count_op(x, &mut uses),
-                            Rvalue::Ref { place: p, .. } => self.count_place(p, &mut uses, true),
+                            Rvalue::Use(x) => lv.op(x),
+                            Rvalue::Ref { place: p, .. } => lv.place(p, true, false),
                             Rvalue::Bin { x, y, .. } => {
-                                self.count_op(x, &mut uses);
-                                self.count_op(y, &mut uses);
+                                lv.op(x);
+                                lv.op(y);
                             }
-                            Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => self.count_op(x, &mut uses),
-                            Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { self.count_op(o, &mut uses); } }
-                            Rvalue::Discr(p) | Rvalue::Len(p) => self.count_place(p, &mut uses, true),
+                            Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => lv.op(x),
+                            Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { lv.op(o); } }
+                            Rvalue::Discr(p) | Rvalue::Len(p) => lv.place(p, true, false),
                         }
+                        lv.place(place, false, true);
                     }
-                    Stmt::SetDiscr { place, .. } => self.count_place(place, &mut uses, true),
-                    Stmt::Box { local, .. } => { uses[*local] += 1; }
+                    Stmt::SetDiscr { place, .. } => lv.place(place, true, false),
+                    Stmt::Box { local, .. } => lv.def(*local),
                     Stmt::PushDefer { fn_op, args } => {
-                        self.count_op(fn_op, &mut uses);
-                        for a in args.iter() { self.count_op(a, &mut uses); }
+                        lv.op(fn_op);
+                        for a in args.iter() { lv.op(a); }
                     }
                     _ => {}
                 }
+                pos += 1;
             }
+            lv.pos = pos;
+            let mut ss: Vec<usize> = Vec::new();
             match &b.term {
-                Term::Switch { x, .. } => self.count_op(x, &mut uses),
-                Term::Call { fn_op, args, dest, .. } => {
-                    self.count_op(fn_op, &mut uses);
-                    for a in args.iter() { self.count_op(a, &mut uses); }
-                    self.count_place(dest, &mut uses, false);
+                Term::Goto(t) => ss.push(*t),
+                Term::Switch { x, targets, els, .. } => {
+                    lv.op(x);
+                    for t in targets.iter() { ss.push(*t); }
+                    ss.push(*els);
                 }
-                Term::Assert { cond, len, index, .. } => {
-                    self.count_op(cond, &mut uses);
-                    self.count_op(len, &mut uses);
-                    self.count_op(index, &mut uses);
+                Term::Call { fn_op, args, dest, target, .. } => {
+                    lv.op(fn_op);
+                    for a in args.iter() { lv.op(a); }
+                    lv.place(dest, false, true);
+                    if *target >= 0 { ss.push(*target as usize); }
                 }
+                Term::Assert { cond, len, index, target, .. } => {
+                    lv.op(cond);
+                    lv.op(len);
+                    lv.op(index);
+                    ss.push(*target);
+                }
+                Term::Return => lv.use_(0),
                 _ => {}
             }
+            ends.push(pos);
+            succs.push(ss);
+            pos += 1;
+            bi += 1;
         }
-        // The most used candidates, at least 3 uses each.
-        let mut next = 0;
-        while next < NUM_SAVED {
-            let mut best = -1i64;
-            let mut best_uses = 2i64;
-            i = 0;
-            while i < n {
-                if self.preg[i] < 0 && uses[i] > best_uses {
-                    best = i as i64;
-                    best_uses = uses[i];
+        // Liveness: in = gen | (out & !kill), out = the successors' ins.
+        let mut live_in: Vec<u64> = Vec::new();
+        let mut live_out: Vec<u64> = Vec::new();
+        i = 0;
+        while i < nb * words {
+            live_in.push(0);
+            live_out.push(0);
+            i += 1;
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut bj = nb;
+            while bj > 0 {
+                bj -= 1;
+                let o = bj * words;
+                let mut w = 0;
+                while w < words {
+                    let mut out = 0u64;
+                    for sb in succs[bj].iter() { out = out | live_in[*sb * words + w]; }
+                    live_out[o + w] = out;
+                    let inn = lv.gen[o + w] | (out & !lv.kill[o + w]);
+                    if inn != live_in[o + w] {
+                        live_in[o + w] = inn;
+                        changed = true;
+                    }
+                    w += 1;
                 }
-                i += 1;
             }
-            if best < 0 { break; }
-            let r = S0 + next as Reg;
-            self.preg[best as usize] = r as i64;
-            self.saved.push((r, 0));
-            next += 1;
+        }
+        bi = 0;
+        while bi < nb {
+            let o = bi * words;
+            let mut w = 0;
+            while w < words {
+                let mut k = 0;
+                while k < 64 {
+                    let l = w * 64 + k;
+                    if l < n {
+                        if (live_in[o + w] >> k as u32) & 1 != 0 { lv.touch_at(l, starts[bi]); }
+                        if (live_out[o + w] >> k as u32) & 1 != 0 { lv.touch_at(l, ends[bi]); }
+                    }
+                    k += 1;
+                }
+                w += 1;
+            }
+            bi += 1;
+        }
+        // Linear scan by start; out of registers, the range ending last
+        // stays in memory.
+        let mut order: Vec<usize> = Vec::new();
+        i = 0;
+        while i < n {
+            if !lv.bad[i] && lv.lo[i] >= 0 { order.push(i); }
+            i += 1;
+        }
+        order.sort_by(|a, b| if lv.lo[*a] != lv.lo[*b] { lv.lo[*a].cmp(&lv.lo[*b]) } else { a.cmp(b) });
+        let mut active: Vec<usize> = Vec::new();
+        let mut free: Vec<Reg> = Vec::new();
+        let mut used = [false; 9];
+        let mut r = NUM_SAVED;
+        while r > 0 {
+            r -= 1;
+            free.push(S0 + r as Reg);
+        }
+        for l in order.iter() {
+            let cur = *l;
+            // Ranges that ended before this one starts give their registers back.
+            let mut keep: Vec<usize> = Vec::new();
+            for a in active.iter() {
+                if lv.hi[*a] < lv.lo[cur] { free.push(self.preg[*a] as Reg); } else { keep.push(*a); }
+            }
+            active = keep;
+            if free.len() > 0 {
+                let reg = free.pop().unwrap();
+                self.preg[cur] = reg as i64;
+                used[(reg - S0) as usize] = true;
+                active.push(cur);
+                continue;
+            }
+            let mut far = 0;
+            let mut j = 1;
+            while j < active.len() {
+                if lv.hi[active[j]] > lv.hi[active[far]] { far = j; }
+                j += 1;
+            }
+            let victim = active[far];
+            if lv.hi[victim] > lv.hi[cur] {
+                self.preg[cur] = self.preg[victim];
+                self.preg[victim] = -1;
+                active[far] = cur;
+            }
+        }
+        let mut k = 0;
+        while k < NUM_SAVED {
+            if used[k] { self.saved.push((S0 + k as Reg, 0)); }
+            k += 1;
         }
     }
 
@@ -2741,5 +2847,60 @@ fn term_pos(t: &Term) -> Pos {
     match t {
         Term::Call { pos, .. } | Term::Assert { pos, .. } => *pos,
         _ => 0,
+    }
+}
+
+// The positions and liveness of a function's locals (choose_registers).
+struct Live {
+    lo: Vec<i64>,
+    hi: Vec<i64>,
+    // Not a scalar, or its address is taken: stays in memory.
+    bad: Vec<bool>,
+    words: usize,
+    // Per block: the locals read before written (gen) and written (kill).
+    gen: Vec<u64>,
+    kill: Vec<u64>,
+    b: usize,
+    pos: i64,
+}
+
+impl Live {
+    fn touch_at(&mut self, l: usize, p: i64) {
+        if self.lo[l] < 0 || p < self.lo[l] { self.lo[l] = p; }
+        if p > self.hi[l] { self.hi[l] = p; }
+    }
+
+    fn touch(&mut self, l: usize) { let p = self.pos; self.touch_at(l, p); }
+
+    fn bit(&self, l: usize) -> (usize, u64) { (self.b * self.words + l / 64, 1u64 << (l % 64) as u32) }
+
+    fn use_(&mut self, l: usize) {
+        self.touch(l);
+        let (w, m) = self.bit(l);
+        if self.kill[w] & m == 0 { self.gen[w] = self.gen[w] | m; }
+    }
+
+    fn def(&mut self, l: usize) {
+        self.touch(l);
+        let (w, m) = self.bit(l);
+        self.kill[w] = self.kill[w] | m;
+    }
+
+    // A place read (or, def, written whole); as_ref: its address is used.
+    fn place(&mut self, pl: &Place, as_ref: bool, def: bool) {
+        for pr in pl.proj.iter() {
+            if pr.kind == mir::P_INDEX { self.use_(pr.index); }
+        }
+        if pl.proj.len() == 0 {
+            if as_ref { self.bad[pl.local] = true; }
+            if def && !as_ref { self.def(pl.local); } else { self.use_(pl.local); }
+        } else {
+            if pl.proj[0].kind != mir::P_DEREF { self.bad[pl.local] = true; }
+            self.use_(pl.local);
+        }
+    }
+
+    fn op(&mut self, x: &Operand) {
+        if x.kind == mir::OP_COPY { self.place(&x.place, false, false); }
     }
 }
