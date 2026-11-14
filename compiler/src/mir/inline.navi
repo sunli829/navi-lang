@@ -4,7 +4,8 @@
 //! positions moved to the call site. Calls through traits, closures and
 //! function values are left alone, and so are callees that create
 //! closures, register defers, use #[track_caller] or #[inline(never)], or
-//! belong to the runtime (which relies on its frames).
+//! belong to the runtime (which relies on its frames), but for its leaves
+//! (functions that call nothing); runtime functions only get leaves.
 
 use std::collections::HashMap;
 use crate::resolve::{self, Def, Node};
@@ -48,6 +49,14 @@ fn never_inline(d: &Def) -> bool {
     false
 }
 
+// Whether f calls nothing.
+fn leaf(f: &Func) -> bool {
+    for b in f.blocks.iter() {
+        if let Term::Call { .. } = &b.term { return false; }
+    }
+    true
+}
+
 /// Whether f may be copied into its callers.
 fn inlinable(f: &Func) -> bool {
     let d = match f.def { Some(d) => d, None => return false };
@@ -56,7 +65,10 @@ fn inlinable(f: &Func) -> bool {
     if let Some(p) = d.parent {
         if p.kind == resolve::DEF_TRAIT { return false; }
     }
-    if in_runtime(d) || never_inline(d) { return false; }
+    if never_inline(d) { return false; }
+    // The runtime relies on its frames, but not in leaves (no call at all:
+    // its word accessors and the like).
+    if in_runtime(d) && !leaf(f) { return false; }
     for b in f.blocks.iter() {
         for s in b.stmts.iter() {
             match s {
@@ -220,14 +232,13 @@ pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>) {
     for f in funcs.iter() {
         let caller = *f;
         let mut ds: Vec<usize> = Vec::new();
+        // Runtime functions only get leaves.
         let rt = match caller.def { Some(d) => in_runtime(d), None => false };
-        skip.push(rt);
-        if !rt {
-            for b in caller.blocks.iter() {
-                if let Some(callee) = target(&b.term, &by_def, &ok) {
-                    if callee.id != caller.id {
-                        if let Some(j) = index.get(&callee.id) { ds.push(*j); }
-                    }
+        skip.push(false);
+        for b in caller.blocks.iter() {
+            if let Some(callee) = target(&b.term, &by_def, &ok) {
+                if callee.id != caller.id && (!rt || leaf(callee)) {
+                    if let Some(j) = index.get(&callee.id) { ds.push(*j); }
                 }
             }
         }
@@ -265,12 +276,13 @@ pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>) {
         for _ in lv.iter() { outs.push(None); }
         crate::util::par_for(lv.len(), 16, |k| {
             let caller = funcs[lv[k]];
+            let rt = match caller.def { Some(d) => in_runtime(d), None => false };
             let body = &mut Body { blocks: caller.blocks.clone(), locals: caller.locals.clone() };
             let n = body.blocks.len();
             let mut bi = 0;
             while bi < n {
                 if let Some(callee) = target(&body.blocks[bi].term, &by_def, &ok) {
-                    if callee.id != caller.id { inline_call(info, body, bi, callee); }
+                    if callee.id != caller.id && (!rt || leaf(callee)) { inline_call(info, body, bi, callee); }
                 }
                 bi += 1;
             }
