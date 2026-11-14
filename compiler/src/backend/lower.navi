@@ -99,6 +99,14 @@ const RUNTIME_SYMS: [&str; 19] = ["_navi_argc", "_navi_argv", "_navi_data_end", 
 const CHUNK: usize = 4;
 
 pub struct Gen {
+    /// Placeholder names (%S<k>, %L<k>), made once for each k.
+    ph_s: Vec<String>,
+    ph_l: Vec<String>,
+    /// A number for each file name, and the symbol of each file name.
+    file_no: HashMap<String, u32>,
+    file_sym: HashMap<String, String>,
+    /// A worker's locations in the function by file number and position.
+    floc_pos: HashMap<u64, usize>,
     /// Runtime symbols every function refers to (shared by relocations).
     sym_marking: String,
     sym_rundefers: String,
@@ -195,7 +203,8 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         loc_ids: HashMap::new(), str_ids: HashMap::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
-        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live(),
+        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
+        file_sym: HashMap::new(), floc_pos: HashMap::new(),
         sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string() }
 }
 
@@ -425,15 +434,16 @@ impl Gen {
     fn emit_out(&mut self, sym: &str) {
         let c = self.m.finish();
         let name = if self.cur_name.len() > 0 { self.cur_name.clone() } else { sym.to_string() };
-        let mut relocs: Vec<OutReloc> = Vec::new();
+        // (The names are shared with the machine's relocations.)
+        let mut relocs: Vec<OutReloc> = Vec::with_capacity(c.relocs.len());
         for r in c.relocs.iter() {
             let (ph, ix) = placeholder_index(&r.sym);
             if ph > 0 {
-                relocs.push(OutReloc { off: r.off, kind: r.kind, id: -1, ph, ix, name: String::new() });
+                relocs.push(OutReloc { off: r.off, kind: r.kind, id: -1, ph, ix, name: r.sym });
                 continue;
             }
             let id = match self.main_ids.get(&r.sym) { Some(i) => *i as i64, None => -1 };
-            relocs.push(OutReloc { off: r.off, kind: r.kind, id, ph: 0, ix: 0, name: if id >= 0 { String::new() } else { r.sym.clone() } });
+            relocs.push(OutReloc { off: r.off, kind: r.kind, id, ph: 0, ix: 0, name: r.sym });
         }
         let out = &mut FuncOut { sym: sym.to_string(), name, code: c.code, relocs, lines: Vec::new(), file: self.cur_file, strs: self.fstrs,
             locs: self.flocs, undef: self.fundef, errs: self.errs, failed: false };
@@ -455,6 +465,7 @@ impl Gen {
         self.fstr_ix = HashMap::new();
         self.flocs = Vec::new();
         self.floc_ix = HashMap::new();
+        self.floc_pos = HashMap::new();
         self.fundef = Vec::new();
         self.errs = Vec::new();
         self.outs.push(out);
@@ -526,6 +537,15 @@ impl Gen {
     fn loc(&mut self, file: Option<&File>, pos: Pos) -> String {
         match file {
             Some(f) => {
+                // A worker finds a location it has without formatting it.
+                if self.worker {
+                    let key = (self.file_number(&f.name) as u64) << 32 | pos as u64;
+                    if let Some(k) = self.floc_pos.get(&key) { return self.placeholder(2, *k); }
+                    let ps = f.position(pos);
+                    let p = self.loc_at(ps.file.as_str(), ps.line as i64, ps.col as i64);
+                    self.floc_pos.insert(key, self.flocs.len() - 1);
+                    return p;
+                }
                 let ps = f.position(pos);
                 self.loc_at(ps.file.as_str(), ps.line as i64, ps.col as i64)
             }
@@ -536,12 +556,12 @@ impl Gen {
     fn loc_at(&mut self, file: &str, line: i64, col: i64) -> String {
         let key = `${file}:${line}:${col}`;
         if self.worker {
-            if let Some(k) = self.floc_ix.get(&key) { return `%L${*k}`; }
+            if let Some(k) = self.floc_ix.get(&key) { return self.placeholder(2, *k); }
             let k = self.flocs.len();
             self.floc_ix.insert(key, k);
             // sym: the key, for merge.
             self.flocs.push(LocData { sym: key.clone(), file: file.to_string(), line, col });
-            return `%L${k}`;
+            return self.placeholder(2, k);
         }
         if let Some(s) = self.locs.get(&key) { return s.clone(); }
         let s = `_navi_loc${self.locs.len()}`;
@@ -555,11 +575,39 @@ impl Gen {
 
     fn str_bytes(&mut self, b: &Vec<u8>) -> String {
         if !self.worker { return self.p.str_sym(b); }
-        if let Some(k) = self.fstr_ix.get(b) { return `%S${*k}`; }
+        if let Some(k) = self.fstr_ix.get(b) { return self.placeholder(1, *k); }
         let k = self.fstrs.len();
         self.fstr_ix.insert(b.clone(), k);
         self.fstrs.push(b.clone());
-        `%S${k}`
+        self.placeholder(1, k)
+    }
+
+    // %S<k> (kind 1) or %L<k> (2), made once for each k.
+    fn placeholder(&mut self, kind: u8, k: usize) -> String {
+        let mut v = if kind == 1 { self.ph_s } else { self.ph_l };
+        while v.len() <= k {
+            let n = v.len();
+            v.push(if kind == 1 { `%S${n}` } else { `%L${n}` });
+        }
+        v[k]
+    }
+
+    fn file_number(&mut self, name: &String) -> u32 {
+        if let Some(n) = self.file_no.get(name) { return *n; }
+        let n = self.file_no.len() as u32;
+        self.file_no.insert(name.clone(), n);
+        n
+    }
+
+    // The symbol of a file's name (as str_sym), found once per file.
+    fn file_name_sym(&mut self, name: &String) -> String {
+        if !self.worker {
+            if let Some(s) = self.file_sym.get(name) { return *s; }
+            let s = self.str_sym(name.as_str());
+            self.file_sym.insert(name.clone(), s);
+            return s;
+        }
+        self.str_sym(name.as_str())
     }
 
     /// Writes strings, locations, dictionaries, vtables and statics.
@@ -2044,10 +2092,7 @@ impl FnGen {
             self.store_caller_loc(16);
         } else {
             match self.f.file {
-                Some(file) => {
-                    let ps = file.position(pos);
-                    self.store_file_line(16, ps.file.as_str(), ps.line as i64, ps.col as i64);
-                }
+                Some(file) => self.store_file_pos(16, file, pos),
                 None => self.store_file_line(16, "<unknown>", 0, 0),
             }
         }
@@ -2069,6 +2114,21 @@ impl FnGen {
         m.load(4, V1, BASE, ll.fields[1]);
         m.store(4, V1, SP, off + 16);
         m.load(4, V1, BASE, ll.fields[2]);
+        m.store(4, V1, SP, off + 24);
+    }
+
+    // store_file_line for a position in file.
+    fn store_file_pos(&mut self, off: i64, file: &File, pos: Pos) {
+        let m = self.m;
+        let (line, col) = file.line_col(pos);
+        let fs = self.g.file_name_sym(&file.name);
+        m.adr_sym(V1, &fs);
+        m.store(8, V1, SP, off);
+        m.mov_imm(V1, file.name.len() as i64);
+        m.store(8, V1, SP, off + 8);
+        m.mov_imm(V1, line as i64);
+        m.store(4, V1, SP, off + 16);
+        m.mov_imm(V1, col as i64);
         m.store(4, V1, SP, off + 24);
     }
 
@@ -2414,10 +2474,7 @@ impl FnGen {
                     self.load_scalar(index, V1);
                     m.store(8, V1, SP, 8);
                     match self.f.file {
-                        Some(file) => {
-                            let ps = file.position(*pos);
-                            self.store_file_line(16, ps.file.as_str(), ps.line as i64, ps.col as i64);
-                        }
+                        Some(file) => self.store_file_pos(16, file, *pos),
                         None => self.store_file_line(16, "<unknown>", 0, 0),
                     }
                     self.call_runtime("panic_bounds");
