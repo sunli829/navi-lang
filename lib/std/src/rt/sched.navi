@@ -1178,7 +1178,12 @@ pub fn exit_blocked() {
     if !MULTI { return; }
     let g = current();
     unsafe {
-        while !crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_BLOCKED, SYS_RUNNING) { os_yield(); }
+        while !crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_BLOCKED, SYS_RUNNING) {
+            // Only a collector's claim keeps it waiting: anything else is a
+            // lost state (it would wait forever, holding what it holds).
+            if crate::rt::atomic_load(&mut (*g).sys as *mut usize) != SYS_CLAIMED { crate::rt::native::fatal("exit_blocked: the G is not blocked"); }
+            os_yield();
+        }
     }
 }
 
@@ -1748,12 +1753,21 @@ pub fn morestack() -> usize {
             return 0;
         }
         if stw && !(*g).is_g0 {
-            // The registers are saved below (by the stub), above SP.
-            (*g).sp = crate::rt::stack_pointer() as usize;
-            (*g).fp = crate::rt::frame_address() as usize;
-            crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_STOPPED);
-            while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { os_yield(); }
-            crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_RUNNING);
+            if crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_RUNNING, SYS_STOPPED) {
+                // The registers are saved below (by the stub), above SP.
+                (*g).sp = crate::rt::stack_pointer() as usize;
+                (*g).fp = crate::rt::frame_address() as usize;
+                crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_STOPPED);
+                while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { os_yield(); }
+                crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_RUNNING);
+            } else {
+                // Blocked (or claimed): between enter_blocked and the call
+                // that blocks, a function's prologue met the poisoned
+                // limit. The collector counts the G as stopped already (its
+                // SP and registers were saved); its state stays for
+                // exit_blocked, which would otherwise wait forever.
+                while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { os_yield(); }
+            }
         }
         if (*g).old_size != 0 {
             release_os((*g).old_stack, (*g).old_size);
