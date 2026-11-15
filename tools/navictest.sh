@@ -93,4 +93,15 @@ if [ "$w100" = "$(printf '%s\nfn main() {}' "$long")" ] \
 else
 	echo "FAIL navic fmt comment_width"; echo "$w100"; echo "$w40"; fail=1
 fi
+# navic lsp: the recorded session tests/lsp/session.jsonl (one message a
+# line, the repository's path as @ROOT@) answers as tests/lsp/session.out.
+root=$(pwd)
+sed "s#@ROOT@#$root#g" tests/lsp/session.jsonl | LC_ALL=C awk '{ printf "Content-Length: %d\r\n\r\n%s", length($0), $0 }' \
+	| NAVI_STD="$root/lib/std" "$navic" lsp 2>/dev/null | perl -0777 -pe 's/Content-Length: \d+\r\n\r\n/\n/g' \
+	| sed "s#$root#@ROOT@#g" | sed '/^$/d' > "$tmp/lsp.out"
+if cmp -s "$tmp/lsp.out" tests/lsp/session.out; then
+	echo "ok   navic lsp tests/lsp/session.jsonl"
+else
+	echo "FAIL navic lsp tests/lsp/session.jsonl"; diff tests/lsp/session.out "$tmp/lsp.out" | head -20; fail=1
+fi
 exit $fail
