@@ -59,7 +59,7 @@
 | 布局、shim、代码生成规划、lowering、arm64、Mach-O、驱动 | 完成 | `build -c` 的目标文件与 stage0 逐字节相同（全部 22 个运行测试和编译器自身） |
 | 自举 | 完成 | `tools/bootstrap.sh`：stage0 → stage1 → stage2 → stage3，stage1 编译自身得到的目标文件与 stage0 相同，stage2 与 stage3 逐字节相同；stage2 编译的 22 个 golden 测试全部通过 |
 
-navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0 提供，按需再移植。navic 编译自身约 48 秒（stage0 约 0.6 秒），生成代码没有寄存器分配、没有内联、所有被取地址的局部变量都装箱，这是 M9 性能工作的起点。
+（当时）navic 只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 后来在 M9 移植过来了（见 M9 的“其他平台”）。navic 编译自身约 48 秒（stage0 约 0.6 秒），生成代码没有寄存器分配、没有内联、所有被取地址的局部变量都装箱，这是 M9 性能工作的起点。
 
 移植中的做法：
 - Go 里以指针为键的 map 改成以 id 为键：AST 节点带全局唯一 id，`Def` 带下标 id，类型带驻留 id；为 `impl Trait` 参数合成的类型参数从 0x40000000 起编号。
@@ -200,6 +200,26 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
   - `if let` / `while let` 支持 let 链：`if let Some(x) = a && let Some(y) = b && x < y`。不含 let 的条件照旧生成，MIR 与 stage0 一致。
   - 不可达分支警告：编译器有了警告（`diag::Error.warning`），只有错误才让构建失败；`tests/run` 里用 `// warn: 行:列 消息` 检查。i128/u128 的字面量和区间原来按 0 宽的值域算，会误判；现在当作不透明（不参与覆盖），和字符串一样。
 - 解构赋值（同 Rust）：`(a, b) = (b, a)`、`P { x, y: v[i], .. } = p`、`W(a, _) = w`、`[c, .., d] = arr`。原来能编译过，但什么都不赋值。parser 照 Rust 改写成 `{ let ($d0, $d1) = e; a = $d0; b = $d1; }`。顺带修了 `1 = 2` 这类非位置的赋值不报错（现在报 "invalid left-hand side of assignment"）；`tests/run` 加了 `// error: 行:列 消息`，用来检查编译应当失败的用例。
+- 其他平台（为删掉 stage0 做准备）：navic 现在支持 stage0 的全部 5 个目标（`--target` 或 `NAVI_TARGET`）。
+  - amd64 后端（`backend/amd64.navi`）：
+    - 寄存器：G 寄存器放 r14（同 Go），保存寄存器只有 rbx、r12 两个，因为 amd64 只有 16 个通用寄存器。r9、rdx、xmm14、xmm15 是暗中使用的临时寄存器。
+    - 运行时例程（morestack、上下文切换、setjmp）的保存槽位与 arm64 相同，所以栈遍历、搬栈和 morestack 协议是两种架构共用的。
+    - 栈图里调用的返回偏移按指令单位记录：arm64 是 4 字节，amd64 是 1 字节（`TargetConv.code_unit`，运行时里是 `CODE_UNIT`）。
+    - C 调用支持 System V 和 Windows x64 两种约定，包括栈上参数、Windows 的 32 字节影子区，以及 System V 可变参数要求的 al。
+    - 有符号除以 -1 不会触发 idiv 的异常：商回绕，余数为 0。
+  - macOS x64：自研 Mach-O 链接器也能链接 x86-64（跳板是 `jmp [rip+got]`），不需要系统工具链。
+    - 在 Rosetta 下，全部测试在各种模式（线程数、GCVERIFY、GCSTW、GCPOISON）下都通过。
+    - x64 版 navic 编译自身能到定点，交叉编译出的 arm64 产物与 arm64 版 navic 编译的逐字节相同。
+  - Linux：生成 ELF 目标文件，由系统 cc 链接（同 stage0）。
+    - arm64 的 ldr 低 12 位用单独的重定位类型（R_AARCH64_LDST64_ABS_LO12_NC）。
+    - linux-arm64 的原子操作用 LL/SC 循环，因为 ARMv8.0 的板子（如树莓派 4）没有 LSE。`NAVI_LLSC=1` 可以在 macOS 上试这种写法。
+    - 在本机的 Android arm64 模拟器上验证过：Linux 内核加 bionic，用 NDK 的 lld 链接。全部测试在各种模式下都通过，navic 在模拟器上编译自身，产物与 mac 上交叉编译的逐字节相同。用的脚本是 `tools/androidtest.sh`。
+    - linux-x64 只用 lld 链接过，没有运行。
+  - Windows：生成 COFF 目标文件，由 clang 链接。
+    - 重定位超过 65535 条时用 IMAGE_SCN_LNK_NRELOC_OVFL。
+    - 运行时的线程和锁加了一层抽象：pthread，或 Windows 的 SRWLOCK、CONDITION_VARIABLE、CreateThread、SwitchToThread、GetSystemInfo。
+    - navic 在 Windows 上运行要用的也补上了：缓存目录用 LOCALAPPDATA，输出加 `.exe`，PATH 用 `;` 分隔，不调 chmod。
+    - 用 NDK 的 lld-link 加上 llvm-dlltool 生成的导入库，链接过 hello 和 navic 自身，没有运行。
 - 没做的：
   - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
   - 冷编译与 go build 持平（见上面的数字）。
@@ -208,4 +228,8 @@ navic 目前只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 仍由 stage0
 
 1. 冷编译提速：剩下的串行部分（plan 的按序遍历、codegen 合并之后的 gen_data、链接）；GC 标记占约四分之一 CPU（保守扫描，生成的代码不做寄存器分配）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。
 2. 运行时：每个 M 的运行队列、基于信号的抢占、栈收缩、最后一次 STW 的并行排空。
-3. DWARF 的变量和类型信息；amd64/ELF/COFF 上的自研链接器和 DWARF（现在只有 macOS arm64）。
+3. DWARF 的变量和类型信息；ELF/PE 的自研链接器和 DWARF（现在 Linux/Windows 由系统 cc/clang 链接，DWARF 只在 Mach-O 里）。
+4. 删掉 stage0：
+   - 先在真实的 Linux x64 和 Windows 上跑一遍测试（CI）。
+   - 再定引导方式：照 Go/Rust，用上一版 navic 的二进制引导。
+   - 然后删 Go 代码，以及 `NAVI_STAGE0`、`// stage0: skip`、编译器源码不能用新语法这些兼容包袱。

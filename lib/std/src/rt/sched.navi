@@ -851,7 +851,9 @@ fn case_send(c: &crate::sync::mpmc::SelectCase) -> bool { crate::sync::mpmc::sel
 
 // --- M:N (navic) ------------------------------------------------------------------
 
-#[cfg(feature = "navic")]
+// The OS's threads and locks: pthreads, or Windows' slim reader/writer
+// locks, condition variables and CreateThread.
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
 extern "C" {
     fn pthread_mutex_init(m: *mut u8, attr: *const u8) -> i32;
     fn pthread_mutex_lock(m: *mut u8) -> i32;
@@ -863,15 +865,95 @@ extern "C" {
     fn pthread_create(t: *mut usize, attr: *const u8, start: usize, arg: usize) -> i32;
     fn pthread_detach(t: usize) -> i32;
     fn sched_yield() -> i32;
+    fn sysconf(name: i32) -> i64;
+}
+
+#[cfg(all(feature = "navic", target_os = "windows"))]
+extern "C" {
+    fn InitializeSRWLock(l: *mut u8);
+    fn AcquireSRWLockExclusive(l: *mut u8);
+    fn TryAcquireSRWLockExclusive(l: *mut u8) -> u8;
+    fn ReleaseSRWLockExclusive(l: *mut u8);
+    fn InitializeConditionVariable(c: *mut u8);
+    fn SleepConditionVariableSRW(c: *mut u8, l: *mut u8, ms: u32, flags: u32) -> i32;
+    fn WakeConditionVariable(c: *mut u8);
+    fn CreateThread(attr: *const u8, stack: usize, start: usize, arg: usize, flags: u32, id: *mut u32) -> usize;
+    fn CloseHandle(h: usize) -> i32;
+    fn SwitchToThread() -> i32;
+    fn GetSystemInfo(info: *mut u8);
+}
+
+#[cfg(feature = "navic")]
+extern "C" {
     fn calloc(n: usize, size: usize) -> *mut u8;
     fn free(p: *mut u8);
-    fn sysconf(name: i32) -> i64;
 }
 
 #[cfg(all(feature = "navic", target_os = "macos"))]
 const SC_NPROCESSORS_ONLN: i32 = 58;
-#[cfg(all(feature = "navic", not(target_os = "macos")))]
+#[cfg(all(feature = "navic", target_os = "linux"))]
 const SC_NPROCESSORS_ONLN: i32 = 84;
+
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_mutex_init(m: *mut u8) { pthread_mutex_init(m, 0 as *const u8); }
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_mutex_lock(m: *mut u8) { pthread_mutex_lock(m); }
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_mutex_trylock(m: *mut u8) -> bool { pthread_mutex_trylock(m) == 0 }
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_mutex_unlock(m: *mut u8) { pthread_mutex_unlock(m); }
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_cond_init(c: *mut u8) { pthread_cond_init(c, 0 as *const u8); }
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_cond_wait(c: *mut u8, m: *mut u8) { pthread_cond_wait(c, m); }
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_cond_signal(c: *mut u8) { pthread_cond_signal(c); }
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_yield() { sched_yield(); }
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+fn os_ncpu() -> i64 { unsafe { sysconf(SC_NPROCESSORS_ONLN) } }
+// Starts an OS thread at the C function start with arg; false if it
+// cannot.
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+unsafe fn os_thread(start: usize, arg: usize) -> bool {
+    let mut tid = 0usize;
+    if pthread_create(&mut tid as *mut usize, 0 as *const u8, start, arg) != 0 { return false; }
+    pthread_detach(tid);
+    true
+}
+
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_mutex_init(m: *mut u8) { InitializeSRWLock(m); }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_mutex_lock(m: *mut u8) { AcquireSRWLockExclusive(m); }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_mutex_trylock(m: *mut u8) -> bool { TryAcquireSRWLockExclusive(m) != 0 }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_mutex_unlock(m: *mut u8) { ReleaseSRWLockExclusive(m); }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_cond_init(c: *mut u8) { InitializeConditionVariable(c); }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_cond_wait(c: *mut u8, m: *mut u8) { SleepConditionVariableSRW(c, m, 0xffffffff, 0); }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_cond_signal(c: *mut u8) { WakeConditionVariable(c); }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_yield() { SwitchToThread(); }
+// SYSTEM_INFO.dwNumberOfProcessors is at 32.
+#[cfg(all(feature = "navic", target_os = "windows"))]
+fn os_ncpu() -> i64 {
+    let mut info = [0u64; 8];
+    unsafe {
+        GetSystemInfo(&mut info as *mut [u64; 8] as *mut u8);
+        *((&mut info as *mut [u64; 8] as usize + 32) as *const u32) as i64
+    }
+}
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_thread(start: usize, arg: usize) -> bool {
+    let h = CreateThread(0 as *const u8, 0, start, arg, 0, 0 as *mut u32);
+    if h == 0 { return false; }
+    CloseHandle(h);
+    true
+}
 
 // The stack of M0's scheduler record (other Ms use their thread's stack).
 #[cfg(feature = "navic")]
@@ -1014,8 +1096,8 @@ fn init_ms(main: *mut G) {
     MU = unsafe { calloc(1, 128) } as usize;
     IDLE_CV = unsafe { calloc(1, 128) } as usize;
     unsafe {
-        pthread_mutex_init(MU as *mut u8, 0 as *const u8);
-        pthread_cond_init(IDLE_CV as *mut u8, 0 as *const u8);
+        os_mutex_init(MU as *mut u8);
+        os_cond_init(IDLE_CV as *mut u8);
     }
     MAX_M = max_procs();
 }
@@ -1041,7 +1123,7 @@ fn max_procs() -> usize {
         }
         if n > 0 { return n; }
     }
-    let n = unsafe { sysconf(SC_NPROCESSORS_ONLN) };
+    let n = os_ncpu();
     if n < 1 { 1 } else { n as usize }
 }
 
@@ -1053,9 +1135,9 @@ pub fn lock() {
     unsafe {
         (*g).lock_depth += 1;
         if (*g).lock_depth > 1 || !MULTI { return; }
-        if pthread_mutex_trylock(MU as *mut u8) == 0 { return; }
+        if os_mutex_trylock(MU as *mut u8) { return; }
         enter_blocked();
-        pthread_mutex_lock(MU as *mut u8);
+        os_mutex_lock(MU as *mut u8);
         exit_blocked();
     }
 }
@@ -1065,7 +1147,7 @@ pub fn unlock() {
     let g = current();
     unsafe {
         (*g).lock_depth -= 1;
-        if (*g).lock_depth == 0 && MULTI { pthread_mutex_unlock(MU as *mut u8); }
+        if (*g).lock_depth == 0 && MULTI { os_mutex_unlock(MU as *mut u8); }
     }
 }
 
@@ -1096,7 +1178,7 @@ pub fn exit_blocked() {
     if !MULTI { return; }
     let g = current();
     unsafe {
-        while !crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_BLOCKED, SYS_RUNNING) { sched_yield(); }
+        while !crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_BLOCKED, SYS_RUNNING) { os_yield(); }
     }
 }
 
@@ -1238,20 +1320,20 @@ fn wakep() {
 #[cfg(feature = "navic")]
 fn note_wake(m: *mut M) {
     unsafe {
-        pthread_mutex_lock((*m).note_mu as *mut u8);
+        os_mutex_lock((*m).note_mu as *mut u8);
         (*m).note = 1;
-        pthread_cond_signal((*m).note_cv as *mut u8);
-        pthread_mutex_unlock((*m).note_mu as *mut u8);
+        os_cond_signal((*m).note_cv as *mut u8);
+        os_mutex_unlock((*m).note_mu as *mut u8);
     }
 }
 
 #[cfg(feature = "navic")]
 fn note_sleep(m: *mut M) {
     unsafe {
-        pthread_mutex_lock((*m).note_mu as *mut u8);
-        while (*m).note == 0 { pthread_cond_wait((*m).note_cv as *mut u8, (*m).note_mu as *mut u8); }
+        os_mutex_lock((*m).note_mu as *mut u8);
+        while (*m).note == 0 { os_cond_wait((*m).note_cv as *mut u8, (*m).note_mu as *mut u8); }
         (*m).note = 0;
-        pthread_mutex_unlock((*m).note_mu as *mut u8);
+        os_mutex_unlock((*m).note_mu as *mut u8);
     }
 }
 
@@ -1260,8 +1342,8 @@ fn new_note(m: *mut M) {
     unsafe {
         (*m).note_mu = calloc(1, 128) as usize;
         (*m).note_cv = calloc(1, 128) as usize;
-        pthread_mutex_init((*m).note_mu as *mut u8, 0 as *const u8);
-        pthread_cond_init((*m).note_cv as *mut u8, 0 as *const u8);
+        os_mutex_init((*m).note_mu as *mut u8);
+        os_cond_init((*m).note_cv as *mut u8);
     }
 }
 
@@ -1347,7 +1429,7 @@ fn unidle(m: *mut M) -> bool {
 #[cfg(feature = "navic")]
 fn find_runnable(m: *mut M) -> *mut G {
     loop {
-        while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { unsafe { sched_yield(); } }
+        while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { unsafe { os_yield(); } }
         let mut g = local_pop(m);
         if g as usize != 0 { return g; }
         g = gq_pop();
@@ -1440,7 +1522,7 @@ fn exit_current() -> ! {
 fn start_m() {
     if !MULTI {
         // From now on the lock is real: the running G holds it.
-        unsafe { pthread_mutex_lock(MU as *mut u8); }
+        unsafe { os_mutex_lock(MU as *mut u8); }
         MULTI = true;
         crate::rt::gc::MULTI = true;
     }
@@ -1456,11 +1538,9 @@ fn start_m() {
     }
     MS = m as usize;
     NUM_M += 1;
-    let mut tid = 0usize;
-    if unsafe { pthread_create(&mut tid as *mut usize, 0 as *const u8, crate::rt::mstart_address(), g0 as usize) } != 0 {
+    if !unsafe { os_thread(crate::rt::mstart_address(), g0 as usize) } {
         crate::rt::native::fatal("cannot create an OS thread");
     }
-    unsafe { pthread_detach(tid); }
 }
 
 /// The first navi code of a new M (its G register is its scheduler record).
@@ -1513,7 +1593,7 @@ fn obj_lock(lk: *mut usize) {
 fn obj_unlock(lk: *mut usize) { crate::rt::atomic_store(lk, 0); }
 
 #[cfg(feature = "navic")]
-fn spin_wait() { unsafe { sched_yield(); } }
+fn spin_wait() { unsafe { os_yield(); } }
 
 /// Keeps the running G from stopping for the collector until preempt_on:
 /// a store and the write barrier's marking happen in one step.
@@ -1598,7 +1678,7 @@ pub fn mutex_unlock(w: *mut usize, lk: *mut usize, q: *mut WaitList) {
 
 /// Gives the CPU to another thread while spinning.
 #[cfg(feature = "navic")]
-pub fn cpu_relax() { unsafe { sched_yield(); } }
+pub fn cpu_relax() { unsafe { os_yield(); } }
 
 // Blocks the running G (its wait nodes are enlisted) until woken: it holds
 // the n object locks at locks, which its M's scheduler record releases
@@ -1672,7 +1752,7 @@ pub fn morestack() -> usize {
             (*g).sp = crate::rt::stack_pointer() as usize;
             (*g).fp = crate::rt::frame_address() as usize;
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_STOPPED);
-            while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { sched_yield(); }
+            while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { os_yield(); }
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_RUNNING);
         }
         if (*g).old_size != 0 {
@@ -1987,7 +2067,7 @@ pub fn stop_the_world() {
             }
         }
         if waiting == 0 { return; }
-        unsafe { sched_yield(); }
+        unsafe { os_yield(); }
     }
 }
 

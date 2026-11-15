@@ -1,0 +1,177 @@
+//! COFF object files for x86-64 Windows (linked by the system's clang).
+
+use std::collections::HashMap;
+use crate::obj::{self, Object};
+
+const SECT_NAMES: [&str; 4] = [".text", ".rdata", ".data$r", ".data"];
+
+const CNT_CODE: u32 = 0x20;
+const CNT_INIT_DATA: u32 = 0x40;
+const MEM_EXECUTE: u32 = 0x20000000;
+const MEM_READ: u32 = 0x40000000;
+const MEM_WRITE: u32 = 0x80000000;
+const ALIGN8: u32 = 0x00400000;
+const ALIGN16: u32 = 0x00500000;
+/// More than 0xffff relocations: the first one holds the count.
+const LNK_NRELOC_OVFL: u32 = 0x01000000;
+const REL_AMD64_ADDR64: u16 = 0x1;
+const REL_AMD64_REL32: u16 = 0x4;
+
+fn put16(b: &mut Vec<u8>, v: u16) {
+    b.push(v as u8);
+    b.push((v >> 8) as u8);
+}
+
+fn put32(b: &mut Vec<u8>, v: u32) {
+    let mut i = 0;
+    while i < 4 {
+        b.push((v >> (8 * i) as u32) as u8);
+        i += 1;
+    }
+}
+
+/// Encodes o (amd64) as a COFF object.
+pub fn write(o: &Object) -> Result<Vec<u8>, String> {
+    if o.arch != "amd64" { return Err("coff: only amd64 is supported".to_string()); }
+    let nsec = obj::NUM_SECTIONS;
+    // Symbols: one per defined symbol, then the undefined ones.
+    let mut strtab: Vec<u8> = Vec::new();
+    let mut symtab: Vec<u8> = Vec::new();
+    let mut sym_index: HashMap<String, u32> = HashMap::new();
+    let mut n = 0u32;
+    for sy in o.syms.iter() {
+        sym_index.insert(sy.name.clone(), n);
+        n += 1;
+        add_sym(&mut symtab, &mut strtab, sy.name.as_str(), sy.off as u32, (sy.sec + 1) as u16, if sy.sec == obj::TEXT { 0x20 } else { 0 }, if sy.global { 2 } else { 3 });
+    }
+    let mut undef: Vec<String> = Vec::new();
+    for name in o.undef.keys() {
+        if !sym_index.contains_key(name) { undef.push(name.clone()); }
+    }
+    undef.sort();
+    for name in undef.iter() {
+        sym_index.insert(name.clone(), n);
+        n += 1;
+        add_sym(&mut symtab, &mut strtab, name.as_str(), 0, 0, 0x20, 2);
+    }
+    // Relocations per section.
+    let mut relocs: Vec<Vec<u8>> = Vec::new();
+    let mut nrel: Vec<u32> = Vec::new();
+    let mut s = 0;
+    while s < nsec {
+        relocs.push(Vec::new());
+        nrel.push(0);
+        s += 1;
+    }
+    for r in o.relocs.iter() {
+        let name = o.names[r.sym as usize].clone();
+        let idx = match sym_index.get(&name) { Some(x) => *x, None => return Err(`coff: relocation against unknown symbol ${name}`) };
+        let typ = if r.kind == obj::CALL32 || r.kind == obj::PC32 { REL_AMD64_REL32 }
+            else if r.kind == obj::ABS64 { REL_AMD64_ADDR64 }
+            else { return Err(`coff: relocation kind ${r.kind} not supported`); };
+        let mut b = relocs[r.sec];
+        put32(&mut b, r.off);
+        put32(&mut b, idx);
+        put16(&mut b, typ);
+        nrel[r.sec] += 1;
+    }
+    // Layout: header (20), section headers (40 each), raw data,
+    // relocations (an overflowing count first), symbols, strings.
+    let mut off = (20 + 40 * nsec) as u32;
+    let mut raw_off: Vec<u32> = Vec::new();
+    s = 0;
+    while s < nsec {
+        off = (off + 15) / 16 * 16;
+        raw_off.push(off);
+        off += o.sects[s].len() as u32;
+        s += 1;
+    }
+    let mut rel_off: Vec<u32> = Vec::new();
+    s = 0;
+    while s < nsec {
+        rel_off.push(off);
+        if nrel[s] > 0xffff { off += 10; }
+        off += relocs[s].len() as u32;
+        s += 1;
+    }
+    let sym_off = off;
+    let mut b: Vec<u8> = Vec::new();
+    put16(&mut b, 0x8664);
+    put16(&mut b, nsec as u16);
+    put32(&mut b, 0);
+    put32(&mut b, sym_off);
+    put32(&mut b, n);
+    put16(&mut b, 0);
+    put16(&mut b, 0);
+    s = 0;
+    while s < nsec {
+        let nm = SECT_NAMES[s].as_bytes();
+        let mut i = 0;
+        while i < 8 {
+            b.push(if i < nm.len() { nm[i] } else { 0 });
+            i += 1;
+        }
+        put32(&mut b, 0);
+        put32(&mut b, 0);
+        put32(&mut b, o.sects[s].len() as u32);
+        put32(&mut b, raw_off[s]);
+        put32(&mut b, if nrel[s] > 0 { rel_off[s] } else { 0 });
+        put32(&mut b, 0);
+        let mut ch = if s == obj::TEXT { CNT_CODE | MEM_EXECUTE | MEM_READ | ALIGN16 }
+            else if s == obj::RO_DATA { CNT_INIT_DATA | MEM_READ | ALIGN8 }
+            else { CNT_INIT_DATA | MEM_READ | MEM_WRITE | ALIGN8 };
+        if nrel[s] > 0xffff {
+            put16(&mut b, 0xffff);
+            ch = ch | LNK_NRELOC_OVFL;
+        } else {
+            put16(&mut b, nrel[s] as u16);
+        }
+        put16(&mut b, 0);
+        put32(&mut b, ch);
+        s += 1;
+    }
+    s = 0;
+    while s < nsec {
+        while (b.len() as u32) < raw_off[s] { b.push(0); }
+        b.extend_from_slice(o.sects[s].as_slice());
+        s += 1;
+    }
+    s = 0;
+    while s < nsec {
+        while (b.len() as u32) < rel_off[s] { b.push(0); }
+        if nrel[s] > 0xffff {
+            // The real count, this entry included.
+            put32(&mut b, nrel[s] + 1);
+            put32(&mut b, 0);
+            put16(&mut b, 0);
+        }
+        b.extend_from_slice(relocs[s].as_slice());
+        s += 1;
+    }
+    b.extend_from_slice(symtab.as_slice());
+    put32(&mut b, (4 + strtab.len()) as u32);
+    b.extend_from_slice(strtab.as_slice());
+    Ok(b)
+}
+
+/// An 18-byte symbol record (names over 8 bytes go to the string table).
+fn add_sym(symtab: &mut Vec<u8>, strtab: &mut Vec<u8>, name: &str, value: u32, sect: u16, typ: u16, class: u8) {
+    let nb = name.as_bytes();
+    if nb.len() <= 8 {
+        let mut i = 0;
+        while i < 8 {
+            symtab.push(if i < nb.len() { nb[i] } else { 0 });
+            i += 1;
+        }
+    } else {
+        put32(symtab, 0);
+        put32(symtab, (4 + strtab.len()) as u32);
+        strtab.extend_from_slice(nb);
+        strtab.push(0);
+    }
+    put32(symtab, value);
+    put16(symtab, sect);
+    put16(symtab, typ);
+    symtab.push(class);
+    symtab.push(0);
+}
