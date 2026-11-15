@@ -1,0 +1,393 @@
+//! A linker for Windows x64: turns the object model into a PE32+
+//! executable without a C runtime's startup code (as Go's internal
+//! linker). It replaces `clang` for navic's own output.
+//!
+//! Sections: .text (code, the import stubs and the entry point), .rdata,
+//! .data (the object's read-only data with pointers, then its data),
+//! .idata (import descriptors, lookup and address tables, names) and
+//! .reloc (base relocations: the image may load anywhere). Win32 functions
+//! (capitalized names) come from kernel32.dll, the C library's from
+//! ucrtbase.dll; calls go through stubs that jump via the import address
+//! table. The entry point asks ucrtbase for argc and argv, calls main and
+//! exits with its result.
+
+use std::collections::HashMap;
+use crate::obj::{self, Object};
+use crate::link::{align_up, set32, set64, patch_rel32};
+
+const IMAGE_BASE: u64 = 0x140000000;
+const SECT_ALIGN: u64 = 0x1000;
+const FILE_ALIGN: u64 = 0x200;
+const STUB_SIZE: u64 = 8;
+
+fn put16(b: &mut Vec<u8>, v: u16) {
+    b.push(v as u8);
+    b.push((v >> 8) as u8);
+}
+
+fn put32(b: &mut Vec<u8>, v: u32) {
+    let mut i = 0;
+    while i < 4 {
+        b.push((v >> (8 * i) as u32) as u8);
+        i += 1;
+    }
+}
+
+fn put64(b: &mut Vec<u8>, v: u64) {
+    put32(b, v as u32);
+    put32(b, (v >> 32) as u32);
+}
+
+fn pad(b: &mut Vec<u8>, n: u64) { while (b.len() as u64) < n { b.push(0); } }
+
+struct Sec {
+    name: String,
+    data: Vec<u8>,
+    rva: u64,
+    off: u64,
+    flags: u32,
+}
+
+fn sec(name: &str, flags: u32) -> &mut Sec { &mut Sec { name: name.to_string(), data: Vec::new(), rva: 0, off: 0, flags } }
+
+const CODE: u32 = 0x20;
+const IDATA: u32 = 0x40;
+const EXEC: u32 = 0x20000000;
+const READ: u32 = 0x40000000;
+const WRITE: u32 = 0x80000000;
+const DISCARDABLE: u32 = 0x02000000;
+
+/// The DLL an imported function comes from.
+fn dll_of(name: &str) -> &str {
+    let c = name.as_bytes()[0];
+    if c >= 0x41 && c <= 0x5a { "kernel32.dll" } else { "ucrtbase.dll" }
+}
+
+/// Links o (amd64) into an executable.
+pub fn link(o: &Object) -> Result<Vec<u8>, String> {
+    if o.arch != "amd64" { return Err("link: Windows executables are x64 only".to_string()); }
+    // Imports: the undefined symbols and what the entry point calls,
+    // sorted by DLL, then name.
+    let mut names: Vec<String> = o.undef.keys().map(|k| k.clone()).collect();
+    for f in ["_configure_narrow_argv", "_initialize_narrow_environment", "__p___argc", "__p___argv", "exit"].iter() {
+        if !o.undef.contains_key(&f.to_string()) { names.push(f.to_string()); }
+    }
+    names.sort_by(|a, b| {
+        let da = dll_of(a.as_str());
+        let db = dll_of(b.as_str());
+        if da != db { da.cmp(db) } else { a.cmp(b) }
+    });
+    let mut import_index: HashMap<String, usize> = HashMap::new();
+    let mut ii = 0;
+    while ii < names.len() {
+        import_index.insert(names[ii].clone(), ii);
+        ii += 1;
+    }
+    let nimp = names.len() as u64;
+    let mut dlls: Vec<String> = Vec::new();
+    for n in names.iter() {
+        let d = dll_of(n.as_str()).to_string();
+        if dlls.len() == 0 || dlls[dlls.len() - 1] != d { dlls.push(d); }
+    }
+    let nsyms = o.names.len();
+    let mut defined: Vec<bool> = Vec::new();
+    let mut import_by: Vec<i64> = Vec::new();
+    let mut si = 0;
+    while si < nsyms {
+        defined.push(false);
+        import_by.push(-1);
+        si += 1;
+    }
+    for sy in o.syms.iter() { defined[sy.id as usize] = true; }
+    for (name, ix) in import_index.iter() {
+        if let Some(id) = o.ids.get(name) { import_by[*id as usize] = *ix as i64; }
+    }
+
+    // .text: the code, the stubs, the entry point.
+    let text = sec(".text", CODE | EXEC | READ);
+    text.data = o.sects[obj::TEXT].clone();
+    let stubs_off = align_up(text.data.len() as u64, 16);
+    pad(&mut text.data, stubs_off + nimp * STUB_SIZE);
+    let entry_off = align_up(text.data.len() as u64, 16);
+    pad(&mut text.data, entry_off);
+    entry_code(&mut text.data);
+    let rdata = sec(".rdata", IDATA | READ);
+    rdata.data = o.sects[obj::RO_DATA].clone();
+    let data = sec(".data", IDATA | READ | WRITE);
+    data.data = o.sects[obj::DATA_CONST].clone();
+    let data_off = align_up(data.data.len() as u64, 16);
+    pad(&mut data.data, data_off);
+    data.data.extend_from_slice(o.sects[obj::DATA].as_slice());
+    // .idata: descriptors (one per DLL and a null one), then per DLL its
+    // lookup table, then the address tables (one block, each DLL's ending
+    // in 0), then the hint/name entries and the DLL names.
+    let idata = sec(".idata", IDATA | READ | WRITE);
+    let ndll = dlls.len() as u64;
+    let desc_size = 20 * (ndll + 1);
+    let ilt_off = align_up(desc_size, 8);
+    let table_size = 8 * (nimp + ndll);
+    let iat_off = ilt_off + table_size;
+    let names_off = iat_off + table_size;
+    pad(&mut idata.data, names_off);
+    // Each import's slot in the tables (DLLs end with a null entry).
+    let mut slot: Vec<u64> = Vec::new();
+    let mut dll_first: Vec<u64> = Vec::new();
+    let mut k = 0u64;
+    let mut cur = String::new();
+    for n in names.iter() {
+        let d = dll_of(n.as_str()).to_string();
+        if d != cur {
+            if cur.len() > 0 { k += 1; }
+            dll_first.push(k);
+            cur = d;
+        }
+        slot.push(k);
+        k += 1;
+    }
+    let mut hint_rva_off: Vec<u64> = Vec::new();
+    for n in names.iter() {
+        let at = align_up(idata.data.len() as u64, 2);
+        pad(&mut idata.data, at);
+        hint_rva_off.push(at);
+        put16(&mut idata.data, 0);
+        idata.data.extend_from_slice(n.as_bytes());
+        idata.data.push(0);
+    }
+    let mut dll_name_off: Vec<u64> = Vec::new();
+    for d in dlls.iter() {
+        dll_name_off.push(idata.data.len() as u64);
+        idata.data.extend_from_slice(d.as_bytes());
+        idata.data.push(0);
+    }
+
+    // Layout.
+    let mut secs: Vec<&mut Sec> = Vec::new();
+    secs.push(text);
+    secs.push(rdata);
+    secs.push(data);
+    secs.push(idata);
+    let reloc = sec(".reloc", IDATA | READ | DISCARDABLE);
+    secs.push(reloc);
+    let nsec = secs.len() as u64;
+    let headers = align_up(0x80 + 4 + 20 + 240 + 40 * nsec, FILE_ALIGN);
+    let mut rva = align_up(headers, SECT_ALIGN);
+    // .reloc is sized below, after the others are placed.
+    let mut j = 0;
+    while j < 4 {
+        secs[j].rva = rva;
+        rva = align_up(rva + secs[j].data.len() as u64, SECT_ALIGN);
+        j += 1;
+    }
+    reloc.rva = rva;
+
+    // The import tables, now that .idata's address is known.
+    j = 0;
+    while j < dlls.len() {
+        let at = (20 * j) as usize;
+        set32(&mut idata.data, at, (idata.rva + ilt_off + 8 * dll_first[j]) as u32);
+        set32(&mut idata.data, at + 12, (idata.rva + dll_name_off[j]) as u32);
+        set32(&mut idata.data, at + 16, (idata.rva + iat_off + 8 * dll_first[j]) as u32);
+        j += 1;
+    }
+    j = 0;
+    while j < names.len() {
+        let hn = idata.rva + hint_rva_off[j];
+        set64(&mut idata.data, (ilt_off + 8 * slot[j]) as usize, hn);
+        set64(&mut idata.data, (iat_off + 8 * slot[j]) as usize, hn);
+        j += 1;
+    }
+
+    // Addresses (RVAs).
+    let sect_rva = |s: obj::Section| -> u64 {
+        if s == obj::TEXT { text.rva } else if s == obj::RO_DATA { rdata.rva } else if s == obj::DATA_CONST { data.rva } else { data.rva + data_off }
+    };
+    let mut rva_by: Vec<u64> = Vec::new();
+    si = 0;
+    while si < nsyms {
+        rva_by.push(0);
+        si += 1;
+    }
+    let mut main_rva = 0u64;
+    for sy in o.syms.iter() {
+        let a = sect_rva(sy.sec) + sy.off;
+        rva_by[sy.id as usize] = a;
+        if sy.name == "main" { main_rva = a; }
+    }
+    if main_rva == 0 { return Err("link: no main".to_string()); }
+    let stub_rva = |i: usize| -> u64 { text.rva + stubs_off + i as u64 * STUB_SIZE };
+
+    // Stubs: jmp [rip + iat].
+    let mut i = 0usize;
+    while i < names.len() {
+        let at = (stubs_off + i as u64 * STUB_SIZE) as usize;
+        text.data[at] = 0xFF;
+        text.data[at + 1] = 0x25;
+        let field = text.rva + at as u64 + 2;
+        patch_rel32(&mut text.data, at + 2, field, idata.rva + iat_off + 8 * slot[i])?;
+        text.data[at + 6] = 0xCC;
+        text.data[at + 7] = 0xCC;
+        i += 1;
+    }
+    // The entry point's calls.
+    let e = entry_off as usize;
+    let calls = [(10usize, "_configure_narrow_argv"), (15, "_initialize_narrow_environment"), (20, "__p___argc"), (27, "__p___argv"), (37, "main"), (44, "exit")];
+    for c in calls.iter() {
+        let target = if c.1 == "main" { main_rva } else { stub_rva(*import_index.get(&c.1.to_string()).unwrap()) };
+        patch_rel32(&mut text.data, e + c.0, text.rva + entry_off + c.0 as u64, target)?;
+    }
+
+    // Relocations: code is patched; data pointers are written (at the
+    // preferred base) and get base relocations.
+    let mut based: Vec<u64> = Vec::new();
+    for r in o.relocs.iter() {
+        let sid = r.sym as usize;
+        let target = if defined[sid] {
+            rva_by[sid]
+        } else if import_by[sid] >= 0 {
+            stub_rva(import_by[sid] as usize)
+        } else {
+            return Err(`link: undefined symbol ${o.names[sid]}`);
+        };
+        if r.sec == obj::TEXT {
+            if r.kind != obj::CALL32 && r.kind != obj::PC32 { return Err("link: unsupported code relocation".to_string()); }
+            patch_rel32(&mut text.data, r.off as usize, text.rva + r.off as u64, target)?;
+            continue;
+        }
+        if r.kind != obj::ABS64 { return Err("link: unsupported data relocation".to_string()); }
+        if r.sec != obj::DATA_CONST && r.sec != obj::DATA { return Err("link: relocation in read-only data".to_string()); }
+        let at = if r.sec == obj::DATA_CONST { r.off as u64 } else { data_off + r.off as u64 };
+        set64(&mut data.data, at as usize, IMAGE_BASE + target);
+        based.push(data.rva + at);
+    }
+    based.sort();
+    // .reloc: blocks per 4 KiB page of IMAGE_REL_BASED_DIR64 entries.
+    let mut bi = 0;
+    while bi < based.len() {
+        let page = based[bi] & !0xfff;
+        let start = reloc.data.len();
+        put32(&mut reloc.data, page as u32);
+        put32(&mut reloc.data, 0);
+        let mut n = 0;
+        while bi < based.len() && based[bi] & !0xfff == page {
+            put16(&mut reloc.data, (10 << 12 | (based[bi] & 0xfff)) as u16);
+            n += 1;
+            bi += 1;
+        }
+        if n % 2 == 1 { put16(&mut reloc.data, 0); }
+        let size = (reloc.data.len() - start) as u32;
+        set32(&mut reloc.data, start + 4, size);
+    }
+    let image_size = align_up(reloc.rva + reloc.data.len() as u64, SECT_ALIGN);
+    // File offsets.
+    let mut off = headers;
+    j = 0;
+    while j < secs.len() {
+        secs[j].off = off;
+        off += align_up(secs[j].data.len() as u64, FILE_ALIGN);
+        j += 1;
+    }
+
+    // Headers: a minimal DOS header pointing at the PE header at 0x80.
+    let mut b: Vec<u8> = Vec::new();
+    b.push(0x4d);
+    b.push(0x5a);
+    pad(&mut b, 0x3c);
+    put32(&mut b, 0x80);
+    pad(&mut b, 0x80);
+    put32(&mut b, 0x4550); // PE\0\0
+    put16(&mut b, 0x8664);
+    put16(&mut b, nsec as u16);
+    put32(&mut b, 0); // timestamp
+    put32(&mut b, 0);
+    put32(&mut b, 0);
+    put16(&mut b, 240);
+    put16(&mut b, 0x22); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    // Optional header (PE32+).
+    put16(&mut b, 0x20b);
+    b.push(14);
+    b.push(0);
+    put32(&mut b, align_up(text.data.len() as u64, FILE_ALIGN) as u32);
+    put32(&mut b, (align_up(rdata.data.len() as u64, FILE_ALIGN) + align_up(data.data.len() as u64, FILE_ALIGN) + align_up(idata.data.len() as u64, FILE_ALIGN) + align_up(reloc.data.len() as u64, FILE_ALIGN)) as u32);
+    put32(&mut b, 0);
+    put32(&mut b, (text.rva + entry_off) as u32);
+    put32(&mut b, text.rva as u32);
+    put64(&mut b, IMAGE_BASE);
+    put32(&mut b, SECT_ALIGN as u32);
+    put32(&mut b, FILE_ALIGN as u32);
+    put16(&mut b, 6); // OS version
+    put16(&mut b, 0);
+    put16(&mut b, 0); // image version
+    put16(&mut b, 0);
+    put16(&mut b, 6); // subsystem version
+    put16(&mut b, 0);
+    put32(&mut b, 0);
+    put32(&mut b, image_size as u32);
+    put32(&mut b, headers as u32);
+    put32(&mut b, 0); // checksum
+    put16(&mut b, 3); // console
+    put16(&mut b, 0x8160); // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
+    put64(&mut b, 0x200000); // stack reserve (the main thread soon leaves it)
+    put64(&mut b, 0x1000);
+    put64(&mut b, 0x100000); // heap
+    put64(&mut b, 0x1000);
+    put32(&mut b, 0);
+    put32(&mut b, 16);
+    // Data directories: import (1), base relocation (5), IAT (12).
+    let mut d = 0;
+    while d < 16 {
+        if d == 1 {
+            put32(&mut b, idata.rva as u32);
+            put32(&mut b, desc_size as u32);
+        } else if d == 5 {
+            put32(&mut b, reloc.rva as u32);
+            put32(&mut b, reloc.data.len() as u32);
+        } else if d == 12 {
+            put32(&mut b, (idata.rva + iat_off) as u32);
+            put32(&mut b, table_size as u32);
+        } else {
+            put64(&mut b, 0);
+        }
+        d += 1;
+    }
+    for s in secs.iter() {
+        let nm = s.name.as_bytes();
+        let mut c = 0;
+        while c < 8 {
+            b.push(if c < nm.len() { nm[c] } else { 0 });
+            c += 1;
+        }
+        put32(&mut b, s.data.len() as u32);
+        put32(&mut b, s.rva as u32);
+        put32(&mut b, align_up(s.data.len() as u64, FILE_ALIGN) as u32);
+        put32(&mut b, s.off as u32);
+        put32(&mut b, 0);
+        put32(&mut b, 0);
+        put16(&mut b, 0);
+        put16(&mut b, 0);
+        put32(&mut b, s.flags);
+    }
+    for s in secs.iter() {
+        pad(&mut b, s.off);
+        b.extend_from_slice(s.data.as_slice());
+        pad(&mut b, s.off + align_up(s.data.len() as u64, FILE_ALIGN));
+    }
+    Ok(b)
+}
+
+/// The entry point (no C runtime startup): Windows calls it with nothing.
+///
+///   sub rsp, 40; mov ecx, 1; call _configure_narrow_argv;
+///   call _initialize_narrow_environment; call __p___argc;
+///   mov ebx, [rax]; call __p___argv; mov rdx, [rax]; mov ecx, ebx;
+///   call main; mov ecx, eax; call exit; ud2
+///
+/// (link patches the calls' displacements at 10, 15, 20, 27, 37 and 44.)
+fn entry_code(b: &mut Vec<u8>) {
+    let code = [0x48u8, 0x83, 0xEC, 0x28, 0xB9, 1, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0,
+        0x8B, 0x18, 0xE8, 0, 0, 0, 0, 0x48, 0x8B, 0x10, 0x89, 0xD9, 0xE8, 0, 0, 0, 0, 0x89, 0xC1, 0xE8, 0, 0, 0, 0, 0x0F, 0x0B];
+    let mut i = 0;
+    while i < code.len() {
+        b.push(code[i]);
+        i += 1;
+    }
+}

@@ -210,16 +210,22 @@
   - macOS x64：自研 Mach-O 链接器也能链接 x86-64（跳板是 `jmp [rip+got]`），不需要系统工具链。
     - 在 Rosetta 下，全部测试在各种模式（线程数、GCVERIFY、GCSTW、GCPOISON）下都通过。
     - x64 版 navic 编译自身能到定点，交叉编译出的 arm64 产物与 arm64 版 navic 编译的逐字节相同。
-  - Linux：生成 ELF 目标文件，由系统 cc 链接（同 stage0）。
+  - Linux：有自研的 ELF 链接器（`elflink.navi`，同 Go 的内部链接），不需要 C 工具链。
+    - 输出是动态加载 libc 的 PIE：导入函数经 GOT 加跳板调用，GOT 在装载时一次绑好（BIND_NOW）；数据里的指针用 RELATIVE 重定位；`_start` 调 `__libc_start_main`；带 DT_HASH，并带 .symtab 和 DWARF 供调试器用。
+    - `NAVI_LINKER=cc` 还能改回系统 cc，`-c` 照样生成 ELF 目标文件。
     - arm64 的 ldr 低 12 位用单独的重定位类型（R_AARCH64_LDST64_ABS_LO12_NC）。
     - linux-arm64 的原子操作用 LL/SC 循环，因为 ARMv8.0 的板子（如树莓派 4）没有 LSE。`NAVI_LLSC=1` 可以在 macOS 上试这种写法。
-    - 在本机的 Android arm64 模拟器上验证过：Linux 内核加 bionic，用 NDK 的 lld 链接。全部测试在各种模式下都通过，navic 在模拟器上编译自身，产物与 mac 上交叉编译的逐字节相同。用的脚本是 `tools/androidtest.sh`。
-    - linux-x64 只用 lld 链接过，没有运行。
-  - Windows：生成 COFF 目标文件，由 clang 链接。
+    - 在本机的 Android arm64 模拟器上验证过（Linux 内核加 bionic）。`NAVI_ELF_LIBC=bionic` 会换成 bionic 的动态链接器、libc.so 和 `__libc_init`，这样 navic 链接出的程序可以直接在模拟器上运行。
+    - 结果：全部测试在各种模式下都通过；navic 在模拟器上链接自身，产物与 mac 上的逐字节相同。用的脚本是 `tools/androidtest.sh`，加 `ANDROID_LINK=ndk` 则改用 NDK 的 clang 链接。
+    - linux-x64 只做了静态检查（llvm-readelf/objdump），没有运行。
+  - Windows：有自研的 PE 链接器（`pelink.navi`），不需要 C 工具链。
+    - 输出是 PE32+，支持 ASLR（带 .reloc 基址重定位）。Win32 API（首字母大写的函数）从 kernel32.dll 导入，C 库函数从 ucrtbase.dll 导入，都经导入地址表跳板调用。
+    - 不带 CRT 启动代码：入口向 ucrtbase 要 argc、argv（`_configure_narrow_argv`、`__p___argc`、`__p___argv`），然后调 main 并 exit。
+    - `-c` 生成 COFF 目标文件（`NAVI_LINKER=cc` 时由 clang 链接）。
     - 重定位超过 65535 条时用 IMAGE_SCN_LNK_NRELOC_OVFL。
     - 运行时的线程和锁加了一层抽象：pthread，或 Windows 的 SRWLOCK、CONDITION_VARIABLE、CreateThread、SwitchToThread、GetSystemInfo。
     - navic 在 Windows 上运行要用的也补上了：缓存目录用 LOCALAPPDATA，输出加 `.exe`，PATH 用 `;` 分隔，不调 chmod。
-    - 用 NDK 的 lld-link 加上 llvm-dlltool 生成的导入库，链接过 hello 和 navic 自身，没有运行。
+    - COFF 用 NDK 的 lld-link 加上 llvm-dlltool 生成的导入库链接过 hello 和 navic 自身；PE 用 llvm-readobj/objdump 检查过导入表、基址重定位和入口。都没有运行。
 - 没做的：
   - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
   - 冷编译与 go build 持平（见上面的数字）。
@@ -228,8 +234,8 @@
 
 1. 冷编译提速：剩下的串行部分（plan 的按序遍历、codegen 合并之后的 gen_data、链接）；GC 标记占约四分之一 CPU（保守扫描，生成的代码不做寄存器分配）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。
 2. 运行时：每个 M 的运行队列、基于信号的抢占、栈收缩、最后一次 STW 的并行排空。
-3. DWARF 的变量和类型信息；ELF/PE 的自研链接器和 DWARF（现在 Linux/Windows 由系统 cc/clang 链接，DWARF 只在 Mach-O 里）。
+3. DWARF 的变量和类型信息；PE 的调试信息（现在只有 Mach-O 和 ELF 带 DWARF）。
 4. 删掉 stage0：
-   - 先在真实的 Linux x64 和 Windows 上跑一遍测试（CI）。
+   - 先在真实的 Linux（glibc）和 Windows 上跑一遍测试（CI），尤其是两个自研链接器的输出。
    - 再定引导方式：照 Go/Rust，用上一版 navic 的二进制引导。
    - 然后删 Go 代码，以及 `NAVI_STAGE0`、`// stage0: skip`、编译器源码不能用新语法这些兼容包袱。
