@@ -457,6 +457,7 @@ let s: String = p.to_string();
    - `assert!` 系列 → `std::panic::{assert, assert_eq, assert_ne}`
    - 以上都在 prelude 里；`format!` 就是模板字符串本身
 8. **GC 语言特有的功能**放在新模块 `std::gc`，比如 `gc::collect()`、弱引用 `gc::Weak<T>`、finalizer。这一版不做
+   - 元编程不用宏，用运行时反射 `std::reflect`（照 Go 的 reflect，不需要标注），`std::json` 建在它上面（见 std-diff 第 6 节）
 9. **每一处和 Rust 不同的地方**，都在 `spec/std-diff.md` 里列出来
 
 **这一版只实现语言和测试离不开的子集**，用的都是 Rust 的路径：

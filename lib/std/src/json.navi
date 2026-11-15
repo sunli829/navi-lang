@@ -1,0 +1,643 @@
+//! JSON for every type, through std::reflect (as Go's encoding/json; the
+//! function names and the mapping follow Rust's serde_json):
+//!
+//! - bool, integers and floats are JSON booleans and numbers (NaN and the
+//!   infinities are written as null); char, String and &str are strings.
+//! - Structs are objects (missing fields keep their zero values, unknown
+//!   ones are skipped); tuple structs, tuples, arrays and Vecs are arrays;
+//!   a one-field tuple struct is its field; () and unit structs are null.
+//! - Option is null or its value; other enums are "Variant" (no fields) or
+//!   {"Variant": payload}, the payload being the field, an array of the
+//!   fields, or an object of them.
+//! - HashMaps with string or integer keys are objects.
+//! - References are what they point to.
+//!
+//!     let s = json::to_string(&p).unwrap();
+//!     let q: Point = json::from_str(s.as_str()).unwrap();
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::reflect::{self, Kind, Value};
+
+/// Why a value could not be written or read (with the byte offset in the
+/// input when reading).
+#[derive(Clone)]
+pub struct Error {
+    msg: String,
+    pos: usize,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        if self.pos == usize::MAX { f.write_str(self.msg.as_str()) } else { f.write_fmt(`${self.msg} at offset ${self.pos}`) }
+    }
+}
+
+impl Debug for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { Display::fmt(self, f) }
+}
+
+fn err<T>(msg: String) -> Result<T, Error> { Err(Error { msg, pos: usize::MAX }) }
+
+/// The JSON text of x.
+pub fn to_string<T>(x: &T) -> Result<String, Error> {
+    let mut w = Writer { out: String::new(), indent: -1, depth: 0 };
+    w.value(&reflect::value_of(x))?;
+    Ok(w.out)
+}
+
+/// The JSON text of x, indented by two spaces.
+pub fn to_string_pretty<T>(x: &T) -> Result<String, Error> {
+    let mut w = Writer { out: String::new(), indent: 2, depth: 0 };
+    w.value(&reflect::value_of(x))?;
+    Ok(w.out)
+}
+
+/// The value of type T that s describes.
+pub fn from_str<T>(s: &str) -> Result<T, Error> {
+    let v = Value::new(reflect::type_of::<T>());
+    let mut r = Reader { b: s.as_bytes(), i: 0 };
+    let mut target = v.clone();
+    r.value(&mut target)?;
+    r.ws();
+    if r.i < r.b.len() { return r.fail("trailing characters"); }
+    Ok(unsafe { (v.as_ptr() as *const T).read() })
+}
+
+// Whether an enum type is Option.
+fn is_option(v: &Value) -> bool {
+    let vs = v.ty().variants();
+    vs.len() == 2 && vs[0].name == "None" && vs[0].fields.len() == 0 && vs[1].name == "Some" && vs[1].fields.len() == 1
+}
+
+// A tuple struct's fields are named 0, 1, ...
+fn is_tuple_like(fields: &Vec<reflect::Field>) -> bool { fields.len() > 0 && fields[0].name == "0" }
+
+struct Writer {
+    out: String,
+    /// Spaces per level, or -1: compact.
+    indent: i64,
+    depth: i64,
+}
+
+impl Writer {
+    fn newline(&mut self) {
+        if self.indent < 0 { return; }
+        self.out.push('\n');
+        let mut i = 0;
+        while i < self.indent * self.depth {
+            self.out.push(' ');
+            i += 1;
+        }
+    }
+
+    fn string(&mut self, s: &str) {
+        self.out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => self.out.push_str("\\\""),
+                '\\' => self.out.push_str("\\\\"),
+                '\n' => self.out.push_str("\\n"),
+                '\r' => self.out.push_str("\\r"),
+                '\t' => self.out.push_str("\\t"),
+                _ => {
+                    if (c as u32) < 0x20 {
+                        self.out.push_str(`\\u${hex4(c as u32)}`.as_str());
+                    } else {
+                        self.out.push(c);
+                    }
+                }
+            }
+        }
+        self.out.push('"');
+    }
+
+    // [ items ] or { items }, items written by each.
+    fn open(&mut self, c: char) {
+        self.out.push(c);
+        self.depth += 1;
+    }
+
+    fn item(&mut self, first: bool) {
+        if !first { self.out.push(','); }
+        self.newline();
+    }
+
+    fn close(&mut self, c: char, empty: bool) {
+        self.depth -= 1;
+        if !empty { self.newline(); }
+        self.out.push(c);
+    }
+
+    fn key(&mut self, k: &str) {
+        self.string(k);
+        self.out.push(':');
+        if self.indent >= 0 { self.out.push(' '); }
+    }
+
+    fn fields(&mut self, v: &Value, fields: &Vec<reflect::Field>, variant: bool) -> Result<(), Error> {
+        let get = |i: usize| -> Value { if variant { v.variant_field(i) } else { v.field(i) } };
+        if fields.len() == 1 && is_tuple_like(fields) { return self.value(&get(0)); }
+        if is_tuple_like(fields) {
+            self.open('[');
+            let mut i = 0;
+            while i < fields.len() {
+                self.item(i == 0);
+                self.value(&get(i))?;
+                i += 1;
+            }
+            self.close(']', fields.len() == 0);
+            return Ok(());
+        }
+        self.open('{');
+        let mut i = 0;
+        while i < fields.len() {
+            self.item(i == 0);
+            self.key(fields[i].name);
+            self.value(&get(i))?;
+            i += 1;
+        }
+        self.close('}', fields.len() == 0);
+        Ok(())
+    }
+
+    fn value(&mut self, v: &Value) -> Result<(), Error> {
+        match v.kind() {
+            Kind::Bool => self.out.push_str(if v.as_bool() { "true" } else { "false" }),
+            Kind::Char => {
+                let mut s = String::new();
+                s.push(v.as_char());
+                self.string(s.as_str());
+            }
+            Kind::F32 | Kind::F64 => {
+                let x = v.as_f64();
+                if x.is_nan() || x.is_infinite() { self.out.push_str("null"); } else { self.out.push_str(`${x}`.as_str()); }
+            }
+            Kind::String => self.string(v.as_str()),
+            Kind::Tuple | Kind::Struct => {
+                let fs = v.ty().fields();
+                if fs.len() == 0 { self.out.push_str("null"); } else { self.fields(v, &fs, false)?; }
+            }
+            Kind::Array | Kind::Vec => {
+                let n = v.len();
+                self.open('[');
+                let mut i = 0;
+                while i < n {
+                    self.item(i == 0);
+                    self.value(&v.index(i))?;
+                    i += 1;
+                }
+                self.close(']', n == 0);
+            }
+            Kind::Enum => {
+                let vi = v.variant();
+                let var = v.ty().variants()[vi].clone();
+                if is_option(v) {
+                    if vi == 0 { self.out.push_str("null"); } else { self.value(&v.variant_field(0))?; }
+                } else if var.fields.len() == 0 {
+                    self.string(var.name);
+                } else {
+                    self.open('{');
+                    self.item(true);
+                    self.key(var.name);
+                    self.fields(v, &var.fields, true)?;
+                    self.close('}', false);
+                }
+            }
+            Kind::Map => {
+                let mut es = v.map_entries();
+                // Sorted by key, so the text does not depend on hashing.
+                let mut keys: Vec<String> = Vec::new();
+                for e in es.iter() {
+                    let k = &e.0;
+                    if k.is_str() { keys.push(k.as_str().to_string()); }
+                    else if k.is_int() { keys.push(`${k.as_i128()}`); }
+                    else { return err(`json: map keys of type ${k.ty()} are not supported`); }
+                }
+                let mut order: Vec<usize> = (0..es.len()).collect();
+                order.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
+                self.open('{');
+                let mut i = 0;
+                while i < order.len() {
+                    self.item(i == 0);
+                    self.key(keys[order[i]].as_str());
+                    self.value(&es[order[i]].1)?;
+                    i += 1;
+                }
+                self.close('}', es.len() == 0);
+            }
+            Kind::Ref => {
+                if v.is_str() {
+                    self.string(v.as_str());
+                } else if v.ty().elem().unwrap().kind() == Kind::Slice {
+                    let n = v.len();
+                    self.open('[');
+                    let mut i = 0;
+                    while i < n {
+                        self.item(i == 0);
+                        self.value(&v.index(i))?;
+                        i += 1;
+                    }
+                    self.close(']', n == 0);
+                } else if v.is_null() {
+                    self.out.push_str("null");
+                } else {
+                    match v.ty().elem().unwrap().kind() {
+                        Kind::Dyn => return err(`json: ${v.ty()} is not supported`),
+                        _ => self.value(&v.deref())?,
+                    }
+                }
+            }
+            _ => {
+                if v.is_int() {
+                    self.out.push_str(`${v.as_i128()}`.as_str());
+                } else {
+                    return err(`json: ${v.ty()} is not supported`);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn hex4(n: u32) -> String {
+    let digits = "0123456789abcdef".as_bytes();
+    let mut s = String::new();
+    let mut sh = 12;
+    loop {
+        s.push(digits[((n >> sh) & 15) as usize] as char);
+        if sh == 0 { break; }
+        sh -= 4;
+    }
+    s
+}
+
+// A decimal integer (at most 38 digits: within i128).
+fn parse_int(s: &str) -> Option<i128> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let neg = b.len() > 0 && b[0] == b'-';
+    if neg { i = 1; }
+    if i == b.len() || b.len() - i > 38 { return None; }
+    let mut n: i128 = 0;
+    while i < b.len() {
+        if b[i] < b'0' || b[i] > b'9' { return None; }
+        n = n * 10 + (b[i] - b'0') as i128;
+        i += 1;
+    }
+    Some(if neg { -n } else { n })
+}
+
+struct Reader {
+    b: &[u8],
+    i: usize,
+}
+
+impl Reader {
+    fn fail<T>(&self, msg: &str) -> Result<T, Error> { Err(Error { msg: `json: ${msg}`, pos: self.i }) }
+
+    fn ws(&mut self) {
+        while self.i < self.b.len() {
+            let c = self.b[self.i];
+            if c != b' ' && c != b'\n' && c != b'\r' && c != b'\t' { return; }
+            self.i += 1;
+        }
+    }
+
+    fn peek(&mut self) -> u8 {
+        self.ws();
+        if self.i < self.b.len() { self.b[self.i] } else { 0 }
+    }
+
+    fn expect(&mut self, c: u8) -> Result<(), Error> {
+        if self.peek() != c { return self.fail(`expected '${c as char}'`.as_str()); }
+        self.i += 1;
+        Ok(())
+    }
+
+    fn word(&mut self, w: &str) -> bool {
+        self.ws();
+        let wb = w.as_bytes();
+        if self.i + wb.len() > self.b.len() { return false; }
+        let mut j = 0;
+        while j < wb.len() {
+            if self.b[self.i + j] != wb[j] { return false; }
+            j += 1;
+        }
+        self.i += wb.len();
+        true
+    }
+
+    fn string(&mut self) -> Result<String, Error> {
+        self.expect(b'"')?;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            if self.i >= self.b.len() { return self.fail("unterminated string"); }
+            let c = self.b[self.i];
+            self.i += 1;
+            if c == b'"' { break; }
+            if c != b'\\' {
+                out.push(c);
+                continue;
+            }
+            if self.i >= self.b.len() { return self.fail("unterminated string"); }
+            let e = self.b[self.i];
+            self.i += 1;
+            match e {
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                b'/' => out.push(b'/'),
+                b'b' => out.push(8),
+                b'f' => out.push(12),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'u' => {
+                    let mut cp = self.hex()?;
+                    // A surrogate pair.
+                    if cp >= 0xD800 && cp < 0xDC00 && self.i + 1 < self.b.len() && self.b[self.i] == b'\\' && self.b[self.i + 1] == b'u' {
+                        self.i += 2;
+                        let lo = self.hex()?;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    }
+                    let ch = match char::from_u32(cp) { Some(x) => x, None => return self.fail("invalid \\u escape") };
+                    let mut s = String::new();
+                    s.push(ch);
+                    out.extend_from_slice(s.as_bytes());
+                }
+                _ => return self.fail("invalid escape"),
+            }
+        }
+        match String::from_utf8(out) {
+            Ok(s) => Ok(s),
+            Err(_) => self.fail("invalid UTF-8"),
+        }
+    }
+
+    fn hex(&mut self) -> Result<u32, Error> {
+        if self.i + 4 > self.b.len() { return self.fail("short \\u escape"); }
+        let mut v = 0u32;
+        let mut j = 0;
+        while j < 4 {
+            let c = self.b[self.i + j];
+            let d = if c >= b'0' && c <= b'9' { c - b'0' } else if c >= b'a' && c <= b'f' { c - b'a' + 10 } else if c >= b'A' && c <= b'F' { c - b'A' + 10 } else { return self.fail("invalid \\u escape"); };
+            v = v * 16 + d as u32;
+            j += 1;
+        }
+        self.i += 4;
+        Ok(v)
+    }
+
+    // A number's text.
+    fn number(&mut self) -> Result<&str, Error> {
+        self.ws();
+        let start = self.i;
+        while self.i < self.b.len() {
+            let c = self.b[self.i];
+            if c >= b'0' && c <= b'9' || c == b'-' || c == b'+' || c == b'.' || c == b'e' || c == b'E' { self.i += 1; } else { break; }
+        }
+        if self.i == start { return self.fail("expected a number"); }
+        Ok(crate::rt::str_from_raw(crate::rt::ptr_offset(crate::rt::slice_ptr(self.b), start), self.i - start))
+    }
+
+    // Skips a value of any type.
+    fn skip(&mut self) -> Result<(), Error> {
+        let c = self.peek();
+        if c == b'"' {
+            self.string()?;
+        } else if c == b'{' || c == b'[' {
+            let close = if c == b'{' { b'}' } else { b']' };
+            self.i += 1;
+            if self.peek() == close {
+                self.i += 1;
+                return Ok(());
+            }
+            loop {
+                if c == b'{' {
+                    self.string()?;
+                    self.expect(b':')?;
+                }
+                self.skip()?;
+                if self.peek() == b',' {
+                    self.i += 1;
+                    continue;
+                }
+                self.expect(close)?;
+                return Ok(());
+            }
+        } else if self.word("true") || self.word("false") || self.word("null") {
+        } else {
+            self.number()?;
+        }
+        Ok(())
+    }
+
+    // [ each... ]: calls item for every element.
+    fn array(&mut self, v: &mut Value, n: i64) -> Result<(), Error> {
+        self.expect(b'[')?;
+        let mut i = 0;
+        if self.peek() == b']' {
+            self.i += 1;
+        } else {
+            loop {
+                if v.kind() == Kind::Vec {
+                    let mut e = v.push();
+                    self.value(&mut e)?;
+                } else {
+                    if i >= n { return self.fail(`more than ${n} elements`.as_str()); }
+                    let mut e = if v.kind() == Kind::Array { v.index(i as usize) } else { v.field(i as usize) };
+                    self.value(&mut e)?;
+                }
+                i += 1;
+                if self.peek() == b',' {
+                    self.i += 1;
+                    continue;
+                }
+                self.expect(b']')?;
+                break;
+            }
+        }
+        if n >= 0 && i != n { return self.fail(`expected ${n} elements, found ${i}`.as_str()); }
+        Ok(())
+    }
+
+    // The fields of a struct (or of variant vi, if >= 0) from an array,
+    // an object or (one tuple field) the field's value.
+    fn fields(&mut self, v: &mut Value, fields: &Vec<reflect::Field>, vi: i64) -> Result<(), Error> {
+        if fields.len() == 1 && is_tuple_like(fields) {
+            let mut f = if vi >= 0 { v.field_of_variant(vi as usize, 0) } else { v.field(0) };
+            return self.value(&mut f);
+        }
+        if is_tuple_like(fields) {
+            self.expect(b'[')?;
+            let mut i = 0;
+            while i < fields.len() {
+                if i > 0 { self.expect(b',')?; }
+                let mut f = if vi >= 0 { v.field_of_variant(vi as usize, i) } else { v.field(i) };
+                self.value(&mut f)?;
+                i += 1;
+            }
+            return self.expect(b']');
+        }
+        self.expect(b'{')?;
+        if self.peek() == b'}' {
+            self.i += 1;
+            return Ok(());
+        }
+        loop {
+            let k = self.string()?;
+            self.expect(b':')?;
+            let mut found = false;
+            let mut i = 0;
+            while i < fields.len() {
+                if fields[i].name == k.as_str() {
+                    let mut f = if vi >= 0 { v.field_of_variant(vi as usize, i) } else { v.field(i) };
+                    self.value(&mut f)?;
+                    found = true;
+                    break;
+                }
+                i += 1;
+            }
+            if !found { self.skip()?; }
+            if self.peek() == b',' {
+                self.i += 1;
+                continue;
+            }
+            return self.expect(b'}');
+        }
+    }
+
+    fn value(&mut self, v: &mut Value) -> Result<(), Error> {
+        let c = self.peek();
+        match v.kind() {
+            Kind::Bool => {
+                if self.word("true") { v.set_bool(true); } else if self.word("false") { v.set_bool(false); } else { return self.fail("expected a boolean"); }
+            }
+            Kind::Char => {
+                let s = self.string()?;
+                let mut cs = s.chars();
+                match (cs.next(), cs.next()) {
+                    (Some(ch), None) => v.set_char(ch),
+                    _ => return self.fail("expected a one-character string"),
+                }
+            }
+            Kind::F32 | Kind::F64 => {
+                if self.word("null") {
+                    v.set_f64(f64::NAN);
+                } else {
+                    let t = self.number()?;
+                    match t.parse::<f64>() {
+                        Ok(x) => v.set_f64(x),
+                        Err(_) => return self.fail("invalid number"),
+                    }
+                }
+            }
+            Kind::String => {
+                let s = self.string()?;
+                v.set_str(s.as_str());
+            }
+            Kind::Tuple | Kind::Struct => {
+                let fs = v.ty().fields();
+                if fs.len() == 0 {
+                    if !self.word("null") { return self.fail("expected null"); }
+                } else {
+                    self.fields(v, &fs, -1)?;
+                }
+            }
+            Kind::Array => self.array(v, v.ty().len() as i64)?,
+            Kind::Vec => self.array(v, -1)?,
+            Kind::Enum => {
+                if is_option(v) {
+                    if self.word("null") {
+                        v.set_variant(0);
+                    } else {
+                        v.set_variant(1);
+                        let mut f = v.field_of_variant(1, 0);
+                        self.value(&mut f)?;
+                    }
+                } else if c == b'"' {
+                    let name = self.string()?;
+                    match v.variant_named(name.as_str()) {
+                        Some(i) => {
+                            if v.ty().variants()[i].fields.len() > 0 { return self.fail(`variant ${name} has fields`.as_str()); }
+                            v.set_variant(i);
+                        }
+                        None => return self.fail(`unknown variant ${name}`.as_str()),
+                    }
+                } else {
+                    self.expect(b'{')?;
+                    let name = self.string()?;
+                    self.expect(b':')?;
+                    let i = match v.variant_named(name.as_str()) { Some(i) => i, None => return self.fail(`unknown variant ${name}`.as_str()) };
+                    v.set_variant(i);
+                    let fs = v.ty().variants()[i].fields.clone();
+                    if fs.len() == 0 {
+                        if !self.word("null") { return self.fail("expected null"); }
+                    } else {
+                        self.fields(v, &fs, i as i64)?;
+                    }
+                    self.expect(b'}')?;
+                }
+            }
+            Kind::Map => {
+                let kt = v.ty().key().unwrap();
+                let vt = v.ty().value().unwrap();
+                self.expect(b'{')?;
+                if self.peek() == b'}' {
+                    self.i += 1;
+                    return Ok(());
+                }
+                loop {
+                    let ks = self.string()?;
+                    let mut k = Value::new(kt.clone());
+                    if k.is_str() {
+                        k.set_str(ks.as_str());
+                    } else if k.is_int() {
+                        match parse_int(ks.as_str()) {
+                            Some(n) => k.set_i128(n),
+                            None => return self.fail("expected an integer key"),
+                        }
+                    } else {
+                        return self.fail(`map keys of type ${kt} are not supported`.as_str());
+                    }
+                    self.expect(b':')?;
+                    let mut val = Value::new(vt.clone());
+                    self.value(&mut val)?;
+                    v.map_insert(&k, &val);
+                    if self.peek() == b',' {
+                        self.i += 1;
+                        continue;
+                    }
+                    return self.expect(b'}');
+                }
+            }
+            Kind::Ref => {
+                if v.is_str() {
+                    let s = self.string()?;
+                    v.set_str(s.as_str());
+                } else {
+                    match v.ty().elem().unwrap().kind() {
+                        Kind::Slice | Kind::Dyn => return self.fail(`${v.ty()} is not supported`.as_str()),
+                        _ => {
+                            let mut t = v.set_new();
+                            self.value(&mut t)?;
+                        }
+                    }
+                }
+            }
+            _ => {
+                if !v.is_int() { return self.fail(`${v.ty()} is not supported`.as_str()); }
+                let t = self.number()?;
+                let n = match parse_int(t) { Some(n) => n, None => return self.fail("expected an integer") };
+                let bits = 8 * v.ty().size() as u32;
+                let (lo, hi) = if v.is_signed() {
+                    if bits == 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) }
+                } else {
+                    if bits == 128 { (0, i128::MAX) } else { (0, (1i128 << bits) - 1) }
+                };
+                if n < lo || n > hi { return self.fail(`${n} out of range for ${v.ty()}`.as_str()); }
+                v.set_i128(n);
+            }
+        }
+        Ok(())
+    }
+}

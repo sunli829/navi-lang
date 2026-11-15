@@ -43,8 +43,9 @@ for b in "$tmp"/bin/*; do
 	want_code=$(grep -E '^// exit:' "$f" | sed -E 's#^// exit: *##')
 	[ -z "$want_code" ] && want_code=0
 	got=$("$adb" shell "cd $dir && chmod 755 $n && env $* ./$n 2>/dev/null; echo EXIT=\$?" | tr -d '\r')
-	code=$(echo "$got" | tail -1 | sed 's/EXIT=//')
-	got_out=$(echo "$got" | sed '$d')
+	# printf, not echo: sh's echo would expand backslashes in the output.
+	code=$(printf '%s\n' "$got" | tail -1 | sed 's/EXIT=//')
+	got_out=$(printf '%s\n' "$got" | sed '$d')
 	if [ "$got_out" = "$want_out" ] && [ "$code" = "$want_code" ]; then
 		echo "ok   $f"
 	else

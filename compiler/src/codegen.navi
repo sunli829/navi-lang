@@ -25,7 +25,8 @@ pub fn is_inline(name: &str) -> bool {
         | "caller_location" | "abort" | "run_defers" | "save_context" | "resume_context"
         | "frame_address" | "stack_top" | "stack_pointer" | "spill_registers" | "data_start" | "data_end"
         | "swap_context" | "gstart_address" | "mstart_address" | "set_stack_limit" | "current_g" | "set_current_g"
-        | "atomic_load" | "atomic_store" | "atomic_add" | "atomic_cas" | "gc_marking_flag" | "scan_words" | "func_table" => true,
+        | "atomic_load" | "atomic_store" | "atomic_add" | "atomic_cas" | "gc_marking_flag" | "scan_words" | "func_table"
+        | "type_desc" => true,
         _ => false,
     }
 }
@@ -54,6 +55,9 @@ pub struct Target {
 impl Target {
     fn key(&self) -> String {
         if self.kind == T_INST { return `i${self.inst.unwrap().key}`; }
+        // A type descriptor differs with its type (a dictionary slot in
+        // shared code).
+        if self.kind == T_INTRINSIC && self.intrinsic == "type_desc" { return `xtype_desc<${args_key(&self.type_args)}>`; }
         if self.kind == T_INTRINSIC { return `x${self.intrinsic}`; }
         `v${self.method}`
     }
@@ -133,6 +137,16 @@ pub struct Vtable {
     pub methods: Vec<&mut Target>,
 }
 
+/// The runtime description of a type (std::reflect), made for every type
+/// type_desc reaches and, in turn, the types of its parts.
+pub struct Desc {
+    pub sym: String,
+    pub ty: &Type,
+    /// A HashMap's vtable for std::reflect::ReflectMap (its insertion and
+    /// iteration need the key's Hash and Eq).
+    pub map_vt: Option<&mut Vtable>,
+}
+
 /// One dictionary entry.
 pub enum DictEntry {
     Target(&mut Target),
@@ -152,6 +166,9 @@ pub struct Plan {
     pub vtables: HashMap<String, &mut Vtable>,
     /// The vtables in creation order.
     pub vtable_list: Vec<&mut Vtable>,
+    /// Type descriptors by type id, and in creation order.
+    pub descs: HashMap<u32, &mut Desc>,
+    pub desc_list: Vec<&mut Desc>,
     /// String literal -> symbol.
     pub strings: HashMap<Vec<u8>, String>,
     /// The string literals in creation order.
@@ -249,7 +266,7 @@ fn opt_id(t: Option<&Type>) -> u32 { match t { Some(x) => x.id, None => 0 } }
 pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> &mut Plan {
     let p = &mut Plan { mir: prog, info: prog.info, lay: layout::new_computer(prog.info), groups: Vec::new(), insts: HashMap::new(),
         main: None, statics: Vec::new(), static_ok: HashMap::new(), vtables: HashMap::new(), vtable_list: Vec::new(),
-        strings: HashMap::new(), string_list: Vec::new(), errors: Vec::new(), static_init: HashMap::new(), runtime: HashMap::new(),
+        descs: HashMap::new(), desc_list: Vec::new(), strings: HashMap::new(), string_list: Vec::new(), errors: Vec::new(), static_init: HashMap::new(), runtime: HashMap::new(),
         groups_by_key: HashMap::new(), native: None, shapes: new_shapes(), shape_cache: HashMap::new(), copies: Vec::new(), drafting: false, bail: false,
         evs: Vec::new(), dyn_seen: HashMap::new(), pending: Vec::new() };
     p.find_native();
@@ -451,7 +468,7 @@ impl Plan {
     fn warm_copy(&mut self) -> &mut Plan {
         &mut Plan { mir: self.mir, info: self.info, lay: layout::new_computer(self.info), groups: Vec::new(), insts: self.insts,
             main: None, statics: Vec::new(), static_ok: self.static_ok, vtables: self.vtables, vtable_list: Vec::new(),
-            strings: self.strings, string_list: Vec::new(), errors: Vec::new(), static_init: self.static_init,
+            descs: self.descs, desc_list: Vec::new(), strings: self.strings, string_list: Vec::new(), errors: Vec::new(), static_init: self.static_init,
             runtime: self.runtime, groups_by_key: self.groups_by_key, native: self.native, shapes: self.shapes, shape_cache: HashMap::new(), copies: Vec::new(), drafting: true,
             bail: false, evs: Vec::new(), dyn_seen: HashMap::new(),
             pending: Vec::new() }
@@ -561,6 +578,7 @@ impl Plan {
             match e {
                 Ev::Fn(tp) => {
                     let t = *tp;
+                    self.note_desc(t);
                     if t.kind == T_INST {
                         let d = t.inst.unwrap();
                         match self.insts.get(&d.key) {
@@ -574,6 +592,7 @@ impl Plan {
                 }
                 Ev::Ref(k, r) => {
                     let t = self.resolve(inst, *r);
+                    self.note_desc(t);
                     inst.targets.insert((*k).clone(), t);
                 }
                 Ev::Static(d) => self.static_def(*d),
@@ -720,6 +739,66 @@ impl Plan {
         }
         self.error(`method ${m.name} is not callable through dyn`);
         0
+    }
+
+    // type_desc::<T>() needs T's descriptor.
+    fn note_desc(&mut self, t: &Target) {
+        if t.kind == T_INTRINSIC && t.intrinsic == "type_desc" && t.type_args.len() == 1 { self.desc(t.type_args[0]); }
+    }
+
+    /// The descriptor of concrete type t, made (with its parts') the first
+    /// time.
+    pub fn desc(&mut self, t: &Type) -> &mut Desc {
+        if let Some(d) = self.descs.get(&t.id) { return *d; }
+        let d = &mut Desc { sym: `_navi_ty${self.desc_list.len()}`, ty: t, map_vt: None };
+        self.descs.insert(t.id, d);
+        self.desc_list.push(d);
+        for p in self.desc_parts(t).iter() { self.desc(*p); }
+        if self.is_lang(t, "HashMap") {
+            if let Some(rm) = self.info.lang_def("ReflectMap") {
+                let tr = &TraitRef { tdef: Some(rm), self_ty: None, args: Vec::new(), bindings: Vec::new() };
+                let mut bs = Vec::new();
+                bs.push(tr);
+                let dt = self.info.ctx.dyn_(bs);
+                d.map_vt = Some(self.vtable(t, dt));
+            }
+        }
+        d
+    }
+
+    /// Whether t is the std type with lang name name.
+    pub fn is_lang(&self, t: &Type, name: &str) -> bool {
+        if t.kind != types::K_ADT { return false; }
+        match self.info.lang_def(name) { Some(d) => d.id == t.d().id, None => false }
+    }
+
+    /// The types a descriptor refers to: elements, fields (of every
+    /// variant), a collection's elements, a map's keys and values.
+    pub fn desc_parts(&mut self, t: &Type) -> Vec<&Type> {
+        let mut out: Vec<&Type> = Vec::new();
+        let k = t.kind;
+        if k == types::K_REF || k == types::K_PTR || k == types::K_ARRAY || k == types::K_SLICE {
+            out.push(t.el());
+        } else if k == types::K_TUPLE {
+            for e in t.elems.iter() { out.push(*e); }
+        } else if k == types::K_ADT {
+            if self.is_lang(t, "String") { return out; }
+            if self.is_lang(t, "Vec") || self.is_lang(t, "HashMap") {
+                for a in t.args.iter() { out.push(*a); }
+                return out;
+            }
+            let ai = self.info.adts[&t.d().id];
+            if ai.is_enum {
+                let mut v = 0;
+                while v < ai.variants.len() {
+                    for f in self.lay.field_types(t, v as i64).iter() { out.push(*f); }
+                    v += 1;
+                }
+            } else {
+                for f in self.lay.field_types(t, -1).iter() { out.push(*f); }
+            }
+        }
+        out
     }
 
     fn vtable(&mut self, concrete: &Type, dyn_ty: &Type) -> &mut Vtable {

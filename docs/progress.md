@@ -226,6 +226,17 @@
     - 运行时的线程和锁加了一层抽象：pthread，或 Windows 的 SRWLOCK、CONDITION_VARIABLE、CreateThread、SwitchToThread、GetSystemInfo。
     - navic 在 Windows 上运行要用的也补上了：缓存目录用 LOCALAPPDATA，输出加 `.exe`，PATH 用 `;` 分隔，不调 chmod。
     - COFF 用 NDK 的 lld-link 加上 llvm-dlltool 生成的导入库链接过 hello 和 navic 自身；PE 用 llvm-readobj/objdump 检查过导入表、基址重定位和入口。都没有运行。
+- 修了一个偶发死锁（表现为测试卡住，CPU 空转）。
+  - 现象：一个 G 拿着运行时锁，却在 `exit_blocked` 里永远等下去，其他线程都在等这把锁。用 lldb 读出这个 G 的 `sys` 是"运行中"。
+  - 原因：G 在 `enter_blocked` 之后、真正阻塞之前，又进了一个 navi 函数的序言（比如锁的封装函数）。这时收集器正好在停世界，栈界限是毒化过的，于是进了 morestack。morestack 的停世界分支把 `sys` 改成"已停"、再改成"运行中"，盖掉了"阻塞/已认领"。
+  - 修复：morestack 只在 `sys` 为"运行中"时才参与停世界；阻塞窗口里的 G 只等停世界结束，不改状态。`exit_blocked` 遇到"认领"以外的状态时直接报 fatal，不再空等。
+- 反射（照 Go 的 reflect，不需要标注；代替过程宏）：
+  - 内建函数 `type_desc::<T>()` 返回 T 的描述的地址。规划器为每个到达它的类型，以及这些类型各部分的类型（字段、变体、元素、map 的键和值）生成描述，按类型去重。泛型代码中 T 不同的实例共用代码时，描述放在字典的槽里（`Target.key` 带上类型参数）。
+  - 描述有 12 个字，内容是：kind、大小、对齐、名字、元素、长度、字段或变体表、枚举的标记（整数标记或空指针 niche）、标志位，以及 HashMap 的 `ReflectMap` 虚表。
+  - Vec、String、HashMap 的空值和类型参数无关，反射可以直接构造。Vec 加元素用 `Vec<u8>` 视图按字节做。只有 HashMap 的插入和遍历要用键的 Hash 和 Eq，所以描述里带它的 `ReflectMap` 虚表，复用了现有的虚表机制。
+  - 含指针的值用运行时的拷贝函数复制，带写屏障。
+  - 不用反射的程序，产物和以前逐字节相同。
+  - `std::json` 和 `std::any::type_name` 都建在反射上。测试是 `tests/run/reflect`、`tests/run/json`。
 - 没做的：
   - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
   - 冷编译与 go build 持平（见上面的数字）。

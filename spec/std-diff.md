@@ -64,6 +64,9 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `Sender::close()` | 见第 3 节 |
 | `std::gc` | `collect()`、`stats()`、`set_min_heap(bytes)`（M9）、`set_percent(percent)`（同 Go 的 `debug.SetGCPercent`）；`Weak<T>`、finalizer 以后再做 |
 | `std::bench::Bencher` | `navi bench` 用（Rust 里是不稳定的 `test::Bencher`）：`iter(f)` |
+| `std::reflect` | 运行时反射，照 Go 的 reflect，不需要标注（navi 没有过程宏）：`type_of::<T>()`、`value_of(&x)`、`value_of_mut(&mut x)`、`Value::new(ty)`；`Type` 能查 kind、名字、大小、字段、变体、元素类型、map 的键和值类型；`Value` 能读写基本类型和字符串，按下标或字段名访问，`push` 到 Vec，切换枚举变体，读写 HashMap。编译器只为程序里实际反射的类型（连同它们各部分的类型）生成描述，不用反射的程序不受影响 |
+| `std::json` | 用反射实现的 JSON，任意类型都能用（Go 的 encoding/json；Rust 里这是 serde_json 这个 crate）：`to_string`、`to_string_pretty`、`from_str`，返回 `Result<_, json::Error>`；结构体、枚举、Option、HashMap 的对应规则和 serde_json 的默认规则相同 |
+| `std::any::type_name` | 和 Rust 一样，但名字不带模块路径（`Vec<i32>`，Rust 是 `alloc::vec::Vec<i32>`）；`TypeId`、`Any` 不提供 |
 
 ## 5. M7 补充标准库时新增的偏离
 

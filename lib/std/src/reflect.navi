@@ -1,0 +1,622 @@
+//! Runtime reflection, as Go's reflect (Rust's std has none): every type
+//! can be inspected and every value read and written through its
+//! description, with no annotations. The compiler describes each type a
+//! program reflects on (type_of, value_of), with the types of its parts.
+//!
+//!     let t = reflect::type_of::<Point>();
+//!     for f in t.fields().iter() { println(`${f.name}: ${f.ty}`); }
+//!     let mut p = Point { x: 1, y: 2 };
+//!     let mut v = reflect::value_of_mut(&mut p);
+//!     v.field_named("x").unwrap().set_i64(10);
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::collections::HashMap;
+
+/// What a type is.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Kind {
+    Bool, Char,
+    I8, I16, I32, I64, Isize, U8, U16, U32, U64, Usize, I128, U128,
+    F32, F64,
+    /// str (only behind a reference).
+    Str,
+    String,
+    /// Tuples, () included.
+    Tuple,
+    Array,
+    /// [T] (only behind a reference).
+    Slice,
+    Ref,
+    /// A raw pointer.
+    Ptr,
+    Struct,
+    Enum,
+    Vec,
+    /// HashMap.
+    Map,
+    /// Functions and closures.
+    Fn,
+    /// dyn Trait (only behind a reference).
+    Dyn,
+    Other,
+}
+
+const KINDS: [Kind; 31] = [Kind::Other, Kind::Bool, Kind::Char, Kind::I8, Kind::I16, Kind::I32, Kind::I64, Kind::Isize,
+    Kind::U8, Kind::U16, Kind::U32, Kind::U64, Kind::Usize, Kind::I128, Kind::U128, Kind::F32, Kind::F64, Kind::Str,
+    Kind::String, Kind::Tuple, Kind::Array, Kind::Slice, Kind::Ref, Kind::Ptr, Kind::Struct, Kind::Enum, Kind::Vec,
+    Kind::Map, Kind::Fn, Kind::Dyn, Kind::Other];
+
+// Descriptor words (see the compiler's lower::gen_descs).
+const W_KIND: usize = 0;
+const W_SIZE: usize = 1;
+const W_ALIGN: usize = 2;
+const W_NAME: usize = 3;
+const W_NAME_LEN: usize = 4;
+const W_ELEM: usize = 5;
+const W_LEN: usize = 6;
+const W_COUNT: usize = 7;
+const W_TABLE: usize = 8;
+const W_TAG: usize = 9;
+const W_FLAGS: usize = 10;
+const W_MAP_VT: usize = 11;
+
+const TAG_INT: usize = 1;
+const TAG_NICHE: usize = 2;
+
+/// A type's description.
+#[derive(Clone)]
+pub struct Type {
+    d: *const usize,
+}
+
+/// The description of T.
+pub fn type_of<T>() -> Type { Type { d: crate::intrinsics::type_desc::<T>() as *const usize } }
+
+fn word(p: *const usize, i: usize) -> usize { unsafe { *crate::rt::ptr_offset(p, i) } }
+
+fn str_at(p: usize, n: usize) -> &str { crate::rt::str_from_raw(p as *const u8, n) }
+
+/// A struct's, tuple's or variant's field.
+#[derive(Clone)]
+pub struct Field {
+    /// Tuple fields are named 0, 1, ...
+    pub name: &str,
+    pub ty: Type,
+    /// From the start of the value.
+    pub offset: usize,
+}
+
+/// An enum's variant.
+#[derive(Clone)]
+pub struct Variant {
+    pub name: &str,
+    /// The discriminant.
+    pub discr: i64,
+    pub fields: Vec<Field>,
+}
+
+fn fields_at(table: usize, n: usize) -> Vec<Field> {
+    let mut out = Vec::new();
+    let t = table as *const usize;
+    let mut i = 0;
+    while i < n {
+        out.push(Field { name: str_at(word(t, 4 * i), word(t, 4 * i + 1)), ty: Type { d: word(t, 4 * i + 2) as *const usize }, offset: word(t, 4 * i + 3) });
+        i += 1;
+    }
+    out
+}
+
+impl Type {
+    fn w(&self, i: usize) -> usize { word(self.d, i) }
+
+    pub fn kind(&self) -> Kind {
+        let k = self.w(W_KIND);
+        if k < KINDS.len() { KINDS[k].clone() } else { Kind::Other }
+    }
+
+    /// The name as written in source (without the module path).
+    pub fn name(&self) -> &str { str_at(self.w(W_NAME), self.w(W_NAME_LEN)) }
+
+    /// The size in bytes (0 for str, [T] and dyn).
+    pub fn size(&self) -> usize { self.w(W_SIZE) }
+    pub fn align(&self) -> usize { self.w(W_ALIGN) }
+
+    /// Whether values may hold references (the collector scans them).
+    pub fn has_pointers(&self) -> bool { self.w(W_FLAGS) & 1 != 0 }
+
+    /// Whether a reference or pointer is mutable.
+    pub fn is_mut(&self) -> bool { self.w(W_FLAGS) & 2 != 0 }
+
+    /// The element type of a reference, pointer, array, slice or Vec.
+    pub fn elem(&self) -> Option<Type> {
+        match self.kind() {
+            Kind::Ref | Kind::Ptr | Kind::Array | Kind::Slice | Kind::Vec => Some(Type { d: self.w(W_ELEM) as *const usize }),
+            _ => None,
+        }
+    }
+
+    /// A map's key type.
+    pub fn key(&self) -> Option<Type> { if self.kind() == Kind::Map { Some(Type { d: self.w(W_ELEM) as *const usize }) } else { None } }
+
+    /// A map's value type.
+    pub fn value(&self) -> Option<Type> { if self.kind() == Kind::Map { Some(Type { d: self.w(W_LEN) as *const usize }) } else { None } }
+
+    /// An array's length.
+    pub fn len(&self) -> usize { if self.kind() == Kind::Array { self.w(W_LEN) } else { 0 } }
+
+    /// A struct's or tuple's fields.
+    pub fn fields(&self) -> Vec<Field> {
+        match self.kind() {
+            Kind::Struct | Kind::Tuple => fields_at(self.w(W_TABLE), self.w(W_COUNT)),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn field_named(&self, name: &str) -> Option<Field> {
+        for f in self.fields().iter() { if f.name == name { return Some(f.clone()); } }
+        None
+    }
+
+    /// An enum's variants.
+    pub fn variants(&self) -> Vec<Variant> {
+        let mut out = Vec::new();
+        if self.kind() != Kind::Enum { return out; }
+        let t = self.w(W_TABLE) as *const usize;
+        let mut i = 0;
+        while i < self.w(W_COUNT) {
+            out.push(Variant { name: str_at(word(t, 5 * i), word(t, 5 * i + 1)), discr: word(t, 5 * i + 2) as i64, fields: fields_at(word(t, 5 * i + 4), word(t, 5 * i + 3)) });
+            i += 1;
+        }
+        out
+    }
+}
+
+impl PartialEq for Type {
+    fn eq(&self, other: &Type) -> bool { self.d == other.d }
+}
+
+impl Display for Type {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.name()) }
+}
+
+impl Debug for Type {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.name()) }
+}
+
+/// A value seen through its type: read-only from value_of, settable from
+/// value_of_mut (and what those reach).
+#[derive(Clone)]
+pub struct Value {
+    ptr: *mut u8,
+    ty: Type,
+    settable: bool,
+}
+
+pub fn value_of<T>(x: &T) -> Value { Value { ptr: x as *const T as *mut u8, ty: type_of::<T>(), settable: false } }
+
+pub fn value_of_mut<T>(x: &mut T) -> Value { Value { ptr: x as *mut T as *mut u8, ty: type_of::<T>(), settable: true } }
+
+impl Value {
+    /// A new value of type ty on the heap: zeroed, then made valid as
+    /// init does.
+    pub fn new(ty: Type) -> Value {
+        let size = if ty.size() == 0 { 8 } else { ty.size() };
+        let p = crate::rt::native::gc_alloc(size, !ty.has_pointers());
+        let mut v = Value { ptr: p, ty, settable: true };
+        v.init();
+        v
+    }
+
+    pub fn ty(&self) -> Type { self.ty.clone() }
+    pub fn kind(&self) -> Kind { self.ty.kind() }
+    pub fn can_set(&self) -> bool { self.settable }
+
+    /// The value's address.
+    pub fn as_ptr(&self) -> *mut u8 { self.ptr }
+
+    fn at(&self, off: usize, ty: Type) -> Value { Value { ptr: (self.ptr as usize + off) as *mut u8, ty, settable: self.settable } }
+
+    fn need_set(&self) {
+        if !self.settable { panic(`reflect: the value (a ${self.ty}) is not settable (use value_of_mut)`); }
+    }
+
+    fn wrong(&self, what: &str) -> ! { panic(`reflect: ${what} on a value of type ${self.ty}`) }
+
+    fn rd(&self, size: usize) -> u64 {
+        unsafe {
+            if size == 1 { *(self.ptr as *const u8) as u64 }
+            else if size == 2 { *(self.ptr as *const u16) as u64 }
+            else if size == 4 { *(self.ptr as *const u32) as u64 }
+            else { *(self.ptr as *const u64) }
+        }
+    }
+
+    fn wr(&mut self, size: usize, v: u64) {
+        self.need_set();
+        unsafe {
+            if size == 1 { *(self.ptr as *mut u8) = v as u8; }
+            else if size == 2 { *(self.ptr as *mut u16) = v as u16; }
+            else if size == 4 { *(self.ptr as *mut u32) = v as u32; }
+            else { *(self.ptr as *mut u64) = v; }
+        }
+    }
+
+    // --- Scalars --------------------------------------------------------------------
+
+    pub fn as_bool(&self) -> bool {
+        if self.kind() != Kind::Bool { self.wrong("as_bool"); }
+        self.rd(1) != 0
+    }
+
+    pub fn set_bool(&mut self, b: bool) {
+        if self.kind() != Kind::Bool { self.wrong("set_bool"); }
+        self.wr(1, if b { 1 } else { 0 });
+    }
+
+    pub fn as_char(&self) -> char {
+        if self.kind() != Kind::Char { self.wrong("as_char"); }
+        char::from_u32(self.rd(4) as u32).unwrap()
+    }
+
+    pub fn set_char(&mut self, c: char) {
+        if self.kind() != Kind::Char { self.wrong("set_char"); }
+        self.wr(4, c as u32 as u64);
+    }
+
+    /// Whether the value is a (signed or unsigned) integer.
+    pub fn is_int(&self) -> bool {
+        match self.kind() {
+            Kind::I8 | Kind::I16 | Kind::I32 | Kind::I64 | Kind::Isize | Kind::I128 | Kind::U8 | Kind::U16 | Kind::U32 | Kind::U64 | Kind::Usize | Kind::U128 => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_signed(&self) -> bool {
+        match self.kind() {
+            Kind::I8 | Kind::I16 | Kind::I32 | Kind::I64 | Kind::Isize | Kind::I128 => true,
+            _ => false,
+        }
+    }
+
+    /// An integer of any type as i128.
+    pub fn as_i128(&self) -> i128 {
+        if !self.is_int() { self.wrong("as_i128"); }
+        let size = self.ty.size();
+        if size == 16 {
+            let lo = self.rd(8) as u128;
+            let hi = unsafe { *((self.ptr as usize + 8) as *const u64) } as u128;
+            return (hi << 64 | lo) as i128;
+        }
+        let v = self.rd(size);
+        if !self.is_signed() { return v as i128; }
+        let shift = 64 - 8 * size as u32;
+        ((v << shift) as i64 >> shift) as i128
+    }
+
+    pub fn as_i64(&self) -> i64 { self.as_i128() as i64 }
+    pub fn as_u64(&self) -> u64 { self.as_i128() as u64 }
+
+    /// Sets an integer of any type (truncated to its size).
+    pub fn set_i128(&mut self, v: i128) {
+        if !self.is_int() { self.wrong("set_i128"); }
+        let size = self.ty.size();
+        if size == 16 {
+            self.wr(8, v as u64);
+            unsafe { *((self.ptr as usize + 8) as *mut u64) = (v >> 64) as u64; }
+            return;
+        }
+        self.wr(size, v as u64);
+    }
+
+    pub fn set_i64(&mut self, v: i64) { self.set_i128(v as i128); }
+    pub fn set_u64(&mut self, v: u64) { self.set_i128(v as i128); }
+
+    pub fn is_float(&self) -> bool { self.kind() == Kind::F32 || self.kind() == Kind::F64 }
+
+    pub fn as_f64(&self) -> f64 {
+        match self.kind() {
+            Kind::F64 => f64::from_bits(self.rd(8)),
+            Kind::F32 => f32::from_bits(self.rd(4) as u32) as f64,
+            _ => self.wrong("as_f64"),
+        }
+    }
+
+    pub fn set_f64(&mut self, x: f64) {
+        match self.kind() {
+            Kind::F64 => self.wr(8, x.to_bits()),
+            Kind::F32 => self.wr(4, (x as f32).to_bits() as u64),
+            _ => self.wrong("set_f64"),
+        }
+    }
+
+    /// Whether the value is a String or a &str.
+    pub fn is_str(&self) -> bool {
+        match self.kind() {
+            Kind::String => true,
+            Kind::Ref => self.ty.elem().unwrap().kind() == Kind::Str,
+            _ => false,
+        }
+    }
+
+    /// A String's or &str's text.
+    pub fn as_str(&self) -> &str {
+        if self.kind() == Kind::String { return unsafe { (*(self.ptr as *const String)).as_str() }; }
+        if !self.is_str() { self.wrong("as_str"); }
+        unsafe { *(self.ptr as *const &str) }
+    }
+
+    /// Sets a String or a &str (to a copy of s).
+    pub fn set_str(&mut self, s: &str) {
+        if !self.is_str() { self.wrong("set_str"); }
+        self.need_set();
+        let owned = String::from(s);
+        if self.kind() == Kind::String {
+            unsafe { *(self.ptr as *mut String) = owned; }
+        } else {
+            unsafe { *(self.ptr as *mut &str) = owned.as_str(); }
+        }
+    }
+
+    // --- Structs, tuples, arrays ------------------------------------------------------
+
+    /// The number of a struct's or tuple's fields.
+    pub fn num_fields(&self) -> usize { self.ty.fields().len() }
+
+    /// A struct's or tuple's field i.
+    pub fn field(&self, i: usize) -> Value {
+        let fs = self.ty.fields();
+        if i >= fs.len() { self.wrong(`field(${i})`.as_str()); }
+        self.at(fs[i].offset, fs[i].ty.clone())
+    }
+
+    pub fn field_named(&self, name: &str) -> Option<Value> {
+        match self.ty.field_named(name) {
+            Some(f) => Some(self.at(f.offset, f.ty)),
+            None => None,
+        }
+    }
+
+    /// The length of an array, slice (behind a reference), Vec, String or
+    /// map.
+    pub fn len(&self) -> usize {
+        match self.kind() {
+            Kind::Array => self.ty.len(),
+            Kind::Vec => unsafe { (*(self.ptr as *const Vec<u8>)).len() },
+            Kind::String => unsafe { (*(self.ptr as *const String)).len() },
+            Kind::Map => self.map().rm_len(),
+            Kind::Ref => {
+                if self.ty.elem().unwrap().kind() == Kind::Slice { return unsafe { *((self.ptr as usize + 8) as *const usize) }; }
+                if self.is_str() { return self.as_str().len(); }
+                self.wrong("len")
+            }
+            _ => self.wrong("len"),
+        }
+    }
+
+    /// Element i of an array, a slice (behind a reference) or a Vec.
+    pub fn index(&self, i: usize) -> Value {
+        let n = self.len();
+        if i >= n { panic(`reflect: index ${i} out of range (len ${n})`); }
+        match self.kind() {
+            Kind::Array => {
+                let et = self.ty.elem().unwrap();
+                self.at(i * et.size(), et)
+            }
+            Kind::Vec => {
+                let et = self.ty.elem().unwrap();
+                let data = unsafe { (*(self.ptr as *const Vec<u8>)).reflect_data() };
+                Value { ptr: (data as usize + i * et.size()) as *mut u8, ty: et, settable: self.settable }
+            }
+            Kind::Ref => {
+                let et = self.ty.elem().unwrap().elem().unwrap();
+                let data = unsafe { *(self.ptr as *const usize) };
+                Value { ptr: (data + i * et.size()) as *mut u8, ty: et, settable: self.settable && self.ty.is_mut() }
+            }
+            _ => self.wrong("index"),
+        }
+    }
+
+    /// Appends a new element to a Vec (zeroed, then made valid as init
+    /// does) and returns it.
+    pub fn push(&mut self) -> Value {
+        if self.kind() != Kind::Vec { self.wrong("push"); }
+        self.need_set();
+        let et = self.ty.elem().unwrap();
+        let p = unsafe { (*(self.ptr as *mut Vec<u8>)).reflect_push(et.size(), et.has_pointers()) };
+        let mut v = Value { ptr: p, ty: et, settable: true };
+        v.init();
+        v
+    }
+
+    // --- References ------------------------------------------------------------------
+
+    /// Whether a reference or pointer is null (only an unset one is).
+    pub fn is_null(&self) -> bool {
+        match self.kind() {
+            Kind::Ref | Kind::Ptr => self.rd(8) == 0,
+            _ => false,
+        }
+    }
+
+    /// What a reference or pointer (to a sized type) points to.
+    pub fn deref(&self) -> Value {
+        match self.kind() {
+            Kind::Ref | Kind::Ptr => {}
+            _ => self.wrong("deref"),
+        }
+        let et = self.ty.elem().unwrap();
+        match et.kind() {
+            Kind::Str | Kind::Slice | Kind::Dyn => self.wrong("deref (unsized)"),
+            _ => {}
+        }
+        if self.is_null() { panic("reflect: deref of a null reference"); }
+        Value { ptr: self.rd(8) as *mut u8, ty: et, settable: self.ty.is_mut() || self.kind() == Kind::Ptr }
+    }
+
+    /// Points a reference or pointer at a new value (as Value::new makes)
+    /// and returns it.
+    pub fn set_new(&mut self) -> Value {
+        match self.kind() {
+            Kind::Ref | Kind::Ptr => {}
+            _ => self.wrong("set_new"),
+        }
+        self.need_set();
+        let v = Value::new(self.ty.elem().unwrap());
+        unsafe { *(self.ptr as *mut &u8) = &*(v.ptr as *const u8); }
+        v
+    }
+
+    // --- Enums ------------------------------------------------------------------------
+
+    /// The index of an enum's variant (in ty().variants()).
+    pub fn variant(&self) -> usize {
+        if self.kind() != Kind::Enum { self.wrong("variant"); }
+        let tag = self.ty.w(W_TAG);
+        let kind = tag & 0xff;
+        if kind == TAG_NICHE {
+            let niche = tag >> 16;
+            return if self.rd(8) == 0 { niche } else { 1 - niche };
+        }
+        if kind != TAG_INT { return 0; }
+        let size = (tag >> 8) & 0xff;
+        let shift = 64 - 8 * size as u32;
+        let raw = self.rd(size);
+        let d = ((raw << shift) as i64) >> shift;
+        let vs = self.ty.variants();
+        let mut i = 0;
+        while i < vs.len() {
+            if vs[i].discr == d || (vs[i].discr as u64) << shift >> shift == raw { return i; }
+            i += 1;
+        }
+        panic(`reflect: invalid tag of a ${self.ty}`)
+    }
+
+    pub fn variant_name(&self) -> &str { self.ty.variants()[self.variant()].name }
+
+    /// The number of fields of the current variant.
+    pub fn num_variant_fields(&self) -> usize { self.ty.variants()[self.variant()].fields.len() }
+
+    /// Field i of the current variant.
+    pub fn variant_field(&self, i: usize) -> Value { self.field_of_variant(self.variant(), i) }
+
+    /// Field i of variant vi (whichever the value is: a niche enum's
+    /// pointer variant reads as the other one until its field is set).
+    pub fn field_of_variant(&self, vi: usize, i: usize) -> Value {
+        if self.kind() != Kind::Enum { self.wrong("field_of_variant"); }
+        let v = self.ty.variants()[vi].clone();
+        if i >= v.fields.len() { self.wrong(`field_of_variant(${vi}, ${i})`.as_str()); }
+        self.at(v.fields[i].offset, v.fields[i].ty.clone())
+    }
+
+    /// Makes the value variant i, with its fields zeroed and made valid as
+    /// init does.
+    pub fn set_variant(&mut self, i: usize) {
+        if self.kind() != Kind::Enum { self.wrong("set_variant"); }
+        self.need_set();
+        let vs = self.ty.variants();
+        if i >= vs.len() { panic(`reflect: ${self.ty} has no variant ${i}`); }
+        zero(self.ptr, self.ty.size());
+        let tag = self.ty.w(W_TAG);
+        if tag & 0xff == TAG_INT { self.wr((tag >> 8) & 0xff, vs[i].discr as u64); }
+        // A niche enum's other variant is a pointer: its field (once set)
+        // makes it non-null.
+        for f in vs[i].fields.iter() { self.at(f.offset, f.ty.clone()).init(); }
+    }
+
+    pub fn variant_named(&self, name: &str) -> Option<usize> {
+        let vs = self.ty.variants();
+        let mut i = 0;
+        while i < vs.len() {
+            if vs[i].name == name { return Some(i); }
+            i += 1;
+        }
+        None
+    }
+
+    // --- Maps -------------------------------------------------------------------------
+
+    fn map(&self) -> &mut dyn ReflectMap {
+        let parts: [usize; 2] = [self.ptr as usize, self.ty.w(W_MAP_VT)];
+        if parts[1] == 0 { panic(`reflect: ${self.ty} has no reflection support`); }
+        unsafe { *(&parts as *const [usize; 2] as *const &mut dyn ReflectMap) }
+    }
+
+    /// A map's entries (in no particular order).
+    pub fn map_entries(&self) -> Vec<(Value, Value)> {
+        if self.kind() != Kind::Map { self.wrong("map_entries"); }
+        let m = self.map();
+        let kt = self.ty.key().unwrap();
+        let vt = self.ty.value().unwrap();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < m.rm_slots() {
+            let (k, v) = m.rm_slot(i);
+            if !k.is_null() {
+                out.push((Value { ptr: k as *mut u8, ty: kt.clone(), settable: false }, Value { ptr: v as *mut u8, ty: vt.clone(), settable: self.settable }));
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Inserts a copy of key and value (values of the map's key and value
+    /// types).
+    pub fn map_insert(&mut self, key: &Value, value: &Value) {
+        if self.kind() != Kind::Map { self.wrong("map_insert"); }
+        self.need_set();
+        if key.ty != self.ty.key().unwrap() || value.ty != self.ty.value().unwrap() { panic(`reflect: map_insert of ${key.ty}, ${value.ty} into ${self.ty}`); }
+        self.map().rm_insert(key.ptr as *const u8, value.ptr as *const u8);
+    }
+
+    // --- Making values valid ------------------------------------------------------------
+
+    /// Makes a zeroed value valid: empty Strings, Vecs and maps, enums set
+    /// to their first variant, recursively through fields and arrays
+    /// (references stay null).
+    pub fn init(&mut self) {
+        match self.kind() {
+            Kind::String => unsafe { *(self.ptr as *mut String) = String::new(); },
+            Kind::Vec => unsafe { *(self.ptr as *mut Vec<u8>) = Vec::new(); },
+            Kind::Map => unsafe { *(self.ptr as *mut HashMap<u8, u8>) = HashMap::new(); },
+            Kind::Struct | Kind::Tuple => {
+                for f in self.ty.fields().iter() { self.at(f.offset, f.ty.clone()).init(); }
+            }
+            Kind::Array => {
+                let et = self.ty.elem().unwrap();
+                let mut i = 0;
+                while i < self.ty.len() {
+                    self.at(i * et.size(), et.clone()).init();
+                    i += 1;
+                }
+            }
+            Kind::Enum => {
+                if self.ty.w(W_TAG) & 0xff != TAG_NICHE && self.ty.variants().len() > 0 { self.set_variant(0); }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn zero(p: *mut u8, n: usize) {
+    let mut i = 0;
+    while i < n {
+        unsafe { *((p as usize + i) as *mut u8) = 0; }
+        i += 1;
+    }
+}
+
+impl Debug for Value {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`reflect::Value(${self.ty})`) }
+}
+
+/// What reflection needs of a map: its keys hash and compare by their
+/// type's code (implemented by HashMap; the compiler puts each reflected
+/// map type's vtable in its description).
+pub trait ReflectMap {
+    fn rm_len(&self) -> usize;
+    fn rm_slots(&self) -> usize;
+    /// The key and value in slot i, or nulls if it is empty.
+    fn rm_slot(&self, i: usize) -> (*const u8, *const u8);
+    /// Inserts copies of the key and value at k and v.
+    fn rm_insert(&mut self, k: *const u8, v: *const u8);
+}
