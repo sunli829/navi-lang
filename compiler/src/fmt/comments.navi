@@ -1,0 +1,163 @@
+//! Wrapping // comments wider than the comment width (rustfmt's
+//! wrap_comments): lines break at spaces, and what a broken line leaves
+//! over joins the next line of its paragraph. Code blocks, indented code,
+//! headings, tables and quotes stay as they are; continuation lines of a
+//! list item line up with its text.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::fmt::ctx::*;
+
+/// rustfmt's comment_width: the column comments wrap at (counted from the
+/// start of the line).
+pub const DEFAULT_COMMENT_WIDTH: usize = 80;
+
+static COMMENT_WIDTH: AtomicUsize = AtomicUsize::new(80);
+
+pub fn set_comment_width(w: usize) { COMMENT_WIDTH.store(w, Ordering::Relaxed); }
+
+pub fn comment_width() -> usize { COMMENT_WIDTH.load(Ordering::Relaxed) }
+
+// A part of a broken line waiting to join the next one.
+struct Carry {
+    marker: String,
+    indent: usize,
+    text: String,
+}
+
+/// The lines of consecutive comments (joined by \n, not indented), wrapped
+/// for a block at indent.
+pub fn wrap_comments(text: &str, indent: usize) -> String {
+    let width = comment_width();
+    let mut out: Vec<String> = Vec::new();
+    let mut carry: Option<Carry> = None;
+    let mut in_fence = false;
+    for l in text.split('\n') {
+        let marker = line_marker(l);
+        if marker.len() == 0 {
+            flush(&mut out, &mut carry);
+            out.push(l.to_string());
+            continue;
+        }
+        let rest = &l[marker.len()..];
+        let content = match rest.strip_prefix(" ") { Some(r) => r, None => rest };
+        if content.trim_start().starts_with("```") {
+            flush(&mut out, &mut carry);
+            in_fence = !in_fence;
+            out.push(l.to_string());
+            continue;
+        }
+        if in_fence {
+            out.push(l.to_string());
+            continue;
+        }
+        let lead = leading_spaces(content);
+        let body = &content[lead..];
+        // Join what the line before left over.
+        let mut joined: Option<Carry> = None;
+        if let Some(c) = &carry {
+            if c.marker == marker && lead == c.indent && plain(body) && list_marker(body) == 0 {
+                joined = Some(Carry { marker: marker.to_string(), indent: c.indent, text: cat3(c.text.as_str(), " ", body) });
+            }
+        }
+        if let Some(j) = joined {
+            carry = None;
+            wrap_line(&mut out, &mut carry, marker, j.indent, 0, j.text.as_str(), indent, width);
+            continue;
+        }
+        flush(&mut out, &mut carry);
+        if !plain(body) || lead >= 4 {
+            out.push(l.to_string());
+            continue;
+        }
+        let first = cat3(marker, " ", content);
+        if indent + str_width(first.as_str()) <= width {
+            out.push(l.to_string());
+            continue;
+        }
+        wrap_line(&mut out, &mut carry, marker, lead, list_marker(body), body, indent, width);
+    }
+    flush(&mut out, &mut carry);
+    out.join("\n")
+}
+
+// Breaks one line of text after marker and lead spaces; a list item's later
+// lines are indented past its marker. The last piece waits in carry.
+fn wrap_line(out: &mut Vec<String>, carry: &mut Option<Carry>, marker: &str, lead: usize, item: usize, text: &str,
+    indent: usize, width: usize) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_lead = lead;
+    for w in text.split(' ') {
+        if w.len() == 0 { continue; }
+        let used = indent + marker.len() + 1 + cur_lead;
+        if cur.len() > 0 && used + str_width(cur.as_str()) + 1 + str_width(w) > width {
+            lines.push(cur);
+            cur = String::new();
+            cur_lead = lead + item;
+        }
+        if cur.len() > 0 { cur.push(' '); }
+        cur.push_str(w);
+    }
+    let first_lead = lead;
+    if lines.len() == 0 {
+        // Nothing to break at: as it is.
+        out.push(cat3(marker, " ", cat(spaces(first_lead).as_str(), cur.as_str()).as_str()));
+        return;
+    }
+    let mut i = 0;
+    for l in lines.iter() {
+        let ld = if i == 0 { first_lead } else { lead + item };
+        out.push(cat3(marker, " ", cat(spaces(ld).as_str(), l.as_str()).as_str()));
+        i += 1;
+    }
+    *carry = Some(Carry { marker: marker.to_string(), indent: lead + item, text: cur });
+}
+
+fn flush(out: &mut Vec<String>, carry: &mut Option<Carry>) {
+    if let Some(c) = carry {
+        out.push(cat3(c.marker.as_str(), " ", cat(spaces(c.indent).as_str(), c.text.as_str()).as_str()));
+    }
+    *carry = None;
+}
+
+// The // of a line comment ("///", "//!" or "//"), or "" for anything else.
+fn line_marker(l: &str) -> &str {
+    if l.starts_with("////") { return ""; }
+    if l.starts_with("///") { return "///"; }
+    if l.starts_with("//!") { return "//!"; }
+    if l.starts_with("//") { return "//"; }
+    ""
+}
+
+// Whether a line's text is prose that may be wrapped and joined (not a
+// heading, table, quote, tag or a rule like // --- Section ------).
+fn plain(body: &str) -> bool {
+    if body.len() == 0 { return false; }
+    let c = body.as_bytes()[0];
+    if c == b'#' || c == b'|' || c == b'>' || c == b'<' || body.starts_with("```") { return false; }
+    for w in body.split(' ') {
+        if w.len() >= 4 && is_rule(w) { return false; }
+    }
+    true
+}
+
+// Whether a word is one punctuation character repeated (----, ====).
+fn is_rule(w: &str) -> bool {
+    let b = w.as_bytes();
+    let c = b[0];
+    if (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c >= 0x80 { return false; }
+    for x in b.iter() {
+        if *x != c { return false; }
+    }
+    true
+}
+
+// The width of a list item's marker ("- ", "* ", "1. "), or 0.
+fn list_marker(body: &str) -> usize {
+    if body.starts_with("- ") || body.starts_with("* ") || body.starts_with("+ ") { return 2; }
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i] >= b'0' && b[i] <= b'9' { i += 1; }
+    if i > 0 && i + 1 < b.len() && (b[i] == b'.' || b[i] == b')') && b[i + 1] == b' ' { return i + 2; }
+    0
+}

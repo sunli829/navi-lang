@@ -232,8 +232,9 @@
 
 ## navic fmt（格式化工具）
 
-- 用法：`navic fmt [--check] [路径...]`。路径是 crate 目录时从 `src/main.navi` / `src/lib.navi` 开始，是文件时从这个文件开始，都会顺着 `mod x;` 把子模块一起格式化（同 rustfmt）。不给路径时格式化当前目录的 crate。`--check` 只列出会变的文件和改动，有改动时退出码为 1。`navic fmt -` 从标准输入读、向标准输出写（只支持有 `/dev/stdin` 的系统）。
-- 风格完全照 rustfmt 的默认配置，2024 风格：最大宽度 100，缩进 4 格，各种宽度阈值相同（参数列表 60、结构体字面量 18、枚举结构体变体 35、链式调用 60、单行 if-else 50）；`use` 和 `mod x;` 按版本序排序，`use` 树会规范化；`loop`/`while`/`for` 后的分号去掉；块末尾的 `return`/`break`/`continue` 补上分号。
+- 用法：`navic fmt [--check] [--comment-width N] [路径...]`。路径是 crate 目录时从 `src/main.navi` / `src/lib.navi` 开始，是文件时从这个文件开始，都会顺着 `mod x;` 把子模块一起格式化（同 rustfmt）。不给路径时格式化当前目录的 crate。`--check` 只列出会变的文件和改动，有改动时退出码为 1。`navic fmt -` 从标准输入读、向标准输出写（只支持有 `/dev/stdin` 的系统）。
+- 注释折行（师傅定的，默认打开；rustfmt 的 `wrap_comments` 默认关闭）：超过注释宽度的 `//`、`///`、`//!` 注释在空格处折行，折下来的部分接到同一段的下一行（同 rustfmt 的 `wrap_comments`）。代码块、缩进 4 格的内容、标题、表格、引用不动；列表项的续行对齐到文字；`// --- 小节 -----` 这种带一串重复符号的分隔行不折（rustfmt 会折开）；写在代码后面的行尾注释和 `/* */` 不折。注释宽度从行首算，默认 80（同 rustfmt 的 `comment_width`），可以在 crate 的 `navi.toml` 里用 `[fmt]` 表的 `comment_width = N` 设置（从文件所在目录往上找最近的 navi.toml），命令行的 `--comment-width N` 优先。
+- 其余风格完全照 rustfmt 的默认配置，2024 风格：最大宽度 100，缩进 4 格，各种宽度阈值相同（参数列表 60、结构体字面量 18、枚举结构体变体 35、链式调用 60、单行 if-else 50）；`use` 和 `mod x;` 按版本序排序，`use` 树会规范化；`loop`/`while`/`for` 后的分号去掉；块末尾的 `return`/`break`/`continue` 补上分号。
 - 实现在 `compiler/src/fmt/`，按 rustfmt 的结构移植：Shape（首行剩余宽度和续行缩进）、lists（横排/竖排/混排，行尾注释对齐）、overflow（最后一个参数溢出到后面几行）、chains、closures、`choose_rhs`（赋值右边放同一行还是下一行）、matches、items（函数签名、结构体、枚举、impl、trait、where）、imports。
   - 复用编译器的 lexer 和 parser，编译路径不受影响。注释不在 AST 里：格式化器从 token 之间的空隙取出注释，再按位置放回。列表、块、条目之间、else 前后的注释都会被格式化；其他位置有注释的节点原样保留（rustfmt 也是这样）。
   - 节点只记录了起点，终点由 token 表算出（括号配对、泛型的 `<>`）。
@@ -241,10 +242,10 @@
   - navi 特有的语法：`defer` 按语句处理；`select` 按 match 的规则处理；模板字符串和普通字符串一样原样保留（同 rustfmt 2024，单行字符串不受宽度限制）。
 - 安全检查：格式化结果必须能重新解析，并且 AST dump（`syntax::dump`）与原文件一致；比较前两边都抹掉格式化允许的改动（use 和 mod 的顺序、use 树的形状、包住单个表达式的花括号、循环后和 return 处的分号、空语句、重复的括号）。不一致就报内部错误，文件保持不动。
 - 验证：
-  - 对照 rustfmt 1.11（`--edition 2024`）：仓库里 rustfmt 能解析的 172 个文件（把单行模板字符串换成等宽的普通字符串），171 个与 rustfmt 的输出逐字节相同。剩下一个是 rustfmt 排序 `use` 时把行尾注释挪到了别的行上，navic fmt 让注释跟着原来那一行。
-  - 仓库的全部 191 个 `.navi` 文件都能格式化，通过安全检查，格式化两遍结果不变（只有一个故意写错语法的测试文件不能格式化）。
-  - `tests/fmt/` 是格式化的测试用例（`x.navi` 格式化成 `x.out`，`x.out` 保持不变），由 `tools/navictest.sh` 运行；`items`、`exprs` 两个用例也与 rustfmt 的输出相同。
-- 没做的：注释换行（rustfmt 的 `wrap_comments` 默认也是关闭的）；链式调用中间、二元运算中间这些位置有注释时节点原样保留；配置文件（rustfmt.toml）。仓库自己的代码还没有用 navic fmt 格式化过。
+  - 对照 rustfmt 1.11（`--edition 2024`，navic fmt 用 `--comment-width 1000` 关掉注释折行，因为 stable 的 rustfmt 不能打开 `wrap_comments`）：仓库里 rustfmt 能解析的 176 个文件（把单行模板字符串换成等宽的普通字符串），175 个与 rustfmt 的输出逐字节相同。剩下一个是 rustfmt 排序 `use` 时把行尾注释挪到了别的行上，navic fmt 让注释跟着原来那一行。
+  - 仓库的全部 `.navi` 文件都能格式化（按默认的注释宽度），通过安全检查，格式化两遍结果不变（只有一个故意写错语法的测试文件不能格式化）。
+  - `tests/fmt/` 是格式化的测试用例（`x.navi` 格式化成 `x.out`，`x.out` 保持不变），由 `tools/navictest.sh` 运行，它也检查 `--check` 和 `comment_width` 的配置；`items`、`exprs` 两个用例也与 rustfmt 的输出相同。
+- 没做的：行尾注释和块注释的折行；链式调用中间、二元运算中间这些位置有注释时节点原样保留；配置文件（rustfmt.toml）。仓库自己的代码还没有用 navic fmt 格式化过。
 
 ## 下一步
 

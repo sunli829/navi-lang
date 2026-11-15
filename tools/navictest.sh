@@ -78,4 +78,19 @@ if [ "$c1" = 1 ] && [ "$c2" = 0 ] && [ "$c3" = 0 ] && cmp -s "$tmp/check.navi" t
 else
 	echo "FAIL navic fmt --check ($c1 $c2 $c3)"; fail=1
 fi
+# comment_width from navi.toml's [fmt] table, and --comment-width over it.
+mkdir -p "$tmp/cw/src"
+printf '[package]\nname = "cw"\n\n[fmt]\ncomment_width = 40\n' > "$tmp/cw/navi.toml"
+long='// one two three four five six seven eight nine ten'
+printf '%s\nfn main() {}\n' "$long" > "$tmp/cw/src/main.navi"
+"$navic" fmt --comment-width 100 "$tmp/cw" > /dev/null 2>&1
+w100=$(cat "$tmp/cw/src/main.navi")
+"$navic" fmt "$tmp/cw" > /dev/null 2>&1
+w40=$(cat "$tmp/cw/src/main.navi")
+if [ "$w100" = "$(printf '%s\nfn main() {}' "$long")" ] \
+	&& [ "$w40" = "$(printf '// one two three four five six seven\n// eight nine ten\nfn main() {}')" ]; then
+	echo "ok   navic fmt comment_width"
+else
+	echo "FAIL navic fmt comment_width"; echo "$w100"; echo "$w40"; fail=1
+fi
 exit $fail
