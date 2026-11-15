@@ -1,0 +1,340 @@
+//! Delimited lists of nodes (rustfmt's overflow.rs): call arguments, tuples,
+//! arrays and generics, on one line, one per line, packed, or with the last
+//! item overflowing onto the lines after the others.
+
+use crate::syntax::source::Pos;
+use crate::syntax::ast::*;
+use crate::fmt::ctx::*;
+use crate::fmt::lists::*;
+
+/// Something a list holds.
+#[derive(Clone)]
+pub enum Node {
+    E(&Expr),
+    T(&Type),
+    P(&Pat),
+    F(&Field),
+    G(&GenericParam),
+    B(&AssocBinding),
+}
+
+/// rustfmt's fn_call_width, array_width, struct_lit_width, ...
+pub const FN_CALL_WIDTH: usize = 60;
+pub const ARRAY_WIDTH: usize = 60;
+pub const STRUCT_LIT_WIDTH: usize = 18;
+pub const STRUCT_VARIANT_WIDTH: usize = 35;
+pub const CHAIN_WIDTH: usize = 60;
+pub const SINGLE_LINE_IF_ELSE_WIDTH: usize = 50;
+pub const SINGLE_LINE_LET_ELSE_WIDTH: usize = 50;
+pub const SHORT_ARRAY_ELEMENT_WIDTH: usize = 10;
+
+impl Ctx {
+    pub fn node(&self, n: &Node, sh: Shape) -> Option<String> {
+        match n {
+            Node::E(x) => self.expr(*x, sh),
+            Node::T(t) => self.typ(*t, sh),
+            Node::P(p) => self.pat(*p, sh),
+            Node::F(f) => self.field_def(*f, sh),
+            Node::G(g) => self.generic_param(*g, sh),
+            Node::B(b) => {
+                let n = self.ident(b.name);
+                let t = self.typ(b.ty, sh.offset_left(n.len() + 3)?)?;
+                Some(cat3(n.as_str(), " = ", t.as_str()))
+            }
+        }
+    }
+
+    pub fn node_span(&self, n: &Node) -> (Pos, Pos) {
+        match n {
+            Node::E(x) => (self.expr_start(*x), self.expr_end(*x)),
+            Node::T(t) => (t.pos(), self.type_end(*t)),
+            Node::P(p) => (self.pat_start(*p), self.pat_end(*p)),
+            Node::F(f) => {
+                let lo = if f.attrs.len() > 0 { f.attrs[0].hash } else if f.vis != Vis::Private { self.vis_pos(f.ty.pos()) } else { f.ty.pos() };
+                (lo, self.type_end(f.ty))
+            }
+            Node::G(g) => (if g.ty.is_some() { self.prev_tok_pos(g.name.pos) } else { g.name.pos }, self.generic_param_end(*g)),
+            Node::B(b) => (b.name.pos, self.type_end(b.ty)),
+        }
+    }
+
+    // The position of pub before a field's type (tuple fields).
+    fn vis_pos(&self, ty: Pos) -> Pos {
+        let i = self.tok_index(ty);
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if self.toks[j].kind == crate::syntax::token::KW_PUB { return self.toks[j].pos; }
+            if self.toks[j].kind == crate::syntax::token::COMMA || self.toks[j].kind == crate::syntax::token::L_PAREN { break; }
+        }
+        ty
+    }
+
+    pub fn generic_param_end(&self, g: &GenericParam) -> Pos {
+        if let Some(d) = g.default { return self.type_end(d); }
+        if let Some(t) = g.ty { return self.type_end(t); }
+        if g.bounds.len() > 0 { return self.path_end(g.bounds[g.bounds.len() - 1]); }
+        self.tok_end(g.name.pos)
+    }
+
+    /// A list between ( and ) (rustfmt's rewrite_with_parens).
+    pub fn with_parens(&self, ident: &str, items: &Vec<Node>, sh: Shape, open: Pos, max_w: usize, force: Option<Trailing>) -> Option<String> {
+        self.overflow(ident, items, sh, open, "(", ")", max_w, force)
+    }
+
+    pub fn with_brackets(&self, ident: &str, items: &Vec<Node>, sh: Shape, open: Pos, force: Option<Trailing>) -> Option<String> {
+        self.overflow(ident, items, sh, open, "[", "]", ARRAY_WIDTH, force)
+    }
+
+    pub fn with_angles(&self, ident: &str, items: &Vec<Node>, sh: Shape, open: Pos) -> Option<String> {
+        self.overflow(ident, items, sh, open, "<", ">", MAX_WIDTH, None)
+    }
+
+    fn overflow(&self, ident: &str, items: &Vec<Node>, sh: Shape, open: Pos, prefix: &str, suffix: &str,
+        max_w: usize, force: Option<Trailing>) -> Option<String> {
+        let used_width = extra_offset(ident, &sh);
+        let one_line_width = sub(sh.width, used_width + 2);
+        let one_line_shape = match sh.offset_left(last_line_width(ident) + 1) {
+            Some(s) => match s.sub_width(1) { Some(t) => t, None => sh.with_width(0) },
+            None => sh.with_width(0),
+        };
+        let ns = sh.block_only().block_indent(TAB).with_max_width();
+        let nested = ns.with_width(sub(ns.width, 1));
+        let close = if prefix == "<" { self.angle_end(open) - 1 } else { self.close_end(open) - 1 };
+        let ov = Ov { items, ident, one_line_shape, nested, one_line_width, max_w };
+        // Items and their comments.
+        let mut spans = Vec::new();
+        for n in items.iter() { spans.push(self.node_span(n)); }
+        let mut list = self.itemize(&spans, open + 1, close);
+        let mut i = 0;
+        while i < items.len() {
+            list[i].item = self.node(&items[i], nested.clone());
+            i += 1;
+        }
+        let tactic = self.try_overflow_last(&ov, &mut list);
+        let trailing = match force {
+            Some(t) => t,
+            None => Trailing::Vertical,
+        };
+        let mut f = ListFormatting::new(nested.clone());
+        f.tactic = tactic.clone();
+        f.trailing = trailing;
+        f.ends_with_newline = tactic == Tactic::Vertical || tactic == Tactic::Mixed;
+        let items_str = write_list(&list, &f)?;
+        let extendable = tactic == Tactic::Horizontal;
+        // Wrap them.
+        let wsh = sh.with_width(sub(sh.width, last_line_width(ident)));
+        let extend_width = if items_str.len() == 0 { 2 } else { first_line_width(items_str.as_str()) + 1 };
+        let mut out = String::new();
+        out.push_str(ident);
+        out.push_str(prefix);
+        if extendable && extend_width <= wsh.width {
+            out.push_str(items_str.as_str());
+        } else {
+            if items_str.len() > 0 {
+                out.push_str(nested.nl_indent().as_str());
+                out.push_str(items_str.as_str());
+            }
+            out.push_str(wsh.block_only().nl_indent().as_str());
+        }
+        out.push_str(suffix);
+        Some(out)
+    }
+
+    fn try_overflow_last(&self, ov: &Ov, list: &mut Vec<ListItem>) -> Tactic {
+        let items = ov.items;
+        let n = items.len();
+        let combine_with_callee = n == 1 && is_expr(&items[0]) && ov.ident.len() < TAB;
+        let overflow_last = combine_with_callee || (n > 0 && self.can_be_overflowed(&items[n - 1], n));
+        let mut placeholder: Option<String> = None;
+        if overflow_last {
+            let old = self.force_one_line_chain.load(std::sync::atomic::Ordering::Relaxed);
+            if !combine_with_callee && is_method_call(&items[n - 1]) { self.force_one_line_chain.store(1, std::sync::atomic::Ordering::Relaxed); }
+            if let Some(sh) = last_item_shape(items, list, &ov.one_line_shape, ov.max_w) {
+                placeholder = self.rewrite_last_overflow(items, &mut list[n - 1], sh);
+            }
+            self.force_one_line_chain.store(old, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut tactic = definitive_tactic(list, ListTactic::Limited(ov.max_w), 2, ov.one_line_width);
+        if overflow_last && tactic == Tactic::Horizontal && placeholder.is_some() {
+            let ph = match placeholder { Some(p) => p, None => String::new() };
+            if n == 1 && count_newlines(ph.as_str()) == 1 {
+                let rw = self.node(&items[n - 1], ov.nested.clone());
+                let no_newline = match &rw { Some(s) => !s.contains('\n'), None => false };
+                if no_newline { list[n - 1].item = rw; } else { list[n - 1].item = Some(ph); }
+            } else {
+                list[n - 1].item = Some(ph);
+            }
+            return tactic;
+        }
+        if n > 0 {
+            list[n - 1].item = self.node(&items[n - 1], ov.nested.clone());
+            if n == 1 && ov.one_line_width != 0 && !list[0].has_comment() && !list[0].text().contains('\n')
+                && total_item_width(&list[0]) <= ov.one_line_width {
+                tactic = Tactic::Horizontal;
+            } else {
+                tactic = definitive_tactic(list, ListTactic::Limited(ov.max_w), 2, ov.one_line_width);
+                if tactic == Tactic::Vertical && self.every_simple(items) && no_long_items(list) {
+                    tactic = Tactic::Mixed;
+                }
+            }
+        }
+        tactic
+    }
+
+    fn every_simple(&self, items: &Vec<Node>) -> bool {
+        for n in items.iter() {
+            let ok = match n {
+                Node::E(x) => is_simple_expr(*x),
+                _ => false,
+            };
+            if !ok { return false; }
+        }
+        true
+    }
+
+    fn rewrite_last_overflow(&self, items: &Vec<Node>, last: &mut ListItem, sh: Shape) -> Option<String> {
+        let rw = match &items[items.len() - 1] {
+            Node::E(x) => match &x.kind {
+                ExprKind::Closure { .. } => {
+                    if args_have_many_closures(items) { None } else { self.rewrite_last_closure(*x, sh) }
+                }
+                ExprKind::If { .. } | ExprKind::Let { .. } | ExprKind::For { .. } | ExprKind::Loop { .. }
+                | ExprKind::While { .. } | ExprKind::Match { .. } => {
+                    let multi = match self.rewrite_cond(*x, sh.clone()) { Some(c) => c.contains('\n'), None => false };
+                    if multi { None } else { self.expr(*x, sh) }
+                }
+                _ => self.expr(*x, sh),
+            },
+            n => self.node(n, sh),
+        };
+        match rw {
+            Some(r) => {
+                last.item = Some(first_line(r.as_str()).to_string());
+                Some(r)
+            }
+            None => None,
+        }
+    }
+
+    pub fn can_be_overflowed(&self, n: &Node, len: usize) -> bool {
+        match n {
+            Node::E(x) => can_be_overflowed_expr(*x, len),
+            Node::P(p) => can_be_overflowed_pat(*p, len),
+            Node::T(t) => match &t.kind {
+                TypeKind::Path(_) | TypeKind::Tuple { .. } => len == 1,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+struct Ov {
+    items: &Vec<Node>,
+    ident: &str,
+    one_line_shape: Shape,
+    nested: Shape,
+    one_line_width: usize,
+    max_w: usize,
+}
+
+fn is_expr(n: &Node) -> bool { match n { Node::E(_) => true, _ => false } }
+
+fn is_method_call(n: &Node) -> bool {
+    match n {
+        Node::E(x) => match &x.kind { ExprKind::MethodCall { .. } => true, _ => false },
+        _ => false,
+    }
+}
+
+fn last_item_shape(items: &Vec<Node>, list: &Vec<ListItem>, sh: &Shape, max_w: usize) -> Option<Shape> {
+    let nested_call = match &items[0] { Node::E(x) => is_nested_call(*x), _ => false };
+    if items.len() == 1 && !nested_call { return Some(sh.clone()); }
+    let mut offset = 0;
+    let mut i = 0;
+    while i + 1 < list.len() {
+        offset += 2 + list[i].text().len();
+        i += 1;
+    }
+    let w = if max_w < sh.width { max_w } else { sh.width };
+    sh.with_width(w).offset_left(offset)
+}
+
+fn no_long_items(list: &Vec<ListItem>) -> bool {
+    for it in list.iter() {
+        if it.text().len() > SHORT_ARRAY_ELEMENT_WIDTH { return false; }
+    }
+    true
+}
+
+fn args_have_many_closures(items: &Vec<Node>) -> bool {
+    let mut n = 0;
+    for it in items.iter() {
+        if let Node::E(x) = it {
+            if let ExprKind::Closure { .. } = &x.kind { n += 1; }
+        }
+    }
+    n > 1
+}
+
+/// rustfmt's extra_offset: the width of text's last line beyond shape's
+/// start.
+pub fn extra_offset(text: &str, sh: &Shape) -> usize {
+    match text.rfind('\n') {
+        Some(i) => sub(text.len(), i + 1 + sh.used_width()),
+        None => text.len(),
+    }
+}
+
+pub fn is_nested_call(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::Call { .. } => true,
+        ExprKind::Ref { x, .. } => is_nested_call(*x),
+        ExprKind::Try { x, .. } => is_nested_call(*x),
+        ExprKind::Unary { x, .. } => is_nested_call(*x),
+        ExprKind::Cast { x, .. } => is_nested_call(*x),
+        _ => false,
+    }
+}
+
+pub fn is_simple_expr(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::Lit { .. } => true,
+        ExprKind::Path(p) => p.qself.is_none() && p.segments.len() <= 1 && p.segments[0].args.is_none(),
+        ExprKind::Ref { x, .. } => is_simple_expr(*x),
+        ExprKind::Cast { x, .. } => is_simple_expr(*x),
+        ExprKind::Field { x, .. } => is_simple_expr(*x),
+        ExprKind::Try { x, .. } => is_simple_expr(*x),
+        ExprKind::Unary { x, .. } => is_simple_expr(*x),
+        ExprKind::Index { x, index, .. } => is_simple_expr(*x) && is_simple_expr(*index),
+        ExprKind::ArrayRepeat { value, count, .. } => is_simple_expr(*value) && is_simple_expr(*count),
+        _ => false,
+    }
+}
+
+pub fn can_be_overflowed_expr(x: &Expr, len: usize) -> bool {
+    match &x.kind {
+        ExprKind::Match { .. } => len == 1,
+        ExprKind::If { .. } | ExprKind::For { .. } | ExprKind::Loop { .. } | ExprKind::While { .. } => len == 1,
+        ExprKind::Block(_) | ExprKind::Closure { .. } => true,
+        ExprKind::Array { .. } | ExprKind::ArrayRepeat { .. } | ExprKind::StructLit { .. } => len == 1,
+        ExprKind::Call { .. } | ExprKind::MethodCall { .. } | ExprKind::Tuple { .. } => len == 1,
+        ExprKind::Ref { x, .. } => can_be_overflowed_expr(*x, len),
+        ExprKind::Try { x, .. } => can_be_overflowed_expr(*x, len),
+        ExprKind::Unary { x, .. } => can_be_overflowed_expr(*x, len),
+        ExprKind::Cast { x, .. } => can_be_overflowed_expr(*x, len),
+        ExprKind::Template { .. } => false,
+        ExprKind::Select { .. } => len == 1,
+        _ => false,
+    }
+}
+
+pub fn can_be_overflowed_pat(p: &Pat, len: usize) -> bool {
+    match &p.kind {
+        PatKind::Path(_) | PatKind::Tuple { .. } | PatKind::Struct { .. } | PatKind::TupleStruct { .. } => len == 1,
+        PatKind::Ref { pat, .. } => can_be_overflowed_pat(*pat, len),
+        PatKind::Lit(x) => can_be_overflowed_expr(*x, len),
+        _ => false,
+    }
+}

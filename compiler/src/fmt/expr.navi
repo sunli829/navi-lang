@@ -1,0 +1,1175 @@
+//! Expressions (rustfmt's expr.rs, pairs.rs and matches.rs).
+
+use crate::syntax::token::*;
+use crate::syntax::source::Pos;
+use crate::syntax::ast::*;
+use crate::fmt::ctx::*;
+use crate::fmt::lists::*;
+use crate::fmt::overflow::*;
+
+impl Ctx {
+    /// An expression in a larger one.
+    pub fn expr(&self, x: &Expr, sh: Shape) -> Option<String> { self.format_expr(x, false, sh) }
+
+    /// An expression; as a statement when stmt.
+    pub fn format_expr(&self, x: &Expr, stmt: bool, sh: Shape) -> Option<String> {
+        let rw = self.format_expr_inner(x, stmt, sh)?;
+        // Keep the source when a comment inside got lost.
+        let lo = self.expr_start(x);
+        let hi = self.expr_end(x);
+        if self.has_comment(lo, hi) {
+            for c in self.comments_in(lo, hi).iter() {
+                let t = self.snippet(c.pos, c.end).trim_end();
+                let first = first_line(t).trim();
+                if !rw.contains(first) { return Some(self.snippet(lo, hi).to_string()); }
+            }
+        }
+        Some(rw)
+    }
+
+    fn format_expr_inner(&self, x: &Expr, stmt: bool, sh0: Shape) -> Option<String> {
+        let sh = if stmt && semicolon_for_expr(x) { sh0.sub_width(1)? } else { sh0 };
+        match &x.kind {
+            ExprKind::Lit { pos, .. } => self.string_lit(*pos, self.tok_end(*pos), sh),
+            ExprKind::Template { pos, .. } => self.string_lit(*pos, self.tok_end(*pos), sh),
+            ExprKind::Path(p) => self.path(*p, true, sh),
+            ExprKind::Unary { op, x: inner, .. } => self.unary_prefix(kind_name(*op), &Node::E(*inner), sh),
+            ExprKind::Ref { is_mut, x: inner, .. } => self.unary_prefix(if *is_mut { "&mut " } else { "&" }, &Node::E(*inner), sh),
+            ExprKind::Binary { op, x: l, y: r, .. } => {
+                match self.all_pairs(x, sh.clone()) {
+                    Some(s) => Some(s),
+                    None => {
+                        let infix = cat3(" ", kind_name(*op), " ");
+                        self.pair(&Node::E(*l), &Node::E(*r), "", infix.as_str(), "", sh, true)
+                    }
+                }
+            }
+            ExprKind::Assign { op, x: l, y: r, .. } => self.assignment(*l, *r, kind_name(*op), sh),
+            ExprKind::Cast { x: inner, ty } => self.pair(&Node::E(*inner), &Node::T(*ty), "", " as ", "", sh, true),
+            ExprKind::Range { lo, hi, inclusive, .. } => self.range(*lo, *hi, *inclusive, sh),
+            ExprKind::Call { fun, lparen, args } => {
+                let callee = self.expr(*fun, sh.clone())?;
+                let mut items = Vec::new();
+                for a in args.iter() { items.push(Node::E(*a)); }
+                self.with_parens(callee.as_str(), &items, sh, *lparen, FN_CALL_WIDTH, None)
+            }
+            ExprKind::MethodCall { .. } | ExprKind::Field { .. } | ExprKind::Try { .. } => self.chain(x, sh),
+            ExprKind::Index { x: inner, index, .. } => self.index(*inner, *index, sh),
+            ExprKind::StructLit { path, fields, base } => self.struct_lit(x, *path, fields, *base, sh),
+            ExprKind::Tuple { lparen, elems } => {
+                let mut items = Vec::new();
+                for e in elems.iter() { items.push(Node::E(*e)); }
+                let force = if elems.len() == 1 { Some(Trailing::Always) } else { None };
+                self.with_parens("", &items, sh, *lparen, FN_CALL_WIDTH, force)
+            }
+            ExprKind::Paren { lparen, x: inner } => self.paren(*lparen, *inner, sh),
+            ExprKind::Array { lbrack, elems } => {
+                let mut items = Vec::new();
+                for e in elems.iter() { items.push(Node::E(*e)); }
+                self.with_brackets("", &items, sh, *lbrack, None)
+            }
+            ExprKind::ArrayRepeat { value, count, .. } => self.pair(&Node::E(*value), &Node::E(*count), "[", "; ", "]", sh, false),
+            ExprKind::Block(b) => {
+                if let Some((pat, places)) = destructure(*b) { return self.destructure_assign(*b, pat, &places, sh); }
+                if stmt {
+                    if b.is_unsafe { return self.block(*b, None, sh); }
+                    if let Some(s) = self.empty_block(*b, "", None, sh.clone()) { return Some(s); }
+                    let prefix = if b.is_unsafe { "unsafe " } else { "" };
+                    return self.block_with_visitor(prefix, *b, None, sh);
+                }
+                self.block(*b, None, sh)
+            }
+            ExprKind::If { .. } | ExprKind::Loop { .. } | ExprKind::While { .. } | ExprKind::For { .. } => {
+                let cf = self.control_flow(x, !stmt)?;
+                self.rewrite_control_flow(&cf, sh)
+            }
+            ExprKind::Let { pat, x: init, .. } => self.let_expr(*pat, *init, sh),
+            ExprKind::Match { x: cond, arms, .. } => self.match_expr(x, *cond, arms, sh),
+            ExprKind::Break { label, value, .. } => {
+                let mut kw = s("break");
+                if let Some(l) = label {
+                    kw.push(' ');
+                    kw.push_str(self.ident(*l).as_str());
+                }
+                match value {
+                    Some(v) => {
+                        kw.push(' ');
+                        self.unary_prefix(kw.as_str(), &Node::E(*v), sh)
+                    }
+                    None => Some(kw),
+                }
+            }
+            ExprKind::Continue { label, .. } => {
+                let mut kw = s("continue");
+                if let Some(l) = label {
+                    kw.push(' ');
+                    kw.push_str(self.ident(*l).as_str());
+                }
+                Some(kw)
+            }
+            ExprKind::Return { value, .. } => match value {
+                Some(v) => self.unary_prefix("return ", &Node::E(*v), sh),
+                None => Some(s("return")),
+            },
+            ExprKind::Closure { .. } => self.closure(x, sh),
+            ExprKind::Select { pos, arms } => self.select_expr(*pos, x, arms, sh),
+            ExprKind::Bad(_) => None,
+        }
+    }
+
+    pub fn ident(&self, n: &Name) -> String {
+        let e = self.tok_end(n.pos);
+        if e > n.pos { self.snippet(n.pos, e).to_string() } else { n.value.clone() }
+    }
+
+    fn string_lit(&self, lo: Pos, hi: Pos, sh: Shape) -> Option<String> {
+        let t = self.snippet(lo, hi);
+        // One line: as written whatever its width (rustfmt 2024).
+        if !t.contains('\n') { return Some(t.to_string()); }
+        {
+            let mut all = true;
+            let lines: Vec<&str> = t.split('\n').collect();
+            let mut i = 0;
+            while i + 1 < lines.len() {
+                if !lines[i].ends_with("\\") { all = false; }
+                i += 1;
+            }
+            if all { return Some(t.to_string()); }
+        }
+        wrap_str(t.to_string(), &sh)
+    }
+
+    pub fn unary_prefix(&self, prefix: &str, n: &Node, sh: Shape) -> Option<String> {
+        let s2 = sh.offset_left(prefix.len())?;
+        let r = self.node(n, s2)?;
+        Some(cat(prefix, r.as_str()))
+    }
+
+    pub fn unary_suffix(&self, suffix: &str, n: &Node, sh: Shape) -> Option<String> {
+        let s2 = sh.sub_width(suffix.len())?;
+        let r = self.node(n, s2)?;
+        Some(cat(r.as_str(), suffix))
+    }
+
+    /// lhs infix rhs between prefix and suffix, the separator in front of
+    /// the rhs when it breaks (front) or after the lhs (rustfmt's
+    /// rewrite_pair).
+    pub fn pair(&self, l: &Node, r: &Node, prefix: &str, infix: &str, suffix: &str, sh: Shape, front: bool) -> Option<String> {
+        let lhs_overhead = if front { sh.used_width() } else { sh.used_width() + prefix.len() + infix.trim_end().len() };
+        let lsh = sh.with_width(sub(MAX_WIDTH, lhs_overhead));
+        let lhs = cat(prefix, self.node(l, lsh)?.as_str());
+        // Both on one line.
+        let rsh = match sh.offset_left(last_line_width(lhs.as_str()) + infix.len()) {
+            Some(s) => s.sub_width(suffix.len()),
+            None => None,
+        };
+        if let Some(rs) = rsh {
+            if let Some(rhs) = self.node(r, rs) {
+                let allow_same_line = lhs.len() <= TAB || first_line(rhs.as_str()).ends_with("{");
+                if !rhs.contains('\n') || allow_same_line {
+                    let w = last_line_width(lhs.as_str()) + infix.len() + first_line_width(rhs.as_str()) + suffix.len();
+                    if w <= sh.width {
+                        let mut out = lhs.clone();
+                        out.push_str(infix);
+                        out.push_str(rhs.as_str());
+                        out.push_str(suffix);
+                        return Some(out);
+                    }
+                }
+            }
+        }
+        // Several lines.
+        let mut rsh2 = Shape::indented(sh.block + TAB).with_align(sh.align).sub_width(sh.rhs_overhead())?;
+        let inf = if front { infix.trim_start() } else { infix.trim_end() };
+        if front { rsh2 = rsh2.offset_left(inf.len())?; }
+        let rhs = self.node(r, rsh2.clone())?;
+        let ind = spaces(rsh2.indent_width());
+        let mut out = lhs;
+        if front {
+            out.push('\n');
+            out.push_str(ind.as_str());
+            out.push_str(inf);
+        } else {
+            out.push_str(inf);
+            out.push('\n');
+            out.push_str(ind.as_str());
+        }
+        out.push_str(rhs.as_str());
+        out.push_str(suffix);
+        Some(out)
+    }
+
+    /// A chain of binary operators of one kind (rustfmt's rewrite_all_pairs).
+    fn all_pairs(&self, x: &Expr, sh: Shape) -> Option<String> {
+        let top = match &x.kind { ExprKind::Binary { op, .. } => *op, _ => return None };
+        // Flatten in order.
+        let mut list: Vec<&Expr> = Vec::new();
+        let mut seps: Vec<&str> = Vec::new();
+        let mut stack: Vec<&Expr> = Vec::new();
+        let mut node = x;
+        loop {
+            let mut descend = false;
+            if let ExprKind::Binary { op, x: l, .. } = &node.kind {
+                if *op == top {
+                    stack.push(node);
+                    node = *l;
+                    descend = true;
+                }
+            }
+            if descend { continue; }
+            list.push(node);
+            match stack.pop() {
+                Some(p) => {
+                    if let ExprKind::Binary { op, y, .. } = &p.kind {
+                        seps.push(kind_name(*op));
+                        node = *y;
+                    }
+                }
+                None => break,
+            }
+        }
+        // The default rewrites.
+        let mut rws: Vec<Option<String>> = Vec::new();
+        let mut i = 0;
+        while i < list.len() {
+            if i == 0 {
+                rws.push(self.expr(list[0], sh.clone()));
+            } else {
+                let overhead = seps[i - 1].len() + 1;
+                let ns = sh.block_indent(TAB).with_max_width().sub_width(sh.rhs_overhead());
+                let r = match ns {
+                    Some(n) => match n.offset_left(overhead) {
+                        Some(d) => self.expr(list[i], d),
+                        None => None,
+                    },
+                    None => None,
+                };
+                rws.push(r);
+            }
+            i += 1;
+        }
+        let mut lets = 0;
+        for e in list.iter() {
+            if let ExprKind::Let { .. } = &e.kind { lets += 1; }
+        }
+        let single_let_ok = list.len() == 2 && is_ident_expr(list[0]) && match &list[1].kind { ExprKind::Let { .. } => true, _ => false };
+        if lets > 0 && !single_let_ok { return self.pairs_multiline(&list, &rws, &seps, sh); }
+        match self.pairs_one_line(&list, &rws, &seps, sh.clone()) {
+            Some(s) => Some(s),
+            None => self.pairs_multiline(&list, &rws, &seps, sh),
+        }
+    }
+
+    fn pairs_one_line(&self, list: &Vec<&Expr>, rws: &Vec<Option<String>>, seps: &Vec<&str>, sh: Shape) -> Option<String> {
+        let mut out = String::new();
+        let base = sh.block_only();
+        let mut i = 0;
+        while i + 1 < list.len() {
+            let rw = match &rws[i] { Some(r) => r.clone(), None => return None };
+            if rw.contains('\n') || out.len() > sh.width { return None; }
+            out.push_str(rw.as_str());
+            out.push(' ');
+            out.push_str(seps[i]);
+            out.push(' ');
+            i += 1;
+        }
+        let prefix_len = out.len();
+        let cur = base.offset_left(last_line_width(out.as_str()))?;
+        let last = self.expr(list[list.len() - 1], cur)?;
+        out.push_str(last.as_str());
+        if first_line_width(out.as_str()) > sh.width { return None; }
+        if !(is_single_line(out.as_str()) || last.starts_with("{")) && (last.starts_with("(") || prefix_len > TAB) {
+            return None;
+        }
+        wrap_str(out, &sh)
+    }
+
+    fn pairs_multiline(&self, list: &Vec<&Expr>, rws: &Vec<Option<String>>, seps: &Vec<&str>, sh: Shape) -> Option<String> {
+        let rhs_offset = sh.rhs_overhead();
+        let nested = sh.block_indent(TAB).with_max_width().sub_width(rhs_offset)?;
+        let ind = nested.nl_indent();
+        let mut out = match &rws[0] { Some(r) => r.clone(), None => return None };
+        let mut i = 1;
+        while i < list.len() {
+            let sep = seps[i - 1];
+            let offset = if out.contains('\n') { 0 } else { sh.used_width() };
+            let mut done = false;
+            if last_line_width(out.as_str()) + offset <= nested.used_width() {
+                if let Some(ls) = sh.offset_left(sep.len() + 2 + trimmed_last_line_width(out.as_str())) {
+                    if let Some(rw) = self.expr(list[i], ls) {
+                        out.push(' ');
+                        out.push_str(sep);
+                        out.push(' ');
+                        out.push_str(rw.as_str());
+                        done = true;
+                    }
+                }
+            }
+            if !done {
+                out.push_str(ind.as_str());
+                out.push_str(sep);
+                out.push(' ');
+                match &rws[i] {
+                    Some(r) => out.push_str(r.as_str()),
+                    None => return None,
+                }
+            }
+            i += 1;
+        }
+        Some(out)
+    }
+
+    fn range(&self, lo: Option<&Expr>, hi: Option<&Expr>, inclusive: bool, sh: Shape) -> Option<String> {
+        let delim = if inclusive { "..=" } else { ".." };
+        match (lo, hi) {
+            (Some(l), Some(h)) => {
+                let mut d = String::new();
+                if needs_space_before_range(self, l) { d.push(' '); }
+                d.push_str(delim);
+                if needs_space_after_range(h) { d.push(' '); }
+                self.pair(&Node::E(l), &Node::E(h), "", d.as_str(), "", sh, true)
+            }
+            (None, Some(h)) => {
+                let mut d = s(delim);
+                if needs_space_after_range(h) { d.push(' '); }
+                self.unary_prefix(d.as_str(), &Node::E(h), sh)
+            }
+            (Some(l), None) => {
+                let mut d = String::new();
+                if needs_space_before_range(self, l) { d.push(' '); }
+                d.push_str(delim);
+                self.unary_suffix(d.as_str(), &Node::E(l), sh)
+            }
+            (None, None) => Some(s(delim)),
+        }
+    }
+
+    fn paren(&self, lparen: Pos, x0: &Expr, sh: Shape) -> Option<String> {
+        let mut x = x0;
+        let mut open = lparen;
+        loop {
+            let close = self.close_end(open) - 1;
+            let lo = self.expr_start(x);
+            let hi = self.expr_end(x);
+            if self.has_comment(open + 1, lo) || self.has_comment(hi, close) { return None; }
+            if let ExprKind::Paren { lparen: l2, x: inner } = &x.kind {
+                open = *l2;
+                x = *inner;
+                continue;
+            }
+            break;
+        }
+        let ss = sh.offset_left(1)?.sub_width(1)?;
+        let inner = self.expr(x, ss)?;
+        if inner.contains("//") { return None; }
+        Some(cat3("(", inner.as_str(), ")"))
+    }
+
+    fn index(&self, x: &Expr, index: &Expr, sh: Shape) -> Option<String> {
+        let xs = self.expr(x, sh.clone())?;
+        let offset = last_line_width(xs.as_str()) + 1;
+        let rhs_overhead = sh.rhs_overhead();
+        let ish = if xs.contains('\n') {
+            match Shape::legacy(MAX_WIDTH, sh.block).with_align(sh.align).with_width(MAX_WIDTH).offset_left(offset) {
+                Some(s) => s.sub_width(1 + rhs_overhead),
+                None => None,
+            }
+        } else {
+            match sh.offset_left(offset) { Some(s) => s.sub_width(1), None => None }
+        };
+        let orig = match ish { Some(s) => self.expr(index, s), None => None };
+        if let Some(o) = &orig {
+            if !o.contains('\n') { return Some(cat3(xs.as_str(), "[", cat(o.as_str(), "]").as_str())); }
+        }
+        let ind = Shape::indented(sh.block + TAB).with_align(sh.align);
+        let nsh = ind.offset_left(1)?.sub_width(1 + rhs_overhead)?;
+        let new = self.expr(index, nsh);
+        let mut out = xs;
+        match (orig, new) {
+            (_, Some(n)) if !n.contains('\n') => {
+                out.push_str(ind.nl_indent().as_str());
+                out.push('[');
+                out.push_str(n.as_str());
+                out.push(']');
+                Some(out)
+            }
+            (None, Some(n)) => {
+                out.push_str(ind.nl_indent().as_str());
+                out.push('[');
+                out.push_str(n.as_str());
+                out.push(']');
+                Some(out)
+            }
+            (Some(o), _) => {
+                out.push('[');
+                out.push_str(o.as_str());
+                out.push(']');
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    fn struct_lit(&self, x: &Expr, path: &Path, fields: &Vec<&FieldInit>, base: Option<&Expr>, sh: Shape) -> Option<String> {
+        let path_str = self.path(path, true, sh.sub_width(2)?)?;
+        let rest = match base {
+            Some(b) => match &b.kind {
+                ExprKind::Range { lo: None, hi: None, inclusive: false, .. } => true,
+                _ => false,
+            },
+            None => false,
+        };
+        if fields.len() == 0 && base.is_none() { return Some(cat(path_str.as_str(), " {}")); }
+        if fields.len() == 0 && rest { return Some(cat(path_str.as_str(), " { .. }")); }
+        let (h_shape, v_shape) = struct_lit_shape(&sh, path_str.len() + 3, 2)?;
+        let one_line_width = match &h_shape { Some(h) => h.width, None => 0 };
+        let open = self.find(self.path_end(path), L_BRACE);
+        let close = self.expr_end(x) - 1;
+        let mut spans = Vec::new();
+        for f in fields.iter() { spans.push((f.name.pos, self.expr_end(f.value))); }
+        if let Some(b) = base { spans.push((self.prev_tok_pos(self.expr_start(b)), self.expr_end(b))); }
+        if rest {
+            // The span of .. is its own token.
+            let n = spans.len();
+            spans[n - 1] = (self.prev_tok_pos(close + 1), close);
+        }
+        let mut items = self.itemize(&spans, open + 1, close);
+        let vs = v_shape.sub_width(1);
+        let mut i = 0;
+        for f in fields.iter() {
+            items[i].item = match &vs { Some(v) => self.field_init(*f, v.clone()), None => None };
+            i += 1;
+        }
+        if let Some(b) = base {
+            items[i].item = if rest { Some(s("..")) } else {
+                match v_shape.offset_left(2) {
+                    Some(v) => match self.expr(b, v) { Some(r) => Some(cat("..", r.as_str())), None => None },
+                    None => None,
+                }
+            };
+        }
+        let tactic = struct_lit_tactic(&h_shape, &items);
+        let nested = if tactic == Tactic::Horizontal { match &h_shape { Some(h) => h.clone(), None => v_shape.clone() } } else { v_shape.clone() };
+        let mut f = ListFormatting::new(nested);
+        f.tactic = tactic.clone();
+        f.trailing = if base.is_some() { Trailing::Never } else { Trailing::Vertical };
+        f.ends_with_newline = tactic == Tactic::Vertical;
+        f.preserve_newline = true;
+        let fields_str = write_list(&items, &f)?;
+        let body = wrap_struct_field(fields_str.as_str(), &sh, &v_shape, one_line_width);
+        Some(cat3(path_str.as_str(), " {", cat(body.as_str(), "}").as_str()))
+    }
+
+    fn field_init(&self, f: &FieldInit, sh: Shape) -> Option<String> {
+        let name = self.ident(f.name);
+        let shorthand = match &f.value.kind {
+            ExprKind::Path(p) => p.segments.len() == 1 && p.segments[0].name.pos == f.name.pos,
+            _ => false,
+        };
+        if shorthand { return Some(name); }
+        let overhead = name.len() + 2;
+        let esh = sh.offset_left(overhead)?;
+        match self.expr(f.value, esh) {
+            Some(e) => Some(cat3(name.as_str(), ": ", e.as_str())),
+            None => {
+                let off = Shape::indented(sh.block + TAB).with_align(sh.align);
+                let e = self.expr(f.value, off.clone())?;
+                let mut out = name;
+                out.push_str(":\n");
+                out.push_str(off.indent_str().as_str());
+                out.push_str(e.as_str());
+                Some(out)
+            }
+        }
+    }
+
+    fn assignment(&self, l: &Expr, r: &Expr, op: &str, sh: Shape) -> Option<String> {
+        let lsh = sh.sub_width(op.len() + 1)?;
+        let lhs = cat3(self.expr(l, lsh)?.as_str(), " ", op);
+        self.assign_rhs(lhs.as_str(), &Node::E(r), sh, false)
+    }
+
+    // A destructuring assignment the parser expanded (see destructure).
+    fn destructure_assign(&self, b: &Block, pat: &Pat, places: &Vec<&Expr>, sh: Shape) -> Option<String> {
+        let l = match b.stmts[0] { Stmt::Let(l) => l, _ => return None };
+        let init = l.init?;
+        let _ = places;
+        let lhs = self.assignee(pat)?;
+        let lhs2 = cat(lhs.as_str(), " =");
+        self.assign_rhs(lhs2.as_str(), &Node::E(init), sh, false)
+    }
+
+    // The source of an assignee (the pattern the parser made of it has
+    // its positions); kept as written when on one line.
+    fn assignee(&self, p: &Pat) -> Option<String> {
+        let t = self.snippet(self.pat_start(p), self.pat_end(p));
+        if t.contains('\n') { return None; }
+        Some(t.to_string())
+    }
+
+    /// lhs followed by the rhs on its line or the next (rustfmt's
+    /// rewrite_assign_rhs).
+    pub fn assign_rhs(&self, lhs: &str, r: &Node, sh: Shape, force_next_no_indent: bool) -> Option<String> {
+        let rhs = self.assign_rhs_expr(lhs, r, sh, force_next_no_indent, false)?;
+        Some(cat(lhs, rhs.as_str()))
+    }
+
+    pub fn assign_rhs_expr(&self, lhs: &str, r: &Node, sh: Shape, force_next_no_indent: bool, allow_overflow: bool) -> Option<String> {
+        let llw = sub(last_line_width(lhs), if lhs.contains('\n') { sh.indent_width() } else { 0 });
+        let orig_shape = match sh.offset_left(llw + 1) {
+            Some(s) => s,
+            None => {
+                let mut s = sh.with_width(0);
+                s.offset = sh.offset + llw + 1;
+                s
+            }
+        };
+        let orig = self.node(r, orig_shape.clone());
+        self.choose_rhs(r, orig_shape, orig, force_next_no_indent, allow_overflow)
+    }
+
+    fn choose_rhs(&self, r: &Node, sh: Shape, orig: Option<String>, force_next_no_indent: bool, allow_overflow: bool) -> Option<String> {
+        if let Some(o) = &orig {
+            if o.len() == 0 { return Some(String::new()); }
+            if !o.contains('\n') && str_width(o.as_str()) <= sh.width { return Some(cat(" ", o.as_str())); }
+        }
+        let new_shape = if force_next_no_indent {
+            sh.with_max_width().sub_width(sh.indent_width())?
+        } else {
+            Shape::indented(sh.block + TAB).with_align(sh.align).sub_width(sh.rhs_overhead())?
+        };
+        let new = self.node(r, new_shape.clone());
+        let ind = Shape::indented(sh.block + TAB).with_align(sh.align).nl_indent();
+        match (orig, new) {
+            (Some(o), Some(n)) => {
+                if !str_fits(n.as_str(), &new_shape) { return Some(cat(" ", o.as_str())); }
+                if prefer_next_line(o.as_str(), n.as_str(), force_next_no_indent) { return Some(cat(ind.as_str(), n.as_str())); }
+                Some(cat(" ", o.as_str()))
+            }
+            (None, Some(n)) => Some(cat(ind.as_str(), n.as_str())),
+            (None, None) => {
+                if allow_overflow {
+                    let wide = sh.with_width(usize::MAX / 2);
+                    match self.node(r, wide) { Some(s2) => Some(cat(" ", s2.as_str())), None => None }
+                } else {
+                    None
+                }
+            }
+            (Some(o), None) => Some(cat(" ", o.as_str())),
+        }
+    }
+
+    fn let_expr(&self, pat: &Pat, x: &Expr, sh: Shape) -> Option<String> {
+        let psh = sh.offset_left(4)?;
+        let p = self.pat(pat, psh)?;
+        let lhs = cat3("let ", p.as_str(), " =");
+        self.assign_rhs(lhs.as_str(), &Node::E(x), sh, false)
+    }
+
+    // --- Blocks --------------------------------------------------------------------
+
+    /// A block in an expression: {}, { e } or several lines.
+    pub fn block(&self, b: &Block, label: Option<&Name>, sh: Shape) -> Option<String> { self.block_inner(b, label, true, sh) }
+
+    pub fn block_inner(&self, b: &Block, label: Option<&Name>, allow_single_line: bool, sh: Shape) -> Option<String> {
+        let prefix = if b.is_unsafe { self.unsafe_prefix(b)? } else { String::new() };
+        if let Some(s) = self.empty_block(b, prefix.as_str(), label, sh.clone()) { return Some(s); }
+        let r = self.block_with_visitor(prefix.as_str(), b, label, sh.clone())?;
+        if allow_single_line && count_newlines(r.as_str()) < 3 {
+            if let Some(s1) = self.single_line_block(prefix.as_str(), b, label, sh) { return Some(s1); }
+        }
+        Some(r)
+    }
+
+    fn unsafe_prefix(&self, b: &Block) -> Option<String> {
+        let kw = self.prev_tok_pos(b.lbrace);
+        if self.has_comment(kw, b.lbrace) { return None; }
+        Some(s("unsafe "))
+    }
+
+    pub fn empty_block(&self, b: &Block, prefix: &str, label: Option<&Name>, sh: Shape) -> Option<String> {
+        if b.stmts.len() > 0 || b.tail.is_some() { return None; }
+        let l = label_str(self, label);
+        if !self.has_comment(b.lbrace + 1, b.rbrace) && sh.width >= 2 {
+            return Some(cat3(prefix, l.as_str(), "{}"));
+        }
+        let inner = self.snippet(b.lbrace + 1, b.rbrace).trim();
+        if !inner.contains('\n') && !inner.starts_with("//") && inner.len() + 4 <= sh.width {
+            let mut out = cat3(prefix, l.as_str(), "{ ");
+            out.push_str(inner);
+            out.push_str(" }");
+            return Some(out);
+        }
+        None
+    }
+
+    fn single_line_block(&self, prefix: &str, b: &Block, label: Option<&Name>, sh: Shape) -> Option<String> {
+        let t = self.simple_block_expr(b)?;
+        let esh = sh.offset_left(last_line_width(prefix))?;
+        let e = self.format_expr(t, false, esh)?;
+        let mut out = cat3(prefix, label_str(self, label).as_str(), "{ ");
+        out.push_str(e.as_str());
+        out.push_str(" }");
+        if out.len() <= sh.width && !out.contains('\n') { return Some(out); }
+        None
+    }
+
+    /// The tail of a block of nothing else (rustfmt's is_simple_block).
+    pub fn simple_block_expr(&self, b: &Block) -> Option<&Expr> {
+        if b.stmts.len() > 0 { return None; }
+        let t = b.tail?;
+        if self.has_comment(b.lbrace + 1, b.rbrace) { return None; }
+        Some(t)
+    }
+
+    pub fn block_with_visitor(&self, prefix: &str, b: &Block, label: Option<&Name>, sh: Shape) -> Option<String> {
+        if let Some(s) = self.empty_block(b, prefix, label, sh.clone()) { return Some(s); }
+        let body = self.block_body(b, sh.indent_width())?;
+        Some(cat3(prefix, label_str(self, label).as_str(), body.as_str()))
+    }
+
+    // --- if, loops -------------------------------------------------------------------
+
+    fn control_flow(&self, x: &Expr, allow_single_line: bool) -> Option<CF> {
+        match &x.kind {
+            ExprKind::If { pos, cond, then, els } => {
+                Some(CF { keyword: "if", label: None, cond: Some(*cond), pat: None, matcher: "", connector: "", block: then.block(),
+                    els: *els, allow_single_line, nested_if: false, pos: *pos })
+            }
+            ExprKind::Loop { label, pos, body } => {
+                Some(CF { keyword: "loop", label: *label, cond: None, pat: None, matcher: "", connector: "", block: body.block(),
+                    els: None, allow_single_line: false, nested_if: false, pos: *pos })
+            }
+            ExprKind::While { label, pos, cond, body } => {
+                Some(CF { keyword: "while", label: *label, cond: Some(*cond), pat: None, matcher: "", connector: "", block: body.block(),
+                    els: None, allow_single_line: false, nested_if: false, pos: *pos })
+            }
+            ExprKind::For { label, pos, pat, iter, body } => {
+                Some(CF { keyword: "for", label: *label, cond: Some(*iter), pat: Some(*pat), matcher: "", connector: " in", block: body.block(),
+                    els: None, allow_single_line: false, nested_if: false, pos: *pos })
+            }
+            _ => None,
+        }
+    }
+
+    fn pat_expr(&self, cf: &CF, x: &Expr, sh: Shape, offset: usize) -> Option<String> {
+        let csh = sh.offset_left(offset)?;
+        if let Some(p) = cf.pat {
+            let matcher = if cf.matcher.len() == 0 { String::new() } else { cat(cf.matcher, " ") };
+            let psh = csh.offset_left(matcher.len())?.sub_width(cf.connector.len())?;
+            let ps = self.pat(p, psh)?;
+            let lhs = cat3(matcher.as_str(), ps.as_str(), cf.connector);
+            return self.assign_rhs(lhs.as_str(), &Node::E(x), csh, false);
+        }
+        let r = self.expr(x, csh);
+        if cf.keyword == "if" || r.is_some() { return r; }
+        let nested = sh.block_indent(TAB).with_max_width();
+        let e = self.expr(x, nested.clone())?;
+        Some(cat(nested.nl_indent().as_str(), e.as_str()))
+    }
+
+    /// The part of a control flow expression before its block, and its
+    /// width (0 when the whole of it fits on one line).
+    fn cf_cond(&self, cf: &CF, sh: Shape, alt_block_sep: &str) -> Option<(String, usize)> {
+        let fresh = sh.with_width(sub(MAX_WIDTH, sh.used_width()));
+        let constr = if cf.nested_if { fresh.offset_left(7)? } else { fresh };
+        let l = label_str(self, cf.label);
+        let offset = cf.keyword.len() + l.len() + 1;
+        let pe = match cf.cond {
+            Some(c) => self.pat_expr(cf, c, constr.clone(), offset)?,
+            None => String::new(),
+        };
+        let one_line_budget = sub(MAX_WIDTH, constr.used_width() + offset + 2);
+        let force_newline_brace = (pe.contains('\n') || pe.len() > one_line_budget)
+            && (!last_line_extendable(pe.as_str()) || last_line_offsetted(sh.used_width(), pe.as_str()));
+        if cf.allow_single_line {
+            if let Some(one) = self.cf_single_line(cf, pe.as_str(), sh.width) {
+                if one.len() <= SINGLE_LINE_IF_ELSE_WIDTH { return Some((one, 0)); }
+            }
+        }
+        // Comments between the keyword and the block are not formatted.
+        let kw_end = self.tok_end(cf.pos);
+        if self.has_comment(kw_end, cf.block.lbrace) {
+            if let Some(c) = cf.cond {
+                let lo = match cf.pat { Some(p) => self.pat_start(p), None => self.expr_start(c) };
+                if self.has_comment(kw_end, lo) || self.has_comment(self.expr_end(c), cf.block.lbrace) { return None; }
+            }
+        }
+        let block_sep = if force_newline_brace { alt_block_sep } else { " " };
+        let used = if pe.contains('\n') { last_line_width(pe.as_str()) } else { l.len() + cf.keyword.len() + pe.len() + 2 };
+        let mut out = l;
+        out.push_str(cf.keyword);
+        if pe.len() > 0 && !pe.starts_with("\n") { out.push(' '); }
+        out.push_str(pe.as_str());
+        out.push_str(block_sep);
+        Some((out, used))
+    }
+
+    fn cf_single_line(&self, cf: &CF, pe: &str, width: usize) -> Option<String> {
+        let els = cf.els?;
+        let fixed = cf.keyword.len() + "  {  } else {  }".len();
+        let eb = match &els.kind { ExprKind::Block(b) => *b, _ => return None };
+        if pe.contains('\n') { return None; }
+        let ie = self.simple_block_expr(cf.block)?;
+        let ee = self.simple_block_expr(eb)?;
+        if cf.block.is_unsafe || eb.is_unsafe { return None; }
+        let w = sub_opt(width, pe.len() + fixed)?;
+        let is = self.format_expr(ie, false, Shape::legacy(w, 0))?;
+        let w2 = sub_opt(w, is.len())?;
+        let es = self.format_expr(ee, false, Shape::legacy(w2, 0))?;
+        if is.contains('\n') || es.contains('\n') { return None; }
+        let mut out = s(cf.keyword);
+        out.push(' ');
+        out.push_str(pe);
+        out.push_str(" { ");
+        out.push_str(is.as_str());
+        out.push_str(" } else { ");
+        out.push_str(es.as_str());
+        out.push_str(" }");
+        if out.len() <= width { return Some(out); }
+        None
+    }
+
+    fn rewrite_control_flow(&self, cf: &CF, sh: Shape) -> Option<String> {
+        let alt = sh.nl_indent();
+        let (cond, used) = self.cf_cond(cf, sh.clone(), alt.as_str())?;
+        if used == 0 { return Some(cond); }
+        let bw = sub(sh.width, used);
+        let bw2 = if cf.els.is_some() || cf.nested_if { if bw < 1 { bw } else { 1 } } else { bw };
+        let bsh = sh.with_width(bw2);
+        let body = self.block_with_visitor("", cf.block, None, bsh)?;
+        let mut out = cond;
+        out.push_str(body.as_str());
+        if let Some(e) = cf.els {
+            let esh = Shape::indented(sh.block).with_align(sh.align);
+            let else_pos = self.find(cf.block.rbrace + 1, KW_ELSE);
+            let before = self.comments_between(cf.block.rbrace + 1, else_pos, &esh);
+            let after = self.comments_between(else_pos + 4, self.expr_start(e), &esh);
+            let rw = match &e.kind {
+                ExprKind::If { pos, cond, then, els } => {
+                    let cf2 = CF { keyword: "if", label: None, cond: Some(*cond), pat: None, matcher: "", connector: "",
+                        block: then.block(), els: *els, allow_single_line: false, nested_if: true, pos: *pos };
+                    self.rewrite_control_flow(&cf2, esh)
+                }
+                _ => {
+                    let w = if esh.width < 1 { esh.width } else { 1 };
+                    self.format_expr(e, true, esh.with_width(w))
+                }
+            };
+            out.push_str(match &before { Some(c) => c.as_str(), None => " " });
+            out.push_str("else");
+            out.push_str(match &after { Some(c) => c.as_str(), None => " " });
+            out.push_str(rw?.as_str());
+        }
+        Some(out)
+    }
+
+    // The comments between lo and hi, each on a line of its own at sh's
+    // indentation and a newline after them (rustfmt's extract_comment).
+    fn comments_between(&self, lo: Pos, hi: Pos, sh: &Shape) -> Option<String> {
+        if !self.has_comment(lo, hi) { return None; }
+        let ind = sh.nl_indent();
+        let mut out = String::new();
+        for c in self.comments_in(lo, hi).iter() {
+            out.push_str(ind.as_str());
+            out.push_str(self.comment_text(c, sh.indent_width()).as_str());
+        }
+        out.push_str(ind.as_str());
+        Some(out)
+    }
+
+    /// The condition part of a control flow expression or match scrutinee
+    /// (rustfmt's rewrite_cond).
+    pub fn rewrite_cond(&self, x: &Expr, sh: Shape) -> Option<String> {
+        match &x.kind {
+            ExprKind::Match { x: c, .. } => {
+                let csh = sh.offset_left(8)?;
+                self.expr(*c, csh)
+            }
+            _ => {
+                let cf = self.control_flow(x, false)?;
+                let alt = cat("\n", spaces(sh.block).as_str());
+                match self.cf_cond(&cf, sh, alt.as_str()) {
+                    Some((s1, _)) => Some(s1),
+                    None => None,
+                }
+            }
+        }
+    }
+
+    // --- match -----------------------------------------------------------------------
+
+    fn match_expr(&self, x: &Expr, cond: &Expr, arms: &Vec<&MatchArm>, sh: Shape) -> Option<String> {
+        let csh = sh.with_width(sub(MAX_WIDTH, sh.used_width())).offset_left(6)?;
+        let cs = self.expr(cond, csh.clone())?;
+        let alt = sh.nl_indent();
+        let block_sep = if last_line_extendable(cs.as_str()) {
+            s(" ")
+        } else if cs.contains('\n') || cs.len() + 2 > csh.width {
+            alt.clone()
+        } else {
+            s(" ")
+        };
+        let open = self.find(self.expr_end(cond), L_BRACE);
+        let close = self.expr_end(x) - 1;
+        if arms.len() == 0 {
+            if self.snippet(open + 1, close).trim().len() == 0 { return Some(cat3("match ", cs.as_str(), " {}")); }
+            return Some(self.snippet(self.expr_start(x), close + 1).to_string());
+        }
+        let arm_shape = sh.block_indent(TAB).with_max_width();
+        let mut spans = Vec::new();
+        for a in arms.iter() { spans.push((self.arm_start(*a), self.arm_end(*a))); }
+        let mut items = self.itemize(&spans, open + 1, close);
+        let mut i = 0;
+        while i < arms.len() {
+            items[i].item = self.match_arm(arms[i], arm_shape.clone(), i + 1 == arms.len());
+            i += 1;
+        }
+        let mut f = ListFormatting::new(arm_shape.clone());
+        f.sep = String::new();
+        f.preserve_newline = true;
+        let body = write_list(&items, &f)?;
+        let mut out = cat3("match ", cs.as_str(), block_sep.as_str());
+        out.push_str("{\n");
+        out.push_str(arm_shape.indent_str().as_str());
+        out.push_str(body.as_str());
+        out.push('\n');
+        out.push_str(sh.indent_str().as_str());
+        out.push('}');
+        Some(out)
+    }
+
+    fn arm_start(&self, a: &MatchArm) -> Pos { self.pat_start(a.pat) }
+
+    // The end of an arm: its body, and the comma after it.
+    fn arm_end(&self, a: &MatchArm) -> Pos {
+        let e = self.expr_end(a.body);
+        if self.next_kind(e) == COMMA { return self.next_pos(e) + 1; }
+        e
+    }
+
+    fn match_arm(&self, a: &MatchArm, sh: Shape, is_last: bool) -> Option<String> {
+        let psh = sh.sub_width(5)?;
+        let ps = self.pat(a.pat, psh)?;
+        let block_like_pat = trimmed_last_line_width(ps.as_str()) <= TAB;
+        let new_line_guard = ps.contains('\n') && !block_like_pat;
+        let guard = self.guard(a.guard, sh.clone(), trimmed_last_line_width(ps.as_str()), new_line_guard)?;
+        let lhs = cat(ps.as_str(), guard.as_str());
+        // Comments between the pattern and the body are not formatted.
+        if self.has_comment(self.pat_end(a.pat), self.expr_start(a.body)) {
+            let lo = match a.guard { Some(g) => self.expr_end(g), None => self.pat_end(a.pat) };
+            if self.has_comment(self.pat_end(a.pat), lo) { return None; }
+            let arrow = self.find(lo, FAT_ARROW);
+            if self.has_comment(lo, arrow) { return None; }
+            let c = self.snippet(arrow + 2, self.expr_start(a.body)).trim().to_string();
+            return self.match_body(a.body, lhs.as_str(), sh, guard.contains('\n'), c, is_last);
+        }
+        self.match_body(a.body, lhs.as_str(), sh, guard.contains('\n'), String::new(), is_last)
+    }
+
+    fn guard(&self, g: Option<&Expr>, sh: Shape, pw: usize, multi: bool) -> Option<String> {
+        let g = match g { Some(g) => g, None => return Some(String::new()) };
+        if !multi {
+            if let Some(c) = sh.offset_left(pw + 4) {
+                if let Some(c2) = c.sub_width(5) {
+                    if let Some(cs) = self.expr(g, c2) {
+                        if !cs.contains('\n') || pw <= 4 { return Some(cat(" if ", cs.as_str())); }
+                    }
+                }
+            }
+        }
+        let csh = Shape::indented(sh.block + TAB).with_align(sh.align).offset_left(3)?.sub_width(5)?;
+        let cs = self.expr(g, csh.clone())?;
+        Some(cat3(csh.nl_indent().as_str(), "if ", cs.as_str()))
+    }
+
+    // (extend, body): whether the body may follow => and the body with a
+    // block of one expression flattened.
+    fn flatten_arm_body(&self, body: &Expr, opt_shape: Option<Shape>) -> (bool, &Expr) {
+        if let ExprKind::Block(b) = &body.kind {
+            if !b.is_unsafe && destructure(*b).is_none() {
+                if let Some(t) = self.simple_block_expr(*b) {
+                    if let ExprKind::Block(_) = &t.kind { return self.flatten_arm_body(t, None); }
+                    let multi = match opt_shape {
+                        Some(s1) => match self.rewrite_cond(t, s1) { Some(c) => c.contains('\n'), None => false },
+                        None => false,
+                    };
+                    if multi { return (false, body); }
+                    return (can_flatten_block_around(t), t);
+                }
+                return (false, body);
+            }
+        }
+        (can_flatten_block_around(body), body)
+    }
+
+    fn match_body(&self, body0: &Expr, pats: &str, sh: Shape, has_guard: bool, arrow_comment: String, is_last: bool) -> Option<String> {
+        let (extend, body) = self.flatten_arm_body(body0, sh.offset_left(extra_offset(pats, &sh) + 4));
+        let (is_block, is_empty_block) = match &body.kind {
+            ExprKind::Block(b) => (destructure(*b).is_none(), destructure(*b).is_none() && b.stmts.len() == 0 && b.tail.is_none() && !self.has_comment(b.lbrace + 1, b.rbrace)),
+            _ => (false, false),
+        };
+        let comma = arm_comma(body);
+        let next_line_indent = if !is_block || is_empty_block { sh.block_indent(TAB) } else { sh.clone() };
+        let forbid_same_line = has_guard && pats.contains('\n') && !is_empty_block;
+        let orig_body_shape = match sh.offset_left(extra_offset(pats, &sh) + 4) { Some(s1) => s1.sub_width(comma.len()), None => None };
+        let mut orig: Option<String> = None;
+        if !forbid_same_line && arrow_comment.len() == 0 {
+            if let Some(bs) = &orig_body_shape {
+                let rw = nop_block_collapse(self.format_expr(body, true, bs.clone()), bs.width);
+                if let Some(b) = &rw {
+                    if is_block || (!b.contains('\n') && str_width(b.as_str()) <= bs.width) {
+                        return Some(combine_orig_body(pats, b.as_str(), comma));
+                    }
+                }
+                orig = rw;
+            }
+        }
+        let orig_budget = match &orig_body_shape { Some(s1) => s1.width, None => 0 };
+        let nsh = Shape::indented(next_line_indent.block).with_align(next_line_indent.align);
+        let next = nop_block_collapse(self.format_expr(body, true, nsh.clone()), nsh.width);
+        let ac = arrow_comment.as_str();
+        match (orig, next) {
+            (Some(o), Some(n)) => {
+                if prefer_next_line(o.as_str(), n.as_str(), false) {
+                    return Some(self.combine_next_line_body(pats, n.as_str(), &sh, &nsh, is_block, comma, forbid_same_line, ac, semicolon_for_expr(body)));
+                }
+                if extend && first_line_width(o.as_str()) <= orig_budget { return Some(combine_orig_body(pats, o.as_str(), comma)); }
+                if o.contains('\n') {
+                    return Some(self.combine_next_line_body(pats, n.as_str(), &sh, &nsh, is_block, comma, forbid_same_line, ac, semicolon_for_expr(body)));
+                }
+                Some(combine_orig_body(pats, o.as_str(), comma))
+            }
+            (Some(o), None) => Some(combine_orig_body(pats, o.as_str(), comma)),
+            (None, Some(n)) => Some(self.combine_next_line_body(pats, n.as_str(), &sh, &nsh, is_block, comma, forbid_same_line, ac, semicolon_for_expr(body))),
+            (None, None) => None,
+        }
+    }
+
+    fn combine_next_line_body(&self, pats: &str, body: &str, sh: &Shape, nsh: &Shape, is_block: bool, comma: &str, forbid_same_line: bool, arrow_comment: &str, semi: bool) -> String {
+        let nested_indent = nsh.nl_indent();
+        let mut out = s(pats);
+        out.push_str(" =>");
+        if arrow_comment.len() > 0 {
+            out.push_str(nested_indent.as_str());
+            out.push_str(arrow_comment);
+        }
+        if is_block {
+            out.push_str(nested_indent.as_str());
+            out.push_str(body);
+            out.push_str(comma);
+            return out;
+        }
+        let indent = sh.nl_indent();
+        if forbid_same_line || arrow_comment.len() > 0 {
+            out.push_str(sh.nl_indent().as_str());
+            out.push('{');
+        } else {
+            out.push_str(" {");
+        }
+        out.push_str(nested_indent.as_str());
+        out.push_str(body);
+        if semi { out.push(';'); }
+        out.push_str(indent.as_str());
+        out.push('}');
+        out
+    }
+
+    // select { pat = op => body, ... }: as a match.
+    fn select_expr(&self, pos: Pos, x: &Expr, arms: &Vec<&SelectArm>, sh: Shape) -> Option<String> {
+        let open = self.find(pos, L_BRACE);
+        let close = self.expr_end(x) - 1;
+        if arms.len() == 0 { return Some(s("select {}")); }
+        let arm_shape = sh.block_indent(TAB).with_max_width();
+        let mut spans = Vec::new();
+        for a in arms.iter() {
+            let lo = match a.pat {
+                Some(p) => self.pat_start(p),
+                None => match a.op { Some(o) => self.expr_start(o), None => self.find(open + 1, IDENT) },
+            };
+            let mut hi = self.expr_end(a.body);
+            if self.next_kind(hi) == COMMA { hi = self.next_pos(hi) + 1; }
+            spans.push((lo, hi));
+        }
+        let mut items = self.itemize(&spans, open + 1, close);
+        let mut i = 0;
+        while i < arms.len() {
+            let a = arms[i];
+            let mut lhs = String::new();
+            let mut ok = true;
+            if a.is_default {
+                lhs.push_str("default");
+            } else {
+                if let Some(p) = a.pat {
+                    match self.pat(p, arm_shape.clone()) {
+                        Some(ps) => {
+                            lhs.push_str(ps.as_str());
+                            lhs.push_str(" = ");
+                        }
+                        None => ok = false,
+                    }
+                }
+                if let Some(o) = a.op {
+                    match arm_shape.offset_left(lhs.len()) {
+                        Some(osh) => match self.expr(o, osh.sub_width(5).unwrap_or(osh)) {
+                            Some(os) => lhs.push_str(os.as_str()),
+                            None => ok = false,
+                        },
+                        None => ok = false,
+                    }
+                }
+            }
+            items[i].item = if ok { self.match_body(a.body, lhs.as_str(), arm_shape.clone(), false, String::new(), i + 1 == arms.len()) } else { None };
+            i += 1;
+        }
+        let mut f = ListFormatting::new(arm_shape.clone());
+        f.sep = String::new();
+        f.preserve_newline = true;
+        let body = write_list(&items, &f)?;
+        let mut out = s("select {\n");
+        out.push_str(arm_shape.indent_str().as_str());
+        out.push_str(body.as_str());
+        out.push('\n');
+        out.push_str(sh.indent_str().as_str());
+        out.push('}');
+        Some(out)
+    }
+}
+
+/// An if, loop, while or for (rustfmt's ControlFlow).
+struct CF {
+    keyword: &str,
+    label: Option<&Name>,
+    cond: Option<&Expr>,
+    pat: Option<&Pat>,
+    matcher: &str,
+    connector: &str,
+    block: &Block,
+    els: Option<&Expr>,
+    allow_single_line: bool,
+    nested_if: bool,
+    pos: Pos,
+}
+
+pub fn sub_opt(a: usize, b: usize) -> Option<usize> { if a >= b { Some(a - b) } else { None } }
+
+fn label_str(cx: &Ctx, l: Option<&Name>) -> String {
+    match l {
+        Some(n) => cat(cx.ident(n).as_str(), ": "),
+        None => String::new(),
+    }
+}
+
+fn semicolon_for_expr(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::Return { .. } | ExprKind::Continue { .. } | ExprKind::Break { .. } => true,
+        _ => false,
+    }
+}
+
+fn is_ident_expr(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::Path(p) => p.qself.is_none() && p.segments.len() == 1 && p.segments[0].args.is_none(),
+        _ => false,
+    }
+}
+
+fn needs_space_before_range(cx: &Ctx, l: &Expr) -> bool {
+    match &l.kind {
+        ExprKind::Lit { pos, .. } => cx.snippet(*pos, cx.tok_end(*pos)).ends_with("."),
+        ExprKind::Unary { x, .. } => needs_space_before_range(cx, *x),
+        ExprKind::Binary { y, .. } => needs_space_before_range(cx, *y),
+        _ => false,
+    }
+}
+
+fn needs_space_after_range(h: &Expr) -> bool {
+    match &h.kind {
+        ExprKind::Range { lo: None, .. } => true,
+        _ => false,
+    }
+}
+
+pub fn prefer_next_line(orig: &str, next: &str, force_next_no_indent: bool) -> bool {
+    force_next_no_indent || !next.contains('\n') || count_newlines(orig) > count_newlines(next) + 1
+        || (first_line(orig).ends_with("(") && !first_line(next).ends_with("("))
+        || (first_line(orig).ends_with("{") && !first_line(next).ends_with("{"))
+        || (first_line(orig).ends_with("[") && !first_line(next).ends_with("["))
+}
+
+/// Whether the last line of s starts further right than start.
+fn last_line_offsetted(start: usize, t: &str) -> bool {
+    let l = last_line(t);
+    leading_spaces(l) > start
+}
+
+pub fn struct_lit_shape(sh: &Shape, prefix_width: usize, suffix_width: usize) -> Option<(Option<Shape>, Shape)> {
+    let bs = sh.block_indent(TAB);
+    let v = bs.with_width(sub(MAX_WIDTH, bs.indent_width()));
+    if sh.width >= prefix_width + suffix_width {
+        let w = sh.width - prefix_width - suffix_width;
+        let w2 = if w < STRUCT_LIT_WIDTH { w } else { STRUCT_LIT_WIDTH };
+        let h = Shape { width: w2, block: sh.block, align: sh.align, offset: sh.align };
+        return Some((Some(h), v));
+    }
+    Some((None, v))
+}
+
+pub fn struct_lit_tactic(h: &Option<Shape>, items: &Vec<ListItem>) -> Tactic {
+    match h {
+        Some(hs) => definitive_tactic(items, ListTactic::HorizontalVertical, 2, hs.width),
+        None => Tactic::Vertical,
+    }
+}
+
+pub fn wrap_struct_field(fields: &str, sh: &Shape, nested: &Shape, one_line_width: usize) -> String {
+    if fields.contains('\n') || fields.len() > one_line_width {
+        let mut out = nested.nl_indent();
+        out.push_str(fields);
+        out.push_str(sh.nl_indent().as_str());
+        return out;
+    }
+    cat3(" ", fields, " ")
+}
+
+fn arm_comma(body: &Expr) -> &str {
+    match &body.kind {
+        ExprKind::Block(b) => if b.is_unsafe || destructure(*b).is_some() { "," } else { "" },
+        _ => ",",
+    }
+}
+
+fn combine_orig_body(pats: &str, body: &str, comma: &str) -> String {
+    let mut out = s(pats);
+    out.push_str(" => ");
+    out.push_str(body);
+    out.push_str(comma);
+    out
+}
+
+fn nop_block_collapse(b: Option<String>, budget: usize) -> Option<String> {
+    match b {
+        Some(t) => {
+            if t.starts_with("{") && budget >= 2 && t.len() >= 2 && t[1..t.len() - 1].trim().len() == 0 && t.ends_with("}") {
+                return Some(s("{}"));
+            }
+            Some(t)
+        }
+        None => None,
+    }
+}
+
+fn can_flatten_block_around(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::If { .. } | ExprKind::For { .. } | ExprKind::While { .. } => false,
+        ExprKind::Loop { .. } | ExprKind::Match { .. } | ExprKind::Block(_) | ExprKind::Closure { .. } | ExprKind::Array { .. }
+        | ExprKind::ArrayRepeat { .. } | ExprKind::Call { .. } | ExprKind::MethodCall { .. } | ExprKind::StructLit { .. }
+        | ExprKind::Tuple { .. } | ExprKind::Select { .. } => true,
+        ExprKind::Ref { x, .. } => can_flatten_block_around(*x),
+        ExprKind::Try { x, .. } => can_flatten_block_around(*x),
+        ExprKind::Unary { x, .. } => can_flatten_block_around(*x),
+        ExprKind::Index { x, .. } => can_flatten_block_around(*x),
+        ExprKind::Cast { x, .. } => can_flatten_block_around(*x),
+        _ => false,
+    }
+}

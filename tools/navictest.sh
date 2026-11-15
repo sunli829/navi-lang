@@ -56,4 +56,26 @@ if [ "$("$navic" bench tests/harness 2>&1 | grep -c ' ns/iter ')" = 2 ]; then
 else
 	echo "FAIL navic bench tests/harness"; fail=1
 fi
+# navic fmt: tests/fmt/x.navi formats to x.out, which stays as it is;
+# --check reports a file that would change and passes one that would not.
+for f in tests/fmt/*.navi; do
+	want="${f%.navi}.out"
+	if "$navic" fmt - < "$f" > "$tmp/fmt.out" 2>&1 && cmp -s "$tmp/fmt.out" "$want" \
+		&& "$navic" fmt - < "$want" > "$tmp/fmt2.out" 2>&1 && cmp -s "$tmp/fmt2.out" "$want"; then
+		echo "ok   navic fmt $f"
+	else
+		echo "FAIL navic fmt $f"; diff "$want" "$tmp/fmt.out" | head -20; fail=1
+	fi
+done
+cp tests/fmt/exprs.navi "$tmp/check.navi"
+set +e
+"$navic" fmt --check "$tmp/check.navi" > /dev/null 2>&1; c1=$?
+"$navic" fmt "$tmp/check.navi" > /dev/null 2>&1; c2=$?
+"$navic" fmt --check "$tmp/check.navi" > /dev/null 2>&1; c3=$?
+set -e
+if [ "$c1" = 1 ] && [ "$c2" = 0 ] && [ "$c3" = 0 ] && cmp -s "$tmp/check.navi" tests/fmt/exprs.out; then
+	echo "ok   navic fmt --check"
+else
+	echo "FAIL navic fmt --check ($c1 $c2 $c3)"; fail=1
+fi
 exit $fail

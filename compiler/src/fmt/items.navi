@@ -1,0 +1,1157 @@
+//! Items, statements and the blocks and lists of them (rustfmt's items.rs,
+//! visitor.rs, stmt.rs and missed_spans.rs).
+
+use crate::syntax::token::*;
+use crate::syntax::source::Pos;
+use crate::syntax::ast::*;
+use crate::fmt::ctx::*;
+use crate::fmt::lists::*;
+use crate::fmt::overflow::*;
+
+impl Ctx {
+    // --- Comments and blank lines between elements -----------------------------------
+
+    /// Writes the comments between lo and hi; returns whether a blank line
+    /// goes before what follows hi.
+    pub fn emit_gap(&self, out: &mut String, lo: Pos, hi: Pos, indent: usize, at_start: bool) -> bool {
+        let mut last = lo;
+        let mut start = at_start;
+        for c in self.comments_in(lo, hi).iter() {
+            if !start && self.line_of(c.pos) == self.line_of(last) {
+                out.push(' ');
+                out.push_str(self.comment_text(c, indent).as_str());
+            } else {
+                if !start && self.blank_between(last, c.pos) { out.push('\n'); }
+                out.push('\n');
+                push_spaces(out, indent);
+                out.push_str(self.comment_text(c, indent).as_str());
+            }
+            last = c.end;
+            start = false;
+        }
+        !start && self.blank_between(last, hi)
+    }
+
+    // --- Lists of items -------------------------------------------------------------
+
+    /// The items (and inner attributes) between lo and hi, each on lines
+    /// of its own at indent, every one after a newline.
+    pub fn items_body(&self, attrs: &Vec<&Attr>, items: &Vec<Item>, lo: Pos, hi: Pos, indent: usize, in_extern: bool) -> String {
+        let mut out = String::new();
+        let mut prev = lo;
+        let mut at_start = true;
+        for a in attrs.iter() {
+            if !a.inner { continue; }
+            let blank = self.emit_gap(&mut out, prev, a.hash, indent, at_start);
+            push_sep(&mut out, blank, indent);
+            out.push_str(self.attr(*a, Shape::indented(indent)).as_str());
+            prev = self.attr_end(*a);
+            at_start = false;
+        }
+        let mut i = 0;
+        while i < items.len() {
+            let kind = reorder_kind(&items[i]);
+            let mut j = i + 1;
+            if kind != 0 {
+                while j < items.len() && reorder_kind(&items[j]) == kind
+                    && self.line_of(self.item_lo(&items[j])) <= self.line_of(self.item_end(&items[j - 1])) + 1 {
+                    j += 1;
+                }
+            }
+            if j - i > 1 {
+                let blank = self.emit_gap(&mut out, prev, self.item_lo(&items[i]), indent, at_start);
+                // Each with the comment after it on its line.
+                let mut group: Vec<(String, String, usize)> = Vec::new();
+                let mut k = i;
+                let mut end = prev;
+                while k < j {
+                    let it = &items[k];
+                    let hi2 = self.item_end(it);
+                    let next = if k + 1 < items.len() { self.item_lo(&items[k + 1]) } else { hi };
+                    let mut tail = String::new();
+                    end = hi2;
+                    for c in self.comments_in(hi2, next).iter() {
+                        if self.line_of(c.pos) != self.line_of(hi2) { break; }
+                        tail.push(' ');
+                        tail.push_str(self.comment_text(c, indent).as_str());
+                        end = c.end;
+                    }
+                    let text = self.item_or_source(it, indent, in_extern);
+                    group.push((self.reorder_key(it), cat(text.as_str(), tail.as_str()), k));
+                    k += 1;
+                }
+                if kind == 1 {
+                    let keys = self.use_keys(items, i, j);
+                    sort_group(&mut group, &keys, i, true);
+                } else {
+                    let keys: Vec<UseKey> = Vec::new();
+                    sort_group(&mut group, &keys, i, false);
+                }
+                let mut first = true;
+                for g in group.iter() {
+                    push_sep(&mut out, first && blank, indent);
+                    out.push_str(g.1.as_str());
+                    first = false;
+                }
+                prev = end;
+                at_start = false;
+                i = j;
+                continue;
+            }
+            let it = &items[i];
+            let blank = self.emit_gap(&mut out, prev, self.item_lo(it), indent, at_start);
+            push_sep(&mut out, blank, indent);
+            out.push_str(self.item_or_source(it, indent, in_extern).as_str());
+            prev = self.item_end(it);
+            at_start = false;
+            i += 1;
+        }
+        self.emit_gap(&mut out, prev, hi, indent, at_start);
+        out
+    }
+
+    pub fn item_lo(&self, it: &Item) -> Pos {
+        let b = it.base();
+        for a in b.attrs.iter() {
+            if !a.inner { return a.hash; }
+        }
+        b.start
+    }
+
+    fn item_or_source(&self, it: &Item, indent: usize, in_extern: bool) -> String {
+        match self.item(it, indent, in_extern) {
+            Some(s1) => s1,
+            None => self.snippet(self.item_lo(it), self.item_end(it)).to_string(),
+        }
+    }
+
+    // --- Attributes -------------------------------------------------------------------
+
+    pub fn attr_end(&self, a: &Attr) -> Pos {
+        let i = self.tok_index(a.hash);
+        let mut j = i;
+        while j < self.toks.len() && self.toks[j].kind != L_BRACKET { j += 1; }
+        self.toks[self.close[j]].end
+    }
+
+    pub fn attr(&self, a: &Attr, sh: Shape) -> String {
+        let mut out = s(if a.inner { "#![" } else { "#[" });
+        let mut first = true;
+        for seg in a.path.segments.iter() {
+            if !first { out.push_str("::"); }
+            out.push_str(self.ident(seg.name).as_str());
+            first = false;
+        }
+        if a.args.len() > 0 || self.kind_at(self.path_end(a.path)) == L_PAREN {
+            out.push('(');
+            out.push_str(self.attr_tokens(&a.args).as_str());
+            out.push(')');
+        }
+        if let Some(v) = a.value {
+            out.push_str(" = ");
+            match self.expr(v, sh.offset_left(out.len() + 1).unwrap_or(sh.clone())) {
+                Some(e) => out.push_str(e.as_str()),
+                None => out.push_str(self.snippet(self.expr_start(v), self.expr_end(v))),
+            }
+        }
+        out.push(']');
+        out
+    }
+
+    fn attr_tokens(&self, toks: &Vec<crate::syntax::token::Token>) -> String {
+        let mut out = String::new();
+        let mut prev = EOF;
+        for t in toks.iter() {
+            let text = self.snippet(t.pos, t.end);
+            let k = t.kind;
+            if prev != EOF {
+                if prev == COMMA || k == EQ || prev == EQ || (is_word(prev) && is_word(k)) { out.push(' '); }
+            }
+            out.push_str(text);
+            prev = k;
+        }
+        out
+    }
+
+    /// The outer attributes of a node, each on a line of its own, then the
+    /// indentation for the node.
+    pub fn outer_attrs(&self, attrs: &Vec<&Attr>, indent: usize) -> String {
+        let mut out = String::new();
+        for a in attrs.iter() {
+            if a.inner { continue; }
+            out.push_str(self.attr(*a, Shape::indented(indent)).as_str());
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        }
+        out
+    }
+
+    // --- Items ------------------------------------------------------------------------
+
+    pub fn item(&self, it: &Item, indent: usize, in_extern: bool) -> Option<String> {
+        let b = it.base();
+        // Comments between attributes or in the header are not formatted.
+        let lo = self.item_lo(it);
+        if b.attrs.len() > 0 && self.has_comment(lo, b.start) { return None; }
+        let attrs = self.outer_attrs(&b.attrs, indent);
+        let body = match it {
+            Item::Fn(f) => self.fn_item(*f, indent, in_extern)?,
+            Item::Struct(st) => self.struct_item(*st, indent)?,
+            Item::Enum(e) => self.enum_item(*e, indent)?,
+            Item::TypeAlias(t) => self.type_alias(*t, indent)?,
+            Item::Const(c) => self.static_item(&c.base, "const", false, c.name, c.ty, c.value, indent)?,
+            Item::Static(st) => self.static_item(&st.base, "static", st.is_mut, st.name, st.ty, st.value, indent)?,
+            Item::Impl(im) => self.impl_item(*im, indent)?,
+            Item::Trait(t) => self.trait_item(*t, indent)?,
+            Item::Mod(m) => self.mod_item(*m, indent)?,
+            Item::Use(u) => self.use_item(*u, indent)?,
+            Item::Extern(e) => self.extern_item(*e, indent)?,
+        };
+        Some(cat(attrs.as_str(), body.as_str()))
+    }
+
+    fn mod_item(&self, m: &ModDecl, indent: usize) -> Option<String> {
+        let mut out = vis_str(&m.base.vis);
+        out.push_str("mod ");
+        out.push_str(self.ident(m.name).as_str());
+        if !m.inline {
+            out.push(';');
+            return Some(out);
+        }
+        let open = self.find(m.name.pos, L_BRACE);
+        let close = self.close_end(open) - 1;
+        let body = self.items_body(&m.base.attrs, &m.items, open + 1, close, indent + TAB, false);
+        if body.len() == 0 {
+            out.push_str(" {}");
+            return Some(out);
+        }
+        out.push_str(" {");
+        out.push_str(body.as_str());
+        out.push('\n');
+        push_spaces(&mut out, indent);
+        out.push('}');
+        Some(out)
+    }
+
+    fn extern_item(&self, e: &ExternBlock, indent: usize) -> Option<String> {
+        let mut out = vis_str(&e.base.vis);
+        out.push_str("extern \"");
+        out.push_str(e.abi.as_str());
+        out.push_str("\" {");
+        let open = self.find(e.base.start, L_BRACE);
+        let close = self.close_end(open) - 1;
+        let body = self.items_body(&e.base.attrs, &e.items, open + 1, close, indent + TAB, true);
+        if body.len() == 0 {
+            out.push('}');
+            return Some(out);
+        }
+        out.push_str(body.as_str());
+        out.push('\n');
+        push_spaces(&mut out, indent);
+        out.push('}');
+        Some(out)
+    }
+
+    fn static_item(&self, b: &ItemBase, kw: &str, is_mut: bool, name: &Name, ty: &Type, value: Option<&Expr>, indent: usize) -> Option<String> {
+        let mut prefix = vis_str(&b.vis);
+        prefix.push_str(kw);
+        prefix.push(' ');
+        if is_mut { prefix.push_str("mut "); }
+        prefix.push_str(self.ident(name).as_str());
+        prefix.push_str(": ");
+        let tsh = Shape::indented(indent).offset_left(prefix.len() + 2)?;
+        let ts = match self.typ(ty, tsh) {
+            Some(t) => t,
+            None => {
+                prefix = prefix.trim_end().to_string();
+                let n = Shape::indented(indent + TAB);
+                cat(n.nl_indent().as_str(), self.typ(ty, n.clone())?.as_str())
+            }
+        };
+        match value {
+            Some(v) => {
+                let eq = self.find(self.type_end(ty), EQ);
+                if self.has_comment(eq, self.expr_start(v)) { return None; }
+                let lhs = cat3(prefix.as_str(), ts.as_str(), " =");
+                let sh = Shape::legacy(sub(MAX_WIDTH, indent + 1), indent);
+                let r = self.assign_rhs(lhs.as_str(), &Node::E(v), sh, false)?;
+                Some(cat(r.as_str(), ";"))
+            }
+            None => Some(cat3(prefix.as_str(), ts.as_str(), ";")),
+        }
+    }
+
+    fn type_alias(&self, t: &TypeAlias, indent: usize) -> Option<String> {
+        let mut out = vis_str(&t.base.vis);
+        out.push_str("type ");
+        let name = self.ident(t.name);
+        if t.generics.params.len() == 0 {
+            out.push_str(name.as_str());
+        } else {
+            let gsh = Shape::indented(indent).offset_left(out.len())?.sub_width(2)?;
+            out.push_str(self.generics(name.as_str(), t.generics, gsh)?.as_str());
+        }
+        if t.bounds.len() > 0 {
+            let bsh = Shape::indented(indent).offset_left(out.len() + 2)?;
+            out.push_str(": ");
+            out.push_str(self.bounds(&t.bounds, bsh)?.as_str());
+        }
+        let snug = last_line_width(out.as_str()) == 1;
+        let w = self.where_clause(t.generics, Shape::legacy(sub(MAX_WIDTH, last_line_width(out.as_str())), indent), snug, t.ty.is_none())?;
+        out.push_str(w.as_str());
+        match t.ty {
+            Some(ty) => {
+                if t.generics.wheres.len() > 0 {
+                    out.push('\n');
+                    push_spaces(&mut out, indent);
+                } else {
+                    out.push(' ');
+                }
+                out.push('=');
+                let sh = Shape::indented(indent).sub_width(1)?;
+                let r = self.assign_rhs(out.as_str(), &Node::T(ty), sh, false)?;
+                Some(cat(r.as_str(), ";"))
+            }
+            None => Some(cat(out.as_str(), ";")),
+        }
+    }
+
+    // --- Functions --------------------------------------------------------------------
+
+    fn fn_item(&self, f: &FnDecl, indent: usize, in_extern: bool) -> Option<String> {
+        let has_body = f.body.is_some();
+        let (sig, _, force_brace) = self.fn_sig(f, indent, in_extern, has_body)?;
+        let body = match f.body {
+            Some(b) => b,
+            None => return Some(cat(sig.as_str(), ";")),
+        };
+        let blk = body.block();
+        let mut newline_brace = f.generics.wheres.len() > 0;
+        if force_brace || last_line_width(sig.as_str()) + 2 > sub(MAX_WIDTH, indent) {
+            newline_brace = true;
+        } else if !sig.contains('\n') {
+            newline_brace = false;
+        }
+        if !sig.contains('\n') && blk.stmts.len() == 0 && blk.tail.is_none() && !self.has_comment(blk.lbrace + 1, blk.rbrace)
+            && indent + sig.len() + 3 <= MAX_WIDTH && !last_line(sig.as_str()).contains("//") {
+            return Some(cat(sig.as_str(), " {}"));
+        }
+        let mut out = sig;
+        if newline_brace {
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        } else {
+            out.push(' ');
+        }
+        out.push_str(self.block_body(blk, indent)?.as_str());
+        Some(out)
+    }
+
+    /// The signature of a function: (text, ends with a comment, brace on
+    /// the next line). rustfmt's rewrite_fn_base.
+    fn fn_sig(&self, f: &FnDecl, indent: usize, in_extern: bool, has_body: bool) -> Option<(String, bool, bool)> {
+        let mut force_brace = false;
+        let mut out = vis_str(&f.base.vis);
+        if f.is_const { out.push_str("const "); }
+        if f.is_unsafe { out.push_str("unsafe "); }
+        if f.abi.len() > 0 && !in_extern {
+            out.push_str("extern \"");
+            out.push_str(f.abi.as_str());
+            out.push_str("\" ");
+        }
+        out.push_str("fn ");
+        // Comments inside a signature are not formatted.
+        let sig_lo = f.base.start;
+        let sig_hi = match f.body { Some(b) => b.block().lbrace, None => self.find(self.tok_end(f.name.pos), SEMI) };
+        let params_open = self.find(f.name.pos, L_PAREN);
+        let params_close = self.close_end(params_open) - 1;
+        if self.has_comment(sig_lo, params_open) || self.has_comment(params_close, sig_hi) { return None; }
+        let overhead = if has_body { 4 } else { 2 };
+        let used = indent + out.len();
+        let gsh = Shape { width: sub(MAX_WIDTH, used + overhead), block: indent, align: 0, offset: out.len() };
+        let gs = self.generics(self.ident(f.name).as_str(), f.generics, gsh)?;
+        out.push_str(gs.as_str());
+        let ret = match f.result {
+            Some(r) => self.ret_type(r, Shape::indented(indent))?,
+            None => String::new(),
+        };
+        let multi_ret = ret.contains('\n');
+        let ret_len = if multi_ret { 0 } else { ret.len() };
+        // Budgets for the parameters.
+        let (one_line_budget, multi_line_budget, param_indent0) = budgets_for_params(out.as_str(), indent, ret_len, has_body, multi_ret);
+        let mut param_indent = param_indent0;
+        out.push('(');
+        let n_params = f.params.len() + if f.self_param.is_some() { 1 } else { 0 };
+        let param_str = if n_params == 0 {
+            self.snippet(params_open + 1, params_close).trim().to_string()
+        } else {
+            self.fn_params(f, one_line_budget, multi_line_budget, indent, params_open, params_close)?
+        };
+        let put_in_block = (param_str.contains('\n') || param_str.len() > one_line_budget) && n_params > 0;
+        let mut last_line_comment = false;
+        let mut no_params_over = false;
+        if put_in_block {
+            param_indent = indent + TAB;
+            out.push('\n');
+            push_spaces(&mut out, param_indent);
+            out.push_str(param_str.as_str());
+            out.push('\n');
+            push_spaces(&mut out, indent);
+            out.push(')');
+        } else {
+            out.push_str(param_str.as_str());
+            let used_w = last_line_used_width(out.as_str(), indent) + first_line_width(ret.as_str());
+            let closing_over = n_params == 0 && used_w + 1 > MAX_WIDTH;
+            last_line_comment = last_line(param_str.as_str()).contains("//");
+            if closing_over {
+                out.push(')');
+                out.push('\n');
+                push_spaces(&mut out, indent);
+                no_params_over = true;
+            } else if last_line_comment {
+                out.push('\n');
+                push_spaces(&mut out, indent);
+                out.push(')');
+                no_params_over = true;
+            } else {
+                out.push(')');
+            }
+        }
+        if let Some(r) = f.result {
+            let ret_should_indent = if put_in_block || n_params == 0 {
+                false
+            } else if last_line_comment {
+                false
+            } else if out.contains('\n') || multi_ret {
+                true
+            } else {
+                let mut sig_len = out.len() + indent + ret_len + 1;
+                if f.generics.wheres.len() == 0 { sig_len += 2; }
+                sig_len > MAX_WIDTH
+            };
+            let rsh = if ret_should_indent {
+                let mut rs = Shape::indented(indent);
+                if param_str.len() == 0 {
+                    force_brace = true;
+                    rs = rs.offset_left(4).unwrap_or(rs.clone());
+                }
+                out.push('\n');
+                push_spaces(&mut out, rs.indent_width());
+                rs
+            } else {
+                if param_str.len() > 0 || !no_params_over { out.push(' '); }
+                let rs = Shape::indented(indent);
+                rs.offset_left(last_line_width(out.as_str())).unwrap_or(rs.clone())
+            };
+            if multi_ret || ret_should_indent {
+                out.push_str(self.ret_type(r, rsh)?.as_str());
+            } else {
+                out.push_str(ret.as_str());
+            }
+        }
+        let snug_space = put_in_block && ret.len() == 0;
+        let w = self.where_clause(f.generics, Shape::indented(indent), snug_space, !has_body)?;
+        out.push_str(w.as_str());
+        let ends_with_comment = last_line(out.as_str()).contains("//");
+        force_brace = force_brace || ends_with_comment;
+        Some((out, ends_with_comment, force_brace))
+    }
+
+    fn ret_type(&self, r: &Type, sh: Shape) -> Option<String> {
+        let w = sub_opt4(sh.width, 3)?;
+        let a = sh.align + 3;
+        let t = self.typ(r, Shape { width: w, block: sh.block, align: a, offset: a })?;
+        Some(cat("-> ", t.as_str()))
+    }
+
+    fn fn_params(&self, f: &FnDecl, one_line_budget: usize, multi_line_budget: usize, indent: usize, open: Pos, close: Pos) -> Option<String> {
+        let psh = Shape::legacy(multi_line_budget, indent + TAB);
+        let mut spans = Vec::new();
+        let mut texts: Vec<Option<String>> = Vec::new();
+        if let Some(sp) = f.self_param {
+            let mut lo = sp.pos;
+            if sp.is_ref && sp.is_mut { lo = self.prev_tok_pos(self.prev_tok_pos(sp.pos)); } else if sp.is_ref || sp.is_mut { lo = self.prev_tok_pos(sp.pos); }
+            spans.push((lo, sp.pos + 4));
+            let t = if sp.is_ref { if sp.is_mut { "&mut self" } else { "&self" } } else if sp.is_mut { "mut self" } else { "self" };
+            texts.push(Some(s(t)));
+        }
+        for p in f.params.iter() {
+            let ty = match p.ty { Some(t) => t, None => return None };
+            let lo = self.pat_start(p.pat);
+            let hi = self.type_end(ty);
+            spans.push((lo, hi));
+            let r = match self.fn_param(p.pat, ty, psh.clone()) {
+                Some(r) => Some(r),
+                None => Some(self.snippet(lo, hi).to_string()),
+            };
+            texts.push(r);
+        }
+        let mut items = self.itemize(&spans, open + 1, close);
+        let mut i = 0;
+        while i < texts.len() {
+            items[i].item = texts[i].clone();
+            i += 1;
+        }
+        let tactic = definitive_tactic(&items, ListTactic::HorizontalVertical, 2, one_line_budget);
+        let budget = if tactic == Tactic::Horizontal { one_line_budget } else { multi_line_budget };
+        let mut fm = ListFormatting::new(Shape::legacy(budget, indent + TAB));
+        fm.tactic = tactic.clone();
+        fm.trailing = Trailing::Vertical;
+        fm.ends_with_newline = tactic != Tactic::Horizontal;
+        fm.preserve_newline = true;
+        write_list(&items, &fm)
+    }
+
+    fn fn_param(&self, pat: &Pat, ty: &Type, sh: Shape) -> Option<String> {
+        let name = self.pat(pat, Shape::legacy(sh.width, sh.indent_width()))?;
+        let mut out = cat(name.as_str(), ": ");
+        let w = sub_opt4(sh.width, last_line_width(out.as_str()))?;
+        out.push_str(self.typ(ty, Shape::legacy(w, sh.indent_width()))?.as_str());
+        Some(out)
+    }
+
+    // --- Statements and blocks -------------------------------------------------------
+
+    /// A block's braces and statements at indent.
+    pub fn block_body(&self, b: &Block, indent: usize) -> Option<String> {
+        let inner = indent + TAB;
+        let mut out = s("{");
+        let mut body = String::new();
+        let mut prev = b.lbrace + 1;
+        let mut at_start = true;
+        let n = b.stmts.len();
+        let mut i = 0;
+        while i < n {
+            let st = b.stmts[i];
+            if let Stmt::Empty(_) = st {
+                i += 1;
+                continue;
+            }
+            let (lo, hi) = self.stmt_span(st);
+            let blank = self.emit_gap(&mut body, prev, lo, inner, at_start);
+            push_sep(&mut body, blank, inner);
+            let text = match self.stmt(st, inner) {
+                Some(t) => t,
+                None => self.snippet(lo, hi).to_string(),
+            };
+            body.push_str(text.as_str());
+            prev = hi;
+            at_start = false;
+            i += 1;
+        }
+        if let Some(t) = b.tail {
+            let lo = self.expr_start(t);
+            let hi = self.expr_end(t);
+            let blank = self.emit_gap(&mut body, prev, lo, inner, at_start);
+            push_sep(&mut body, blank, inner);
+            let text = match self.format_expr(t, false, Shape::indented(inner)) {
+                Some(s1) => s1,
+                None => self.snippet(lo, hi).to_string(),
+            };
+            body.push_str(text.as_str());
+            match &t.kind {
+                ExprKind::Return { .. } | ExprKind::Break { .. } | ExprKind::Continue { .. } => body.push(';'),
+                _ => {}
+            }
+            prev = hi;
+            at_start = false;
+        }
+        self.emit_gap(&mut body, prev, b.rbrace, inner, at_start);
+        out.push_str(body.as_str());
+        out.push('\n');
+        push_spaces(&mut out, indent);
+        out.push('}');
+        Some(out)
+    }
+
+    pub fn stmt_span(&self, st: &Stmt) -> (Pos, Pos) {
+        match st {
+            Stmt::Let(l) => {
+                let from = match l.els {
+                    Some(e) => self.expr_end(e),
+                    None => match l.init {
+                        Some(i) => self.expr_end(i),
+                        None => match l.ty { Some(t) => self.type_end(t), None => self.pat_end(l.pat) },
+                    },
+                };
+                (l.pos, self.semi_after(from))
+            }
+            Stmt::Expr { x, semi } => {
+                let e = self.expr_end(*x);
+                (self.expr_start(*x), if *semi { self.semi_after(e) } else { e })
+            }
+            Stmt::Item(it) => (self.item_lo(it), self.item_end(it)),
+            Stmt::Defer { pos, x } => {
+                let e = self.expr_end(*x);
+                (*pos, if self.next_kind(e) == SEMI { self.next_pos(e) + 1 } else { e })
+            }
+            Stmt::Empty(p) => (*p, *p + 1),
+        }
+    }
+
+    fn semi_after(&self, e: Pos) -> Pos {
+        if self.next_kind(e) == SEMI { self.next_pos(e) + 1 } else { e }
+    }
+
+    pub fn stmt(&self, st: &Stmt, indent: usize) -> Option<String> {
+        let sh = Shape::indented(indent);
+        match st {
+            Stmt::Let(l) => self.local(*l, sh),
+            Stmt::Expr { x, semi } => {
+                let suffix = if *semi && semicolon_for_stmt(*x) { ";" } else { "" };
+                let s2 = sh.sub_width(suffix.len())?;
+                let r = self.format_expr(*x, true, s2)?;
+                Some(cat(r.as_str(), suffix))
+            }
+            Stmt::Item(it) => Some(self.item_or_source(it, indent, false)),
+            Stmt::Defer { x, .. } => {
+                let r = self.format_expr(*x, false, sh.offset_left(6)?.sub_width(1)?)?;
+                let block = match &x.kind { ExprKind::Block(_) => true, _ => false };
+                Some(cat3("defer ", r.as_str(), if block { "" } else { ";" }))
+            }
+            Stmt::Empty(_) => Some(String::new()),
+        }
+    }
+
+    fn local(&self, l: &LetStmt, sh: Shape) -> Option<String> {
+        // Comments inside a let are not formatted.
+        let (lo, hi) = self.stmt_span(&Stmt::Let(l));
+        if self.has_comment(lo, hi) {
+            // Comments in the initializer itself are its own business.
+            let mut inner_ok = true;
+            let init_lo = match l.init { Some(i) => self.expr_start(i), None => hi };
+            if self.has_comment(lo, init_lo) { inner_ok = false; }
+            if let Some(i) = l.init {
+                let ie = self.expr_end(i);
+                let stop = match l.els { Some(e) => self.expr_start(e), None => hi };
+                if self.has_comment(ie, stop) { inner_ok = false; }
+            }
+            if !inner_ok { return None; }
+        }
+        let mut out = s("let ");
+        let psh = sh.offset_left(4)?.sub_width(1)?;
+        out.push_str(self.pat(l.pat, psh)?.as_str());
+        if let Some(t) = l.ty {
+            let base = if out.contains('\n') { sh.with_max_width() } else { sh.clone() };
+            let tsh = base.offset_left(last_line_width(out.as_str()) + 2)?.sub_width(2)?;
+            out.push_str(": ");
+            out.push_str(self.typ(t, tsh)?.as_str());
+        }
+        let init = match l.init {
+            Some(i) => i,
+            None => return Some(cat(out.as_str(), ";")),
+        };
+        out.push_str(" =");
+        let nested = sh.sub_width(1)?;
+        out = self.assign_rhs(out.as_str(), &Node::E(init), nested.clone(), false)?;
+        if let Some(e) = l.els {
+            let eb = e.block();
+            let init_str = out.clone();
+            let force_newline_else = !same_line_else(init_str.as_str(), &nested);
+            if force_newline_else {
+                out.push_str(sh.nl_indent().as_str());
+                out.push_str("else ");
+            } else {
+                out.push_str(" else ");
+            }
+            let max_w = if sh.width < SINGLE_LINE_LET_ELSE_WIDTH { sh.width } else { SINGLE_LINE_LET_ELSE_WIDTH };
+            let available = sub(max_w, init_str.len());
+            let allow_single = !force_newline_else && available > 0 && !init_str.contains('\n') && eb.stmts.len() + if eb.tail.is_some() { 1 } else { 0 } <= 1;
+            let mut rw = self.block_inner(eb, None, allow_single, sh.clone())?;
+            if allow_single && !rw.contains('\n') && rw.len() + 1 > available {
+                rw = self.block_inner(eb, None, false, sh.clone())?;
+            }
+            out.push_str(rw.as_str());
+        }
+        out.push(';');
+        Some(out)
+    }
+
+    // --- Structs and enums -------------------------------------------------------------
+
+    fn struct_item(&self, st: &StructDecl, indent: usize) -> Option<String> {
+        let mut out = vis_str(&st.base.vis);
+        out.push_str("struct ");
+        out.push_str(self.ident(st.name).as_str());
+        match st.kind {
+            StructKind::Unit => {
+                let g = self.generics("", st.generics, Shape::legacy(sub(MAX_WIDTH, indent + out.len()), indent))?;
+                out.push_str(g.as_str());
+                let w = self.where_clause(st.generics, Shape::indented(indent), false, true)?;
+                out.push_str(w.as_str());
+                out.push(';');
+                Some(out)
+            }
+            StructKind::Tuple => {
+                let r = self.tuple_struct(out, st.generics, &st.fields, indent, st.name.pos)?;
+                Some(cat(r.as_str(), ";"))
+            }
+            StructKind::Named => {
+                let open = self.find(self.tok_end(st.name.pos), L_BRACE);
+                let open2 = if st.generics.lt != -1 { self.find(self.angle_end(st.generics.lt), L_BRACE) } else { open };
+                self.struct_body(out, Some(st.generics), &st.fields, indent, open2, None)
+            }
+        }
+    }
+
+    /// header { fields } (rustfmt's format_struct_struct).
+    fn struct_body(&self, header: String, generics: Option<&Generics>, fields: &Vec<&Field>, indent: usize, open: Pos, one_line_width: Option<usize>) -> Option<String> {
+        let mut out = header;
+        let close = self.close_end(open) - 1;
+        match generics {
+            Some(g) => {
+                let used = last_line_width(out.as_str());
+                let gs = self.format_generics(g, if fields.len() == 0 { 1 } else { 0 }, indent, used)?;
+                out.push_str(gs.as_str());
+            }
+            None => {
+                let overhead = if fields.len() == 0 { 3 } else { 2 };
+                if MAX_WIDTH < out.len() + overhead {
+                    out.push('\n');
+                    push_spaces(&mut out, indent);
+                    out.push('{');
+                } else {
+                    out.push_str(" {");
+                }
+            }
+        }
+        if fields.len() == 0 {
+            let inner = self.snippet(open + 1, close).trim();
+            if inner.len() == 0 {
+                out.push('}');
+            } else if !inner.contains('\n') && !inner.starts_with("//") {
+                out.push(' ');
+                out.push_str(inner);
+                out.push_str(" }");
+            } else {
+                return None;
+            }
+            return Some(out);
+        }
+        let budget0 = sub(MAX_WIDTH, out.len() + 3 + indent);
+        let one_line_budget = match one_line_width { Some(w) => if w < budget0 { w } else { budget0 }, None => 0 };
+        let item_shape = Shape::indented(indent + TAB).sub_width(1)?;
+        let mut spans = Vec::new();
+        for f in fields.iter() { spans.push(self.node_span(&Node::F(*f))); }
+        let mut items = self.itemize(&spans, open + 1, close);
+        let mut i = 0;
+        for f in fields.iter() {
+            items[i].item = self.field_def(*f, item_shape.clone());
+            i += 1;
+        }
+        let tactic = definitive_tactic(&items, ListTactic::HorizontalVertical, 2, one_line_budget);
+        let mut fm = ListFormatting::new(item_shape.clone());
+        fm.tactic = tactic;
+        fm.trailing = Trailing::Vertical;
+        fm.preserve_newline = true;
+        let items_str = write_list(&items, &fm)?;
+        if !items_str.contains('\n') && !out.contains('\n') && items_str.len() <= one_line_budget && !items_str.contains("//") {
+            return Some(cat3(out.as_str(), " ", cat(items_str.as_str(), " }").as_str()));
+        }
+        out.push('\n');
+        push_spaces(&mut out, indent + TAB);
+        out.push_str(items_str.as_str());
+        out.push('\n');
+        push_spaces(&mut out, indent);
+        out.push('}');
+        Some(out)
+    }
+
+    fn tuple_struct(&self, header: String, generics: &Generics, fields: &Vec<&Field>, indent: usize, name_pos: Pos) -> Option<String> {
+        let mut out = header;
+        let gs = self.generics("", generics, Shape::legacy(sub(MAX_WIDTH, last_line_width(out.as_str())), indent))?;
+        out.push_str(gs.as_str());
+        let wb = sub(MAX_WIDTH, last_line_width(out.as_str()));
+        let w = self.where_clause(generics, Shape::legacy(wb, indent), false, true)?;
+        let from = if generics.lt != -1 { self.angle_end(generics.lt) } else { self.tok_end(name_pos) };
+        let open = self.find(from, L_PAREN);
+        if fields.len() == 0 {
+            out.push_str("()");
+        } else {
+            let sh = Shape::indented(indent).sub_width(1)?;
+            let mut items = Vec::new();
+            for f in fields.iter() { items.push(Node::F(*f)); }
+            out = self.with_parens(out.as_str(), &items, sh, open, FN_CALL_WIDTH, None)?;
+        }
+        if w.len() > 0 && !w.contains('\n') && (out.contains('\n') || indent + out.len() + w.len() + 1 > MAX_WIDTH) {
+            out.push('\n');
+            push_spaces(&mut out, indent + TAB - 1);
+        }
+        out.push_str(w.as_str());
+        Some(out)
+    }
+
+    /// A field of a struct or variant (rustfmt's rewrite_struct_field).
+    pub fn field_def(&self, f: &Field, sh: Shape) -> Option<String> {
+        let mut prefix = vis_str(&f.vis);
+        if let Some(n) = f.name {
+            prefix.push_str(self.ident(n).as_str());
+            prefix.push(':');
+        }
+        let attrs = self.outer_attrs(&f.attrs, sh.indent_width());
+        let attr_prefix = cat(attrs.as_str(), prefix.as_str());
+        let spacing = if f.name.is_some() { " " } else { "" };
+        let spacing2 = if prefix.len() == 0 && attrs.len() > 0 && f.name.is_none() { "" } else { spacing };
+        let overhead = trimmed_last_line_width(attr_prefix.as_str());
+        if let Some(ts) = sh.offset_left(overhead + spacing2.len()) {
+            if let Some(t) = self.typ(f.ty, ts) {
+                if !t.contains('\n') { return Some(cat3(attr_prefix.as_str(), spacing2, t.as_str())); }
+            }
+        }
+        let r = self.assign_rhs(prefix.as_str(), &Node::T(f.ty), sh, false)?;
+        let r2 = if prefix.len() == 0 { r.trim_start().to_string() } else { r };
+        Some(cat(attrs.as_str(), r2.as_str()))
+    }
+
+    /// Generics and the brace after them (rustfmt's format_generics);
+    /// brace 1 forces it on the line (an empty body), 2 means none.
+    fn format_generics(&self, g: &Generics, brace: i32, indent: usize, used_width: usize) -> Option<String> {
+        let sh = Shape::legacy(sub(MAX_WIDTH, used_width + indent), indent);
+        let mut out = self.generics("", g, sh)?;
+        let same_line_brace = if g.wheres.len() > 0 {
+            let snug = last_line_width(out.as_str()) == 1;
+            let budget = sub(MAX_WIDTH, last_line_used_width(out.as_str(), indent));
+            let w = self.where_clause(g, Shape::legacy(budget, indent), snug, brace == 2)?;
+            out.push_str(w.as_str());
+            brace == 1
+        } else {
+            true
+        };
+        if brace == 2 { return Some(out); }
+        let total = last_line_used_width(out.as_str(), used_width);
+        let remaining = sub(MAX_WIDTH, total);
+        let overhead = if brace == 1 { 3 } else { 2 };
+        if overhead <= remaining && same_line_brace {
+            out.push(' ');
+        } else {
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        }
+        out.push('{');
+        Some(out)
+    }
+
+    fn enum_item(&self, e: &EnumDecl, indent: usize) -> Option<String> {
+        let mut out = vis_str(&e.base.vis);
+        out.push_str("enum ");
+        out.push_str(self.ident(e.name).as_str());
+        let used = out.len();
+        let gs = self.format_generics(e.generics, if e.variants.len() == 0 { 1 } else { 0 }, indent, used)?;
+        out.push_str(gs.as_str());
+        let from = if e.generics.lt != -1 { self.angle_end(e.generics.lt) } else { self.tok_end(e.name.pos) };
+        let open = self.find(from, L_BRACE);
+        let close = self.close_end(open) - 1;
+        if e.variants.len() == 0 {
+            let inner = self.snippet(open + 1, close).trim();
+            if inner.len() == 0 {
+                out.push('}');
+                return Some(out);
+            }
+            return None;
+        }
+        let vindent = indent + TAB;
+        let mut spans = Vec::new();
+        for v in e.variants.iter() {
+            let lo = if v.attrs.len() > 0 { v.attrs[0].hash } else { v.name.pos };
+            spans.push((lo, self.variant_end(*v)));
+        }
+        let mut items = self.itemize(&spans, open + 1, close);
+        let mut i = 0;
+        for v in e.variants.iter() {
+            items[i].item = self.variant(*v, vindent, STRUCT_VARIANT_WIDTH);
+            i += 1;
+        }
+        let mut multi = false;
+        let mut single = false;
+        for it in items.iter() {
+            // Doc comments are attributes of the variant.
+            let doc = match &it.pre { Some(c) => c.contains("///") || c.contains("/**"), None => false };
+            if it.text().contains('\n') || doc { multi = true; } else { single = true; }
+        }
+        if multi && single {
+            let mut k = 0;
+            for v in e.variants.iter() {
+                items[k].item = self.variant(*v, vindent, 0);
+                k += 1;
+            }
+        }
+        let sh = Shape::indented(vindent).sub_width(2)?;
+        let mut fm = ListFormatting::new(sh);
+        fm.trailing = Trailing::Vertical;
+        fm.preserve_newline = true;
+        let list = write_list(&items, &fm)?;
+        out.push('\n');
+        push_spaces(&mut out, vindent);
+        out.push_str(list.as_str());
+        out.push('\n');
+        push_spaces(&mut out, indent);
+        out.push('}');
+        Some(out)
+    }
+
+    fn variant_end(&self, v: &Variant) -> Pos {
+        if let Some(d) = v.discriminant { return self.expr_end(d); }
+        let k = self.next_kind(self.tok_end(v.name.pos));
+        if k == L_PAREN || k == L_BRACE { return self.close_end(self.next_pos(self.tok_end(v.name.pos))); }
+        self.tok_end(v.name.pos)
+    }
+
+    fn variant(&self, v: &Variant, indent: usize, one_line_width: usize) -> Option<String> {
+        let sh = Shape::indented(indent);
+        let attrs = self.outer_attrs(&v.attrs, indent);
+        let sh1 = sh.sub_width(1)?;
+        let name = self.ident(v.name);
+        let body = match v.kind {
+            StructKind::Unit => name,
+            StructKind::Tuple => {
+                let open = self.next_pos(self.tok_end(v.name.pos));
+                let mut items = Vec::new();
+                for f in v.fields.iter() { items.push(Node::F(*f)); }
+                if v.fields.len() == 0 { cat(name.as_str(), "()") } else {
+                    self.with_parens(name.as_str(), &items, Shape::indented(indent).sub_width(1)?, open, FN_CALL_WIDTH, None)?
+                }
+            }
+            StructKind::Named => {
+                let open = self.next_pos(self.tok_end(v.name.pos));
+                self.struct_body(name, None, &v.fields, indent, open, Some(one_line_width))?
+            }
+        };
+        let body2 = match v.discriminant {
+            Some(d) => {
+                let lhs = cat(body.as_str(), " =");
+                let r = self.assign_rhs_expr(lhs.as_str(), &Node::E(d), sh1, false, true)?;
+                cat(lhs.as_str(), r.as_str())
+            }
+            None => body,
+        };
+        Some(cat(attrs.as_str(), body2.as_str()))
+    }
+
+    // --- impl and trait ----------------------------------------------------------------
+
+    fn impl_item(&self, im: &ImplDecl, indent: usize) -> Option<String> {
+        let mut out = vis_str(&im.base.vis);
+        if im.is_unsafe { out.push_str("unsafe "); }
+        let gsh = Shape::indented(indent + out.len());
+        let gs = self.generics("impl", im.generics, gsh)?;
+        out.push_str(gs.as_str());
+        let trait_overhead = if let Some(tp) = im.trait_path {
+            let used = 1 + last_line_width(out.as_str());
+            let tsh = Shape::indented(indent + used);
+            match self.path(tp, false, tsh) {
+                Some(t) if !t.contains('\n') => {
+                    out.push(' ');
+                    out.push_str(t.as_str());
+                }
+                _ => {
+                    let t = self.path(tp, false, Shape::indented(indent + TAB))?;
+                    out.push('\n');
+                    push_spaces(&mut out, indent + TAB);
+                    out.push_str(t.as_str());
+                }
+            }
+            4
+        } else {
+            0
+        };
+        let brace_overhead = if im.generics.wheres.len() == 0 { 2 } else { 0 };
+        let used = last_line_width(out.as_str()) + trait_overhead + brace_overhead;
+        let budget = sub(MAX_WIDTH, used + 1);
+        match self.typ(im.ty, Shape::legacy(budget, indent)) {
+            Some(t) if !t.contains('\n') => {
+                out.push_str(if im.trait_path.is_some() { " for " } else { " " });
+                out.push_str(t.as_str());
+            }
+            _ => {
+                out.push('\n');
+                push_spaces(&mut out, indent + TAB);
+                if im.trait_path.is_some() { out.push_str("for "); }
+                let b2 = sub(MAX_WIDTH, last_line_width(out.as_str()));
+                out.push_str(self.typ(im.ty, Shape::legacy(b2, indent + TAB))?.as_str());
+            }
+        }
+        let open = self.find(self.type_end(im.ty), L_BRACE);
+        let close = self.close_end(open) - 1;
+        if self.has_comment(self.type_end(im.ty), open) { return None; }
+        let empty = im.items.len() == 0 && !self.has_comment(open + 1, close);
+        let where_budget = if out.contains('\n') { MAX_WIDTH } else { sub(MAX_WIDTH, last_line_width(out.as_str())) };
+        let snug = last_line_width(out.as_str()) == 1;
+        let single_where = empty && im.generics.wheres.len() == 1 && !out.contains('\n');
+        let w = self.where_clause(im.generics, Shape::legacy(where_budget, indent), snug || single_where, single_where)?;
+        if empty && !out.contains('\n') && out.len() + w.len() <= MAX_WIDTH {
+            out.push_str(w.as_str());
+            if w.contains('\n') {
+                if im.generics.wheres.len() == 1 && single_where { out.push(','); }
+                out.push('\n');
+                push_spaces(&mut out, indent);
+                out.push_str("{\n");
+                push_spaces(&mut out, indent);
+                out.push('}');
+            } else {
+                out.push_str(" {}");
+            }
+            return Some(out);
+        }
+        out.push_str(w.as_str());
+        let need_newline = out.contains('\n');
+        if need_newline || w.len() > 0 {
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        } else {
+            out.push(' ');
+        }
+        out.push('{');
+        let body = self.items_body(&im.base.attrs, &im.items, open + 1, close, indent + TAB, false);
+        if body.len() > 0 {
+            out.push_str(body.as_str());
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        } else if need_newline {
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        }
+        out.push('}');
+        Some(out)
+    }
+
+    fn trait_item(&self, t: &TraitDecl, indent: usize) -> Option<String> {
+        let mut out = vis_str(&t.base.vis);
+        if t.is_unsafe { out.push_str("unsafe "); }
+        out.push_str("trait ");
+        let sh = Shape::indented(indent).offset_left(out.len())?;
+        let gs = self.generics(self.ident(t.name).as_str(), t.generics, sh.clone())?;
+        out.push_str(gs.as_str());
+        if t.supers.len() > 0 {
+            let lhs = cat(out.as_str(), ":");
+            let b = self.bounds(&t.supers, sh.offset_left(1 + last_line_width(gs.as_str()))?)?;
+            out = cat3(lhs.as_str(), " ", b.as_str());
+        }
+        let open = self.find(if t.supers.len() > 0 { self.path_end(t.supers[t.supers.len() - 1]) } else { self.tok_end(t.name.pos) }, L_BRACE);
+        let open2 = if t.generics.wheres.len() > 0 { self.find(self.type_end(t.generics.wheres[t.generics.wheres.len() - 1].ty), L_BRACE) } else { open };
+        let close = self.close_end(open2) - 1;
+        if t.generics.wheres.len() > 0 {
+            let wb = sub(MAX_WIDTH, last_line_width(out.as_str()));
+            let snug = last_line_width(gs.as_str()) == 1;
+            let w = self.where_clause(t.generics, Shape::legacy(wb, indent), snug, false)?;
+            out.push_str(w.as_str());
+        }
+        let empty = t.items.len() == 0 && !self.has_comment(open2 + 1, close);
+        if last_line(out.as_str()).contains("//") || last_line_width(out.as_str()) + 2 > sub(MAX_WIDTH, indent) {
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        } else if empty && !out.contains('\n') {
+            out.push_str(" {}");
+            return Some(out);
+        } else if out.contains('\n') || (t.generics.wheres.len() > 0 && t.items.len() > 0) {
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        } else {
+            out.push(' ');
+        }
+        out.push('{');
+        let body = self.items_body(&t.base.attrs, &t.items, open2 + 1, close, indent + TAB, false);
+        if body.len() > 0 {
+            out.push_str(body.as_str());
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        } else if out.contains('\n') {
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        }
+        out.push('}');
+        Some(out)
+    }
+}
+
+pub fn vis_str(v: &Vis) -> String {
+    match v {
+        Vis::Private => String::new(),
+        Vis::Pub => s("pub "),
+        Vis::Crate => s("pub(crate) "),
+        Vis::Super => s("pub(super) "),
+    }
+}
+
+fn push_sep(out: &mut String, blank: bool, indent: usize) {
+    if blank { out.push('\n'); }
+    out.push('\n');
+    push_spaces(out, indent);
+}
+
+fn is_word(k: Kind) -> bool {
+    k == IDENT || k == INT || k == FLOAT || k == STRING || k == RAW_STRING || k == CHAR || k == BYTE || k == BYTE_STRING
+        || is_keyword(k)
+}
+
+/// 1 for a use item, 2 for a module declaration, else 0: consecutive
+/// items of a kind get sorted.
+fn reorder_kind(it: &Item) -> i32 {
+    match it {
+        Item::Use(_) => 1,
+        Item::Mod(m) => if m.inline { 0 } else { 2 },
+        _ => 0,
+    }
+}
+
+fn semicolon_for_stmt(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::While { .. } | ExprKind::Loop { .. } | ExprKind::For { .. } => false,
+        _ => true,
+    }
+}
+
+fn last_line_used_width(t: &str, offset: usize) -> usize {
+    if t.contains('\n') { last_line_width(t) } else { offset + t.len() }
+}
+
+pub fn sub_opt4(a: usize, b: usize) -> Option<usize> { if a >= b { Some(a - b) } else { None } }
+
+// (one line budget, multi line budget, parameter indent); rustfmt's
+// compute_budgets_for_params.
+fn budgets_for_params(result: &str, indent: usize, ret_len: usize, has_body: bool, force_vertical: bool) -> (usize, usize, usize) {
+    if !result.contains('\n') && !force_vertical {
+        let overhead = if ret_len == 0 { 2 } else { 3 };
+        let mut used = indent + result.len() + ret_len + overhead;
+        used += if has_body { 2 } else { 1 };
+        let one = sub(MAX_WIDTH, used);
+        if one > 0 { return (one, sub(MAX_WIDTH, indent + TAB + 1), indent + TAB); }
+    }
+    (0, sub(MAX_WIDTH, indent + TAB + 1), indent + TAB)
+}
+
+// Whether else { goes on the line where a let's initializer ends.
+fn same_line_else(init: &str, sh: &Shape) -> bool {
+    if !init.contains('\n') { return sub(sh.width, init.len()) >= 7; }
+    if !(init.ends_with(")") || init.ends_with("]") || init.ends_with("}")) { return false; }
+    let ind = sh.indent_str();
+    match last_line(init).strip_prefix(ind.as_str()) {
+        Some(l) => !l.starts_with(" "),
+        None => false,
+    }
+}
+
+// Sorts a run of items by their keys (in place).
+fn sort_group(group: &mut Vec<(String, String, usize)>, use_keys: &Vec<UseKey>, base: usize, uses: bool) {
+    let n = group.len();
+    let mut i = 1;
+    while i < n {
+        let mut j = i;
+        while j > 0 {
+            let a = &group[j - 1];
+            let b = &group[j];
+            let gt = if uses {
+                crate::fmt::imports::cmp_use(&use_keys[a.2 - base], &use_keys[b.2 - base]) > 0
+            } else {
+                crate::fmt::imports::version_cmp(a.0.as_str(), b.0.as_str()) > 0
+            };
+            if !gt { break; }
+            let t = group[j - 1].clone();
+            group[j - 1] = group[j].clone();
+            group[j] = t;
+            j -= 1;
+        }
+        i += 1;
+    }
+}
+
+use crate::fmt::imports::UseKey;

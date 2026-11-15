@@ -1,0 +1,313 @@
+//! Lists (rustfmt's lists.rs): items between separators, the comments
+//! around them, and laying them out on one line, one per line or packed.
+
+use crate::syntax::source::Pos;
+use crate::fmt::ctx::*;
+
+#[derive(Clone)]
+pub struct ListItem {
+    /// Comments before the item (lines joined by \n, not indented).
+    pub pre: Option<String>,
+    /// Whether the last pre comment ends on the item's line.
+    pub pre_same_line: bool,
+    pub item: Option<String>,
+    /// The comment after the item; it starts with \n when it is on a line
+    /// of its own.
+    pub post: Option<String>,
+    /// Whether a blank line follows the item.
+    pub new_lines: bool,
+}
+
+impl ListItem {
+    pub fn of(s: String) -> ListItem { ListItem { pre: None, pre_same_line: false, item: Some(s), post: None, new_lines: false } }
+
+    pub fn text(&self) -> &str {
+        match &self.item {
+            Some(s) => s.as_str(),
+            None => "",
+        }
+    }
+
+    pub fn has_comment(&self) -> bool { self.pre.is_some() || self.post.is_some() }
+
+    pub fn has_single_line_comment(&self) -> bool {
+        let a = match &self.pre { Some(c) => c.trim_start().starts_with("//"), None => false };
+        let b = match &self.post { Some(c) => c.trim_start().starts_with("//"), None => false };
+        a || b
+    }
+
+    pub fn is_multiline(&self) -> bool {
+        let a = match &self.item { Some(s) => s.contains('\n'), None => false };
+        let b = match &self.pre { Some(c) => c.contains('\n'), None => false };
+        let c = match &self.post { Some(c) => c.contains('\n'), None => false };
+        a || b || c
+    }
+}
+
+fn comment_len(c: &Option<String>) -> usize {
+    match c {
+        Some(s) => {
+            let n = str_width(s.trim());
+            if n > 0 { n + 1 } else { 0 }
+        }
+        None => 0,
+    }
+}
+
+pub fn total_item_width(it: &ListItem) -> usize { comment_len(&it.pre) + comment_len(&it.post) + str_width(it.text()) }
+
+#[derive(Clone, PartialEq)]
+pub enum ListTactic { Horizontal, Vertical, HorizontalVertical, Limited(usize), Mixed }
+
+#[derive(Clone, PartialEq)]
+pub enum Tactic { Horizontal, Vertical, Mixed }
+
+/// Which layout the items take: one line when they fit in width (and
+/// limit), else one per line or packed (rustfmt's definitive_tactic).
+pub fn definitive_tactic(items: &Vec<ListItem>, t: ListTactic, sep_len: usize, width: usize) -> Tactic {
+    for it in items.iter() {
+        if it.has_single_line_comment() { return Tactic::Vertical; }
+    }
+    let limit = match t {
+        ListTactic::Horizontal => return Tactic::Horizontal,
+        ListTactic::Vertical => return Tactic::Vertical,
+        ListTactic::Limited(l) => if l < width { l } else { width },
+        _ => width,
+    };
+    let mut total = 0;
+    let mut multi = false;
+    for it in items.iter() {
+        total += total_item_width(it);
+        if it.is_multiline() { multi = true; }
+    }
+    if items.len() > 1 { total += sep_len * (items.len() - 1); }
+    if total <= limit && !multi { return Tactic::Horizontal; }
+    if t == ListTactic::Mixed { Tactic::Mixed } else { Tactic::Vertical }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum Trailing { Always, Never, Vertical }
+
+pub struct ListFormatting {
+    pub tactic: Tactic,
+    pub sep: String,
+    pub trailing: Trailing,
+    /// Separators before items (as | in patterns and + in bounds).
+    pub sep_front: bool,
+    pub shape: Shape,
+    pub ends_with_newline: bool,
+    pub preserve_newline: bool,
+    pub nested: bool,
+    pub align_comments: bool,
+}
+
+impl ListFormatting {
+    pub fn new(shape: Shape) -> ListFormatting {
+        ListFormatting { tactic: Tactic::Vertical, sep: s(","), trailing: Trailing::Never, sep_front: false, shape,
+            ends_with_newline: true, preserve_newline: false, nested: false, align_comments: true }
+    }
+
+    fn needs_trailing_separator(&self) -> bool {
+        match self.trailing {
+            Trailing::Always => true,
+            Trailing::Vertical => self.tactic == Tactic::Vertical || (self.tactic == Tactic::Mixed && self.ends_with_newline),
+            Trailing::Never => false,
+        }
+    }
+}
+
+/// A comment's lines indented to indent (its first line is not).
+pub fn indent_comment(c: &str, indent: &str) -> String {
+    if !c.contains('\n') { return c.to_string(); }
+    let mut out = String::new();
+    let mut first = true;
+    for l in c.split('\n') {
+        if !first {
+            out.push('\n');
+            if l.len() > 0 { out.push_str(indent); }
+        }
+        out.push_str(l);
+        first = false;
+    }
+    out
+}
+
+fn max_width_with_post_comment(items: &Vec<ListItem>, i: usize, overhead: usize) -> usize {
+    let mut max = 0;
+    let mut j = i;
+    while j < items.len() {
+        let it = &items[j];
+        let w = str_width(it.text());
+        if j != i && (it.post.is_none() || w + overhead > MAX_WIDTH) { return max; }
+        if max < w { max = w; }
+        if it.new_lines { return max; }
+        j += 1;
+    }
+    max
+}
+
+/// Writes the items (rustfmt's write_list).
+pub fn write_list(items: &Vec<ListItem>, f: &ListFormatting) -> Option<String> {
+    let tactic = f.tactic.clone();
+    let mut trailing = f.needs_trailing_separator();
+    let sep_len = f.sep.len();
+    let mut out = String::new();
+    let indent = f.shape.indent_str();
+    let mut line_len = 0;
+    let mut item_max: Option<usize> = None;
+    let mut prev_post = false;
+    let mut prev_nested = false;
+    let mut i = 0;
+    let n = items.len();
+    while i < n {
+        let it = &items[i];
+        let inner = match &it.item { Some(s) => s.as_str(), None => return None };
+        let first = i == 0;
+        let last = i + 1 == n;
+        let mut separate = if f.sep_front { !first } else { !last || trailing };
+        let item_sep_len = if separate { sep_len } else { 0 };
+        let last_line_of = if inner.contains('\n') { last_line(inner) } else { inner };
+        let mut item_last_width = str_width(last_line_of) + item_sep_len;
+        if last_line_of.starts_with(indent.as_str()) { item_last_width = sub(item_last_width, indent.len()); }
+        match tactic {
+            Tactic::Horizontal => {
+                if !first { out.push(' '); }
+            }
+            Tactic::Vertical => {
+                if !first && inner.len() > 0 && out.len() > 0 {
+                    out.push('\n');
+                    out.push_str(indent.as_str());
+                }
+            }
+            Tactic::Mixed => {
+                let total = total_item_width(it) + item_sep_len;
+                if (line_len > 0 && line_len + 1 + total > f.shape.width) || prev_post
+                    || (f.nested && (prev_nested || (!first && inner.contains("::")))) {
+                    out.push('\n');
+                    out.push_str(indent.as_str());
+                    line_len = 0;
+                    if f.ends_with_newline { trailing = true; }
+                } else if line_len > 0 {
+                    out.push(' ');
+                    line_len += 1;
+                }
+                if last && f.ends_with_newline { separate = f.trailing != Trailing::Never; }
+                line_len += total;
+            }
+        }
+        if let Some(c) = &it.pre {
+            out.push_str(indent_comment(c.as_str(), indent.as_str()).as_str());
+            if inner.len() > 0 {
+                if tactic == Tactic::Horizontal {
+                    out.push(' ');
+                } else {
+                    let keep = it.pre_same_line && total_item_width(it) + item_sep_len + 1 <= f.shape.width;
+                    if keep {
+                        out.push(' ');
+                    } else {
+                        out.push('\n');
+                        out.push_str(indent.as_str());
+                        line_len = str_width(inner);
+                    }
+                }
+            }
+            item_max = None;
+        }
+        if separate && f.sep_front && !first {
+            out.push_str(f.sep.trim());
+            out.push(' ');
+        }
+        out.push_str(inner);
+        if tactic == Tactic::Horizontal {
+            if let Some(c) = &it.post {
+                out.push(' ');
+                out.push_str(c.trim());
+            }
+        }
+        if separate && !f.sep_front { out.push_str(f.sep.as_str()); }
+        if tactic != Tactic::Horizontal && it.post.is_some() {
+            let c = match &it.post { Some(c) => c.clone(), None => String::new() };
+            if c.starts_with("\n") {
+                out.push('\n');
+                out.push_str(indent.as_str());
+                out.push_str(indent_comment(c.trim_start(), indent.as_str()).as_str());
+            } else {
+                let overhead = last_line_width(out.as_str()) + first_line_width(c.as_str()) + 1;
+                if item_max.is_none() && !last && !inner.contains('\n') {
+                    item_max = Some(max_width_with_post_comment(items, i, overhead));
+                }
+                let mut align = match item_max { Some(m) => sub(m, str_width(inner)), None => 0 };
+                if first_line_width(c.as_str()) + last_line_width(out.as_str()) + align + 1 > MAX_WIDTH {
+                    item_max = None;
+                    align = 0;
+                }
+                if f.align_comments {
+                    push_spaces(&mut out, align + 1);
+                }
+                if !f.align_comments || (last && item_max.is_some() && !separate && f.sep.len() > 0) {
+                    out.push(' ');
+                }
+                if c.contains('\n') { item_max = None; }
+                out.push_str(indent_comment(c.as_str(), indent.as_str()).as_str());
+            }
+        } else {
+            item_max = None;
+        }
+        if f.preserve_newline && !last && tactic == Tactic::Vertical && it.new_lines {
+            item_max = None;
+            out.push('\n');
+        }
+        prev_post = it.post.is_some();
+        prev_nested = inner.contains("::");
+        i += 1;
+    }
+    Some(out)
+}
+
+impl Ctx {
+    /// The comments of list items with the given spans, the list closing at
+    /// close (the item strings are filled in later).
+    pub fn itemize(&self, spans: &Vec<(Pos, Pos)>, open_end: Pos, close: Pos) -> Vec<ListItem> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        let mut prev_end = open_end;
+        while i < spans.len() {
+            let (lo, hi) = spans[i];
+            let mut it = ListItem { pre: None, pre_same_line: false, item: None, post: None, new_lines: false };
+            // Pre comments: those in the gap not on the previous item's line.
+            let cs = self.comments_in(prev_end, lo);
+            let mut pre = String::new();
+            let mut last_end: Pos = -1;
+            for c in cs.iter() {
+                if i > 0 && self.line_of(c.pos) == self.line_of(prev_end) { continue; }
+                if pre.len() > 0 { pre.push('\n'); }
+                pre.push_str(self.comment_text(c, 0).as_str());
+                last_end = c.end;
+            }
+            if pre.len() > 0 {
+                it.pre = Some(pre);
+                it.pre_same_line = self.line_of(last_end) == self.line_of(lo) && !self.snippet(last_end, lo).contains('\n');
+            }
+            // Post comments: those after the item on its line.
+            let next = if i + 1 < spans.len() { spans[i + 1].0 } else { close };
+            let cs2 = self.comments_in(hi, next);
+            let mut post = String::new();
+            for c in cs2.iter() {
+                if self.line_of(c.pos) == self.line_of(hi) {
+                    if post.len() > 0 { post.push(' '); }
+                    post.push_str(self.comment_text(c, 0).as_str());
+                } else if i + 1 == spans.len() {
+                    // Comments after the last item go after it.
+                    post.push('\n');
+                    post.push_str(self.comment_text(c, 0).as_str());
+                }
+            }
+            if post.len() > 0 { it.post = Some(post); }
+            if i + 1 < spans.len() { it.new_lines = self.blank_between(hi, spans[i + 1].0); }
+            out.push(it);
+            prev_end = hi;
+            i += 1;
+        }
+        out
+    }
+}

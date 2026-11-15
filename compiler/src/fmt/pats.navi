@@ -1,0 +1,154 @@
+//! Patterns (rustfmt's patterns.rs).
+
+use crate::syntax::token::*;
+use crate::syntax::ast::*;
+use crate::fmt::ctx::*;
+use crate::fmt::lists::*;
+use crate::fmt::overflow::*;
+use crate::fmt::expr::*;
+
+impl Ctx {
+    pub fn pat(&self, p: &Pat, sh: Shape) -> Option<String> {
+        match &p.kind {
+            PatKind::Wild(_) => if sh.width >= 1 { Some(s("_")) } else { None },
+            PatKind::Rest(_) => if sh.width >= 2 { Some(s("..")) } else { None },
+            PatKind::Ident { is_mut, name, sub: sp } => {
+                let mut out = if *is_mut { s("mut ") } else { String::new() };
+                out.push_str(self.ident(*name).as_str());
+                if let Some(q) = sp {
+                    out.push_str(" @ ");
+                    let ss = sh.offset_left(out.len())?;
+                    out.push_str(self.pat(*q, ss)?.as_str());
+                }
+                wrap_str(out, &sh)
+            }
+            PatKind::Lit(x) => self.expr(*x, sh),
+            PatKind::Range { lo, hi, inclusive, .. } => {
+                let infix = if *inclusive { "..=" } else { ".." };
+                let mut out = String::new();
+                if let Some(l) = lo { out.push_str(self.expr(*l, sh.clone())?.as_str()); }
+                out.push_str(infix);
+                if let Some(h) = hi {
+                    let hs = sh.offset_left(out.len())?;
+                    out.push_str(self.expr(*h, hs)?.as_str());
+                }
+                wrap_str(out, &sh)
+            }
+            PatKind::Path(q) => self.path(*q, true, sh),
+            PatKind::Tuple { lparen, elems } => {
+                let mut items = Vec::new();
+                for e in elems.iter() { items.push(Node::P(*e)); }
+                if elems.len() == 0 { return Some(s("()")); }
+                let last_rest = match &elems[elems.len() - 1].kind { PatKind::Rest(_) => true, _ => false };
+                let force = if elems.len() == 1 && !last_rest { Some(Trailing::Always) } else { None };
+                self.with_parens("", &items, sh, *lparen, MAX_WIDTH, force)
+            }
+            PatKind::TupleStruct { path, elems } => {
+                let ps = self.path(*path, true, sh.clone())?;
+                if elems.len() == 0 { return Some(cat(ps.as_str(), "()")); }
+                let mut items = Vec::new();
+                for e in elems.iter() { items.push(Node::P(*e)); }
+                let open = self.find(self.path_end(*path), L_PAREN);
+                self.with_parens(ps.as_str(), &items, sh, open, MAX_WIDTH, None)
+            }
+            PatKind::Struct { path, fields, rest } => self.struct_pat(p, *path, fields, *rest, sh),
+            PatKind::Slice { lbrack, elems } => {
+                let mut items = Vec::new();
+                for e in elems.iter() { items.push(Node::P(*e)); }
+                self.with_brackets("", &items, sh, *lbrack, None)
+            }
+            PatKind::Ref { pat: inner, .. } => self.unary_prefix("&", &Node::P(*inner), sh),
+            PatKind::Or(alts) => {
+                let mut items = Vec::new();
+                let mut short = true;
+                for a in alts.iter() {
+                    let r = self.pat(*a, sh.clone())?;
+                    if !(r.len() <= 20 && !r.contains('\n') && is_short_pattern(*a)) { short = false; }
+                    items.push(ListItem::of(r));
+                }
+                let tactic = if short { Tactic::Mixed } else { definitive_tactic(&items, ListTactic::HorizontalVertical, 3, sh.width) };
+                let mut f = ListFormatting::new(sh);
+                f.tactic = tactic;
+                f.sep = s(" |");
+                f.sep_front = true;
+                f.ends_with_newline = false;
+                write_list(&items, &f)
+            }
+        }
+    }
+
+    fn struct_pat(&self, p: &Pat, path: &Path, fields: &Vec<&FieldPat>, rest: bool, sh: Shape) -> Option<String> {
+        let ps = self.path(path, true, sh.sub_width(2)?)?;
+        if fields.len() == 0 && !rest { return Some(cat(ps.as_str(), " {}")); }
+        let ellipsis_len = if rest { 4 } else { 0 };
+        let (h_shape, v_shape) = struct_lit_shape(&sh, ps.len() + 3, ellipsis_len + 2)?;
+        let open = self.find(self.path_end(path), L_BRACE);
+        let close = self.pat_end(p) - 1;
+        let mut spans = Vec::new();
+        for f in fields.iter() { spans.push((f.name.pos, self.pat_end(f.pat))); }
+        let end = if rest { self.find(if fields.len() > 0 { spans[spans.len() - 1].1 } else { open }, DOT_DOT) } else { close };
+        let mut items = self.itemize(&spans, open + 1, end);
+        let mut i = 0;
+        for f in fields.iter() {
+            items[i].item = self.field_pat(*f, v_shape.clone());
+            i += 1;
+        }
+        let tactic = struct_lit_tactic(&h_shape, &items);
+        let nested = if tactic == Tactic::Horizontal { match &h_shape { Some(h) => h.clone(), None => v_shape.clone() } } else { v_shape.clone() };
+        let mut f = ListFormatting::new(nested.clone());
+        f.tactic = tactic.clone();
+        f.trailing = Trailing::Vertical;
+        f.ends_with_newline = tactic == Tactic::Vertical;
+        f.preserve_newline = true;
+        let has_trailing = tactic == Tactic::Vertical;
+        let mut fs = write_list(&items, &f)?;
+        let one_line_width = match &h_shape { Some(h) => h.width, None => 0 };
+        if rest {
+            if fs.contains('\n') || fs.len() > one_line_width {
+                if !has_trailing { fs.push(','); }
+                fs.push('\n');
+                fs.push_str(nested.indent_str().as_str());
+            } else if fs.len() > 0 {
+                if has_trailing { fs.push(' '); } else { fs.push_str(", "); }
+            }
+            fs.push_str("..");
+        }
+        let body = wrap_struct_field(fs.as_str(), &sh, &v_shape, one_line_width);
+        Some(cat3(ps.as_str(), " {", cat(body.as_str(), "}").as_str()))
+    }
+
+    fn field_pat(&self, f: &FieldPat, sh: Shape) -> Option<String> {
+        let shorthand = match &f.pat.kind {
+            PatKind::Ident { name, sub: None, .. } => name.pos == f.name.pos,
+            _ => false,
+        };
+        let ps = self.pat(f.pat, sh.clone())?;
+        if shorthand { return Some(ps); }
+        let id = self.ident(f.name);
+        if id.len() + 2 + ps.len() <= sh.width { return Some(cat3(id.as_str(), ": ", ps.as_str())); }
+        let nested = sh.block_indent(TAB);
+        let p2 = self.pat(f.pat, nested.clone())?;
+        let mut out = id;
+        out.push_str(":\n");
+        out.push_str(nested.indent_str().as_str());
+        out.push_str(p2.as_str());
+        Some(out)
+    }
+}
+
+fn is_short_pattern(p: &Pat) -> bool {
+    match &p.kind {
+        PatKind::Rest(_) | PatKind::Wild(_) | PatKind::Lit(_) => true,
+        PatKind::Ident { sub, .. } => sub.is_none(),
+        PatKind::Struct { .. } | PatKind::Slice { .. } | PatKind::Path(_) | PatKind::Range { .. } => false,
+        PatKind::TupleStruct { path, elems } => path.segments.len() <= 1 && elems.len() <= 1,
+        PatKind::Tuple { elems, .. } => elems.len() <= 1,
+        PatKind::Ref { pat, .. } => is_short_pattern(*pat),
+        PatKind::Or(alts) => {
+            for a in alts.iter() {
+                if !is_short_pattern(*a) { return false; }
+            }
+            true
+        }
+    }
+}

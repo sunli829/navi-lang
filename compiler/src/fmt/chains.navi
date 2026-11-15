@@ -1,0 +1,240 @@
+//! Method chains: a.b().c?.d (rustfmt's chains.rs, block indent style).
+
+use crate::syntax::source::Pos;
+use crate::syntax::ast::*;
+use crate::fmt::ctx::*;
+use crate::fmt::overflow::*;
+
+/// A link of a chain: its root (an expression of another kind), a method
+/// call or a field, and the ?s after it.
+struct Link {
+    x: &Expr,
+    root: bool,
+    tries: usize,
+}
+
+impl Ctx {
+    pub fn chain(&self, x: &Expr, sh: Shape) -> Option<String> {
+        // Outermost first.
+        let mut subs: Vec<&Expr> = Vec::new();
+        let mut cur = x;
+        loop {
+            subs.push(cur);
+            match &cur.kind {
+                ExprKind::MethodCall { recv, .. } => cur = *recv,
+                ExprKind::Field { x: inner, .. } => cur = *inner,
+                ExprKind::Try { x: inner, .. } => cur = *inner,
+                _ => break,
+            }
+        }
+        let mut rev: Vec<Link> = Vec::new();
+        let mut tries = 0;
+        let mut i = 0;
+        while i < subs.len() {
+            let e = subs[i];
+            match &e.kind {
+                ExprKind::Try { .. } => tries += 1,
+                _ => {
+                    rev.push(Link { x: e, root: i + 1 == subs.len(), tries });
+                    tries = 0;
+                }
+            }
+            i += 1;
+        }
+        // The root of only ?s.
+        if rev.len() == 1 {
+            let r = &rev[0];
+            let s2 = sh.sub_width(r.tries)?;
+            let mut out = self.expr(r.x, s2)?;
+            push_tries(&mut out, r.tries);
+            return Some(out);
+        }
+        let mut links: Vec<Link> = Vec::new();
+        let mut j = rev.len();
+        while j > 0 {
+            j -= 1;
+            links.push(Link { x: rev[j].x, root: rev[j].root, tries: rev[j].tries });
+        }
+        // Comments between links are not formatted.
+        let lo = self.expr_start(x);
+        let hi = self.expr_end(x);
+        if self.has_comment(lo, hi) {
+            let mut k = 1;
+            while k < links.len() {
+                let (a, b) = self.link_gap(&links[k]);
+                if self.has_comment(a, b) { return None; }
+                k += 1;
+            }
+        }
+        // The root, with short links joined to it.
+        let mut root = self.link(&links[0], sh.clone())?;
+        let mut root_block = is_block_expr(links[0].x, root.as_str());
+        let tab_width = sub(TAB, sh.offset);
+        let mut start = 1;
+        while root.len() <= tab_width && !root.contains('\n') {
+            let s2 = sh.offset_left(root.len())?;
+            match self.link(&links[start], s2) {
+                Some(r) => root.push_str(r.as_str()),
+                None => break,
+            }
+            root_block = last_line_extendable(root.as_str());
+            start += 1;
+            if start == links.len() { break; }
+        }
+        if start == links.len() { return wrap_str(root, &sh); }
+        let children = &links[start..];
+        let child_shape = (if root_block { sh.block_indent(0) } else { sh.block_indent(TAB) }).with_max_width();
+        let mut rewrites: Vec<String> = Vec::new();
+        rewrites.push(root);
+        let mut k = 0;
+        while k + 1 < children.len() {
+            rewrites.push(self.link(&children[k], child_shape.clone())?);
+            k += 1;
+        }
+        // The last link.
+        let last = &children[children.len() - 1];
+        let mut fits_single_line = false;
+        let extendable = last_line_extendable(rewrites[0].as_str());
+        let prev_llw = last_line_width(rewrites[0].as_str());
+        let mut almost_total = if extendable {
+            prev_llw
+        } else {
+            let mut t = 0;
+            for r in rewrites.iter() { t += str_width(r.as_str()); }
+            t
+        };
+        almost_total += last.tries;
+        let budget0 = if links.len() == 2 { sh.width } else { if sh.width < CHAIN_WIDTH { sh.width } else { CHAIN_WIDTH } };
+        let one_line_budget = sub(budget0, almost_total);
+        let mut multi = false;
+        for r in rewrites.iter() {
+            if r.contains('\n') { multi = true; }
+        }
+        let all_in_one_line = !multi && one_line_budget > 0;
+        let last_shape = if all_in_one_line {
+            sh.sub_width(last.tries)?
+        } else if extendable {
+            child_shape.sub_width(last.tries)?
+        } else {
+            child_shape.sub_width(sh.rhs_overhead() + last.tries)?
+        };
+        let mut last_str: Option<String> = None;
+        if all_in_one_line || extendable {
+            if let Some(ols) = last_shape.offset_left(almost_total) {
+                if let Some(rw) = self.link(last, ols) {
+                    let line_count = count_newlines(rw.as_str()) + 1;
+                    let could_fit = first_line_width(rw.as_str()) <= one_line_budget;
+                    if could_fit && line_count >= 5 {
+                        last_str = Some(rw);
+                        fits_single_line = all_in_one_line;
+                    } else {
+                        let ls2 = child_shape.sub_width(sh.rhs_overhead() + last.tries)?;
+                        match self.link(last, ls2) {
+                            Some(nr) => {
+                                if !could_fit {
+                                    last_str = Some(nr);
+                                } else if count_newlines(nr.as_str()) + 1 >= line_count {
+                                    last_str = Some(rw);
+                                    fits_single_line = could_fit && all_in_one_line;
+                                } else {
+                                    last_str = Some(nr);
+                                }
+                            }
+                            None => {
+                                last_str = Some(rw);
+                                fits_single_line = could_fit && all_in_one_line;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let ls = match last_str {
+            Some(l) => l,
+            None => self.link(last, last_shape)?,
+        };
+        rewrites.push(ls);
+        // Join.
+        let connector = if fits_single_line {
+            String::new()
+        } else {
+            if self.force_one_line_chain.load(std::sync::atomic::Ordering::Relaxed) == 1 { return None; }
+            child_shape.nl_indent()
+        };
+        let mut out = rewrites[0].clone();
+        let mut m = 1;
+        while m < rewrites.len() {
+            out.push_str(connector.as_str());
+            out.push_str(rewrites[m].as_str());
+            m += 1;
+        }
+        wrap_str(out, &sh)
+    }
+
+    // The source between a link and the one before it.
+    fn link_gap(&self, l: &Link) -> (Pos, Pos) {
+        match &l.x.kind {
+            ExprKind::MethodCall { recv, name, .. } => (self.expr_end(*recv), name.pos),
+            ExprKind::Field { x, name } => (self.expr_end(*x), name.pos),
+            _ => (0, 0),
+        }
+    }
+
+    fn link(&self, l: &Link, sh: Shape) -> Option<String> {
+        let s2 = sh.sub_width(l.tries)?;
+        let mut out = if l.root {
+            self.expr(l.x, s2)?
+        } else {
+            match &l.x.kind {
+                ExprKind::MethodCall { name, type_args, args, .. } => {
+                    let mut callee = cat(".", self.ident(*name).as_str());
+                    if let Some(ta) = type_args {
+                        let mut ts = Vec::new();
+                        for t in ta.args.iter() { ts.push(self.typ(*t, s2.clone())?); }
+                        callee.push_str("::<");
+                        callee.push_str(ts.join(", ").as_str());
+                        callee.push('>');
+                    }
+                    let mut items = Vec::new();
+                    for a in args.iter() { items.push(Node::E(*a)); }
+                    let from = match type_args { Some(a) => self.angle_end(a.lt), None => self.tok_end(name.pos) };
+                    let open = self.find(from, crate::syntax::token::L_PAREN);
+                    self.with_parens(callee.as_str(), &items, s2, open, FN_CALL_WIDTH, None)?
+                }
+                ExprKind::Field { name, .. } => cat(".", self.ident(*name).as_str()),
+                _ => return None,
+            }
+        };
+        push_tries(&mut out, l.tries);
+        Some(out)
+    }
+}
+
+fn push_tries(out: &mut String, n: usize) {
+    let mut i = 0;
+    while i < n {
+        out.push('?');
+        i += 1;
+    }
+}
+
+/// Whether x's rewrite r ends as a block does (rustfmt's is_block_expr).
+pub fn is_block_expr(x: &Expr, r: &str) -> bool {
+    match &x.kind {
+        ExprKind::Call { .. } | ExprKind::MethodCall { .. } | ExprKind::Array { .. } | ExprKind::ArrayRepeat { .. }
+        | ExprKind::StructLit { .. } | ExprKind::While { .. } | ExprKind::If { .. } | ExprKind::Block(_)
+        | ExprKind::Loop { .. } | ExprKind::For { .. } | ExprKind::Match { .. } | ExprKind::Select { .. } => r.contains('\n'),
+        ExprKind::Paren { x, .. } => is_block_expr(*x, r),
+        ExprKind::Binary { y, .. } => is_block_expr(*y, r),
+        ExprKind::Index { index, .. } => is_block_expr(*index, r),
+        ExprKind::Unary { x, .. } => is_block_expr(*x, r),
+        ExprKind::Ref { x, .. } => is_block_expr(*x, r),
+        ExprKind::Closure { body, .. } => is_block_expr(*body, r),
+        ExprKind::Range { hi: Some(h), .. } => is_block_expr(*h, r),
+        ExprKind::Return { value: Some(v), .. } => is_block_expr(*v, r),
+        ExprKind::Break { value: Some(v), .. } => is_block_expr(*v, r),
+        ExprKind::Assign { y, .. } => is_block_expr(*y, r),
+        ExprKind::Lit { .. } | ExprKind::Template { .. } => r.contains('\n'),
+        _ => false,
+    }
+}
