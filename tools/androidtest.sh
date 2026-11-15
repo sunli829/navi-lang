@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs the golden tests in tests/run as linux-arm64 programs on an Android
-# arm64 device or emulator (a Linux kernel with bionic): navic writes ELF
-# objects, the NDK's clang links them, adb runs them.
+# arm64 device or emulator (a Linux kernel with bionic), with adb: navic
+# links them itself (for bionic: NAVI_ELF_LIBC=bionic), or with
+# ANDROID_LINK=ndk writes objects the NDK's clang links.
 #
 #   tools/androidtest.sh path/to/navic [VAR=value ...]
 #
@@ -23,10 +24,14 @@ fail=0
 for f in tests/run/*.navi; do
 	n=$(basename "$f" .navi)
 	grep -q '^// error:' "$f" && continue
-	if ! "$navic" build --target linux-arm64 -c -o "$tmp/$n.o" "$f" > "$tmp/$n.build" 2>&1; then
-		echo "FAIL $f (build)"; cat "$tmp/$n.build"; fail=1; continue
+	if [ "$ANDROID_LINK" = ndk ]; then
+		if ! "$navic" build --target linux-arm64 -c -o "$tmp/$n.o" "$f" > "$tmp/$n.build" 2>&1; then
+			echo "FAIL $f (build)"; cat "$tmp/$n.build"; fail=1; continue
+		fi
+		"$cc" --target=aarch64-linux-android35 -o "$tmp/bin/$n" "$tmp/$n.o" -lm || { echo "FAIL $f (link)"; fail=1; }
+	elif ! NAVI_ELF_LIBC=bionic "$navic" build --target linux-arm64 -o "$tmp/bin/$n" "$f" > "$tmp/$n.build" 2>&1; then
+		echo "FAIL $f (build)"; cat "$tmp/$n.build"; fail=1
 	fi
-	"$cc" --target=aarch64-linux-android35 -o "$tmp/bin/$n" "$tmp/$n.o" -lm || { echo "FAIL $f (link)"; fail=1; }
 done
 "$adb" shell rm -rf $dir
 "$adb" shell mkdir -p $dir
