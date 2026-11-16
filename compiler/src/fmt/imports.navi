@@ -1,0 +1,344 @@
+//! use items: normalizing, sorting and writing their trees (rustfmt's
+//! imports.rs and reorder.rs, 2024 style: version sorting).
+
+use crate::syntax::ast::*;
+use crate::fmt::ctx::*;
+use crate::fmt::lists::*;
+use crate::fmt::items::vis_str;
+
+/// A segment of a use path.
+#[derive(Clone)]
+pub enum Seg {
+    Slf(Option<String>),
+    Super(Option<String>),
+    Crate(Option<String>),
+    Ident(String, Option<String>),
+    Glob,
+    List(Vec<UseKey>),
+}
+
+/// A use tree as segments, the last of which may be a list.
+#[derive(Clone)]
+pub struct UseKey {
+    pub segs: Vec<Seg>,
+}
+
+impl Ctx {
+    pub fn use_key(&self, t: &UseTree) -> UseKey {
+        let mut segs = Vec::new();
+        if let Some(p) = t.prefix {
+            let n = p.segments.len();
+            let mut i = 0;
+            for sg in p.segments.iter() {
+                let name = self.ident(sg.name);
+                let alias = if i + 1 == n && !t.glob && !t.group {
+                    match t.alias { Some(a) => Some(self.ident(a)), None => None }
+                } else {
+                    None
+                };
+                segs.push(match name.as_str() {
+                    "self" => Seg::Slf(alias),
+                    "super" => Seg::Super(alias),
+                    "crate" => Seg::Crate(alias),
+                    _ => Seg::Ident(name.clone(), alias),
+                });
+                i += 1;
+            }
+        }
+        if t.glob { segs.push(Seg::Glob); }
+        if t.group {
+            let mut list = Vec::new();
+            for c in t.children.iter() { list.push(self.use_key(*c)); }
+            segs.push(Seg::List(list));
+        }
+        UseKey { segs }
+    }
+
+    pub fn use_keys(&self, items: &Vec<Item>, i: usize, j: usize) -> Vec<UseKey> {
+        let mut out = Vec::new();
+        let mut k = i;
+        while k < j {
+            match &items[k] {
+                Item::Use(u) => out.push(normalize(self.use_key(u.tree))),
+                _ => out.push(UseKey { segs: Vec::new() }),
+            }
+            k += 1;
+        }
+        out
+    }
+
+    pub fn reorder_key(&self, it: &Item) -> String {
+        match it {
+            Item::Mod(m) => self.ident(m.name),
+            _ => String::new(),
+        }
+    }
+
+    pub fn use_item(&self, u: &UseDecl, indent: usize) -> Option<String> {
+        let lo = u.base.start;
+        let hi = self.item_close(self.use_end(u.tree));
+        if self.has_comment(lo, hi) { return None; }
+        let vis = vis_str(&u.base.vis);
+        let key = normalize(self.use_key(u.tree));
+        let sh = Shape::indented(indent).offset_left(4)?.sub_width(1)?.offset_left(vis.len())?;
+        let t = render_tree(&key, sh)?;
+        let mut out = vis;
+        out.push_str("use ");
+        out.push_str(t.as_str());
+        out.push(';');
+        Some(out)
+    }
+}
+
+fn render_tree(k: &UseKey, sh0: Shape) -> Option<String> {
+    let mut out = String::new();
+    let mut sh = sh0;
+    let mut i = 0;
+    while i < k.segs.len() {
+        let s1 = render_seg(&k.segs[i], sh.clone())?;
+        out.push_str(s1.as_str());
+        if i + 1 < k.segs.len() {
+            out.push_str("::");
+            sh = sh.offset_left(2 + s1.len())?;
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+fn with_alias(name: &str, a: &Option<String>) -> String {
+    match a {
+        Some(x) => cat3(name, " as ", x.as_str()),
+        None => name.to_string(),
+    }
+}
+
+fn render_seg(sg: &Seg, sh: Shape) -> Option<String> {
+    match sg {
+        Seg::Slf(a) => Some(with_alias("self", a)),
+        Seg::Super(a) => Some(with_alias("super", a)),
+        Seg::Crate(a) => Some(with_alias("crate", a)),
+        Seg::Ident(n, a) => Some(with_alias(n.as_str(), a)),
+        Seg::Glob => Some(s("*")),
+        Seg::List(list) => {
+            let nested = sh.block_indent(TAB).with_max_width().sub_width(1)?;
+            let mut items = Vec::new();
+            let mut has_nested = false;
+            for t in list.iter() {
+                items.push(ListItem::of(render_tree(t, nested.clone())?));
+                if let Some(Seg::List(l)) = t.segs.last() {
+                    if l.len() > 0 { has_nested = true; }
+                }
+            }
+            let remaining = if has_nested { 0 } else { sub(sh.width, 2) };
+            let tactic = definitive_tactic(&items, ListTactic::Mixed, 2, remaining);
+            let ends = tactic != Tactic::Horizontal;
+            let mut f = ListFormatting::new(nested.clone());
+            f.tactic = tactic.clone();
+            f.trailing = if ends { Trailing::Vertical } else { Trailing::Never };
+            f.ends_with_newline = ends;
+            f.preserve_newline = true;
+            f.nested = has_nested;
+            let ls = write_list(&items, &f)?;
+            if ls.contains('\n') || ls.len() > remaining || tactic == Tactic::Vertical {
+                let mut out = s("{\n");
+                out.push_str(nested.indent_str().as_str());
+                out.push_str(ls.as_str());
+                out.push('\n');
+                out.push_str(sh.indent_str().as_str());
+                out.push('}');
+                return Some(out);
+            }
+            Some(cat3("{", ls.as_str(), "}"))
+        }
+    }
+}
+
+fn is_just_self(k: &UseKey) -> bool {
+    if k.segs.len() != 1 { return false; }
+    match &k.segs[0] {
+        Seg::Slf(None) => true,
+        _ => false,
+    }
+}
+
+/// rustfmt's UseTree::normalize.
+pub fn normalize(k: UseKey) -> UseKey {
+    let mut segs = k.segs;
+    let last = match segs.pop() {
+        Some(l) => l,
+        None => return UseKey { segs },
+    };
+    match &last {
+        Seg::Slf(None) => {
+            if segs.len() > 0 {
+                segs.push(last);
+                return UseKey { segs };
+            }
+        }
+        Seg::Slf(Some(a)) => {
+            let n = segs.len();
+            if n > 0 {
+                let mut repl: Option<String> = None;
+                if let Seg::Ident(name, None) = &segs[n - 1] { repl = Some(name.clone()); }
+                if let Some(name) = repl {
+                    segs[n - 1] = Seg::Ident(name, Some(a.clone()));
+                    return UseKey { segs };
+                }
+            }
+        }
+        Seg::List(list) => {
+            if list.len() == 1 && !is_just_self(&list[0]) {
+                for sg in list[0].segs.iter() { segs.push(sg.clone()); }
+                return normalize(UseKey { segs });
+            }
+            let mut l2 = Vec::new();
+            for t in list.iter() { l2.push(normalize(t.clone())); }
+            sort_keys(&mut l2);
+            segs.push(Seg::List(l2));
+            return UseKey { segs };
+        }
+        _ => {}
+    }
+    segs.push(last);
+    UseKey { segs }
+}
+
+fn sort_keys(l: &mut Vec<UseKey>) {
+    let n = l.len();
+    let mut i = 1;
+    while i < n {
+        let mut j = i;
+        while j > 0 && cmp_use(&l[j - 1], &l[j]) > 0 {
+            let t = l[j - 1].clone();
+            l[j - 1] = l[j].clone();
+            l[j] = t;
+            j -= 1;
+        }
+        i += 1;
+    }
+}
+
+fn seg_rank(sg: &Seg) -> i32 {
+    match sg {
+        Seg::Slf(_) => 0,
+        Seg::Super(_) => 1,
+        Seg::Crate(_) => 2,
+        Seg::Ident(_, _) => 3,
+        Seg::Glob => 4,
+        Seg::List(_) => 5,
+    }
+}
+
+fn cmp_alias(a: &Option<String>, b: &Option<String>) -> i32 {
+    match (a, b) {
+        (None, None) => 0,
+        (None, Some(_)) => -1,
+        (Some(_), None) => 1,
+        (Some(x), Some(y)) => version_cmp(x.as_str(), y.as_str()),
+    }
+}
+
+fn cmp_seg(a: &Seg, b: &Seg, aliases: bool) -> i32 {
+    let ra = seg_rank(a);
+    let rb = seg_rank(b);
+    if ra != rb { return if ra < rb { -1 } else { 1 }; }
+    match (a, b) {
+        (Seg::Slf(x), Seg::Slf(y)) => if aliases { cmp_alias(x, y) } else { 0 },
+        (Seg::Super(x), Seg::Super(y)) => if aliases { cmp_alias(x, y) } else { 0 },
+        (Seg::Crate(x), Seg::Crate(y)) => if aliases { cmp_alias(x, y) } else { 0 },
+        (Seg::Ident(x, xa), Seg::Ident(y, ya)) => {
+            let o = version_cmp(x.as_str(), y.as_str());
+            if o != 0 || !aliases { return o; }
+            cmp_alias(xa, ya)
+        }
+        (Seg::List(x), Seg::List(y)) => {
+            let mut i = 0;
+            while i < x.len() && i < y.len() {
+                let o = cmp_use(&x[i], &y[i]);
+                if o != 0 { return o; }
+                i += 1;
+            }
+            if x.len() < y.len() { -1 } else if x.len() > y.len() { 1 } else { 0 }
+        }
+        _ => 0,
+    }
+}
+
+/// The order of two use trees (-1, 0 or 1).
+pub fn cmp_use(a: &UseKey, b: &UseKey) -> i32 {
+    let mut i = 0;
+    while i < a.segs.len() && i < b.segs.len() {
+        let o = cmp_seg(&a.segs[i], &b.segs[i], true);
+        if o != 0 && cmp_seg(&a.segs[i], &b.segs[i], false) != 0 { return o; }
+        i += 1;
+    }
+    if a.segs.len() < b.segs.len() { -1 } else if a.segs.len() > b.segs.len() { 1 } else { 0 }
+}
+
+/// rustfmt's version_sort: _ first, digit runs by value, the rest by bytes.
+pub fn version_cmp(a: &str, b: &str) -> i32 {
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    let mut i = 0;
+    let mut j = 0;
+    let mut tie = 0;
+    loop {
+        let ea = i >= x.len();
+        let eb = j >= y.len();
+        if ea && eb { return tie; }
+        if ea { return -1; }
+        if eb { return 1; }
+        let ca = x[i];
+        let cb = y[j];
+        if ca == b'_' || cb == b'_' {
+            if ca == b'_' && cb == b'_' {
+                i += 1;
+                j += 1;
+                continue;
+            }
+            return if ca == b'_' { -1 } else { 1 };
+        }
+        let da = is_digit(ca);
+        let db = is_digit(cb);
+        if da && db {
+            let si = i;
+            while i < x.len() && is_digit(x[i]) { i += 1; }
+            let sj = j;
+            while j < y.len() && is_digit(y[j]) { j += 1; }
+            // Compare by value: strip leading zeros, then length, then bytes.
+            let mut za = si;
+            while za + 1 < i && x[za] == b'0' { za += 1; }
+            let mut zb = sj;
+            while zb + 1 < j && y[zb] == b'0' { zb += 1; }
+            let la = i - za;
+            let lb = j - zb;
+            if la != lb { return if la < lb { -1 } else { 1 }; }
+            let mut k = 0;
+            while k < la {
+                if x[za + k] != y[zb + k] { return if x[za + k] < y[zb + k] { -1 } else { 1 }; }
+                k += 1;
+            }
+            let lza = za - si;
+            let lzb = zb - sj;
+            if lza != lzb && tie == 0 { tie = if lzb < lza { -1 } else { 1 }; }
+            continue;
+        }
+        if da != db { return if da { -1 } else { 1 }; }
+        // Runs of other bytes.
+        let si = i;
+        while i < x.len() && x[i] != b'_' && !is_digit(x[i]) { i += 1; }
+        let sj = j;
+        while j < y.len() && y[j] != b'_' && !is_digit(y[j]) { j += 1; }
+        let ra = &x[si..i];
+        let rb = &y[sj..j];
+        let mut k = 0;
+        while k < ra.len() && k < rb.len() {
+            if ra[k] != rb[k] { return if ra[k] < rb[k] { -1 } else { 1 }; }
+            k += 1;
+        }
+        if ra.len() != rb.len() { return if ra.len() < rb.len() { -1 } else { 1 }; }
+    }
+}
+
+fn is_digit(c: u8) -> bool { c >= b'0' && c <= b'9' }

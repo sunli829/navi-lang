@@ -1,0 +1,268 @@
+//! navic fmt: formats navi source as rustfmt formats Rust (its default
+//! configuration, 2024 style).
+
+pub mod ctx;
+mod lists;
+mod overflow;
+mod expr;
+mod chains;
+mod closures;
+mod types;
+mod pats;
+mod items;
+mod imports;
+mod verify;
+mod comments;
+
+use std::fs;
+use crate::syntax::source::{File, Errors};
+use crate::syntax::{lexer, parser};
+use crate::util;
+use crate::fmt::ctx::Ctx;
+
+/// The formatted text of a source file, or its syntax errors.
+pub fn format_source(name: &str, src: String) -> Result<String, String> {
+    let f = File::new(name, src);
+    let (sf, errs) = parser::parse_file(f);
+    if errs.len() > 0 { return Err(errs.to_string()); }
+    let toks = lexer::tokenize(f.src.as_str(), Errors::new(f));
+    let cx = Ctx::new(f, toks);
+    let body = cx.items_body(&sf.attrs, &sf.items, 0, f.src.len() as i32, 0, false);
+    let mut out = body.trim_start_matches('\n').to_string();
+    if out.len() > 0 { out.push('\n'); }
+    // What comes out must parse.
+    let g = File::new(name, out.clone());
+    let (sf2, errs2) = parser::parse_file(g);
+    if errs2.len() > 0 { return Err(`${name}: internal error: the formatted text does not parse:\n${errs2.to_string()}`); }
+    // And mean what the source does.
+    let d1 = crate::syntax::dump::dump_file(sf);
+    let d2 = crate::syntax::dump::dump_file(sf2);
+    if !verify::same_dump(d1.as_str(), d2.as_str()) {
+        if std::env::var("NAVI_FMT_DEBUG").is_ok() {
+            eprintln(verify::canon(d1.as_str()));
+            eprintln(verify::canon(d2.as_str()));
+        }
+        return Err(`${name}: internal error: formatting would change the program; the file is left as it is`);
+    }
+    Ok(out)
+}
+
+/// navic fmt [--check] [--comment-width N] [path...]: formats the files
+/// of crates (a directory) or files and the modules they declare, in
+/// place. With --check, lists the files that would change instead (and
+/// exits 1 if any would). With -, formats standard input to standard
+/// output. Comments wrap at column N: the flag, else comment_width in the
+/// [fmt] table of the nearest navi.toml, else 80.
+pub fn fmt_command(args: &Vec<String>) -> i32 {
+    let mut check = false;
+    let mut stdin = false;
+    let mut width: Option<usize> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--check" {
+            check = true;
+        } else if a == "--comment-width" && i + 1 < args.len() {
+            match args[i + 1].parse::<usize>() {
+                Ok(n) => width = Some(n),
+                Err(_) => {
+                    eprintln(`navic fmt: bad --comment-width ${util::quote(args[i + 1].as_str())}`);
+                    return 2;
+                }
+            }
+            i += 1;
+        } else if a == "-" {
+            stdin = true;
+        } else if a.starts_with("-") {
+            eprintln(`navic fmt: unknown flag ${util::quote(a.as_str())}`);
+            eprintln("usage: navic fmt [--check] [--comment-width N] [path...]");
+            return 2;
+        } else {
+            paths.push(a.clone());
+        }
+        i += 1;
+    }
+    if stdin {
+        comments::set_comment_width(match width { Some(w) => w, None => config_width(".") });
+        return fmt_stdin();
+    }
+    if paths.len() == 0 { paths.push(".".to_string()); }
+    let mut files: Vec<String> = Vec::new();
+    for p in paths.iter() {
+        let path = std::path::Path::new(p.as_str());
+        if !path.exists() {
+            eprintln(`navic fmt: ${p}: no such file or directory`);
+            return 2;
+        }
+        if path.is_dir() {
+            let mut found = false;
+            for root in ["src/main.navi", "src/lib.navi"].iter() {
+                let r = util::path_join(p.as_str(), *root);
+                if std::path::Path::new(r.as_str()).exists() {
+                    collect(r.as_str(), true, &mut files);
+                    found = true;
+                }
+            }
+            if !found {
+                eprintln(`navic fmt: ${p}: no src/main.navi or src/lib.navi`);
+                return 2;
+            }
+        } else {
+            collect(p.as_str(), true, &mut files);
+        }
+    }
+    let mut code = 0;
+    for f in files.iter() {
+        let src = match fs::read_to_string(f.as_str()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln(`navic fmt: ${f}: ${e}`);
+                code = 1;
+                continue;
+            }
+        };
+        comments::set_comment_width(match width { Some(w) => w, None => config_width(util::path_dir(f.as_str()).as_str()) });
+        let out = match format_source(f.as_str(), src.clone()) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln(e);
+                code = 1;
+                continue;
+            }
+        };
+        if out == src { continue; }
+        if check {
+            println(`Diff in ${f}:`);
+            print_diff(src.as_str(), out.as_str());
+            code = 1;
+            continue;
+        }
+        if let Err(e) = fs::write(f.as_str(), out.as_str()) {
+            eprintln(`navic fmt: ${f}: ${e}`);
+            code = 1;
+        }
+    }
+    code
+}
+
+/// The formatted text of a file with the comment width its crate's
+/// navi.toml sets (for navic lsp).
+pub fn format_file(path: &str, src: String) -> Result<String, String> {
+    comments::set_comment_width(config_width(util::path_dir(path).as_str()));
+    format_source(path, src)
+}
+
+fn fmt_stdin() -> i32 {
+    let src = match fs::read_to_string("/dev/stdin") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(`navic fmt: stdin: ${e}`);
+            return 1;
+        }
+    };
+    match format_source("<stdin>", src) {
+        Ok(o) => {
+            print(o);
+            0
+        }
+        Err(e) => {
+            eprintln(e);
+            1
+        }
+    }
+}
+
+// comment_width in the [fmt] table of the navi.toml in dir or the nearest
+// directory above it, or the default.
+fn config_width(dir: &str) -> usize {
+    let mut d = util::path_clean(dir);
+    loop {
+        let toml = util::path_join(d.as_str(), "navi.toml");
+        if let Ok(m) = fs::read_to_string(toml.as_str()) {
+            let mut in_fmt = false;
+            for raw in m.lines() {
+                let line = raw.trim();
+                if line.starts_with("[") {
+                    in_fmt = line == "[fmt]";
+                    continue;
+                }
+                if !in_fmt { continue; }
+                if let Some((k, v)) = line.split_once('=') {
+                    if k.trim() == "comment_width" {
+                        if let Ok(n) = v.trim().parse::<usize>() { return n; }
+                    }
+                }
+            }
+            return comments::DEFAULT_COMMENT_WIDTH;
+        }
+        let up = util::path_dir(d.as_str());
+        if up == d || d == "." || d == "/" || d.len() == 0 { break; }
+        d = up;
+    }
+    comments::DEFAULT_COMMENT_WIDTH
+}
+
+// Adds path and the files of the modules it declares (out of line, also
+// inside inline modules) to files.
+fn collect(path: &str, is_root: bool, files: &mut Vec<String>) {
+    for f in files.iter() {
+        if f == path { return; }
+    }
+    files.push(path.to_string());
+    let src = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let f = File::new(path, src);
+    let (sf, errs) = parser::parse_file(f);
+    if errs.len() > 0 { return; }
+    let base = util::path_base(path);
+    let dir = if is_root || base == "mod.navi" || base == "main.navi" || base == "lib.navi" {
+        util::path_dir(path)
+    } else {
+        util::path_join(util::path_dir(path).as_str(), &base[0..base.len() - 5])
+    };
+    collect_mods(&sf.items, dir.as_str(), files);
+}
+
+fn collect_mods(items: &Vec<crate::syntax::ast::Item>, dir: &str, files: &mut Vec<String>) {
+    for it in items.iter() {
+        if let crate::syntax::ast::Item::Mod(m) = it {
+            let name = m.name.value.as_str();
+            if m.inline {
+                collect_mods(&m.items, util::path_join(dir, name).as_str(), files);
+                continue;
+            }
+            let a = util::path_join(dir, `${name}.navi`.as_str());
+            let b = util::path_join(util::path_join(dir, name).as_str(), "mod.navi");
+            if std::path::Path::new(a.as_str()).exists() {
+                collect(a.as_str(), false, files);
+            } else if std::path::Path::new(b.as_str()).exists() {
+                collect(b.as_str(), false, files);
+            }
+        }
+    }
+}
+
+// Prints the lines that differ, with a line of context (a simple diff:
+// the changed region between the common head and tail).
+fn print_diff(a: &str, b: &str) {
+    let x: Vec<&str> = a.split('\n').collect();
+    let y: Vec<&str> = b.split('\n').collect();
+    let mut head = 0;
+    while head < x.len() && head < y.len() && x[head] == y[head] { head += 1; }
+    let mut tail = 0;
+    while tail < x.len() - head && tail < y.len() - head && x[x.len() - 1 - tail] == y[y.len() - 1 - tail] { tail += 1; }
+    println(`@@ line ${head + 1}`);
+    let mut i = head;
+    while i < x.len() - tail {
+        println(`-${x[i]}`);
+        i += 1;
+    }
+    let mut j = head;
+    while j < y.len() - tail {
+        println(`+${y[j]}`);
+        j += 1;
+    }
+}

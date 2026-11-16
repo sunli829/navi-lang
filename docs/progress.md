@@ -241,6 +241,51 @@
   - 函数粒度的增量缓存（需要序列化类型和 MIR）；现在只有整个构建的缓存。
   - 冷编译与 go build 持平（见上面的数字）。
 
+## navic fmt（格式化工具）
+
+- 用法：`navic fmt [--check] [--comment-width N] [路径...]`。路径是 crate 目录时从 `src/main.navi` / `src/lib.navi` 开始，是文件时从这个文件开始，都会顺着 `mod x;` 把子模块一起格式化（同 rustfmt）。不给路径时格式化当前目录的 crate。`--check` 只列出会变的文件和改动，有改动时退出码为 1。`navic fmt -` 从标准输入读、向标准输出写（只支持有 `/dev/stdin` 的系统）。
+- 注释折行（师傅定的，默认打开；rustfmt 的 `wrap_comments` 默认关闭）：超过注释宽度的 `//`、`///`、`//!` 注释在空格处折行，折下来的部分接到同一段的下一行（同 rustfmt 的 `wrap_comments`）。代码块、缩进 4 格的内容、标题、表格、引用不动；列表项的续行对齐到文字；`// --- 小节 -----` 这种带一串重复符号的分隔行不折（rustfmt 会折开）；写在代码后面的行尾注释和 `/* */` 不折。注释宽度从行首算，默认 80（同 rustfmt 的 `comment_width`），可以在 crate 的 `navi.toml` 里用 `[fmt]` 表的 `comment_width = N` 设置（从文件所在目录往上找最近的 navi.toml），命令行的 `--comment-width N` 优先。
+- 其余风格完全照 rustfmt 的默认配置，2024 风格：最大宽度 100，缩进 4 格，各种宽度阈值相同（参数列表 60、结构体字面量 18、枚举结构体变体 35、链式调用 60、单行 if-else 50）；`use` 和 `mod x;` 按版本序排序，`use` 树会规范化；`loop`/`while`/`for` 后的分号去掉；块末尾的 `return`/`break`/`continue` 补上分号。
+- 实现在 `compiler/src/fmt/`，按 rustfmt 的结构移植：Shape（首行剩余宽度和续行缩进）、lists（横排/竖排/混排，行尾注释对齐）、overflow（最后一个参数溢出到后面几行）、chains、closures、`choose_rhs`（赋值右边放同一行还是下一行）、matches、items（函数签名、结构体、枚举、impl、trait、where）、imports。
+  - 复用编译器的 lexer 和 parser，编译路径不受影响。注释不在 AST 里：格式化器从 token 之间的空隙取出注释，再按位置放回。列表、块、条目之间、else 前后的注释都会被格式化；其他位置有注释的节点原样保留（rustfmt 也是这样）。
+  - 节点只记录了起点，终点由 token 表算出（括号配对、泛型的 `<>`）。
+  - 解构赋值被 parser 改写成了 let 块，格式化时识别出来，按原来的写法打印左边。
+  - navi 特有的语法：`defer` 按语句处理；`select` 按 match 的规则处理；模板字符串和普通字符串一样原样保留（同 rustfmt 2024，单行字符串不受宽度限制）。
+- 安全检查：格式化结果必须能重新解析，并且 AST dump（`syntax::dump`）与原文件一致；比较前两边都抹掉格式化允许的改动（use 和 mod 的顺序、use 树的形状、包住单个表达式的花括号、循环后和 return 处的分号、空语句、重复的括号）。不一致就报内部错误，文件保持不动。
+- 验证：
+  - 对照 rustfmt 1.11（`--edition 2024`，navic fmt 用 `--comment-width 1000` 关掉注释折行，因为 stable 的 rustfmt 不能打开 `wrap_comments`）：仓库里 rustfmt 能解析的 176 个文件（把单行模板字符串换成等宽的普通字符串），175 个与 rustfmt 的输出逐字节相同。剩下一个是 rustfmt 排序 `use` 时把行尾注释挪到了别的行上，navic fmt 让注释跟着原来那一行。
+  - 仓库的全部 `.navi` 文件都能格式化（按默认的注释宽度），通过安全检查，格式化两遍结果不变（只有一个故意写错语法的测试文件不能格式化）。
+  - `tests/fmt/` 是格式化的测试用例（`x.navi` 格式化成 `x.out`，`x.out` 保持不变），由 `tools/navictest.sh` 运行，它也检查 `--check` 和 `comment_width` 的配置；`items`、`exprs` 两个用例也与 rustfmt 的输出相同。
+- 没做的：行尾注释和块注释的折行；链式调用中间、二元运算中间这些位置有注释时节点原样保留；配置文件（rustfmt.toml）。仓库自己的代码还没有用 navic fmt 格式化过。
+
+## navic lsp（语言服务器）
+
+- `navic lsp`：用标准输入输出说 LSP（JSON-RPC，`Content-Length` 分帧），全部用 navi 写，在编译器前端上实现，代码在 `compiler/src/lsp/`。
+- 功能：
+  - 诊断：打开、修改、保存时分析文档所在的 crate，发出编译器的错误和警告（范围是整个 token）；std 的不发。
+  - 格式化：`textDocument/formatting` 调 `navic fmt`（注释宽度照 crate 的 navi.toml）。
+  - 跳转到定义、类型定义、实现（trait 或类型的 impl；trait 方法的各个实现）；查找引用；同一文件里的高亮；重命名（含 prepareRename，只允许改本 crate 里定义的东西，结构体字面量和模式里的字段简写会改成 `x: new`）。
+  - 悬停：定义的声明（照源码，到函数体为止）和它上面的 `///` 文档，模块的 `//!` 文档；局部变量和字段显示类型；基本类型。
+  - 文档符号（层级：impl 和 trait 的条目、枚举变体、结构体字段）、工作区符号。
+  - 补全：`值.` 列出字段和方法（固有 impl、trait impl 和 trait 的默认方法，引用会自动解引用）；`路径::` 列出模块成员、枚举变体、关联函数；否则列出当前函数里此前声明的局部变量、模块里的名字、prelude 和关键字。
+  - 函数签名提示：当前实参高亮，方法调用跳过 self。
+  - 类型内嵌提示：没写类型的 let、for、if let 绑定。
+  - 折叠：括号块、连续的注释、连续的 use。语义高亮：关键字、字符串、数字、注释、标签，以及按解析结果分类的名字（模块、类型、结构体、枚举、trait、类型参数、变量、字段、枚举变体、函数、方法）。
+- 实现：
+  - 分析就是 `driver::check_specs`（解析、名字解析、类型检查，`cfg(test)` 打开），打开的文档通过 `cache::OVERLAY` 代替磁盘上的文件（`resolve` 读源文件时先查它）。连续的修改合并成一次分析：读消息的线程把消息放进通道，主循环一次取完再分析；请求要用到过期的分析时先重新分析。前端或请求崩溃（panic）时用 `catch_unwind` 接住，只回一个错误。
+  - 文档所在的 crate：往上找最近的有 navi.toml、src/main.navi 或 src/lib.navi 的目录；文档不在这个 crate 的模块树里时当作单文件 crate。std 的位置：`$NAVI_STD`，否则往上找 `lib/std`，否则在 navic 旁边找。
+  - `lsp/index.navi` 把一个文件里每个名字指向什么（定义、局部变量、字段、基本类型）记下来：路径用 `resolve::Info.paths`（前面的段按父定义的名字对应），方法调用和 `Vec::new` 这类类型相关的路径用类型检查的 callees，字段用接收者的类型，use 里的名字用模块的绑定。std 的函数体按需检查（`Info::body`）。跳转、引用、重命名、悬停、语义高亮、补全都用这个索引。
+  - 内存：每份分析都带一整份 std，所以只留最近 4 个 crate 的分析，文档全部关闭的 crate 立即丢掉；GC 节奏改回默认（编译时是 200%）。
+  - 速度（M 系列 Mac）：小 crate 一次分析约 70ms，编译器自己（约 4 万行，加 std）约 0.6s。
+- 验证：
+  - `tests/lsp/session.jsonl` 是录下的一次会话（每行一条消息，仓库路径写成 `@ROOT@`），覆盖上面的每个功能和一次带错误的编辑，`tools/navictest.sh` 把它喂给 `navic lsp` 并和 `tests/lsp/session.out` 比较。
+  - 压力测试：仓库的 203 个文件逐个打开，每个文件请求语义高亮、符号、折叠、内嵌提示，并在随机的名字上请求悬停、跳转、补全、签名、高亮、引用，共 13175 次请求，没有错误；抽查的非关键字名字都有悬停结果。
+- 编辑器配置（服务器命令都是 `navic lsp`，必要时设 `NAVI_STD`）：
+  - Neovim：`vim.lsp.start({ name = "navic", cmd = { "navic", "lsp" }, root_dir = vim.fs.root(0, { "navi.toml", "src" }) })`，文件类型 `navi`。
+  - Helix（languages.toml）：`[language-server.navic] command = "navic"` 和 `args = ["lsp"]`，再加一个 `[[language]] name = "navi"`、`file-types = ["navi"]`、`language-servers = ["navic"]`。
+  - VS Code 需要一个通用 LSP 客户端扩展（仓库里没有带）。
+- 没做的：Windows（读标准输入用的是 `/dev/stdin`）；代码操作（code actions）、调用层级；增量分析（每次都整个 crate 加 std 重新分析）；补全只认得局部变量、字段、方法调用结果这类接收者，泛型参数上的方法不补全。
+
 ## 下一步
 
 1. 冷编译提速：剩下的串行部分（plan 的按序遍历、codegen 合并之后的 gen_data、链接）；GC 标记占约四分之一 CPU（保守扫描，生成的代码不做寄存器分配）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。

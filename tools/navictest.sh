@@ -56,4 +56,52 @@ if [ "$("$navic" bench tests/harness 2>&1 | grep -c ' ns/iter ')" = 2 ]; then
 else
 	echo "FAIL navic bench tests/harness"; fail=1
 fi
+# navic fmt: tests/fmt/x.navi formats to x.out, which stays as it is;
+# --check reports a file that would change and passes one that would not.
+for f in tests/fmt/*.navi; do
+	want="${f%.navi}.out"
+	if "$navic" fmt - < "$f" > "$tmp/fmt.out" 2>&1 && cmp -s "$tmp/fmt.out" "$want" \
+		&& "$navic" fmt - < "$want" > "$tmp/fmt2.out" 2>&1 && cmp -s "$tmp/fmt2.out" "$want"; then
+		echo "ok   navic fmt $f"
+	else
+		echo "FAIL navic fmt $f"; diff "$want" "$tmp/fmt.out" | head -20; fail=1
+	fi
+done
+cp tests/fmt/exprs.navi "$tmp/check.navi"
+set +e
+"$navic" fmt --check "$tmp/check.navi" > /dev/null 2>&1; c1=$?
+"$navic" fmt "$tmp/check.navi" > /dev/null 2>&1; c2=$?
+"$navic" fmt --check "$tmp/check.navi" > /dev/null 2>&1; c3=$?
+set -e
+if [ "$c1" = 1 ] && [ "$c2" = 0 ] && [ "$c3" = 0 ] && cmp -s "$tmp/check.navi" tests/fmt/exprs.out; then
+	echo "ok   navic fmt --check"
+else
+	echo "FAIL navic fmt --check ($c1 $c2 $c3)"; fail=1
+fi
+# comment_width from navi.toml's [fmt] table, and --comment-width over it.
+mkdir -p "$tmp/cw/src"
+printf '[package]\nname = "cw"\n\n[fmt]\ncomment_width = 40\n' > "$tmp/cw/navi.toml"
+long='// one two three four five six seven eight nine ten'
+printf '%s\nfn main() {}\n' "$long" > "$tmp/cw/src/main.navi"
+"$navic" fmt --comment-width 100 "$tmp/cw" > /dev/null 2>&1
+w100=$(cat "$tmp/cw/src/main.navi")
+"$navic" fmt "$tmp/cw" > /dev/null 2>&1
+w40=$(cat "$tmp/cw/src/main.navi")
+if [ "$w100" = "$(printf '%s\nfn main() {}' "$long")" ] \
+	&& [ "$w40" = "$(printf '// one two three four five six seven\n// eight nine ten\nfn main() {}')" ]; then
+	echo "ok   navic fmt comment_width"
+else
+	echo "FAIL navic fmt comment_width"; echo "$w100"; echo "$w40"; fail=1
+fi
+# navic lsp: the recorded session tests/lsp/session.jsonl (one message a
+# line, the repository's path as @ROOT@) answers as tests/lsp/session.out.
+root=$(pwd)
+sed "s#@ROOT@#$root#g" tests/lsp/session.jsonl | LC_ALL=C awk '{ printf "Content-Length: %d\r\n\r\n%s", length($0), $0 }' \
+	| NAVI_STD="$root/lib/std" "$navic" lsp 2>/dev/null | perl -0777 -pe 's/Content-Length: \d+\r\n\r\n/\n/g' \
+	| sed "s#$root#@ROOT@#g" | sed '/^$/d' > "$tmp/lsp.out"
+if cmp -s "$tmp/lsp.out" tests/lsp/session.out; then
+	echo "ok   navic lsp tests/lsp/session.jsonl"
+else
+	echo "FAIL navic lsp tests/lsp/session.jsonl"; diff tests/lsp/session.out "$tmp/lsp.out" | head -20; fail=1
+fi
 exit $fail

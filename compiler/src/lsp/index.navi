@@ -1,0 +1,619 @@
+//! What each name in a file refers to: a walk over its AST with the
+//! resolver's paths and bindings and the type checker's bodies.
+
+use crate::syntax::source::{File, Pos};
+use crate::syntax::ast::*;
+use crate::resolve::{Def, Local};
+use crate::types::collect::Info;
+use crate::types::body::BodyInfo;
+use crate::types::Type;
+use crate::lsp::analysis::token_end;
+
+/// What a name refers to.
+#[derive(Clone)]
+pub enum Target {
+    Def(&mut Def),
+    Local(&mut Local),
+    /// A field of a struct or variant (its definition).
+    Field(&mut Def, String),
+    /// A primitive type.
+    Prim(String),
+}
+
+impl Target {
+    pub fn same(&self, o: &Target) -> bool {
+        match (self, o) {
+            (Target::Def(a), Target::Def(b)) => a.id == b.id,
+            (Target::Local(a), Target::Local(b)) => a.id == b.id,
+            (Target::Field(a, x), Target::Field(b, y)) => a.id == b.id && x == y,
+            (Target::Prim(a), Target::Prim(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// A name and what it refers to.
+#[derive(Clone)]
+pub struct Ref {
+    pub lo: Pos,
+    pub hi: Pos,
+    pub target: Target,
+    /// The name is where the thing is declared.
+    pub decl: bool,
+    /// The type of the expression or binding, when known.
+    pub ty: Option<&Type>,
+    /// The function whose body it is in.
+    pub owner: Option<&mut Def>,
+}
+
+pub struct FileIndex {
+    pub refs: Vec<Ref>,
+    /// The bodies of functions: (start, end, function).
+    pub bodies: Vec<(Pos, Pos, &mut Def)>,
+}
+
+impl FileIndex {
+    /// The references whose name covers off (innermost first: the last
+    /// recorded).
+    pub fn at(&self, off: Pos) -> Vec<Ref> {
+        let mut out = Vec::new();
+        for r in self.refs.iter() {
+            if r.lo <= off && off <= r.hi { out.push(r.clone()); }
+        }
+        out
+    }
+
+    /// The function whose body holds off.
+    pub fn body_at(&self, off: Pos) -> Option<&mut Def> {
+        let mut best: Option<&mut Def> = None;
+        let mut best_len: Pos = -1;
+        for b in self.bodies.iter() {
+            let (lo, hi, d) = *b;
+            if lo <= off && off <= hi && (best_len < 0 || hi - lo < best_len) {
+                best = Some(d);
+                best_len = hi - lo;
+            }
+        }
+        best
+    }
+}
+
+/// Indexes a file.
+pub fn index_file(info: &mut Info, sf: &SourceFile) -> &mut FileIndex {
+    let toks = crate::syntax::lexer::tokenize(sf.file.src.as_str(), crate::syntax::source::Errors::new(sf.file));
+    let fx = crate::fmt::ctx::Ctx::new(sf.file, toks);
+    let mut module: Option<&mut crate::resolve::Module> = None;
+    for c in info.res.crates.iter() {
+        if let Some(r) = c.root {
+            if let Some(m) = module_of(r, sf.file.name.as_str()) { module = Some(m); }
+        }
+    }
+    let w = &mut W { info, src: sf.file.src.as_str(), file: sf.file, fx, refs: Vec::new(), bodies: Vec::new(), body: None, owner: None, module };
+    w.items(&sf.items);
+    w.refs.sort_by(|a, b| a.lo.cmp(&b.lo));
+    &mut FileIndex { refs: w.refs, bodies: w.bodies }
+}
+
+struct W {
+    info: &mut Info,
+    src: &str,
+    file: &File,
+    fx: &crate::fmt::ctx::Ctx,
+    refs: Vec<Ref>,
+    bodies: Vec<(Pos, Pos, &mut Def)>,
+    body: Option<&mut BodyInfo>,
+    owner: Option<&mut Def>,
+    /// The module whose items are being walked (for use items).
+    module: Option<&mut crate::resolve::Module>,
+}
+
+/// The module a file holds.
+pub fn module_of(m: &mut crate::resolve::Module, file: &str) -> Option<&mut crate::resolve::Module> {
+    if let Some(f) = m.file {
+        if f.name == file && !m.anonymous { return Some(m); }
+    }
+    for c in m.children.iter() {
+        if let Some(x) = module_of(*c, file) { return Some(x); }
+    }
+    None
+}
+
+impl W {
+    fn add(&mut self, pos: Pos, target: Target, decl: bool, ty: Option<&Type>) {
+        if pos < 0 || pos as usize >= self.src.len() { return; }
+        let hi = token_end(self.src, pos as usize) as Pos;
+        self.refs.push(Ref { lo: pos, hi, target, decl, ty, owner: self.owner });
+    }
+
+    fn def_of(&self, id: u32) -> Option<&mut Def> {
+        match self.info.res.def_of.get(&id) {
+            Some(d) => Some(*d),
+            None => None,
+        }
+    }
+
+    fn items(&mut self, items: &Vec<Item>) {
+        for it in items.iter() { self.item(it); }
+    }
+
+    fn item(&mut self, it: &Item) {
+        let def = self.def_of(it.id());
+        let saved_body = self.body;
+        let saved_owner = self.owner;
+        match it {
+            Item::Fn(f) => {
+                if let Some(d) = def { self.add(f.name.pos, Target::Def(d), true, None); }
+                self.generics(f.generics);
+                if let Some(d) = def {
+                    self.owner = Some(d);
+                    self.body = self.body_of(d);
+                }
+                for p in f.params.iter() {
+                    self.pat(p.pat);
+                    if let Some(t) = p.ty { self.typ(t); }
+                }
+                if let Some(r) = f.result { self.typ(r); }
+                if let Some(b) = f.body {
+                    if let Some(d) = def { self.bodies.push((it.pos(), self.fx.expr_end(b), d)); }
+                    self.expr(b);
+                }
+            }
+            Item::Struct(s) => {
+                if let Some(d) = def { self.add(s.name.pos, Target::Def(d), true, None); }
+                self.generics(s.generics);
+                self.fields(&s.fields, def);
+            }
+            Item::Enum(e) => {
+                if let Some(d) = def { self.add(e.name.pos, Target::Def(d), true, None); }
+                self.generics(e.generics);
+                for v in e.variants.iter() {
+                    let vd = self.def_of(v.id);
+                    if let Some(d) = vd { self.add(v.name.pos, Target::Def(d), true, None); }
+                    self.fields(&v.fields, vd);
+                    if let Some(x) = v.discriminant { self.expr(x); }
+                }
+            }
+            Item::TypeAlias(t) => {
+                if let Some(d) = def { self.add(t.name.pos, Target::Def(d), true, None); }
+                self.generics(t.generics);
+                for b in t.bounds.iter() { self.path(*b, None); }
+                if let Some(ty) = t.ty { self.typ(ty); }
+            }
+            Item::Const(c) => {
+                if let Some(d) = def {
+                    self.add(c.name.pos, Target::Def(d), true, None);
+                    self.owner = Some(d);
+                    self.body = self.body_of(d);
+                }
+                self.typ(c.ty);
+                if let Some(v) = c.value { self.expr(v); }
+            }
+            Item::Static(s) => {
+                if let Some(d) = def {
+                    self.add(s.name.pos, Target::Def(d), true, None);
+                    self.owner = Some(d);
+                    self.body = self.body_of(d);
+                }
+                self.typ(s.ty);
+                if let Some(v) = s.value { self.expr(v); }
+            }
+            Item::Impl(im) => {
+                self.generics(im.generics);
+                if let Some(tp) = im.trait_path { self.path(tp, None); }
+                self.typ(im.ty);
+                self.items(&im.items);
+            }
+            Item::Trait(t) => {
+                if let Some(d) = def { self.add(t.name.pos, Target::Def(d), true, None); }
+                self.generics(t.generics);
+                for b in t.supers.iter() { self.path(*b, None); }
+                self.items(&t.items);
+            }
+            Item::Mod(m) => {
+                if let Some(d) = def { self.add(m.name.pos, Target::Def(d), true, None); }
+                let saved = self.module;
+                if let Some(cur) = self.module {
+                    for c in cur.children.iter() {
+                        if c.name == m.name.value { self.module = Some(*c); }
+                    }
+                }
+                self.items(&m.items);
+                self.module = saved;
+            }
+            Item::Use(u) => {
+                let mut prefix: Vec<&Name> = Vec::new();
+                self.use_tree(u.tree, &mut prefix);
+            }
+            Item::Extern(e) => self.items(&e.items),
+        }
+        self.body = saved_body;
+        self.owner = saved_owner;
+    }
+
+    // The names of a use tree: what the module's binding for each imported
+    // name is, and its parents for the segments before.
+    fn use_tree(&mut self, t: &UseTree, prefix: &mut Vec<&Name>) {
+        let n0 = prefix.len();
+        if let Some(p) = t.prefix {
+            for s in p.segments.iter() { prefix.push(s.name); }
+        }
+        if t.group {
+            for c in t.children.iter() { self.use_tree(*c, prefix); }
+        } else if !t.glob && prefix.len() > 0 {
+            let last = prefix[prefix.len() - 1];
+            let bound = match t.alias { Some(a) => a.value.clone(), None => last.value.clone() };
+            let mut def: Option<&mut Def> = None;
+            if let Some(m) = self.module {
+                let mut b = m.lookup(bound.as_str(), crate::resolve::TYPE_NS);
+                if b.is_none() { b = m.lookup(bound.as_str(), crate::resolve::VALUE_NS); }
+                if let Some(x) = b { def = x.res.def; }
+            }
+            if let Some(d0) = def {
+                let mut d = d0;
+                let mut i = prefix.len() - 1;
+                if last.value == "self" {
+                    if i == 0 { return; }
+                    i -= 1;
+                }
+                self.add(prefix[i].pos, Target::Def(d), false, None);
+                if let Some(a) = t.alias { self.add(a.pos, Target::Def(d), false, None); }
+                while i > 0 {
+                    i -= 1;
+                    let name = prefix[i].value.as_str();
+                    if name == "self" || name == "super" || name == "crate" { continue; }
+                    let mut found: Option<&mut Def> = None;
+                    let mut cur = d.parent;
+                    loop {
+                        match cur {
+                            Some(c) => {
+                                if c.name == name {
+                                    found = Some(c);
+                                    break;
+                                }
+                                cur = c.parent;
+                            }
+                            None => break,
+                        }
+                    }
+                    match found {
+                        Some(f) => {
+                            self.add(prefix[i].pos, Target::Def(f), false, None);
+                            d = f;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        prefix.truncate(n0);
+    }
+
+    // The checked body of d (std's are checked when first asked for).
+    fn body_of(&mut self, d: &mut Def) -> Option<&mut BodyInfo> {
+        if let Some(b) = self.info.bodies.get(&d.id) { return Some(*b); }
+        let info = self.info;
+        match std::panic::catch_unwind(|| info.body(d)) {
+            Ok(b) => b,
+            Err(_) => None,
+        }
+    }
+
+    fn fields(&mut self, fields: &Vec<&Field>, owner: Option<&mut Def>) {
+        for f in fields.iter() {
+            if let Some(n) = f.name {
+                if let Some(d) = owner { self.add(n.pos, Target::Field(d, n.value.clone()), true, None); }
+            }
+            self.typ(f.ty);
+        }
+    }
+
+    fn generics(&mut self, g: &Generics) {
+        for p in g.params.iter() {
+            if let Some(d) = self.def_of(p.id) { self.add(p.name.pos, Target::Def(d), true, None); }
+            for b in p.bounds.iter() { self.path(*b, None); }
+            if let Some(d) = p.default { self.typ(d); }
+            if let Some(t) = p.ty { self.typ(t); }
+        }
+        for w in g.wheres.iter() {
+            self.typ(w.ty);
+            for b in w.bounds.iter() { self.path(*b, None); }
+        }
+    }
+
+    fn typ(&mut self, t: &crate::syntax::ast::Type) {
+        match &t.kind {
+            TypeKind::Path(p) => self.path(*p, None),
+            TypeKind::Ref { elem, .. } => self.typ(*elem),
+            TypeKind::Ptr { elem, .. } => self.typ(*elem),
+            TypeKind::Slice { elem, .. } => self.typ(*elem),
+            TypeKind::Array { elem, len, .. } => {
+                self.typ(*elem);
+                self.expr(*len);
+            }
+            TypeKind::Tuple { elems, .. } => { for e in elems.iter() { self.typ(*e); } }
+            TypeKind::Fn { params, result, .. } => {
+                for e in params.iter() { self.typ(*e); }
+                if let Some(r) = result { self.typ(*r); }
+            }
+            TypeKind::Dyn { bounds, .. } => { for b in bounds.iter() { self.path(*b, None); } }
+            TypeKind::Impl { bounds, .. } => { for b in bounds.iter() { self.path(*b, None); } }
+            TypeKind::Const(x) => self.expr(*x),
+            _ => {}
+        }
+    }
+
+    // The segments of a path: the last names what it resolved to, the ones
+    // before name its parents; the rest the type checker resolved.
+    fn path(&mut self, p: &Path, x: Option<&Expr>) {
+        if let Some(q) = p.qself {
+            self.typ(q.ty);
+            if let Some(tp) = q.trait_path { self.path(tp, None); }
+        }
+        for s in p.segments.iter() {
+            if let Some(ga) = s.args {
+                for t in ga.args.iter() { self.typ(*t); }
+                for b in ga.bindings.iter() { self.typ(b.ty); }
+            }
+        }
+        let ty = match x {
+            Some(e) => match self.body { Some(b) => match b.types.get(&e.id) { Some(t) => Some(*t), None => None }, None => None },
+            None => None,
+        };
+        let res = match self.info.res.paths.get(&p.id) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let n = p.segments.len();
+        if res.kind == crate::resolve::RES_PRIM {
+            self.add(p.segments[n - 1].name.pos, Target::Prim(res.prim.clone()), false, None);
+            return;
+        }
+        if let Some(l) = res.local {
+            let lt = match self.body { Some(b) => match b.locals.get(&l.id) { Some(t) => Some(*t), None => ty }, None => ty };
+            self.add(p.segments[n - 1].name.pos, Target::Local(l), false, lt);
+            return;
+        }
+        let rest = res.rest.len();
+        let mut d = match res.def {
+            Some(d) => d,
+            None => return,
+        };
+        // Type-relative segments (Vec::new): what the checker chose.
+        if rest > 0 {
+            if let Some(e) = x {
+                if let Some(b) = self.body {
+                    if let Some(c0) = b.callees.get(&e.id) {
+                        let c = *c0;
+                        self.add(p.segments[n - 1].name.pos, Target::Def(c.def), false, ty);
+                    }
+                }
+            }
+        }
+        if n < rest + 1 { return; }
+        let mut i = n - rest - 1;
+        let first_ty = if rest == 0 { ty } else { None };
+        self.add(p.segments[i].name.pos, Target::Def(d), false, first_ty);
+        // Parents by name.
+        while i > 0 {
+            i -= 1;
+            let name = p.segments[i].name.value.as_str();
+            if name == "self" || name == "super" || name == "crate" || name == "Self" { continue; }
+            let mut found: Option<&mut Def> = None;
+            let mut cur = d.parent;
+            loop {
+                match cur {
+                    Some(c) => {
+                        if c.name == name {
+                            found = Some(c);
+                            break;
+                        }
+                        cur = c.parent;
+                    }
+                    None => break,
+                }
+            }
+            match found {
+                Some(f) => {
+                    self.add(p.segments[i].name.pos, Target::Def(f), false, None);
+                    d = f;
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn expr(&mut self, x: &Expr) {
+        let ty = match self.body { Some(b) => match b.types.get(&x.id) { Some(t) => Some(*t), None => None }, None => None };
+        match &x.kind {
+            ExprKind::Path(p) => self.path(*p, Some(x)),
+            ExprKind::Template { parts, .. } => {
+                for pt in parts.iter() {
+                    if let Some(e) = pt.x { self.expr(e); }
+                }
+            }
+            ExprKind::Unary { x: e, .. } => self.expr(*e),
+            ExprKind::Ref { x: e, .. } => self.expr(*e),
+            ExprKind::Binary { x: a, y: b, .. } => {
+                self.expr(*a);
+                self.expr(*b);
+            }
+            ExprKind::Assign { x: a, y: b, .. } => {
+                self.expr(*a);
+                self.expr(*b);
+            }
+            ExprKind::Cast { x: e, ty: t } => {
+                self.expr(*e);
+                self.typ(*t);
+            }
+            ExprKind::Range { lo, hi, .. } => {
+                if let Some(e) = lo { self.expr(*e); }
+                if let Some(e) = hi { self.expr(*e); }
+            }
+            ExprKind::Call { fun, args, .. } => {
+                self.expr(*fun);
+                for a in args.iter() { self.expr(*a); }
+            }
+            ExprKind::MethodCall { recv, name, type_args, args } => {
+                self.expr(*recv);
+                if let Some(b) = self.body {
+                    if let Some(c0) = b.callees.get(&x.id) {
+                        let c = *c0;
+                        self.add(name.pos, Target::Def(c.def), false, ty);
+                    }
+                }
+                if let Some(ta) = type_args { for t in ta.args.iter() { self.typ(*t); } }
+                for a in args.iter() { self.expr(*a); }
+            }
+            ExprKind::Field { x: e, name } => {
+                self.expr(*e);
+                if let Some(d) = self.field_owner(*e) { self.add(name.pos, Target::Field(d, name.value.clone()), false, ty); }
+            }
+            ExprKind::Index { x: e, index, .. } => {
+                self.expr(*e);
+                self.expr(*index);
+            }
+            ExprKind::Try { x: e, .. } => self.expr(*e),
+            ExprKind::StructLit { path, fields, base } => {
+                self.path(*path, None);
+                let owner = match self.info.res.paths.get(&path.id) { Some(r) => r.def, None => None };
+                for f in fields.iter() {
+                    if let Some(d) = owner {
+                        let ft = match self.body { Some(b) => match b.types.get(&f.value.id) { Some(t) => Some(*t), None => None }, None => None };
+                        self.add(f.name.pos, Target::Field(d, f.name.value.clone()), false, ft);
+                    }
+                    // Shorthand: the value is the same name.
+                    self.expr(f.value);
+                }
+                if let Some(b) = base { self.expr(b); }
+            }
+            ExprKind::Tuple { elems, .. } => { for e in elems.iter() { self.expr(*e); } }
+            ExprKind::Paren { x: e, .. } => self.expr(*e),
+            ExprKind::Array { elems, .. } => { for e in elems.iter() { self.expr(*e); } }
+            ExprKind::ArrayRepeat { value, count, .. } => {
+                self.expr(*value);
+                self.expr(*count);
+            }
+            ExprKind::Block(b) => self.block(*b),
+            ExprKind::If { cond, then, els, .. } => {
+                self.expr(*cond);
+                self.expr(*then);
+                if let Some(e) = els { self.expr(*e); }
+            }
+            ExprKind::Let { pat, x: e, .. } => {
+                self.expr(*e);
+                self.pat(*pat);
+            }
+            ExprKind::Match { x: e, arms, .. } => {
+                self.expr(*e);
+                for a in arms.iter() {
+                    self.pat(a.pat);
+                    if let Some(g) = a.guard { self.expr(g); }
+                    self.expr(a.body);
+                }
+            }
+            ExprKind::Loop { body, .. } => self.expr(*body),
+            ExprKind::While { cond, body, .. } => {
+                self.expr(*cond);
+                self.expr(*body);
+            }
+            ExprKind::For { pat, iter, body, .. } => {
+                self.expr(*iter);
+                self.pat(*pat);
+                self.expr(*body);
+            }
+            ExprKind::Break { value, .. } => { if let Some(v) = value { self.expr(*v); } }
+            ExprKind::Return { value, .. } => { if let Some(v) = value { self.expr(*v); } }
+            ExprKind::Closure { params, result, body, .. } => {
+                for p in params.iter() {
+                    self.pat(p.pat);
+                    if let Some(t) = p.ty { self.typ(t); }
+                }
+                if let Some(r) = result { self.typ(*r); }
+                self.expr(*body);
+            }
+            ExprKind::Select { arms, .. } => {
+                for a in arms.iter() {
+                    if let Some(o) = a.op { self.expr(o); }
+                    if let Some(p) = a.pat { self.pat(p); }
+                    self.expr(a.body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The struct a field expression's receiver is (through references).
+    fn field_owner(&mut self, recv: &Expr) -> Option<&mut Def> {
+        let b = self.body?;
+        let mut t = *b.types.get(&recv.id)?;
+        loop {
+            if t.kind == crate::types::K_REF || t.kind == crate::types::K_PTR {
+                t = t.elem?;
+                continue;
+            }
+            break;
+        }
+        if t.kind == crate::types::K_ADT { return t.def; }
+        None
+    }
+
+    fn block(&mut self, b: &Block) {
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::Let(l) => {
+                    if let Some(i) = l.init { self.expr(i); }
+                    self.pat(l.pat);
+                    if let Some(t) = l.ty { self.typ(t); }
+                    if let Some(e) = l.els { self.expr(e); }
+                }
+                Stmt::Expr { x, .. } => self.expr(*x),
+                Stmt::Item(it) => self.item(it),
+                Stmt::Defer { x, .. } => self.expr(*x),
+                Stmt::Empty(_) => {}
+            }
+        }
+        if let Some(t) = b.tail { self.expr(t); }
+    }
+
+    fn pat(&mut self, p: &Pat) {
+        match &p.kind {
+            PatKind::Ident { name, sub, .. } => {
+                if let Some(r) = self.info.res.pat_consts.get(&p.id) {
+                    let rc = r.clone();
+                    if let Some(d) = rc.def { self.add(name.pos, Target::Def(d), false, None); }
+                } else if let Some(l) = self.info.res.bindings.get(&p.id) {
+                    let lc = *l;
+                    let lt = match self.body { Some(b) => match b.locals.get(&lc.id) { Some(t) => Some(*t), None => None }, None => None };
+                    self.add(name.pos, Target::Local(lc), true, lt);
+                }
+                if let Some(s) = sub { self.pat(*s); }
+            }
+            PatKind::Lit(x) => self.expr(*x),
+            PatKind::Range { lo, hi, .. } => {
+                if let Some(e) = lo { self.expr(*e); }
+                if let Some(e) = hi { self.expr(*e); }
+            }
+            PatKind::Path(q) => self.path(*q, None),
+            PatKind::Tuple { elems, .. } => { for e in elems.iter() { self.pat(*e); } }
+            PatKind::TupleStruct { path, elems } => {
+                self.path(*path, None);
+                for e in elems.iter() { self.pat(*e); }
+            }
+            PatKind::Struct { path, fields, .. } => {
+                self.path(*path, None);
+                let owner = match self.info.res.paths.get(&path.id) { Some(r) => r.def, None => None };
+                for f in fields.iter() {
+                    let shorthand = match &f.pat.kind { PatKind::Ident { name, .. } => name.pos == f.name.pos, _ => false };
+                    if let Some(d) = owner {
+                        if !shorthand { self.add(f.name.pos, Target::Field(d, f.name.value.clone()), false, None); }
+                    }
+                    self.pat(f.pat);
+                }
+            }
+            PatKind::Slice { elems, .. } => { for e in elems.iter() { self.pat(*e); } }
+            PatKind::Ref { pat, .. } => self.pat(*pat),
+            PatKind::Or(alts) => { for a in alts.iter() { self.pat(*a); } }
+            _ => {}
+        }
+    }
+}
