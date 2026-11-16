@@ -79,11 +79,29 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `Vec::drain` | 返回 `Drain<'_, T>` 惰性迭代器 | 立即移走元素，返回 `vec::IntoIter<T>` | 没有生命周期绑定的借用迭代器 |
 | `hash::DefaultHasher` | SipHash-1-3（抗哈希洪水） | FxHash（快，但不抗攻击） | 编译器式负载优先速度 |
 | `HashMap` 迭代顺序 | 随机种子 | 确定（取决于插入历史） | 便于编译器输出稳定 |
-| `str` 的模式参数 | `Pattern` 支持 `&str`、`char`、`&[char]`、闭包 | `std::str::pattern::Pattern` 支持 `&str`、`&String`、`char`、`fn(char) -> bool` | 未实现 `&[char]` |
+| `str` 的模式参数 | `Pattern` 支持 `&str`、`char`、`&[char]`、`[char; N]`、闭包 | `std::str::pattern::Pattern` 支持 `&str`、`&String`、`char`、`fn(char) -> bool`；navic 还支持 `&[char]`、`[char; N]`、`&[char; N]` | stage0 没有常量泛型 |
 | `f32` 解析 | 精确舍入 | 先精确解析成 `f64` 再转换（极少数情况下有两次舍入） | 简化 |
-| `str::matches` | 返回迭代器 | 只提供 `matches_count` | 简化 |
 | `BTreeSet::union` | `a.union(&b)` | `a.r#union(&b)` | `union` 在 navi 是保留字 |
 | `BTreeMap`/`BTreeSet` 的查找参数 | `get<Q>(&self, key: &Q) where K: Borrow<Q>`；`range<T, R: RangeBounds<T>>` | `get(&self, key: &K)`；`range<R: RangeBounds<K>>`（同 `HashMap`） | 没有 `Borrow` |
 | `BinaryHeap::peek_mut` | 返回 `PeekMut`，drop 时下沉 | 不提供；用 `pop` 再 `push` | 没有 Drop |
 | `BinaryHeap::into_sorted_vec` | 原地排序 | 返回排好序的新 Vec，堆本身不变 | 没有 move：原地排序会破坏仍共享缓冲区的堆 |
 | `BinaryHeap::drain` | 返回惰性 `Drain<'_, T>` | 立即取走，返回 `vec::IntoIter<T>` | 同 `Vec::drain` |
+| `str::matches` | 返回迭代器 | navic：迭代器（另有 `matches_count`）；stage0 编译的 std 只有 `matches_count` | 新增的方法只对 navic 开放 |
+
+## 7. 补全常用方法时新增的偏离
+
+str、String、切片、Vec、Iterator、Option、Result、char 和数值类型补全的方法（以及整数之间的 `From`/`TryFrom`、`std::f64::consts`/`std::f32::consts`、`std::num::{TryFromIntError, FpCategory}`、`std::array::IntoIter`、`std::cmp::Reverse`）都用 `#[cfg(feature = "navic")]` 对 stage0 隐藏：用 stage0 编译的 std 没有它们。
+
+| 项目 | Rust | navi | 原因 |
+|---|---|---|---|
+| `[T]::concat` / `[T]::join` | `concat<Item>() -> <Self as Concat<Item>>::Output`，`Concat`/`Join` 按 `Borrow` 实现 | `concat<O>() -> O where [T]: Concat<Output = O>`、`join<Sep, O>(sep) -> O where [T]: Join<Sep, Output = O>`；`slice::Concat` 没有 `Item` 参数；实现了 `[S: AsRef<str>]`（得到 `String`）、`[Vec<T>]`、`[&[T]]`、`[[T; N]]`（得到 `Vec<T>`），`join` 的分隔符可以是 `&str`、`&T`、`&[T]` | 类型位置的 `<X as Trait>::Name` 会让编译器崩溃；没有 `Borrow` |
+| `Iterator::cloned` / `copied` / `flatten` 的返回类型 | `Cloned<I>`、`Copied<I>`、`Flatten<I>` | `Cloned<I, T>`、`Copied<I, T>`（`T` 是被引用的类型）、`Flatten<I, U>`（`U` 是 `I::Item`） | 编译器不支持只经由关联类型约束的 impl 参数（`impl<T, I: Iterator<Item = &T>> Iterator for Cloned<I>` 会编错） |
+| `Iterator::eq`、`ne`、`lt`、`le`、`gt`、`ge`、`cmp`、`partial_cmp` | 有 | 不提供 | 与 `PartialEq`/`PartialOrd`/`Ord` 的同名方法冲突：接收者是还没定类型的整数字面量时（`1.cmp(&2)`）会选中 `Iterator` 的方法 |
+| `Iterator::try_fold`、`try_for_each` | 用 `Try` trait | 不提供 | 没有 `Try` trait |
+| `Flatten`、`FlatMap`、`StepBy` 的 `DoubleEndedIterator` | 有 | 不提供 | 简化 |
+| `[T]::get` | 参数可以是下标或区间 | 只能是下标（`str::get` 只接受区间，同 Rust） | 没有 `SliceIndex` |
+| `char::to_uppercase` / `to_lowercase`、`is_uppercase` / `is_lowercase` | 完整的 Unicode 大小写映射 | 只覆盖拉丁字母（ASCII、Latin-1、扩展 A、扩展附加）、希腊字母、西里尔字母、亚美尼亚字母和全角拉丁字母（另有 `ß` → `SS`、`İ` → `i̇`）；其他字符映射为自身。`str::to_uppercase` / `to_lowercase` 按字符调用它们，词尾的 `Σ` 变成 `ς` | 没有 Unicode 表 |
+| `char::is_whitespace` | Unicode White_Space | 相同（navic）；stage0 编译的 std 只认 ASCII 空白 | — |
+| `f32` 的数学函数 | 调用 `f32` 版本的 libm 函数 | 转成 `f64` 计算再舍入回 `f32` | 简化 |
+| `RangeInclusive` 迭代 | 有 `exhausted` 标志，`0..=u8::MAX` 能迭代完 | 没有该标志：正向迭代到类型最大值时溢出（已有问题），反向迭代 `MAX..=MAX` 溢出 | 结构体由编译器构造，加字段要改编译器 |
+| `String::drain` | 惰性迭代器，drop 时移走 | 立即移走文本，返回被移走字符的迭代器 `string::Drain` | 同 `Vec::drain` |
