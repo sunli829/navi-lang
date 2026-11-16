@@ -1,7 +1,27 @@
-//! Input and output: printing, the Read and Write traits, errors.
+//! Input and output: printing, the Read, Write, BufRead and Seek traits,
+//! errors, buffering, cursors, standard streams and adapters.
 
 use crate::fmt::{self, Display, Debug, Formatter};
 use crate::string::String;
+
+#[cfg(feature = "navic")]
+mod buffered;
+#[cfg(feature = "navic")]
+pub use self::buffered::{BufRead, BufReader, LineWriter, Lines, Split};
+#[cfg(feature = "navic")]
+mod cursor;
+#[cfg(feature = "navic")]
+pub use self::cursor::Cursor;
+#[cfg(feature = "navic")]
+mod util;
+#[cfg(feature = "navic")]
+pub use self::util::{copy, empty, sink, repeat, read_to_string, Empty, Sink, Repeat, Take, Chain, Bytes};
+#[cfg(feature = "navic")]
+mod stdio;
+#[cfg(feature = "navic")]
+pub use self::stdio::{stdin, Stdin, StdinLock, StdoutLock, StderrLock, IsTerminal};
+#[cfg(feature = "navic")]
+pub mod prelude;
 
 // --- Printing ---------------------------------------------------------------------
 
@@ -30,37 +50,185 @@ pub fn eprintln(value: impl Display) { emit(2, value, true); }
 
 // --- Errors -------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The category of an I/O error (Rust's list; Uncategorized stands for the
+/// OS errors no other kind fits).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     NotFound,
     PermissionDenied,
+    ConnectionRefused,
+    ConnectionReset,
+    HostUnreachable,
+    NetworkUnreachable,
+    ConnectionAborted,
+    NotConnected,
+    AddrInUse,
+    AddrNotAvailable,
+    NetworkDown,
+    BrokenPipe,
     AlreadyExists,
+    WouldBlock,
+    NotADirectory,
+    IsADirectory,
+    DirectoryNotEmpty,
+    ReadOnlyFilesystem,
+    FilesystemLoop,
+    StaleNetworkFileHandle,
     InvalidInput,
     InvalidData,
+    TimedOut,
+    WriteZero,
+    StorageFull,
+    NotSeekable,
+    QuotaExceeded,
+    FileTooLarge,
+    ResourceBusy,
+    ExecutableFileBusy,
+    Deadlock,
+    CrossesDevices,
+    TooManyLinks,
+    InvalidFilename,
+    ArgumentListTooLong,
+    Interrupted,
+    Unsupported,
     UnexpectedEof,
+    OutOfMemory,
+    InProgress,
     Other,
+    Uncategorized,
 }
 
-/// An I/O error: a kind and a message.
-#[derive(Debug, Clone)]
+impl ErrorKind {
+    /// The kind's description (what Display shows).
+    pub fn as_str(&self) -> &str {
+        match self {
+            ErrorKind::NotFound => "entity not found",
+            ErrorKind::PermissionDenied => "permission denied",
+            ErrorKind::ConnectionRefused => "connection refused",
+            ErrorKind::ConnectionReset => "connection reset",
+            ErrorKind::HostUnreachable => "host unreachable",
+            ErrorKind::NetworkUnreachable => "network unreachable",
+            ErrorKind::ConnectionAborted => "connection aborted",
+            ErrorKind::NotConnected => "not connected",
+            ErrorKind::AddrInUse => "address in use",
+            ErrorKind::AddrNotAvailable => "address not available",
+            ErrorKind::NetworkDown => "network down",
+            ErrorKind::BrokenPipe => "broken pipe",
+            ErrorKind::AlreadyExists => "entity already exists",
+            ErrorKind::WouldBlock => "operation would block",
+            ErrorKind::NotADirectory => "not a directory",
+            ErrorKind::IsADirectory => "is a directory",
+            ErrorKind::DirectoryNotEmpty => "directory not empty",
+            ErrorKind::ReadOnlyFilesystem => "read-only filesystem or storage medium",
+            ErrorKind::FilesystemLoop => "filesystem loop or indirection limit (e.g. symlink loop)",
+            ErrorKind::StaleNetworkFileHandle => "stale network file handle",
+            ErrorKind::InvalidInput => "invalid input parameter",
+            ErrorKind::InvalidData => "invalid data",
+            ErrorKind::TimedOut => "timed out",
+            ErrorKind::WriteZero => "write zero",
+            ErrorKind::StorageFull => "no storage space",
+            ErrorKind::NotSeekable => "seek on unseekable file",
+            ErrorKind::QuotaExceeded => "quota exceeded",
+            ErrorKind::FileTooLarge => "file too large",
+            ErrorKind::ResourceBusy => "resource busy",
+            ErrorKind::ExecutableFileBusy => "executable file busy",
+            ErrorKind::Deadlock => "deadlock",
+            ErrorKind::CrossesDevices => "cross-device link or rename",
+            ErrorKind::TooManyLinks => "too many links",
+            ErrorKind::InvalidFilename => "invalid filename",
+            ErrorKind::ArgumentListTooLong => "argument list too long",
+            ErrorKind::Interrupted => "operation interrupted",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::UnexpectedEof => "unexpected end of file",
+            ErrorKind::OutOfMemory => "out of memory",
+            ErrorKind::InProgress => "in progress",
+            ErrorKind::Other => "other error",
+            ErrorKind::Uncategorized => "uncategorized error",
+        }
+    }
+}
+
+impl Display for ErrorKind {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.as_str()) }
+}
+
+// Error representations: a kind alone, a kind with a message, an OS error.
+const REPR_SIMPLE: u8 = 0;
+const REPR_CUSTOM: u8 = 1;
+const REPR_OS: u8 = 2;
+
+/// An I/O error: a kind alone, a kind and a message, or an OS error code
+/// (errno; a Windows error code on Windows) with the system's message.
+#[derive(Clone)]
 pub struct Error {
     kind: ErrorKind,
     msg: String,
+    code: i32,
+    repr: u8,
+}
+
+#[cfg(not(feature = "navic"))]
+impl Error {
+    pub fn new(kind: ErrorKind, msg: &str) -> Error { Error { kind, msg: msg.to_string(), code: 0, repr: REPR_CUSTOM } }
+    pub fn other(msg: &str) -> Error { Error::new(ErrorKind::Other, msg) }
 }
 
 impl Error {
-    pub fn new(kind: ErrorKind, msg: &str) -> Error { Error { kind, msg: msg.to_string() } }
-    pub fn other(msg: &str) -> Error { Error::new(ErrorKind::Other, msg) }
     pub fn kind(&self) -> ErrorKind { self.kind.clone() }
+    /// The OS error code of an error that came from the OS.
+    pub fn raw_os_error(&self) -> Option<i32> { if self.repr == REPR_OS { Some(self.code) } else { None } }
+}
+
+impl From<ErrorKind> for Error {
+    fn from(kind: ErrorKind) -> Error { Error { kind, msg: String::new(), code: 0, repr: REPR_SIMPLE } }
 }
 
 impl Display for Error {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.msg.as_str()) }
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        if self.repr == REPR_SIMPLE { return f.write_str(self.kind.as_str()); }
+        f.write_str(self.msg.as_str())?;
+        if self.repr == REPR_OS { f.write_fmt(` (os error ${self.code})`)?; }
+        Ok(())
+    }
+}
+
+impl Debug for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        if self.repr == REPR_SIMPLE { return f.debug_tuple("Kind").field(&self.kind).finish(); }
+        if self.repr == REPR_CUSTOM { return f.debug_struct("Custom").field("kind", &self.kind).field("error", &self.msg).finish(); }
+        f.debug_struct("Os").field("code", &self.code).field("kind", &self.kind).field("message", &self.msg).finish()
+    }
+}
+
+#[cfg(feature = "navic")]
+impl Error {
+    /// An error of a kind with a message (a &str or a String: Rust takes
+    /// any error value).
+    pub fn new<M: AsRef<str>>(kind: ErrorKind, msg: M) -> Error {
+        Error { kind, msg: msg.as_ref().to_string(), code: 0, repr: REPR_CUSTOM }
+    }
+
+    pub fn other<M: AsRef<str>>(msg: M) -> Error { Error::new(ErrorKind::Other, msg) }
+
+    /// The error for an OS error code (errno; a Windows error code on
+    /// Windows), with the system's message for it.
+    pub fn from_raw_os_error(code: i32) -> Error {
+        Error { kind: crate::sys::decode_error_kind(code), msg: crate::sys::error_string(code), code, repr: REPR_OS }
+    }
+
+    /// The error of this thread's last failed OS call.
+    pub fn last_os_error() -> Error { Error::from_raw_os_error(crate::sys::errno()) }
+
+    /// The message of a custom error (Rust's get_ref, as a string).
+    pub fn get_ref(&self) -> Option<&str> { if self.repr == REPR_CUSTOM { Some(self.msg.as_str()) } else { None } }
+
+    /// The message of a custom error (Rust's into_inner, as a string).
+    pub fn into_inner(self) -> Option<String> { if self.repr == REPR_CUSTOM { Some(self.msg) } else { None } }
 }
 
 pub type Result<T> = crate::result::Result<T, Error>;
 
-// --- Read and Write -------------------------------------------------------------------
+// --- Read, Write and Seek ----------------------------------------------------------------
 
 pub trait Read {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
@@ -84,6 +252,35 @@ pub trait Read {
             Err(_) => Err(Error::new(ErrorKind::InvalidData, "stream did not contain valid UTF-8")),
         }
     }
+
+    /// Reads exactly buf.len() bytes (UnexpectedEof if the input ends first).
+    #[cfg(feature = "navic")]
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            match self.read(&mut buf[done..]) {
+                Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer")),
+                Ok(n) => { done += n; }
+                Err(e) => { if e.kind() != ErrorKind::Interrupted { return Err(e); } }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "navic")]
+    fn by_ref(&mut self) -> &mut Self { self }
+
+    /// The bytes of the input, one at a time.
+    #[cfg(feature = "navic")]
+    fn bytes(self) -> Bytes<Self> { Bytes { inner: self } }
+
+    /// This input followed by next.
+    #[cfg(feature = "navic")]
+    fn chain<R: Read>(self, next: R) -> Chain<Self, R> { Chain { first: self, second: next, done_first: false } }
+
+    /// At most limit bytes of the input.
+    #[cfg(feature = "navic")]
+    fn take(self, limit: u64) -> Take<Self> { Take { inner: self, limit } }
 }
 
 pub trait Write {
@@ -94,13 +291,51 @@ pub trait Write {
         let mut done = 0;
         while done < buf.len() {
             let n = self.write(&buf[done..buf.len()])?;
-            if n == 0 { return Err(Error::new(ErrorKind::Other, "failed to write whole buffer")); }
+            if n == 0 { return Err(Error::new(ErrorKind::WriteZero, "failed to write whole buffer")); }
             done += n;
         }
         Ok(())
     }
 
     fn write_str(&mut self, s: &str) -> Result<()> { self.write_all(s.as_bytes()) }
+
+    /// Writes a template string (Rust's write! macro calls this).
+    #[cfg(feature = "navic")]
+    fn write_fmt(&mut self, args: fmt::Arguments) -> Result<()> {
+        let s = fmt::format(args);
+        self.write_all(s.as_bytes())
+    }
+
+    #[cfg(feature = "navic")]
+    fn by_ref(&mut self) -> &mut Self { self }
+}
+
+/// Where a seek goes from.
+#[cfg(feature = "navic")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeekFrom {
+    Start(u64),
+    End(i64),
+    Current(i64),
+}
+
+/// A stream with a position that can move.
+#[cfg(feature = "navic")]
+pub trait Seek {
+    /// Moves the position; returns the new position from the start.
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+
+    fn rewind(&mut self) -> Result<()> {
+        self.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+
+    fn stream_position(&mut self) -> Result<u64> { self.seek(SeekFrom::Current(0)) }
+
+    fn seek_relative(&mut self, offset: i64) -> Result<()> {
+        self.seek(SeekFrom::Current(offset))?;
+        Ok(())
+    }
 }
 
 /// The standard output stream (unbuffered).
@@ -132,10 +367,11 @@ impl Write for Stderr {
 pub struct BufWriter<W: Write> {
     inner: W,
     buf: Vec<u8>,
+    cap: usize,
 }
 
 impl<W: Write> BufWriter<W> {
-    pub fn new(inner: W) -> BufWriter<W> { BufWriter { inner, buf: Vec::with_capacity(8192) } }
+    pub fn new(inner: W) -> BufWriter<W> { BufWriter { inner, buf: Vec::with_capacity(8192), cap: 8192 } }
     pub fn get_ref(&self) -> &W { &self.inner }
     pub fn into_inner(mut self) -> Result<W> {
         self.flush()?;
@@ -145,18 +381,50 @@ impl<W: Write> BufWriter<W> {
 
 impl<W: Write> Write for BufWriter<W> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        if self.buf.len() + buf.len() > 8192 { self.flush()?; }
-        if buf.len() >= 8192 {
+        if self.buf.len() + buf.len() > self.cap { self.flush_buf()?; }
+        if buf.len() >= self.cap {
             return self.inner.write(buf);
         }
         self.buf.extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> Result<()> {
-        if self.buf.len() > 0 {
-            self.inner.write_all(self.buf.as_slice())?;
-            self.buf.clear();
-        }
+        self.flush_buf()?;
         self.inner.flush()
+    }
+}
+
+impl<W: Write> BufWriter<W> {
+    // Writes the buffered bytes to the inner writer.
+    fn flush_buf(&mut self) -> Result<()> {
+        if self.buf.len() > 0 {
+            let r = self.inner.write_all(self.buf.as_slice());
+            self.buf.clear();
+            r?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "navic")]
+impl<W: Write> BufWriter<W> {
+    pub fn with_capacity(capacity: usize, inner: W) -> BufWriter<W> {
+        let cap = if capacity == 0 { 1 } else { capacity };
+        BufWriter { inner, buf: Vec::with_capacity(cap), cap }
+    }
+    pub fn get_mut(&mut self) -> &mut W { &mut self.inner }
+    /// The bytes written but not yet passed on.
+    pub fn buffer(&self) -> &[u8] { self.buf.as_slice() }
+    pub fn capacity(&self) -> usize { self.cap }
+    /// The inner writer and the unwritten bytes, without flushing.
+    pub fn into_parts(self) -> (W, Vec<u8>) { (self.inner, self.buf) }
+}
+
+#[cfg(feature = "navic")]
+impl<W: Write + Seek> Seek for BufWriter<W> {
+    /// Flushes the buffer, then seeks the inner writer.
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        self.flush_buf()?;
+        self.inner.seek(pos)
     }
 }
