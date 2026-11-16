@@ -264,7 +264,7 @@ func satMulMin(t intType) string {
 
 const floats = `
 impl f64 {
-    pub const NAN: f64 = 0.0 / 0.0;
+    pub const NAN: f64 = f64::from_bits(0x7ff8000000000000);
     pub const INFINITY: f64 = 1.0 / 0.0;
     pub const NEG_INFINITY: f64 = -1.0 / 0.0;
     pub const MAX: f64 = 1.7976931348623157e308;
@@ -294,7 +294,7 @@ impl f64 {
 }
 
 impl f32 {
-    pub const NAN: f32 = 0.0 / 0.0;
+    pub const NAN: f32 = f32::from_bits(0x7fc00000);
     pub const INFINITY: f32 = 1.0 / 0.0;
     pub const NEG_INFINITY: f32 = -1.0 / 0.0;
 
