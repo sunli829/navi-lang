@@ -1,0 +1,402 @@
+//! Sockets over the C library (macOS, Linux): non-blocking descriptors
+//! registered with the runtime's network poller; an operation that would
+//! block parks the G until the socket is ready or its deadline passes.
+
+use crate::io;
+use crate::net::ip::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use crate::rt::netpoll::{self, PollDesc};
+
+extern "C" {
+    fn socket(domain: i32, ty: i32, proto: i32) -> i32;
+    fn bind(fd: i32, addr: *const u8, len: u32) -> i32;
+    fn listen(fd: i32, backlog: i32) -> i32;
+    fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+    fn connect(fd: i32, addr: *const u8, len: u32) -> i32;
+    fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+    fn getpeername(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+    fn recv(fd: i32, buf: *mut u8, n: usize, flags: i32) -> isize;
+    fn send(fd: i32, buf: *const u8, n: usize, flags: i32) -> isize;
+    fn recvfrom(fd: i32, buf: *mut u8, n: usize, flags: i32, addr: *mut u8, len: *mut u32) -> isize;
+    fn sendto(fd: i32, buf: *const u8, n: usize, flags: i32, addr: *const u8, len: u32) -> isize;
+    fn shutdown(fd: i32, how: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn setsockopt(fd: i32, level: i32, name: i32, val: *const u8, len: u32) -> i32;
+    fn getsockopt(fd: i32, level: i32, name: i32, val: *mut u8, len: *mut u32) -> i32;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn getaddrinfo(node: *const u8, service: *const u8, hints: *const u8, res: *mut usize) -> i32;
+    fn freeaddrinfo(res: usize);
+    fn gai_strerror(code: i32) -> *const u8;
+    fn strerror(code: i32) -> *const u8;
+    fn strlen(s: *const u8) -> usize;
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn __error() -> *mut i32;
+}
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn __errno_location() -> *mut i32;
+}
+
+#[cfg(target_os = "macos")]
+fn errno() -> i32 { unsafe { *__error() } }
+#[cfg(target_os = "linux")]
+fn errno() -> i32 { unsafe { *__errno_location() } }
+
+pub const SOCK_STREAM: i32 = 1;
+pub const SOCK_DGRAM: i32 = 2;
+const AF_INET: i32 = 2;
+#[cfg(target_os = "macos")]
+const AF_INET6: i32 = 30;
+#[cfg(target_os = "linux")]
+const AF_INET6: i32 = 10;
+#[cfg(target_os = "macos")]
+const SOL_SOCKET: i32 = 0xffff;
+#[cfg(target_os = "linux")]
+const SOL_SOCKET: i32 = 1;
+#[cfg(target_os = "macos")]
+const SO_REUSEADDR: i32 = 4;
+#[cfg(target_os = "linux")]
+const SO_REUSEADDR: i32 = 2;
+#[cfg(target_os = "macos")]
+const SO_ERROR: i32 = 0x1007;
+#[cfg(target_os = "linux")]
+const SO_ERROR: i32 = 4;
+#[cfg(target_os = "macos")]
+pub const SO_BROADCAST: i32 = 0x20;
+#[cfg(target_os = "linux")]
+pub const SO_BROADCAST: i32 = 6;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 4;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0x800;
+#[cfg(target_os = "macos")]
+const SEND_FLAGS: i32 = 0;
+// MSG_NOSIGNAL: a closed peer is an error, not SIGPIPE.
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: i32 = 0x4000;
+pub const IPPROTO_TCP: i32 = 6;
+pub const TCP_NODELAY: i32 = 1;
+
+#[cfg(target_os = "macos")]
+const EAGAIN: i32 = 35;
+#[cfg(target_os = "linux")]
+const EAGAIN: i32 = 11;
+#[cfg(target_os = "macos")]
+const EINPROGRESS: i32 = 36;
+#[cfg(target_os = "linux")]
+const EINPROGRESS: i32 = 115;
+const EINTR: i32 = 4;
+
+fn cstr_owned(s: &str) -> Vec<u8> {
+    let mut v = s.as_bytes().to_vec();
+    v.push(0);
+    v
+}
+
+fn c_message(p: *const u8) -> String {
+    let n = unsafe { strlen(p) };
+    String::from_utf8_lossy(crate::rt::slice_from_raw(p, n)).to_string()
+}
+
+/// The io::Error of a C error number.
+pub fn os_error(e: i32) -> io::Error { io::Error::other(c_message(unsafe { strerror(e) }).as_str()) }
+
+pub fn last_error() -> io::Error { os_error(errno()) }
+
+fn timed_out() -> io::Error { io::Error::other("operation timed out") }
+fn closed() -> io::Error { io::Error::other("socket closed") }
+
+/// A socket and its timeouts (shared by the copies of a TcpStream etc.).
+pub struct Socket {
+    pub fd: i32,
+    pd: *mut PollDesc,
+    /// Read and write timeouts in nanoseconds (0: none).
+    pub rto: u64,
+    pub wto: u64,
+    closed: bool,
+}
+
+/// A new non-blocking socket for addresses like a.
+pub fn new_socket(a: &SocketAddr, ty: i32) -> io::Result<&mut Socket> {
+    let fam = if a.is_ipv4() { AF_INET } else { AF_INET6 };
+    let fd = unsafe { socket(fam, ty, 0) };
+    if fd < 0 { return Err(last_error()); }
+    wrap(fd)
+}
+
+fn wrap(fd: i32) -> io::Result<&mut Socket> {
+    unsafe {
+        fcntl(fd, 2, 1); // F_SETFD, FD_CLOEXEC
+        let fl = fcntl(fd, 3); // F_GETFL
+        fcntl(fd, 4, fl | O_NONBLOCK); // F_SETFL
+    }
+    no_sigpipe(fd);
+    let pd = netpoll::open(fd);
+    if pd as usize == 0 {
+        let e = last_error();
+        unsafe { close(fd); }
+        return Err(e);
+    }
+    Ok(&mut Socket { fd, pd, rto: 0, wto: 0, closed: false })
+}
+
+// A write to a closed peer is an error, not SIGPIPE (Linux: MSG_NOSIGNAL).
+#[cfg(target_os = "macos")]
+fn no_sigpipe(fd: i32) { let _ = set_int(fd, SOL_SOCKET, 0x1022, 1); } // SO_NOSIGPIPE
+#[cfg(target_os = "linux")]
+fn no_sigpipe(fd: i32) {}
+
+pub fn set_int(fd: i32, level: i32, name: i32, v: i32) -> io::Result<()> {
+    let x = v;
+    if unsafe { setsockopt(fd, level, name, &x as *const i32 as *const u8, 4) } < 0 { return Err(last_error()); }
+    Ok(())
+}
+
+pub fn get_int(fd: i32, level: i32, name: i32) -> io::Result<i32> {
+    let mut x = 0i32;
+    let mut n = 4u32;
+    if unsafe { getsockopt(fd, level, name, &mut x as *mut i32 as *mut u8, &mut n as *mut u32) } < 0 { return Err(last_error()); }
+    Ok(x)
+}
+
+// struct sockaddr_in / sockaddr_in6: macOS starts with a length byte and a
+// family byte, Linux with a 16-bit family.
+#[cfg(target_os = "macos")]
+fn put_family(b: &mut [u8; 28], fam: i32, len: u32) {
+    b[0] = len as u8;
+    b[1] = fam as u8;
+}
+#[cfg(target_os = "linux")]
+fn put_family(b: &mut [u8; 28], fam: i32, len: u32) {
+    b[0] = fam as u8;
+    b[1] = (fam >> 8) as u8;
+}
+#[cfg(target_os = "macos")]
+fn get_family(b: &[u8; 28]) -> i32 { b[1] as i32 }
+#[cfg(target_os = "linux")]
+fn get_family(b: &[u8; 28]) -> i32 { b[0] as i32 | (b[1] as i32) << 8 }
+
+/// The C encoding of a (and its length).
+pub fn encode(a: &SocketAddr) -> ([u8; 28], u32) {
+    let mut b = [0u8; 28];
+    match a {
+        SocketAddr::V4(v) => {
+            put_family(&mut b, AF_INET, 16);
+            b[2] = (v.port() >> 8) as u8;
+            b[3] = v.port() as u8;
+            let o = v.ip().octets();
+            b[4] = o[0];
+            b[5] = o[1];
+            b[6] = o[2];
+            b[7] = o[3];
+            (b, 16)
+        }
+        SocketAddr::V6(v) => {
+            put_family(&mut b, AF_INET6, 28);
+            b[2] = (v.port() >> 8) as u8;
+            b[3] = v.port() as u8;
+            let fl = v.flowinfo();
+            b[4] = (fl >> 24) as u8;
+            b[5] = (fl >> 16) as u8;
+            b[6] = (fl >> 8) as u8;
+            b[7] = fl as u8;
+            let o = v.ip().octets();
+            let mut i = 0;
+            while i < 16 {
+                b[8 + i] = o[i];
+                i += 1;
+            }
+            let sc = v.scope_id();
+            b[24] = sc as u8;
+            b[25] = (sc >> 8) as u8;
+            b[26] = (sc >> 16) as u8;
+            b[27] = (sc >> 24) as u8;
+            (b, 28)
+        }
+    }
+}
+
+pub fn decode(b: &[u8; 28]) -> SocketAddr {
+    let port = (b[2] as u16) << 8 | b[3] as u16;
+    if get_family(b) == AF_INET {
+        return SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(b[4], b[5], b[6], b[7]), port));
+    }
+    let mut o = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        o[i] = b[8 + i];
+        i += 1;
+    }
+    let fl = (b[4] as u32) << 24 | (b[5] as u32) << 16 | (b[6] as u32) << 8 | b[7] as u32;
+    let sc = b[24] as u32 | (b[25] as u32) << 8 | (b[26] as u32) << 16 | (b[27] as u32) << 24;
+    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from_octets(o), port, fl, sc))
+}
+
+fn deadline(timeout: u64) -> u64 { if timeout == 0 { 0 } else { crate::rt::native::monotonic_nanos() + timeout } }
+
+impl Socket {
+    // Waits until readable (or writable) before deadline.
+    fn wait(&self, write: bool, dl: u64) -> io::Result<()> {
+        if self.closed { return Err(closed()); }
+        let r = netpoll::wait(self.pd, write, dl);
+        if r == netpoll::TIMED_OUT { return Err(timed_out()); }
+        if r == netpoll::CLOSED { return Err(closed()); }
+        Ok(())
+    }
+
+    pub fn bind(&self, a: &SocketAddr) -> io::Result<()> {
+        set_int(self.fd, SOL_SOCKET, SO_REUSEADDR, 1)?;
+        let (b, n) = encode(a);
+        if unsafe { bind(self.fd, &b as *const [u8; 28] as *const u8, n) } < 0 { return Err(last_error()); }
+        Ok(())
+    }
+
+    pub fn listen(&self, backlog: i32) -> io::Result<()> {
+        if unsafe { listen(self.fd, backlog) } < 0 { return Err(last_error()); }
+        Ok(())
+    }
+
+    pub fn accept(&self) -> io::Result<(&mut Socket, SocketAddr)> {
+        let dl = deadline(self.rto);
+        loop {
+            let mut b = [0u8; 28];
+            let mut n = 28u32;
+            let fd = unsafe { accept(self.fd, &mut b as *mut [u8; 28] as *mut u8, &mut n as *mut u32) };
+            if fd >= 0 { return Ok((wrap(fd)?, decode(&b))); }
+            let e = errno();
+            if e == EINTR { continue; }
+            if e != EAGAIN { return Err(os_error(e)); }
+            self.wait(false, dl)?;
+        }
+    }
+
+    pub fn connect(&self, a: &SocketAddr, timeout: u64) -> io::Result<()> {
+        let (b, n) = encode(a);
+        if unsafe { connect(self.fd, &b as *const [u8; 28] as *const u8, n) } == 0 { return Ok(()); }
+        let e = errno();
+        if e != EINPROGRESS && e != EINTR { return Err(os_error(e)); }
+        self.wait(true, deadline(timeout))?;
+        let err = get_int(self.fd, SOL_SOCKET, SO_ERROR)?;
+        if err != 0 { return Err(os_error(err)); }
+        Ok(())
+    }
+
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let dl = deadline(self.rto);
+        loop {
+            let n = unsafe { recv(self.fd, crate::rt::slice_ptr(buf) as *mut u8, buf.len(), 0) };
+            if n >= 0 { return Ok(n as usize); }
+            let e = errno();
+            if e == EINTR { continue; }
+            if e != EAGAIN { return Err(os_error(e)); }
+            self.wait(false, dl)?;
+        }
+    }
+
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        let dl = deadline(self.wto);
+        loop {
+            let n = unsafe { send(self.fd, crate::rt::slice_ptr(buf), buf.len(), SEND_FLAGS) };
+            if n >= 0 { return Ok(n as usize); }
+            let e = errno();
+            if e == EINTR { continue; }
+            if e != EAGAIN { return Err(os_error(e)); }
+            self.wait(true, dl)?;
+        }
+    }
+
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let dl = deadline(self.rto);
+        loop {
+            let mut b = [0u8; 28];
+            let mut an = 28u32;
+            let n = unsafe { recvfrom(self.fd, crate::rt::slice_ptr(buf) as *mut u8, buf.len(), 0, &mut b as *mut [u8; 28] as *mut u8, &mut an as *mut u32) };
+            if n >= 0 { return Ok((n as usize, decode(&b))); }
+            let e = errno();
+            if e == EINTR { continue; }
+            if e != EAGAIN { return Err(os_error(e)); }
+            self.wait(false, dl)?;
+        }
+    }
+
+    pub fn send_to(&self, buf: &[u8], a: &SocketAddr) -> io::Result<usize> {
+        let dl = deadline(self.wto);
+        let (b, an) = encode(a);
+        loop {
+            let n = unsafe { sendto(self.fd, crate::rt::slice_ptr(buf), buf.len(), SEND_FLAGS, &b as *const [u8; 28] as *const u8, an) };
+            if n >= 0 { return Ok(n as usize); }
+            let e = errno();
+            if e == EINTR { continue; }
+            if e != EAGAIN { return Err(os_error(e)); }
+            self.wait(true, dl)?;
+        }
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        let mut b = [0u8; 28];
+        let mut n = 28u32;
+        if unsafe { getsockname(self.fd, &mut b as *mut [u8; 28] as *mut u8, &mut n as *mut u32) } < 0 { return Err(last_error()); }
+        Ok(decode(&b))
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        let mut b = [0u8; 28];
+        let mut n = 28u32;
+        if unsafe { getpeername(self.fd, &mut b as *mut [u8; 28] as *mut u8, &mut n as *mut u32) } < 0 { return Err(last_error()); }
+        Ok(decode(&b))
+    }
+
+    pub fn shutdown(&self, how: i32) -> io::Result<()> {
+        if unsafe { shutdown(self.fd, how) } < 0 { return Err(last_error()); }
+        Ok(())
+    }
+
+    /// Closes the socket (waiters see it closed); again is a no-op.
+    pub fn close(&mut self) {
+        if self.closed { return; }
+        self.closed = true;
+        netpoll::close(self.pd);
+        unsafe { close(self.fd); }
+    }
+}
+
+/// The addresses of host:port (a name is resolved by the C library's
+/// getaddrinfo, a blocking call).
+pub fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let h = cstr_owned(host);
+    let mut hints = [0u8; 48];
+    hints[8] = SOCK_STREAM as u8; // ai_socktype
+    let mut res = 0usize;
+    crate::rt::sched::enter_blocked();
+    let rc = unsafe { getaddrinfo(crate::rt::slice_ptr(h.as_slice()), 0 as *const u8, &hints as *const [u8; 48] as *const u8, &mut res as *mut usize) };
+    crate::rt::sched::exit_blocked();
+    if rc != 0 { return Err(io::Error::other(`failed to lookup address information: ${c_message(unsafe { gai_strerror(rc) })}`.as_str())); }
+    let mut p = res;
+    while p != 0 {
+        unsafe {
+            let fam = *((p + 4) as *const i32);
+            // ai_canonname and ai_addr: glibc puts ai_addr first, the BSDs
+            // and bionic ai_canonname, which is null (not asked for).
+            let a24 = *((p + 24) as *const usize);
+            let addr = if a24 != 0 { a24 } else { *((p + 32) as *const usize) };
+            if (fam == AF_INET || fam == AF_INET6) && addr != 0 {
+                let mut b = [0u8; 28];
+                let len = if fam == AF_INET { 16 } else { 28 };
+                let mut i = 0;
+                while i < len {
+                    b[i] = *((addr + i) as *const u8);
+                    i += 1;
+                }
+                let mut a = decode(&b);
+                a.set_port(port);
+                if !out.contains(&a) { out.push(a); }
+            }
+            p = *((p + 40) as *const usize);
+        }
+    }
+    unsafe { freeaddrinfo(res); }
+    Ok(out)
+}

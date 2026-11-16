@@ -1026,6 +1026,8 @@ struct M {
     // What its scheduler record does after a G switched to it (AFTER_*).
     after: usize,
     after_g: usize,
+    // The network poller's thread (runs no Gs; see netpoll).
+    poller: bool,
 }
 
 // The runtime lock (pthread mutex) and the condition idle Ms wait on.
@@ -1228,6 +1230,11 @@ pub fn exit_blocked() {
         }
     }
 }
+
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+fn netpoll_active() -> bool { crate::rt::netpoll::active() }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+fn netpoll_active() -> bool { false }
 
 // --- Timers -----------------------------------------------------------------------
 //
@@ -1465,6 +1472,13 @@ fn ready(g: *mut G) {
     let mut mm = 0usize;
     if cur as usize != 0 { mm = unsafe { (*cur).m }; }
     let m = mm as *mut M;
+    if m as usize != 0 && unsafe { (*m).poller } {
+        // From the poller's thread: the global queue, and an idle M (even
+        // the only one) must look.
+        gq_push(g);
+        wake_idle();
+        return;
+    }
     if m as usize == 0 {
         gq_push(g);
     } else {
@@ -1505,6 +1519,26 @@ fn wakep() {
         if NUM_M < MAX_M { start_m(); }
         unlock();
     }
+}
+
+// Wakes an idle M, if any (else starts one if allowed).
+#[cfg(feature = "navic")]
+fn wake_idle() {
+    obj_lock(&mut IDLE_LK as *mut usize);
+    let m = IDLE_MS as *mut M;
+    if m as usize != 0 {
+        unsafe {
+            IDLE_MS = (*m).idle_next;
+            (*m).idle = false;
+        }
+        NIDLE -= 1;
+    }
+    obj_unlock(&mut IDLE_LK as *mut usize);
+    if m as usize != 0 {
+        note_wake(m);
+        return;
+    }
+    wakep();
 }
 
 #[cfg(feature = "navic")]
@@ -1666,7 +1700,7 @@ fn find_runnable(m: *mut M) -> *mut G {
             run_timers();
             continue;
         }
-        if all {
+        if all && !netpoll_active() {
             // No M runs a G that could ready one: every G waits.
             crate::rt::native::fatal("all goroutines are asleep - deadlock!");
         }
@@ -1757,8 +1791,69 @@ fn start_m() {
 }
 
 /// The first navi code of a new M (its G register is its scheduler record).
-#[cfg(feature = "navic")]
+#[cfg(all(feature = "navic", not(target_os = "windows")))]
+pub fn mstart() -> ! {
+    let m = unsafe { (*current()).m } as *mut M;
+    if unsafe { (*m).poller } { crate::rt::netpoll::poll_loop(); }
+    mloop()
+}
+#[cfg(all(feature = "navic", target_os = "windows"))]
 pub fn mstart() -> ! { mloop() }
+
+/// Starts the network poller's thread: an M outside the list of Ms (it
+/// runs no Gs, and the collector need not stop it).
+#[cfg(feature = "navic")]
+pub fn start_poller() {
+    lock();
+    if !MULTI {
+        unsafe { os_mutex_lock(MU as *mut u8); }
+        MULTI = true;
+        crate::rt::gc::MULTI = true;
+    }
+    unlock();
+    let m = unsafe { calloc(1, crate::intrinsics::size_of::<M>()) } as *mut M;
+    let g0 = unsafe { calloc(1, crate::intrinsics::size_of::<G>()) } as *mut G;
+    new_note(m);
+    unsafe {
+        (*g0).is_g0 = true;
+        (*g0).status = RUNNING;
+        (*g0).m = m as usize;
+        (*m).g0 = g0;
+        (*m).poller = true;
+    }
+    if !unsafe { os_thread(crate::rt::mstart_address(), g0 as usize) } {
+        crate::rt::native::fatal("cannot create an OS thread");
+    }
+}
+
+/// The running G's wait generation (a waker that saw it readies the G
+/// only if it has not been woken otherwise since: wake_gen).
+#[cfg(feature = "navic")]
+pub fn wait_gen(g: *mut G) -> usize { unsafe { crate::rt::atomic_load(&mut (*g).wait_gen as *mut usize) } }
+
+/// Readies g unless it was woken since its wait generation was gen.
+#[cfg(feature = "navic")]
+pub fn wake_gen(g: *mut G, gen: usize) {
+    if unsafe { word_cas(&mut (*g).wait_gen as *mut usize, gen, gen + 1) } { ready(g); }
+}
+
+/// Parks the running G, releasing lk (held again on return), until a
+/// wake_gen or deadline (monotonic nanoseconds; 0: none): whether the
+/// deadline woke it.
+#[cfg(feature = "navic")]
+pub fn park_until(lk: *mut usize, deadline: u64) -> bool {
+    if deadline == 0 {
+        let one = [lk as usize];
+        park_on(&one as *const [usize; 1] as *const usize, 1);
+        return false;
+    }
+    obj_lock(&mut TIMER_LK as *mut usize);
+    let t = add_timer(deadline as usize);
+    let two = [lk as usize, &mut TIMER_LK as *mut usize as usize];
+    park_on(&two as *const [usize; 2] as *const usize, 2);
+    obj_unlock(&mut TIMER_LK as *mut usize);
+    unsafe { (*t).fired }
+}
 
 #[cfg(feature = "navic")]
 fn lock_held_mloop() { mloop(); }

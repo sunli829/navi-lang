@@ -1,0 +1,303 @@
+//! The network poller (as Go's netpoll): sockets are non-blocking; a G
+//! whose operation would block parks on its socket's readiness, and a
+//! poller thread waiting in kqueue (macOS) or epoll (Linux) readies it when
+//! the socket becomes readable or writable. Deadlines use the scheduler's
+//! timers. (Windows uses blocking sockets: no poller.)
+//!
+//! The poller thread is an M that runs no Gs. It only sets flags and
+//! readies Gs (no list of GC objects changes there, so it needs no write
+//! barrier); the PollDescs stay alive in a registry until closed.
+
+use crate::rt::sched::{self, G};
+
+/// A socket's readiness and the Gs waiting for it.
+pub struct PollDesc {
+    pub fd: i32,
+    lk: usize,
+    // Readable/writable since a waiter last looked (edge-triggered events).
+    rready: bool,
+    wready: bool,
+    closing: bool,
+    // The waiting G for each direction and its wait generation.
+    rg: usize,
+    rgen: usize,
+    wg: usize,
+    wgen: usize,
+    // Index in the registry.
+    slot: usize,
+}
+
+static mut POLL_FD: i32 = -1;
+static mut POLL_READY: usize = 0;
+static mut INIT_LK: usize = 0;
+// The open PollDescs (an array of pointers, GC memory), so that the
+// collector keeps them while the kernel holds their addresses.
+static mut REG: usize = 0;
+static mut REG_N: usize = 0;
+static mut REG_CAP: usize = 0;
+static mut REG_LK: usize = 0;
+
+fn lkp(x: &usize) -> *mut usize { x as *const usize as *mut usize }
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn kqueue() -> i32;
+    fn kevent(kq: i32, changes: *const u8, nchanges: i32, events: *mut u8, nevents: i32, timeout: *const i64) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn epoll_create1(flags: i32) -> i32;
+    fn epoll_ctl(epfd: i32, op: i32, fd: i32, ev: *mut u8) -> i32;
+    fn epoll_wait(epfd: i32, evs: *mut u8, n: i32, timeout: i32) -> i32;
+}
+
+// Creates the poller (kqueue/epoll and its thread) on first use.
+fn init() {
+    if crate::rt::atomic_load(lkp(unsafe { &POLL_READY })) != 0 { return; }
+    sched::obj_lock(lkp(unsafe { &INIT_LK }));
+    if POLL_READY == 0 {
+        let fd = poll_create();
+        if fd < 0 { crate::rt::native::fatal("netpoll: cannot create the poller"); }
+        POLL_FD = fd;
+        sched::start_poller();
+        crate::rt::atomic_store(lkp(unsafe { &POLL_READY }), 1);
+    }
+    sched::obj_unlock(lkp(unsafe { &INIT_LK }));
+}
+
+/// Whether sockets are registered (Gs may be waiting for them: all Ms
+/// idle is no deadlock).
+pub fn active() -> bool { crate::rt::atomic_load(lkp(unsafe { &REG_N })) != 0 }
+
+#[cfg(target_os = "macos")]
+fn poll_create() -> i32 { unsafe { kqueue() } }
+#[cfg(target_os = "linux")]
+fn poll_create() -> i32 { unsafe { epoll_create1(0x80000) } }
+
+/// Registers fd (non-blocking) with the poller.
+pub fn open(fd: i32) -> *mut PollDesc {
+    init();
+    let pd = crate::rt::gc::alloc(crate::intrinsics::size_of::<PollDesc>(), false) as *mut PollDesc;
+    unsafe {
+        (*pd).fd = fd;
+        (*pd).lk = 0;
+        (*pd).rready = false;
+        (*pd).wready = false;
+        (*pd).closing = false;
+        (*pd).rg = 0;
+        (*pd).wg = 0;
+    }
+    reg_add(pd);
+    if !arm(fd, pd) {
+        reg_remove(pd);
+        return 0 as *mut PollDesc;
+    }
+    pd
+}
+
+fn reg_add(pd: *mut PollDesc) {
+    sched::obj_lock(lkp(unsafe { &REG_LK }));
+    if REG_N == REG_CAP {
+        let cap = if REG_CAP == 0 { 64 } else { 2 * REG_CAP };
+        let a = crate::rt::gc::alloc(8 * cap, false) as usize;
+        let mut i = 0;
+        while i < REG_N {
+            unsafe { *((a + 8 * i) as *mut usize) = *((REG + 8 * i) as *const usize); }
+            i += 1;
+        }
+        REG = a;
+        REG_CAP = cap;
+    }
+    unsafe {
+        *((REG + 8 * REG_N) as *mut *mut PollDesc) = pd;
+        (*pd).slot = REG_N;
+    }
+    REG_N += 1;
+    sched::obj_unlock(lkp(unsafe { &REG_LK }));
+}
+
+fn reg_remove(pd: *mut PollDesc) {
+    sched::obj_lock(lkp(unsafe { &REG_LK }));
+    unsafe {
+        let i = (*pd).slot;
+        REG_N -= 1;
+        let last = *((REG + 8 * REG_N) as *const *mut PollDesc);
+        *((REG + 8 * i) as *mut *mut PollDesc) = last;
+        (*last).slot = i;
+        *((REG + 8 * REG_N) as *mut usize) = 0;
+    }
+    sched::obj_unlock(lkp(unsafe { &REG_LK }));
+}
+
+// Edge-triggered read and write interest, with the PollDesc as user data.
+#[cfg(target_os = "macos")]
+fn arm(fd: i32, pd: *mut PollDesc) -> bool {
+    // struct kevent: ident u64, filter i16, flags u16, fflags u32, data i64,
+    // udata u64.
+    let mut ch = [0u64; 8];
+    ch[0] = fd as u64;
+    ch[1] = (0xffffu64) | (0x21u64 << 16); // EVFILT_READ, EV_ADD | EV_CLEAR
+    ch[3] = pd as u64;
+    ch[4] = fd as u64;
+    ch[5] = (0xfffeu64) | (0x21u64 << 16); // EVFILT_WRITE
+    ch[7] = pd as u64;
+    unsafe { kevent(POLL_FD, &ch as *const [u64; 8] as *const u8, 2, 0 as *mut u8, 0, 0 as *const i64) >= 0 }
+}
+
+// struct epoll_event is packed on x86-64 (12 bytes), aligned elsewhere (16).
+#[cfg(target_os = "linux")]
+fn arm(fd: i32, pd: *mut PollDesc) -> bool {
+    let mut ev = [0u64; 2];
+    let events: u64 = 1 | 4 | 0x2000 | 0x80000000; // EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET
+    set_epoll_event(&mut ev as *mut [u64; 2] as *mut u8, events as u32, pd as u64);
+    unsafe { epoll_ctl(POLL_FD, 1, fd, &mut ev as *mut [u64; 2] as *mut u8) == 0 } // EPOLL_CTL_ADD
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const EV_SIZE: usize = 12;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const EV_SIZE: usize = 16;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const EV_DATA: usize = 4;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const EV_DATA: usize = 8;
+
+#[cfg(target_os = "linux")]
+fn set_epoll_event(p: *mut u8, events: u32, data: u64) {
+    unsafe {
+        *(p as *mut u32) = events;
+        let d = p as usize + EV_DATA;
+        *(d as *mut u32) = data as u32;
+        *((d + 4) as *mut u32) = (data >> 32) as u32;
+    }
+}
+
+/// Deregisters pd (the caller closes the descriptor after) and wakes its
+/// waiters (they see the socket closed).
+pub fn close(pd: *mut PollDesc) {
+    sched::obj_lock(lkp(unsafe { &(*pd).lk }));
+    unsafe { (*pd).closing = true; }
+    wake(pd, true, true);
+    sched::obj_unlock(lkp(unsafe { &(*pd).lk }));
+    reg_remove(pd);
+}
+
+// Readies pd's waiters (its lock is held).
+fn wake(pd: *mut PollDesc, r: bool, w: bool) {
+    unsafe {
+        if r {
+            (*pd).rready = true;
+            let g = (*pd).rg as *mut G;
+            if g as usize != 0 { sched::wake_gen(g, (*pd).rgen); }
+        }
+        if w {
+            (*pd).wready = true;
+            let g = (*pd).wg as *mut G;
+            if g as usize != 0 { sched::wake_gen(g, (*pd).wgen); }
+        }
+    }
+}
+
+/// What a wait for readiness ended with.
+pub const READY: i32 = 0;
+pub const TIMED_OUT: i32 = 1;
+pub const CLOSED: i32 = 2;
+
+/// Waits until pd is readable (or writable: write), until deadline
+/// (monotonic nanoseconds; 0: none).
+pub fn wait(pd: *mut PollDesc, write: bool, deadline: u64) -> i32 {
+    let lk = lkp(unsafe { &(*pd).lk });
+    sched::obj_lock(lk);
+    unsafe {
+        if (*pd).closing {
+            sched::obj_unlock(lk);
+            return CLOSED;
+        }
+        if write && (*pd).wready {
+            (*pd).wready = false;
+            sched::obj_unlock(lk);
+            return READY;
+        }
+        if !write && (*pd).rready {
+            (*pd).rready = false;
+            sched::obj_unlock(lk);
+            return READY;
+        }
+        let g = sched::current();
+        let gen = sched::wait_gen(g);
+        if write {
+            (*pd).wg = g as usize;
+            (*pd).wgen = gen;
+        } else {
+            (*pd).rg = g as usize;
+            (*pd).rgen = gen;
+        }
+    }
+    let fired = sched::park_until(lk, deadline);
+    unsafe {
+        if write { (*pd).wg = 0; } else { (*pd).rg = 0; }
+        let r = if (*pd).closing { CLOSED } else if fired { TIMED_OUT } else { READY };
+        if r == READY {
+            if write { (*pd).wready = false; } else { (*pd).rready = false; }
+        }
+        sched::obj_unlock(lk);
+        r
+    }
+}
+
+/// The poller thread: waits for events and readies the Gs waiting for
+/// them (no allocation: it runs on a scheduler record).
+pub fn poll_loop() -> ! {
+    let mut evs = [0u64; 256];
+    loop {
+        let n = poll_events(&mut evs as *mut [u64; 256] as *mut u8);
+        let mut i = 0;
+        while i < n {
+            let (pd, r, w) = event(&evs as *const [u64; 256] as *const u8, i);
+            if pd as usize != 0 {
+                sched::obj_lock(lkp(unsafe { &(*pd).lk }));
+                wake(pd, r, w);
+                sched::obj_unlock(lkp(unsafe { &(*pd).lk }));
+            }
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn poll_events(buf: *mut u8) -> usize {
+    let n = unsafe { kevent(POLL_FD, 0 as *const u8, 0, buf, 64, 0 as *const i64) };
+    if n < 0 { 0 } else { n as usize }
+}
+
+// The PollDesc of event i, and whether it is readable and writable.
+#[cfg(target_os = "macos")]
+fn event(buf: *const u8, i: usize) -> (*mut PollDesc, bool, bool) {
+    unsafe {
+        let e = buf as usize + 32 * i;
+        let filter = *((e + 8) as *const i16);
+        let flags = *((e + 10) as *const u16);
+        let pd = *((e + 24) as *const u64) as *mut PollDesc;
+        let eof = flags & 0x8000 != 0 || flags & 0x4000 != 0; // EV_EOF, EV_ERROR
+        (pd, filter == -1 || eof, filter == -2 || eof)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn poll_events(buf: *mut u8) -> usize {
+    let n = unsafe { epoll_wait(POLL_FD, buf, 128, -1) };
+    if n < 0 { 0 } else { n as usize }
+}
+
+#[cfg(target_os = "linux")]
+fn event(buf: *const u8, i: usize) -> (*mut PollDesc, bool, bool) {
+    unsafe {
+        let e = buf as usize + EV_SIZE * i;
+        let events = *(e as *const u32);
+        let d = e + EV_DATA;
+        let pd = (*(d as *const u32) as u64 | (*((d + 4) as *const u32) as u64) << 32) as *mut PollDesc;
+        let err = events & (8 | 0x10 | 0x2000) != 0; // EPOLLERR | EPOLLHUP | EPOLLRDHUP
+        (pd, events & 1 != 0 || err, events & 4 != 0 || err)
+    }
+}
