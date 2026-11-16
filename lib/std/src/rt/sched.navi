@@ -453,9 +453,9 @@ fn park_on(locks: *const usize, n: usize) {
     schedule();
 }
 #[cfg(not(feature = "navic"))]
-fn obj_lock(lk: *mut usize) {}
+pub fn obj_lock(lk: *mut usize) {}
 #[cfg(not(feature = "navic"))]
-fn obj_unlock(lk: *mut usize) {}
+pub fn obj_unlock(lk: *mut usize) {}
 
 #[cfg(not(feature = "navic"))]
 pub fn lock() {}
@@ -875,6 +875,17 @@ extern "C" {
     fn sysconf(name: i32) -> i64;
 }
 
+#[cfg(all(feature = "navic", target_os = "macos"))]
+extern "C" {
+    fn pthread_cond_timedwait_relative_np(c: *mut u8, m: *mut u8, ts: *const i64) -> i32;
+}
+
+#[cfg(all(feature = "navic", target_os = "linux"))]
+extern "C" {
+    fn pthread_cond_timedwait(c: *mut u8, m: *mut u8, ts: *const i64) -> i32;
+    fn clock_gettime(clock: i32, ts: *mut i64) -> i32;
+}
+
 #[cfg(all(feature = "navic", target_os = "windows"))]
 extern "C" {
     fn InitializeSRWLock(l: *mut u8);
@@ -917,6 +928,22 @@ unsafe fn os_cond_wait(c: *mut u8, m: *mut u8) { pthread_cond_wait(c, m); }
 unsafe fn os_cond_signal(c: *mut u8) { pthread_cond_signal(c); }
 #[cfg(all(feature = "navic", not(target_os = "windows")))]
 unsafe fn os_yield() { sched_yield(); }
+// Waits on c (m held) for at most ns nanoseconds.
+#[cfg(all(feature = "navic", target_os = "macos"))]
+unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
+    let ts = [(ns / 1000000000) as i64, (ns % 1000000000) as i64];
+    pthread_cond_timedwait_relative_np(c, m, &ts as *const [i64; 2] as *const i64);
+}
+#[cfg(all(feature = "navic", target_os = "linux"))]
+unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
+    // An absolute CLOCK_REALTIME deadline.
+    let mut ts = [0i64; 2];
+    clock_gettime(0, &mut ts as *mut [i64; 2] as *mut i64);
+    let t = (ts[1] as u64) + ns % 1000000000;
+    ts[0] = ts[0] + (ns / 1000000000) as i64 + (t / 1000000000) as i64;
+    ts[1] = (t % 1000000000) as i64;
+    pthread_cond_timedwait(c, m, &ts as *const [i64; 2] as *const i64);
+}
 #[cfg(all(feature = "navic", not(target_os = "windows")))]
 fn os_ncpu() -> i64 { unsafe { sysconf(SC_NPROCESSORS_ONLN) } }
 // Starts an OS thread at the C function start with arg; false if it
@@ -945,6 +972,11 @@ unsafe fn os_cond_wait(c: *mut u8, m: *mut u8) { SleepConditionVariableSRW(c, m,
 unsafe fn os_cond_signal(c: *mut u8) { WakeConditionVariable(c); }
 #[cfg(all(feature = "navic", target_os = "windows"))]
 unsafe fn os_yield() { SwitchToThread(); }
+#[cfg(all(feature = "navic", target_os = "windows"))]
+unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
+    let ms = (ns + 999999) / 1000000;
+    SleepConditionVariableSRW(c, m, if ms >= 0xfffffffe { 0xfffffffe } else { ms as u32 }, 0);
+}
 // SYSTEM_INFO.dwNumberOfProcessors is at 32.
 #[cfg(all(feature = "navic", target_os = "windows"))]
 fn os_ncpu() -> i64 {
@@ -1197,6 +1229,149 @@ pub fn exit_blocked() {
     }
 }
 
+// --- Timers -----------------------------------------------------------------------
+//
+// A min-heap of deadlines (monotonic nanoseconds), each readying a G unless
+// it was woken otherwise meanwhile (its wait_gen moved on). Schedulers run
+// the expired ones whenever they look for work; an idle M sleeps until the
+// next one.
+
+#[cfg(feature = "navic")]
+struct Timer {
+    when: usize,
+    g: *mut G,
+    gen: usize,
+    fired: bool,
+}
+
+#[cfg(feature = "navic")]
+const NO_TIMER: usize = 18446744073709551615;
+// The heap (an array of *mut Timer, GC memory), its size and capacity.
+#[cfg(feature = "navic")]
+static mut TIMERS: usize = 0;
+#[cfg(feature = "navic")]
+static mut TIMER_N: usize = 0;
+#[cfg(feature = "navic")]
+static mut TIMER_CAP: usize = 0;
+#[cfg(feature = "navic")]
+static mut TIMER_LK: usize = 0;
+// The earliest deadline (NO_TIMER: none), read without the lock.
+#[cfg(feature = "navic")]
+static mut TIMER_NEXT: usize = 18446744073709551615;
+
+#[cfg(feature = "navic")]
+fn theap(i: usize) -> *mut Timer { unsafe { *((TIMERS + 8 * i) as *const *mut Timer) } }
+#[cfg(feature = "navic")]
+fn theap_set(i: usize, t: *mut Timer) { unsafe { *((TIMERS + 8 * i) as *mut *mut Timer) = t; } }
+
+// Adds a timer for the running G at when (TIMER_LK held).
+#[cfg(feature = "navic")]
+fn add_timer(when: usize) -> *mut Timer {
+    let g = current();
+    let t = crate::rt::gc::alloc(crate::intrinsics::size_of::<Timer>(), false) as *mut Timer;
+    unsafe {
+        (*t).when = when;
+        (*t).g = g;
+        (*t).gen = (*g).wait_gen;
+        (*t).fired = false;
+    }
+    if TIMER_N == TIMER_CAP {
+        let cap = if TIMER_CAP == 0 { 16 } else { 2 * TIMER_CAP };
+        let a = crate::rt::gc::alloc(8 * cap, false) as usize;
+        let mut i = 0;
+        while i < TIMER_N {
+            unsafe { *((a + 8 * i) as *mut *mut Timer) = theap(i); }
+            i += 1;
+        }
+        TIMERS = a;
+        TIMER_CAP = cap;
+    }
+    let mut i = TIMER_N;
+    TIMER_N += 1;
+    while i > 0 {
+        let p = (i - 1) / 2;
+        if unsafe { (*theap(p)).when } <= when { break; }
+        theap_set(i, theap(p));
+        i = p;
+    }
+    theap_set(i, t);
+    crate::rt::atomic_store(&mut TIMER_NEXT as *mut usize, unsafe { (*theap(0)).when });
+    t
+}
+
+// Removes the earliest timer (TIMER_LK held).
+#[cfg(feature = "navic")]
+fn pop_timer() -> *mut Timer {
+    let top = theap(0);
+    TIMER_N -= 1;
+    if TIMER_N > 0 {
+        let last = theap(TIMER_N);
+        let w = unsafe { (*last).when };
+        let mut i = 0;
+        loop {
+            let mut c = 2 * i + 1;
+            if c >= TIMER_N { break; }
+            if c + 1 < TIMER_N && unsafe { (*theap(c + 1)).when < (*theap(c)).when } { c += 1; }
+            if w <= unsafe { (*theap(c)).when } { break; }
+            theap_set(i, theap(c));
+            i = c;
+        }
+        theap_set(i, last);
+    }
+    theap_set(TIMER_N, 0 as *mut Timer);
+    crate::rt::atomic_store(&mut TIMER_NEXT as *mut usize, if TIMER_N > 0 { unsafe { (*theap(0)).when } } else { NO_TIMER });
+    top
+}
+
+// Readies the Gs whose timers expired (no allocation: Ms run it).
+#[cfg(feature = "navic")]
+fn run_timers() {
+    let next = crate::rt::atomic_load(&mut TIMER_NEXT as *mut usize);
+    if next == NO_TIMER { return; }
+    let now = crate::rt::native::monotonic_nanos() as usize;
+    if next > now { return; }
+    obj_lock(&mut TIMER_LK as *mut usize);
+    while TIMER_N > 0 && unsafe { (*theap(0)).when } <= now {
+        let t = pop_timer();
+        unsafe {
+            let g = (*t).g;
+            if word_cas(&mut (*g).wait_gen as *mut usize, (*t).gen, (*t).gen + 1) {
+                (*t).fired = true;
+                ready(g);
+            }
+        }
+    }
+    obj_unlock(&mut TIMER_LK as *mut usize);
+}
+
+/// Parks the running G for ns nanoseconds (its OS thread runs others).
+#[cfg(feature = "navic")]
+pub fn sleep_ns(ns: u64) {
+    if ns == 0 {
+        yield_now();
+        return;
+    }
+    let when = crate::rt::native::monotonic_nanos() as usize + ns as usize;
+    obj_lock(&mut TIMER_LK as *mut usize);
+    add_timer(when);
+    let one = [&mut TIMER_LK as *mut usize as usize];
+    park_on(&one as *const [usize; 1] as *const usize, 1);
+    obj_unlock(&mut TIMER_LK as *mut usize);
+}
+
+/// wait, for at most ns nanoseconds: whether the time ran out.
+#[cfg(feature = "navic")]
+pub fn wait_ns(w: *mut WaitList, lk: *mut usize, ns: u64) -> bool {
+    enlist_key(w, 0);
+    let when = crate::rt::native::monotonic_nanos() as usize + ns as usize;
+    obj_lock(&mut TIMER_LK as *mut usize);
+    let t = add_timer(when);
+    let two = [lk as usize, &mut TIMER_LK as *mut usize as usize];
+    park_on(&two as *const [usize; 2] as *const usize, 2);
+    obj_unlock(&mut TIMER_LK as *mut usize);
+    unsafe { (*t).fired }
+}
+
 // --- Run queues (as Go's GMP) -------------------------------------------------
 //
 // Each M has a run queue and a runnext slot; a G readied by a G goes to its
@@ -1352,6 +1527,19 @@ fn note_sleep(m: *mut M) {
     }
 }
 
+// note_sleep for at most ns nanoseconds: whether the note was set.
+#[cfg(feature = "navic")]
+fn note_sleep_ns(m: *mut M, ns: u64) -> bool {
+    unsafe {
+        os_mutex_lock((*m).note_mu as *mut u8);
+        if (*m).note == 0 { os_cond_wait_ns((*m).note_cv as *mut u8, (*m).note_mu as *mut u8, ns); }
+        let woken = (*m).note != 0;
+        (*m).note = 0;
+        os_mutex_unlock((*m).note_mu as *mut u8);
+        woken
+    }
+}
+
 #[cfg(feature = "navic")]
 fn new_note(m: *mut M) {
     unsafe {
@@ -1445,6 +1633,7 @@ fn unidle(m: *mut M) -> bool {
 fn find_runnable(m: *mut M) -> *mut G {
     loop {
         while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { unsafe { os_yield(); } }
+        run_timers();
         let mut g = local_pop(m);
         if g as usize != 0 { return g; }
         g = gq_pop();
@@ -1466,6 +1655,15 @@ fn find_runnable(m: *mut M) -> *mut G {
         obj_unlock(&mut IDLE_LK as *mut usize);
         if work_exists() {
             if !unidle(m) { note_sleep(m); }
+            continue;
+        }
+        let next = crate::rt::atomic_load(&mut TIMER_NEXT as *mut usize);
+        if next != NO_TIMER {
+            // Asleep until the next timer (or woken).
+            let now = crate::rt::native::monotonic_nanos() as usize;
+            let woken = next > now && note_sleep_ns(m, (next - now) as u64);
+            if !woken && !unidle(m) { note_sleep(m); }
+            run_timers();
             continue;
         }
         if all {
@@ -1612,12 +1810,12 @@ fn mloop() -> ! {
 // spinning on one calls a function each time round, a safepoint for a
 // collector.
 #[cfg(feature = "navic")]
-fn obj_lock(lk: *mut usize) {
+pub fn obj_lock(lk: *mut usize) {
     while !crate::rt::atomic_cas(lk, 0, 1) { spin_wait(); }
 }
 
 #[cfg(feature = "navic")]
-fn obj_unlock(lk: *mut usize) { crate::rt::atomic_store(lk, 0); }
+pub fn obj_unlock(lk: *mut usize) { crate::rt::atomic_store(lk, 0); }
 
 #[cfg(feature = "navic")]
 fn spin_wait() { unsafe { os_yield(); } }

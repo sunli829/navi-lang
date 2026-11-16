@@ -1,0 +1,312 @@
+//! RwLock, Condvar, Once, OnceLock, LazyLock and Barrier (as Rust's
+//! std::sync). Waiting parks the green thread, not its OS thread. As with
+//! Mutex there are no guards (no Drop): read/write return the data and
+//! read_unlock/write_unlock end the access, or with_read/with_write run a
+//! function holding the lock (see spec/std-diff.md).
+
+use crate::rt::sched::{self, WaitList};
+use crate::sync::Mutex;
+
+fn lkp(lk: &usize) -> *mut usize { lk as *const usize as *mut usize }
+fn qp(q: &WaitList) -> *mut WaitList { q as *const WaitList as *mut WaitList }
+
+// --- RwLock ------------------------------------------------------------------------
+
+/// A reader-writer lock: many readers or one writer. Writers go first (a
+/// waiting writer holds new readers back, as Go's RWMutex).
+pub struct RwLock<T> {
+    lk: usize,
+    readers: usize,
+    writer: bool,
+    waiting_writers: usize,
+    rq: WaitList,
+    wq: WaitList,
+    data: T,
+}
+
+impl<T> RwLock<T> {
+    pub fn new(t: T) -> RwLock<T> {
+        RwLock { lk: 0, readers: 0, writer: false, waiting_writers: 0, rq: sched::new_wait_list(), wq: sched::new_wait_list(), data: t }
+    }
+
+    fn me(&self) -> &mut RwLock<T> { unsafe { &mut *(self as *const RwLock<T> as *mut RwLock<T>) } }
+
+    /// Waits for shared access; returns the data (until read_unlock).
+    pub fn read(&self) -> &T {
+        let s = self.me();
+        sched::obj_lock(lkp(&s.lk));
+        while s.writer || s.waiting_writers > 0 { sched::wait(qp(&s.rq), lkp(&s.lk)); }
+        s.readers += 1;
+        sched::obj_unlock(lkp(&s.lk));
+        &self.data
+    }
+
+    pub fn try_read(&self) -> Option<&T> {
+        let s = self.me();
+        sched::obj_lock(lkp(&s.lk));
+        let ok = !s.writer && s.waiting_writers == 0;
+        if ok { s.readers += 1; }
+        sched::obj_unlock(lkp(&s.lk));
+        if ok { Some(&self.data) } else { None }
+    }
+
+    pub fn read_unlock(&self) {
+        let s = self.me();
+        sched::obj_lock(lkp(&s.lk));
+        s.readers -= 1;
+        if s.readers == 0 && s.waiting_writers > 0 { sched::signal(qp(&s.wq)); }
+        sched::obj_unlock(lkp(&s.lk));
+    }
+
+    /// Waits for exclusive access; returns the data (until write_unlock).
+    pub fn write(&self) -> &mut T {
+        let s = self.me();
+        sched::obj_lock(lkp(&s.lk));
+        s.waiting_writers += 1;
+        while s.writer || s.readers > 0 { sched::wait(qp(&s.wq), lkp(&s.lk)); }
+        s.waiting_writers -= 1;
+        s.writer = true;
+        sched::obj_unlock(lkp(&s.lk));
+        &mut s.data
+    }
+
+    pub fn try_write(&self) -> Option<&mut T> {
+        let s = self.me();
+        sched::obj_lock(lkp(&s.lk));
+        let ok = !s.writer && s.readers == 0;
+        if ok { s.writer = true; }
+        sched::obj_unlock(lkp(&s.lk));
+        if ok { Some(&mut s.data) } else { None }
+    }
+
+    pub fn write_unlock(&self) {
+        let s = self.me();
+        sched::obj_lock(lkp(&s.lk));
+        s.writer = false;
+        if s.waiting_writers > 0 { sched::signal(qp(&s.wq)); } else { sched::broadcast(qp(&s.rq)); }
+        sched::obj_unlock(lkp(&s.lk));
+    }
+
+    /// Runs f with shared access.
+    pub fn with_read<R>(&self, f: fn(&T) -> R) -> R {
+        let d = self.read();
+        let r = f(d);
+        self.read_unlock();
+        r
+    }
+
+    /// Runs f with exclusive access.
+    pub fn with_write<R>(&self, f: fn(&mut T) -> R) -> R {
+        let d = self.write();
+        let r = f(d);
+        self.write_unlock();
+        r
+    }
+
+    pub fn get_mut(&mut self) -> &mut T { &mut self.data }
+    pub fn into_inner(self) -> T { self.data }
+}
+
+// --- Condvar -----------------------------------------------------------------------
+
+/// A condition variable: waits release a Mutex and take it again.
+pub struct Condvar {
+    lk: usize,
+    q: WaitList,
+}
+
+impl Condvar {
+    pub fn new() -> Condvar { Condvar { lk: 0, q: sched::new_wait_list() } }
+
+    /// Releases m (which the caller holds), waits for a notification and
+    /// takes m again.
+    pub fn wait<T>(&self, m: &Mutex<T>) {
+        // Registered before m is released: a notification after that
+        // finds this G.
+        sched::obj_lock(lkp(&self.lk));
+        m.unlock();
+        sched::wait(qp(&self.q), lkp(&self.lk));
+        sched::obj_unlock(lkp(&self.lk));
+        m.lock();
+    }
+
+    /// wait, for at most dur.
+    pub fn wait_timeout<T>(&self, m: &Mutex<T>, dur: crate::time::Duration) -> WaitTimeoutResult {
+        sched::obj_lock(lkp(&self.lk));
+        m.unlock();
+        let timed_out = sched::wait_ns(qp(&self.q), lkp(&self.lk), dur.as_nanos() as u64);
+        sched::obj_unlock(lkp(&self.lk));
+        m.lock();
+        WaitTimeoutResult { timed_out }
+    }
+
+    /// Waits while condition holds of m's data (m is held on return).
+    pub fn wait_while<T>(&self, m: &Mutex<T>, condition: fn(&mut T) -> bool) {
+        while condition(m.data_mut()) { self.wait(m); }
+    }
+
+    pub fn notify_one(&self) {
+        sched::obj_lock(lkp(&self.lk));
+        sched::signal(qp(&self.q));
+        sched::obj_unlock(lkp(&self.lk));
+    }
+
+    pub fn notify_all(&self) {
+        sched::obj_lock(lkp(&self.lk));
+        sched::broadcast(qp(&self.q));
+        sched::obj_unlock(lkp(&self.lk));
+    }
+}
+
+impl Default for Condvar {
+    fn default() -> Condvar { Condvar::new() }
+}
+
+/// Whether Condvar::wait_timeout timed out.
+pub struct WaitTimeoutResult {
+    timed_out: bool,
+}
+
+impl WaitTimeoutResult {
+    pub fn timed_out(&self) -> bool { self.timed_out }
+}
+
+// --- Once, OnceLock, LazyLock ----------------------------------------------------------
+
+const ONCE_NEW: usize = 0;
+const ONCE_RUNNING: usize = 1;
+const ONCE_DONE: usize = 2;
+
+/// Runs a function once; other callers wait until it has run.
+pub struct Once {
+    state: usize,
+    lk: usize,
+    q: WaitList,
+}
+
+impl Once {
+    pub fn new() -> Once { Once { state: ONCE_NEW, lk: 0, q: sched::new_wait_list() } }
+
+    pub fn is_completed(&self) -> bool { sched::word_load(lkp(&self.state)) == ONCE_DONE }
+
+    pub fn call_once(&self, f: fn()) {
+        if self.is_completed() { return; }
+        let st = lkp(&self.state);
+        sched::obj_lock(lkp(&self.lk));
+        if sched::word_load(st) == ONCE_NEW {
+            sched::word_store(st, ONCE_RUNNING);
+            sched::obj_unlock(lkp(&self.lk));
+            f();
+            sched::obj_lock(lkp(&self.lk));
+            sched::word_store(st, ONCE_DONE);
+            sched::broadcast(qp(&self.q));
+        } else {
+            while sched::word_load(st) != ONCE_DONE { sched::wait(qp(&self.q), lkp(&self.lk)); }
+        }
+        sched::obj_unlock(lkp(&self.lk));
+    }
+}
+
+impl Default for Once {
+    fn default() -> Once { Once::new() }
+}
+
+/// A value set at most once.
+pub struct OnceLock<T> {
+    once: Once,
+    value: Option<T>,
+}
+
+impl<T> OnceLock<T> {
+    pub fn new() -> OnceLock<T> { OnceLock { once: Once::new(), value: None } }
+
+    fn me(&self) -> &mut OnceLock<T> { unsafe { &mut *(self as *const OnceLock<T> as *mut OnceLock<T>) } }
+
+    pub fn get(&self) -> Option<&T> {
+        if !self.once.is_completed() { return None; }
+        match &self.value { Some(v) => Some(v), None => None }
+    }
+
+    /// Sets the value unless it is set (Err gives v back).
+    pub fn set(&self, v: T) -> Result<(), T> {
+        let s = self.me();
+        let mut stored = false;
+        s.once.call_once(|| {
+            s.value = Some(v);
+            stored = true;
+        });
+        if stored { Ok(()) } else { Err(v) }
+    }
+
+    /// The value, set by f the first time.
+    pub fn get_or_init(&self, f: fn() -> T) -> &T {
+        let s = self.me();
+        s.once.call_once(|| { s.value = Some(f()); });
+        self.get().unwrap()
+    }
+
+    pub fn into_inner(self) -> Option<T> { self.value }
+}
+
+impl<T> Default for OnceLock<T> {
+    fn default() -> OnceLock<T> { OnceLock::new() }
+}
+
+/// A value computed by init the first time it is used.
+pub struct LazyLock<T> {
+    cell: OnceLock<T>,
+    init: fn() -> T,
+}
+
+impl<T> LazyLock<T> {
+    pub fn new(init: fn() -> T) -> LazyLock<T> { LazyLock { cell: OnceLock::new(), init } }
+
+    /// The value (computing it the first time).
+    pub fn force(this: &LazyLock<T>) -> &T { this.cell.get_or_init(this.init) }
+}
+
+impl<T> crate::ops::Deref for LazyLock<T> {
+    type Target = T;
+    fn deref(&self) -> &T { LazyLock::force(self) }
+}
+
+// --- Barrier -----------------------------------------------------------------------
+
+/// Makes n threads wait until all have reached it.
+pub struct Barrier {
+    n: usize,
+    count: usize,
+    generation: usize,
+    lk: usize,
+    q: WaitList,
+}
+
+/// What Barrier::wait returns: one of the threads is the leader.
+pub struct BarrierWaitResult {
+    leader: bool,
+}
+
+impl BarrierWaitResult {
+    pub fn is_leader(&self) -> bool { self.leader }
+}
+
+impl Barrier {
+    pub fn new(n: usize) -> Barrier { Barrier { n, count: 0, generation: 0, lk: 0, q: sched::new_wait_list() } }
+
+    pub fn wait(&self) -> BarrierWaitResult {
+        let s = unsafe { &mut *(self as *const Barrier as *mut Barrier) };
+        sched::obj_lock(lkp(&s.lk));
+        let gen = s.generation;
+        s.count += 1;
+        let leader = s.count >= s.n;
+        if leader {
+            s.count = 0;
+            s.generation += 1;
+            sched::broadcast(qp(&s.q));
+        } else {
+            while s.generation == gen { sched::wait(qp(&s.q), lkp(&s.lk)); }
+        }
+        sched::obj_unlock(lkp(&s.lk));
+        BarrierWaitResult { leader }
+    }
+}
