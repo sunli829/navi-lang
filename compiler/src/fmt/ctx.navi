@@ -1,0 +1,755 @@
+//! What the formatter knows of a file: its tokens, the comments between
+//! them and where each node ends; and Shape, the room a rewrite has (as
+//! rustfmt's).
+
+use crate::syntax::token::*;
+use crate::syntax::source::{File, Pos};
+use crate::syntax::ast::*;
+
+/// The widest line (rustfmt's max_width).
+pub const MAX_WIDTH: usize = 100;
+/// One level of indentation.
+pub const TAB: usize = 4;
+
+/// A comment: // to the end of its line, or /* ... */.
+#[derive(Clone)]
+pub struct Comment {
+    pub pos: Pos,
+    pub end: Pos,
+    pub line: bool,
+}
+
+pub struct Ctx {
+    pub src: &str,
+    pub file: &File,
+    pub toks: Vec<Token>,
+    /// For a ( [ or { token, the index of the token closing it.
+    pub close: Vec<usize>,
+    pub comments: Vec<Comment>,
+    /// 1 when a chain must fit on one line (it is the last argument of a
+    /// call).
+    pub force_one_line_chain: std::sync::atomic::AtomicUsize,
+}
+
+impl Ctx {
+    pub fn new(file: &File, toks: Vec<Token>) -> &Ctx {
+        let src = file.src.as_str();
+        let mut close = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        let mut comments = Vec::new();
+        let b = src.as_bytes();
+        let mut prev_end: usize = 0;
+        let mut i = 0;
+        while i < toks.len() {
+            close.push(0);
+            let k = toks[i].kind;
+            if k == L_PAREN || k == L_BRACKET || k == L_BRACE {
+                stack.push(i);
+            } else if k == R_PAREN || k == R_BRACKET || k == R_BRACE {
+                if let Some(o) = stack.pop() { close[o] = i; }
+            }
+            // Comments are what is not space in the gap before a token.
+            let start = toks[i].pos as usize;
+            let mut j = prev_end;
+            while j < start && j < b.len() {
+                if b[j] == b'/' && j + 1 < b.len() && b[j + 1] == b'/' {
+                    let s = j;
+                    while j < b.len() && b[j] != b'\n' { j += 1; }
+                    comments.push(Comment { pos: s as Pos, end: j as Pos, line: true });
+                } else if b[j] == b'/' && j + 1 < b.len() && b[j + 1] == b'*' {
+                    let s = j;
+                    let mut depth = 0;
+                    while j < b.len() {
+                        if b[j] == b'/' && j + 1 < b.len() && b[j + 1] == b'*' {
+                            depth += 1;
+                            j += 2;
+                        } else if b[j] == b'*' && j + 1 < b.len() && b[j + 1] == b'/' {
+                            depth -= 1;
+                            j += 2;
+                            if depth == 0 { break; }
+                        } else {
+                            j += 1;
+                        }
+                    }
+                    comments.push(Comment { pos: s as Pos, end: j as Pos, line: false });
+                } else {
+                    j += 1;
+                }
+            }
+            if toks[i].end as usize > prev_end { prev_end = toks[i].end as usize; }
+            i += 1;
+        }
+        &Ctx { src, file, toks, close, comments, force_one_line_chain: std::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    pub fn snippet(&self, lo: Pos, hi: Pos) -> &str { &self.src[lo as usize..hi as usize] }
+
+    /// The index of the first token at or after pos.
+    pub fn tok_index(&self, pos: Pos) -> usize {
+        let mut lo = 0;
+        let mut hi = self.toks.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.toks[mid].pos < pos { lo = mid + 1; } else { hi = mid; }
+        }
+        lo
+    }
+
+    /// The end of the token at pos (a token split by the parser, as >> in
+    /// Vec<Vec<T>>, ends where its first half does).
+    pub fn tok_end(&self, pos: Pos) -> Pos {
+        let i = self.tok_index(pos);
+        if i < self.toks.len() && self.toks[i].pos == pos { return self.toks[i].end; }
+        if i > 0 && self.toks[i - 1].end > pos { return pos + 1; }
+        pos
+    }
+
+    pub fn kind_at(&self, pos: Pos) -> Kind {
+        let i = self.tok_index(pos);
+        if i < self.toks.len() && self.toks[i].pos == pos { self.toks[i].kind } else { EOF }
+    }
+
+    /// The end of the bracket closing the one at pos.
+    pub fn close_end(&self, open: Pos) -> Pos {
+        let i = self.tok_index(open);
+        let c = self.close[i];
+        if c == 0 { return self.toks[i].end; }
+        self.toks[c].end
+    }
+
+    /// The position of the first token of kind k at or after pos.
+    pub fn find(&self, pos: Pos, k: Kind) -> Pos {
+        let mut i = self.tok_index(pos);
+        while i < self.toks.len() {
+            if self.toks[i].kind == k { return self.toks[i].pos; }
+            i += 1;
+        }
+        self.src.len() as Pos
+    }
+
+    /// The position of the token after the one ending at end.
+    pub fn next_pos(&self, end: Pos) -> Pos {
+        let i = self.tok_index(end);
+        if i < self.toks.len() { self.toks[i].pos } else { self.src.len() as Pos }
+    }
+
+    /// The kind of the token after the one ending at end.
+    pub fn next_kind(&self, end: Pos) -> Kind {
+        let i = self.tok_index(end);
+        if i < self.toks.len() { self.toks[i].kind } else { EOF }
+    }
+
+    /// The end of the generic list opened by the < at lt.
+    pub fn angle_end(&self, lt: Pos) -> Pos {
+        let mut i = self.tok_index(lt);
+        let mut depth = 0;
+        while i < self.toks.len() {
+            let t = &self.toks[i];
+            let k = t.kind;
+            if k == LT {
+                depth += 1;
+            } else if k == GT || k == GE {
+                depth -= 1;
+                if depth == 0 { return t.pos + 1; }
+            } else if k == SHR || k == SHR_EQ {
+                if depth == 1 { return t.pos + 1; }
+                depth -= 2;
+                if depth == 0 { return t.pos + 2; }
+            } else if k == L_PAREN || k == L_BRACKET || k == L_BRACE {
+                let c = self.close[i];
+                if c > i { i = c; }
+            }
+            i += 1;
+        }
+        self.src.len() as Pos
+    }
+
+    /// Comments with lo <= pos < hi.
+    pub fn comments_in(&self, lo: Pos, hi: Pos) -> Vec<Comment> {
+        let mut out = Vec::new();
+        let mut a = 0;
+        let mut b = self.comments.len();
+        while a < b {
+            let mid = (a + b) / 2;
+            if self.comments[mid].pos < lo { a = mid + 1; } else { b = mid; }
+        }
+        while a < self.comments.len() && self.comments[a].pos < hi {
+            out.push(self.comments[a].clone());
+            a += 1;
+        }
+        out
+    }
+
+    pub fn has_comment(&self, lo: Pos, hi: Pos) -> bool {
+        let mut a = 0;
+        let mut b = self.comments.len();
+        while a < b {
+            let mid = (a + b) / 2;
+            if self.comments[mid].pos < lo { a = mid + 1; } else { b = mid; }
+        }
+        a < self.comments.len() && self.comments[a].pos < hi
+    }
+
+    pub fn line_of(&self, pos: Pos) -> u32 { self.file.line_of(pos) }
+
+    /// Whether a blank line separates lo and hi (comments count as text).
+    pub fn blank_between(&self, lo: Pos, hi: Pos) -> bool {
+        let b = self.src.as_bytes();
+        let mut i = lo as usize;
+        let mut nl = 0;
+        let cs = self.comments_in(lo, hi);
+        let mut ci = 0;
+        while i < hi as usize && i < b.len() {
+            if ci < cs.len() && cs[ci].pos as usize == i {
+                i = cs[ci].end as usize;
+                ci += 1;
+                nl = 0;
+                continue;
+            }
+            let c = b[i];
+            if c == b'\n' {
+                nl += 1;
+                if nl >= 2 { return true; }
+            } else if c != b' ' && c != b'\t' && c != b'\r' {
+                nl = 0;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// The text of a comment as written (without trailing space), its lines
+    /// after the first moved to indent.
+    pub fn comment_text(&self, c: &Comment, indent: usize) -> String {
+        let text = self.snippet(c.pos, c.end).trim_end();
+        if c.line || !text.contains('\n') { return text.to_string(); }
+        // Re-indent a block comment's lines by how far its start moves.
+        let col = self.column(c.pos);
+        let mut out = String::new();
+        let mut first = true;
+        for l in text.split('\n') {
+            if first {
+                out.push_str(l.trim_end());
+                first = false;
+                continue;
+            }
+            out.push('\n');
+            let lead = leading_spaces(l);
+            let t = l.trim_end();
+            if t.len() == 0 { continue; }
+            let keep = if lead >= col { lead - col } else { 0 };
+            push_spaces(&mut out, indent + keep);
+            out.push_str(&t[lead..]);
+        }
+        out
+    }
+
+    /// The column (from 0) of pos.
+    pub fn column(&self, pos: Pos) -> usize {
+        let b = self.src.as_bytes();
+        let mut i = pos as usize;
+        while i > 0 && b[i - 1] != b'\n' { i -= 1; }
+        pos as usize - i
+    }
+
+    /// Whether only spaces precede pos on its line.
+    pub fn starts_line(&self, pos: Pos) -> bool {
+        let b = self.src.as_bytes();
+        let mut i = pos as usize;
+        while i > 0 && (b[i - 1] == b' ' || b[i - 1] == b'\t') { i -= 1; }
+        i == 0 || b[i - 1] == b'\n'
+    }
+
+    /// The source of a node, its lines after the first moved by how far its
+    /// start moves to shape (what rustfmt keeps when it cannot rewrite).
+    pub fn verbatim(&self, lo: Pos, hi: Pos, indent: usize) -> String {
+        let text = self.snippet(lo, hi);
+        if !text.contains('\n') { return text.to_string(); }
+        let col = self.line_indent(lo);
+        let mut out = String::new();
+        let mut first = true;
+        for l in text.split('\n') {
+            if first {
+                out.push_str(l.trim_end());
+                first = false;
+                continue;
+            }
+            out.push('\n');
+            let t = l.trim_end();
+            if t.len() == 0 { continue; }
+            let lead = leading_spaces(l);
+            if lead >= col {
+                push_spaces(&mut out, indent + lead - col);
+                out.push_str(&t[lead..]);
+            } else {
+                push_spaces(&mut out, indent);
+                out.push_str(&t[lead..]);
+            }
+        }
+        out
+    }
+
+    /// The indentation of the line holding pos.
+    pub fn line_indent(&self, pos: Pos) -> usize {
+        let b = self.src.as_bytes();
+        let mut i = pos as usize;
+        while i > 0 && b[i - 1] != b'\n' { i -= 1; }
+        leading_spaces(&self.src[i..])
+    }
+
+    // --- Where nodes end ------------------------------------------------------------
+
+    pub fn path_end(&self, p: &Path) -> Pos {
+        let last = p.segments[p.segments.len() - 1];
+        match last.args {
+            Some(a) => self.angle_end(a.lt),
+            None => self.tok_end(last.name.pos),
+        }
+    }
+
+    pub fn type_end(&self, t: &Type) -> Pos {
+        match &t.kind {
+            TypeKind::Path(p) => self.path_end(*p),
+            TypeKind::Ref { elem, .. } => self.type_end(*elem),
+            TypeKind::Ptr { elem, .. } => self.type_end(*elem),
+            TypeKind::Slice { lbrack, .. } => self.close_end(*lbrack),
+            TypeKind::Array { lbrack, .. } => self.close_end(*lbrack),
+            TypeKind::Tuple { lparen, .. } => self.close_end(*lparen),
+            TypeKind::Fn { start, result, .. } => match result {
+                Some(r) => self.type_end(*r),
+                None => self.close_end(self.find(*start, L_PAREN)),
+            },
+            TypeKind::Dyn { bounds, .. } => self.path_end(bounds[bounds.len() - 1]),
+            TypeKind::Impl { bounds, .. } => self.path_end(bounds[bounds.len() - 1]),
+            TypeKind::Never(p) => *p + 1,
+            TypeKind::Infer(p) => *p + 1,
+            TypeKind::Const(x) => self.expr_end(*x),
+        }
+    }
+
+    pub fn expr_end(&self, x: &Expr) -> Pos {
+        match &x.kind {
+            ExprKind::Lit { pos, .. } => self.tok_end(*pos),
+            ExprKind::Template { pos, .. } => self.tok_end(*pos),
+            ExprKind::Path(p) => self.path_end(*p),
+            ExprKind::Unary { x, .. } => self.expr_end(*x),
+            ExprKind::Ref { x, .. } => self.expr_end(*x),
+            ExprKind::Binary { y, .. } => self.expr_end(*y),
+            ExprKind::Assign { y, .. } => self.expr_end(*y),
+            ExprKind::Cast { ty, .. } => self.type_end(*ty),
+            ExprKind::Range { op_pos, hi, .. } => match hi {
+                Some(h) => self.expr_end(*h),
+                None => self.tok_end(*op_pos),
+            },
+            ExprKind::Call { lparen, .. } => self.close_end(*lparen),
+            ExprKind::MethodCall { name, type_args, .. } => {
+                let from = match type_args { Some(a) => self.angle_end(a.lt), None => self.tok_end(name.pos) };
+                self.close_end(self.find(from, L_PAREN))
+            }
+            ExprKind::Field { name, .. } => self.tok_end(name.pos),
+            ExprKind::Index { lbrack, .. } => self.close_end(*lbrack),
+            ExprKind::Try { question, .. } => *question + 1,
+            ExprKind::StructLit { path, .. } => self.close_end(self.find(self.path_end(*path), L_BRACE)),
+            ExprKind::Tuple { lparen, .. } => self.close_end(*lparen),
+            ExprKind::Paren { lparen, .. } => self.close_end(*lparen),
+            ExprKind::Array { lbrack, .. } => self.close_end(*lbrack),
+            ExprKind::ArrayRepeat { lbrack, .. } => self.close_end(*lbrack),
+            ExprKind::Block(b) => {
+                match destructure(*b) {
+                    Some(_) => {
+                        let s = b.stmts[0];
+                        match s {
+                            Stmt::Let(l) => match l.init { Some(i) => self.expr_end(i), None => b.rbrace },
+                            _ => b.rbrace,
+                        }
+                    }
+                    None => b.rbrace + 1,
+                }
+            }
+            ExprKind::If { then, els, .. } => match els {
+                Some(e) => self.expr_end(*e),
+                None => self.expr_end(*then),
+            },
+            ExprKind::Let { x, .. } => self.expr_end(*x),
+            ExprKind::Match { x, .. } => self.close_end(self.find(self.expr_end(*x), L_BRACE)),
+            ExprKind::Loop { body, .. } => self.expr_end(*body),
+            ExprKind::While { body, .. } => self.expr_end(*body),
+            ExprKind::For { body, .. } => self.expr_end(*body),
+            ExprKind::Break { pos, label, value } => match value {
+                Some(v) => self.expr_end(*v),
+                None => match label { Some(l) => self.tok_end(l.pos), None => self.tok_end(*pos) },
+            },
+            ExprKind::Continue { pos, label } => match label {
+                Some(l) => self.tok_end(l.pos),
+                None => self.tok_end(*pos),
+            },
+            ExprKind::Return { pos, value } => match value {
+                Some(v) => self.expr_end(*v),
+                None => self.tok_end(*pos),
+            },
+            ExprKind::Closure { body, .. } => self.expr_end(*body),
+            ExprKind::Select { pos, .. } => self.close_end(self.find(*pos, L_BRACE)),
+            ExprKind::Bad(p) => *p,
+        }
+    }
+
+    /// Where an expression starts (a labeled loop at its label, an unsafe
+    /// block at unsafe).
+    pub fn expr_start(&self, x: &Expr) -> Pos {
+        match &x.kind {
+            ExprKind::Block(b) => {
+                if destructure(*b).is_some() { return b.lbrace; }
+                if b.is_unsafe { return self.prev_tok_pos(b.lbrace); }
+                b.lbrace
+            }
+            ExprKind::Binary { x, .. } => self.expr_start(*x),
+            ExprKind::Assign { x, .. } => self.expr_start(*x),
+            ExprKind::Cast { x, .. } => self.expr_start(*x),
+            ExprKind::Range { lo, op_pos, .. } => match lo { Some(l) => self.expr_start(*l), None => *op_pos },
+            ExprKind::Call { fun, .. } => self.expr_start(*fun),
+            ExprKind::MethodCall { recv, .. } => self.expr_start(*recv),
+            ExprKind::Field { x, .. } => self.expr_start(*x),
+            ExprKind::Index { x, .. } => self.expr_start(*x),
+            ExprKind::Try { x, .. } => self.expr_start(*x),
+            ExprKind::Loop { label, pos, .. } => match label { Some(l) => l.pos, None => *pos },
+            ExprKind::While { label, pos, .. } => match label { Some(l) => l.pos, None => *pos },
+            ExprKind::For { label, pos, .. } => match label { Some(l) => l.pos, None => *pos },
+            _ => x.pos(),
+        }
+    }
+
+    pub fn prev_tok_pos(&self, pos: Pos) -> Pos {
+        let i = self.tok_index(pos);
+        if i == 0 { 0 } else { self.toks[i - 1].pos }
+    }
+
+    pub fn prev_tok_kind(&self, pos: Pos) -> Kind {
+        let i = self.tok_index(pos);
+        if i == 0 { EOF } else { self.toks[i - 1].kind }
+    }
+
+    pub fn pat_end(&self, p: &Pat) -> Pos {
+        match &p.kind {
+            PatKind::Wild(q) => *q + 1,
+            PatKind::Rest(q) => *q + 2,
+            PatKind::Ident { name, sub, .. } => match sub {
+                Some(s) => self.pat_end(*s),
+                None => self.tok_end(name.pos),
+            },
+            PatKind::Lit(x) => self.expr_end(*x),
+            PatKind::Range { hi, op_pos, .. } => match hi {
+                Some(h) => self.expr_end(*h),
+                None => self.tok_end(*op_pos),
+            },
+            PatKind::Path(q) => self.path_end(*q),
+            PatKind::Tuple { lparen, .. } => self.close_end(*lparen),
+            PatKind::TupleStruct { path, .. } => self.close_end(self.find(self.path_end(*path), L_PAREN)),
+            PatKind::Struct { path, .. } => self.close_end(self.find(self.path_end(*path), L_BRACE)),
+            PatKind::Slice { lbrack, .. } => self.close_end(*lbrack),
+            PatKind::Ref { pat, .. } => self.pat_end(*pat),
+            PatKind::Or(alts) => self.pat_end(alts[alts.len() - 1]),
+        }
+    }
+
+    pub fn pat_start(&self, p: &Pat) -> Pos {
+        match &p.kind {
+            PatKind::Ident { is_mut, name, .. } => if *is_mut { self.prev_tok_pos(name.pos) } else { name.pos },
+            PatKind::Range { lo, op_pos, .. } => match lo { Some(l) => self.expr_start(*l), None => *op_pos },
+            PatKind::Or(alts) => self.pat_start(alts[0]),
+            _ => p.pos(),
+        }
+    }
+
+    /// Where an item ends.
+    pub fn item_end(&self, it: &Item) -> Pos {
+        // Every item ends with } or ;, the last token before the next
+        // item: find it from the item's own last part.
+        let from = match it {
+            Item::Fn(f) => match f.body {
+                Some(b) => return self.expr_end(b),
+                None => match f.result { Some(r) => self.type_end(r), None => self.tok_end(f.name.pos) },
+            },
+            Item::Struct(s) => self.tok_end(s.name.pos),
+            Item::Enum(e) => self.tok_end(e.name.pos),
+            Item::TypeAlias(t) => self.tok_end(t.name.pos),
+            Item::Const(c) => match c.value { Some(v) => self.expr_end(v), None => self.type_end(c.ty) },
+            Item::Static(s) => match s.value { Some(v) => self.expr_end(v), None => self.type_end(s.ty) },
+            Item::Impl(im) => self.type_end(im.ty),
+            Item::Trait(t) => self.tok_end(t.name.pos),
+            Item::Mod(m) => self.tok_end(m.name.pos),
+            Item::Use(u) => self.use_end(u.tree),
+            Item::Extern(e) => e.base.start,
+        };
+        self.item_close(from)
+    }
+
+    // The end of the ; or block that ends an item whose last part before it
+    // ends at from: the first ; or { at depth 0.
+    pub fn item_close(&self, from: Pos) -> Pos {
+        let mut i = self.tok_index(from);
+        while i < self.toks.len() {
+            let k = self.toks[i].kind;
+            if k == SEMI { return self.toks[i].end; }
+            if k == L_BRACE {
+                let c = self.close[i];
+                return self.toks[c].end;
+            }
+            if k == L_PAREN || k == L_BRACKET {
+                let c = self.close[i];
+                if c > i { i = c; }
+            }
+            i += 1;
+        }
+        self.src.len() as Pos
+    }
+
+    pub fn use_end(&self, t: &UseTree) -> Pos {
+        if t.group || t.glob { return self.find(t.prefix_or_pos(), SEMI); }
+        match t.alias {
+            Some(a) => self.tok_end(a.pos),
+            None => match t.prefix { Some(p) => self.path_end(p), None => 0 },
+        }
+    }
+}
+
+impl UseTree {
+    pub fn prefix_or_pos(&self) -> Pos {
+        match self.prefix {
+            Some(p) => p.pos(),
+            None => 0,
+        }
+    }
+}
+
+/// The parts of a destructuring assignment the parser turned into a block
+/// ({ let (a, b) = e; ... }): its pattern and places.
+pub fn destructure(b: &Block) -> Option<(&Pat, Vec<&Expr>)> {
+    if b.stmts.len() == 0 { return None; }
+    let l = match b.stmts[0] {
+        Stmt::Let(l) => l,
+        _ => return None,
+    };
+    if l.pos != b.lbrace || b.lbrace == b.rbrace { return None; }
+    let mut places = Vec::new();
+    let mut i = 1;
+    while i < b.stmts.len() {
+        match b.stmts[i] {
+            Stmt::Expr { x, .. } => match &x.kind {
+                ExprKind::Assign { x: place, .. } => places.push(*place),
+                _ => return None,
+            },
+            _ => return None,
+        }
+        i += 1;
+    }
+    Some((l.pat, places))
+}
+
+// --- Shape ------------------------------------------------------------------------
+
+/// The room for a rewrite (rustfmt's Shape): its first line starts at column
+/// block + offset and has width columns; later lines start at block + align.
+#[derive(Clone)]
+pub struct Shape {
+    pub width: usize,
+    pub block: usize,
+    pub align: usize,
+    pub offset: usize,
+}
+
+pub fn sub(a: usize, b: usize) -> usize { if a > b { a - b } else { 0 } }
+
+impl Shape {
+    pub fn indented(block: usize) -> Shape { Shape { width: sub(MAX_WIDTH, block), block, align: 0, offset: 0 } }
+
+    pub fn legacy(width: usize, block: usize) -> Shape { Shape { width, block, align: 0, offset: 0 } }
+
+    pub fn used_width(&self) -> usize { self.block + self.offset }
+
+    pub fn indent_width(&self) -> usize { self.block + self.align }
+
+    pub fn with_max_width(&self) -> Shape {
+        Shape { width: sub(MAX_WIDTH, self.indent_width()), block: self.block, align: self.align, offset: self.offset }
+    }
+
+    pub fn visual_indent(&self, extra: usize) -> Shape {
+        let a = self.offset + extra;
+        Shape { width: self.width, block: self.block, align: a, offset: a }
+    }
+
+    pub fn block_indent(&self, extra: usize) -> Shape {
+        if self.align == 0 {
+            Shape { width: self.width, block: self.block + extra, align: 0, offset: 0 }
+        } else {
+            Shape { width: self.width, block: self.block, align: self.align + extra, offset: self.align + extra }
+        }
+    }
+
+    pub fn block_left(&self, w: usize) -> Option<Shape> { self.block_indent(w).sub_width(w) }
+
+    pub fn add_offset(&self, w: usize) -> Shape {
+        Shape { width: self.width, block: self.block, align: self.align, offset: self.offset + w }
+    }
+
+    /// rustfmt's Shape::block: the same with no alignment.
+    pub fn block_only(&self) -> Shape {
+        Shape { width: self.width, block: self.block, align: 0, offset: self.offset }
+    }
+
+    pub fn sub_width(&self, w: usize) -> Option<Shape> {
+        if w > self.width { return None; }
+        Some(Shape { width: self.width - w, block: self.block, align: self.align, offset: self.offset })
+    }
+
+    pub fn sat_sub_width(&self, w: usize) -> Shape {
+        Shape { width: sub(self.width, w), block: self.block, align: self.align, offset: self.offset }
+    }
+
+    pub fn shrink_left(&self, w: usize) -> Option<Shape> {
+        if w > self.width { return None; }
+        Some(Shape { width: self.width - w, block: self.block, align: self.align + w, offset: self.offset + w })
+    }
+
+    pub fn offset_left(&self, w: usize) -> Option<Shape> { self.add_offset(w).sub_width(w) }
+
+    pub fn rhs_overhead(&self) -> usize { sub(MAX_WIDTH, self.used_width() + self.width) }
+
+    pub fn with_width(&self, w: usize) -> Shape { Shape { width: w, block: self.block, align: self.align, offset: self.offset } }
+
+    pub fn indent_str(&self) -> String { spaces(self.indent_width()) }
+
+    pub fn nl_indent(&self) -> String {
+        let mut s = String::new();
+        s.push('\n');
+        push_spaces(&mut s, self.indent_width());
+        s
+    }
+
+    /// The shape for the next line at this shape's indentation.
+    pub fn next_line(&self) -> Shape { Shape::indented(self.block).with_align(self.align) }
+
+    pub fn with_align(&self, a: usize) -> Shape {
+        Shape { width: sub(MAX_WIDTH, self.block + a), block: self.block, align: a, offset: a }
+    }
+}
+
+// --- Strings ----------------------------------------------------------------------
+
+pub fn spaces(n: usize) -> String {
+    let mut s = String::new();
+    push_spaces(&mut s, n);
+    s
+}
+
+pub fn push_spaces(s: &mut String, n: usize) {
+    let mut i = 0;
+    while i < n {
+        s.push(' ');
+        i += 1;
+    }
+}
+
+pub fn leading_spaces(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') { i += 1; }
+    i
+}
+
+/// The width of text in columns (wide East Asian characters take two).
+pub fn str_width(s: &str) -> usize {
+    let mut w = 0;
+    for c in s.chars() {
+        let u = c as u32;
+        if u < 0x1100 {
+            w += 1;
+        } else if (u >= 0x1100 && u <= 0x115f) || (u >= 0x2e80 && u <= 0xa4cf) || (u >= 0xac00 && u <= 0xd7a3)
+            || (u >= 0xf900 && u <= 0xfaff) || (u >= 0xfe30 && u <= 0xfe4f) || (u >= 0xff00 && u <= 0xff60)
+            || (u >= 0xffe0 && u <= 0xffe6) || (u >= 0x1f300 && u <= 0x1f64f) || (u >= 0x20000 && u <= 0x3fffd) {
+            w += 2;
+        } else {
+            w += 1;
+        }
+    }
+    w
+}
+
+pub fn first_line_width(s: &str) -> usize {
+    match s.find('\n') {
+        Some(i) => str_width(&s[..i]),
+        None => str_width(s),
+    }
+}
+
+pub fn last_line_width(s: &str) -> usize {
+    match s.rfind('\n') {
+        Some(i) => str_width(&s[i + 1..]),
+        None => str_width(s),
+    }
+}
+
+pub fn first_line(s: &str) -> &str {
+    match s.find('\n') {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
+pub fn last_line(s: &str) -> &str {
+    match s.rfind('\n') {
+        Some(i) => &s[i + 1..],
+        None => s,
+    }
+}
+
+pub fn is_single_line(s: &str) -> bool { !s.contains('\n') }
+
+pub fn count_newlines(s: &str) -> usize { s.matches_count('\n') }
+
+/// Whether the text after the first line fits (rustfmt's
+/// filtered_str_fits).
+pub fn str_fits(s: &str, sh: &Shape) -> bool {
+    if s.len() == 0 { return true; }
+    if first_line_width(s) > sh.width { return false; }
+    if is_single_line(s) { return true; }
+    for l in s.split('\n').skip(1) {
+        if str_width(l) > MAX_WIDTH { return false; }
+    }
+    if last_line_width(s) > sh.used_width() + sh.width { return false; }
+    true
+}
+
+pub fn wrap_str(s: String, sh: &Shape) -> Option<String> {
+    if str_fits(s.as_str(), sh) { Some(s) } else { None }
+}
+
+/// The last line's width when it is the only line, else its own width
+/// (rustfmt's last_line_extendable checks).
+pub fn last_line_extendable(s: &str) -> bool {
+    if s.ends_with("\"#") { return true; }
+    let l = last_line(s).trim();
+    for c in l.chars() {
+        if c != ')' && c != ']' && c != '}' && c != '?' && c != '>' { return false; }
+    }
+    true
+}
+
+pub fn trimmed_last_line_width(s: &str) -> usize { str_width(last_line(s).trim()) }
+
+pub fn s(t: &str) -> String { t.to_string() }
+
+/// a + b.
+pub fn cat(a: &str, b: &str) -> String {
+    let mut r = String::with_capacity(a.len() + b.len());
+    r.push_str(a);
+    r.push_str(b);
+    r
+}
+
+pub fn cat3(a: &str, b: &str, c: &str) -> String {
+    let mut r = String::with_capacity(a.len() + b.len() + c.len());
+    r.push_str(a);
+    r.push_str(b);
+    r.push_str(c);
+    r
+}

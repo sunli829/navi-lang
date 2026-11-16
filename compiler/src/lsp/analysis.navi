@@ -1,0 +1,483 @@
+//! Documents, crates and their analysis: the front end run over a crate
+//! with the open documents standing in for their files; diagnostics;
+//! URIs and positions.
+
+use std::collections::HashMap;
+use crate::syntax::ast::SourceFile;
+use crate::syntax::source::{File, Pos};
+use crate::resolve::{CrateSpec, Def};
+use crate::diag::Error;
+use crate::types::collect::Info;
+use crate::util;
+use crate::lsp::{Server, notify, log};
+use crate::lsp::json::{Json, obj, arr, str, int};
+use crate::lsp::index::FileIndex;
+
+/// An open document.
+pub struct Doc {
+    pub uri: String,
+    pub path: String,
+    pub text: String,
+    pub version: i64,
+    /// The crate it belongs to (its root directory, or the file).
+    pub krate: String,
+    pub lines: LineIndex,
+}
+
+/// A file of an analyzed crate.
+pub struct FileData {
+    pub path: String,
+    pub uri: String,
+    pub sf: &SourceFile,
+    /// Of the analyzed crate (not std).
+    pub user: bool,
+    pub lines: LineIndex,
+}
+
+/// The front end's results for a crate.
+pub struct Analysis {
+    pub key: String,
+    pub info: Option<&mut Info>,
+    pub errors: Vec<Error>,
+    pub files: Vec<&mut FileData>,
+    /// By the compiler's file name.
+    pub by_name: HashMap<String, usize>,
+    /// By path.
+    pub by_path: HashMap<String, usize>,
+    /// The URIs diagnostics were published for.
+    pub published: Vec<String>,
+    pub indexes: HashMap<String, &mut FileIndex>,
+}
+
+// --- Lines and positions ----------------------------------------------------------------
+
+/// Where the lines of a text start.
+#[derive(Clone)]
+pub struct LineIndex {
+    pub starts: Vec<usize>,
+}
+
+impl LineIndex {
+    pub fn new(text: &str) -> LineIndex {
+        let mut starts = Vec::new();
+        starts.push(0);
+        let b = text.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\n' { starts.push(i + 1); }
+            i += 1;
+        }
+        LineIndex { starts }
+    }
+
+    pub fn line_of(&self, off: usize) -> usize {
+        let mut lo = 0;
+        let mut hi = self.starts.len();
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if self.starts[mid] <= off { lo = mid; } else { hi = mid; }
+        }
+        lo
+    }
+
+    /// An offset as an LSP position (UTF-16 columns).
+    pub fn pos(&self, text: &str, off: usize) -> Json {
+        let o = if off > text.len() { text.len() } else { off };
+        let line = self.line_of(o);
+        let start = self.starts[line];
+        let col = utf16_len(&text[start..o]);
+        obj().set("line", int(line as i64)).set("character", int(col as i64))
+    }
+
+    pub fn range(&self, text: &str, lo: usize, hi: usize) -> Json {
+        obj().set("start", self.pos(text, lo)).set("end", self.pos(text, hi))
+    }
+
+    /// An LSP position as an offset.
+    pub fn offset(&self, text: &str, line: usize, ch: usize) -> usize {
+        if line >= self.starts.len() { return text.len(); }
+        let start = self.starts[line];
+        let mut n = 0;
+        let mut off = start;
+        for c in text[start..].chars() {
+            if n >= ch || c == '\n' { break; }
+            n += if (c as u32) >= 0x10000 { 2 } else { 1 };
+            off += c.len_utf8();
+        }
+        off
+    }
+}
+
+pub fn utf16_len(s: &str) -> usize {
+    let mut n = 0;
+    for c in s.chars() { n += if (c as u32) >= 0x10000 { 2 } else { 1 }; }
+    n
+}
+
+/// The offset of a request's position in its document's text.
+pub fn json_offset(p: &Json, text: &str, li: &LineIndex) -> usize {
+    let line = p.at(&["position", "line"]).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+    let ch = p.at(&["position", "character"]).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+    li.offset(text, line, ch)
+}
+
+// --- URIs ---------------------------------------------------------------------------------
+
+pub fn uri_to_path(uri: &str) -> String {
+    let rest = match uri.strip_prefix("file://") { Some(r) => r, None => uri };
+    let b = rest.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = hexval(b[i + 1]) * 16 + hexval(b[i + 2]);
+            out.push(h as u8);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    util::path_clean(String::from_utf8_lossy(out.as_slice()).as_str())
+}
+
+fn hexval(c: u8) -> u32 {
+    if c >= b'0' && c <= b'9' { return (c - b'0') as u32; }
+    if c >= b'a' && c <= b'f' { return (c - b'a' + 10) as u32; }
+    if c >= b'A' && c <= b'F' { return (c - b'A' + 10) as u32; }
+    0
+}
+
+pub fn path_to_uri(path: &str) -> String {
+    let mut out = String::from("file://");
+    let hex = "0123456789ABCDEF".as_bytes();
+    for b in path.as_bytes().iter() {
+        let c = *b;
+        let keep = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9')
+            || c == b'/' || c == b'-' || c == b'_' || c == b'.' || c == b'~';
+        if keep {
+            out.push(c as char);
+        } else {
+            out.push('%');
+            out.push(hex[(c >> 4) as usize] as char);
+            out.push(hex[(c & 15) as usize] as char);
+        }
+    }
+    out
+}
+
+fn exists(p: &str) -> bool { std::path::Path::new(p).exists() }
+
+/// The crate a file belongs to: the nearest directory above it with a
+/// navi.toml or src/main.navi or src/lib.navi, else the file itself.
+pub fn crate_root(path: &str) -> String {
+    let mut d = util::path_dir(path);
+    loop {
+        if exists(util::path_join(d.as_str(), "navi.toml").as_str())
+            || exists(util::path_join(d.as_str(), "src/main.navi").as_str())
+            || exists(util::path_join(d.as_str(), "src/lib.navi").as_str()) {
+            return d;
+        }
+        let up = util::path_dir(d.as_str());
+        if up == d || d == "/" || d == "." { break; }
+        d = up;
+    }
+    path.to_string()
+}
+
+// Where std is: $NAVI_STD, a lib/std above the crate or the workspace, or
+// beside the compiler.
+fn std_dir(start: &str, root: &str) -> Option<String> {
+    if let Ok(d) = std::env::var("NAVI_STD") { return Some(d); }
+    for s in [start, root].iter() {
+        let mut d = util::path_clean(*s);
+        loop {
+            let cand = util::path_join(d.as_str(), "lib/std");
+            if exists(util::path_join(cand.as_str(), "src/lib.navi").as_str()) { return Some(cand); }
+            let up = util::path_dir(d.as_str());
+            if up == d || d == "/" || d == "." || d.len() == 0 { break; }
+            d = up;
+        }
+    }
+    if let Some(a0) = std::env::args().next() {
+        let exe_dir = util::path_dir(a0.as_str());
+        for rel in ["../lib/std", "../../lib/std", "lib/std"].iter() {
+            let cand = util::path_join(exe_dir.as_str(), *rel);
+            if exists(util::path_join(cand.as_str(), "src/lib.navi").as_str()) { return Some(cand); }
+        }
+    }
+    None
+}
+
+impl Server {
+    pub fn open(&mut self, uri: &str, text: String, version: i64) {
+        let path = uri_to_path(uri);
+        let krate = match self.docs.get(&uri.to_string()) {
+            Some(d) => d.krate.clone(),
+            None => crate_root(path.as_str()),
+        };
+        let lines = LineIndex::new(text.as_str());
+        self.docs.insert(uri.to_string(), &mut Doc { uri: uri.to_string(), path, text, version, krate: krate.clone(), lines });
+        self.dirty.insert(krate, true);
+    }
+
+    pub fn change(&mut self, uri: &str, changes: &Vec<Json>, version: i64) {
+        let d = match self.docs.get(&uri.to_string()) { Some(d) => *d, None => return };
+        for c in changes.iter() {
+            let t = c.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            match c.get("range") {
+                Some(r) => {
+                    let sl = r.at(&["start", "line"]).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+                    let sc = r.at(&["start", "character"]).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+                    let el = r.at(&["end", "line"]).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+                    let ec = r.at(&["end", "character"]).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+                    let a = d.lines.offset(d.text.as_str(), sl, sc);
+                    let b = d.lines.offset(d.text.as_str(), el, ec);
+                    let mut nt = String::with_capacity(d.text.len() + t.len());
+                    nt.push_str(&d.text[..a]);
+                    nt.push_str(t.as_str());
+                    nt.push_str(&d.text[b..]);
+                    d.text = nt;
+                }
+                None => d.text = t,
+            }
+            d.lines = LineIndex::new(d.text.as_str());
+        }
+        d.version = version;
+        let k = d.krate.clone();
+        self.dirty.insert(k, true);
+    }
+
+    /// Analyzes the crates that changed and publishes their diagnostics.
+    pub fn refresh(&mut self) {
+        let keys: Vec<String> = self.dirty.keys().map(|k| k.clone()).collect();
+        for k in keys.iter() {
+            self.dirty.remove(k);
+            self.analyze(k.as_str());
+        }
+    }
+
+    /// The analysis of a document's crate, brought up to date.
+    pub fn analysis_for(&mut self, uri: &str) -> Option<&mut Analysis> {
+        let k = match self.docs.get(&uri.to_string()) {
+            Some(d) => d.krate.clone(),
+            None => crate_root(uri_to_path(uri).as_str()),
+        };
+        if self.dirty.contains_key(&k) || !self.analyses.contains_key(&k) {
+            self.dirty.remove(&k);
+            self.analyze(k.as_str());
+        }
+        match self.analyses.get(&k) {
+            Some(a) => Some(*a),
+            None => None,
+        }
+    }
+
+    fn analyze(&mut self, key: &str) {
+        let t0 = crate::driver::now_nanos();
+        crate::cache::OVERLAY.clear();
+        crate::cache::READ.clear();
+        for d in self.docs.values() {
+            crate::cache::OVERLAY.push((d.path.clone(), d.text.clone()));
+        }
+        let std_root = match std_dir(key, self.root.as_str()) {
+            Some(d) => util::path_clean(d.as_str()),
+            None => {
+                log("cannot find the standard library (set NAVI_STD)".to_string());
+                return;
+            }
+        };
+        let std_spec = &CrateSpec { name: "std".to_string(), fs_root: std_root.clone(), root: "src/lib.navi".to_string(), deps: Vec::new(), dir: String::new() };
+        let mut specs = Vec::new();
+        specs.push(std_spec);
+        if util::path_clean(key) != std_root {
+            let spec = match crate::driver::load_crate(key) {
+                Ok(s) => s,
+                Err(e) => {
+                    log(e);
+                    return;
+                }
+            };
+            specs.push(&CrateSpec { name: spec.name.clone(), fs_root: util::path_clean(spec.fs_root.as_str()), root: spec.root.clone(),
+                deps: spec.deps.clone(), dir: util::path_clean(spec.dir.as_str()) });
+        }
+        let mut cfg = crate::driver::host_config();
+        cfg.test = true;
+        cfg.debug = true;
+        let r = std::panic::catch_unwind(|| crate::driver::check_specs(cfg.clone(), &specs));
+        let (info, errors) = match r {
+            Ok((i, e)) => (Some(i), e),
+            Err(_) => {
+                log(`${key}: the front end crashed`);
+                (None, Vec::new())
+            }
+        };
+        let a = &mut Analysis { key: key.to_string(), info, errors, files: Vec::new(), by_name: HashMap::new(), by_path: HashMap::new(),
+            published: Vec::new(), indexes: HashMap::new() };
+        if let Some(old) = self.analyses.get(&key.to_string()) { a.published = old.published.clone(); }
+        if let Some(info) = a.info {
+            for c in info.res.crates.iter() {
+                for sf in c.files.iter() {
+                    let name = sf.file.name.clone();
+                    let prefix = cat(c.dir.as_str(), "/");
+                    let path = if name.starts_with("/") {
+                        util::path_clean(name.as_str())
+                    } else if name.starts_with(prefix.as_str()) {
+                        util::path_join(c.fs_root.as_str(), &name[prefix.len()..])
+                    } else {
+                        util::path_join(c.fs_root.as_str(), name.as_str())
+                    };
+                    let fd = &mut FileData { path: path.clone(), uri: path_to_uri(path.as_str()), sf: *sf, user: !c.is_std || specs.len() == 1,
+                        lines: LineIndex::new(sf.file.src.as_str()) };
+                    let i = a.files.len();
+                    a.files.push(fd);
+                    a.by_name.insert(name, i);
+                    a.by_path.insert(path, i);
+                }
+            }
+        }
+        self.analyses.insert(key.to_string(), a);
+        // Keep a few crates' analyses (each holds a whole std).
+        self.order.retain(|x| x != key);
+        self.order.push(key.to_string());
+        while self.order.len() > 4 {
+            let old = self.order.remove(0);
+            self.analyses.remove(&old);
+        }
+        // A document that is not part of its crate's module tree is a crate
+        // of its own.
+        if a.info.is_some() {
+            let mut moved: Vec<String> = Vec::new();
+            for d in self.docs.values() {
+                if d.krate == key && !a.by_path.contains_key(&d.path) && d.path != key { moved.push(d.uri.clone()); }
+            }
+            for u in moved.iter() {
+                if let Some(d0) = self.docs.get(u) {
+                    let d = *d0;
+                    d.krate = d.path.clone();
+                    let k = d.krate.clone();
+                    self.dirty.insert(k, true);
+                }
+            }
+        }
+        self.publish(a);
+        let ms = (crate::driver::now_nanos() - t0) / 1000000;
+        log(`analyzed ${key} in ${ms} ms`);
+    }
+
+    fn publish(&mut self, a: &mut Analysis) {
+        let mut by_uri: HashMap<String, Json> = HashMap::new();
+        for f in a.files.iter() {
+            if f.user { by_uri.insert(f.uri.clone(), arr()); }
+        }
+        for e in a.errors.iter() {
+            let i = match a.by_name.get(&e.pos.file) {
+                Some(i) => *i,
+                None => {
+                    // Errors without a file go on the crate's root file.
+                    let mut r = 0;
+                    let mut found = false;
+                    for (k, j) in a.by_path.iter() {
+                        let _ = k;
+                        if a.files[*j].user && !found {
+                            r = *j;
+                            found = true;
+                        }
+                    }
+                    if !found { continue; }
+                    r
+                }
+            };
+            let f = &a.files[i];
+            if !f.user { continue; }
+            let src = f.sf.file.src.as_str();
+            let line = if e.pos.line > 0 { (e.pos.line - 1) as usize } else { 0 };
+            let col = if e.pos.col > 0 { (e.pos.col - 1) as usize } else { 0 };
+            let lo = if line < f.lines.starts.len() { f.lines.starts[line] + col } else { src.len() };
+            let hi = whole_token_end(f, lo);
+            let d = obj()
+                .set("range", f.lines.range(src, lo, hi))
+                .set("severity", int(if e.warning { 2 } else { 1 }))
+                .set("source", str("navic"))
+                .set("message", str(e.msg.as_str()));
+            let cur = match by_uri.get(&f.uri) { Some(c) => c.clone(), None => arr() };
+            by_uri.insert(f.uri.clone(), cur.push(d));
+        }
+        // Clear what was published before and is gone.
+        for u in a.published.iter() {
+            if !by_uri.contains_key(u) { by_uri.insert(u.clone(), arr()); }
+        }
+        let mut published = Vec::new();
+        let mut uris: Vec<String> = by_uri.keys().map(|k| k.clone()).collect();
+        uris.sort();
+        for u in uris.iter() {
+            let ds = &by_uri[u];
+            notify("textDocument/publishDiagnostics", obj().set("uri", str(u.as_str())).set("diagnostics", ds.clone()));
+            if let Json::Arr(items) = ds {
+                if items.len() > 0 { published.push(u.clone()); }
+            }
+        }
+        a.published = published;
+    }
+}
+
+fn cat(a: &str, b: &str) -> String {
+    let mut s = a.to_string();
+    s.push_str(b);
+    s
+}
+
+// The end of the token at lo (a whole string literal, say).
+fn whole_token_end(f: &FileData, lo: usize) -> usize {
+    let toks = crate::syntax::lexer::tokenize(f.sf.file.src.as_str(), crate::syntax::source::Errors::new(f.sf.file));
+    for t in toks.iter() {
+        if t.pos as usize == lo && t.end as usize > lo { return t.end as usize; }
+        if t.pos as usize > lo { break; }
+    }
+    token_end(f.sf.file.src.as_str(), lo)
+}
+
+/// The end of the word at lo (at least one character).
+pub fn token_end(src: &str, lo: usize) -> usize {
+    let b = src.as_bytes();
+    if lo >= b.len() { return b.len(); }
+    let mut i = lo;
+    while i < b.len() && (b[i] == b'_' || (b[i] >= b'a' && b[i] <= b'z') || (b[i] >= b'A' && b[i] <= b'Z') || (b[i] >= b'0' && b[i] <= b'9')) {
+        i += 1;
+    }
+    if i == lo {
+        i = lo + 1;
+        while i < b.len() && (b[i] & 0xc0) == 0x80 { i += 1; }
+    }
+    i
+}
+
+impl Analysis {
+    pub fn file_by_path(&self, path: &str) -> Option<&mut FileData> {
+        match self.by_path.get(&path.to_string()) {
+            Some(i) => Some(self.files[*i]),
+            None => None,
+        }
+    }
+
+    pub fn file_of(&self, f: &File) -> Option<&mut FileData> {
+        match self.by_name.get(&f.name) {
+            Some(i) => Some(self.files[*i]),
+            None => None,
+        }
+    }
+
+    /// The location (uri, range) of a definition.
+    pub fn def_location(&self, d: &Def) -> Option<Json> {
+        let f = d.file?;
+        let fd = self.file_of(f)?;
+        let src = fd.sf.file.src.as_str();
+        let lo = if d.pos >= 0 { d.pos as usize } else { 0 };
+        Some(obj().set("uri", str(fd.uri.as_str())).set("range", fd.lines.range(src, lo, token_end(src, lo))))
+    }
+
+    pub fn location(&self, fd: &FileData, lo: Pos, hi: Pos) -> Json {
+        let src = fd.sf.file.src.as_str();
+        obj().set("uri", str(fd.uri.as_str())).set("range", fd.lines.range(src, lo as usize, hi as usize))
+    }
+}
