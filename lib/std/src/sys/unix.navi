@@ -1,0 +1,970 @@
+//! POSIX (macOS and Linux with glibc or bionic): file descriptors, stat,
+//! directories, the environment, posix_spawn and waitpid.
+//!
+//! errno is per OS thread and a green thread may move to another one at
+//! any navi call: it is read right after the failed C call, before any
+//! navi code runs. Calls that may block for long run between
+//! enter_blocked and exit_blocked (a collector proceeds meanwhile).
+
+use crate::io::{self, Error, ErrorKind};
+use crate::string::String;
+use crate::sys::{FileAttr, DirEnt, cstring, from_cstr, zeroed, rd_u16, rd_u32, rd_u64, split_env};
+use crate::rt::sched::{enter_blocked, exit_blocked};
+
+extern "C" {
+    fn strerror(e: i32) -> *const u8;
+    #[link_name = "read"]
+    fn c_read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    #[link_name = "write"]
+    fn c_write(fd: i32, buf: *const u8, n: usize) -> isize;
+    #[link_name = "open"]
+    fn c_open(path: *const u8, flags: i32, ...) -> i32;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn lseek(fd: i32, off: i64, whence: i32) -> i64;
+    #[link_name = "close"]
+    fn c_close(fd: i32) -> i32;
+    fn fsync(fd: i32) -> i32;
+    fn ftruncate(fd: i32, len: i64) -> i32;
+    #[link_name = "unlink"]
+    fn c_unlink(path: *const u8) -> i32;
+    #[link_name = "rmdir"]
+    fn c_rmdir(path: *const u8) -> i32;
+    #[link_name = "mkdir"]
+    fn c_mkdir(path: *const u8, mode: u32) -> i32;
+    #[link_name = "rename"]
+    fn c_rename(from: *const u8, to: *const u8) -> i32;
+    #[link_name = "link"]
+    fn c_link(from: *const u8, to: *const u8) -> i32;
+    #[link_name = "symlink"]
+    fn c_symlink(target: *const u8, link: *const u8) -> i32;
+    #[link_name = "readlink"]
+    fn c_readlink(path: *const u8, buf: *mut u8, n: usize) -> isize;
+    #[link_name = "chmod"]
+    fn c_chmod(path: *const u8, mode: u32) -> i32;
+    #[link_name = "fchmod"]
+    fn c_fchmod(fd: i32, mode: u32) -> i32;
+    #[link_name = "getcwd"]
+    fn c_getcwd(buf: *mut u8, n: usize) -> *mut u8;
+    #[link_name = "chdir"]
+    fn c_chdir(path: *const u8) -> i32;
+    #[link_name = "isatty"]
+    fn c_isatty(fd: i32) -> i32;
+    #[link_name = "getenv"]
+    fn c_getenv(name: *const u8) -> *const u8;
+    #[link_name = "setenv"]
+    fn c_setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
+    #[link_name = "unsetenv"]
+    fn c_unsetenv(name: *const u8) -> i32;
+    #[link_name = "getpid"]
+    fn c_getpid() -> i32;
+    fn closedir(d: *mut u8) -> i32;
+    fn futimens(fd: i32, times: *const u8) -> i32;
+    fn waitpid(pid: i32, status: *mut u8, options: i32) -> i32;
+    #[link_name = "kill"]
+    fn c_kill(pid: i32, sig: i32) -> i32;
+    fn poll(fds: *mut u8, n: u64, timeout: i32) -> i32;
+    fn signal(sig: i32, handler: usize) -> usize;
+    fn sigemptyset(set: *mut u8) -> i32;
+    fn sigaddset(set: *mut u8, sig: i32) -> i32;
+    fn posix_spawn_file_actions_init(fa: *mut u8) -> i32;
+    fn posix_spawn_file_actions_destroy(fa: *mut u8) -> i32;
+    fn posix_spawn_file_actions_adddup2(fa: *mut u8, fd: i32, newfd: i32) -> i32;
+    fn posix_spawn_file_actions_addopen(fa: *mut u8, fd: i32, path: *const u8, flags: i32, mode: u32) -> i32;
+    fn posix_spawn_file_actions_addchdir_np(fa: *mut u8, path: *const u8) -> i32;
+    fn posix_spawnattr_init(a: *mut u8) -> i32;
+    fn posix_spawnattr_destroy(a: *mut u8) -> i32;
+    fn posix_spawnattr_setflags(a: *mut u8, flags: i16) -> i32;
+    fn posix_spawnattr_setsigdefault(a: *mut u8, set: *const u8) -> i32;
+    #[link_name = "access"]
+    fn c_access(path: *const u8, mode: i32) -> i32;
+    fn posix_spawnp(pid: *mut u8, file: *const u8, fa: *const u8, attr: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    #[link_name = "__error"]
+    fn errno_ptr() -> *mut i32;
+    fn pipe(fds: *mut u8) -> i32;
+    fn _NSGetEnviron() -> *const *const *const u8;
+    fn _NSGetExecutablePath(buf: *mut u8, size: *mut u8) -> i32;
+    #[link_name = "realpath$DARWIN_EXTSN"]
+    fn c_realpath(path: *const u8, buf: *mut u8) -> *mut u8;
+}
+
+// The 64-bit-inode stat and dirent (the only ones on arm64).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+extern "C" {
+    #[link_name = "stat"]
+    fn c_stat(path: *const u8, buf: *mut u8) -> i32;
+    #[link_name = "lstat"]
+    fn c_lstat(path: *const u8, buf: *mut u8) -> i32;
+    #[link_name = "fstat"]
+    fn c_fstat(fd: i32, buf: *mut u8) -> i32;
+    fn opendir(path: *const u8) -> *mut u8;
+    fn readdir(d: *mut u8) -> *const u8;
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" {
+    #[link_name = "stat$INODE64"]
+    fn c_stat(path: *const u8, buf: *mut u8) -> i32;
+    #[link_name = "lstat$INODE64"]
+    fn c_lstat(path: *const u8, buf: *mut u8) -> i32;
+    #[link_name = "fstat$INODE64"]
+    fn c_fstat(fd: i32, buf: *mut u8) -> i32;
+    #[link_name = "opendir$INODE64"]
+    fn opendir(path: *const u8) -> *mut u8;
+    #[link_name = "readdir$INODE64"]
+    fn readdir(d: *mut u8) -> *const u8;
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    #[link_name = "__errno_location"]
+    fn errno_ptr() -> *mut i32;
+    fn pipe2(fds: *mut u8, flags: i32) -> i32;
+    fn syscall(n: i64, ...) -> i64;
+    fn opendir(path: *const u8) -> *mut u8;
+    fn readdir(d: *mut u8) -> *const u8;
+    #[link_name = "realpath"]
+    fn c_realpath(path: *const u8, buf: *mut u8) -> *mut u8;
+}
+
+// --- Constants ---------------------------------------------------------------------
+
+const EINTR: i32 = 4;
+const EINVAL: i32 = 22;
+pub const EBADF: i32 = 9;
+pub const EINVAL_CODE: i32 = 22;
+
+#[cfg(target_os = "macos")]
+const O_APPEND: i32 = 0x8;
+#[cfg(target_os = "macos")]
+const O_CREAT: i32 = 0x200;
+#[cfg(target_os = "macos")]
+const O_TRUNC: i32 = 0x400;
+#[cfg(target_os = "macos")]
+const O_EXCL: i32 = 0x800;
+#[cfg(target_os = "macos")]
+const O_CLOEXEC: i32 = 0x1000000;
+
+#[cfg(target_os = "linux")]
+const O_APPEND: i32 = 0x400;
+#[cfg(target_os = "linux")]
+const O_CREAT: i32 = 0x40;
+#[cfg(target_os = "linux")]
+const O_TRUNC: i32 = 0x200;
+#[cfg(target_os = "linux")]
+const O_EXCL: i32 = 0x80;
+#[cfg(target_os = "linux")]
+const O_CLOEXEC: i32 = 0x80000;
+
+const F_SETFD: i32 = 2;
+const FD_CLOEXEC: i32 = 1;
+const SIGKILL: i32 = 9;
+const SIGPIPE: i32 = 13;
+const WNOHANG: i32 = 1;
+const POSIX_SPAWN_SETSIGDEF: i16 = 4;
+
+// Kernel stat (Linux: through syscall; glibc exports stat only since 2.33).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SYS_NEWFSTATAT: i64 = 262;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SYS_FSTAT: i64 = 5;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const SYS_NEWFSTATAT: i64 = 79;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const SYS_FSTAT: i64 = 80;
+#[cfg(target_os = "linux")]
+const AT_FDCWD: i64 = -100;
+#[cfg(target_os = "linux")]
+const AT_SYMLINK_NOFOLLOW: i64 = 0x100;
+
+#[cfg(target_os = "macos")]
+const UTIME_OMIT: i64 = -2;
+#[cfg(target_os = "linux")]
+const UTIME_OMIT: i64 = 1073741822;
+
+// Where the name and type of a struct dirent are.
+#[cfg(target_os = "macos")]
+const DIRENT_NAME: usize = 21;
+#[cfg(target_os = "macos")]
+const DIRENT_TYPE: usize = 20;
+#[cfg(target_os = "linux")]
+const DIRENT_NAME: usize = 19;
+#[cfg(target_os = "linux")]
+const DIRENT_TYPE: usize = 18;
+
+#[cfg(target_os = "macos")]
+const STAT_SIZE: usize = 144;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const STAT_SIZE: usize = 144;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const STAT_SIZE: usize = 128;
+
+// macOS limits a read or write to INT_MAX bytes.
+const IO_MAX: usize = 0x7ffff000;
+
+// --- Errors ------------------------------------------------------------------------
+
+/// This thread's errno.
+pub fn errno() -> i32 { unsafe { *errno_ptr() } }
+
+pub fn error_string(code: i32) -> String {
+    let p = unsafe { strerror(code) };
+    if p as usize == 0 { return `Unknown error ${code}`; }
+    from_cstr(p)
+}
+
+#[cfg(target_os = "macos")]
+pub fn decode_error_kind(code: i32) -> ErrorKind {
+    match code {
+        1 | 13 => ErrorKind::PermissionDenied,
+        2 => ErrorKind::NotFound,
+        4 => ErrorKind::Interrupted,
+        7 => ErrorKind::ArgumentListTooLong,
+        11 => ErrorKind::Deadlock,
+        12 => ErrorKind::OutOfMemory,
+        16 => ErrorKind::ResourceBusy,
+        17 => ErrorKind::AlreadyExists,
+        18 => ErrorKind::CrossesDevices,
+        20 => ErrorKind::NotADirectory,
+        21 => ErrorKind::IsADirectory,
+        22 => ErrorKind::InvalidInput,
+        26 => ErrorKind::ExecutableFileBusy,
+        27 => ErrorKind::FileTooLarge,
+        28 => ErrorKind::StorageFull,
+        29 => ErrorKind::NotSeekable,
+        30 => ErrorKind::ReadOnlyFilesystem,
+        31 => ErrorKind::TooManyLinks,
+        32 => ErrorKind::BrokenPipe,
+        35 => ErrorKind::WouldBlock,
+        36 => ErrorKind::InProgress,
+        45 | 78 => ErrorKind::Unsupported,
+        48 => ErrorKind::AddrInUse,
+        49 => ErrorKind::AddrNotAvailable,
+        50 => ErrorKind::NetworkDown,
+        51 => ErrorKind::NetworkUnreachable,
+        53 => ErrorKind::ConnectionAborted,
+        54 => ErrorKind::ConnectionReset,
+        57 => ErrorKind::NotConnected,
+        60 => ErrorKind::TimedOut,
+        61 => ErrorKind::ConnectionRefused,
+        62 => ErrorKind::FilesystemLoop,
+        63 => ErrorKind::InvalidFilename,
+        65 => ErrorKind::HostUnreachable,
+        66 => ErrorKind::DirectoryNotEmpty,
+        69 => ErrorKind::QuotaExceeded,
+        70 => ErrorKind::StaleNetworkFileHandle,
+        _ => ErrorKind::Uncategorized,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn decode_error_kind(code: i32) -> ErrorKind {
+    match code {
+        1 | 13 => ErrorKind::PermissionDenied,
+        2 => ErrorKind::NotFound,
+        4 => ErrorKind::Interrupted,
+        7 => ErrorKind::ArgumentListTooLong,
+        11 => ErrorKind::WouldBlock,
+        12 => ErrorKind::OutOfMemory,
+        16 => ErrorKind::ResourceBusy,
+        17 => ErrorKind::AlreadyExists,
+        18 => ErrorKind::CrossesDevices,
+        20 => ErrorKind::NotADirectory,
+        21 => ErrorKind::IsADirectory,
+        22 => ErrorKind::InvalidInput,
+        26 => ErrorKind::ExecutableFileBusy,
+        27 => ErrorKind::FileTooLarge,
+        28 => ErrorKind::StorageFull,
+        29 => ErrorKind::NotSeekable,
+        30 => ErrorKind::ReadOnlyFilesystem,
+        31 => ErrorKind::TooManyLinks,
+        32 => ErrorKind::BrokenPipe,
+        35 => ErrorKind::Deadlock,
+        36 => ErrorKind::InvalidFilename,
+        38 | 95 => ErrorKind::Unsupported,
+        39 => ErrorKind::DirectoryNotEmpty,
+        40 => ErrorKind::FilesystemLoop,
+        98 => ErrorKind::AddrInUse,
+        99 => ErrorKind::AddrNotAvailable,
+        100 => ErrorKind::NetworkDown,
+        101 => ErrorKind::NetworkUnreachable,
+        103 => ErrorKind::ConnectionAborted,
+        104 => ErrorKind::ConnectionReset,
+        107 => ErrorKind::NotConnected,
+        110 => ErrorKind::TimedOut,
+        111 => ErrorKind::ConnectionRefused,
+        113 => ErrorKind::HostUnreachable,
+        115 => ErrorKind::InProgress,
+        116 => ErrorKind::StaleNetworkFileHandle,
+        122 => ErrorKind::QuotaExceeded,
+        _ => ErrorKind::Uncategorized,
+    }
+}
+
+fn os_err(code: i32) -> Error { Error::from_raw_os_error(code) }
+
+// --- Files -------------------------------------------------------------------------
+
+/// Opens a file: access 0 read, 1 write, 2 both; creation one of the
+/// sys::OPEN_* values; mode for a new file (before the umask).
+pub fn open(path: &str, access: u8, append: bool, creation: u8, mode: u32) -> io::Result<i64> {
+    let c = cstring(path)?;
+    let mut flags = O_CLOEXEC | access as i32;
+    if append { flags = flags | O_APPEND; }
+    flags = flags | match creation {
+        1 => O_CREAT,
+        2 => O_TRUNC,
+        3 => O_CREAT | O_TRUNC,
+        4 => O_CREAT | O_EXCL,
+        _ => 0,
+    };
+    loop {
+        // Opening a FIFO waits for the other end.
+        enter_blocked();
+        let fd = unsafe { c_open(c.as_ptr(), flags, mode) };
+        let e = unsafe { *errno_ptr() };
+        exit_blocked();
+        if fd >= 0 { return Ok(fd as i64); }
+        if e != EINTR { return Err(os_err(e)); }
+    }
+}
+
+pub fn read(fd: i64, buf: &mut [u8]) -> io::Result<usize> {
+    let p = crate::rt::slice_ptr(buf) as *mut u8;
+    let n = if buf.len() > IO_MAX { IO_MAX } else { buf.len() };
+    loop {
+        enter_blocked();
+        let r = unsafe { c_read(fd as i32, p, n) };
+        let e = unsafe { *errno_ptr() };
+        exit_blocked();
+        if r >= 0 { return Ok(r as usize); }
+        if e != EINTR { return Err(os_err(e)); }
+    }
+}
+
+pub fn write(fd: i64, buf: &[u8]) -> io::Result<usize> {
+    let p = crate::rt::slice_ptr(buf);
+    let n = if buf.len() > IO_MAX { IO_MAX } else { buf.len() };
+    loop {
+        enter_blocked();
+        let r = unsafe { c_write(fd as i32, p, n) };
+        let e = unsafe { *errno_ptr() };
+        exit_blocked();
+        if r >= 0 { return Ok(r as usize); }
+        if e != EINTR { return Err(os_err(e)); }
+    }
+}
+
+/// Moves the position (whence: 0 start, 1 current, 2 end).
+pub fn seek(fd: i64, off: i64, whence: i32) -> io::Result<u64> {
+    let r = unsafe { lseek(fd as i32, off, whence) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(r as u64)
+}
+
+pub fn close(fd: i64) -> io::Result<()> {
+    let r = unsafe { c_close(fd as i32) };
+    // EINTR: the descriptor is closed anyway.
+    if r < 0 {
+        let e = unsafe { *errno_ptr() };
+        if e != EINTR { return Err(os_err(e)); }
+    }
+    Ok(())
+}
+
+pub fn sync(fd: i64) -> io::Result<()> {
+    enter_blocked();
+    let r = unsafe { fsync(fd as i32) };
+    let e = unsafe { *errno_ptr() };
+    exit_blocked();
+    if r < 0 { Err(os_err(e)) } else { Ok(()) }
+}
+
+pub fn truncate(fd: i64, len: u64) -> io::Result<()> {
+    let r = unsafe { ftruncate(fd as i32, len as i64) };
+    if r < 0 { Err(os_err(unsafe { *errno_ptr() })) } else { Ok(()) }
+}
+
+/// Sets the access and modification times (nanoseconds since the epoch;
+/// None: unchanged).
+pub fn set_times(fd: i64, atime: Option<i128>, mtime: Option<i128>) -> io::Result<()> {
+    let mut ts: Vec<i64> = Vec::new();
+    for t in [atime, mtime].iter() {
+        match t {
+            Some(n) => {
+                let mut s = *n / 1000000000;
+                let mut ns = *n % 1000000000;
+                if ns < 0 {
+                    s -= 1;
+                    ns += 1000000000;
+                }
+                ts.push(s as i64);
+                ts.push(ns as i64);
+            }
+            None => {
+                ts.push(0);
+                ts.push(UTIME_OMIT);
+            }
+        }
+    }
+    let r = unsafe { futimens(fd as i32, ts.as_ptr() as *const u8) };
+    if r < 0 { Err(os_err(unsafe { *errno_ptr() })) } else { Ok(()) }
+}
+
+pub fn fchmod(fd: i64, mode: u32) -> io::Result<()> {
+    let r = unsafe { c_fchmod(fd as i32, mode) };
+    if r < 0 { Err(os_err(unsafe { *errno_ptr() })) } else { Ok(()) }
+}
+
+pub fn isatty(fd: i64) -> bool { unsafe { c_isatty(fd as i32) != 0 } }
+
+/// The standard streams' descriptors.
+pub fn stdio_fd(n: i32) -> i64 { n as i64 }
+
+// --- Metadata ----------------------------------------------------------------------
+
+fn ts(b: &Vec<u8>, at: usize) -> i128 { (rd_u64(b, at) as i64) as i128 * 1000000000 + (rd_u64(b, at + 8) as i64) as i128 }
+
+#[cfg(target_os = "macos")]
+fn attr(b: &Vec<u8>) -> FileAttr {
+    FileAttr {
+        mode: rd_u16(b, 4) as u32, size: rd_u64(b, 96), atime: ts(b, 32), mtime: ts(b, 48), ctime: ts(b, 64),
+        btime: ts(b, 80), has_btime: true, dev: rd_u32(b, 0), ino: rd_u64(b, 8), nlink: rd_u16(b, 6),
+        uid: rd_u32(b, 16) as u32, gid: rd_u32(b, 20) as u32, rdev: rd_u32(b, 24), blksize: rd_u32(b, 112),
+        blocks: rd_u64(b, 104), attrib: 0,
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn attr(b: &Vec<u8>) -> FileAttr {
+    FileAttr {
+        mode: rd_u32(b, 24) as u32, size: rd_u64(b, 48), atime: ts(b, 72), mtime: ts(b, 88), ctime: ts(b, 104),
+        btime: 0, has_btime: false, dev: rd_u64(b, 0), ino: rd_u64(b, 8), nlink: rd_u64(b, 16),
+        uid: rd_u32(b, 28) as u32, gid: rd_u32(b, 32) as u32, rdev: rd_u64(b, 40), blksize: rd_u64(b, 56),
+        blocks: rd_u64(b, 64), attrib: 0,
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn attr(b: &Vec<u8>) -> FileAttr {
+    FileAttr {
+        mode: rd_u32(b, 16) as u32, size: rd_u64(b, 48), atime: ts(b, 72), mtime: ts(b, 88), ctime: ts(b, 104),
+        btime: 0, has_btime: false, dev: rd_u64(b, 0), ino: rd_u64(b, 8), nlink: rd_u32(b, 20),
+        uid: rd_u32(b, 24) as u32, gid: rd_u32(b, 28) as u32, rdev: rd_u64(b, 32), blksize: rd_u32(b, 56),
+        blocks: rd_u64(b, 64), attrib: 0,
+    }
+}
+
+/// stat (follow) or lstat.
+#[cfg(target_os = "macos")]
+pub fn stat(path: &str, follow: bool) -> io::Result<FileAttr> {
+    let c = cstring(path)?;
+    let b = zeroed(STAT_SIZE);
+    let p = b.as_ptr() as *mut u8;
+    let r = if follow { unsafe { c_stat(c.as_ptr(), p) } } else { unsafe { c_lstat(c.as_ptr(), p) } };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(attr(&b))
+}
+
+#[cfg(target_os = "macos")]
+pub fn fstat(fd: i64) -> io::Result<FileAttr> {
+    let b = zeroed(STAT_SIZE);
+    let r = unsafe { c_fstat(fd as i32, b.as_ptr() as *mut u8) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(attr(&b))
+}
+
+#[cfg(target_os = "linux")]
+pub fn stat(path: &str, follow: bool) -> io::Result<FileAttr> {
+    let c = cstring(path)?;
+    let b = zeroed(STAT_SIZE);
+    let flags = if follow { 0 } else { AT_SYMLINK_NOFOLLOW };
+    let r = unsafe { syscall(SYS_NEWFSTATAT, AT_FDCWD, c.as_ptr(), b.as_ptr(), flags) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(attr(&b))
+}
+
+#[cfg(target_os = "linux")]
+pub fn fstat(fd: i64) -> io::Result<FileAttr> {
+    let b = zeroed(STAT_SIZE);
+    let r = unsafe { syscall(SYS_FSTAT, fd, b.as_ptr()) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(attr(&b))
+}
+
+// --- Paths and directories ------------------------------------------------------------
+
+fn check(r: i32) -> io::Result<()> {
+    if r < 0 { Err(os_err(unsafe { *errno_ptr() })) } else { Ok(()) }
+}
+
+pub fn unlink(path: &str) -> io::Result<()> {
+    let c = cstring(path)?;
+    let r = unsafe { c_unlink(c.as_ptr()) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+pub fn rmdir(path: &str) -> io::Result<()> {
+    let c = cstring(path)?;
+    let r = unsafe { c_rmdir(c.as_ptr()) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+pub fn mkdir(path: &str, mode: u32) -> io::Result<()> {
+    let c = cstring(path)?;
+    let r = unsafe { c_mkdir(c.as_ptr(), mode) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+pub fn rename(from: &str, to: &str) -> io::Result<()> {
+    let a = cstring(from)?;
+    let b = cstring(to)?;
+    let r = unsafe { c_rename(a.as_ptr(), b.as_ptr()) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+pub fn link(from: &str, to: &str) -> io::Result<()> {
+    let a = cstring(from)?;
+    let b = cstring(to)?;
+    let r = unsafe { c_link(a.as_ptr(), b.as_ptr()) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+/// A symbolic link at link pointing to target (dir: Windows only).
+pub fn symlink(target: &str, link: &str, dir: bool) -> io::Result<()> {
+    let a = cstring(target)?;
+    let b = cstring(link)?;
+    let r = unsafe { c_symlink(a.as_ptr(), b.as_ptr()) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+pub fn readlink(path: &str) -> io::Result<String> {
+    let c = cstring(path)?;
+    let mut size = 256;
+    loop {
+        let buf = zeroed(size);
+        let r = unsafe { c_readlink(c.as_ptr(), buf.as_ptr() as *mut u8, size) };
+        if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+        if (r as usize) < size { return Ok(String::from_utf8_lossy(&buf[0..r as usize])); }
+        size = size * 2;
+    }
+}
+
+pub fn realpath(path: &str) -> io::Result<String> {
+    let c = cstring(path)?;
+    let buf = zeroed(4097);
+    let r = unsafe { c_realpath(c.as_ptr(), buf.as_ptr() as *mut u8) };
+    if r as usize == 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(from_cstr(buf.as_ptr()))
+}
+
+/// Sets the permission bits (readonly: unused, Windows only).
+pub fn chmod(path: &str, mode: u32, readonly: bool) -> io::Result<()> {
+    let c = cstring(path)?;
+    let r = unsafe { c_chmod(c.as_ptr(), mode) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+/// The entries of a directory (without . and ..), read at once.
+pub fn read_dir(path: &str) -> io::Result<Vec<DirEnt>> {
+    let c = cstring(path)?;
+    let d = unsafe { opendir(c.as_ptr()) };
+    if d as usize == 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    let mut out: Vec<DirEnt> = Vec::new();
+    let mut err = 0;
+    loop {
+        unsafe { *errno_ptr() = 0; }
+        let ent = unsafe { readdir(d) };
+        if ent as usize == 0 {
+            err = unsafe { *errno_ptr() };
+            break;
+        }
+        let name = from_cstr(crate::rt::ptr_offset(ent, DIRENT_NAME));
+        if name == "." || name == ".." { continue; }
+        let t = unsafe { *crate::rt::ptr_offset(ent, DIRENT_TYPE) };
+        let typ = match t {
+            1 => crate::sys::S_IFIFO,
+            2 => crate::sys::S_IFCHR,
+            4 => crate::sys::S_IFDIR,
+            6 => crate::sys::S_IFBLK,
+            8 => crate::sys::S_IFREG,
+            10 => crate::sys::S_IFLNK,
+            12 => crate::sys::S_IFSOCK,
+            _ => 0,
+        };
+        out.push(DirEnt { name, typ });
+    }
+    unsafe { closedir(d); }
+    if err != 0 { return Err(os_err(err)); }
+    Ok(out)
+}
+
+pub fn getcwd() -> io::Result<String> {
+    let mut size = 512;
+    loop {
+        let buf = zeroed(size);
+        let r = unsafe { c_getcwd(buf.as_ptr() as *mut u8, size) };
+        if r as usize != 0 { return Ok(from_cstr(buf.as_ptr())); }
+        let e = unsafe { *errno_ptr() };
+        if e != 34 { return Err(os_err(e)); } // ERANGE: a larger buffer
+        size = size * 2;
+    }
+}
+
+/// Removes a symbolic link (attr: its lstat).
+pub fn unlink_link(path: &str, attr: &FileAttr) -> io::Result<()> { unlink(path) }
+
+pub fn chdir(path: &str) -> io::Result<()> {
+    let c = cstring(path)?;
+    let r = unsafe { c_chdir(c.as_ptr()) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+// --- Environment -------------------------------------------------------------------
+
+pub fn getenv(name: &str) -> Option<String> {
+    let c = match cstring(name) { Ok(c) => c, Err(_) => return None };
+    let p = unsafe { c_getenv(c.as_ptr()) };
+    if p as usize == 0 { None } else { Some(from_cstr(p)) }
+}
+
+fn check_env_name(name: &str) -> io::Result<()> {
+    if name.len() == 0 || name.contains('=') {
+        return Err(Error::new(ErrorKind::InvalidInput, `invalid environment variable name: ${name:?}`));
+    }
+    Ok(())
+}
+
+pub fn setenv(name: &str, value: &str) -> io::Result<()> {
+    check_env_name(name)?;
+    let n = cstring(name)?;
+    let v = cstring(value)?;
+    let r = unsafe { c_setenv(n.as_ptr(), v.as_ptr(), 1) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    note_name(name);
+    Ok(())
+}
+
+pub fn unsetenv(name: &str) -> io::Result<()> {
+    check_env_name(name)?;
+    let n = cstring(name)?;
+    let r = unsafe { c_unsetenv(n.as_ptr()) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+/// The environment as NAME=value strings.
+#[cfg(target_os = "macos")]
+fn env_strings() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let envp = unsafe { *_NSGetEnviron() };
+    if envp as usize == 0 { return out; }
+    let mut i = 0;
+    loop {
+        let p = unsafe { *crate::rt::ptr_offset(envp, i) };
+        if p as usize == 0 { break; }
+        out.push(from_cstr(p));
+        i += 1;
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn note_name(name: &str) {}
+
+// Linux: libc's environ is a variable (navic imports functions only). The
+// names are those of the initial environment (after argv) and those set
+// since; getenv has their values.
+#[cfg(target_os = "linux")]
+static mut SET_NAMES: Vec<String> = Vec::new();
+
+#[cfg(target_os = "linux")]
+fn note_name(name: &str) {
+    for n in SET_NAMES.iter() { if n.as_str() == name { return; } }
+    SET_NAMES.push(name.to_string());
+}
+
+#[cfg(target_os = "linux")]
+fn env_strings() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let envp = crate::rt::native::os_envp() as *const *const u8;
+    let mut i = 0;
+    loop {
+        let p = unsafe { *crate::rt::ptr_offset(envp, i) };
+        if p as usize == 0 { break; }
+        if let Some((k, _)) = split_env(from_cstr(p).as_str()) { names.push(k); }
+        i += 1;
+    }
+    for n in SET_NAMES.iter() { names.push(n.clone()); }
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for n in names.iter() {
+        if seen.contains(n) { continue; }
+        seen.push(n.clone());
+        if let Some(v) = getenv(n.as_str()) { out.push(`${n}=${v}`); }
+    }
+    out
+}
+
+/// The environment's variables in order.
+pub fn environ() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for s in env_strings().iter() {
+        if let Some(kv) = split_env(s.as_str()) { out.push(kv); }
+    }
+    out
+}
+
+pub fn home_dir() -> Option<String> {
+    match getenv("HOME") { Some(h) => if h.len() > 0 { Some(h) } else { None }, None => None }
+}
+
+pub fn temp_dir() -> String {
+    match getenv("TMPDIR") { Some(t) => if t.len() > 0 { t } else { "/tmp".to_string() }, None => "/tmp".to_string() }
+}
+
+#[cfg(target_os = "macos")]
+pub fn current_exe() -> io::Result<String> {
+    let mut size = zeroed(4);
+    crate::sys::wr_u32(&mut size, 0, 4096);
+    let buf = zeroed(4096);
+    let r = unsafe { _NSGetExecutablePath(buf.as_ptr() as *mut u8, size.as_ptr() as *mut u8) };
+    if r != 0 { return Err(Error::new(ErrorKind::Uncategorized, "executable path too long")); }
+    let p = from_cstr(buf.as_ptr());
+    match realpath(p.as_str()) { Ok(r) => Ok(r), Err(_) => Ok(p) }
+}
+
+#[cfg(target_os = "linux")]
+pub fn current_exe() -> io::Result<String> { readlink("/proc/self/exe") }
+
+pub fn getpid() -> u32 { unsafe { c_getpid() as u32 } }
+
+// --- Processes ----------------------------------------------------------------------
+
+static mut SIGPIPE_IGNORED: bool = false;
+
+/// A pipe (read end, write end), close-on-exec. The first one ignores
+/// SIGPIPE (a write to a pipe nobody reads fails with BrokenPipe instead
+/// of ending the process, as in Rust; children get the default back).
+pub fn pipe_pair() -> io::Result<(i64, i64)> {
+    if !SIGPIPE_IGNORED {
+        SIGPIPE_IGNORED = true;
+        unsafe { signal(SIGPIPE, 1); } // SIG_IGN
+    }
+    let fds = zeroed(8);
+    let r = make_pipe(fds.as_ptr() as *mut u8);
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok((rd_u32(&fds, 0) as i64, rd_u32(&fds, 4) as i64))
+}
+
+#[cfg(target_os = "macos")]
+fn make_pipe(fds: *mut u8) -> i32 {
+    let r = unsafe { pipe(fds) };
+    if r < 0 { return r; }
+    unsafe {
+        fcntl(*(fds as *const i32), F_SETFD, FD_CLOEXEC);
+        fcntl(*(crate::rt::ptr_offset(fds as *const i32, 1)), F_SETFD, FD_CLOEXEC);
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn make_pipe(fds: *mut u8) -> i32 { unsafe { pipe2(fds, O_CLOEXEC) } }
+
+/// Starts program (searched in PATH unless it has a slash) with argv
+/// (argv[0] first), env (NAME=value strings), in cwd (or here), its
+/// stdin, stdout and stderr each inherited (STDIO_INHERIT), /dev/null
+/// (STDIO_NULL) or a descriptor (STDIO_FD). Returns (pid, 0).
+pub fn spawn(program: &str, argv: &Vec<String>, env: &Vec<String>, cwd: Option<&str>, kinds: &[u8], fds: &[i64]) -> io::Result<(i64, i64)> {
+    let found = find_program(program, env, cwd.is_some())?;
+    let prog = cstring(found.as_str())?;
+    let mut keep: Vec<Vec<u8>> = Vec::new();
+    let mut av: Vec<*const u8> = Vec::new();
+    for a in argv.iter() {
+        let c = cstring(a.as_str())?;
+        av.push(c.as_ptr());
+        keep.push(c);
+    }
+    av.push(0 as *const u8);
+    let mut ev: Vec<*const u8> = Vec::new();
+    for s in env.iter() {
+        let c = cstring(s.as_str())?;
+        ev.push(c.as_ptr());
+        keep.push(c);
+    }
+    ev.push(0 as *const u8);
+    let dev_null = cstring("/dev/null")?;
+    let dir = match cwd { Some(d) => Some(cstring(d)?), None => None };
+
+    // posix_spawn_file_actions_t / posix_spawnattr_t / sigset_t are at most
+    // this large (glibc's attributes: 336 bytes).
+    let fa = zeroed(256);
+    let attr = zeroed(512);
+    let sigs = zeroed(256);
+    let fap = fa.as_ptr() as *mut u8;
+    let ap = attr.as_ptr() as *mut u8;
+    let mut r = unsafe { posix_spawn_file_actions_init(fap) };
+    if r != 0 { return Err(os_err(r)); }
+    r = unsafe { posix_spawnattr_init(ap) };
+    if r != 0 {
+        unsafe { posix_spawn_file_actions_destroy(fap); }
+        return Err(os_err(r));
+    }
+    let mut i = 0;
+    while i < 3 && r == 0 {
+        if kinds[i] == crate::sys::STDIO_NULL {
+            let fl = if i == 0 { 0 } else { 1 }; // O_RDONLY, O_WRONLY
+            r = unsafe { posix_spawn_file_actions_addopen(fap, i as i32, dev_null.as_ptr(), fl, 0) };
+        } else if kinds[i] == crate::sys::STDIO_FD {
+            r = unsafe { posix_spawn_file_actions_adddup2(fap, fds[i] as i32, i as i32) };
+        }
+        i += 1;
+    }
+    if r == 0 {
+        if let Some(d) = &dir { r = unsafe { posix_spawn_file_actions_addchdir_np(fap, d.as_ptr()) }; }
+    }
+    if r == 0 {
+        unsafe {
+            sigemptyset(sigs.as_ptr() as *mut u8);
+            sigaddset(sigs.as_ptr() as *mut u8, SIGPIPE);
+            posix_spawnattr_setsigdefault(ap, sigs.as_ptr());
+            posix_spawnattr_setflags(ap, POSIX_SPAWN_SETSIGDEF);
+        }
+        let pid = zeroed(8);
+        enter_blocked();
+        r = unsafe { posix_spawnp(pid.as_ptr() as *mut u8, prog.as_ptr(), fa.as_ptr(), attr.as_ptr(), av.as_ptr(), ev.as_ptr()) };
+        exit_blocked();
+        unsafe {
+            posix_spawn_file_actions_destroy(fap);
+            posix_spawnattr_destroy(ap);
+        }
+        if r != 0 { return Err(os_err(r)); }
+        if keep.len() > 1000000000 { return Err(os_err(EINVAL)); } // keeps the strings alive until here
+        return Ok((rd_u32(&pid, 0) as i64, 0));
+    }
+    unsafe {
+        posix_spawn_file_actions_destroy(fap);
+        posix_spawnattr_destroy(ap);
+    }
+    Err(os_err(r))
+}
+
+// Whether path names an executable file.
+fn executable(path: &str) -> io::Result<()> {
+    let c = cstring(path)?;
+    let r = unsafe { c_access(c.as_ptr(), 1) }; // X_OK
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    match stat(path, true) {
+        Ok(a) => if a.mode & crate::sys::S_IFMT == crate::sys::S_IFDIR { Err(os_err(13)) } else { Ok(()) }, // EACCES
+        Err(e) => Err(e),
+    }
+}
+
+// The program's path: searched in the child's PATH (the parent's if the
+// child's environment has none) unless it has a slash. Done here rather than by
+// posix_spawnp so that a missing program is an error everywhere (bionic's
+// child exits with 127 instead).
+fn find_program(program: &str, env: &Vec<String>, has_cwd: bool) -> io::Result<String> {
+    if program.contains('/') {
+        if !has_cwd || program.starts_with("/") { executable(program)?; }
+        return Ok(program.to_string());
+    }
+    let mut path = match getenv("PATH") { Some(p) => p, None => "/usr/bin:/bin".to_string() };
+    for s in env.iter() { if s.starts_with("PATH=") { path = s[5..].to_string(); } }
+    let mut first_err: Option<Error> = None;
+    for dir in path.as_str().split(':') {
+        let cand = if dir.len() == 0 { program.to_string() } else if dir.ends_with("/") { `${dir}${program}` } else { `${dir}/${program}` };
+        match executable(cand.as_str()) {
+            Ok(()) => return Ok(cand),
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound && e.kind() != ErrorKind::NotADirectory && first_err.is_none() { first_err = Some(e); }
+            }
+        }
+    }
+    match first_err { Some(e) => Err(e), None => Err(os_err(2)) }
+}
+
+/// Waits for a child (block: until it ends; else returns None if it
+/// runs). The status is the raw wait status.
+pub fn wait(pid: i64, handle: i64, block: bool) -> io::Result<Option<i32>> {
+    let st = zeroed(8);
+    let p = st.as_ptr() as *mut u8;
+    loop {
+        enter_blocked();
+        let r = unsafe { waitpid(pid as i32, p, if block { 0 } else { WNOHANG }) };
+        let e = unsafe { *errno_ptr() };
+        exit_blocked();
+        if r > 0 { return Ok(Some(rd_u32(&st, 0) as i32)); }
+        if r == 0 { return Ok(None); }
+        if e != EINTR { return Err(os_err(e)); }
+    }
+}
+
+pub fn kill(pid: i64, handle: i64) -> io::Result<()> {
+    let r = unsafe { c_kill(pid as i32, SIGKILL) };
+    if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
+    Ok(())
+}
+
+/// Releases what spawn returned besides the pid (nothing on POSIX).
+pub fn close_process(handle: i64) {}
+
+/// Reads two descriptors to their ends at once (-1: none), as a child's
+/// stdout and stderr must be (either may fill while the other is read).
+pub fn read2(fd1: i64, fd2: i64) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut outs: Vec<Vec<u8>> = Vec::new();
+    outs.push(Vec::new());
+    outs.push(Vec::new());
+    let mut open = [fd1 >= 0, fd2 >= 0];
+    let fds = [fd1, fd2];
+    let mut pfd = zeroed(16);
+    let mut chunk = zeroed(16384);
+    while open[0] || open[1] {
+        let mut n = 0;
+        let mut which = [0usize; 2];
+        let mut k = 0;
+        while k < 2 {
+            if open[k] {
+                crate::sys::wr_u32(&mut pfd, 8 * n, fds[k] as u64);
+                crate::sys::wr_u32(&mut pfd, 8 * n + 4, 1); // events POLLIN, revents 0
+                which[n] = k;
+                n += 1;
+            }
+            k += 1;
+        }
+        let pp = pfd.as_ptr() as *mut u8;
+        enter_blocked();
+        let r = unsafe { poll(pp, n as u64, -1) };
+        let e = unsafe { *errno_ptr() };
+        exit_blocked();
+        if r < 0 {
+            if e == EINTR { continue; }
+            return Err(os_err(e));
+        }
+        let mut j = 0;
+        while j < n {
+            let revents = rd_u16(&pfd, 8 * j + 6);
+            if revents != 0 {
+                let k2 = which[j];
+                let got = read(fds[k2], chunk.as_mut_slice())?;
+                if got == 0 { open[k2] = false; } else { outs[k2].extend_from_slice(&chunk[0..got]); }
+            }
+            j += 1;
+        }
+    }
+    Ok((outs[0].clone(), outs[1].clone()))
+}
+
+/// Whether two variable names are the same (case matters on POSIX).
+pub fn env_name_eq(a: &str, b: &str) -> bool { a == b }

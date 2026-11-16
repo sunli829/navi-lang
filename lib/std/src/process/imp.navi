@@ -1,0 +1,484 @@
+//! Child processes on the OS layer: Command, Child, Stdio, ExitStatus.
+//! navi has no Drop: a child's piped streams are closed by close() (wait
+//! and wait_with_output close the child's stdin first, as in Rust).
+
+use crate::io::{self, Read, Write, Error, ErrorKind};
+use crate::string::String;
+use crate::path::{Path, PathBuf};
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::sys;
+
+const KIND_INHERIT: u8 = 0;
+const KIND_NULL: u8 = 1;
+const KIND_FD: u8 = 2;
+const KIND_PIPED: u8 = 3;
+
+/// What a child's standard stream is connected to.
+#[derive(Clone, Debug)]
+pub struct Stdio {
+    kind: u8,
+    fd: i64,
+}
+
+impl Stdio {
+    /// A new pipe to the parent (Child::stdin, stdout, stderr).
+    pub fn piped() -> Stdio { Stdio { kind: KIND_PIPED, fd: -1 } }
+    /// The parent's stream.
+    pub fn inherit() -> Stdio { Stdio { kind: KIND_INHERIT, fd: -1 } }
+    /// Nothing (/dev/null, NUL on Windows).
+    pub fn null() -> Stdio { Stdio { kind: KIND_NULL, fd: -1 } }
+}
+
+impl From<crate::fs::File> for Stdio {
+    fn from(f: crate::fs::File) -> Stdio { Stdio { kind: KIND_FD, fd: f.fd } }
+}
+
+impl From<ChildStdin> for Stdio {
+    fn from(c: ChildStdin) -> Stdio { Stdio { kind: KIND_FD, fd: c.fd } }
+}
+
+impl From<ChildStdout> for Stdio {
+    fn from(c: ChildStdout) -> Stdio { Stdio { kind: KIND_FD, fd: c.fd } }
+}
+
+impl From<ChildStderr> for Stdio {
+    fn from(c: ChildStderr) -> Stdio { Stdio { kind: KIND_FD, fd: c.fd } }
+}
+
+impl From<io::Stdout> for Stdio {
+    fn from(s: io::Stdout) -> Stdio { Stdio { kind: KIND_FD, fd: sys::stdio_fd(1) } }
+}
+
+impl From<io::Stderr> for Stdio {
+    fn from(s: io::Stderr) -> Stdio { Stdio { kind: KIND_FD, fd: sys::stdio_fd(2) } }
+}
+
+/// A command to run: program, arguments, environment, directory and
+/// standard streams.
+#[derive(Clone)]
+pub struct Command {
+    program: String,
+    args: Vec<String>,
+    envs: Vec<(String, Option<String>)>,
+    clear: bool,
+    cwd: Option<String>,
+    stdio: Vec<Option<Stdio>>,
+}
+
+impl Command {
+    /// A command running program (searched in PATH unless it has a path
+    /// separator).
+    pub fn new<S: AsRef<str>>(program: S) -> Command {
+        let mut stdio: Vec<Option<Stdio>> = Vec::new();
+        stdio.push(None);
+        stdio.push(None);
+        stdio.push(None);
+        Command { program: program.as_ref().to_string(), args: Vec::new(), envs: Vec::new(), clear: false, cwd: None, stdio }
+    }
+
+    pub fn arg<S: AsRef<str>>(&mut self, arg: S) -> &mut Command {
+        self.args.push(arg.as_ref().to_string());
+        self
+    }
+
+    pub fn args<I: IntoIterator<Item = S>, S: AsRef<str>>(&mut self, args: I) -> &mut Command {
+        for a in args { self.args.push(a.as_ref().to_string()); }
+        self
+    }
+
+    /// Sets a variable of the child's environment.
+    pub fn env<K: AsRef<str>, V: AsRef<str>>(&mut self, key: K, val: V) -> &mut Command {
+        self.envs.push((key.as_ref().to_string(), Some(val.as_ref().to_string())));
+        self
+    }
+
+    pub fn envs<I: IntoIterator<Item = (K, V)>, K: AsRef<str>, V: AsRef<str>>(&mut self, vars: I) -> &mut Command {
+        for (k, v) in vars { self.envs.push((k.as_ref().to_string(), Some(v.as_ref().to_string()))); }
+        self
+    }
+
+    /// Leaves a variable out of the child's environment.
+    pub fn env_remove<K: AsRef<str>>(&mut self, key: K) -> &mut Command {
+        self.envs.push((key.as_ref().to_string(), None));
+        self
+    }
+
+    /// Starts the child's environment empty (then env adds to it).
+    pub fn env_clear(&mut self) -> &mut Command {
+        self.clear = true;
+        self.envs.clear();
+        self
+    }
+
+    /// The child's working directory.
+    pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Command {
+        self.cwd = Some(dir.as_ref().as_str().to_string());
+        self
+    }
+
+    pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+        self.stdio[0] = Some(cfg.into());
+        self
+    }
+
+    pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+        self.stdio[1] = Some(cfg.into());
+        self
+    }
+
+    pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+        self.stdio[2] = Some(cfg.into());
+        self
+    }
+
+    pub fn get_program(&self) -> &str { self.program.as_str() }
+
+    pub fn get_args(&self) -> crate::slice::Iter<String> { self.args.iter() }
+
+    /// The environment changes: (name, Some(value)) set, (name, None)
+    /// removed.
+    pub fn get_envs(&self) -> crate::slice::Iter<(String, Option<String>)> { self.envs.iter() }
+
+    pub fn get_current_dir(&self) -> Option<&Path> {
+        match &self.cwd { Some(d) => Some(Path::new(d.as_str())), None => None }
+    }
+
+    /// Starts the child (streams not set are inherited).
+    pub fn spawn(&mut self) -> io::Result<Child> { self.start(KIND_INHERIT, KIND_INHERIT) }
+
+    /// Runs the child to its end with its stdout and stderr captured
+    /// (unless set otherwise; stdin is null unless set).
+    pub fn output(&mut self) -> io::Result<Output> {
+        let child = self.start(KIND_NULL, KIND_PIPED)?;
+        child.wait_with_output()
+    }
+
+    /// Runs the child to its end (streams not set are inherited).
+    pub fn status(&mut self) -> io::Result<ExitStatus> {
+        let mut child = self.start(KIND_INHERIT, KIND_INHERIT)?;
+        child.wait()
+    }
+
+    // The environment the child gets, as NAME=value strings.
+    fn child_env(&self) -> Vec<String> {
+        let mut all: Vec<(String, String)> = if self.clear { Vec::new() } else { sys::environ() };
+        for (k, v) in self.envs.iter() {
+            let mut i = 0;
+            let mut found = false;
+            while i < all.len() {
+                if sys::env_name_eq(all[i].0.as_str(), k.as_str()) {
+                    found = true;
+                    match v {
+                        Some(val) => {
+                            all[i] = (k.clone(), val.clone());
+                            i += 1;
+                        }
+                        None => { all.remove(i); }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if !found {
+                if let Some(val) = v { all.push((k.clone(), val.clone())); }
+            }
+        }
+        let mut out: Vec<String> = Vec::new();
+        for (k, v) in all.iter() { out.push(`${k}=${v}`); }
+        out
+    }
+
+    fn start(&mut self, def_in: u8, def_out: u8) -> io::Result<Child> {
+        let mut kinds = [0u8; 3];
+        let mut fds = [-1i64; 3];
+        let mut parent = [-1i64; 3];
+        let mut err: Option<Error> = None;
+        let mut i = 0;
+        while i < 3 {
+            let s = match &self.stdio[i] {
+                Some(s) => s.clone(),
+                None => Stdio { kind: if i == 0 { def_in } else { def_out }, fd: -1 },
+            };
+            if s.kind == KIND_PIPED {
+                match sys::pipe_pair() {
+                    Ok((r, w)) => {
+                        kinds[i] = sys::STDIO_FD;
+                        if i == 0 {
+                            fds[i] = r;
+                            parent[i] = w;
+                        } else {
+                            fds[i] = w;
+                            parent[i] = r;
+                        }
+                    }
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            } else if s.kind == KIND_FD {
+                kinds[i] = sys::STDIO_FD;
+                fds[i] = s.fd;
+            } else {
+                kinds[i] = if s.kind == KIND_NULL { sys::STDIO_NULL } else { sys::STDIO_INHERIT };
+            }
+            i += 1;
+        }
+        let mut argv: Vec<String> = Vec::new();
+        argv.push(self.program.clone());
+        for a in self.args.iter() { argv.push(a.clone()); }
+        let env = self.child_env();
+        let cwd: Option<&str> = match &self.cwd { Some(d) => Some(d.as_str()), None => None };
+        let r = match err {
+            Some(e) => Err(e),
+            None => sys::spawn(self.program.as_str(), &argv, &env, cwd, &kinds, &fds),
+        };
+        // The child's ends of the pipes belong to the child now.
+        let mut j = 0;
+        while j < 3 {
+            if parent[j] >= 0 {
+                let _ = sys::close(fds[j]);
+                if r.is_err() { let _ = sys::close(parent[j]); }
+            }
+            j += 1;
+        }
+        let (pid, handle) = r?;
+        Ok(Child {
+            pid, handle,
+            stdin: if parent[0] >= 0 { Some(ChildStdin { fd: parent[0] }) } else { None },
+            stdout: if parent[1] >= 0 { Some(ChildStdout { fd: parent[1] }) } else { None },
+            stderr: if parent[2] >= 0 { Some(ChildStderr { fd: parent[2] }) } else { None },
+            status: None,
+        })
+    }
+}
+
+impl Debug for Command {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        Debug::fmt(&self.program, f)?;
+        for a in self.args.iter() {
+            f.write_str(" ")?;
+            Debug::fmt(a, f)?;
+        }
+        Ok(())
+    }
+}
+
+/// A running (or finished) child process. Copies of a Child share the
+/// process and its streams.
+pub struct Child {
+    pid: i64,
+    handle: i64,
+    pub stdin: Option<ChildStdin>,
+    pub stdout: Option<ChildStdout>,
+    pub stderr: Option<ChildStderr>,
+    status: Option<ExitStatus>,
+}
+
+impl Debug for Child {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.debug_struct("Child").field("pid", &self.pid).finish() }
+}
+
+impl Child {
+    /// The OS's process id.
+    pub fn id(&self) -> u32 { self.pid as u32 }
+
+    /// Kills the child (SIGKILL; TerminateProcess on Windows). Ok if it
+    /// has already been waited for.
+    pub fn kill(&mut self) -> io::Result<()> {
+        if self.status.is_some() { return Ok(()); }
+        sys::kill(self.pid, self.handle)
+    }
+
+    /// Waits for the child to end (closing its stdin first).
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        if let Some(s) = self.stdin.take() {
+            let mut s2 = s;
+            s2.close();
+        }
+        if let Some(st) = &self.status { return Ok(st.clone()); }
+        match sys::wait(self.pid, self.handle, true)? {
+            Some(raw) => {
+                let st = ExitStatus { raw };
+                self.status = Some(st.clone());
+                sys::close_process(self.handle);
+                Ok(st)
+            }
+            None => Err(Error::new(ErrorKind::Other, "wait returned without a status")),
+        }
+    }
+
+    /// The child's status if it has ended; None if it runs.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if let Some(st) = &self.status { return Ok(Some(st.clone())); }
+        match sys::wait(self.pid, self.handle, false)? {
+            Some(raw) => {
+                let st = ExitStatus { raw };
+                self.status = Some(st.clone());
+                sys::close_process(self.handle);
+                Ok(Some(st))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Closes stdin, reads stdout and stderr to their ends (those piped),
+    /// waits.
+    pub fn wait_with_output(self) -> io::Result<Output> {
+        let mut c = self;
+        if let Some(s) = c.stdin.take() {
+            let mut s2 = s;
+            s2.close();
+        }
+        let fo = match &c.stdout { Some(s) => s.fd, None => -1 };
+        let fe = match &c.stderr { Some(s) => s.fd, None => -1 };
+        let r = sys::read2(fo, fe);
+        if fo >= 0 { let _ = sys::close(fo); }
+        if fe >= 0 { let _ = sys::close(fe); }
+        c.stdout = None;
+        c.stderr = None;
+        let (out, err) = r?;
+        let status = c.wait()?;
+        Ok(Output { status, stdout: out, stderr: err })
+    }
+}
+
+/// The write end of a child's stdin pipe. close() it when done (the child
+/// sees the end of its input).
+#[derive(Debug, Clone)]
+pub struct ChildStdin {
+    fd: i64,
+}
+
+/// The read end of a child's stdout pipe.
+#[derive(Debug, Clone)]
+pub struct ChildStdout {
+    fd: i64,
+}
+
+/// The read end of a child's stderr pipe.
+#[derive(Debug, Clone)]
+pub struct ChildStderr {
+    fd: i64,
+}
+
+impl ChildStdin {
+    pub fn close(&mut self) {
+        if self.fd >= 0 {
+            let _ = sys::close(self.fd);
+            self.fd = -1;
+        }
+    }
+}
+
+impl ChildStdout {
+    pub fn close(&mut self) {
+        if self.fd >= 0 {
+            let _ = sys::close(self.fd);
+            self.fd = -1;
+        }
+    }
+}
+
+impl ChildStderr {
+    pub fn close(&mut self) {
+        if self.fd >= 0 {
+            let _ = sys::close(self.fd);
+            self.fd = -1;
+        }
+    }
+}
+
+impl Write for ChildStdin {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> { sys::write(self.fd, buf) }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+impl Read for ChildStdout {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { sys::read(self.fd, buf) }
+}
+
+impl Read for ChildStderr {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { sys::read(self.fd, buf) }
+}
+
+/// What Command::output and Child::wait_with_output return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// How a child ended: the raw wait status on Unix, the exit code on
+/// Windows.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ExitStatus {
+    pub(crate) raw: i32,
+}
+
+impl ExitStatus {
+    /// Whether it exited with 0.
+    pub fn success(&self) -> bool { self.code() == Some(0) }
+
+    /// The exit code (None if a signal ended it).
+    #[cfg(not(target_os = "windows"))]
+    pub fn code(&self) -> Option<i32> { if self.raw & 0x7f == 0 { Some((self.raw >> 8) & 0xff) } else { None } }
+
+    #[cfg(target_os = "windows")]
+    pub fn code(&self) -> Option<i32> { Some(self.raw) }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn signal_name(sig: i32) -> &str {
+    match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        _ => "",
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Display for ExitStatus {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self.code() {
+            Some(c) => f.write_fmt(`exit status: ${c}`),
+            None => {
+                let sig = self.raw & 0x7f;
+                let name = signal_name(sig);
+                f.write_fmt(`signal: ${sig}`)?;
+                if name.len() > 0 { f.write_fmt(` (${name})`)?; }
+                if self.raw & 0x80 != 0 { f.write_str(" (core dumped)")?; }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Display for ExitStatus {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`exit code: ${self.raw}`) }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Debug for ExitStatus {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`ExitStatus(unix_wait_status(${self.raw}))`) }
+}
+
+#[cfg(target_os = "windows")]
+impl Debug for ExitStatus {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`ExitStatus(${self.raw})`) }
+}
+
+/// The id of this process.
+pub fn id() -> u32 { sys::getpid() }
