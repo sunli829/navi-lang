@@ -16,7 +16,7 @@ sdk=$HOME/Library/Android/sdk
 ndk=${ANDROID_NDK:-$(ls -d "$sdk"/ndk/* | sort | tail -1)}
 adb=${ADB:-$sdk/platform-tools/adb}
 cc=$(ls -d "$ndk"/toolchains/llvm/prebuilt/*/bin | head -1)/clang
-dir=/data/local/tmp/navi-test
+dir=/data/local/tmp/navi-test-$$
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"; "$adb" shell rm -rf $dir' EXIT
 mkdir -p "$tmp/bin"
