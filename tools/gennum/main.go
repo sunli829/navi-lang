@@ -1,5 +1,8 @@
-// Command gennum generates lib/std/src/num.navi: the inherent methods and
-// constants of the integer types, which Rust's core writes with macros.
+// Command gennum generates lib/std/src/num.navi and num/ext.navi: the
+// inherent methods and constants of the integer and float types and the
+// conversions between them, which Rust's core writes with macros; and the
+// consts modules lib/std/src/f64.navi and f32.navi. Run it from the
+// repository root: go run ./tools/gennum
 package main
 
 import (
@@ -26,7 +29,12 @@ func main() {
 
 use crate::option::Option::{self, None, Some};
 use crate::result::Result::{self, Err, Ok};
-use crate::str::ParseIntError;
+pub use crate::str::{ParseFloatError, ParseIntError};
+
+#[cfg(feature = "navic")]
+mod ext;
+#[cfg(feature = "navic")]
+pub use self::ext::{FpCategory, TryFromIntError};
 `)
 	for _, t := range ints {
 		unsigned := t.name
@@ -77,16 +85,29 @@ impl %[1]s {
         match self.checked_mul(rhs) { Some(r) => r, None => if %[11]s { %[1]s::MIN } else { %[1]s::MAX } }
     }
     pub fn pow(self, exp: u32) -> %[1]s {
-        let mut r: %[1]s = 1;
-        let mut i = 0;
-        while i < exp { r = r * self; i += 1; }
-        r
+        if exp == 0 { return 1; }
+        let mut base = self;
+        let mut acc: %[1]s = 1;
+        let mut e = exp;
+        loop {
+            if e & 1 == 1 {
+                acc = acc * base;
+                if e == 1 { return acc; }
+            }
+            e = e / 2;
+            base = base * base;
+        }
     }
     pub fn wrapping_pow(self, exp: u32) -> %[1]s {
-        let mut r: %[1]s = 1;
-        let mut i = 0;
-        while i < exp { r = r.wrapping_mul(self); i += 1; }
-        r
+        let mut base = self;
+        let mut acc: %[1]s = 1;
+        let mut e = exp;
+        while e > 0 {
+            if e & 1 == 1 { acc = acc.wrapping_mul(base); }
+            e = e / 2;
+            base = base.wrapping_mul(base);
+        }
+        acc
     }
     pub fn count_ones(self) -> u32 {
         let mut v = self as %[12]s;
@@ -170,8 +191,16 @@ impl %[1]s {
 `, t.name)
 		}
 	}
+	b.WriteString(int128)
 	b.WriteString(floats)
-	if err := os.WriteFile("lib/std/src/num.navi", []byte(b.String()), 0o644); err != nil {
+	write("lib/std/src/num.navi", b.String())
+	write("lib/std/src/num/ext.navi", extFile())
+	write("lib/std/src/f64.navi", constsModule("f64"))
+	write("lib/std/src/f32.navi", constsModule("f32"))
+}
+
+func write(path, text string) {
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
 		panic(err)
 	}
 }
