@@ -82,3 +82,8 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `str` 的模式参数 | `Pattern` 支持 `&str`、`char`、`&[char]`、闭包 | `std::str::pattern::Pattern` 支持 `&str`、`&String`、`char`、`fn(char) -> bool` | 未实现 `&[char]` |
 | `f32` 解析 | 精确舍入 | 先精确解析成 `f64` 再转换（极少数情况下有两次舍入） | 简化 |
 | `str::matches` | 返回迭代器 | 只提供 `matches_count` | 简化 |
+| `BTreeSet::union` | `a.union(&b)` | `a.r#union(&b)` | `union` 在 navi 是保留字 |
+| `BTreeMap`/`BTreeSet` 的查找参数 | `get<Q>(&self, key: &Q) where K: Borrow<Q>`；`range<T, R: RangeBounds<T>>` | `get(&self, key: &K)`；`range<R: RangeBounds<K>>`（同 `HashMap`） | 没有 `Borrow` |
+| `BinaryHeap::peek_mut` | 返回 `PeekMut`，drop 时下沉 | 不提供；用 `pop` 再 `push` | 没有 Drop |
+| `BinaryHeap::into_sorted_vec` | 原地排序 | 返回排好序的新 Vec，堆本身不变 | 没有 move：原地排序会破坏仍共享缓冲区的堆 |
+| `BinaryHeap::drain` | 返回惰性 `Drain<'_, T>` | 立即取走，返回 `vec::IntoIter<T>` | 同 `Vec::drain` |

@@ -1,0 +1,244 @@
+//! An ordered set (a BTreeMap with unit values). BTreeSet has reference
+//! semantics like Vec: copies share the tree; use clone() for an
+//! independent copy.
+
+use crate::cmp::Ordering;
+use crate::fmt::{self, Debug, Formatter};
+use crate::ops::RangeBounds;
+use crate::collections::btree_map::{self, BTreeMap};
+
+pub struct BTreeSet<T> { m: BTreeMap<T, ()> }
+
+impl<T> BTreeSet<T> {
+    pub fn new() -> BTreeSet<T> { BTreeSet { m: BTreeMap::new() } }
+    pub fn len(&self) -> usize { self.m.len() }
+    pub fn is_empty(&self) -> bool { self.m.is_empty() }
+    pub fn clear(&mut self) { self.m.clear(); }
+    /// The values in ascending order.
+    pub fn iter(&self) -> Iter<T> { Iter { keys: self.m.keys() } }
+    pub fn first(&self) -> Option<&T> { match self.m.first_key_value() { Some((k, _)) => Some(k), None => None } }
+    pub fn last(&self) -> Option<&T> { match self.m.last_key_value() { Some((k, _)) => Some(k), None => None } }
+}
+
+impl<T: Ord> BTreeSet<T> {
+    /// Adds a value; returns whether it was not present.
+    pub fn insert(&mut self, value: T) -> bool { self.m.insert(value, ()).is_none() }
+    pub fn contains(&self, value: &T) -> bool { self.m.contains_key(value) }
+    /// Removes a value; returns whether it was present.
+    pub fn remove(&mut self, value: &T) -> bool { self.m.remove(value).is_some() }
+    pub fn get(&self, value: &T) -> Option<&T> { match self.m.get_key_value(value) { Some((k, _)) => Some(k), None => None } }
+    /// Removes and returns the set's value equal to value.
+    pub fn take(&mut self, value: &T) -> Option<T> { match self.m.remove_entry(value) { Some((k, _)) => Some(k), None => None } }
+
+    /// Adds a value, replacing and returning an equal one.
+    pub fn replace(&mut self, value: T) -> Option<T> {
+        let old = self.take(&value);
+        self.m.insert(value, ());
+        old
+    }
+
+    pub fn pop_first(&mut self) -> Option<T> { match self.m.pop_first() { Some((k, _)) => Some(k), None => None } }
+    pub fn pop_last(&mut self) -> Option<T> { match self.m.pop_last() { Some((k, _)) => Some(k), None => None } }
+
+    /// The values in range, in ascending order.
+    #[track_caller]
+    pub fn range<R: RangeBounds<T>>(&self, range: R) -> Range<T> { Range { r: self.m.range(range) } }
+
+    pub fn retain(&mut self, f: fn(&T) -> bool) {
+        let mut gone: Vec<T> = Vec::new();
+        for v in self.iter() { if !f(v) { gone.push(*v); } }
+        for v in gone.iter() { self.remove(v); }
+    }
+
+    /// Moves all the values of other into this set, leaving other empty.
+    pub fn append(&mut self, other: &mut BTreeSet<T>) { self.m.append(&mut other.m); }
+
+    /// Splits off the values from value on into a new set.
+    pub fn split_off(&mut self, value: &T) -> BTreeSet<T> { BTreeSet { m: self.m.split_off(value) } }
+
+    /// The values in self or other, in ascending order. (union is a
+    /// reserved word in navi: call it as a.r#union(&b).)
+    pub fn r#union(&self, other: &BTreeSet<T>) -> Union<T> { Union { m: Merge::new(self, other) } }
+    /// The values in both self and other, in ascending order.
+    pub fn intersection(&self, other: &BTreeSet<T>) -> Intersection<T> { Intersection { m: Merge::new(self, other) } }
+    /// The values in self but not in other, in ascending order.
+    pub fn difference(&self, other: &BTreeSet<T>) -> Difference<T> { Difference { m: Merge::new(self, other) } }
+    /// The values in self or other but not both, in ascending order.
+    pub fn symmetric_difference(&self, other: &BTreeSet<T>) -> SymmetricDifference<T> {
+        SymmetricDifference { m: Merge::new(self, other) }
+    }
+
+    pub fn is_disjoint(&self, other: &BTreeSet<T>) -> bool { self.intersection(other).next().is_none() }
+    pub fn is_subset(&self, other: &BTreeSet<T>) -> bool {
+        if self.len() > other.len() { return false; }
+        self.difference(other).next().is_none()
+    }
+    pub fn is_superset(&self, other: &BTreeSet<T>) -> bool { other.is_subset(self) }
+}
+
+pub struct Iter<T> { keys: btree_map::Keys<T, ()> }
+impl<T> Iterator for Iter<T> {
+    type Item = &T;
+    fn next(&mut self) -> Option<&T> { self.keys.next() }
+    fn size_hint(&self) -> (usize, Option<usize>) { self.keys.size_hint() }
+}
+impl<T> DoubleEndedIterator for Iter<T> {
+    fn next_back(&mut self) -> Option<&T> { self.keys.next_back() }
+}
+impl<T> ExactSizeIterator for Iter<T> {}
+
+/// The by-value iterator of a BTreeSet.
+pub struct IntoIter<T> { keys: btree_map::IntoKeys<T, ()> }
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> { self.keys.next() }
+    fn size_hint(&self) -> (usize, Option<usize>) { self.keys.size_hint() }
+}
+impl<T> DoubleEndedIterator for IntoIter<T> {
+    fn next_back(&mut self) -> Option<T> { self.keys.next_back() }
+}
+
+pub struct Range<T> { r: btree_map::Range<T, ()> }
+impl<T> Iterator for Range<T> {
+    type Item = &T;
+    fn next(&mut self) -> Option<&T> { match self.r.next() { Some((k, _)) => Some(k), None => None } }
+}
+impl<T> DoubleEndedIterator for Range<T> {
+    fn next_back(&mut self) -> Option<&T> { match self.r.next_back() { Some((k, _)) => Some(k), None => None } }
+}
+
+// Two sets walked side by side: the next value of each (a, b) and which
+// of them is smaller.
+struct Merge<T> { a: Iter<T>, b: Iter<T>, x: Option<&T>, y: Option<&T> }
+
+impl<T: Ord> Merge<T> {
+    fn new(a: &BTreeSet<T>, b: &BTreeSet<T>) -> Merge<T> {
+        let mut m = Merge { a: a.iter(), b: b.iter(), x: None, y: None };
+        m.x = m.a.next();
+        m.y = m.b.next();
+        m
+    }
+
+    // The next value of either set with its source: Less if only in a,
+    // Greater if only in b, Equal if in both (given once).
+    fn next(&mut self) -> Option<(&T, Ordering)> {
+        match (self.x, self.y) {
+            (None, None) => None,
+            (Some(x), None) => { self.x = self.a.next(); Some((x, Ordering::Less)) }
+            (None, Some(y)) => { self.y = self.b.next(); Some((y, Ordering::Greater)) }
+            (Some(x), Some(y)) => match x.cmp(y) {
+                Ordering::Less => { self.x = self.a.next(); Some((x, Ordering::Less)) }
+                Ordering::Greater => { self.y = self.b.next(); Some((y, Ordering::Greater)) }
+                Ordering::Equal => {
+                    self.x = self.a.next();
+                    self.y = self.b.next();
+                    Some((x, Ordering::Equal))
+                }
+            },
+        }
+    }
+}
+
+pub struct Union<T> { m: Merge<T> }
+impl<T: Ord> Iterator for Union<T> {
+    type Item = &T;
+    fn next(&mut self) -> Option<&T> { match self.m.next() { Some((v, _)) => Some(v), None => None } }
+}
+
+pub struct Intersection<T> { m: Merge<T> }
+impl<T: Ord> Iterator for Intersection<T> {
+    type Item = &T;
+    fn next(&mut self) -> Option<&T> {
+        loop {
+            if self.m.x.is_none() || self.m.y.is_none() { return None; }
+            let (v, o) = self.m.next()?;
+            if o == Ordering::Equal { return Some(v); }
+        }
+    }
+}
+
+pub struct Difference<T> { m: Merge<T> }
+impl<T: Ord> Iterator for Difference<T> {
+    type Item = &T;
+    fn next(&mut self) -> Option<&T> {
+        loop {
+            if self.m.x.is_none() { return None; }
+            let (v, o) = self.m.next()?;
+            if o == Ordering::Less { return Some(v); }
+        }
+    }
+}
+
+pub struct SymmetricDifference<T> { m: Merge<T> }
+impl<T: Ord> Iterator for SymmetricDifference<T> {
+    type Item = &T;
+    fn next(&mut self) -> Option<&T> {
+        loop {
+            let (v, o) = self.m.next()?;
+            if o != Ordering::Equal { return Some(v); }
+        }
+    }
+}
+
+impl<T> IntoIterator for BTreeSet<T> {
+    type Item = T;
+    type IntoIter = IntoIter<T>;
+    fn into_iter(self) -> IntoIter<T> { IntoIter { keys: self.m.into_keys() } }
+}
+
+impl<T> IntoIterator for &BTreeSet<T> {
+    type Item = &T;
+    type IntoIter = Iter<T>;
+    fn into_iter(self) -> Iter<T> { self.iter() }
+}
+
+impl<T: Clone> Clone for BTreeSet<T> {
+    fn clone(&self) -> BTreeSet<T> { BTreeSet { m: self.m.clone() } }
+}
+
+impl<T> Default for BTreeSet<T> {
+    fn default() -> BTreeSet<T> { BTreeSet::new() }
+}
+
+impl<T: Debug> Debug for BTreeSet<T> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut s = f.debug_set();
+        for v in self.iter() { s.entry(v); }
+        s.finish()
+    }
+}
+
+impl<T: PartialEq> PartialEq for BTreeSet<T> {
+    fn eq(&self, other: &BTreeSet<T>) -> bool { self.m == other.m }
+}
+
+impl<T: Eq> Eq for BTreeSet<T> {}
+
+impl<T: crate::hash::Hash> crate::hash::Hash for BTreeSet<T> {
+    fn hash<H: crate::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.len());
+        for v in self.iter() { v.hash(state); }
+    }
+}
+
+impl<T: Ord> FromIterator<T> for BTreeSet<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> BTreeSet<T> {
+        let mut s = BTreeSet::new();
+        for v in iter { s.insert(v); }
+        s
+    }
+}
+
+impl<T: Ord> Extend<T> for BTreeSet<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for v in iter { self.insert(v); }
+    }
+}
+
+impl<T: Ord, const N: usize> From<[T; N]> for BTreeSet<T> {
+    fn from(a: [T; N]) -> BTreeSet<T> {
+        let mut s = BTreeSet::new();
+        for v in a.iter() { s.insert(*v); }
+        s
+    }
+}
