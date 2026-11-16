@@ -26,8 +26,11 @@ for f in tests/run/*.navi; do
 	want_code=$(grep -E '^// exit:' "$f" | sed -E 's#^// exit: *##')
 	[ -z "$want_code" ] && want_code=0
 	set +e
-	got_out=$(cd "$tmp" && "./$n" 2>"$tmp/$n.err")
+	# A hung program fails after 5 minutes (perl's alarm: macOS has no
+	# timeout command).
+	got_out=$(cd "$tmp" && perl -e 'alarm(300); exec(@ARGV)' "./$n" 2>"$tmp/$n.err")
 	code=$?
+	if [ "$code" = 142 ]; then echo "FAIL $f (timed out)"; fail=1; continue; fi
 	set -e
 	# // warn: line:col msg lists the build's warnings.
 	want_warn=$(grep -E '^// warn:' "$f" | sed -E 's#^// warn: ?##')

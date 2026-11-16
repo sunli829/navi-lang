@@ -64,6 +64,10 @@ pub struct G {
     // (below it, the registers it saved).
     need: usize,
     entry_sp: usize,
+    // Fifth (navic): how many morestacks the G is in (the stub counts):
+    // more than one only if the collector poisoned the limit while one
+    // ran; the inner ones do nothing.
+    ms_depth: usize,
     // A stack left by growing (freed by the next morestack, which runs on
     // the new one).
     old_stack: usize,
@@ -98,6 +102,9 @@ pub struct G {
     // releases once the G has switched away (see park_on).
     release: usize,
     release_n: usize,
+    // The M running it (0: none), taken atomically before an M switches
+    // to it (debugging double scheduling).
+    running_on: usize,
 }
 
 // G.sys: running navi code; blocked in C (a system call or waiting for the
@@ -1008,6 +1015,9 @@ static mut MS: usize = 0;
 // Set while a collector stops the world.
 #[cfg(feature = "navic")]
 static mut STW: usize = 0;
+// The G that stopped the world (morestack does not stop it).
+#[cfg(feature = "navic")]
+static mut STW_OWNER: usize = 0;
 
 #[cfg(feature = "navic")]
 pub fn multi() -> bool { MULTI }
@@ -1565,6 +1575,8 @@ fn mloop() -> ! {
         // The G that switched here (M0's main G the first time) stopped: its
         // context is saved, a collector need not wait for it (do_after may
         // wait for the runtime lock a collector holds).
+        let prev = crate::rt::atomic_load(unsafe { &mut (*m).cur as *mut *mut G as *mut usize });
+        if prev != 0 { crate::rt::atomic_store(unsafe { &mut (*(prev as *mut G)).running_on as *mut usize }, 0); }
         crate::rt::atomic_store(unsafe { &mut (*m).cur as *mut *mut G as *mut usize }, 0);
         do_after(m);
         let g = find_runnable(m);
@@ -1581,6 +1593,16 @@ fn mloop() -> ! {
             unsafe { (*g).status = RUNNABLE; }
             gq_push(g);
             continue;
+        }
+        if !crate::rt::atomic_cas(unsafe { &mut (*g).running_on as *mut usize }, 0, m as usize) {
+            crate::rt::native::put(2, "G ");
+            crate::rt::native::put_u64(2, g as u64);
+            crate::rt::native::put(2, " already runs on M ");
+            crate::rt::native::put_u64(2, unsafe { (*g).running_on } as u64);
+            crate::rt::native::put(2, ", now taken by M ");
+            crate::rt::native::put_u64(2, m as u64);
+            crate::rt::native::put(2, "\n");
+            crate::rt::native::fatal("a G scheduled twice");
         }
         switch(g0, g);
     }
@@ -1745,44 +1767,84 @@ pub fn morestack() -> usize {
     let g = current();
     unsafe {
         if (*g).stack_hi == 0 { return 0; } // a thread's scheduler record: no limit
-        let stw = crate::rt::atomic_load(&mut STW as *mut usize) != 0;
+        // Entered from inside morestack (the collector poisoned the limit):
+        // the outer one stops the G at the next prologue if need be.
+        if (*g).ms_depth > 1 { return 0; }
+        // Between enter_blocked and the call that blocks (a function's
+        // prologue): the G runs navi code again until morestack is done (a
+        // collector waits for it rather than scanning a stack that may move)
+        // and blocked after, with the SP and FP it saved moved too.
+        let mut was_blocked = false;
+        let bsp = (*g).sp;
+        let bfp = (*g).fp;
+        let olo = (*g).stack_lo;
+        let ohi = (*g).stack_hi;
+        if !(*g).is_g0 {
+            loop {
+                let st = crate::rt::atomic_load(&mut (*g).sys as *mut usize);
+                if st == SYS_RUNNING { break; }
+                if st == SYS_BLOCKED && crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_BLOCKED, SYS_RUNNING) {
+                    was_blocked = true;
+                    break;
+                }
+                // Claimed: a collector scans the stack; wait for it.
+                os_yield();
+            }
+        }
+        // (The G that stopped the world does not stop for itself.)
+        let stw = crate::rt::atomic_load(&mut STW as *mut usize) != 0 && STW_OWNER != g as usize;
         if stw && !(*g).is_g0 && (*g).nopreempt != 0 {
             // Stops at a prologue after preempt_on (the stub zeroed the
             // limit: poisoned again).
             (*g).guard = POISON;
+            if was_blocked { crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_BLOCKED); }
             return 0;
         }
         if stw && !(*g).is_g0 {
-            if crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_RUNNING, SYS_STOPPED) {
-                // The registers are saved below (by the stub), above SP.
-                (*g).sp = crate::rt::stack_pointer() as usize;
-                (*g).fp = crate::rt::frame_address() as usize;
-                crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_STOPPED);
-                while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { os_yield(); }
-                crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_RUNNING);
-            } else {
-                // Blocked (or claimed): between enter_blocked and the call
-                // that blocks, a function's prologue met the poisoned
-                // limit. The collector counts the G as stopped already (its
-                // SP and registers were saved); its state stays for
-                // exit_blocked, which would otherwise wait forever.
-                while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { os_yield(); }
-            }
+            // A collector scans from SP to the frame record call_morestack
+            // pushed (above the stub's: morestack's frames and the
+            // registers the stub saved, conservatively), then the frames of
+            // the entering function's callers by their maps. (The stub's
+            // own record returns into the entering function, whose frame
+            // does not exist yet: its map must not describe its caller's.)
+            (*g).sp = crate::rt::stack_pointer() as usize;
+            (*g).fp = (*g).entry_sp + 256 + 16;
+            crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_STOPPED);
+            while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { os_yield(); }
+            crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_RUNNING);
         }
         if (*g).old_size != 0 {
             release_os((*g).old_stack, (*g).old_size);
             (*g).old_size = 0;
         }
         let mut delta = 0usize;
-        if (*g).entry_sp < (*g).stack_lo + RED_ZONE + (*g).need {
+        stack_mode();
+        // (Only while little of the stack is used: deep recursion would
+        // copy quadratically.)
+        // The collector's stack must not move while the world is stopped:
+        // it holds its own SP and frames (stop_the_world makes room first).
+        let owner = crate::rt::atomic_load(&mut STW as *mut usize) != 0 && STW_OWNER == g as usize;
+        let stress = STACKMOVE && !owner && !(*g).main && !(*g).is_g0 && (*g).stack_hi - (*g).entry_sp < 262144;
+        if (*g).entry_sp < (*g).stack_lo + RED_ZONE + (*g).need || stress {
             if (*g).main || (*g).is_g0 { crate::rt::native::fatal("stack overflow"); }
+            if owner { crate::rt::native::fatal("the collector ran out of stack while the world was stopped"); }
             delta = grow(g);
+        }
+        let mut limit = (*g).stack_lo + RED_ZONE;
+        if stress {
+            let near = (*g).entry_sp.wrapping_add(delta) - (*g).need - 256;
+            if near > limit { limit = near; }
         }
         // A collector may have poisoned the limit meanwhile (it sets STW
         // first): the G must still stop at its next prologue.
-        crate::rt::atomic_store(&mut (*g).guard as *mut usize, (*g).stack_lo + RED_ZONE);
-        if crate::rt::atomic_load(&mut STW as *mut usize) != 0 && !(*g).is_g0 {
+        crate::rt::atomic_store(&mut (*g).guard as *mut usize, limit);
+        if crate::rt::atomic_load(&mut STW as *mut usize) != 0 && STW_OWNER != g as usize && !(*g).is_g0 {
             crate::rt::atomic_store(&mut (*g).guard as *mut usize, POISON);
+        }
+        if was_blocked {
+            (*g).sp = if bsp >= olo && bsp < ohi { bsp.wrapping_add(delta) } else { bsp };
+            (*g).fp = if bfp >= olo && bfp < ohi { bfp.wrapping_add(delta) } else { bfp };
+            crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_BLOCKED);
         }
         delta
     }
@@ -1802,12 +1864,41 @@ fn grow(g: *mut G) -> usize {
         let lo = (*g).stack_lo;
         let hi = (*g).stack_hi;
         let sp = (*g).entry_sp;
+        if sp > hi || sp < lo {
+            let n = crate::rt::native::put;
+            n(2, "morestack: SP outside the G's stack: sp=");
+            crate::rt::native::put_u64(2, sp as u64);
+            n(2, " lo=");
+            crate::rt::native::put_u64(2, lo as u64);
+            n(2, " hi=");
+            crate::rt::native::put_u64(2, hi as u64);
+            n(2, " g=");
+            crate::rt::native::put_u64(2, g as u64);
+            n(2, " m=");
+            crate::rt::native::put_u64(2, (*g).m as u64);
+            n(2, " m.cur=");
+            crate::rt::native::put_u64(2, if (*g).m != 0 { (*((*g).m as *mut M)).cur as u64 } else { 0 });
+            n(2, " status=");
+            crate::rt::native::put_u64(2, (*g).status as u64);
+            n(2, " sys=");
+            crate::rt::native::put_u64(2, (*g).sys as u64);
+            n(2, " old=");
+            crate::rt::native::put_u64(2, (*g).old_stack as u64);
+            n(2, "/");
+            crate::rt::native::put_u64(2, (*g).old_size as u64);
+            n(2, " stub fp=");
+            crate::rt::native::put_u64(2, crate::rt::frame_address() as u64);
+            n(2, "\n");
+            crate::rt::native::fatal("morestack: the stub's SP is outside the G's stack");
+        }
         let used = hi - sp;
         let mut size = hi - lo;
-        loop {
-            size = size * 2;
-            if size > MAX_STACK { crate::rt::native::fatal("stack overflow"); }
-            if size >= used + (*g).need + RED_ZONE + 4096 { break; }
+        if !(STACKMOVE && size >= used + (*g).need + RED_ZONE + 4096) {
+            loop {
+                size = size * 2;
+                if size > MAX_STACK { crate::rt::native::fatal("stack overflow"); }
+                if size >= used + (*g).need + RED_ZONE + 4096 { break; }
+            }
         }
         let nlo = reserve(size);
         let nhi = nlo + size;
@@ -1841,12 +1932,18 @@ fn grow(g: *mut G) -> usize {
 static mut STACKMAP: usize = 0;
 #[cfg(feature = "navic")]
 static mut STACKCHECK: bool = false;
+// NAVI_STACKMOVE=1 (debugging the stack maps): every morestack of a
+// spawned G using under 256 KiB of stack moves it, and the new limit is
+// just below where it is, so nearly every deeper call moves it again.
+#[cfg(feature = "navic")]
+static mut STACKMOVE: bool = false;
 
 #[cfg(feature = "navic")]
 fn stack_mode() {
     if STACKMAP == 0 {
         STACKMAP = if crate::rt::native::env_set(b"NAVI_STACKCONS\0") { 2 } else { 1 };
         if crate::rt::native::env_set(b"NAVI_STACKCHECK\0") { STACKCHECK = true; }
+        if crate::rt::native::env_set(b"NAVI_STACKMOVE\0") { STACKMOVE = true; }
     }
 }
 
@@ -2040,6 +2137,17 @@ fn check_moved(nsp: usize, nhi: usize, lo: usize, hi: usize, delta: usize) {
     }
 }
 
+// Grows the stack now (if need be) so that a collection, which runs with
+// the world stopped, has 256 KiB below the caller's frame (Go runs its
+// collector on the system stack instead).
+#[cfg(feature = "navic")]
+fn stack_headroom() {
+    let mut pad = [0u64; 32768];
+    let i = (crate::rt::stack_pointer() as usize >> 4) & 32767;
+    pad[i] = 1;
+    if pad[(i + 1) & 32767] != 0 { crate::rt::native::fatal("stack_headroom"); }
+}
+
 /// Stops every G running on another M (the collector holds the runtime
 /// lock): each is asked to stop at its next function prologue (its stack
 /// limit is made unreachable) or, if blocked outside navi code, claimed so
@@ -2049,6 +2157,8 @@ pub fn stop_the_world() {
     if !MULTI { return; }
     if crate::rt::native::env_set(b"NAVI_GCPOISON\0") { crate::rt::gc::POISON_FREE = true; }
     let me = current();
+    stack_headroom();
+    STW_OWNER = me as usize;
     crate::rt::atomic_store(&mut STW as *mut usize, 1);
     // Every G on an M, whatever its status: a G changes its status before
     // it switches away (yield, park), and runs until its context is saved.
