@@ -1,0 +1,438 @@
+//! Searching: a Pike VM (a Thompson NFA simulation that tracks captures,
+//! linear in the haystack) and a bounded backtracker for the captures of a
+//! match already found.
+
+use super::compile::{Inst, Prog};
+use super::parse::Look;
+
+/// An unset capture slot.
+pub const NONE: usize = usize::MAX;
+
+/// The char at b[i] (valid UTF-8) and its length.
+pub fn decode(b: &[u8], i: usize) -> (u32, usize) {
+    let c0 = b[i] as u32;
+    if c0 < 0x80 { return (c0, 1); }
+    if c0 < 0xE0 { return (((c0 & 0x1F) << 6) | (b[i + 1] as u32 & 0x3F), 2); }
+    if c0 < 0xF0 {
+        return (((c0 & 0x0F) << 12) | ((b[i + 1] as u32 & 0x3F) << 6) | (b[i + 2] as u32 & 0x3F), 3);
+    }
+    let c = ((c0 & 0x07) << 18) | ((b[i + 1] as u32 & 0x3F) << 12) | ((b[i + 2] as u32 & 0x3F) << 6) | (b[i + 3] as u32 & 0x3F);
+    (c, 4)
+}
+
+/// The length of the char at b[i].
+pub fn char_len(b: &[u8], i: usize) -> usize {
+    let c = b[i];
+    if c < 0x80 { 1 } else if c < 0xE0 { 2 } else if c < 0xF0 { 3 } else { 4 }
+}
+
+fn is_word(prog: &Prog, b: &[u8], c: u32, ascii: bool) -> bool {
+    if c < 0x80 {
+        return (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F;
+    }
+    !ascii && prog.word.contains(c)
+}
+
+fn word_before(prog: &Prog, b: &[u8], at: usize, ascii: bool) -> bool {
+    if at == 0 { return false; }
+    let mut j = at - 1;
+    while j > 0 && b[j] & 0xC0 == 0x80 { j -= 1; }
+    is_word(prog, b, decode(b, j).0, ascii)
+}
+
+fn word_after(prog: &Prog, b: &[u8], at: usize, ascii: bool) -> bool {
+    at < b.len() && is_word(prog, b, decode(b, at).0, ascii)
+}
+
+/// Whether the assertion holds at b[at] (looking at the whole haystack).
+pub fn look(prog: &Prog, l: &Look, b: &[u8], at: usize) -> bool {
+    match l {
+        Look::Start => at == 0,
+        Look::End => at == b.len(),
+        Look::StartLine => at == 0 || b[at - 1] == b'\n',
+        Look::EndLine => at == b.len() || b[at] == b'\n',
+        Look::Word(a) => word_before(prog, b, at, *a) != word_after(prog, b, at, *a),
+        Look::NotWord(a) => word_before(prog, b, at, *a) == word_after(prog, b, at, *a),
+        Look::WordStart(a) => !word_before(prog, b, at, *a) && word_after(prog, b, at, *a),
+        Look::WordEnd(a) => word_before(prog, b, at, *a) && !word_after(prog, b, at, *a),
+        Look::WordStartHalf(a) => !word_before(prog, b, at, *a),
+        Look::WordEndHalf(a) => !word_after(prog, b, at, *a),
+    }
+}
+
+/// The first position at or after at where a match can start, by the
+/// literal prefix or the possible first bytes; None if there is none.
+pub fn skip(prog: &Prog, b: &[u8], at: usize, end: usize) -> Option<usize> {
+    let p = &prog.prefix;
+    if p.len() > 0 {
+        let n = p.len();
+        if end < n { return None; }
+        let first = p[0];
+        let mut i = at;
+        while i + n <= end {
+            if b[i] == first {
+                let mut k = 1;
+                while k < n && b[i + k] == p[k] { k += 1; }
+                if k == n { return Some(i); }
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let f = &prog.first;
+    if f.len() == 0 { return Some(at); }
+    let mut i = at;
+    while i < end {
+        if f[b[i] as usize] { return Some(i); }
+        i += 1;
+    }
+    None
+}
+
+// A sparse set of program counters, with capture slots for each.
+struct Threads {
+    sparse: Vec<usize>,
+    dense: Vec<usize>,
+    n: usize,
+    caps: Vec<usize>,
+}
+
+impl Threads {
+    fn new(ninsts: usize, nslots: usize) -> Threads {
+        let mut t = Threads { sparse: Vec::new(), dense: Vec::new(), n: 0, caps: Vec::new() };
+        t.sparse.resize(ninsts, 0);
+        t.dense.resize(ninsts, 0);
+        t.caps.resize(ninsts * nslots, NONE);
+        t
+    }
+
+    fn contains(&self, pc: usize) -> bool {
+        let i = self.sparse[pc];
+        i < self.n && self.dense[i] == pc
+    }
+
+    fn insert(&mut self, pc: usize) {
+        self.sparse[pc] = self.n;
+        self.dense[self.n] = pc;
+        self.n += 1;
+    }
+}
+
+enum Frame {
+    Explore(usize),
+    Restore(usize, usize),
+}
+
+/// The state of a Pike VM, reusable across searches of one program.
+pub struct PikeVM {
+    clist: Threads,
+    nlist: Threads,
+    stack: Vec<Frame>,
+    scratch: Vec<usize>,
+    nslots: usize,
+}
+
+impl PikeVM {
+    pub fn new(prog: &Prog) -> PikeVM {
+        let n = prog.insts.len();
+        PikeVM {
+            clist: Threads::new(n, prog.nslots),
+            nlist: Threads::new(n, prog.nslots),
+            stack: Vec::new(),
+            scratch: { let mut v = Vec::new(); v.resize(prog.nslots, NONE); v },
+            nslots: 0,
+        }
+    }
+
+    // Adds pc and what it reaches without consuming input to the next list,
+    // in priority order; scratch holds the thread's slots.
+    fn add(&mut self, prog: &Prog, b: &[u8], pc0: usize, at: usize) {
+        let ns = self.nslots;
+        self.stack.push(Frame::Explore(pc0));
+        while let Some(f) = self.stack.pop() {
+            let mut pc = match f {
+                Frame::Explore(pc) => pc,
+                Frame::Restore(slot, v) => {
+                    self.scratch[slot] = v;
+                    continue;
+                }
+            };
+            loop {
+                if self.nlist.contains(pc) { break; }
+                self.nlist.insert(pc);
+                match prog.insts[pc] {
+                    Inst::Jmp(x) => pc = x,
+                    Inst::Split(x, y) => {
+                        self.stack.push(Frame::Explore(y));
+                        pc = x;
+                    }
+                    Inst::Save(s) => {
+                        if s < ns {
+                            self.stack.push(Frame::Restore(s, self.scratch[s]));
+                            self.scratch[s] = at;
+                        }
+                        pc += 1;
+                    }
+                    Inst::Look(l) => {
+                        if !look(prog, &l, b, at) { break; }
+                        pc += 1;
+                    }
+                    Inst::Fail => break,
+                    _ => {
+                        if ns > 0 {
+                            let base = pc * ns;
+                            let mut k = 0;
+                            while k < ns {
+                                self.nlist.caps[base + k] = self.scratch[k];
+                                k += 1;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn swap(&mut self) {
+        let t = self.clist;
+        self.clist = self.nlist;
+        self.nlist = t;
+        self.nlist.n = 0;
+    }
+
+    /// Searches b[start..end] for the leftmost-first match (starting at
+    /// start if anchored), filling slots (as many as given). With earliest,
+    /// stops at the first match state reached: slots then hold nothing
+    /// useful but the returned end. Returns the match end.
+    pub fn exec(&mut self, prog: &Prog, b: &[u8], start: usize, end: usize, anchored: bool, slots: &mut [usize], earliest: bool) -> Option<usize> {
+        let anchored = anchored || prog.anchored;
+        if prog.anchored && start > 0 { return None; }
+        self.nslots = slots.len();
+        let ns = self.nslots;
+        self.clist.n = 0;
+        self.nlist.n = 0;
+        let mut matched: Option<usize> = None;
+        let mut at = start;
+        loop {
+            if self.clist.n == 0 {
+                if matched.is_some() || (anchored && at > start) { break; }
+                if !anchored {
+                    match skip(prog, b, at, end) {
+                        Some(p) => at = p,
+                        None => break,
+                    }
+                }
+            }
+            if matched.is_none() && (!anchored || at == start) {
+                // The new thread has the lowest priority: it goes last.
+                let mut k = 0;
+                while k < ns {
+                    self.scratch[k] = NONE;
+                    k += 1;
+                }
+                let t = self.clist;
+                self.clist = self.nlist;
+                self.nlist = t;
+                self.add(prog, b, prog.start, at);
+                let t = self.clist;
+                self.clist = self.nlist;
+                self.nlist = t;
+            }
+            let (c, w) = if at < end { decode(b, at) } else { (u32::MAX, 0) };
+            self.nlist.n = 0;
+            let mut i = 0;
+            while i < self.clist.n {
+                let pc = self.clist.dense[i];
+                i += 1;
+                let ok = match prog.insts[pc] {
+                    Inst::Char(x) => c == x,
+                    Inst::Class(k) => w > 0 && prog.classes[k].contains(c),
+                    Inst::Any => w > 0,
+                    Inst::AnyNoNL => w > 0 && c != 10,
+                    Inst::Match(_) => {
+                        if earliest { return Some(at); }
+                        let base = pc * ns;
+                        let mut k = 0;
+                        while k < ns {
+                            slots[k] = self.clist.caps[base + k];
+                            k += 1;
+                        }
+                        matched = Some(at);
+                        // Lower-priority threads lose to this match.
+                        break;
+                    }
+                    _ => false,
+                };
+                if ok {
+                    let base = pc * ns;
+                    let mut k = 0;
+                    while k < ns {
+                        self.scratch[k] = self.clist.caps[base + k];
+                        k += 1;
+                    }
+                    self.add(prog, b, pc + 1, at + w);
+                }
+            }
+            if at >= end { break; }
+            at += w;
+            self.swap();
+        }
+        matched
+    }
+
+    /// Runs the patterns of a RegexSet over all of b[start..], marking each
+    /// one that matches somewhere.
+    pub fn exec_set(&mut self, prog: &Prog, b: &[u8], start: usize, matched: &mut Vec<bool>, earliest: bool) {
+        self.nslots = 0;
+        self.clist.n = 0;
+        self.nlist.n = 0;
+        let end = b.len();
+        let mut left = matched.len();
+        let mut at = start;
+        loop {
+            if self.clist.n == 0 && !prog.anchored {
+                match skip(prog, b, at, end) {
+                    Some(p) => at = p,
+                    None => break,
+                }
+            }
+            if !prog.anchored || at == 0 {
+                let t = self.clist;
+                self.clist = self.nlist;
+                self.nlist = t;
+                self.add(prog, b, prog.start, at);
+                let t = self.clist;
+                self.clist = self.nlist;
+                self.nlist = t;
+            }
+            let (c, w) = if at < end { decode(b, at) } else { (u32::MAX, 0) };
+            self.nlist.n = 0;
+            let mut i = 0;
+            while i < self.clist.n {
+                let pc = self.clist.dense[i];
+                i += 1;
+                let ok = match prog.insts[pc] {
+                    Inst::Char(x) => c == x,
+                    Inst::Class(k) => w > 0 && prog.classes[k].contains(c),
+                    Inst::Any => w > 0,
+                    Inst::AnyNoNL => w > 0 && c != 10,
+                    Inst::Match(k) => {
+                        if !matched[k] {
+                            matched[k] = true;
+                            left -= 1;
+                            if left == 0 || earliest { return; }
+                        }
+                        false
+                    }
+                    _ => false,
+                };
+                if ok { self.add(prog, b, pc + 1, at + w); }
+            }
+            if at >= end || (self.nlist.n == 0 && prog.anchored) { break; }
+            at += w;
+            self.swap();
+        }
+    }
+}
+
+/// Bounded backtracking: depth-first in priority order, never visiting an
+/// (instruction, position) pair twice, so linear in their number.
+pub struct Backtrack {
+    jobs: Vec<Frame2>,
+    visited: Vec<u64>,
+}
+
+enum Frame2 {
+    Explore(usize, usize),
+    Restore(usize, usize),
+}
+
+/// The largest instructions * positions the backtracker takes on.
+pub const MAX_VISITED: usize = 256 * 1024;
+
+impl Backtrack {
+    pub fn new() -> Backtrack { Backtrack { jobs: Vec::new(), visited: Vec::new() } }
+
+    /// The leftmost-first match starting exactly at start and ending by end,
+    /// with its slots; prog.insts.len() * (end - start + 1) must be at most
+    /// MAX_VISITED.
+    pub fn exec(&mut self, prog: &Prog, b: &[u8], start: usize, end: usize, slots: &mut [usize]) -> bool {
+        let ns = slots.len();
+        let width = end - start + 1;
+        let words = (prog.insts.len() * width + 63) / 64;
+        if self.visited.len() < words { self.visited.resize(words, 0); }
+        let mut k = 0;
+        while k < words {
+            self.visited[k] = 0;
+            k += 1;
+        }
+        let mut s = 0;
+        while s < ns {
+            slots[s] = NONE;
+            s += 1;
+        }
+        self.jobs.clear();
+        self.jobs.push(Frame2::Explore(prog.start, start));
+        while let Some(job) = self.jobs.pop() {
+            let (mut pc, mut at) = match job {
+                Frame2::Explore(pc, at) => (pc, at),
+                Frame2::Restore(slot, v) => {
+                    slots[slot] = v;
+                    continue;
+                }
+            };
+            loop {
+                let key = pc * width + (at - start);
+                let bit = 1u64 << ((key % 64) as u64);
+                if self.visited[key / 64] & bit != 0 { break; }
+                self.visited[key / 64] = self.visited[key / 64] | bit;
+                match prog.insts[pc] {
+                    Inst::Char(x) => {
+                        if at >= end { break; }
+                        let (c, w) = decode(b, at);
+                        if c != x { break; }
+                        pc += 1;
+                        at += w;
+                    }
+                    Inst::Class(k) => {
+                        if at >= end { break; }
+                        let (c, w) = decode(b, at);
+                        if !prog.classes[k].contains(c) { break; }
+                        pc += 1;
+                        at += w;
+                    }
+                    Inst::Any => {
+                        if at >= end { break; }
+                        pc += 1;
+                        at += char_len(b, at);
+                    }
+                    Inst::AnyNoNL => {
+                        if at >= end || b[at] == b'\n' { break; }
+                        pc += 1;
+                        at += char_len(b, at);
+                    }
+                    Inst::Split(x, y) => {
+                        self.jobs.push(Frame2::Explore(y, at));
+                        pc = x;
+                    }
+                    Inst::Jmp(x) => pc = x,
+                    Inst::Save(s) => {
+                        if s < ns {
+                            self.jobs.push(Frame2::Restore(s, slots[s]));
+                            slots[s] = at;
+                        }
+                        pc += 1;
+                    }
+                    Inst::Look(l) => {
+                        if !look(prog, &l, b, at) { break; }
+                        pc += 1;
+                    }
+                    Inst::Match(_) => return true,
+                    Inst::Fail => break,
+                }
+            }
+        }
+        false
+    }
+}

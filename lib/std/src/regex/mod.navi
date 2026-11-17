@@ -1,0 +1,837 @@
+//! Regular expressions (as Go's regexp, with the API of Rust's regex
+//! crate): RE2 syntax and semantics, so searching takes time linear in the
+//! haystack (no backreferences or look-around). Matches are leftmost-first
+//! like Perl's; positions are byte offsets into the haystack.
+//!
+//!     let re = Regex::new(r"(?P<y>\d{4})-(?P<m>\d{2})").unwrap();
+//!     re.is_match("on 2024-05")                          // true
+//!     let c = re.captures("on 2024-05").unwrap();
+//!     c.name("y").unwrap().as_str()                      // "2024"
+//!     re.replace_all("2024-05 2025-01", "$m/$y")         // "05/2024 01/2025"
+//!     for m in Regex::new(r"\w+").unwrap().find_iter("a bc") { ... }
+//!
+//! Syntax: literals and escapes (\n \t \x7F \x{10FFFF} \u{..}), `.`,
+//! classes ([a-z], [^..], [[:alpha:]], nested classes and && -- ~~
+//! operations), \d \w \s \D \W \S, \p{Greek} \pL \P{..} (general
+//! categories, scripts and some properties), groups ( ), (?: ), (?P<n> )
+//! and (?<n> ), alternation, * + ? {n} {n,} {n,m} and their lazy forms,
+//! ^ $ \A \z \b \B \b{start} \b{end} \< \>, and the flags i m s x U u
+//! as (?flags) or (?flags: ..).
+
+mod parse;
+mod class;
+mod compile;
+mod vm;
+mod unicode;
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::str::FromStr;
+use crate::sync::Mutex;
+use parse::Flags;
+use compile::Prog;
+use vm::{PikeVM, Backtrack, NONE};
+
+/// Why a pattern could not be compiled.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Error {
+    /// The pattern is not valid; the message shows where.
+    Syntax(String),
+    /// The compiled program would exceed this many bytes.
+    CompiledTooBig(usize),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Error::Syntax(s) => f.write_str(s.as_str()),
+            Error::CompiledTooBig(n) => f.write_fmt(`Compiled regex exceeds size limit of ${n} bytes.`),
+        }
+    }
+}
+
+impl Debug for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Error::Syntax(s) => {
+                f.write_str("Syntax(\n")?;
+                for _ in 0..79 { f.write_str("~")?; }
+                f.write_fmt(`\n${s}\n`)?;
+                for _ in 0..79 { f.write_str("~")?; }
+                f.write_str("\n)")
+            }
+            Error::CompiledTooBig(n) => f.write_fmt(`CompiledTooBig(${n})`),
+        }
+    }
+}
+
+// The search state (reused: a pool per Regex).
+struct Cache {
+    vm: PikeVM,
+    bt: Backtrack,
+    slots: Vec<usize>,
+}
+
+/// A compiled regular expression (cheap to clone: clones share the
+/// program).
+#[derive(Clone)]
+pub struct Regex {
+    pattern: String,
+    prog: &Prog,
+    names: &Vec<Option<String>>,
+    pool: &Mutex<Vec<&mut Cache>>,
+}
+
+/// Escapes the meta characters of text so it matches literally.
+pub fn escape(text: &str) -> String {
+    let mut s = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '#' | '&' | '-' | '~' => {
+                s.push('\\');
+                s.push(c);
+            }
+            _ => s.push(c),
+        }
+    }
+    s
+}
+
+/// Configures how a pattern compiles.
+#[derive(Clone)]
+pub struct RegexBuilder {
+    pats: Vec<String>,
+    flags: Flags,
+    size_limit: usize,
+    nest_limit: u32,
+    octal: bool,
+}
+
+impl RegexBuilder {
+    pub fn new(pattern: &str) -> RegexBuilder {
+        let mut v = Vec::new();
+        v.push(pattern.to_string());
+        RegexBuilder::with(v)
+    }
+
+    fn with(pats: Vec<String>) -> RegexBuilder {
+        RegexBuilder { pats, flags: Flags { i: false, m: false, s: false, x: false, swap_greed: false, unicode: true }, size_limit: 10 * (1 << 20), nest_limit: 250, octal: false }
+    }
+
+    pub fn build(&self) -> Result<Regex, Error> {
+        let p = parse::parse(self.pats[0].as_str(), &self.flags, self.nest_limit, self.octal)?;
+        let ncap = p.names.len();
+        let mut hirs = Vec::new();
+        hirs.push(p.hir);
+        let prog = compile::compile(&hirs, ncap, self.size_limit)?;
+        Ok(Regex { pattern: self.pats[0].clone(), prog: &prog, names: &p.names, pool: &Mutex::new(Vec::new()) })
+    }
+
+    /// (?i)
+    pub fn case_insensitive(&mut self, yes: bool) -> &mut RegexBuilder {
+        self.flags.i = yes;
+        self
+    }
+
+    /// (?m): ^ and $ match at line starts and ends.
+    pub fn multi_line(&mut self, yes: bool) -> &mut RegexBuilder {
+        self.flags.m = yes;
+        self
+    }
+
+    /// (?s): . matches \n.
+    pub fn dot_matches_new_line(&mut self, yes: bool) -> &mut RegexBuilder {
+        self.flags.s = yes;
+        self
+    }
+
+    /// (?x): whitespace and # comments in the pattern are ignored.
+    pub fn ignore_whitespace(&mut self, yes: bool) -> &mut RegexBuilder {
+        self.flags.x = yes;
+        self
+    }
+
+    /// (?U): x* is lazy and x*? greedy.
+    pub fn swap_greed(&mut self, yes: bool) -> &mut RegexBuilder {
+        self.flags.swap_greed = yes;
+        self
+    }
+
+    /// (?u), on by default: \w, \d, \s, \b and case folding are Unicode's.
+    pub fn unicode(&mut self, yes: bool) -> &mut RegexBuilder {
+        self.flags.unicode = yes;
+        self
+    }
+
+    /// Whether \0 to \777 are octal escapes (off by default).
+    pub fn octal(&mut self, yes: bool) -> &mut RegexBuilder {
+        self.octal = yes;
+        self
+    }
+
+    /// The largest compiled program in bytes (10 MiB by default).
+    pub fn size_limit(&mut self, bytes: usize) -> &mut RegexBuilder {
+        self.size_limit = bytes;
+        self
+    }
+
+    /// The deepest nesting of groups and repetitions (250 by default).
+    pub fn nest_limit(&mut self, limit: u32) -> &mut RegexBuilder {
+        self.nest_limit = limit;
+        self
+    }
+}
+
+impl Regex {
+    pub fn new(pattern: &str) -> Result<Regex, Error> { RegexBuilder::new(pattern).build() }
+
+    /// The pattern it was compiled from.
+    pub fn as_str(&self) -> &str { self.pattern.as_str() }
+
+    /// The number of capture groups, group 0 (the whole match) included.
+    pub fn captures_len(&self) -> usize { self.names.len() }
+
+    /// The groups' names (None for group 0 and unnamed groups).
+    pub fn capture_names(&self) -> crate::vec::IntoIter<Option<&str>> {
+        let mut v: Vec<Option<&str>> = Vec::new();
+        for n in self.names.iter() {
+            v.push(match n {
+                Some(s) => Some(s.as_str()),
+                None => None,
+            });
+        }
+        v.into_iter()
+    }
+
+    fn cache(&self) -> &mut Cache {
+        let v = self.pool.lock();
+        let c = v.pop();
+        self.pool.unlock();
+        match c {
+            Some(c) => c,
+            None => &mut Cache { vm: PikeVM::new(self.prog), bt: Backtrack::new(), slots: Vec::new() },
+        }
+    }
+
+    fn put(&self, c: &mut Cache) {
+        let v = self.pool.lock();
+        if v.len() < 16 { v.push(c); }
+        self.pool.unlock();
+    }
+
+    // The bounds of the leftmost-first match in b[start..].
+    fn search(&self, b: &[u8], start: usize) -> Option<(usize, usize)> {
+        if start > b.len() { return None; }
+        let p = self.prog;
+        if p.literal {
+            return match vm::skip(p, b, start, b.len()) {
+                Some(s) => Some((s, s + p.prefix.len())),
+                None => None,
+            };
+        }
+        let c = self.cache();
+        c.slots.clear();
+        c.slots.push(NONE);
+        c.slots.push(NONE);
+        let r = c.vm.exec(p, b, start, b.len(), false, c.slots.as_mut_slice(), false);
+        let out = match r {
+            Some(_) => Some((c.slots[0], c.slots[1])),
+            None => None,
+        };
+        self.put(c);
+        out
+    }
+
+    // The slots of the leftmost-first match in b[start..].
+    fn search_slots(&self, b: &[u8], start: usize) -> Option<Vec<usize>> {
+        let (s, e) = self.search(b, start)?;
+        let p = self.prog;
+        let mut slots: Vec<usize> = Vec::new();
+        slots.resize(p.nslots, NONE);
+        if p.nslots == 2 {
+            slots[0] = s;
+            slots[1] = e;
+            return Some(slots);
+        }
+        let c = self.cache();
+        // The groups of the match found: the backtracker when the work is
+        // small, else the Pike VM anchored at its start.
+        let ok = if p.insts.len() * (e - s + 1) <= vm::MAX_VISITED {
+            c.bt.exec(p, b, s, e, slots.as_mut_slice())
+        } else {
+            c.vm.exec(p, b, s, e, true, slots.as_mut_slice(), false).is_some()
+        };
+        self.put(c);
+        if !ok || slots[0] != s || slots[1] != e {
+            slots[0] = s;
+            slots[1] = e;
+        }
+        Some(slots)
+    }
+
+    pub fn is_match(&self, haystack: &str) -> bool { self.is_match_at(haystack, 0) }
+
+    /// Whether there is a match starting at or after start (assertions see
+    /// the whole haystack).
+    pub fn is_match_at(&self, haystack: &str, start: usize) -> bool {
+        let b = haystack.as_bytes();
+        if start > b.len() { return false; }
+        let p = self.prog;
+        if p.literal { return vm::skip(p, b, start, b.len()).is_some(); }
+        let c = self.cache();
+        c.slots.clear();
+        let r = c.vm.exec(p, b, start, b.len(), false, c.slots.as_mut_slice(), true).is_some();
+        self.put(c);
+        r
+    }
+
+    /// The end of the match that ends first (not necessarily the leftmost
+    /// one's end).
+    pub fn shortest_match(&self, haystack: &str) -> Option<usize> { self.shortest_match_at(haystack, 0) }
+
+    pub fn shortest_match_at(&self, haystack: &str, start: usize) -> Option<usize> {
+        let b = haystack.as_bytes();
+        if start > b.len() { return None; }
+        let c = self.cache();
+        c.slots.clear();
+        let r = c.vm.exec(self.prog, b, start, b.len(), false, c.slots.as_mut_slice(), true);
+        self.put(c);
+        r
+    }
+
+    /// The leftmost-first match.
+    pub fn find(&self, haystack: &str) -> Option<Match> { self.find_at(haystack, 0) }
+
+    pub fn find_at(&self, haystack: &str, start: usize) -> Option<Match> {
+        match self.search(haystack.as_bytes(), start) {
+            Some((s, e)) => Some(Match { haystack, start: s, end: e }),
+            None => None,
+        }
+    }
+
+    /// The successive non-overlapping matches.
+    pub fn find_iter(&self, haystack: &str) -> Matches { Matches { re: self.clone(), haystack, at: 0, last: None } }
+
+    /// The leftmost-first match with its groups.
+    pub fn captures(&self, haystack: &str) -> Option<Captures> { self.captures_at(haystack, 0) }
+
+    pub fn captures_at(&self, haystack: &str, start: usize) -> Option<Captures> {
+        match self.search_slots(haystack.as_bytes(), start) {
+            Some(slots) => Some(Captures { haystack, slots, names: self.names }),
+            None => None,
+        }
+    }
+
+    /// The groups of the successive non-overlapping matches.
+    pub fn captures_iter(&self, haystack: &str) -> CaptureMatches { CaptureMatches { re: self.clone(), haystack, at: 0, last: None } }
+
+    /// The pieces between matches.
+    pub fn split(&self, haystack: &str) -> Split { Split { finder: self.find_iter(haystack), last: 0, done: false } }
+
+    /// At most limit pieces (the last one is the rest).
+    pub fn splitn(&self, haystack: &str, limit: usize) -> SplitN { SplitN { splits: self.split(haystack), limit } }
+
+    /// Replaces the first match ($1, $name, ${name} and $$ in a string
+    /// replacement; see Replacer).
+    pub fn replace<R: Replacer>(&self, haystack: &str, rep: R) -> String { self.replacen(haystack, 1, rep) }
+
+    pub fn replace_all<R: Replacer>(&self, haystack: &str, rep: R) -> String { self.replacen(haystack, 0, rep) }
+
+    /// Replaces the first limit matches (0: all).
+    pub fn replacen<R: Replacer>(&self, haystack: &str, limit: usize, rep: R) -> String {
+        let mut out = String::with_capacity(haystack.len());
+        let mut last = 0;
+        let mut n = 0;
+        let literal = rep.no_expansion();
+        if literal.is_some() || !rep.needs_captures() {
+            for m in self.find_iter(haystack) {
+                out.push_str(&haystack[last..m.start]);
+                match &literal {
+                    Some(s) => out.push_str(s.as_str()),
+                    None => {
+                        let mut slots: Vec<usize> = Vec::new();
+                        slots.resize(self.prog.nslots, NONE);
+                        slots[0] = m.start;
+                        slots[1] = m.end;
+                        rep.replace_append(&Captures { haystack, slots, names: self.names }, &mut out);
+                    }
+                }
+                last = m.end;
+                n += 1;
+                if n == limit { break; }
+            }
+        } else {
+            for c in self.captures_iter(haystack) {
+                let m = c.get(0).unwrap();
+                out.push_str(&haystack[last..m.start]);
+                rep.replace_append(&c, &mut out);
+                last = m.end;
+                n += 1;
+                if n == limit { break; }
+            }
+        }
+        out.push_str(&haystack[last..]);
+        out
+    }
+
+    /// replace_all with the replacement computed by f (Rust passes a
+    /// closure to replace_all).
+    pub fn replace_all_with(&self, haystack: &str, f: fn(&Captures) -> String) -> String { self.replacen_with(haystack, 0, f) }
+
+    pub fn replace_with(&self, haystack: &str, f: fn(&Captures) -> String) -> String { self.replacen_with(haystack, 1, f) }
+
+    pub fn replacen_with(&self, haystack: &str, limit: usize, f: fn(&Captures) -> String) -> String {
+        let mut out = String::with_capacity(haystack.len());
+        let mut last = 0;
+        let mut n = 0;
+        for c in self.captures_iter(haystack) {
+            let m = c.get(0).unwrap();
+            out.push_str(&haystack[last..m.start]);
+            out.push_str(f(&c).as_str());
+            last = m.end;
+            n += 1;
+            if n == limit { break; }
+        }
+        out.push_str(&haystack[last..]);
+        out
+    }
+}
+
+impl Display for Regex {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.pattern.as_str()) }
+}
+
+impl Debug for Regex {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`Regex(${self.pattern:?})`) }
+}
+
+impl FromStr for Regex {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Regex, Error> { Regex::new(s) }
+}
+
+/// A match: its bounds in the haystack.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Match {
+    haystack: &str,
+    start: usize,
+    end: usize,
+}
+
+impl Match {
+    pub fn start(&self) -> usize { self.start }
+    pub fn end(&self) -> usize { self.end }
+    pub fn range(&self) -> crate::ops::Range<usize> { self.start..self.end }
+    pub fn len(&self) -> usize { self.end - self.start }
+    pub fn is_empty(&self) -> bool { self.start == self.end }
+    pub fn as_str(&self) -> &str { &self.haystack[self.start..self.end] }
+}
+
+impl Debug for Match {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.write_fmt(`Match { start: ${self.start}, end: ${self.end}, string: ${self.as_str():?} }`)
+    }
+}
+
+/// The groups of a match (group 0 is the whole match).
+#[derive(Clone)]
+pub struct Captures {
+    haystack: &str,
+    slots: Vec<usize>,
+    names: &Vec<Option<String>>,
+}
+
+impl Captures {
+    /// Group i, if it took part in the match.
+    pub fn get(&self, i: usize) -> Option<Match> {
+        if 2 * i + 1 >= self.slots.len() { return None; }
+        let s = self.slots[2 * i];
+        let e = self.slots[2 * i + 1];
+        if s == NONE || e == NONE { return None; }
+        Some(Match { haystack: self.haystack, start: s, end: e })
+    }
+
+    /// The group named name, if it took part in the match.
+    pub fn name(&self, name: &str) -> Option<Match> {
+        let mut i = 0;
+        while i < self.names.len() {
+            if let Some(n) = &self.names[i] {
+                if n == name { return self.get(i); }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// The number of groups (group 0 included).
+    pub fn len(&self) -> usize { self.slots.len() / 2 }
+
+    /// The groups in order.
+    pub fn iter(&self) -> crate::vec::IntoIter<Option<Match>> {
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < self.len() {
+            v.push(self.get(i));
+            i += 1;
+        }
+        v.into_iter()
+    }
+
+    /// Group i's text ("" if it did not take part; &caps[i] in Rust, which
+    /// panics then).
+    pub fn at(&self, i: usize) -> &str {
+        match self.get(i) {
+            Some(m) => m.as_str(),
+            None => "",
+        }
+    }
+
+    /// Appends replacement to dst with $1, $name, ${name} and $$
+    /// expanded ($name takes the longest run of letters, digits and _; a
+    /// missing group is empty).
+    pub fn expand(&self, replacement: &str, dst: &mut String) {
+        let b = replacement.as_bytes();
+        let mut i = 0;
+        let mut last = 0;
+        while i < b.len() {
+            if b[i] != b'$' {
+                i += 1;
+                continue;
+            }
+            dst.push_str(&replacement[last..i]);
+            if i + 1 < b.len() && b[i + 1] == b'$' {
+                dst.push('$');
+                i += 2;
+                last = i;
+                continue;
+            }
+            let (name, next) = if i + 1 < b.len() && b[i + 1] == b'{' {
+                let mut j = i + 2;
+                while j < b.len() && b[j] != b'}' { j += 1; }
+                if j >= b.len() {
+                    (None, i + 1)
+                } else {
+                    (Some(&replacement[i + 2..j]), j + 1)
+                }
+            } else {
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') { j += 1; }
+                if j == i + 1 { (None, i + 1) } else { (Some(&replacement[i + 1..j]), j) }
+            };
+            match name {
+                None => {
+                    // A lone $ stays.
+                    dst.push('$');
+                    i += 1;
+                    last = i;
+                }
+                Some(n) => {
+                    let m = match n.parse::<usize>() {
+                        Ok(k) => self.get(k),
+                        Err(_) => self.name(n),
+                    };
+                    if let Some(m) = m { dst.push_str(m.as_str()); }
+                    i = next;
+                    last = i;
+                }
+            }
+        }
+        dst.push_str(&replacement[last..]);
+    }
+}
+
+impl Debug for Captures {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut m = f.debug_map();
+        let mut i = 0;
+        while i < self.len() {
+            let key = match &self.names[i] {
+                Some(n) => `${i}/${n}`,
+                None => i.to_string(),
+            };
+            match self.get(i) {
+                Some(x) => m.entry(&key, &x.as_str()),
+                None => m.entry(&key, &"None"),
+            };
+            i += 1;
+        }
+        m.finish()
+    }
+}
+
+/// What replaces a match: a string with $ groups (&str, String), a literal
+/// (NoExpand), or computed (Regex::replace_all_with).
+pub trait Replacer {
+    fn replace_append(&self, caps: &Captures, dst: &mut String);
+
+    /// The replacement if it is the same for every match.
+    fn no_expansion(&self) -> Option<String> { None }
+
+    fn needs_captures(&self) -> bool { true }
+}
+
+fn has_dollar(s: &str) -> bool { s.as_bytes().contains(&b'$') }
+
+impl Replacer for &str {
+    fn replace_append(&self, caps: &Captures, dst: &mut String) { caps.expand(*self, dst); }
+    fn no_expansion(&self) -> Option<String> { if has_dollar(*self) { None } else { Some(self.to_string()) } }
+}
+
+impl Replacer for String {
+    fn replace_append(&self, caps: &Captures, dst: &mut String) { caps.expand(self.as_str(), dst); }
+    fn no_expansion(&self) -> Option<String> { if has_dollar(self.as_str()) { None } else { Some(self.clone()) } }
+}
+
+impl Replacer for &String {
+    fn replace_append(&self, caps: &Captures, dst: &mut String) { caps.expand(self.as_str(), dst); }
+    fn no_expansion(&self) -> Option<String> { if has_dollar(self.as_str()) { None } else { Some((*self).clone()) } }
+}
+
+/// A replacement used as it is ($ is not special).
+#[derive(Clone)]
+pub struct NoExpand(pub &str);
+
+impl Replacer for NoExpand {
+    fn replace_append(&self, _caps: &Captures, dst: &mut String) { dst.push_str(self.0); }
+    fn no_expansion(&self) -> Option<String> { Some(self.0.to_string()) }
+}
+
+// The next match at or after at that is not an empty match right where the
+// last match ended.
+fn next_match(re: &Regex, haystack: &str, at: &mut usize, last: &mut Option<usize>) -> Option<(usize, usize)> {
+    let b = haystack.as_bytes();
+    loop {
+        if *at > b.len() { return None; }
+        let (s, e) = re.search(b, *at)?;
+        if s == e && Some(e) == *last {
+            // Not the empty match right after the last one: one char on.
+            if e >= b.len() { return None; }
+            *at = e + vm::char_len(b, e);
+            continue;
+        }
+        *at = e;
+        *last = Some(e);
+        return Some((s, e));
+    }
+}
+
+/// Regex::find_iter.
+#[derive(Clone)]
+pub struct Matches {
+    re: Regex,
+    haystack: &str,
+    at: usize,
+    last: Option<usize>,
+}
+
+impl Iterator for Matches {
+    type Item = Match;
+    fn next(&mut self) -> Option<Match> {
+        match next_match(&self.re, self.haystack, &mut self.at, &mut self.last) {
+            Some((s, e)) => Some(Match { haystack: self.haystack, start: s, end: e }),
+            None => None,
+        }
+    }
+}
+
+/// Regex::captures_iter.
+#[derive(Clone)]
+pub struct CaptureMatches {
+    re: Regex,
+    haystack: &str,
+    at: usize,
+    last: Option<usize>,
+}
+
+impl Iterator for CaptureMatches {
+    type Item = Captures;
+    fn next(&mut self) -> Option<Captures> {
+        let (s, _) = next_match(&self.re, self.haystack, &mut self.at, &mut self.last)?;
+        // The groups of the match starting at s.
+        match self.re.search_slots(self.haystack.as_bytes(), s) {
+            Some(slots) => Some(Captures { haystack: self.haystack, slots, names: self.re.names }),
+            None => None,
+        }
+    }
+}
+
+/// Regex::split.
+#[derive(Clone)]
+pub struct Split {
+    finder: Matches,
+    last: usize,
+    done: bool,
+}
+
+impl Iterator for Split {
+    type Item = &str;
+    fn next(&mut self) -> Option<&str> {
+        if self.done { return None; }
+        let h = self.finder.haystack;
+        match self.finder.next() {
+            Some(m) => {
+                let piece = &h[self.last..m.start];
+                self.last = m.end;
+                Some(piece)
+            }
+            None => {
+                self.done = true;
+                Some(&h[self.last..])
+            }
+        }
+    }
+}
+
+/// Regex::splitn.
+#[derive(Clone)]
+pub struct SplitN {
+    splits: Split,
+    limit: usize,
+}
+
+impl Iterator for SplitN {
+    type Item = &str;
+    fn next(&mut self) -> Option<&str> {
+        if self.limit == 0 { return None; }
+        self.limit -= 1;
+        if self.limit > 0 { return self.splits.next(); }
+        if self.splits.done { return None; }
+        self.splits.done = true;
+        let h = self.splits.finder.haystack;
+        Some(&h[self.splits.last..])
+    }
+}
+
+/// Several patterns matched in one pass: which of them match.
+#[derive(Clone)]
+pub struct RegexSet {
+    pats: Vec<String>,
+    prog: &Prog,
+    pool: &Mutex<Vec<&mut PikeVM>>,
+}
+
+impl RegexSet {
+    pub fn new<I: IntoIterator<Item = S>, S: AsRef<str>>(patterns: I) -> Result<RegexSet, Error> {
+        let mut pats = Vec::new();
+        for p in patterns { pats.push(p.as_ref().to_string()); }
+        RegexSet::build(pats, RegexBuilder::with(Vec::new()))
+    }
+
+    pub fn empty() -> RegexSet { RegexSet::build(Vec::new(), RegexBuilder::with(Vec::new())).unwrap() }
+
+    fn build(pats: Vec<String>, b: RegexBuilder) -> Result<RegexSet, Error> {
+        let mut hirs = Vec::new();
+        for p in pats.iter() {
+            let parsed = parse::parse(p.as_str(), &b.flags, b.nest_limit, b.octal)?;
+            hirs.push(parsed.hir);
+        }
+        let prog = compile::compile(&hirs, 1, b.size_limit)?;
+        Ok(RegexSet { pats, prog: &prog, pool: &Mutex::new(Vec::new()) })
+    }
+
+    pub fn len(&self) -> usize { self.pats.len() }
+    pub fn is_empty(&self) -> bool { self.pats.len() == 0 }
+    pub fn patterns(&self) -> &[String] { self.pats.as_slice() }
+
+    pub fn is_match(&self, haystack: &str) -> bool { self.run(haystack, true).matched_any() }
+
+    /// Which patterns match somewhere in haystack.
+    pub fn matches(&self, haystack: &str) -> SetMatches { self.run(haystack, false) }
+
+    fn run(&self, haystack: &str, earliest: bool) -> SetMatches {
+        let mut m: Vec<bool> = Vec::new();
+        m.resize(self.pats.len(), false);
+        if self.pats.len() == 0 { return SetMatches { m }; }
+        let v = self.pool.lock();
+        let vm0 = v.pop();
+        self.pool.unlock();
+        let vm1 = match vm0 {
+            Some(x) => x,
+            None => &mut PikeVM::new(self.prog),
+        };
+        vm1.exec_set(self.prog, haystack.as_bytes(), 0, &mut m, earliest);
+        let v = self.pool.lock();
+        if v.len() < 16 { v.push(vm1); }
+        self.pool.unlock();
+        SetMatches { m }
+    }
+}
+
+impl Debug for RegexSet {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`RegexSet(${self.pats:?})`) }
+}
+
+/// RegexSet::matches.
+#[derive(Clone, Debug)]
+pub struct SetMatches {
+    m: Vec<bool>,
+}
+
+impl SetMatches {
+    pub fn matched_any(&self) -> bool { self.m.contains(&true) }
+    pub fn matched_all(&self) -> bool { !self.m.contains(&false) }
+    pub fn matched(&self, i: usize) -> bool { self.m[i] }
+    pub fn len(&self) -> usize { self.m.len() }
+
+    /// The indices of the patterns that matched.
+    pub fn iter(&self) -> crate::vec::IntoIter<usize> {
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < self.m.len() {
+            if self.m[i] { v.push(i); }
+            i += 1;
+        }
+        v.into_iter()
+    }
+}
+
+impl IntoIterator for SetMatches {
+    type Item = usize;
+    type IntoIter = crate::vec::IntoIter<usize>;
+    fn into_iter(self) -> crate::vec::IntoIter<usize> { self.iter() }
+}
+
+/// Configures a RegexSet (the flags of RegexBuilder).
+#[derive(Clone)]
+pub struct RegexSetBuilder {
+    b: RegexBuilder,
+}
+
+impl RegexSetBuilder {
+    pub fn new<I: IntoIterator<Item = S>, S: AsRef<str>>(patterns: I) -> RegexSetBuilder {
+        let mut pats = Vec::new();
+        for p in patterns { pats.push(p.as_ref().to_string()); }
+        RegexSetBuilder { b: RegexBuilder::with(pats) }
+    }
+
+    pub fn build(&self) -> Result<RegexSet, Error> { RegexSet::build(self.b.pats.clone(), self.b.clone()) }
+
+    pub fn case_insensitive(&mut self, yes: bool) -> &mut RegexSetBuilder {
+        self.b.flags.i = yes;
+        self
+    }
+
+    pub fn multi_line(&mut self, yes: bool) -> &mut RegexSetBuilder {
+        self.b.flags.m = yes;
+        self
+    }
+
+    pub fn dot_matches_new_line(&mut self, yes: bool) -> &mut RegexSetBuilder {
+        self.b.flags.s = yes;
+        self
+    }
+
+    pub fn ignore_whitespace(&mut self, yes: bool) -> &mut RegexSetBuilder {
+        self.b.flags.x = yes;
+        self
+    }
+
+    pub fn unicode(&mut self, yes: bool) -> &mut RegexSetBuilder {
+        self.b.flags.unicode = yes;
+        self
+    }
+
+    pub fn size_limit(&mut self, bytes: usize) -> &mut RegexSetBuilder {
+        self.b.size_limit = bytes;
+        self
+    }
+}

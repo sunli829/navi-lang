@@ -1,0 +1,419 @@
+//! Hir to a Thompson NFA program, and the facts about a pattern that make
+//! searches faster (literal prefix, possible first bytes, anchoring).
+
+use super::Error;
+use super::class::{self, CharSet};
+use super::parse::{Hir, Look, INF};
+
+#[derive(Clone, Debug)]
+pub enum Inst {
+    /// A match of the pattern with this index (always 0 but in a RegexSet).
+    Match(usize),
+    Char(u32),
+    Class(usize),
+    Any,
+    AnyNoNL,
+    /// Try the first target, then the second.
+    Split(usize, usize),
+    Jmp(usize),
+    Save(usize),
+    Look(Look),
+    Fail,
+}
+
+/// A class as flat (lo, hi) pairs, with a bitmap for ASCII.
+pub struct Class {
+    r: Vec<u32>,
+    lo: u64,
+    hi: u64,
+}
+
+impl Class {
+    fn new(s: &CharSet) -> Class {
+        let mut c = Class { r: Vec::with_capacity(2 * s.r.len()), lo: 0, hi: 0 };
+        for p in s.r.iter() {
+            c.r.push(p.0);
+            c.r.push(p.1);
+            let mut x = p.0;
+            while x <= p.1 && x < 128 {
+                if x < 64 { c.lo = c.lo | (1u64 << (x as u64)); } else { c.hi = c.hi | (1u64 << ((x - 64) as u64)); }
+                x += 1;
+            }
+        }
+        c
+    }
+
+    pub fn contains(&self, c: u32) -> bool {
+        if c < 64 { return (self.lo >> (c as u64)) & 1 == 1; }
+        if c < 128 { return (self.hi >> ((c - 64) as u64)) & 1 == 1; }
+        let r = &self.r;
+        let mut lo = 0;
+        let mut hi = r.len() / 2;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if c < r[2 * mid] { hi = mid; } else if c > r[2 * mid + 1] { lo = mid + 1; } else { return true; }
+        }
+        false
+    }
+}
+
+pub struct Prog {
+    pub insts: Vec<Inst>,
+    pub classes: Vec<Class>,
+    pub start: usize,
+    /// Two slots for each capture group, group 0 included.
+    pub nslots: usize,
+    /// Every match starts at the start of the haystack.
+    pub anchored: bool,
+    /// Every match starts with these bytes.
+    pub prefix: Vec<u8>,
+    /// The pattern is exactly the prefix (no groups, no assertions).
+    pub literal: bool,
+    /// The bytes a match can start with (256 entries), if not all.
+    pub first: Vec<bool>,
+    /// \w, for Unicode word boundaries.
+    pub word: CharSet,
+    /// Approximate heap size in bytes.
+    pub size: usize,
+}
+
+struct Compiler {
+    insts: Vec<Inst>,
+    classes: Vec<Class>,
+    size: usize,
+    limit: usize,
+    has_word: bool,
+}
+
+const INST_SIZE: usize = 24;
+
+impl Compiler {
+    fn emit(&mut self, i: Inst) -> Result<usize, Error> {
+        self.size += INST_SIZE;
+        if self.size > self.limit { return Err(Error::CompiledTooBig(self.limit)); }
+        self.insts.push(i);
+        Ok(self.insts.len() - 1)
+    }
+
+    fn pc(&self) -> usize { self.insts.len() }
+
+    fn set(&mut self, at: usize, i: Inst) { self.insts[at] = i; }
+
+    fn class(&mut self, s: &CharSet) -> Result<(), Error> {
+        if s.is_empty() {
+            self.emit(Inst::Fail)?;
+        } else if s.is_all() {
+            self.emit(Inst::Any)?;
+        } else if s.r.len() == 2 && s.r[0] == (0, 9) && s.r[1] == (11, class::MAX_CHAR) {
+            self.emit(Inst::AnyNoNL)?;
+        } else if let Some(c) = s.single() {
+            self.emit(Inst::Char(c))?;
+        } else {
+            self.size += 8 * s.r.len();
+            self.classes.push(Class::new(s));
+            let k = self.classes.len() - 1;
+            self.emit(Inst::Class(k))?;
+        }
+        Ok(())
+    }
+
+    // Copies the instructions from..to (a fragment that falls through to
+    // to) to the end, moving its jumps along.
+    fn copy(&mut self, from: usize, to: usize) -> Result<(), Error> {
+        let d = self.pc() - from;
+        let mut i = from;
+        while i < to {
+            let inst = match self.insts[i].clone() {
+                Inst::Split(x, y) => Inst::Split(x + d, y + d),
+                Inst::Jmp(x) => Inst::Jmp(x + d),
+                other => other,
+            };
+            self.emit(inst)?;
+            i += 1;
+        }
+        Ok(())
+    }
+
+    // The body of a repetition: compiled the first time, copied after.
+    fn body(&mut self, h: &Hir, frag: &mut Option<(usize, usize)>) -> Result<(), Error> {
+        match *frag {
+            Some((from, to)) => self.copy(from, to),
+            None => {
+                let from = self.pc();
+                self.c(h)?;
+                *frag = Some((from, self.pc()));
+                Ok(())
+            }
+        }
+    }
+
+    fn split(&self, next: usize, out: usize, greedy: bool) -> Inst {
+        if greedy { Inst::Split(next, out) } else { Inst::Split(out, next) }
+    }
+
+    fn repeat(&mut self, h: &Hir, min: u32, max: u32, greedy: bool) -> Result<(), Error> {
+        let mut frag: Option<(usize, usize)> = None;
+        if max == INF {
+            if min == 0 && first_chars(h).1 {
+                // e* as (e+)? when e can match empty (as Rust and Go): an
+                // empty iteration still sets e's groups.
+                let s0 = self.emit(Inst::Fail)?;
+                let l = self.pc();
+                self.body(h, &mut frag)?;
+                let s1 = self.emit(Inst::Fail)?;
+                let i = self.split(l, s1 + 1, greedy);
+                self.set(s1, i);
+                let o = self.split(s0 + 1, self.pc(), greedy);
+                self.set(s0, o);
+                return Ok(());
+            }
+            if min == 0 {
+                let l = self.emit(Inst::Fail)?;
+                self.body(h, &mut frag)?;
+                self.emit(Inst::Jmp(l))?;
+                let s = self.split(l + 1, self.pc(), greedy);
+                self.set(l, s);
+                return Ok(());
+            }
+            let mut k = 1;
+            while k < min {
+                self.body(h, &mut frag)?;
+                k += 1;
+            }
+            let l = self.pc();
+            self.body(h, &mut frag)?;
+            let s = self.emit(Inst::Fail)?;
+            let i = self.split(l, s + 1, greedy);
+            self.set(s, i);
+            return Ok(());
+        }
+        let mut k = 0;
+        while k < min {
+            self.body(h, &mut frag)?;
+            k += 1;
+        }
+        let mut splits: Vec<usize> = Vec::new();
+        while k < max {
+            splits.push(self.emit(Inst::Fail)?);
+            self.body(h, &mut frag)?;
+            k += 1;
+        }
+        let end = self.pc();
+        for s in splits.iter() {
+            let i = self.split(*s + 1, end, greedy);
+            self.set(*s, i);
+        }
+        Ok(())
+    }
+
+    fn c(&mut self, h: &Hir) -> Result<(), Error> {
+        match h {
+            Hir::Empty => {}
+            Hir::Lit(c) => { self.emit(Inst::Char(*c))?; }
+            Hir::Class(s) => self.class(s)?,
+            Hir::Look(l) => {
+                match l {
+                    Look::Word(false) | Look::NotWord(false) | Look::WordStart(false) | Look::WordEnd(false)
+                    | Look::WordStartHalf(false) | Look::WordEndHalf(false) => self.has_word = true,
+                    _ => {}
+                }
+                self.emit(Inst::Look(l.clone()))?;
+            }
+            Hir::Capture(sub, i) => {
+                self.emit(Inst::Save(2 * *i))?;
+                self.c(*sub)?;
+                self.emit(Inst::Save(2 * *i + 1))?;
+            }
+            Hir::Concat(xs) => {
+                for x in xs.iter() { self.c(x)?; }
+            }
+            Hir::Alt(xs) => {
+                let mut jumps: Vec<usize> = Vec::new();
+                let n = xs.len();
+                let mut k = 0;
+                while k + 1 < n {
+                    let s = self.emit(Inst::Fail)?;
+                    self.c(&xs[k])?;
+                    jumps.push(self.emit(Inst::Fail)?);
+                    let next = self.pc();
+                    self.set(s, Inst::Split(s + 1, next));
+                    k += 1;
+                }
+                self.c(&xs[n - 1])?;
+                let end = self.pc();
+                for j in jumps.iter() { self.set(*j, Inst::Jmp(end)); }
+            }
+            Hir::Repeat(sub, min, max, greedy) => self.repeat(*sub, *min, *max, *greedy)?,
+        }
+        Ok(())
+    }
+}
+
+/// Compiles the patterns (one for a Regex, several for a RegexSet; ncap
+/// groups each, counting group 0) within limit bytes.
+pub fn compile(hirs: &Vec<Hir>, ncap: usize, limit: usize) -> Result<Prog, Error> {
+    let mut c = Compiler { insts: Vec::new(), classes: Vec::new(), size: 0, limit, has_word: false };
+    let n = hirs.len();
+    let mut jumps: Vec<usize> = Vec::new();
+    let mut k = 0;
+    while k < n {
+        let s = if k + 1 < n { c.emit(Inst::Fail)? } else { 0 };
+        c.emit(Inst::Save(0))?;
+        c.c(&hirs[k])?;
+        c.emit(Inst::Save(1))?;
+        c.emit(Inst::Match(k))?;
+        if k + 1 < n {
+            let next = c.pc();
+            c.set(s, Inst::Split(s + 1, next));
+        }
+        k += 1;
+    }
+    if n == 0 { c.emit(Inst::Fail)?; }
+    let mut prog = Prog {
+        insts: c.insts,
+        classes: c.classes,
+        start: 0,
+        nslots: 2 * ncap,
+        anchored: n > 0,
+        prefix: Vec::new(),
+        literal: false,
+        first: Vec::new(),
+        word: if c.has_word { class::word(true) } else { CharSet::new() },
+        size: c.size,
+    };
+    let mut first = CharSet::new();
+    let mut nullable = n == 0;
+    for h in hirs.iter() {
+        if !anchored(h) { prog.anchored = false; }
+        let (s, e) = first_chars(h);
+        first = first.unite(&s);
+        if e { nullable = true; }
+    }
+    if n == 1 {
+        let mut p = String::new();
+        let (_, exact) = literal_prefix(&hirs[0], &mut p);
+        prog.prefix.extend_from_slice(p.as_bytes());
+        prog.literal = exact && ncap == 1 && p.len() > 0;
+    }
+    if !nullable {
+        let b = lead_bytes(&first);
+        let mut all = true;
+        for x in b.iter() {
+            if !*x { all = false; }
+        }
+        if !all { prog.first = b; }
+    }
+    Ok(prog)
+}
+
+fn anchored(h: &Hir) -> bool {
+    match h {
+        Hir::Look(Look::Start) => true,
+        Hir::Capture(sub, _) => anchored(*sub),
+        Hir::Concat(xs) => xs.len() > 0 && anchored(&xs[0]),
+        Hir::Alt(xs) => {
+            for x in xs.iter() {
+                if !anchored(x) { return false; }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+// Appends the literal every match of h starts with; returns whether what
+// follows h can extend it, and whether h is exactly that literal.
+fn literal_prefix(h: &Hir, out: &mut String) -> (bool, bool) {
+    match h {
+        Hir::Empty => (true, true),
+        Hir::Lit(c) => {
+            out.push(char::from_u32(*c).unwrap());
+            (true, true)
+        }
+        Hir::Class(s) => match s.single() {
+            Some(c) => {
+                out.push(char::from_u32(c).unwrap());
+                (true, true)
+            }
+            None => (false, false),
+        },
+        Hir::Look(_) => (true, false),
+        Hir::Capture(sub, _) => {
+            let (open, _) = literal_prefix(*sub, out);
+            (open, false)
+        }
+        Hir::Concat(xs) => {
+            let mut exact = true;
+            for x in xs.iter() {
+                let (open, e) = literal_prefix(x, out);
+                if !open { return (false, false); }
+                if !e { exact = false; }
+            }
+            (true, exact)
+        }
+        Hir::Repeat(sub, min, _, _) => {
+            if *min > 0 { literal_prefix(*sub, out); }
+            (false, false)
+        }
+        Hir::Alt(_) => (false, false),
+    }
+}
+
+// The chars a match of h can start with, and whether h can match empty.
+fn first_chars(h: &Hir) -> (CharSet, bool) {
+    match h {
+        Hir::Empty | Hir::Look(_) => (CharSet::new(), true),
+        Hir::Lit(c) => (CharSet::range(*c, *c), false),
+        Hir::Class(s) => (s.clone(), false),
+        Hir::Capture(sub, _) => first_chars(*sub),
+        Hir::Concat(xs) => {
+            let mut acc = CharSet::new();
+            for x in xs.iter() {
+                let (s, e) = first_chars(x);
+                acc = acc.unite(&s);
+                if !e { return (acc, false); }
+            }
+            (acc, true)
+        }
+        Hir::Alt(xs) => {
+            let mut acc = CharSet::new();
+            let mut empty = false;
+            for x in xs.iter() {
+                let (s, e) = first_chars(x);
+                acc = acc.unite(&s);
+                if e { empty = true; }
+            }
+            (acc, empty)
+        }
+        Hir::Repeat(sub, min, _, _) => {
+            let (s, e) = first_chars(*sub);
+            (s, e || *min == 0)
+        }
+    }
+}
+
+// The first bytes of the UTF-8 encodings of the chars of s.
+fn lead_bytes(s: &CharSet) -> Vec<bool> {
+    let mut b: Vec<bool> = Vec::new();
+    b.resize(256, false);
+    for p in s.r.iter() {
+        let (lo, hi) = *p;
+        mark(&mut b, lo, hi, 0, 0x7F, 0, 0);
+        mark(&mut b, lo, hi, 0x80, 0x7FF, 6, 0xC0);
+        mark(&mut b, lo, hi, 0x800, 0xFFFF, 12, 0xE0);
+        mark(&mut b, lo, hi, 0x10000, class::MAX_CHAR, 18, 0xF0);
+    }
+    b
+}
+
+fn mark(b: &mut Vec<bool>, lo: u32, hi: u32, min: u32, max: u32, shift: u32, tag: u32) {
+    let a = if lo > min { lo } else { min };
+    let z = if hi < max { hi } else { max };
+    if a > z { return; }
+    let mut x = (a >> shift) | tag;
+    let end = (z >> shift) | tag;
+    while x <= end {
+        b[x as usize] = true;
+        x += 1;
+    }
+}

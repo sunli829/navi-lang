@@ -1,0 +1,399 @@
+//! Sets of chars as sorted ranges, and the named classes of the syntax
+//! (Perl classes, ASCII classes, Unicode categories, scripts and
+//! properties) with simple case folding.
+
+use super::unicode;
+
+pub const MAX_CHAR: u32 = 0x10FFFF;
+
+/// A set of chars: sorted, non-overlapping and non-adjacent inclusive
+/// ranges once canonical.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CharSet {
+    pub r: Vec<(u32, u32)>,
+}
+
+impl CharSet {
+    pub fn new() -> CharSet { CharSet { r: Vec::new() } }
+
+    pub fn range(lo: u32, hi: u32) -> CharSet {
+        let mut s = CharSet::new();
+        s.r.push((lo, hi));
+        s
+    }
+
+    pub fn all() -> CharSet { CharSet::range(0, MAX_CHAR) }
+
+    /// Adds a range; canonicalize() restores the invariants.
+    pub fn push(&mut self, lo: u32, hi: u32) { self.r.push((lo, hi)); }
+
+    pub fn is_empty(&self) -> bool { self.r.len() == 0 }
+
+    pub fn is_all(&self) -> bool { self.r.len() == 1 && self.r[0].0 == 0 && self.r[0].1 == MAX_CHAR }
+
+    /// The single char of a one-char set.
+    pub fn single(&self) -> Option<u32> {
+        if self.r.len() == 1 && self.r[0].0 == self.r[0].1 { Some(self.r[0].0) } else { None }
+    }
+
+    pub fn canonicalize(&mut self) {
+        let n = self.r.len();
+        if n < 2 { return; }
+        let mut sorted = true;
+        let mut i = 1;
+        while i < n {
+            if self.r[i].0 <= self.r[i - 1].1 + 1 { sorted = false; break; }
+            i += 1;
+        }
+        if sorted { return; }
+        self.r.sort_by(|a: &(u32, u32), b: &(u32, u32)| a.0.cmp(&b.0));
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(n);
+        for p in self.r.iter() {
+            let k = out.len();
+            if k > 0 && p.0 <= out[k - 1].1 + 1 {
+                if p.1 > out[k - 1].1 { out[k - 1].1 = p.1; }
+            } else {
+                out.push(*p);
+            }
+        }
+        self.r = out;
+    }
+
+    pub fn contains(&self, c: u32) -> bool {
+        let mut lo = 0;
+        let mut hi = self.r.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let p = self.r[mid];
+            if c < p.0 { hi = mid; } else if c > p.1 { lo = mid + 1; } else { return true; }
+        }
+        false
+    }
+
+    pub fn negate(&self) -> CharSet {
+        let mut out = CharSet::new();
+        let mut next = 0u32;
+        for p in self.r.iter() {
+            if p.0 > next { out.r.push((next, p.0 - 1)); }
+            next = p.1 + 1;
+        }
+        if next <= MAX_CHAR { out.r.push((next, MAX_CHAR)); }
+        out
+    }
+
+    pub fn unite(&self, other: &CharSet) -> CharSet {
+        let mut out = CharSet { r: self.r.clone() };
+        out.r.extend_from_slice(other.r.as_slice());
+        out.canonicalize();
+        out
+    }
+
+    pub fn intersect(&self, other: &CharSet) -> CharSet {
+        let mut out = CharSet::new();
+        let mut i = 0;
+        let mut j = 0;
+        while i < self.r.len() && j < other.r.len() {
+            let a = self.r[i];
+            let b = other.r[j];
+            let lo = if a.0 > b.0 { a.0 } else { b.0 };
+            let hi = if a.1 < b.1 { a.1 } else { b.1 };
+            if lo <= hi { out.r.push((lo, hi)); }
+            if a.1 < b.1 { i += 1; } else { j += 1; }
+        }
+        out
+    }
+
+    pub fn difference(&self, other: &CharSet) -> CharSet { self.intersect(&other.negate()) }
+
+    pub fn symmetric_difference(&self, other: &CharSet) -> CharSet {
+        self.unite(other).difference(&self.intersect(other))
+    }
+
+    /// Adds the case variants of every char (simple case folding; only
+    /// ASCII letters when unicode is false).
+    pub fn case_fold(&mut self, unicode: bool) {
+        let n = self.r.len();
+        let mut i = 0;
+        while i < n {
+            let (lo, hi) = self.r[i];
+            if unicode { fold_range(self, lo, hi); } else { fold_ascii(self, lo, hi); }
+            i += 1;
+        }
+        self.canonicalize();
+    }
+
+    /// Whether some char of the set is not ASCII.
+    pub fn has_non_ascii(&self) -> bool { self.r.len() > 0 && self.r[self.r.len() - 1].1 > 0x7F }
+}
+
+fn fold_ascii(s: &mut CharSet, lo: u32, hi: u32) {
+    let a = if lo > 0x41 { lo } else { 0x41 };
+    let b = if hi < 0x5A { hi } else { 0x5A };
+    if a <= b { s.push(a + 32, b + 32); }
+    let a = if lo > 0x61 { lo } else { 0x61 };
+    let b = if hi < 0x7A { hi } else { 0x7A };
+    if a <= b { s.push(a - 32, b - 32); }
+}
+
+// The FOLD runs are sorted by lo; at most two of them cover a char (they
+// interleave where upper and lower case letters alternate).
+fn fold_run(k: usize) -> (u32, u32, u32, i32) {
+    let t = &unicode::FOLD;
+    (t[4 * k] as u32, t[4 * k + 1] as u32, t[4 * k + 2] as u32, t[4 * k + 3])
+}
+
+fn fold_runs() -> usize { unicode::FOLD.len() / 4 }
+
+// The index of the last run whose lo <= c, or fold_runs() if none.
+fn last_run_at(c: u32) -> usize {
+    let mut lo = 0;
+    let mut hi = fold_runs();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fold_run(mid).0 <= c { lo = mid + 1; } else { hi = mid; }
+    }
+    if lo == 0 { fold_runs() } else { lo - 1 }
+}
+
+/// The next char of c's case orbit (c itself if it has no other case).
+pub fn fold_next(c: u32) -> u32 {
+    let k = last_run_at(c);
+    if k == fold_runs() { return c; }
+    let (lo, hi, stride, delta) = fold_run(k);
+    if c <= hi && (c - lo) % stride == 0 { return ((c as i32) + delta) as u32; }
+    if k > 0 {
+        let (lo, hi, stride, delta) = fold_run(k - 1);
+        if c <= hi && (c - lo) % stride == 0 { return ((c as i32) + delta) as u32; }
+    }
+    c
+}
+
+fn fold_range(s: &mut CharSet, lo: u32, hi: u32) {
+    let n = fold_runs();
+    let mut k = last_run_at(lo);
+    k = if k == n { 0 } else if k > 0 { k - 1 } else { 0 };
+    while k < n {
+        let (rlo, rhi, stride, _) = fold_run(k);
+        if rlo > hi { break; }
+        if rhi >= lo {
+            let mut c = if lo > rlo { lo + (stride - (lo - rlo) % stride) % stride } else { rlo };
+            while c <= rhi && c <= hi {
+                let mut f = fold_next(c);
+                while f != c {
+                    s.push(f, f);
+                    f = fold_next(f);
+                }
+                c += stride;
+            }
+        }
+        k += 1;
+    }
+}
+
+/// The case orbit of c (c and its other cases), as a set.
+pub fn fold_char(c: u32, unicode: bool) -> CharSet {
+    let mut s = CharSet::range(c, c);
+    s.case_fold(unicode);
+    s
+}
+
+// Ranges of a generated table whose index satisfies the mask (bit i set
+// for index i; indices are below 64) or equals one index.
+fn table_mask(t: &[u32], mask: u64) -> CharSet {
+    let mut s = CharSet::new();
+    let mut i = 0;
+    while i < t.len() {
+        let idx = t[i] >> 21;
+        if idx < 64 && (mask >> (idx as u64)) & 1 == 1 { s.push(t[i] & 0x1FFFFF, t[i + 1]); }
+        i += 2;
+    }
+    s.canonicalize();
+    s
+}
+
+fn table_index(t: &[u32], idx: u32) -> CharSet {
+    let mut s = CharSet::new();
+    let mut i = 0;
+    while i < t.len() {
+        if t[i] >> 21 == idx { s.push(t[i] & 0x1FFFFF, t[i + 1]); }
+        i += 2;
+    }
+    s.canonicalize();
+    s
+}
+
+fn cat_mask(names: &[&str]) -> u64 {
+    let mut m = 0u64;
+    for n in names {
+        let mut i = 0;
+        while i < unicode::CATEGORY_NAMES.len() {
+            if unicode::CATEGORY_NAMES[i] == *n { m = m | (1u64 << (i as u64)); }
+            i += 1;
+        }
+    }
+    m
+}
+
+fn categories(names: &[&str]) -> CharSet { table_mask(&unicode::CATEGORIES, cat_mask(names)) }
+
+fn prop(name: &str) -> CharSet {
+    let mut i = 0;
+    while i < unicode::PROP_NAMES.len() {
+        if unicode::PROP_NAMES[i] == name { return table_index(&unicode::PROPS, i as u32); }
+        i += 1;
+    }
+    CharSet::new()
+}
+
+/// \d: Unicode decimal digits, or 0-9.
+pub fn digit(unicode: bool) -> CharSet {
+    if unicode { categories(&["Nd"]) } else { CharSet::range(0x30, 0x39) }
+}
+
+/// \s: Unicode White_Space, or ASCII whitespace.
+pub fn space(unicode: bool) -> CharSet {
+    if unicode { return prop("White_Space"); }
+    let mut s = CharSet::range(0x09, 0x0D);
+    s.push(0x20, 0x20);
+    s
+}
+
+/// \w: Alphabetic, marks, decimal digits, connector punctuation and
+/// Join_Control (UTS #18 Annex C), or [0-9A-Za-z_].
+pub fn word(unicode: bool) -> CharSet {
+    if !unicode { return ascii_class("word").unwrap(); }
+    let mut s = alphabetic().unite(&categories(&["Mn", "Mc", "Me", "Nd", "Pc"]));
+    s = s.unite(&prop("Join_Control"));
+    s
+}
+
+fn alphabetic() -> CharSet { categories(&["Lu", "Ll", "Lt", "Lm", "Lo", "Nl"]).unite(&prop("Other_Alphabetic")) }
+
+/// [[:name:]] classes.
+pub fn ascii_class(name: &str) -> Option<CharSet> {
+    let mut s = CharSet::new();
+    match name {
+        "alnum" => { s.push(0x30, 0x39); s.push(0x41, 0x5A); s.push(0x61, 0x7A); }
+        "alpha" => { s.push(0x41, 0x5A); s.push(0x61, 0x7A); }
+        "ascii" => s.push(0, 0x7F),
+        "blank" => { s.push(0x09, 0x09); s.push(0x20, 0x20); }
+        "cntrl" => { s.push(0, 0x1F); s.push(0x7F, 0x7F); }
+        "digit" => s.push(0x30, 0x39),
+        "graph" => s.push(0x21, 0x7E),
+        "lower" => s.push(0x61, 0x7A),
+        "print" => s.push(0x20, 0x7E),
+        "punct" => { s.push(0x21, 0x2F); s.push(0x3A, 0x40); s.push(0x5B, 0x60); s.push(0x7B, 0x7E); }
+        "space" => { s.push(0x09, 0x0D); s.push(0x20, 0x20); }
+        "upper" => s.push(0x41, 0x5A),
+        "word" => { s.push(0x30, 0x39); s.push(0x41, 0x5A); s.push(0x5F, 0x5F); s.push(0x61, 0x7A); }
+        "xdigit" => { s.push(0x30, 0x39); s.push(0x41, 0x46); s.push(0x61, 0x66); }
+        _ => return None,
+    }
+    s.canonicalize();
+    Some(s)
+}
+
+// Property names compare ignoring case, spaces, '_' and '-' (UAX #44 LM3).
+fn loose(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c != ' ' && c != '_' && c != '-' { out.push(c.to_ascii_lowercase()); }
+    }
+    out
+}
+
+fn category_by_name(n: &str) -> Option<CharSet> {
+    let names: &[&str] = match n {
+        "l" | "letter" => &["Lu", "Ll", "Lt", "Lm", "Lo"],
+        "lc" | "casedletter" => &["Lu", "Ll", "Lt"],
+        "lu" | "uppercaseletter" => &["Lu"],
+        "ll" | "lowercaseletter" => &["Ll"],
+        "lt" | "titlecaseletter" => &["Lt"],
+        "lm" | "modifierletter" => &["Lm"],
+        "lo" | "otherletter" => &["Lo"],
+        "m" | "mark" | "combiningmark" => &["Mn", "Mc", "Me"],
+        "mn" | "nonspacingmark" => &["Mn"],
+        "mc" | "spacingmark" => &["Mc"],
+        "me" | "enclosingmark" => &["Me"],
+        "n" | "number" => &["Nd", "Nl", "No"],
+        "nd" | "decimalnumber" | "digit" => &["Nd"],
+        "nl" | "letternumber" => &["Nl"],
+        "no" | "othernumber" => &["No"],
+        "p" | "punctuation" | "punct" => &["Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po"],
+        "pc" | "connectorpunctuation" => &["Pc"],
+        "pd" | "dashpunctuation" => &["Pd"],
+        "ps" | "openpunctuation" => &["Ps"],
+        "pe" | "closepunctuation" => &["Pe"],
+        "pi" | "initialpunctuation" => &["Pi"],
+        "pf" | "finalpunctuation" => &["Pf"],
+        "po" | "otherpunctuation" => &["Po"],
+        "s" | "symbol" => &["Sm", "Sc", "Sk", "So"],
+        "sm" | "mathsymbol" => &["Sm"],
+        "sc" | "currencysymbol" => &["Sc"],
+        "sk" | "modifiersymbol" => &["Sk"],
+        "so" | "othersymbol" => &["So"],
+        "z" | "separator" => &["Zs", "Zl", "Zp"],
+        "zs" | "spaceseparator" => &["Zs"],
+        "zl" | "lineseparator" => &["Zl"],
+        "zp" | "paragraphseparator" => &["Zp"],
+        "cc" | "control" | "cntrl" => &["Cc"],
+        "cf" | "format" => &["Cf"],
+        "cs" | "surrogate" => &["Cs"],
+        "co" | "privateuse" => &["Co"],
+        "c" | "other" => {
+            let assigned = categories(&["Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No", "Pc", "Pd", "Ps",
+                "Pe", "Pi", "Pf", "Po", "Sm", "Sc", "Sk", "So", "Zs", "Zl", "Zp"]);
+            return Some(assigned.negate());
+        }
+        "cn" | "unassigned" => return Some(table_mask(&unicode::CATEGORIES, u64::MAX).negate()),
+        _ => return None,
+    };
+    Some(categories(names))
+}
+
+fn script_by_name(n: &str) -> Option<CharSet> {
+    let mut i = 0;
+    while i < unicode::SCRIPT_NAMES.len() {
+        if loose(unicode::SCRIPT_NAMES[i]).as_str() == n { return Some(table_index(&unicode::SCRIPTS, i as u32)); }
+        i += 1;
+    }
+    None
+}
+
+fn property_by_name(n: &str) -> Option<CharSet> {
+    match n {
+        "any" => Some(CharSet::all()),
+        "ascii" => Some(CharSet::range(0, 0x7F)),
+        "assigned" => Some(table_mask(&unicode::CATEGORIES, u64::MAX)),
+        "alphabetic" | "alpha" => Some(alphabetic()),
+        "whitespace" | "wspace" | "space" => Some(prop("White_Space")),
+        "lowercase" | "lower" => Some(categories(&["Ll"]).unite(&prop("Other_Lowercase"))),
+        "uppercase" | "upper" => Some(categories(&["Lu"]).unite(&prop("Other_Uppercase"))),
+        "joincontrol" | "joinc" => Some(prop("Join_Control")),
+        "word" | "perlword" => Some(word(true)),
+        _ => None,
+    }
+}
+
+/// The class of \p{name}: a general category, script or property, also
+/// written gc=..., sc=... (or with ':').
+pub fn unicode_class(name: &str) -> Option<CharSet> {
+    let (key, value) = match name.find('=') {
+        Some(i) => (loose(&name[0..i]), loose(&name[i + 1..])),
+        None => match name.find(':') {
+            Some(i) => (loose(&name[0..i]), loose(&name[i + 1..])),
+            None => (String::new(), loose(name)),
+        },
+    };
+    let v = value.as_str();
+    match key.as_str() {
+        "" => {
+            if let Some(s) = category_by_name(v) { return Some(s); }
+            if let Some(s) = property_by_name(v) { return Some(s); }
+            script_by_name(v)
+        }
+        "gc" | "generalcategory" => category_by_name(v),
+        "sc" | "script" | "scx" | "scriptextensions" => script_by_name(v),
+        _ => None,
+    }
+}

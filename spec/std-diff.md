@@ -182,3 +182,18 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | 未读完的请求体 | Go 读掉最多 256 KiB 后复用连接 | 相同 | — |
 | 路由 | Go 1.22 `ServeMux` 模式 | 支持 `[METHOD ][HOST]/path`、`{name}`、`{name...}`、`{$}`、末尾 `/` 的子树、404/405（带 `Allow`）、子树根补斜杠的 301；不做路径清理（`//`、`..`）的重定向；冲突检查只查完全相同的模式 | 简化 |
 | HTTP/2、代理、Cookie jar、压缩 | reqwest 有 | 没有 | 暂不需要 |
+
+### std::regex（regex crate）
+
+语法和语义同 regex crate（RE2：不支持反向引用和环视，匹配时间与输入长度成线性）。Unicode 表来自 Go 的 unicode 包（Unicode 15.0），由 `tools/genregex` 生成。
+
+| 项目 | regex crate | navi | 原因 |
+|---|---|---|---|
+| 用闭包计算替换文本 | `replace_all(text, \|caps\| ...)`（`Replacer` 对 `FnMut` 实现） | `replace_all_with(text, \|caps\| ...)`（还有 `replace_with`、`replacen_with`）；`Replacer` 只对 `&str`、`String`、`NoExpand` 实现 | 没有 `Fn` trait |
+| `replace` 等的返回值 | `Cow<str>` | `String` | 没有 `Cow` |
+| `&caps[i]`、`&caps["name"]` | `Index`，组不存在时 panic | `caps.at(i)`（组没参与匹配时是 `""`）；按名字用 `caps.name("n")` | 不能对返回 `str` 的 `Index` 做重载 |
+| `Match::range` | `Range<usize>` | 相同 | — |
+| `regex::bytes`、`Regex::captures_read`、`CaptureLocations`、`RegexSet` 的 `matches_read_at` | 有 | 没有 | 暂不需要 |
+| `\p{..}` | 全部 Unicode 属性 | 一般类别、文字（script）和 `Alphabetic`、`White_Space`、`Lowercase`、`Uppercase` 等少数属性 | 表的大小 |
+| 大小写折叠 | 简单折叠（simple case folding） | 相同 | — |
+| 性能 | 惰性 DFA、字面量优化 | 字面量前缀和首字节跳跃，之后是 Pike VM（求分组时短匹配用有界回溯）；没有 DFA，Pike VM 路径比 Go 的 regexp 慢一个数量级（navic 还不做内联） | 先保证正确 |
