@@ -1,0 +1,216 @@
+//! Random numbers, as Rust's rand crate (0.9 names, with the common 0.8
+//! names kept as aliases): generators (rand::rng(), StdRng, SmallRng,
+//! OsRng), the Rng methods to draw values, distributions and sequence
+//! functions. Differences from rand are listed in spec/std-diff.md.
+//!
+//!     use std::rand::{self, Rng, SeedableRng};
+//!     use std::rand::rngs::StdRng;
+//!     use std::rand::seq::{IndexedRandom, SliceRandom};
+//!
+//!     let x: f64 = rand::random();              // [0, 1)
+//!     let mut rng = rand::rng();                // seeded from the OS
+//!     let die = rng.random_range(1..=6);
+//!     let coin = rng.random_bool(0.5);
+//!     let mut bytes = [0u8; 16];
+//!     rng.fill(&mut bytes);
+//!
+//!     let mut r = StdRng::seed_from_u64(42);    // reproducible
+//!     let mut v = Vec::from([1, 2, 3, 4, 5]);
+//!     v.shuffle(&mut r);
+//!     let pick = v.choose(&mut r);
+//!
+//! Random values of a type come from the StandardUniform distribution
+//! (distr::StandardUniform: Distribution<T>): every integer type, f32 and
+//! f64 (in [0, 1)), bool, char, tuples of up to 6 and arrays of such
+//! types.
+
+mod core;
+mod os;
+pub mod rngs;
+pub mod distr;
+pub mod seq;
+
+pub use self::core::{RngCore, TryRngCore, CryptoRng, SeedableRng, OsError};
+pub use self::rngs::ThreadRng;
+
+use crate::rand::distr::{Distribution, DistIter, StandardUniform, Bernoulli};
+use crate::rand::distr::uniform::{SampleUniform, SampleRange, Error as UniformError};
+use crate::marker::PhantomData;
+
+/// rand 0.8's name of the distr module.
+pub mod distributions {
+    pub use crate::rand::distr::*;
+    pub use crate::rand::distr::uniform;
+}
+
+/// The ChaCha generators (rand_chacha).
+pub mod chacha {
+    pub use crate::rand::rngs::{ChaCha8Rng, ChaCha12Rng, ChaCha20Rng};
+}
+
+/// Everything usually needed: use std::rand::prelude::*.
+pub mod prelude {
+    pub use crate::rand::{Rng, RngCore, SeedableRng, CryptoRng};
+    pub use crate::rand::rngs::{StdRng, SmallRng, ThreadRng};
+    pub use crate::rand::distr::Distribution;
+    pub use crate::rand::seq::{IndexedRandom, IndexedMutRandom, SliceRandom, IteratorRandom};
+    pub use crate::rand::{random, rng, thread_rng};
+}
+
+/// The process's generator (see ThreadRng): fast, seeded from the
+/// operating system, cryptographically strong.
+pub fn rng() -> ThreadRng { ThreadRng }
+
+/// rand 0.8's name of rng().
+pub fn thread_rng() -> ThreadRng { ThreadRng }
+
+/// A random value of type T from rand::rng() (StandardUniform).
+///
+///     let x: u8 = rand::random();
+///     let (a, b) = rand::random::<(f64, bool)>();
+pub fn random<T>() -> T where StandardUniform: Distribution<T> {
+    let mut r = ThreadRng;
+    StandardUniform.sample(&mut r)
+}
+
+/// Endless random values of type T from rand::rng().
+pub fn random_iter<T>() -> RandomIter<ThreadRng, T> where StandardUniform: Distribution<T> {
+    RandomIter { rng: &mut ThreadRng, t: PhantomData }
+}
+
+/// A value of the range from rand::rng() (panics if it is empty).
+pub fn random_range<T: SampleUniform, Rg: SampleRange<T>>(range: Rg) -> T {
+    let mut r = ThreadRng;
+    r.random_range(range)
+}
+
+/// true with probability p from rand::rng() (panics unless 0 <= p <= 1).
+pub fn random_bool(p: f64) -> bool {
+    let mut r = ThreadRng;
+    r.random_bool(p)
+}
+
+/// true with probability numerator / denominator from rand::rng().
+pub fn random_ratio(numerator: u32, denominator: u32) -> bool {
+    let mut r = ThreadRng;
+    r.random_ratio(numerator, denominator)
+}
+
+/// Fills dest with random data from rand::rng().
+pub fn fill<T: Fill>(dest: &mut T) {
+    let mut r = ThreadRng;
+    Fill::fill(dest, &mut r);
+}
+
+/// The methods to draw values, for every RngCore.
+pub trait Rng: RngCore {
+    /// A random value of type T (StandardUniform: integers over all their
+    /// values, floats in [0, 1), ...).
+    fn random<T>(&mut self) -> T where StandardUniform: Distribution<T> { StandardUniform.sample(self) }
+
+    /// Endless random values of type T (the iterator borrows the
+    /// generator).
+    fn random_iter<T>(&mut self) -> RandomIter<Self, T> where StandardUniform: Distribution<T> { RandomIter { rng: self, t: PhantomData } }
+
+    /// A uniform value of low..high or low..=high (panics if the range is
+    /// empty; integers are unbiased).
+    ///
+    ///     let i = rng.random_range(0..v.len());
+    ///     let x = rng.random_range(-1.0..=1.0);
+    fn random_range<T: SampleUniform, Rg: SampleRange<T>>(&mut self, range: Rg) -> T {
+        if range.is_empty() { panic("cannot sample empty range"); }
+        match range.sample_single(self) {
+            Ok(v) => v,
+            Err(e) => panic(`random_range: ${e}`),
+        }
+    }
+
+    /// true with probability p (panics unless 0 <= p <= 1).
+    fn random_bool(&mut self, p: f64) -> bool {
+        match Bernoulli::new(p) {
+            Ok(d) => d.sample(self),
+            Err(_) => panic(`p=${p} is outside range [0.0, 1.0]`),
+        }
+    }
+
+    /// true with probability numerator / denominator (panics if the
+    /// denominator is 0 or below the numerator).
+    fn random_ratio(&mut self, numerator: u32, denominator: u32) -> bool {
+        match Bernoulli::from_ratio(numerator, denominator) {
+            Ok(d) => d.sample(self),
+            Err(_) => panic(`p=${numerator}/${denominator} is outside range [0, 1]`),
+        }
+    }
+
+    /// A value of the distribution.
+    fn sample<T, D: Distribution<T>>(&mut self, distr: D) -> T { distr.sample(self) }
+
+    /// Endless values of the distribution (the iterator borrows the
+    /// generator).
+    fn sample_iter<T, D: Distribution<T>>(&mut self, distr: D) -> DistIter<D, Self, T> { distr.sample_iter(self) }
+
+    /// Fills dest (a slice or array of integers) with random data.
+    fn fill<T: Fill>(&mut self, dest: &mut T) { Fill::fill(dest, self); }
+
+    /// rand 0.8's name of random.
+    fn gen<T>(&mut self) -> T where StandardUniform: Distribution<T> { StandardUniform.sample(self) }
+
+    /// rand 0.8's name of random_range.
+    fn gen_range<T: SampleUniform, Rg: SampleRange<T>>(&mut self, range: Rg) -> T { self.random_range(range) }
+
+    /// rand 0.8's name of random_bool.
+    fn gen_bool(&mut self, p: f64) -> bool { self.random_bool(p) }
+
+    /// rand 0.8's name of random_ratio.
+    fn gen_ratio(&mut self, numerator: u32, denominator: u32) -> bool { self.random_ratio(numerator, denominator) }
+}
+
+impl<R: RngCore> Rng for R {}
+
+/// The iterator of random_iter.
+pub struct RandomIter<R, T> {
+    rng: &mut R,
+    t: PhantomData<T>,
+}
+
+impl<R: RngCore, T> Iterator for RandomIter<R, T> where StandardUniform: Distribution<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> { Some(StandardUniform.sample(self.rng)) }
+}
+
+/// What Rng::fill fills: slices and arrays of integers (with the bytes of
+/// fill_bytes, little-endian).
+pub trait Fill {
+    fn fill<R: Rng>(&mut self, rng: &mut R);
+}
+
+impl Fill for [u8] {
+    fn fill<R: Rng>(&mut self, rng: &mut R) { rng.fill_bytes(self); }
+}
+
+// The elements' bytes (little-endian targets: the values are those of
+// rand's fill).
+fn fill_raw<T, R: Rng>(s: &mut [T], rng: &mut R) {
+    let n = s.len() * crate::mem::size_of::<T>();
+    rng.fill_bytes(crate::rt::slice_from_raw_mut(s.as_mut_ptr() as *mut u8, n));
+}
+
+impl Fill for [i8] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [u16] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [i16] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [u32] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [i32] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [u64] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [i64] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [u128] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [i128] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [usize] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+impl Fill for [isize] { fn fill<R: Rng>(&mut self, rng: &mut R) { fill_raw(self, rng); } }
+
+impl<T, const N: usize> Fill for [T; N] where [T]: Fill {
+    fn fill<R: Rng>(&mut self, rng: &mut R) { Fill::fill(self.as_mut_slice(), rng); }
+}
+
+impl<T> Fill for Vec<T> where [T]: Fill {
+    fn fill<R: Rng>(&mut self, rng: &mut R) { Fill::fill(self.as_mut_slice(), rng); }
+}

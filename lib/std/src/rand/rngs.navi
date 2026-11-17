@@ -1,0 +1,301 @@
+//! The generators (rand::rngs): ThreadRng (rand::rng()), StdRng
+//! (ChaCha12), SmallRng (Xoshiro256++), OsRng (the operating system), the
+//! ChaCha generators of rand_chacha and mock::StepRng.
+
+use crate::fmt::{self, Debug, Formatter};
+use crate::sync::{Mutex, LazyLock};
+use crate::rand::core::{RngCore, TryRngCore, CryptoRng, SeedableRng, OsError, ChaChaCore, Xoshiro256};
+
+// --- ThreadRng ---------------------------------------------------------------------
+
+/// The generator of rand::rng() and rand::random(): ChaCha12 seeded from
+/// the operating system and reseeded from it every 64 KiB of output.
+/// There is one for the whole process, shared by every thread under a
+/// lock (navi's threads are green): a ThreadRng is only a handle to it,
+/// cheap to create and to copy.
+#[derive(Clone, Default)]
+pub struct ThreadRng;
+
+struct ThreadState {
+    core: ChaChaCore,
+    // Bytes to give before reseeding.
+    left: i64,
+}
+
+const RESEED_AFTER: i64 = 65536;
+
+fn new_thread_state() -> Mutex<ThreadState> {
+    let mut seed = [0u8; 32];
+    match crate::rand::os::fill(&mut seed[..]) {
+        Ok(()) => {}
+        Err(e) => panic(`could not initialize ThreadRng: ${e}`),
+    }
+    Mutex::new(ThreadState { core: ChaChaCore::new(&seed, 12), left: RESEED_AFTER })
+}
+
+static THREAD_RNG: LazyLock<Mutex<ThreadState>> = LazyLock::new(new_thread_state);
+
+// The shared state, locked; n bytes are about to be taken.
+fn lock_thread_rng(n: i64) -> &mut ThreadState {
+    let m: &Mutex<ThreadState> = &*THREAD_RNG;
+    let s = m.lock();
+    s.left -= n;
+    if s.left < 0 {
+        // A failed reseed keeps the old key (as rand's ReseedingRng).
+        let mut seed = [0u8; 32];
+        if crate::rand::os::fill(&mut seed[..]).is_ok() { s.core = ChaChaCore::new(&seed, 12); }
+        s.left = RESEED_AFTER - n;
+    }
+    s
+}
+
+fn unlock_thread_rng() {
+    let m: &Mutex<ThreadState> = &*THREAD_RNG;
+    m.unlock();
+}
+
+impl RngCore for ThreadRng {
+    fn next_u32(&mut self) -> u32 {
+        let s = lock_thread_rng(4);
+        let v = s.core.next_u32();
+        unlock_thread_rng();
+        v
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let s = lock_thread_rng(8);
+        let v = s.core.next_u64();
+        unlock_thread_rng();
+        v
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let s = lock_thread_rng(dest.len() as i64);
+        s.core.fill_bytes(dest);
+        unlock_thread_rng();
+    }
+}
+
+impl CryptoRng for ThreadRng {}
+
+impl Debug for ThreadRng {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("ThreadRng { .. }") }
+}
+
+// --- StdRng ------------------------------------------------------------------------
+
+/// The standard generator: ChaCha12 (as rand's StdRng), cryptographically
+/// strong and deterministic for a seed (the values are those of rand's
+/// StdRng for the same seed).
+///
+///     let mut r = StdRng::seed_from_u64(42);
+#[derive(Clone)]
+pub struct StdRng {
+    core: ChaChaCore,
+}
+
+impl RngCore for StdRng {
+    fn next_u32(&mut self) -> u32 { self.core.next_u32() }
+    fn next_u64(&mut self) -> u64 { self.core.next_u64() }
+    fn fill_bytes(&mut self, dest: &mut [u8]) { self.core.fill_bytes(dest); }
+}
+
+impl SeedableRng for StdRng {
+    type Seed = [u8; 32];
+    fn from_seed(seed: [u8; 32]) -> StdRng { StdRng { core: ChaChaCore::new(&seed, 12) } }
+}
+
+impl CryptoRng for StdRng {}
+
+impl Debug for StdRng {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("StdRng { .. }") }
+}
+
+// --- SmallRng ----------------------------------------------------------------------
+
+/// A small, fast generator, not for cryptography: Xoshiro256++ (as rand's
+/// SmallRng on 64-bit targets; the same values for the same seed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmallRng {
+    x: Xoshiro256,
+}
+
+impl SmallRng {
+    /// A SmallRng seeded from rand::rng().
+    pub fn from_thread_rng() -> SmallRng {
+        let mut t = ThreadRng;
+        SmallRng::from_rng(&mut t)
+    }
+}
+
+impl RngCore for SmallRng {
+    fn next_u32(&mut self) -> u32 { self.x.next_u32() }
+    fn next_u64(&mut self) -> u64 { self.x.next_u64() }
+    fn fill_bytes(&mut self, dest: &mut [u8]) { self.x.fill_bytes(dest); }
+}
+
+impl SeedableRng for SmallRng {
+    type Seed = [u8; 32];
+    fn from_seed(seed: [u8; 32]) -> SmallRng { SmallRng { x: Xoshiro256::from_seed(&seed) } }
+    // SplitMix64, as rand_xoshiro.
+    fn seed_from_u64(state: u64) -> SmallRng { SmallRng { x: Xoshiro256::seed_from_u64(state) } }
+}
+
+// --- OsRng -------------------------------------------------------------------------
+
+/// The operating system's random source (getentropy on macOS, getrandom
+/// on Linux and Android, rand_s on Windows). Every call asks the OS: slow,
+/// use it to seed. As RngCore it panics if the OS fails; TryRngCore
+/// returns the error.
+#[derive(Clone, Debug, Default)]
+pub struct OsRng;
+
+impl TryRngCore for OsRng {
+    fn try_next_u32(&mut self) -> Result<u32, OsError> {
+        let mut b = [0u8; 4];
+        crate::rand::os::fill(&mut b[..])?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, OsError> {
+        let mut b = [0u8; 8];
+        crate::rand::os::fill(&mut b[..])?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), OsError> { crate::rand::os::fill(dest) }
+}
+
+impl RngCore for OsRng {
+    fn next_u32(&mut self) -> u32 {
+        match self.try_next_u32() { Ok(v) => v, Err(e) => panic(`OsRng failed: ${e}`) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        match self.try_next_u64() { Ok(v) => v, Err(e) => panic(`OsRng failed: ${e}`) }
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        match self.try_fill_bytes(dest) { Ok(()) => {} Err(e) => panic(`OsRng failed: ${e}`) }
+    }
+}
+
+impl CryptoRng for OsRng {}
+
+// --- ChaCha (rand_chacha) ----------------------------------------------------------
+
+/// ChaCha with 8 rounds (rand_chacha's ChaCha8Rng).
+#[derive(Clone)]
+pub struct ChaCha8Rng {
+    core: ChaChaCore,
+}
+
+/// ChaCha with 12 rounds (rand_chacha's ChaCha12Rng; StdRng).
+#[derive(Clone)]
+pub struct ChaCha12Rng {
+    core: ChaChaCore,
+}
+
+/// ChaCha with 20 rounds (rand_chacha's ChaCha20Rng).
+#[derive(Clone)]
+pub struct ChaCha20Rng {
+    core: ChaChaCore,
+}
+
+impl ChaCha8Rng {
+    pub fn get_seed(&self) -> [u8; 32] { self.core.seed() }
+    /// Selects one of 2^64 independent streams (a nonce; 0 by default).
+    pub fn set_stream(&mut self, stream: u64) { self.core.set_stream(stream); }
+    /// The position in the stream, in u32 words.
+    pub fn get_word_pos(&self) -> u128 { self.core.word_pos() }
+    pub fn set_word_pos(&mut self, pos: u128) { self.core.set_word_pos(pos); }
+}
+
+impl ChaCha12Rng {
+    pub fn get_seed(&self) -> [u8; 32] { self.core.seed() }
+    pub fn set_stream(&mut self, stream: u64) { self.core.set_stream(stream); }
+    pub fn get_word_pos(&self) -> u128 { self.core.word_pos() }
+    pub fn set_word_pos(&mut self, pos: u128) { self.core.set_word_pos(pos); }
+}
+
+impl ChaCha20Rng {
+    pub fn get_seed(&self) -> [u8; 32] { self.core.seed() }
+    pub fn set_stream(&mut self, stream: u64) { self.core.set_stream(stream); }
+    pub fn get_word_pos(&self) -> u128 { self.core.word_pos() }
+    pub fn set_word_pos(&mut self, pos: u128) { self.core.set_word_pos(pos); }
+}
+
+impl RngCore for ChaCha8Rng {
+    fn next_u32(&mut self) -> u32 { self.core.next_u32() }
+    fn next_u64(&mut self) -> u64 { self.core.next_u64() }
+    fn fill_bytes(&mut self, dest: &mut [u8]) { self.core.fill_bytes(dest); }
+}
+
+impl RngCore for ChaCha12Rng {
+    fn next_u32(&mut self) -> u32 { self.core.next_u32() }
+    fn next_u64(&mut self) -> u64 { self.core.next_u64() }
+    fn fill_bytes(&mut self, dest: &mut [u8]) { self.core.fill_bytes(dest); }
+}
+
+impl RngCore for ChaCha20Rng {
+    fn next_u32(&mut self) -> u32 { self.core.next_u32() }
+    fn next_u64(&mut self) -> u64 { self.core.next_u64() }
+    fn fill_bytes(&mut self, dest: &mut [u8]) { self.core.fill_bytes(dest); }
+}
+
+impl SeedableRng for ChaCha8Rng {
+    type Seed = [u8; 32];
+    fn from_seed(seed: [u8; 32]) -> ChaCha8Rng { ChaCha8Rng { core: ChaChaCore::new(&seed, 8) } }
+}
+
+impl SeedableRng for ChaCha12Rng {
+    type Seed = [u8; 32];
+    fn from_seed(seed: [u8; 32]) -> ChaCha12Rng { ChaCha12Rng { core: ChaChaCore::new(&seed, 12) } }
+}
+
+impl SeedableRng for ChaCha20Rng {
+    type Seed = [u8; 32];
+    fn from_seed(seed: [u8; 32]) -> ChaCha20Rng { ChaCha20Rng { core: ChaChaCore::new(&seed, 20) } }
+}
+
+impl CryptoRng for ChaCha8Rng {}
+impl CryptoRng for ChaCha12Rng {}
+impl CryptoRng for ChaCha20Rng {}
+
+impl Debug for ChaCha8Rng {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("ChaCha8Rng { .. }") }
+}
+
+impl Debug for ChaCha12Rng {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("ChaCha12Rng { .. }") }
+}
+
+impl Debug for ChaCha20Rng {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("ChaCha20Rng { .. }") }
+}
+
+/// Generators for tests.
+pub mod mock {
+    use crate::rand::core::{RngCore, fill_bytes_via_next};
+
+    /// Not random: initial, initial + increment, ... (rand 0.8's StepRng).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct StepRng {
+        v: u64,
+        a: u64,
+    }
+
+    impl StepRng {
+        pub fn new(initial: u64, increment: u64) -> StepRng { StepRng { v: initial, a: increment } }
+    }
+
+    impl RngCore for StepRng {
+        fn next_u32(&mut self) -> u32 { self.next_u64() as u32 }
+        fn next_u64(&mut self) -> u64 {
+            let r = self.v;
+            self.v = self.v.wrapping_add(self.a);
+            r
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) { fill_bytes_via_next(self, dest); }
+    }
+}

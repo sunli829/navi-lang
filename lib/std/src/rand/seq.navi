@@ -1,0 +1,218 @@
+//! Random choice and shuffling (rand::seq): IndexedRandom (choose,
+//! choose_multiple), IndexedMutRandom (choose_mut) and SliceRandom
+//! (shuffle, partial_shuffle) for slices, Vecs and arrays; IteratorRandom
+//! (choose, choose_stable, choose_multiple) for iterators.
+//!
+//!     use std::rand::seq::{IndexedRandom, SliceRandom};
+//!     let mut v = vec_of_cards();
+//!     v.shuffle(&mut rng);
+//!     let card = v.choose(&mut rng);
+
+use crate::rand::{Rng, RngCore};
+use crate::rand::distr::uniform::{gen_index, canon_u32};
+
+/// Choosing elements of a sequence.
+pub trait IndexedRandom {
+    type Output;
+
+    /// A uniformly chosen element (None if empty).
+    fn choose<R: Rng>(&self, rng: &mut R) -> Option<&Self::Output>;
+
+    /// amount distinct elements (all of them if there are fewer), in
+    /// random order.
+    fn choose_multiple<R: Rng>(&self, rng: &mut R, amount: usize) -> crate::vec::IntoIter<&Self::Output>;
+}
+
+/// Choosing an element to change.
+pub trait IndexedMutRandom: IndexedRandom {
+    fn choose_mut<R: Rng>(&mut self, rng: &mut R) -> Option<&mut Self::Output>;
+}
+
+/// Shuffling in place.
+pub trait SliceRandom: IndexedMutRandom {
+    /// A uniformly random permutation (Fisher-Yates).
+    fn shuffle<R: Rng>(&mut self, rng: &mut R);
+
+    /// Shuffles amount elements to the end: returns them (a uniform
+    /// sample of all the elements, in random order) and the rest.
+    fn partial_shuffle<R: Rng>(&mut self, rng: &mut R, amount: usize) -> (&mut [Self::Output], &mut [Self::Output]);
+}
+
+// amount distinct indices below n in random order (a partial
+// Fisher-Yates shuffle of 0..n).
+fn sample_indices<R: Rng>(rng: &mut R, n: usize, amount: usize) -> Vec<usize> {
+    let k = if amount < n { amount } else { n };
+    let mut idx: Vec<usize> = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        idx.push(i);
+        i += 1;
+    }
+    i = 0;
+    while i < k {
+        let j = i + gen_index(rng, n - i);
+        idx.swap(i, j);
+        i += 1;
+    }
+    idx.truncate(k);
+    idx
+}
+
+impl<T> IndexedRandom for [T] {
+    type Output = T;
+
+    fn choose<R: Rng>(&self, rng: &mut R) -> Option<&T> {
+        if self.len() == 0 { return None; }
+        let i = gen_index(rng, self.len());
+        Some(&self[i])
+    }
+
+    fn choose_multiple<R: Rng>(&self, rng: &mut R, amount: usize) -> crate::vec::IntoIter<&T> {
+        let idx = sample_indices(rng, self.len(), amount);
+        let mut out: Vec<&T> = Vec::with_capacity(idx.len());
+        for i in idx.iter() { out.push(&self[*i]); }
+        out.into_iter()
+    }
+}
+
+impl<T> IndexedMutRandom for [T] {
+    fn choose_mut<R: Rng>(&mut self, rng: &mut R) -> Option<&mut T> {
+        if self.len() == 0 { return None; }
+        let i = gen_index(rng, self.len());
+        Some(&mut self[i])
+    }
+}
+
+impl<T> SliceRandom for [T] {
+    fn shuffle<R: Rng>(&mut self, rng: &mut R) {
+        if self.len() <= 1 { return; }
+        self.partial_shuffle(rng, self.len());
+    }
+
+    fn partial_shuffle<R: Rng>(&mut self, rng: &mut R, amount: usize) -> (&mut [T], &mut [T]) {
+        let n = self.len();
+        let m = if amount < n { n - amount } else { 0 };
+        let mut i = m;
+        if n < 0xffffffff {
+            let mut ch = IncreasingUniform::new(m as u32);
+            while i < n {
+                let j = ch.next_index(rng);
+                self.swap(i, j);
+                i += 1;
+            }
+        } else {
+            while i < n {
+                let j = gen_index(rng, i + 1);
+                self.swap(i, j);
+                i += 1;
+            }
+        }
+        (&mut self[m..n], &mut self[0..m])
+    }
+}
+
+impl<T, const N: usize> IndexedRandom for [T; N] {
+    type Output = T;
+    fn choose<R: Rng>(&self, rng: &mut R) -> Option<&T> { self.as_slice().choose(rng) }
+    fn choose_multiple<R: Rng>(&self, rng: &mut R, amount: usize) -> crate::vec::IntoIter<&T> { self.as_slice().choose_multiple(rng, amount) }
+}
+
+impl<T, const N: usize> IndexedMutRandom for [T; N] {
+    fn choose_mut<R: Rng>(&mut self, rng: &mut R) -> Option<&mut T> { self.as_mut_slice().choose_mut(rng) }
+}
+
+impl<T, const N: usize> SliceRandom for [T; N] {
+    fn shuffle<R: Rng>(&mut self, rng: &mut R) { self.as_mut_slice().shuffle(rng); }
+    fn partial_shuffle<R: Rng>(&mut self, rng: &mut R, amount: usize) -> (&mut [T], &mut [T]) { self.as_mut_slice().partial_shuffle(rng, amount) }
+}
+
+/// Choosing from an iterator (consumes it).
+pub trait IteratorRandom: Iterator {
+    /// A uniformly chosen item (None if there is none); reservoir
+    /// sampling, one random number per item.
+    fn choose<R: Rng>(self, rng: &mut R) -> Option<Self::Item> {
+        let mut it = self;
+        let mut n: usize = 0;
+        let mut res: Option<Self::Item> = None;
+        while let Some(x) = it.next() {
+            n += 1;
+            if n == 1 || gen_index(rng, n) == 0 { res = Some(x); }
+        }
+        res
+    }
+
+    /// As choose (whose result does not depend on size hints here
+    /// either).
+    fn choose_stable<R: Rng>(self, rng: &mut R) -> Option<Self::Item> { self.choose(rng) }
+
+    /// amount distinct items (all of them if there are fewer), in no
+    /// particular order.
+    fn choose_multiple<R: Rng>(self, rng: &mut R, amount: usize) -> Vec<Self::Item> {
+        let mut it = self;
+        let mut res: Vec<Self::Item> = Vec::with_capacity(amount);
+        while res.len() < amount {
+            match it.next() {
+                Some(x) => res.push(x),
+                None => return res,
+            }
+        }
+        let mut i = amount;
+        while let Some(x) = it.next() {
+            i += 1;
+            let k = gen_index(rng, i);
+            if k < amount { res[k] = x; }
+        }
+        res
+    }
+}
+
+impl<I: Iterator> IteratorRandom for I {}
+
+// Indices below 1, 2, 3, ... in turn (as rand's): one u32 draw below
+// n (n+1) (n+2) ... serves several indices.
+struct IncreasingUniform {
+    n: u32,
+    chunk: u32,
+    chunk_remaining: u8,
+}
+
+impl IncreasingUniform {
+    fn new(n: u32) -> IncreasingUniform { IncreasingUniform { n, chunk: 0, chunk_remaining: if n == 0 { 1 } else { 0 } } }
+
+    // An index below n + 1.
+    fn next_index<R: RngCore>(&mut self, rng: &mut R) -> usize {
+        let next_n = self.n + 1;
+        let next_remaining = if self.chunk_remaining == 0 {
+            let (bound, remaining) = bound_u32(next_n);
+            self.chunk = canon_u32(rng, bound);
+            remaining - 1
+        } else {
+            self.chunk_remaining - 1
+        };
+        let r = if next_remaining == 0 {
+            self.chunk
+        } else {
+            let x = self.chunk % next_n;
+            self.chunk = self.chunk / next_n;
+            x
+        };
+        self.chunk_remaining = next_remaining;
+        self.n = next_n;
+        r as usize
+    }
+}
+
+// m (m+1) (m+2) ... while it fits a u32, and how many factors.
+fn bound_u32(m: u32) -> (u32, u8) {
+    let mut product = m;
+    let mut current = m + 1;
+    loop {
+        match product.checked_mul(current) {
+            Some(p) => {
+                product = p;
+                current += 1;
+            }
+            None => return (product, (current - m) as u8),
+        }
+    }
+}

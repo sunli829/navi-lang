@@ -1,0 +1,96 @@
+//! The operating system's random source: getentropy on macOS, the
+//! getrandom system call on Linux and Android (/dev/urandom on kernels
+//! without it), rand_s (RtlGenRandom) on Windows.
+
+use crate::rand::core::OsError;
+#[cfg(target_os = "linux")]
+use crate::io::Read;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getentropy(buf: *mut u8, n: usize) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn syscall(n: i64, ...) -> i64;
+}
+
+#[cfg(target_os = "windows")]
+extern "C" {
+    fn rand_s(v: *mut u32) -> i32;
+}
+
+/// Fills dest with random bytes from the operating system.
+#[cfg(target_os = "macos")]
+pub fn fill(dest: &mut [u8]) -> Result<(), OsError> {
+    // getentropy gives at most 256 bytes a call.
+    let mut i = 0;
+    while i < dest.len() {
+        let n = if dest.len() - i > 256 { 256 } else { dest.len() - i };
+        let r = unsafe { getentropy(dest.as_mut_ptr().add(i), n) };
+        if r != 0 { return Err(OsError::new(crate::sys::errno(), "getentropy failed")); }
+        i += n;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SYS_GETRANDOM: i64 = 318;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const SYS_GETRANDOM: i64 = 278;
+
+#[cfg(target_os = "linux")]
+const EINTR: i32 = 4;
+#[cfg(target_os = "linux")]
+const ENOSYS: i32 = 38;
+#[cfg(target_os = "linux")]
+const EPERM: i32 = 1;
+
+#[cfg(target_os = "linux")]
+pub fn fill(dest: &mut [u8]) -> Result<(), OsError> {
+    let mut i = 0;
+    while i < dest.len() {
+        let r = unsafe { syscall(SYS_GETRANDOM, dest.as_mut_ptr().add(i), (dest.len() - i) as i64, 0i64) };
+        if r < 0 {
+            let e = crate::sys::errno();
+            if e == EINTR { continue; }
+            // Kernels before 3.17 (or a seccomp filter): the device.
+            if e == ENOSYS || e == EPERM { return fill_urandom(&mut dest[i..]); }
+            return Err(OsError::new(e, "getrandom failed"));
+        }
+        i += r as usize;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn fill_urandom(dest: &mut [u8]) -> Result<(), OsError> {
+    let mut f = match crate::fs::File::open("/dev/urandom") {
+        Ok(f) => f,
+        Err(e) => return Err(OsError::new(e.raw_os_error().unwrap_or(0), "could not open /dev/urandom")),
+    };
+    let r = f.read_exact(dest);
+    f.close();
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => Err(OsError::new(e.raw_os_error().unwrap_or(0), "could not read /dev/urandom")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn fill(dest: &mut [u8]) -> Result<(), OsError> {
+    let mut i = 0;
+    while i < dest.len() {
+        let mut v: u32 = 0;
+        let r = unsafe { rand_s(&mut v as *mut u32) };
+        if r != 0 { return Err(OsError::new(r, "rand_s failed")); }
+        let mut k = 0;
+        while k < 4 && i < dest.len() {
+            dest[i] = (v >> (8 * k) as u32) as u8;
+            i += 1;
+            k += 1;
+        }
+    }
+    Ok(())
+}

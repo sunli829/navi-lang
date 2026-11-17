@@ -1,0 +1,360 @@
+//! The generator traits (rand_core's RngCore, TryRngCore, CryptoRng,
+//! SeedableRng) and the ChaCha and Xoshiro256++ cores.
+
+use crate::fmt::{self, Display, Debug, Formatter};
+
+/// The core of a random number generator: uniformly random u32s, u64s
+/// and bytes.
+pub trait RngCore {
+    fn next_u32(&mut self) -> u32;
+    fn next_u64(&mut self) -> u64;
+    fn fill_bytes(&mut self, dest: &mut [u8]);
+}
+
+/// A generator that may fail (OsRng).
+pub trait TryRngCore {
+    fn try_next_u32(&mut self) -> Result<u32, OsError>;
+    fn try_next_u64(&mut self) -> Result<u64, OsError>;
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), OsError>;
+}
+
+/// Marks generators fit for cryptography (StdRng, ThreadRng, OsRng).
+pub trait CryptoRng: RngCore {}
+
+/// Why the operating system's random source failed: the OS error code
+/// (0 when there is none) and a description.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OsError {
+    code: i32,
+    msg: &str,
+}
+
+impl OsError {
+    pub(crate) fn new(code: i32, msg: &str) -> OsError { OsError { code, msg } }
+    /// The OS error code (errno or the Windows error), if there is one.
+    pub fn raw_os_error(&self) -> Option<i32> { if self.code != 0 { Some(self.code) } else { None } }
+}
+
+impl Display for OsError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        if self.code != 0 { f.write_fmt(`${self.msg} (os error ${self.code})`) } else { f.write_str(self.msg) }
+    }
+}
+
+impl Debug for OsError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`OsError(${self})`) }
+}
+
+/// A generator created from a seed: the same seed gives the same values.
+pub trait SeedableRng {
+    /// The seed: a byte array ([u8; 32] for the generators here).
+    type Seed: Clone + Default + AsMut<[u8]>;
+
+    fn from_seed(seed: Self::Seed) -> Self;
+
+    /// A generator seeded from a u64 (expanded with PCG32, as rand_core;
+    /// a generator may do it its own way, as SmallRng does).
+    fn seed_from_u64(state: u64) -> Self {
+        let mut seed: Self::Seed = Default::default();
+        let mut s = state;
+        let b: &mut [u8] = seed.as_mut();
+        let mut i = 0;
+        while i + 4 <= b.len() {
+            let x = pcg32(&mut s);
+            b[i] = x as u8;
+            b[i + 1] = (x >> 8) as u8;
+            b[i + 2] = (x >> 16) as u8;
+            b[i + 3] = (x >> 24) as u8;
+            i += 4;
+        }
+        if i < b.len() {
+            let x = pcg32(&mut s);
+            let mut k = 0;
+            while i < b.len() {
+                b[i] = (x >> (8 * k) as u32) as u8;
+                i += 1;
+                k += 1;
+            }
+        }
+        Self::from_seed(seed)
+    }
+
+    /// A generator seeded from another one.
+    fn from_rng<R: RngCore>(rng: &mut R) -> Self {
+        let mut seed: Self::Seed = Default::default();
+        let b: &mut [u8] = seed.as_mut();
+        rng.fill_bytes(b);
+        Self::from_seed(seed)
+    }
+
+    /// A generator seeded from another one that may fail.
+    fn try_from_rng<R: TryRngCore>(rng: &mut R) -> Result<Self, OsError> {
+        let mut seed: Self::Seed = Default::default();
+        let b: &mut [u8] = seed.as_mut();
+        rng.try_fill_bytes(b)?;
+        Ok(Self::from_seed(seed))
+    }
+
+    /// A generator seeded from the operating system (panics if it fails).
+    fn from_os_rng() -> Self {
+        match Self::try_from_os_rng() {
+            Ok(r) => r,
+            Err(e) => panic(`from_os_rng failed: ${e}`),
+        }
+    }
+
+    fn try_from_os_rng() -> Result<Self, OsError> {
+        let mut seed: Self::Seed = Default::default();
+        let b: &mut [u8] = seed.as_mut();
+        crate::rand::os::fill(b)?;
+        Ok(Self::from_seed(seed))
+    }
+
+    /// rand 0.8's name of from_os_rng.
+    fn from_entropy() -> Self { Self::from_os_rng() }
+}
+
+fn pcg32(state: &mut u64) -> u32 {
+    let mul: u64 = 6364136223846793005;
+    let inc: u64 = 11634580027462260723;
+    *state = state.wrapping_mul(mul).wrapping_add(inc);
+    let s = *state;
+    let xorshifted = (((s >> 18) ^ s) >> 27) as u32;
+    let rot = (s >> 59) as u32;
+    xorshifted.rotate_right(rot)
+}
+
+/// Fills dest with next_u64 (8 bytes at a time, little-endian), the rest
+/// from one more next_u64 or next_u32 (as rand_core's
+/// fill_bytes_via_next).
+pub fn fill_bytes_via_next<R: RngCore>(rng: &mut R, dest: &mut [u8]) {
+    let n = dest.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = rng.next_u64();
+        let mut k = 0;
+        while k < 8 {
+            dest[i + k] = (x >> (8 * k) as u32) as u8;
+            k += 1;
+        }
+        i += 8;
+    }
+    let left = n - i;
+    if left > 4 {
+        let x = rng.next_u64();
+        let mut k = 0;
+        while i < n {
+            dest[i] = (x >> (8 * k) as u32) as u8;
+            i += 1;
+            k += 1;
+        }
+    } else if left > 0 {
+        let x = rng.next_u32();
+        let mut k = 0;
+        while i < n {
+            dest[i] = (x >> (8 * k) as u32) as u8;
+            i += 1;
+            k += 1;
+        }
+    }
+}
+
+// --- ChaCha ------------------------------------------------------------------------
+
+/// The ChaCha stream cipher as a generator (rand_chacha): the key is the
+/// seed, a 64-bit block counter and a 64-bit stream (0); the keystream is
+/// read as little-endian u32s, a block of 16 at a time.
+#[derive(Clone)]
+pub(crate) struct ChaChaCore {
+    key: [u32; 8],
+    counter: u64,
+    stream: u64,
+    rounds: u32,
+    buf: [u32; 16],
+    index: usize,
+}
+
+fn qr(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    x[a] = x[a].wrapping_add(x[b]);
+    x[d] = (x[d] ^ x[a]).rotate_left(16);
+    x[c] = x[c].wrapping_add(x[d]);
+    x[b] = (x[b] ^ x[c]).rotate_left(12);
+    x[a] = x[a].wrapping_add(x[b]);
+    x[d] = (x[d] ^ x[a]).rotate_left(8);
+    x[c] = x[c].wrapping_add(x[d]);
+    x[b] = (x[b] ^ x[c]).rotate_left(7);
+}
+
+impl ChaChaCore {
+    pub(crate) fn new(seed: &[u8; 32], rounds: u32) -> ChaChaCore {
+        let mut key = [0u32; 8];
+        let mut i = 0;
+        while i < 8 {
+            key[i] = seed[4 * i] as u32 | (seed[4 * i + 1] as u32) << 8 | (seed[4 * i + 2] as u32) << 16 | (seed[4 * i + 3] as u32) << 24;
+            i += 1;
+        }
+        ChaChaCore { key, counter: 0, stream: 0, rounds, buf: [0u32; 16], index: 16 }
+    }
+
+    pub(crate) fn seed(&self) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            s[i] = (self.key[i / 4] >> (8 * (i % 4)) as u32) as u8;
+            i += 1;
+        }
+        s
+    }
+
+    pub(crate) fn set_stream(&mut self, stream: u64) {
+        self.stream = stream;
+        if self.index < 16 {
+            // Regenerate the current block on the new stream.
+            self.counter = self.counter.wrapping_sub(1);
+            let i = self.index;
+            self.generate();
+            self.index = i;
+        }
+    }
+
+    /// The position in the stream, in u32 words.
+    pub(crate) fn word_pos(&self) -> u128 {
+        let blocks = if self.index < 16 { self.counter.wrapping_sub(1) } else { self.counter };
+        (blocks as u128) * 16 + (self.index % 16) as u128
+    }
+
+    pub(crate) fn set_word_pos(&mut self, pos: u128) {
+        self.counter = (pos / 16) as u64;
+        let i = (pos % 16) as usize;
+        self.generate();
+        self.index = i;
+    }
+
+    fn generate(&mut self) {
+        let mut x = [0u32; 16];
+        x[0] = 0x61707865;
+        x[1] = 0x3320646e;
+        x[2] = 0x79622d32;
+        x[3] = 0x6b206574;
+        let mut i = 0;
+        while i < 8 {
+            x[4 + i] = self.key[i];
+            i += 1;
+        }
+        x[12] = self.counter as u32;
+        x[13] = (self.counter >> 32) as u32;
+        x[14] = self.stream as u32;
+        x[15] = (self.stream >> 32) as u32;
+        let init = x;
+        let mut r = 0;
+        while r < self.rounds {
+            qr(&mut x, 0, 4, 8, 12);
+            qr(&mut x, 1, 5, 9, 13);
+            qr(&mut x, 2, 6, 10, 14);
+            qr(&mut x, 3, 7, 11, 15);
+            qr(&mut x, 0, 5, 10, 15);
+            qr(&mut x, 1, 6, 11, 12);
+            qr(&mut x, 2, 7, 8, 13);
+            qr(&mut x, 3, 4, 9, 14);
+            r += 2;
+        }
+        i = 0;
+        while i < 16 {
+            self.buf[i] = x[i].wrapping_add(init[i]);
+            i += 1;
+        }
+        self.counter = self.counter.wrapping_add(1);
+        self.index = 0;
+    }
+}
+
+impl RngCore for ChaChaCore {
+    fn next_u32(&mut self) -> u32 {
+        if self.index >= 16 { self.generate(); }
+        let v = self.buf[self.index];
+        self.index += 1;
+        v
+    }
+
+    // Two words, low first (a u64 may straddle two blocks), as rand_core's
+    // BlockRng.
+    fn next_u64(&mut self) -> u64 {
+        let lo = self.next_u32() as u64;
+        let hi = self.next_u32() as u64;
+        hi << 32 | lo
+    }
+
+    // Whole words: the bytes left of the last one are dropped.
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let n = dest.len();
+        let mut i = 0;
+        while i < n {
+            let w = self.next_u32();
+            let mut k = 0;
+            while k < 4 && i < n {
+                dest[i] = (w >> (8 * k) as u32) as u8;
+                i += 1;
+                k += 1;
+            }
+        }
+    }
+}
+
+// --- Xoshiro256++ ------------------------------------------------------------------
+
+/// xoshiro256++ (Blackman and Vigna), as rand_xoshiro.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Xoshiro256 {
+    s: [u64; 4],
+}
+
+impl Xoshiro256 {
+    pub(crate) fn from_seed(seed: &[u8; 32]) -> Xoshiro256 {
+        let mut s = [0u64; 4];
+        let mut zero = true;
+        let mut i = 0;
+        while i < 32 {
+            s[i / 8] = s[i / 8] | (seed[i] as u64) << (8 * (i % 8)) as u32;
+            if seed[i] != 0 { zero = false; }
+            i += 1;
+        }
+        // An all-zero state would only give zeros.
+        if zero { return Xoshiro256::seed_from_u64(0); }
+        Xoshiro256 { s }
+    }
+
+    /// SplitMix64 expands the u64 (as rand_xoshiro).
+    pub(crate) fn seed_from_u64(state: u64) -> Xoshiro256 {
+        let mut s = [0u64; 4];
+        let mut st = state;
+        let mut i = 0;
+        while i < 4 {
+            st = st.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = st;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            s[i] = z ^ (z >> 31);
+            i += 1;
+        }
+        Xoshiro256 { s }
+    }
+}
+
+impl RngCore for Xoshiro256 {
+    // The upper bits (the lowest have linear dependencies).
+    fn next_u32(&mut self) -> u32 { (self.next_u64() >> 32) as u32 }
+
+    fn next_u64(&mut self) -> u64 {
+        let r = self.s[0].wrapping_add(self.s[3]).rotate_left(23).wrapping_add(self.s[0]);
+        let t = self.s[1] << 17;
+        self.s[2] = self.s[2] ^ self.s[0];
+        self.s[3] = self.s[3] ^ self.s[1];
+        self.s[1] = self.s[1] ^ self.s[2];
+        self.s[0] = self.s[0] ^ self.s[3];
+        self.s[2] = self.s[2] ^ t;
+        self.s[3] = self.s[3].rotate_left(45);
+        r
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) { fill_bytes_via_next(self, dest); }
+}

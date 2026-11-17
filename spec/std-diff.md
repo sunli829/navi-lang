@@ -197,3 +197,17 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | `\p{..}` | 全部 Unicode 属性 | 一般类别、文字（script）和 `Alphabetic`、`White_Space`、`Lowercase`、`Uppercase` 等少数属性 | 表的大小 |
 | 大小写折叠 | 简单折叠（simple case folding） | 相同 | — |
 | 性能 | 惰性 DFA、字面量优化 | 字面量前缀和首字节跳跃，之后是 Pike VM（求分组时短匹配用有界回溯）；没有 DFA，Pike VM 路径比 Go 的 regexp 慢一个数量级（navic 还不做内联） | 先保证正确 |
+
+### std::rand（rand crate 0.9）
+
+同一个种子得到的值和 rand 0.9 相同（`StdRng` 是 ChaCha12，`SmallRng` 是 Xoshiro256++；`random_range`、`Uniform`、`shuffle`、`choose`、`WeightedIndex` 等的抽取方式都照 0.9），已经用 crate 核对过。0.8 的名字（`thread_rng`、`gen`、`gen_range`、`gen_bool`）保留为别名。
+
+| 项目 | rand | navi | 原因 |
+|---|---|---|---|
+| `rand::rng()`（`ThreadRng`） | 每个线程一个生成器 | 整个进程共享一个 ChaCha12，加锁使用；每 64 KiB 输出从操作系统重新取种子 | 绿色线程很多，线程局部的生成器不划算 |
+| `OsRng` 的来源 | `getrandom` crate | macOS `getentropy`；Linux/Android `getrandom` 系统调用（不可用时读 `/dev/urandom`）；Windows `rand_s` | — |
+| `StandardUniform` 的元组 | 最多 12 个元素 | 最多 6 个 | 先做常用的 |
+| `IteratorRandom::choose`、`choose_multiple`，`IndexedRandom::choose_multiple` | 有 | 有，分布相同，但抽取顺序和 crate 不同（同一个种子的结果不同） | 简化 |
+| `WeightedIndex::new` | 参数是元素可 `Borrow<X>` 的迭代器 | 元素就是 `X` 的迭代器（传数组或 `Vec`，不能传 `&[X]`） | 没有 `Borrow` |
+| `Distribution::map`、`sample_iter` | 闭包是 `FnMut` | `fn(T) -> U` | 闭包类型 |
+| `rand::distr` 的其他分布（`Slice`、`WeightedAliasIndex`、rand_distr 里的正态分布等） | 有 | 没有 | 暂不需要 |

@@ -1,0 +1,463 @@
+//! Uniform sampling from a range (rand::distr::uniform): Uniform, the
+//! SampleUniform types (integers, floats, char) and SampleRange (a..b and
+//! a..=b, as Rng::random_range takes).
+//!
+//! The draws are rand 0.9's (the same values for the same seed): see the
+//! integer and float sections.
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::ops::{Range, RangeInclusive};
+use crate::rand::{Rng, RngCore};
+use crate::rand::distr::Distribution;
+
+/// Why a range cannot be sampled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// low > high, or low == high for a half-open range.
+    EmptyRange,
+    /// A float bound (or high - low) is not finite.
+    NonFinite,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Error::EmptyRange => f.write_str("low > high (or equal if exclusive) in uniform distribution"),
+            Error::NonFinite => f.write_str("Non-finite range in uniform distribution"),
+        }
+    }
+}
+
+/// A type Uniform and random_range can sample.
+pub trait SampleUniform: Clone + PartialOrd {
+    /// Ok if low..high (low..=high when inclusive) can be sampled.
+    fn check_range(low: &Self, high: &Self, inclusive: bool) -> Result<(), Error> {
+        if inclusive { if low <= high { Ok(()) } else { Err(Error::EmptyRange) } } else if low < high { Ok(()) } else { Err(Error::EmptyRange) }
+    }
+
+    /// A value of low..high (low..=high when inclusive), a range
+    /// check_range accepts.
+    fn sample_checked<R: Rng>(low: &Self, high: &Self, inclusive: bool, rng: &mut R) -> Self;
+
+    /// The same for Uniform::sample (rand's UniformSampler::sample, which
+    /// for integers and floats draws differently from random_range).
+    fn sample_uniform<R: Rng>(low: &Self, high: &Self, inclusive: bool, rng: &mut R) -> Self { Self::sample_checked(low, high, inclusive, rng) }
+
+    /// A value of low..high.
+    fn sample_single<R: Rng>(low: Self, high: Self, rng: &mut R) -> Result<Self, Error> {
+        Self::check_range(&low, &high, false)?;
+        Ok(Self::sample_checked(&low, &high, false, rng))
+    }
+
+    /// A value of low..=high.
+    fn sample_single_inclusive<R: Rng>(low: Self, high: Self, rng: &mut R) -> Result<Self, Error> {
+        Self::check_range(&low, &high, true)?;
+        Ok(Self::sample_checked(&low, &high, true, rng))
+    }
+}
+
+/// A range random_range can sample: a..b or a..=b.
+pub trait SampleRange<T> {
+    fn sample_single<R: Rng>(self, rng: &mut R) -> Result<T, Error>;
+    fn is_empty(&self) -> bool;
+}
+
+impl<T: SampleUniform> SampleRange<T> for Range<T> {
+    fn sample_single<R: Rng>(self, rng: &mut R) -> Result<T, Error> { T::sample_single(self.start, self.end, rng) }
+    fn is_empty(&self) -> bool { !(self.start < self.end) }
+}
+
+impl<T: SampleUniform> SampleRange<T> for RangeInclusive<T> {
+    fn sample_single<R: Rng>(self, rng: &mut R) -> Result<T, Error> { T::sample_single_inclusive(self.start, self.end, rng) }
+    fn is_empty(&self) -> bool { !(self.start <= self.end) }
+}
+
+/// Values uniformly distributed over a range.
+///
+///     let die = Uniform::new_inclusive(1, 6).unwrap();
+///     let n: i32 = die.sample(&mut rng);
+#[derive(Clone, Debug, PartialEq)]
+pub struct Uniform<X> {
+    low: X,
+    high: X,
+    inclusive: bool,
+}
+
+impl<X: SampleUniform> Uniform<X> {
+    /// low..high.
+    pub fn new(low: X, high: X) -> Result<Uniform<X>, Error> {
+        X::check_range(&low, &high, false)?;
+        Ok(Uniform { low, high, inclusive: false })
+    }
+
+    /// low..=high.
+    pub fn new_inclusive(low: X, high: X) -> Result<Uniform<X>, Error> {
+        X::check_range(&low, &high, true)?;
+        Ok(Uniform { low, high, inclusive: true })
+    }
+}
+
+impl<X: SampleUniform> Distribution<X> for Uniform<X> {
+    fn sample<R: Rng>(&self, rng: &mut R) -> X { X::sample_uniform(&self.low, &self.high, self.inclusive, rng) }
+}
+
+impl<X: SampleUniform> TryFrom<Range<X>> for Uniform<X> {
+    type Error = Error;
+    fn try_from(r: Range<X>) -> Result<Uniform<X>, Error> { Uniform::new(r.start, r.end) }
+}
+
+impl<X: SampleUniform> TryFrom<RangeInclusive<X>> for Uniform<X> {
+    type Error = Error;
+    fn try_from(r: RangeInclusive<X>) -> Result<Uniform<X>, Error> { Uniform::new_inclusive(r.start, r.end) }
+}
+
+// --- Integers ----------------------------------------------------------------------
+//
+// As rand 0.9: random_range draws with Canon's method (one widening
+// multiply, a second one when the first could be biased: slightly biased,
+// never rejects); Uniform::sample with Lemire's rejection. 8- to 32-bit
+// types draw u32s, 64-bit ones u64s, 128-bit ones two u64s.
+
+pub(crate) fn canon_u32<R: RngCore>(rng: &mut R, range: u32) -> u32 {
+    let t = rng.next_u32() as u64 * range as u64;
+    let mut r = (t >> 32) as u32;
+    let lo = t as u32;
+    if lo > range.wrapping_neg() {
+        let hi2 = ((rng.next_u32() as u64 * range as u64) >> 32) as u32;
+        if lo.checked_add(hi2).is_none() { r += 1; }
+    }
+    r
+}
+
+fn lemire_u32<R: RngCore>(rng: &mut R, range: u32) -> u32 {
+    let thresh = range.wrapping_neg() % range;
+    loop {
+        let t = rng.next_u32() as u64 * range as u64;
+        if (t as u32) >= thresh { return (t >> 32) as u32; }
+    }
+}
+
+fn canon_u64<R: RngCore>(rng: &mut R, range: u64) -> u64 {
+    let t = rng.next_u64() as u128 * range as u128;
+    let mut r = (t >> 64) as u64;
+    let lo = t as u64;
+    if lo > range.wrapping_neg() {
+        let hi2 = ((rng.next_u64() as u128 * range as u128) >> 64) as u64;
+        if lo.checked_add(hi2).is_none() { r += 1; }
+    }
+    r
+}
+
+fn lemire_u64<R: RngCore>(rng: &mut R, range: u64) -> u64 {
+    let thresh = range.wrapping_neg() % range;
+    loop {
+        let t = rng.next_u64() as u128 * range as u128;
+        if (t as u64) >= thresh { return (t >> 64) as u64; }
+    }
+}
+
+fn canon_u128<R: RngCore>(rng: &mut R, range: u128) -> u128 {
+    let (mut r, lo) = wmul128(random_u128(rng), range);
+    if lo > range.wrapping_neg() {
+        let (hi2, _) = wmul128(random_u128(rng), range);
+        if lo.checked_add(hi2).is_none() { r += 1; }
+    }
+    r
+}
+
+fn lemire_u128<R: RngCore>(rng: &mut R, range: u128) -> u128 {
+    let thresh = range.wrapping_neg() % range;
+    loop {
+        let (hi, lo) = wmul128(random_u128(rng), range);
+        if lo >= thresh { return hi; }
+    }
+}
+
+pub(crate) fn random_u128<R: RngCore>(rng: &mut R) -> u128 {
+    let x = rng.next_u64() as u128;
+    let y = rng.next_u64() as u128;
+    (y << 64) | x
+}
+
+// a * b as (high, low) 128-bit halves.
+fn wmul128(a: u128, b: u128) -> (u128, u128) {
+    let m: u128 = 0xffffffffffffffff;
+    let (a1, a0) = (a >> 64, a & m);
+    let (b1, b0) = (b >> 64, b & m);
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = (p00 >> 64) + (p01 & m) + (p10 & m);
+    let lo = (p00 & m) | (mid << 64);
+    let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
+    (hi, lo)
+}
+
+/// A uniform index below n (> 0), as rand's random_range(..n) on usize: a
+/// u32 draw when n fits one.
+pub(crate) fn gen_index<R: RngCore>(rng: &mut R, n: usize) -> usize {
+    if n > 0xffffffff { canon_u64(rng, n as u64) as usize } else { canon_u32(rng, n as u32) as usize }
+}
+
+// --- Floats ------------------------------------------------------------------------
+
+// A uniform f64 in [0, 1) with 52 random bits (a value of [1, 2) minus 1).
+fn f64_0_1<R: RngCore>(rng: &mut R) -> f64 { f64::from_bits((rng.next_u64() >> 12) | 0x3ff0000000000000) - 1.0 }
+fn f32_0_1<R: RngCore>(rng: &mut R) -> f32 { f32::from_bits((rng.next_u32() >> 9) | 0x3f800000) - 1.0 }
+
+impl SampleUniform for f64 {
+    fn check_range(low: &f64, high: &f64, inclusive: bool) -> Result<(), Error> {
+        if !low.is_finite() || !high.is_finite() { return Err(Error::NonFinite); }
+        if inclusive { if !(*low <= *high) { return Err(Error::EmptyRange); } } else if !(*low < *high) { return Err(Error::EmptyRange); }
+        if !(*high - *low).is_finite() { return Err(Error::NonFinite); }
+        Ok(())
+    }
+
+    // random_range: low + u * (high - low), as rand's sample_single.
+    fn sample_checked<R: Rng>(low: &f64, high: &f64, inclusive: bool, rng: &mut R) -> f64 { f64_0_1(rng) * (*high - *low) + *low }
+
+    // Uniform: the scale adjusted so the result stays in the range.
+    fn sample_uniform<R: Rng>(low: &f64, high: &f64, inclusive: bool, rng: &mut R) -> f64 {
+        let max_rand = 1.0 - f64::EPSILON;
+        let mut scale = if inclusive { (*high - *low) / max_rand } else { *high - *low };
+        // The largest u must give at most high (inclusive) or less.
+        loop {
+            let top = scale * max_rand + *low;
+            if (inclusive && top <= *high) || (!inclusive && top < *high) || scale <= 0.0 { break; }
+            scale = f64::from_bits(scale.to_bits() - 1);
+        }
+        f64_0_1(rng) * scale + *low
+    }
+}
+
+impl SampleUniform for f32 {
+    fn check_range(low: &f32, high: &f32, inclusive: bool) -> Result<(), Error> {
+        if !low.is_finite() || !high.is_finite() { return Err(Error::NonFinite); }
+        if inclusive { if !(*low <= *high) { return Err(Error::EmptyRange); } } else if !(*low < *high) { return Err(Error::EmptyRange); }
+        if !(*high - *low).is_finite() { return Err(Error::NonFinite); }
+        Ok(())
+    }
+
+    // random_range: low + u * (high - low), as rand's sample_single.
+    fn sample_checked<R: Rng>(low: &f32, high: &f32, inclusive: bool, rng: &mut R) -> f32 { f32_0_1(rng) * (*high - *low) + *low }
+
+    // Uniform: the scale adjusted so the result stays in the range.
+    fn sample_uniform<R: Rng>(low: &f32, high: &f32, inclusive: bool, rng: &mut R) -> f32 {
+        let max_rand = 1.0f32 - f32::EPSILON;
+        let mut scale = if inclusive { (*high - *low) / max_rand } else { *high - *low };
+        loop {
+            let top = scale * max_rand + *low;
+            if (inclusive && top <= *high) || (!inclusive && top < *high) || scale <= 0.0 { break; }
+            scale = f32::from_bits(scale.to_bits() - 1);
+        }
+        f32_0_1(rng) * scale + *low
+    }
+}
+
+// --- char --------------------------------------------------------------------------
+
+// chars as u32s without the surrogate gap.
+fn char_to_index(c: char) -> u32 { let n = c as u32; if n >= 0xe000 { n - 0x800 } else { n } }
+fn index_to_char(n: u32) -> char { let m = if n >= 0xd800 { n + 0x800 } else { n }; char::from_u32(m).unwrap() }
+
+impl SampleUniform for char {
+    fn sample_checked<R: Rng>(low: &char, high: &char, inclusive: bool, rng: &mut R) -> char {
+        let lo = char_to_index(*low);
+        let hi = char_to_index(*high);
+        index_to_char(u32::sample_uniform(&lo, &hi, inclusive, rng))
+    }
+}
+
+// --- The integer types -----------------------------------------------------------
+
+impl SampleUniform for u8 {
+    fn sample_checked<R: Rng>(low: &u8, high: &u8, inclusive: bool, rng: &mut R) -> u8 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u8 as u32;
+        if range == 0 { return rng.next_u32() as u8; }
+        low.wrapping_add(canon_u32(rng, range) as u8)
+    }
+
+    fn sample_uniform<R: Rng>(low: &u8, high: &u8, inclusive: bool, rng: &mut R) -> u8 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u8 as u32;
+        if range == 0 { return rng.next_u32() as u8; }
+        low.wrapping_add(lemire_u32(rng, range) as u8)
+    }
+}
+
+impl SampleUniform for u16 {
+    fn sample_checked<R: Rng>(low: &u16, high: &u16, inclusive: bool, rng: &mut R) -> u16 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u16 as u32;
+        if range == 0 { return rng.next_u32() as u16; }
+        low.wrapping_add(canon_u32(rng, range) as u16)
+    }
+
+    fn sample_uniform<R: Rng>(low: &u16, high: &u16, inclusive: bool, rng: &mut R) -> u16 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u16 as u32;
+        if range == 0 { return rng.next_u32() as u16; }
+        low.wrapping_add(lemire_u32(rng, range) as u16)
+    }
+}
+
+impl SampleUniform for u32 {
+    fn sample_checked<R: Rng>(low: &u32, high: &u32, inclusive: bool, rng: &mut R) -> u32 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u32 as u32;
+        if range == 0 { return rng.next_u32() as u32; }
+        low.wrapping_add(canon_u32(rng, range) as u32)
+    }
+
+    fn sample_uniform<R: Rng>(low: &u32, high: &u32, inclusive: bool, rng: &mut R) -> u32 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u32 as u32;
+        if range == 0 { return rng.next_u32() as u32; }
+        low.wrapping_add(lemire_u32(rng, range) as u32)
+    }
+}
+
+impl SampleUniform for u64 {
+    fn sample_checked<R: Rng>(low: &u64, high: &u64, inclusive: bool, rng: &mut R) -> u64 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u64 as u64;
+        if range == 0 { return rng.next_u64() as u64; }
+        low.wrapping_add(canon_u64(rng, range) as u64)
+    }
+
+    fn sample_uniform<R: Rng>(low: &u64, high: &u64, inclusive: bool, rng: &mut R) -> u64 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u64 as u64;
+        if range == 0 { return rng.next_u64() as u64; }
+        low.wrapping_add(lemire_u64(rng, range) as u64)
+    }
+}
+
+impl SampleUniform for u128 {
+    fn sample_checked<R: Rng>(low: &u128, high: &u128, inclusive: bool, rng: &mut R) -> u128 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u128 as u128;
+        if range == 0 { return random_u128(rng) as u128; }
+        low.wrapping_add(canon_u128(rng, range) as u128)
+    }
+
+    fn sample_uniform<R: Rng>(low: &u128, high: &u128, inclusive: bool, rng: &mut R) -> u128 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u128 as u128;
+        if range == 0 { return random_u128(rng) as u128; }
+        low.wrapping_add(lemire_u128(rng, range) as u128)
+    }
+}
+
+impl SampleUniform for i8 {
+    fn sample_checked<R: Rng>(low: &i8, high: &i8, inclusive: bool, rng: &mut R) -> i8 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u8 as u32;
+        if range == 0 { return rng.next_u32() as i8; }
+        low.wrapping_add(canon_u32(rng, range) as i8)
+    }
+
+    fn sample_uniform<R: Rng>(low: &i8, high: &i8, inclusive: bool, rng: &mut R) -> i8 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u8 as u32;
+        if range == 0 { return rng.next_u32() as i8; }
+        low.wrapping_add(lemire_u32(rng, range) as i8)
+    }
+}
+
+impl SampleUniform for i16 {
+    fn sample_checked<R: Rng>(low: &i16, high: &i16, inclusive: bool, rng: &mut R) -> i16 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u16 as u32;
+        if range == 0 { return rng.next_u32() as i16; }
+        low.wrapping_add(canon_u32(rng, range) as i16)
+    }
+
+    fn sample_uniform<R: Rng>(low: &i16, high: &i16, inclusive: bool, rng: &mut R) -> i16 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u16 as u32;
+        if range == 0 { return rng.next_u32() as i16; }
+        low.wrapping_add(lemire_u32(rng, range) as i16)
+    }
+}
+
+impl SampleUniform for i32 {
+    fn sample_checked<R: Rng>(low: &i32, high: &i32, inclusive: bool, rng: &mut R) -> i32 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u32 as u32;
+        if range == 0 { return rng.next_u32() as i32; }
+        low.wrapping_add(canon_u32(rng, range) as i32)
+    }
+
+    fn sample_uniform<R: Rng>(low: &i32, high: &i32, inclusive: bool, rng: &mut R) -> i32 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u32 as u32;
+        if range == 0 { return rng.next_u32() as i32; }
+        low.wrapping_add(lemire_u32(rng, range) as i32)
+    }
+}
+
+impl SampleUniform for i64 {
+    fn sample_checked<R: Rng>(low: &i64, high: &i64, inclusive: bool, rng: &mut R) -> i64 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u64 as u64;
+        if range == 0 { return rng.next_u64() as i64; }
+        low.wrapping_add(canon_u64(rng, range) as i64)
+    }
+
+    fn sample_uniform<R: Rng>(low: &i64, high: &i64, inclusive: bool, rng: &mut R) -> i64 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u64 as u64;
+        if range == 0 { return rng.next_u64() as i64; }
+        low.wrapping_add(lemire_u64(rng, range) as i64)
+    }
+}
+
+impl SampleUniform for isize {
+    fn sample_checked<R: Rng>(low: &isize, high: &isize, inclusive: bool, rng: &mut R) -> isize {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u64 as u64;
+        if range == 0 { return rng.next_u64() as isize; }
+        low.wrapping_add(canon_u64(rng, range) as isize)
+    }
+
+    fn sample_uniform<R: Rng>(low: &isize, high: &isize, inclusive: bool, rng: &mut R) -> isize {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u64 as u64;
+        if range == 0 { return rng.next_u64() as isize; }
+        low.wrapping_add(lemire_u64(rng, range) as isize)
+    }
+}
+
+impl SampleUniform for i128 {
+    fn sample_checked<R: Rng>(low: &i128, high: &i128, inclusive: bool, rng: &mut R) -> i128 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u128 as u128;
+        if range == 0 { return random_u128(rng) as i128; }
+        low.wrapping_add(canon_u128(rng, range) as i128)
+    }
+
+    fn sample_uniform<R: Rng>(low: &i128, high: &i128, inclusive: bool, rng: &mut R) -> i128 {
+        let hi = if inclusive { *high } else { *high - 1 };
+        let range = hi.wrapping_sub(*low).wrapping_add(1) as u128 as u128;
+        if range == 0 { return random_u128(rng) as i128; }
+        low.wrapping_add(lemire_u128(rng, range) as i128)
+    }
+}
+
+// usize draws a u32 when the range's bounds fit one (as rand's
+// UniformUsize, so results do not depend on the pointer width).
+impl SampleUniform for usize {
+    fn sample_checked<R: Rng>(low: &usize, high: &usize, inclusive: bool, rng: &mut R) -> usize {
+        if *high > 0xffffffff { return u64::sample_checked(&(*low as u64), &(*high as u64), inclusive, rng) as usize; }
+        u32::sample_checked(&(*low as u32), &(*high as u32), inclusive, rng) as usize
+    }
+
+    fn sample_uniform<R: Rng>(low: &usize, high: &usize, inclusive: bool, rng: &mut R) -> usize {
+        let hi = if inclusive { *high } else { *high - 1 };
+        if hi > 0xffffffff { return u64::sample_uniform(&(*low as u64), &(hi as u64), true, rng) as usize; }
+        u32::sample_uniform(&(*low as u32), &(hi as u32), true, rng) as usize
+    }
+}
