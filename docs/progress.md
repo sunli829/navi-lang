@@ -299,6 +299,24 @@
   - VS Code 需要一个通用 LSP 客户端扩展（仓库里没有带）。
 - 没做的：Windows（读标准输入用的是 `/dev/stdin`）；代码操作（code actions）、调用层级；增量分析（每次都整个 crate 加 std 重新分析）；补全只认得局部变量、字段、方法调用结果这类接收者，泛型参数上的方法不补全。
 
+## 标准库补全（对标 Go 的标准库，API 照 Rust std 和常用 crate）
+
+- Rust std 补齐：集合（VecDeque、BTreeMap/BTreeSet、BinaryHeap）；str、slice、Iterator、Option、Result、char、数值类型的常用方法；fs、io（BufRead、Seek、Cursor、ErrorKind）、env、process（posix_spawn、管道）、std::os 扩展；sync（RwLock、Condvar、Once、OnceLock、LazyLock、Barrier）、原子类型、时间（SystemTime、sleep）。
+- 运行时：定时器（最小堆，空闲的 M 睡到下一个定时器）；网络轮询器（kqueue/epoll，边沿触发，一个专门的 M）。
+- 网络：std::net（地址、TcpListener/TcpStream/UdpSocket，阻塞只挂起绿色线程）、std::url（url crate，WHATWG 解析）、std::http（类型照 http crate，客户端照 reqwest::blocking，服务端每连接一个绿色线程，路由照 Go 1.22 的 ServeMux；没有 TLS）。Windows 上还没有 socket。
+- 照 crate 做的模块：regex（RE2 语义，Pike VM 加有界回溯）、rand（0.9，同一个种子的值和 crate 相同）、chrono、base64、hex、crypto（MD5、SHA-1、SHA-2、HMAC）、hash::{crc32, adler32}、compress（自己实现的 DEFLATE，flate2 的 API）、log（log 加 env_logger）、cli（clap 4 的 builder API）、csv。
+- 验证方法：能拿到参照实现的都做了逐字对照——regex 对 Go 的 regexp（手写用例加 3600 个随机模式），rand、chrono、clap、csv 对本机缓存的 Rust crate，编码、哈希、压缩对 Python 的 hashlib/base64/zlib/gzip 和系统 gzip。和参照不同的地方都记在 spec/std-diff.md 第 9、10 节。
+- 顺带修的编译器问题：
+  - std 函数体是按需检查的，检查出的错误以前被丢掉（代码照样生成）。现在会报错，`NAVI_CHECK_STD=1` 检查 std 的全部函数体；完整验证在五个目标上都跑这一项。用它找出并修了 std 里十几处一直没报出来的类型错误。
+  - trait 选择：嵌套约束的参数是未知变量时直接算作有歧义（rand 的自引用 impl 曾让检查指数爆炸）；投影在只有一个 impl 可匹配时直接用它（`for i in 0..3 { i as u8 }` 以前报错）。
+  - 整数字面量：超过 64 位的 128 位字面量（以前静默变成 0）、`-128i8` 这类取负的字面量、超出类型范围的字面量报错；int128 降级漏掉转换之后的运算。
+  - 模板字符串的格式说明按原文处理（`${x:08x}` 以前报错）；单元结构体、常量可以按 `&mut` 借用为临时值；arm64 上 C 调用超过 8 个参数。
+  - std：`RangeInclusive` 到类型最大值不再溢出、可以反向迭代，char 区间跳过代理区；`AsRef` 照 Rust 对引用通用实现。
+- 已知的不足：
+  - regex 的 Pike VM 和 compress 比 Go/C 慢一个数量级。原因是 navic 不做内联，`Vec` 的每次下标访问都是一次调用。
+  - `x.clone()` 在 `x: &mut T` 时克隆的是引用不是 T（Rust 里 `&mut T` 不能克隆，会解引用到 `T::clone`）。std 里已经两次因此出错，需要决定是否改方法查找的规则。
+  - 没有 TLS；Windows 上没有 socket，fs/process 只编译过、没有运行过。
+
 ## 下一步
 
 1. 冷编译提速：剩下的串行部分（plan 的按序遍历、codegen 合并之后的 gen_data、链接）；GC 标记占约四分之一 CPU（保守扫描，生成的代码不做寄存器分配）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。
