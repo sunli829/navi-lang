@@ -77,6 +77,7 @@ let d: &dyn Display = &pt;          // trait 对象：(数据指针, vtable)
   - `String`：可增长的字符串
   - 普通字符串字面量的类型是 `&str`；模板字符串默认是 `String`，期望类型是 `impl Display` 时是 `fmt::Arguments`（见 1.13）
 - **集合**：`Vec<T>`、`String`（以及以后的 `HashMap`、`HashSet`、`VecDeque`、`BTreeMap`）内部是指向堆对象的引用，所以**拷贝以后共享同一个容器**（类似 Go 的 map、Java 的 ArrayList），要独立副本时用 `.clone()`。这样避免了 Go 切片那种"共享底层数组、长度却各自独立"的陷阱
+- **引用上的 `.clone()` 克隆的是被引用的值**（同 Rust）：`x: &T` 或 `x: &mut T` 时 `x.clone()` 调用 `T::clone`，得到一个 `T`；只有 `T` 没有实现 `Clone` 时才得到引用的拷贝。引用本身仍然实现 `Clone`（用于泛型约束和 `#[derive(Clone)]` 里的引用字段，拷贝的是引用）
 - 不支持 `union`；FFI 用 `#[repr(C)] struct`
 
 ## 1.4 条目（item）
