@@ -1,0 +1,978 @@
+//! CSV reading and writing (as Go's encoding/csv, with the API of Rust's
+//! csv crate): RFC 4180 quoting, configurable delimiters, quotes,
+//! escapes, comments and trimming, records as StringRecord or ByteRecord,
+//! and records to and from structs by header names (through
+//! std::reflect, as std::json does).
+//!
+//!     let mut rdr = Reader::from_reader(data.as_bytes());
+//!     for rec in rdr.records() {
+//!         let rec = rec?;
+//!         println(`${rec.get(0).unwrap()}`);
+//!     }
+//!     for p in Reader::from_reader(data.as_bytes()).deserialize::<Person>() { ... }
+//!
+//!     let mut w = Writer::from_writer(Vec::new());
+//!     w.write_record(&["a", "b,c"])?;
+//!     w.serialize(&person)?;
+//!     let bytes = w.into_inner()?;          // no Drop: into_inner or flush
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::io::{self, Read, Write};
+use crate::reflect::{self, Kind, Value};
+
+// --- Records and positions -----------------------------------------------------------
+
+/// Where a record starts: its byte offset, line (from 1) and index
+/// (from 0, the header row included).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Position {
+    byte: u64,
+    line: u64,
+    record: u64,
+}
+
+impl Position {
+    pub fn new() -> Position { Position { byte: 0, line: 1, record: 0 } }
+    pub fn byte(&self) -> u64 { self.byte }
+    pub fn line(&self) -> u64 { self.line }
+    pub fn record(&self) -> u64 { self.record }
+    pub fn set_byte(&mut self, b: u64) -> &mut Position { self.byte = b; self }
+    pub fn set_line(&mut self, l: u64) -> &mut Position { self.line = l; self }
+    pub fn set_record(&mut self, r: u64) -> &mut Position { self.record = r; self }
+}
+
+/// A record of byte fields.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct ByteRecord {
+    fields: Vec<Vec<u8>>,
+    pos: Option<Position>,
+}
+
+impl ByteRecord {
+    pub fn new() -> ByteRecord { ByteRecord::default() }
+    pub fn len(&self) -> usize { self.fields.len() }
+    pub fn is_empty(&self) -> bool { self.fields.len() == 0 }
+    pub fn get(&self, i: usize) -> Option<&[u8]> { if i < self.fields.len() { Some(self.fields[i].as_slice()) } else { None } }
+    pub fn push_field(&mut self, f: &[u8]) { self.fields.push(f.to_vec()); }
+    pub fn clear(&mut self) { self.fields.clear(); }
+    pub fn position(&self) -> Option<&Position> { match &self.pos { Some(p) => Some(p), None => None } }
+    pub fn set_position(&mut self, p: Option<Position>) { self.pos = p; }
+    pub fn iter(&self) -> crate::vec::IntoIter<&[u8]> {
+        let mut v = Vec::new();
+        for f in self.fields.iter() { v.push(f.as_slice()); }
+        v.into_iter()
+    }
+    /// The fields' bytes one after another.
+    pub fn as_slice(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        for f in self.fields.iter() { v.extend_from_slice(f.as_slice()); }
+        v
+    }
+}
+
+impl Debug for ByteRecord {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut v: Vec<String> = Vec::new();
+        for x in self.fields.iter() { v.push(String::from_utf8_lossy(x.as_slice())); }
+        f.write_fmt(`ByteRecord(${v:?})`)
+    }
+}
+
+/// A record of UTF-8 fields.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct StringRecord {
+    fields: Vec<String>,
+    pos: Option<Position>,
+}
+
+impl StringRecord {
+    pub fn new() -> StringRecord { StringRecord::default() }
+    pub fn len(&self) -> usize { self.fields.len() }
+    pub fn is_empty(&self) -> bool { self.fields.len() == 0 }
+    pub fn get(&self, i: usize) -> Option<&str> { if i < self.fields.len() { Some(self.fields[i].as_str()) } else { None } }
+    pub fn push_field(&mut self, f: &str) { self.fields.push(f.to_string()); }
+    pub fn clear(&mut self) { self.fields.clear(); }
+    pub fn truncate(&mut self, n: usize) { self.fields.truncate(n); }
+    pub fn position(&self) -> Option<&Position> { match &self.pos { Some(p) => Some(p), None => None } }
+    pub fn set_position(&mut self, p: Option<Position>) { self.pos = p; }
+    pub fn iter(&self) -> crate::vec::IntoIter<&str> {
+        let mut v = Vec::new();
+        for f in self.fields.iter() { v.push(f.as_str()); }
+        v.into_iter()
+    }
+    /// The fields one after another.
+    pub fn as_slice(&self) -> String { self.fields.concat() }
+    /// The fields without leading and trailing whitespace.
+    pub fn trim(&mut self) {
+        let mut i = 0;
+        while i < self.fields.len() {
+            self.fields[i] = self.fields[i].trim().to_string();
+            i += 1;
+        }
+    }
+    pub fn as_byte_record(&self) -> ByteRecord {
+        let mut b = ByteRecord::new();
+        for f in self.fields.iter() { b.fields.push(f.as_bytes().to_vec()); }
+        b.pos = self.pos.clone();
+        b
+    }
+    pub fn from_byte_record(b: ByteRecord) -> crate::result::Result<StringRecord, FromUtf8Error> {
+        let mut r = StringRecord::new();
+        let mut i = 0;
+        while i < b.fields.len() {
+            match crate::str::from_utf8(b.fields[i].as_slice()) {
+                Ok(s) => r.fields.push(s.to_string()),
+                Err(_) => return Err(FromUtf8Error { field: i }),
+            }
+            i += 1;
+        }
+        r.pos = b.pos;
+        Ok(r)
+    }
+}
+
+impl Debug for StringRecord {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`StringRecord(${self.fields:?})`) }
+}
+
+impl From<Vec<&str>> for StringRecord {
+    fn from(v: Vec<&str>) -> StringRecord {
+        let mut r = StringRecord::new();
+        for s in v.iter() { r.fields.push(s.to_string()); }
+        r
+    }
+}
+
+impl From<Vec<String>> for StringRecord {
+    fn from(v: Vec<String>) -> StringRecord { StringRecord { fields: v, pos: None } }
+}
+
+/// StringRecord::from_byte_record's error: field is not UTF-8.
+#[derive(Clone, Debug)]
+pub struct FromUtf8Error {
+    field: usize,
+}
+
+impl FromUtf8Error {
+    pub fn field(&self) -> usize { self.field }
+}
+
+impl Display for FromUtf8Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`invalid utf-8 in field ${self.field}`) }
+}
+
+// --- Errors --------------------------------------------------------------------------
+
+/// What went wrong.
+#[derive(Clone, Debug)]
+pub enum ErrorKind {
+    Io(String),
+    /// A field that is not UTF-8 (read as a StringRecord).
+    Utf8 { pos: Option<Position>, field: usize },
+    /// A record with another number of fields than the first (not
+    /// flexible).
+    UnequalLengths { pos: Option<Position>, expected_len: u64, len: u64 },
+    /// A record that does not fit the type (deserialize).
+    Deserialize { pos: Option<Position>, err: DeserializeError },
+    /// A value that cannot be written (serialize).
+    Serialize(String),
+}
+
+/// A CSV error.
+#[derive(Clone, Debug)]
+pub struct Error {
+    kind: ErrorKind,
+}
+
+pub type Result<T> = crate::result::Result<T, Error>;
+
+impl Error {
+    pub fn kind(&self) -> &ErrorKind { &self.kind }
+    pub fn into_kind(self) -> ErrorKind { self.kind }
+    pub fn is_io_error(&self) -> bool { if let ErrorKind::Io(_) = self.kind { true } else { false } }
+    pub fn position(&self) -> Option<&Position> {
+        match &self.kind {
+            ErrorKind::Utf8 { pos, .. } | ErrorKind::UnequalLengths { pos, .. } | ErrorKind::Deserialize { pos, .. } => match pos { Some(p) => Some(p), None => None },
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Error { Error { kind: ErrorKind::Io(e.to_string()) } }
+}
+
+impl From<Error> for io::Error {
+    fn from(e: Error) -> io::Error { io::Error::new(io::ErrorKind::Other, e.to_string()) }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match &self.kind {
+            ErrorKind::Io(e) => f.write_str(e.as_str()),
+            ErrorKind::Utf8 { pos: None, field } => f.write_fmt(`CSV parse error: field ${field}: invalid utf-8 sequence`),
+            ErrorKind::Utf8 { pos: Some(p), field } => f.write_fmt(`CSV parse error: record ${p.record} (line ${p.line}, field: ${field}, byte: ${p.byte}): invalid utf-8 sequence`),
+            ErrorKind::UnequalLengths { pos: None, expected_len, len } => f.write_fmt(`CSV error: found record with ${len} fields, but the previous record has ${expected_len} fields`),
+            ErrorKind::UnequalLengths { pos: Some(p), expected_len, len } => f.write_fmt(`CSV error: record ${p.record} (line: ${p.line}, byte: ${p.byte}): found record with ${len} fields, but the previous record has ${expected_len} fields`),
+            ErrorKind::Deserialize { pos: None, err } => f.write_fmt(`CSV deserialize error: ${err}`),
+            ErrorKind::Deserialize { pos: Some(p), err } => f.write_fmt(`CSV deserialize error: record ${p.record} (line: ${p.line}, byte: ${p.byte}): ${err}`),
+            ErrorKind::Serialize(m) => f.write_fmt(`CSV serialize error: ${m}`),
+        }
+    }
+}
+
+/// Why a record does not fit a type.
+#[derive(Clone, Debug)]
+pub struct DeserializeError {
+    field: Option<u64>,
+    msg: String,
+}
+
+impl DeserializeError {
+    pub fn field(&self) -> Option<u64> { self.field }
+}
+
+impl Display for DeserializeError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self.field {
+            Some(i) => f.write_fmt(`field ${i}: ${self.msg}`),
+            None => f.write_str(self.msg.as_str()),
+        }
+    }
+}
+
+// --- Reading -------------------------------------------------------------------------
+
+/// Which fields lose their surrounding whitespace.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Trim {
+    None,
+    Headers,
+    Fields,
+    All,
+}
+
+/// What ends a record.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Terminator {
+    /// \r, \n or \r\n when reading; \r\n when writing.
+    CRLF,
+    Any(u8),
+}
+
+/// Configures a Reader.
+#[derive(Clone)]
+pub struct ReaderBuilder {
+    delimiter: u8,
+    has_headers: bool,
+    flexible: bool,
+    quoting: bool,
+    quote: u8,
+    escape: Option<u8>,
+    double_quote: bool,
+    comment: Option<u8>,
+    trim: Trim,
+    terminator: Terminator,
+}
+
+impl Default for ReaderBuilder {
+    fn default() -> ReaderBuilder { ReaderBuilder::new() }
+}
+
+impl ReaderBuilder {
+    pub fn new() -> ReaderBuilder {
+        ReaderBuilder { delimiter: b',', has_headers: true, flexible: false, quoting: true, quote: b'"', escape: None, double_quote: true, comment: None, trim: Trim::None, terminator: Terminator::CRLF }
+    }
+    pub fn delimiter(&mut self, d: u8) -> &mut ReaderBuilder { self.delimiter = d; self }
+    pub fn has_headers(&mut self, yes: bool) -> &mut ReaderBuilder { self.has_headers = yes; self }
+    pub fn flexible(&mut self, yes: bool) -> &mut ReaderBuilder { self.flexible = yes; self }
+    pub fn quoting(&mut self, yes: bool) -> &mut ReaderBuilder { self.quoting = yes; self }
+    pub fn quote(&mut self, q: u8) -> &mut ReaderBuilder { self.quote = q; self }
+    pub fn escape(&mut self, e: Option<u8>) -> &mut ReaderBuilder { self.escape = e; self }
+    pub fn double_quote(&mut self, yes: bool) -> &mut ReaderBuilder { self.double_quote = yes; self }
+    pub fn comment(&mut self, c: Option<u8>) -> &mut ReaderBuilder { self.comment = c; self }
+    pub fn trim(&mut self, t: Trim) -> &mut ReaderBuilder { self.trim = t; self }
+    pub fn terminator(&mut self, t: Terminator) -> &mut ReaderBuilder { self.terminator = t; self }
+
+    pub fn from_reader<R: Read>(&self, rdr: R) -> Reader<R> {
+        let mut buf = Vec::new();
+        buf.resize(32768, 0);
+        Reader { cfg: self.clone(), rdr, buf, bpos: 0, blen: 0, eof: false, byte: 0, line: 1, record: 0, headers: None, headers_read: false, first_len: None, done: false }
+    }
+
+    pub fn from_path<P: AsRef<crate::path::Path>>(&self, path: P) -> Result<Reader<crate::fs::File>> {
+        let f = crate::fs::File::open(path)?;
+        Ok(self.from_reader(f))
+    }
+}
+
+/// Reads CSV records from a reader.
+pub struct Reader<R: Read> {
+    cfg: ReaderBuilder,
+    rdr: R,
+    buf: Vec<u8>,
+    bpos: usize,
+    blen: usize,
+    eof: bool,
+    // The position of the next byte.
+    byte: u64,
+    line: u64,
+    record: u64,
+    headers: Option<StringRecord>,
+    headers_read: bool,
+    first_len: Option<u64>,
+    done: bool,
+}
+
+impl Reader<crate::fs::File> {
+    pub fn from_path<P: AsRef<crate::path::Path>>(path: P) -> Result<Reader<crate::fs::File>> { ReaderBuilder::new().from_path(path) }
+}
+
+const S_START: u8 = 0;
+const S_FIELD: u8 = 1;
+const S_QUOTED: u8 = 2;
+const S_QUOTE_IN_QUOTED: u8 = 3;
+const S_ESCAPE: u8 = 4;
+
+impl<R: Read> Reader<R> {
+    pub fn from_reader(rdr: R) -> Reader<R> { ReaderBuilder::new().from_reader(rdr) }
+
+    fn next_byte(&mut self) -> Result<Option<u8>> {
+        if self.bpos == self.blen {
+            if self.eof { return Ok(None); }
+            let n = self.rdr.read(self.buf.as_mut_slice())?;
+            if n == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
+            self.bpos = 0;
+            self.blen = n;
+        }
+        let b = self.buf[self.bpos];
+        self.bpos += 1;
+        self.byte += 1;
+        if b == b'\n' { self.line += 1; }
+        Ok(Some(b))
+    }
+
+    fn peek_byte(&mut self) -> Result<Option<u8>> {
+        if self.bpos == self.blen {
+            if self.eof { return Ok(None); }
+            let n = self.rdr.read(self.buf.as_mut_slice())?;
+            if n == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
+            self.bpos = 0;
+            self.blen = n;
+        }
+        Ok(Some(self.buf[self.bpos]))
+    }
+
+    fn is_term(&self, b: u8) -> bool {
+        match self.cfg.terminator {
+            Terminator::CRLF => b == b'\r' || b == b'\n',
+            Terminator::Any(t) => b == t,
+        }
+    }
+
+    // The next record's raw fields (false at the end).
+    fn raw_record(&mut self, rec: &mut ByteRecord) -> Result<bool> {
+        rec.fields.clear();
+        // Blank lines and comment lines.
+        loop {
+            match self.peek_byte()? {
+                None => return Ok(false),
+                Some(b) => {
+                    if self.is_term(b) {
+                        self.next_byte()?;
+                        continue;
+                    }
+                    if Some(b) == self.cfg.comment {
+                        loop {
+                            match self.next_byte()? {
+                                None => return Ok(false),
+                                Some(c) => if c == b'\n' || self.is_term(c) { break; },
+                            }
+                        }
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        rec.pos = Some(Position { byte: self.byte, line: self.line, record: self.record });
+        let mut field: Vec<u8> = Vec::new();
+        let mut state = S_START;
+        loop {
+            let b = match self.next_byte()? {
+                Some(b) => b,
+                None => {
+                    rec.fields.push(field);
+                    break;
+                }
+            };
+            let c = &self.cfg;
+            match state {
+                S_START | S_FIELD => {
+                    if state == S_START && c.quoting && b == c.quote {
+                        state = S_QUOTED;
+                    } else if b == c.delimiter {
+                        rec.fields.push(field);
+                        field = Vec::new();
+                        state = S_START;
+                    } else if self.is_term(b) {
+                        rec.fields.push(field);
+                        break;
+                    } else {
+                        field.push(b);
+                        state = S_FIELD;
+                    }
+                }
+                S_QUOTED => {
+                    if b == c.quote {
+                        state = S_QUOTE_IN_QUOTED;
+                    } else if c.escape == Some(b) {
+                        state = S_ESCAPE;
+                    } else {
+                        field.push(b);
+                    }
+                }
+                S_ESCAPE => {
+                    field.push(b);
+                    state = S_QUOTED;
+                }
+                _ => {
+                    // After a quote in a quoted field.
+                    if c.double_quote && b == c.quote {
+                        field.push(b);
+                        state = S_QUOTED;
+                    } else if b == c.delimiter {
+                        rec.fields.push(field);
+                        field = Vec::new();
+                        state = S_START;
+                    } else if self.is_term(b) {
+                        rec.fields.push(field);
+                        break;
+                    } else {
+                        field.push(b);
+                        state = S_FIELD;
+                    }
+                }
+            }
+        }
+        self.record += 1;
+        Ok(true)
+    }
+
+    // A record checked for its length (and trimmed as configured).
+    fn read_checked(&mut self, rec: &mut ByteRecord) -> Result<bool> {
+        if self.done { return Ok(false); }
+        if !self.raw_record(rec)? {
+            self.done = true;
+            return Ok(false);
+        }
+        let n = rec.fields.len() as u64;
+        match self.first_len {
+            None => self.first_len = Some(n),
+            Some(e) => if e != n && !self.cfg.flexible { return Err(Error { kind: ErrorKind::UnequalLengths { pos: rec.pos.clone(), expected_len: e, len: n } }); },
+        }
+        Ok(true)
+    }
+
+    fn to_string_record(&self, b: ByteRecord, header: bool) -> Result<StringRecord> {
+        let pos = b.pos.clone();
+        match StringRecord::from_byte_record(b) {
+            Ok(mut r) => {
+                let t = &self.cfg.trim;
+                if *t == Trim::All || (header && *t == Trim::Headers) || (!header && *t == Trim::Fields) { r.trim(); }
+                Ok(r)
+            }
+            Err(e) => Err(Error { kind: ErrorKind::Utf8 { pos, field: e.field } }),
+        }
+    }
+
+    fn ensure_headers(&mut self) -> Result<()> {
+        if self.headers_read { return Ok(()); }
+        self.headers_read = true;
+        if !self.cfg.has_headers { return Ok(()); }
+        let mut b = ByteRecord::new();
+        if self.read_checked(&mut b)? {
+            let r = self.to_string_record(b, true)?;
+            self.headers = Some(r);
+        }
+        Ok(())
+    }
+
+    /// The header row (the first record when has_headers; empty without
+    /// headers or input).
+    pub fn headers(&mut self) -> Result<StringRecord> {
+        if !self.headers_read && !self.cfg.has_headers {
+            // Without headers the first record stands for them, as the
+            // crate does, but it is still read as a record.
+            return Ok(StringRecord::new());
+        }
+        self.ensure_headers()?;
+        match &self.headers {
+            Some(h) => Ok(h.clone()),
+            None => Ok(StringRecord::new()),
+        }
+    }
+
+    pub fn byte_headers(&mut self) -> Result<ByteRecord> { Ok(self.headers()?.as_byte_record()) }
+
+    pub fn set_headers(&mut self, h: StringRecord) {
+        self.headers_read = true;
+        self.headers = Some(h);
+    }
+
+    pub fn has_headers(&self) -> bool { self.cfg.has_headers }
+
+    /// Reads the next record into rec; false at the end.
+    pub fn read_record(&mut self, rec: &mut StringRecord) -> Result<bool> {
+        self.ensure_headers()?;
+        let mut b = ByteRecord::new();
+        if !self.read_checked(&mut b)? { return Ok(false); }
+        let r = self.to_string_record(b, false)?;
+        rec.fields = r.fields;
+        rec.pos = r.pos;
+        Ok(true)
+    }
+
+    pub fn read_byte_record(&mut self, rec: &mut ByteRecord) -> Result<bool> {
+        self.ensure_headers()?;
+        self.read_checked(rec)
+    }
+
+    /// The records after the header row.
+    pub fn records(&mut self) -> StringRecordsIter<R> { StringRecordsIter { r: self } }
+    pub fn into_records(self) -> StringRecordsIter<R> {
+        let mut me = self;
+        StringRecordsIter { r: &mut me }
+    }
+    pub fn byte_records(&mut self) -> ByteRecordsIter<R> { ByteRecordsIter { r: self } }
+
+    /// The records as values of D (structs by header names, or by
+    /// position without headers; tuples and Vecs by position).
+    pub fn deserialize<D>(&mut self) -> DeserializeRecordsIter<R, D> { DeserializeRecordsIter { r: self, t: crate::marker::PhantomData } }
+
+    /// The position of the next record.
+    pub fn position(&self) -> Position { Position { byte: self.byte, line: self.line, record: self.record } }
+    pub fn is_done(&self) -> bool { self.done }
+    pub fn get_ref(&self) -> &R { &self.rdr }
+    pub fn get_mut(&mut self) -> &mut R { &mut self.rdr }
+    pub fn into_inner(self) -> R { self.rdr }
+}
+
+/// Reader::records.
+pub struct StringRecordsIter<R: Read> {
+    r: &mut Reader<R>,
+}
+
+impl<R: Read> Iterator for StringRecordsIter<R> {
+    type Item = Result<StringRecord>;
+    fn next(&mut self) -> Option<Result<StringRecord>> {
+        let mut rec = StringRecord::new();
+        match self.r.read_record(&mut rec) {
+            Ok(true) => Some(Ok(rec)),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Reader::byte_records.
+pub struct ByteRecordsIter<R: Read> {
+    r: &mut Reader<R>,
+}
+
+impl<R: Read> Iterator for ByteRecordsIter<R> {
+    type Item = Result<ByteRecord>;
+    fn next(&mut self) -> Option<Result<ByteRecord>> {
+        let mut rec = ByteRecord::new();
+        match self.r.read_byte_record(&mut rec) {
+            Ok(true) => Some(Ok(rec)),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Reader::deserialize.
+pub struct DeserializeRecordsIter<R: Read, D> {
+    r: &mut Reader<R>,
+    t: crate::marker::PhantomData<D>,
+}
+
+impl<R: Read, D> Iterator for DeserializeRecordsIter<R, D> {
+    type Item = Result<D>;
+    fn next(&mut self) -> Option<Result<D>> {
+        let mut rec = StringRecord::new();
+        match self.r.read_record(&mut rec) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => return Some(Err(e)),
+        }
+        let headers = self.r.headers.clone();
+        let v = Value::new(reflect::type_of::<D>());
+        match fill(&v, &rec, &headers) {
+            Ok(()) => Some(Ok(unsafe { (v.as_ptr() as *const D).read() })),
+            Err(err) => Some(Err(Error { kind: ErrorKind::Deserialize { pos: rec.pos.clone(), err } })),
+        }
+    }
+}
+
+fn derr(field: Option<usize>, msg: String) -> DeserializeError {
+    DeserializeError { field: match field { Some(f) => Some(f as u64), None => None }, msg }
+}
+
+// Fills v (a new value) from the record.
+fn fill(v: &Value, rec: &StringRecord, headers: &Option<StringRecord>) -> crate::result::Result<(), DeserializeError> {
+    let mut t = v.clone();
+    match t.kind() {
+        Kind::Struct => {
+            let n = t.num_fields();
+            let names = t.ty().fields();
+            let mut k = 0;
+            while k < n {
+                let fname = names[k].name;
+                let idx = match headers {
+                    Some(h) => {
+                        let mut found: Option<usize> = None;
+                        let mut i = 0;
+                        while i < h.len() {
+                            if h.get(i).unwrap() == fname { found = Some(i); }
+                            i += 1;
+                        }
+                        found
+                    }
+                    None => if k < rec.len() { Some(k) } else { None },
+                };
+                let mut f = t.field(k);
+                match idx {
+                    Some(i) => match rec.get(i) {
+                        Some(s) => set_from(&mut f, s, i)?,
+                        None => if !is_option(&f) { return Err(derr(None, `missing field \`${fname}\``)); },
+                    },
+                    None => if !is_option(&f) { return Err(derr(None, `missing field \`${fname}\``)); },
+                }
+                k += 1;
+            }
+            Ok(())
+        }
+        Kind::Tuple | Kind::Array => {
+            let tuple = t.kind() == Kind::Tuple;
+            let n = if tuple { t.num_fields() } else { t.ty().len() };
+            if rec.len() < n { return Err(derr(None, `invalid length ${rec.len()}, expected ${n} fields`)); }
+            let mut k = 0;
+            while k < n {
+                let mut f = if tuple { t.field(k) } else { t.index(k) };
+                set_from(&mut f, rec.get(k).unwrap(), k)?;
+                k += 1;
+            }
+            Ok(())
+        }
+        Kind::Vec => {
+            let mut i = 0;
+            while i < rec.len() {
+                let mut e = t.push();
+                set_from(&mut e, rec.get(i).unwrap(), i)?;
+                i += 1;
+            }
+            Ok(())
+        }
+        _ => {
+            if rec.len() == 0 { return Err(derr(None, "no fields".to_string())); }
+            set_from(&mut t, rec.get(0).unwrap(), 0)
+        }
+    }
+}
+
+fn is_option(v: &Value) -> bool {
+    if v.kind() != Kind::Enum { return false; }
+    let vs = v.ty().variants();
+    vs.len() == 2 && vs[0].name == "None" && vs[1].name == "Some"
+}
+
+// Sets a field from its text (field i of the record).
+fn set_from(v: &mut Value, s: &str, i: usize) -> crate::result::Result<(), DeserializeError> {
+    if is_option(v) {
+        if s.len() == 0 {
+            v.set_variant(0);
+            return Ok(());
+        }
+        v.set_variant(1);
+        let mut inner = v.variant_field(0);
+        // As the crate: a value that does not parse is None.
+        if set_from(&mut inner, s, i).is_err() { v.set_variant(0); }
+        return Ok(());
+    }
+    match v.kind() {
+        Kind::Bool => match s {
+            "true" => v.set_bool(true),
+            "false" => v.set_bool(false),
+            _ => return Err(derr(Some(i), "provided string was not `true` or `false`".to_string())),
+        },
+        Kind::Char => {
+            let mut cs = s.chars();
+            match (cs.next(), cs.next()) {
+                (Some(c), None) => v.set_char(c),
+                _ => return Err(derr(Some(i), `expected single character but got ${s.chars().count()} characters in '${s}'`)),
+            }
+        }
+        Kind::F32 | Kind::F64 => match s.parse::<f64>() {
+            Ok(x) => v.set_f64(x),
+            Err(e) => return Err(derr(Some(i), e.to_string())),
+        },
+        _ => {
+            if v.is_int() {
+                if v.is_signed() {
+                    match s.parse::<i128>() {
+                        Ok(x) => v.set_i128(x),
+                        Err(e) => return Err(derr(Some(i), e.to_string())),
+                    }
+                } else {
+                    match s.parse::<u64>() {
+                        Ok(x) => v.set_u64(x),
+                        Err(e) => return Err(derr(Some(i), e.to_string())),
+                    }
+                }
+                return Ok(());
+            }
+            if v.is_str() {
+                v.set_str(s);
+                return Ok(());
+            }
+            if v.kind() == Kind::Enum {
+                match v.variant_named(s) {
+                    Some(k) => v.set_variant(k),
+                    None => return Err(derr(Some(i), `unknown variant \`${s}\``)),
+                }
+                return Ok(());
+            }
+            return Err(derr(Some(i), `unsupported type ${v.ty().name()}`));
+        }
+    }
+    Ok(())
+}
+
+// --- Writing -------------------------------------------------------------------------
+
+/// When fields are quoted.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum QuoteStyle {
+    /// When they contain the delimiter, a quote or a line break.
+    Necessary,
+    Always,
+    Never,
+    /// When they are not numbers.
+    NonNumeric,
+}
+
+/// Configures a Writer.
+#[derive(Clone)]
+pub struct WriterBuilder {
+    delimiter: u8,
+    has_headers: bool,
+    flexible: bool,
+    quote_style: QuoteStyle,
+    quote: u8,
+    escape: u8,
+    double_quote: bool,
+    terminator: Terminator,
+}
+
+impl Default for WriterBuilder {
+    fn default() -> WriterBuilder { WriterBuilder::new() }
+}
+
+impl WriterBuilder {
+    pub fn new() -> WriterBuilder {
+        WriterBuilder { delimiter: b',', has_headers: true, flexible: false, quote_style: QuoteStyle::Necessary, quote: b'"', escape: b'\\', double_quote: true, terminator: Terminator::Any(b'\n') }
+    }
+    pub fn delimiter(&mut self, d: u8) -> &mut WriterBuilder { self.delimiter = d; self }
+    /// Whether serialize writes a header row of field names first.
+    pub fn has_headers(&mut self, yes: bool) -> &mut WriterBuilder { self.has_headers = yes; self }
+    pub fn flexible(&mut self, yes: bool) -> &mut WriterBuilder { self.flexible = yes; self }
+    pub fn quote_style(&mut self, s: QuoteStyle) -> &mut WriterBuilder { self.quote_style = s; self }
+    pub fn quote(&mut self, q: u8) -> &mut WriterBuilder { self.quote = q; self }
+    pub fn escape(&mut self, e: u8) -> &mut WriterBuilder { self.escape = e; self }
+    pub fn double_quote(&mut self, yes: bool) -> &mut WriterBuilder { self.double_quote = yes; self }
+    pub fn terminator(&mut self, t: Terminator) -> &mut WriterBuilder { self.terminator = t; self }
+
+    pub fn from_writer<W: Write>(&self, w: W) -> Writer<W> {
+        Writer { cfg: self.clone(), wtr: w, buf: Vec::new(), fields_in_record: 0, first_len: None, header_done: false }
+    }
+
+    pub fn from_path<P: AsRef<crate::path::Path>>(&self, path: P) -> Result<Writer<crate::fs::File>> {
+        let f = crate::fs::File::create(path)?;
+        Ok(self.from_writer(f))
+    }
+}
+
+/// Writes CSV records to a writer (buffered: call flush or into_inner,
+/// there is no Drop).
+pub struct Writer<W: Write> {
+    cfg: WriterBuilder,
+    wtr: W,
+    buf: Vec<u8>,
+    fields_in_record: u64,
+    first_len: Option<u64>,
+    header_done: bool,
+}
+
+impl Writer<crate::fs::File> {
+    pub fn from_path<P: AsRef<crate::path::Path>>(path: P) -> Result<Writer<crate::fs::File>> { WriterBuilder::new().from_path(path) }
+}
+
+fn numeric(f: &[u8]) -> bool {
+    match crate::str::from_utf8(f) {
+        Ok(s) => s.len() > 0 && (s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()),
+        Err(_) => false,
+    }
+}
+
+impl<W: Write> Writer<W> {
+    pub fn from_writer(w: W) -> Writer<W> { WriterBuilder::new().from_writer(w) }
+
+    /// Writes one field of the current record.
+    pub fn write_field<T: AsRef<[u8]>>(&mut self, field: T) -> Result<()> {
+        self.field(field.as_ref(), false);
+        Ok(())
+    }
+
+    fn field(&mut self, f: &[u8], only: bool) {
+        if self.fields_in_record > 0 { self.buf.push(self.cfg.delimiter); }
+        self.fields_in_record += 1;
+        let c = &self.cfg;
+        let needs = match c.quote_style {
+            QuoteStyle::Always => true,
+            QuoteStyle::Never => false,
+            QuoteStyle::NonNumeric => !numeric(f),
+            QuoteStyle::Necessary => (only && f.len() == 0) || f.iter().any(|b| *b == c.delimiter || *b == c.quote || *b == b'\r' || *b == b'\n'),
+        };
+        if !needs {
+            self.buf.extend_from_slice(f);
+            return;
+        }
+        self.buf.push(c.quote);
+        for b in f.iter() {
+            if *b == c.quote {
+                if c.double_quote { self.buf.push(c.quote); } else { self.buf.push(c.escape); }
+            }
+            self.buf.push(*b);
+        }
+        self.buf.push(c.quote);
+    }
+
+    // Ends the current record.
+    fn end(&mut self) -> Result<()> {
+        let n = self.fields_in_record;
+        match self.first_len {
+            None => self.first_len = Some(n),
+            Some(e) => if e != n && !self.cfg.flexible {
+                self.fields_in_record = 0;
+                return Err(Error { kind: ErrorKind::UnequalLengths { pos: None, expected_len: e, len: n } });
+            },
+        }
+        match self.cfg.terminator {
+            Terminator::CRLF => self.buf.extend_from_slice(b"\r\n"),
+            Terminator::Any(t) => self.buf.push(t),
+        }
+        self.fields_in_record = 0;
+        if self.buf.len() >= 8192 { self.flush_buf()?; }
+        Ok(())
+    }
+
+    /// Writes a record (its fields, then the end of the record; an empty
+    /// iterator ends a record begun with write_field).
+    pub fn write_record<I: IntoIterator<Item = T>, T: AsRef<[u8]>>(&mut self, record: I) -> Result<()> {
+        let fields: Vec<T> = record.into_iter().collect();
+        let only = fields.len() == 1 && self.fields_in_record == 0;
+        for f in fields.iter() { self.field(f.as_ref(), only); }
+        self.end()
+    }
+
+    pub fn write_byte_record(&mut self, record: &ByteRecord) -> Result<()> {
+        let only = record.len() == 1 && self.fields_in_record == 0;
+        for f in record.fields.iter() { self.field(f.as_slice(), only); }
+        self.end()
+    }
+
+    /// Writes x as a record: a struct's fields (after a header row of its
+    /// field names, the first time, with has_headers), or a tuple's,
+    /// array's or Vec's elements, or one value.
+    pub fn serialize<T>(&mut self, x: &T) -> Result<()> {
+        let v = reflect::value_of(x);
+        if v.kind() == Kind::Struct && self.cfg.has_headers && !self.header_done {
+            self.header_done = true;
+            let mut names: Vec<String> = Vec::new();
+            for f in v.ty().fields().iter() { names.push(f.name.to_string()); }
+            self.write_record(names.iter())?;
+        }
+        self.header_done = true;
+        let mut fields: Vec<String> = Vec::new();
+        match v.kind() {
+            Kind::Struct | Kind::Tuple => {
+                let mut i = 0;
+                while i < v.num_fields() {
+                    fields.push(text_of(&v.field(i))?);
+                    i += 1;
+                }
+            }
+            Kind::Array | Kind::Vec => {
+                let mut i = 0;
+                while i < v.len() {
+                    fields.push(text_of(&v.index(i))?);
+                    i += 1;
+                }
+            }
+            _ => fields.push(text_of(&v)?),
+        }
+        self.write_record(fields.iter())
+    }
+
+    fn flush_buf(&mut self) -> Result<()> {
+        if self.buf.len() > 0 {
+            self.wtr.write_all(self.buf.as_slice())?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    /// Writes the buffered records to the writer and flushes it.
+    pub fn flush(&mut self) -> Result<()> {
+        self.flush_buf()?;
+        self.wtr.flush()?;
+        Ok(())
+    }
+
+    /// Flushes and returns the writer.
+    pub fn into_inner(mut self) -> Result<W> {
+        self.flush()?;
+        Ok(self.wtr)
+    }
+
+    pub fn get_ref(&self) -> &W { &self.wtr }
+}
+
+// The text of a serialized value.
+fn text_of(v: &Value) -> Result<String> {
+    if is_option(v) {
+        if v.variant() == 0 { return Ok(String::new()); }
+        return text_of(&v.variant_field(0));
+    }
+    if v.kind() == Kind::Ref { return text_of(&v.deref()); }
+    match v.kind() {
+        Kind::Bool => Ok(if v.as_bool() { "true".to_string() } else { "false".to_string() }),
+        Kind::Char => Ok(v.as_char().to_string()),
+        Kind::F32 => Ok(`${v.as_f64() as f32:?}`),
+        Kind::F64 => Ok(`${v.as_f64():?}`),
+        _ => {
+            if v.is_int() { return Ok(if v.is_signed() { v.as_i128().to_string() } else { (v.as_i128() as u128).to_string() }); }
+            if v.is_str() { return Ok(v.as_str().to_string()); }
+            if v.kind() == Kind::Enum && v.num_variant_fields() == 0 { return Ok(v.variant_name().to_string()); }
+            Err(Error { kind: ErrorKind::Serialize(`cannot serialize ${v.ty().name()} as a field`) })
+        }
+    }
+}

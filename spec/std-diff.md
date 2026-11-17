@@ -276,3 +276,16 @@ DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）�
 | builder 方法 | 消费 `self` | `&self`，返回修改后的拷贝 | 值语义 |
 | 颜色、自动换行到终端宽度、`long_help` 与 `help` 两种格式 | 有 | 不输出颜色、不按宽度换行；`render_long_help` 同 `render_help` | 简化 |
 | 负数作为值（`allow_negative_numbers`）、`ArgGroup`、`Command::mut_arg`、补全脚本 | 有 | 没有 | 暂不需要 |
+
+### std::csv（csv crate）
+
+读写的结果和错误信息与 csv 1.4 相同（用同一个程序对比过），下面几处除外。
+
+| 项目 | csv crate | navi | 原因 |
+|---|---|---|---|
+| `Position` 的 `line`、`byte` | 由 csv-core 的状态机得出：`\r\n` 的 `\n` 算在下一条记录的开头，引号字段里的换行不计行数 | 记录第一个字节的偏移和它所在的行 | 照记录的真实位置 |
+| `deserialize`、`serialize` | serde | 通过 `std::reflect`：结构体按表头名对应字段（没有表头时按位置），元组、数组、`Vec` 按位置；`Option` 字段空字符串或解析失败是 `None` | 没有 serde |
+| `headers()` | 返回 `&StringRecord` | 返回 `StringRecord`（拷贝） | 简化 |
+| 写入 | `Writer` drop 时刷新缓冲 | 必须 `flush()` 或 `into_inner()` | 没有 Drop |
+| `write_record` 结束只用 `write_field` 写出的记录 | `write_record(None::<&[u8]>)` | 传一个空迭代器（如空 `Vec`） | 写法差异 |
+| `StringRecord` 的 `Index`（`&rec[0]`）、`Reader::seek`、`csv::invalid_option` 等 | 有 | 用 `get(i)`；其余没有 | 暂不需要 |
