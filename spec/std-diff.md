@@ -249,3 +249,16 @@ DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）�
 | `bufread::*`、`Decompress`/`Compress` 底层接口、`GzHeader` 的 `mtime_as_datetime`、zlib 预设字典 | 有 | 没有 | 暂不需要 |
 | 写入编码器的 `flush` | 同步刷新（sync flush） | 相同 | — |
 | 性能 | miniz/zlib（C） | 约为 C 实现的十分之一到二十分之一（navic 还不内联） | — |
+
+### std::log（log crate 加 env_logger）
+
+| 项目 | log / env_logger | navi | 原因 |
+|---|---|---|---|
+| `error!`、`info!` 等 | 宏；级别关闭时参数不求值 | 函数 `log::error(msg)` 等，参数是 `impl Display`；模板字符串是惰性的 `fmt::Arguments`，级别关闭时不格式化，但 `${}` 里的表达式照常求值 | 没有宏 |
+| 指定 target | `info!(target: "net", ...)` | `log::log_target("net", Level::Info, msg)` | 没有宏 |
+| 默认 target | 模块路径 `module_path!()` | 由调用处的文件路径推出（`src/net/http.navi` 是 `<crate>::net::http`；`src` 之外的文件取文件名） | 没有 `module_path!` |
+| `set_logger` | 参数是 `&'static dyn Log` | `&dyn Log`（GC 引用） | 没有生命周期 |
+| 环境变量 | `RUST_LOG` | `NAVI_LOG`（语法相同：`info`、`net=debug,warn`） | — |
+| `Target::Pipe` | `Box<dyn Write + Send>` | `&mut dyn Write` | 没有 `Box` |
+| 颜色、`WriteStyle` | 有 | 接受但不输出颜色 | 简化 |
+| `kv`（结构化字段）、`log::Log` 的 `&'static` 全局记录器以外的用法 | 有 | 没有 | 暂不需要 |
