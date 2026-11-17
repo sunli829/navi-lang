@@ -1,0 +1,1161 @@
+//! Command-line parsing (as Go's flag package, with the builder API of
+//! Rust's clap 4): options, flags, counters, positionals, subcommands,
+//! help and version output and errors in clap's format.
+//!
+//!     let m = Command::new("prog")
+//!         .version("1.0")
+//!         .about("Does things")
+//!         .arg(Arg::new("file").required(true).help("The input"))
+//!         .arg(Arg::new("verbose").short('v').long("verbose").action(ArgAction::Count))
+//!         .arg(Arg::new("port").short('p').long("port").default_value("80"))
+//!         .get_matches();                       // exits with help, version or errors
+//!     let file: String = m.get_one("file").unwrap();
+//!     let port: u16 = m.get_one("port").unwrap(); // parsed on access (FromStr)
+//!     let v = m.get_count("verbose");
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::str::FromStr;
+
+/// What an argument does when it is given.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ArgAction {
+    /// Takes a value (the last one given wins... once: twice is an error).
+    Set,
+    /// Takes values, every time it is given.
+    Append,
+    /// A flag: true when given.
+    SetTrue,
+    /// A flag: false when given.
+    SetFalse,
+    /// Counts how often it is given (-vvv).
+    Count,
+    /// Prints help and exits.
+    Help,
+    /// Prints the version and exits.
+    Version,
+}
+
+/// How many values an argument takes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ValueRange {
+    min: usize,
+    max: usize,
+}
+
+impl From<usize> for ValueRange {
+    fn from(n: usize) -> ValueRange { ValueRange { min: n, max: n } }
+}
+
+impl From<crate::ops::RangeFrom<usize>> for ValueRange {
+    fn from(r: crate::ops::RangeFrom<usize>) -> ValueRange { ValueRange { min: r.start, max: usize::MAX } }
+}
+
+impl From<crate::ops::RangeInclusive<usize>> for ValueRange {
+    fn from(r: crate::ops::RangeInclusive<usize>) -> ValueRange { ValueRange { min: r.start, max: r.end } }
+}
+
+impl From<crate::ops::Range<usize>> for ValueRange {
+    fn from(r: crate::ops::Range<usize>) -> ValueRange { ValueRange { min: r.start, max: r.end - 1 } }
+}
+
+/// How values are checked while parsing (clap's value_parser!, without
+/// macros): any string, a number, a bool, or one of a list.
+#[derive(Clone, Debug)]
+pub enum ValueParser {
+    String,
+    I64(i64, i64),
+    U64(u64, u64),
+    F64,
+    Bool,
+    Possible(Vec<String>),
+}
+
+impl ValueParser {
+    pub fn string() -> ValueParser { ValueParser::String }
+    pub fn i64() -> ValueParser { ValueParser::I64(i64::MIN, i64::MAX) }
+    pub fn u64() -> ValueParser { ValueParser::U64(0, u64::MAX) }
+    pub fn f64() -> ValueParser { ValueParser::F64 }
+    pub fn bool() -> ValueParser { ValueParser::Bool }
+    /// Integers in lo..=hi.
+    pub fn i64_range(lo: i64, hi: i64) -> ValueParser { ValueParser::I64(lo, hi) }
+    pub fn u64_range(lo: u64, hi: u64) -> ValueParser { ValueParser::U64(lo, hi) }
+    pub fn possible(values: &[&str]) -> ValueParser {
+        let mut v = Vec::new();
+        for s in values.iter() { v.push(s.to_string()); }
+        ValueParser::Possible(v)
+    }
+
+    // Err(the reason) for a value it rejects.
+    fn check(&self, v: &str) -> Result<(), String> {
+        match self {
+            ValueParser::String => Ok(()),
+            ValueParser::I64(lo, hi) => match v.parse::<i64>() {
+                Ok(x) => if x < *lo || x > *hi { Err(range_msg(x as i128, *lo as i128, *hi as i128, i64::MIN as i128, i64::MAX as i128)) } else { Ok(()) },
+                Err(e) => Err(e.to_string()),
+            },
+            ValueParser::U64(lo, hi) => match v.parse::<u64>() {
+                Ok(x) => if x < *lo || x > *hi { Err(range_msg(x as i128, *lo as i128, *hi as i128, 0, u64::MAX as i128)) } else { Ok(()) },
+                Err(e) => Err(e.to_string()),
+            },
+            ValueParser::F64 => match v.parse::<f64>() {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            },
+            ValueParser::Bool => if v == "true" || v == "false" { Ok(()) } else { Err(`value was not a boolean`) },
+            ValueParser::Possible(ps) => {
+                for p in ps.iter() {
+                    if p == v { return Ok(()); }
+                }
+                Err(String::new())
+            }
+        }
+    }
+}
+
+fn range_msg(x: i128, lo: i128, hi: i128, min: i128, max: i128) -> String {
+    if hi == max { `${x} is not in ${lo}..` } else if lo == min { `${x} is not in ..=${hi}` } else { `${x} is not in ${lo}..=${hi}` }
+}
+
+/// An argument: an option (--name value), a flag (--verbose) or a
+/// positional (neither short nor long).
+#[derive(Clone, Debug)]
+pub struct Arg {
+    id: String,
+    short: Option<char>,
+    long: Option<String>,
+    help: String,
+    long_help: Option<String>,
+    required: bool,
+    default: Vec<String>,
+    action: Option<ArgAction>,
+    num_args: Option<ValueRange>,
+    value_name: Option<String>,
+    value_names: Vec<String>,
+    index: Option<usize>,
+    env: Option<String>,
+    hide: bool,
+    aliases: Vec<String>,
+    short_aliases: Vec<char>,
+    conflicts: Vec<String>,
+    requires: Vec<String>,
+    parser: ValueParser,
+    delimiter: Option<char>,
+    hyphen_values: bool,
+    global: bool,
+}
+
+impl Arg {
+    pub fn new(id: &str) -> Arg {
+        Arg { id: id.to_string(), short: None, long: None, help: String::new(), long_help: None, required: false, default: Vec::new(), action: None, num_args: None, value_name: None, value_names: Vec::new(), index: None, env: None, hide: false, aliases: Vec::new(), short_aliases: Vec::new(), conflicts: Vec::new(), requires: Vec::new(), parser: ValueParser::String, delimiter: None, hyphen_values: false, global: false }
+    }
+
+    pub fn short(&self, c: char) -> Arg { let mut a = self.clone(); a.short = Some(c); a }
+    pub fn long(&self, s: &str) -> Arg { let mut a = self.clone(); a.long = Some(s.to_string()); a }
+    pub fn help(&self, s: &str) -> Arg { let mut a = self.clone(); a.help = s.to_string(); a }
+    pub fn long_help(&self, s: &str) -> Arg { let mut a = self.clone(); a.long_help = Some(s.to_string()); a }
+    pub fn required(&self, yes: bool) -> Arg { let mut a = self.clone(); a.required = yes; a }
+    pub fn default_value(&self, v: &str) -> Arg { let mut a = self.clone(); a.default = Vec::from([v.to_string()]); a }
+    pub fn action(&self, act: ArgAction) -> Arg { let mut a = self.clone(); a.action = Some(act); a }
+    pub fn num_args<R: Into<ValueRange>>(&self, n: R) -> Arg { let mut a = self.clone(); a.num_args = Some(n.into()); a }
+    pub fn value_name(&self, s: &str) -> Arg { let mut a = self.clone(); a.value_name = Some(s.to_string()); a }
+    /// The names of its values (num_args of them: --pair <K> <V>).
+    pub fn value_names(&self, names: &[&str]) -> Arg {
+        let mut a = self.clone();
+        a.value_names = Vec::new();
+        for n in names.iter() { a.value_names.push(n.to_string()); }
+        if a.num_args.is_none() { a.num_args = Some(ValueRange { min: names.len(), max: names.len() }); }
+        a
+    }
+    /// The position (from 1) of a positional.
+    pub fn index(&self, i: usize) -> Arg { let mut a = self.clone(); a.index = Some(i); a }
+    /// An environment variable giving the value when it is not on the
+    /// command line.
+    pub fn env(&self, var: &str) -> Arg { let mut a = self.clone(); a.env = Some(var.to_string()); a }
+    pub fn hide(&self, yes: bool) -> Arg { let mut a = self.clone(); a.hide = yes; a }
+    pub fn alias(&self, s: &str) -> Arg { let mut a = self.clone(); a.aliases.push(s.to_string()); a }
+    pub fn short_alias(&self, c: char) -> Arg { let mut a = self.clone(); a.short_aliases.push(c); a }
+    pub fn conflicts_with(&self, id: &str) -> Arg { let mut a = self.clone(); a.conflicts.push(id.to_string()); a }
+    pub fn requires(&self, id: &str) -> Arg { let mut a = self.clone(); a.requires.push(id.to_string()); a }
+    pub fn value_parser(&self, p: ValueParser) -> Arg { let mut a = self.clone(); a.parser = p; a }
+    /// Splits each value at c (--tag a,b).
+    pub fn value_delimiter(&self, c: char) -> Arg { let mut a = self.clone(); a.delimiter = Some(c); a }
+    pub fn allow_hyphen_values(&self, yes: bool) -> Arg { let mut a = self.clone(); a.hyphen_values = yes; a }
+    /// Also accepted after the subcommands' names.
+    pub fn global(&self, yes: bool) -> Arg { let mut a = self.clone(); a.global = yes; a }
+
+    pub fn get_id(&self) -> &str { self.id.as_str() }
+    pub fn get_help(&self) -> &str { self.help.as_str() }
+
+    fn positional(&self) -> bool { self.short.is_none() && self.long.is_none() }
+
+    fn act(&self) -> ArgAction {
+        match &self.action {
+            Some(a) => a.clone(),
+            None => {
+                let multi = match &self.num_args {
+                    Some(r) => r.max > 1,
+                    None => false,
+                };
+                if multi { ArgAction::Append } else { ArgAction::Set }
+            }
+        }
+    }
+
+    fn takes_value(&self) -> bool {
+        let a = self.act();
+        a == ArgAction::Set || a == ArgAction::Append
+    }
+
+    fn range(&self) -> ValueRange {
+        match &self.num_args {
+            Some(r) => r.clone(),
+            None => if self.takes_value() { ValueRange { min: 1, max: 1 } } else { ValueRange { min: 0, max: 0 } },
+        }
+    }
+
+    // " <K> <V>", " <name>", " <x> <x>".
+    fn value_part(&self) -> String {
+        if self.value_names.len() > 0 {
+            let mut s = String::new();
+            for n in self.value_names.iter() { s.push_str(` <${n}>`.as_str()); }
+            return s;
+        }
+        let r = self.range();
+        if r.min == r.max && r.min > 1 {
+            let mut s = String::new();
+            let mut k = 0;
+            while k < r.min {
+                s.push_str(` <${self.vname()}>`.as_str());
+                k += 1;
+            }
+            return s;
+        }
+        ` <${self.vname()}>`
+    }
+
+    fn vname(&self) -> String {
+        match &self.value_name {
+            Some(v) => v.clone(),
+            None => self.id.clone(),
+        }
+    }
+
+    // "<file>", "[rest]...", "--name <name>", "-v...", "--quiet".
+    fn usage(&self) -> String {
+        if self.positional() {
+            let r = self.range();
+            let multi = r.max > 1 || self.act() == ArgAction::Append;
+            let req = self.required || r.min > 0 && self.num_args.is_some();
+            let base = if req && self.required { `<${self.vname()}>` } else { `[${self.vname()}]` };
+            return if multi { `${base}...` } else { base };
+        }
+        let mut s = match &self.long {
+            Some(l) => `--${l}`,
+            None => `-${self.short.unwrap()}`,
+        };
+        if self.takes_value() { s.push_str(self.value_part().as_str()); }
+        s
+    }
+
+    // The left column of the help ("-n, --name <name>", "      --long").
+    fn help_name(&self) -> String {
+        if self.positional() { return self.usage(); }
+        let mut s = String::new();
+        match self.short {
+            Some(c) => {
+                s.push_str(`-${c}`.as_str());
+                if self.long.is_some() { s.push_str(", "); }
+            }
+            None => s.push_str("    "),
+        }
+        if let Some(l) = &self.long { s.push_str(`--${l}`.as_str()); }
+        if self.takes_value() {
+            let r = self.range();
+            s.push_str(self.value_part().as_str());
+            if r.max > 1 && r.min != r.max { s.push_str("..."); }
+        } else if self.act() == ArgAction::Count {
+            s.push_str("...");
+        }
+        s
+    }
+
+    // How the error messages name it ("--name <name>", "--quiet").
+    fn err_name(&self) -> String { self.usage() }
+
+    fn flag_name(&self) -> String {
+        match &self.long {
+            Some(l) => `--${l}`,
+            None => match self.short {
+                Some(c) => `-${c}`,
+                None => `<${self.vname()}>`,
+            },
+        }
+    }
+}
+
+/// Where a value came from.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ValueSource {
+    DefaultValue,
+    EnvVariable,
+    CommandLine,
+}
+
+#[derive(Clone, Debug)]
+struct Matched {
+    id: String,
+    values: Vec<String>,
+    count: usize,
+    source: ValueSource,
+    flag: Option<bool>,
+}
+
+/// The parsed arguments of a command.
+#[derive(Clone, Debug, Default)]
+pub struct ArgMatches {
+    args: Vec<Matched>,
+    sub: Option<(String, &ArgMatches)>,
+}
+
+impl ArgMatches {
+    fn find(&self, id: &str) -> Option<&Matched> {
+        for m in self.args.iter() {
+            if m.id == id { return Some(m); }
+        }
+        None
+    }
+
+    /// The value of id parsed as T (clap returns a reference to a value
+    /// its parser made; here values are parsed on access).
+    pub fn get_one<T: FromStr>(&self, id: &str) -> Option<T> {
+        let m = self.find(id)?;
+        if let Some(f) = m.flag {
+            return match f.to_string().parse::<T>() {
+                Ok(t) => Some(t),
+                Err(_) => None,
+            };
+        }
+        let v = m.values.last()?;
+        match v.parse::<T>() {
+            Ok(t) => Some(t),
+            Err(_) => None,
+        }
+    }
+
+    /// The value of id, or why there is none usable.
+    pub fn try_get_one<T: FromStr>(&self, id: &str) -> Result<Option<T>, MatchesError> {
+        let m = match self.find(id) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let v = match m.flag {
+            Some(f) => f.to_string(),
+            None => match m.values.last() {
+                Some(v) => v.clone(),
+                None => return Ok(None),
+            },
+        };
+        match v.parse::<T>() {
+            Ok(t) => Ok(Some(t)),
+            Err(_) => Err(MatchesError { msg: `could not parse the value of '${id}'` }),
+        }
+    }
+
+    /// The values of id parsed as T (those that do not parse are left
+    /// out).
+    pub fn get_many<T: FromStr>(&self, id: &str) -> Option<crate::vec::IntoIter<T>> {
+        let m = self.find(id)?;
+        if m.values.len() == 0 { return None; }
+        let mut out = Vec::new();
+        for v in m.values.iter() {
+            if let Ok(t) = v.parse::<T>() { out.push(t); }
+        }
+        Some(out.into_iter())
+    }
+
+    /// The raw values of id.
+    pub fn get_raw(&self, id: &str) -> Option<crate::vec::IntoIter<&str>> {
+        let m = self.find(id)?;
+        let mut out = Vec::new();
+        for v in m.values.iter() { out.push(v.as_str()); }
+        Some(out.into_iter())
+    }
+
+    /// A SetTrue/SetFalse flag's value (false when not defined).
+    pub fn get_flag(&self, id: &str) -> bool {
+        match self.find(id) {
+            Some(m) => m.flag.unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// How often a Count argument was given.
+    pub fn get_count(&self, id: &str) -> u8 {
+        match self.find(id) {
+            Some(m) => if m.count > 255 { 255 } else { m.count as u8 },
+            None => 0,
+        }
+    }
+
+    /// Whether id has a value (from the command line, a default or the
+    /// environment).
+    pub fn contains_id(&self, id: &str) -> bool { self.find(id).is_some() }
+
+    pub fn value_source(&self, id: &str) -> Option<ValueSource> {
+        match self.find(id) {
+            Some(m) => Some(m.source.clone()),
+            None => None,
+        }
+    }
+
+    /// The subcommand given and its matches.
+    pub fn subcommand(&self) -> Option<(&str, &ArgMatches)> {
+        match &self.sub {
+            Some((n, m)) => Some((n.as_str(), *m)),
+            None => None,
+        }
+    }
+
+    pub fn subcommand_name(&self) -> Option<&str> {
+        match &self.sub {
+            Some((n, _)) => Some(n.as_str()),
+            None => None,
+        }
+    }
+
+    pub fn subcommand_matches(&self, name: &str) -> Option<&ArgMatches> {
+        match &self.sub {
+            Some((n, m)) => if n == name { Some(*m) } else { None },
+            None => None,
+        }
+    }
+
+    /// The ids with values.
+    pub fn ids(&self) -> crate::vec::IntoIter<&str> {
+        let mut v = Vec::new();
+        for m in self.args.iter() { v.push(m.id.as_str()); }
+        v.into_iter()
+    }
+}
+
+/// ArgMatches::try_get_one's error.
+#[derive(Clone, Debug)]
+pub struct MatchesError {
+    msg: String,
+}
+
+impl Display for MatchesError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.msg.as_str()) }
+}
+
+/// What went wrong (or help and version, which are errors to
+/// try_get_matches).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ErrorKind {
+    InvalidValue,
+    UnknownArgument,
+    InvalidSubcommand,
+    NoEquals,
+    ValueValidation,
+    TooManyValues,
+    TooFewValues,
+    WrongNumberOfValues,
+    ArgumentConflict,
+    MissingRequiredArgument,
+    MissingSubcommand,
+    DisplayHelp,
+    DisplayVersion,
+    DisplayHelpOnMissingArgumentOrSubcommand,
+    Io,
+    Format,
+}
+
+/// A parse error, or the help or version text.
+#[derive(Clone)]
+pub struct Error {
+    kind: ErrorKind,
+    text: String,
+}
+
+impl Error {
+    pub fn kind(&self) -> ErrorKind { self.kind.clone() }
+
+    /// 0 for help and version, 2 for errors.
+    pub fn exit_code(&self) -> i32 {
+        match self.kind {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+            _ => 2,
+        }
+    }
+
+    /// The text clap prints (help and version to stdout, errors to stderr).
+    pub fn render(&self) -> String { self.text.clone() }
+
+    pub fn use_stderr(&self) -> bool { self.exit_code() != 0 }
+
+    /// Prints the text where it belongs.
+    pub fn print(&self) {
+        if self.use_stderr() { crate::io::eprint(self.text.as_str()); } else { crate::io::print(self.text.as_str()); }
+    }
+
+    /// Prints and exits.
+    pub fn exit(&self) -> ! {
+        self.print();
+        crate::process::exit(self.exit_code())
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.text.trim_end()) }
+}
+
+impl Debug for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`Error { kind: ${self.kind:?} }`) }
+}
+
+/// A command: its arguments, subcommands, and help and version text.
+#[derive(Clone, Debug)]
+pub struct Command {
+    name: String,
+    bin_name: Option<String>,
+    version: Option<String>,
+    about: Option<String>,
+    long_about: Option<String>,
+    author: Option<String>,
+    args: Vec<Arg>,
+    subs: Vec<Command>,
+    required_else_help: bool,
+    subcommand_required: bool,
+    no_help_flag: bool,
+    no_version_flag: bool,
+    after_help: Option<String>,
+}
+
+impl Command {
+    pub fn new(name: &str) -> Command {
+        Command { name: name.to_string(), bin_name: None, version: None, about: None, long_about: None, author: None, args: Vec::new(), subs: Vec::new(), required_else_help: false, subcommand_required: false, no_help_flag: false, no_version_flag: false, after_help: None }
+    }
+
+    pub fn version(&self, v: &str) -> Command { let mut c = self.clone(); c.version = Some(v.to_string()); c }
+    pub fn about(&self, s: &str) -> Command { let mut c = self.clone(); c.about = Some(s.to_string()); c }
+    pub fn long_about(&self, s: &str) -> Command { let mut c = self.clone(); c.long_about = Some(s.to_string()); c }
+    pub fn author(&self, s: &str) -> Command { let mut c = self.clone(); c.author = Some(s.to_string()); c }
+    pub fn after_help(&self, s: &str) -> Command { let mut c = self.clone(); c.after_help = Some(s.to_string()); c }
+    pub fn bin_name(&self, s: &str) -> Command { let mut c = self.clone(); c.bin_name = Some(s.to_string()); c }
+    pub fn arg(&self, a: Arg) -> Command { let mut c = self.clone(); c.args.push(a); c }
+    pub fn args<I: IntoIterator<Item = Arg>>(&self, xs: I) -> Command {
+        let mut c = self.clone();
+        for a in xs { c.args.push(a); }
+        c
+    }
+    pub fn subcommand(&self, s: Command) -> Command { let mut c = self.clone(); c.subs.push(s); c }
+    pub fn subcommands<I: IntoIterator<Item = Command>>(&self, xs: I) -> Command {
+        let mut c = self.clone();
+        for s in xs { c.subs.push(s); }
+        c
+    }
+    /// Help instead of an error when nothing is given.
+    pub fn arg_required_else_help(&self, yes: bool) -> Command { let mut c = self.clone(); c.required_else_help = yes; c }
+    pub fn subcommand_required(&self, yes: bool) -> Command { let mut c = self.clone(); c.subcommand_required = yes; c }
+    pub fn disable_help_flag(&self, yes: bool) -> Command { let mut c = self.clone(); c.no_help_flag = yes; c }
+    pub fn disable_version_flag(&self, yes: bool) -> Command { let mut c = self.clone(); c.no_version_flag = yes; c }
+
+    pub fn get_name(&self) -> &str { self.name.as_str() }
+
+    /// Parses the program's arguments; prints help, the version or an
+    /// error and exits as clap does.
+    pub fn get_matches(&self) -> ArgMatches { self.get_matches_from(crate::env::args()) }
+
+    pub fn get_matches_from<I: IntoIterator<Item = T>, T: Into<String>>(&self, args: I) -> ArgMatches {
+        match self.try_get_matches_from(args) {
+            Ok(m) => m,
+            Err(e) => e.exit(),
+        }
+    }
+
+    pub fn try_get_matches(&self) -> Result<ArgMatches, Error> { self.try_get_matches_from(crate::env::args()) }
+
+    /// Parses args (the first is the program, as in argv).
+    pub fn try_get_matches_from<I: IntoIterator<Item = T>, T: Into<String>>(&self, args: I) -> Result<ArgMatches, Error> {
+        let mut v: Vec<String> = Vec::new();
+        for a in args { v.push(a.into()); }
+        let c = self.built(true);
+        let prog = match &c.bin_name {
+            Some(b) => b.clone(),
+            None => c.name.clone(),
+        };
+        let rest = if v.len() > 0 { v[1..].to_vec() } else { Vec::new() };
+        let mut p = Parser { toks: rest, i: 0 };
+        p.parse(&c, prog.as_str(), &Vec::new())
+    }
+
+    /// The help text.
+    pub fn render_help(&self) -> String { self.built(true).help_text(self.name.as_str(), &Vec::new()) }
+    pub fn render_long_help(&self) -> String { self.render_help() }
+    pub fn render_version(&self) -> String {
+        match &self.version {
+            Some(v) => `${self.name} ${v}\n`,
+            None => `${self.name}\n`,
+        }
+    }
+    pub fn render_usage(&self) -> String { `Usage: ${self.built(true).full_usage(self.name.as_str(), &Vec::new())}` }
+
+    pub fn print_help(&self) -> crate::io::Result<()> {
+        crate::io::print(self.render_help());
+        Ok(())
+    }
+
+    // The command with its help and version arguments and help
+    // subcommand added.
+    fn built(&self, top: bool) -> Command {
+        let mut c = self.clone();
+        if !c.no_help_flag && !c.args.iter().any(|a| a.id == "help") {
+            c.args.push(Arg::new("help").short('h').long("help").action(ArgAction::Help).help("Print help"));
+        }
+        if top && c.version.is_some() && !c.no_version_flag && !c.args.iter().any(|a| a.id == "version") {
+            c.args.push(Arg::new("version").short('V').long("version").action(ArgAction::Version).help("Print version"));
+        }
+        if c.subs.len() > 0 && !c.subs.iter().any(|s| s.name == "help") {
+            c.subs.push(Command::new("help").about("Print this message or the help of the given subcommand(s)"));
+        }
+        // Positionals numbered in order.
+        let mut k = 1;
+        let mut i = 0;
+        while i < c.args.len() {
+            if c.args[i].positional() && c.args[i].index.is_none() {
+                c.args[i].index = Some(k);
+                k += 1;
+            }
+            i += 1;
+        }
+        c
+    }
+
+    fn positionals(&self) -> Vec<&Arg> {
+        let mut v: Vec<&Arg> = Vec::new();
+        for a in self.args.iter() {
+            if a.positional() { v.push(a); }
+        }
+        v.sort_by(|a, b| a.index.unwrap_or(0).cmp(&b.index.unwrap_or(0)));
+        v
+    }
+
+    fn options(&self) -> Vec<&Arg> {
+        let mut v: Vec<&Arg> = Vec::new();
+        for a in self.args.iter() {
+            if !a.positional() && !a.hide { v.push(a); }
+        }
+        v
+    }
+
+    // "prog [OPTIONS] <file> [rest]... [COMMAND]" (path: the parents and
+    // their required positionals).
+    fn full_usage(&self, prog: &str, path: &Vec<String>) -> String {
+        let mut s = prog.to_string();
+        for p in path.iter() {
+            s.push(' ');
+            s.push_str(p.as_str());
+        }
+        if self.options().len() > 0 { s.push_str(" [OPTIONS]"); }
+        for a in self.positionals().iter() {
+            if !a.hide {
+                s.push(' ');
+                s.push_str(a.usage().as_str());
+            }
+        }
+        if self.subs.len() > 0 { s.push_str(if self.subcommand_required { " <COMMAND>" } else { " [COMMAND]" }); }
+        s
+    }
+
+    // clap's usage for errors: the arguments used, then the positionals.
+    fn smart_usage(&self, prog: &str, path: &Vec<String>, used: &Vec<String>) -> String {
+        self.smart_usage_req(prog, path, used, &Vec::new())
+    }
+
+    // req: arguments now required (by another one), listed first.
+    fn smart_usage_req(&self, prog: &str, path: &Vec<String>, used: &Vec<String>, req: &Vec<String>) -> String {
+        let mut s = prog.to_string();
+        for p in path.iter() {
+            s.push(' ');
+            s.push_str(p.as_str());
+        }
+        for a in self.args.iter() {
+            if !a.positional() && (a.required || req.contains(&a.id)) {
+                s.push(' ');
+                s.push_str(a.usage().as_str());
+            }
+        }
+        for a in self.args.iter() {
+            if !a.positional() && !a.required && !req.contains(&a.id) && used.contains(&a.id) {
+                s.push(' ');
+                s.push_str(a.usage().as_str());
+            }
+        }
+        for a in self.positionals().iter() {
+            if !a.hide {
+                s.push(' ');
+                s.push_str(a.usage().as_str());
+            }
+        }
+        if self.subcommand_required && self.subs.len() > 0 { s.push_str(" <COMMAND>"); }
+        s
+    }
+
+    fn help_text(&self, prog: &str, path: &Vec<String>) -> String {
+        let mut out = String::new();
+        let about = match &self.long_about {
+            Some(a) => Some(a.clone()),
+            None => self.about.clone(),
+        };
+        if let Some(a) = about {
+            out.push_str(a.as_str());
+            out.push_str("\n\n");
+        }
+        out.push_str(`Usage: ${self.full_usage(prog, path)}\n`.as_str());
+        if self.subs.len() > 0 {
+            out.push_str("\nCommands:\n");
+            let mut rows: Vec<(String, String)> = Vec::new();
+            for s in self.subs.iter() { rows.push((s.name.clone(), s.about.clone().unwrap_or(String::new()))); }
+            table(&mut out, &rows);
+        }
+        let pos = self.positionals();
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for a in pos.iter() {
+            if !a.hide { rows.push((a.help_name(), help_of(a))); }
+        }
+        if rows.len() > 0 {
+            out.push_str("\nArguments:\n");
+            table(&mut out, &rows);
+        }
+        rows = Vec::new();
+        for a in self.options().iter() { rows.push((a.help_name(), help_of(a))); }
+        if rows.len() > 0 {
+            out.push_str("\nOptions:\n");
+            table(&mut out, &rows);
+        }
+        if let Some(a) = &self.after_help {
+            out.push('\n');
+            out.push_str(a.as_str());
+            out.push('\n');
+        }
+        out
+    }
+
+    fn find_long(&self, l: &str) -> Option<&Arg> {
+        for a in self.args.iter() {
+            if let Some(x) = &a.long {
+                if x == l { return Some(a); }
+            }
+            if a.aliases.iter().any(|x| x == l) { return Some(a); }
+        }
+        None
+    }
+
+    fn find_short(&self, c: char) -> Option<&Arg> {
+        for a in self.args.iter() {
+            if a.short == Some(c) || a.short_aliases.contains(&c) { return Some(a); }
+        }
+        None
+    }
+
+    fn find_sub(&self, name: &str) -> Option<&Command> {
+        for s in self.subs.iter() {
+            if s.name == name { return Some(s); }
+        }
+        None
+    }
+}
+
+fn help_of(a: &Arg) -> String {
+    let mut h = a.help.clone();
+    if let ValueParser::Possible(ps) = &a.parser {
+        let list = ps.join(", ");
+        h = if h.len() > 0 { `${h} [possible values: ${list}]` } else { `[possible values: ${list}]` };
+    }
+    if a.default.len() > 0 && a.takes_value() {
+        let d = a.default.join(" ");
+        h = if h.len() > 0 { `${h} [default: ${d}]` } else { `[default: ${d}]` };
+    }
+    if let Some(e) = &a.env {
+        h = if h.len() > 0 { `${h} [env: ${e}=]` } else { `[env: ${e}=]` };
+    }
+    h
+}
+
+// Two columns: the names padded to the longest plus two spaces.
+fn table(out: &mut String, rows: &Vec<(String, String)>) {
+    let mut w = 0;
+    for (n, _) in rows.iter() {
+        if n.chars().count() > w { w = n.chars().count(); }
+    }
+    for (n, h) in rows.iter() {
+        out.push_str("  ");
+        out.push_str(n.as_str());
+        let mut k = n.chars().count();
+        while k < w + 2 {
+            out.push(' ');
+            k += 1;
+        }
+        out.push_str(h.as_str());
+        out.push('\n');
+    }
+}
+
+// The Jaro similarity of two strings (clap suggests above 0.7).
+fn jaro(a: &str, b: &str) -> f64 {
+    let x: Vec<char> = a.chars().collect();
+    let y: Vec<char> = b.chars().collect();
+    if x.len() == 0 && y.len() == 0 { return 1.0; }
+    if x.len() == 0 || y.len() == 0 { return 0.0; }
+    let range = if crate::cmp::max(x.len(), y.len()) / 2 > 0 { crate::cmp::max(x.len(), y.len()) / 2 - 1 } else { 0 };
+    let mut xm: Vec<bool> = Vec::new();
+    xm.resize(x.len(), false);
+    let mut ym: Vec<bool> = Vec::new();
+    ym.resize(y.len(), false);
+    let mut m = 0;
+    let mut i = 0;
+    while i < x.len() {
+        let lo = if i > range { i - range } else { 0 };
+        let hi = crate::cmp::min(i + range + 1, y.len());
+        let mut j = lo;
+        while j < hi {
+            if !ym[j] && x[i] == y[j] {
+                xm[i] = true;
+                ym[j] = true;
+                m += 1;
+                break;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    if m == 0 { return 0.0; }
+    let mut t = 0;
+    let mut k = 0;
+    i = 0;
+    while i < x.len() {
+        if xm[i] {
+            while !ym[k] { k += 1; }
+            if x[i] != y[k] { t += 1; }
+            k += 1;
+        }
+        i += 1;
+    }
+    let mf = m as f64;
+    (mf / x.len() as f64 + mf / y.len() as f64 + (mf - (t / 2) as f64) / mf) / 3.0
+}
+
+fn suggest(word: &str, candidates: &Vec<String>) -> Option<String> {
+    let mut best: Option<String> = None;
+    let mut score = 0.7;
+    for c in candidates.iter() {
+        let s = jaro(word, c.as_str());
+        if s > score {
+            score = s;
+            best = Some(c.clone());
+        }
+    }
+    best
+}
+
+struct Parser {
+    toks: Vec<String>,
+    i: usize,
+}
+
+impl Parser {
+    fn err(&self, kind: ErrorKind, msg: String, usage: Option<String>) -> Error {
+        let mut t = `error: ${msg}`;
+        if let Some(u) = usage { t.push_str(`\nUsage: ${u}\n`.as_str()); }
+        t.push_str("\nFor more information, try '--help'.\n");
+        Error { kind, text: t }
+    }
+
+    fn parse(&mut self, c: &Command, prog: &str, path: &Vec<String>) -> Result<ArgMatches, Error> {
+        let mut found: Vec<Matched> = Vec::new();
+        let mut used: Vec<String> = Vec::new();
+        let pos = c.positionals();
+        let mut pi = 0;
+        let mut only_pos = false;
+        let mut sub: Option<(String, &ArgMatches)> = None;
+        if c.required_else_help && self.i >= self.toks.len() {
+            return Err(Error { kind: ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand, text: c.help_text(prog, path) });
+        }
+        while self.i < self.toks.len() {
+            let t = self.toks[self.i].clone();
+            self.i += 1;
+            if !only_pos && t == "--" {
+                only_pos = true;
+                continue;
+            }
+            if !only_pos && t.starts_with("--") {
+                let body = &t[2..];
+                let (name, inline) = match body.find('=') {
+                    Some(k) => (&body[0..k], Some(body[k + 1..].to_string())),
+                    None => (body, None),
+                };
+                let a = match c.find_long(name) {
+                    Some(a) => a,
+                    None => {
+                        let mut longs: Vec<String> = Vec::new();
+                        for x in c.args.iter() {
+                            if let Some(l) = &x.long { longs.push(l.clone()); }
+                        }
+                        let mut msg = `unexpected argument '${t}' found\n`;
+                        let mut u = used.clone();
+                        match suggest(name, &longs) {
+                            Some(s) => {
+                                msg.push_str(`\n  tip: a similar argument exists: '--${s}'\n`.as_str());
+                                if let Some(x) = c.find_long(s.as_str()) { u.push(x.id.clone()); }
+                            }
+                            None => if pos.len() > 0 { msg.push_str(`\n  tip: to pass '${t}' as a value, use '-- ${t}'\n`.as_str()); },
+                        }
+                        return Err(self.err(ErrorKind::UnknownArgument, msg, Some(c.smart_usage(prog, path, &u))));
+                    }
+                };
+                self.take(c, a, inline, &mut found, &mut used, prog, path, &t)?;
+                continue;
+            }
+            if !only_pos && t.starts_with("-") && t.len() > 1 && !(pi < pos.len() && pos[pi].hyphen_values) {
+                let cs: Vec<char> = t[1..].chars().collect();
+                let mut k = 0;
+                while k < cs.len() {
+                    let ch = cs[k];
+                    let a = match c.find_short(ch) {
+                        Some(a) => a,
+                        None => {
+                            let mut msg = `unexpected argument '-${ch}' found\n`;
+                            if pos.len() > 0 { msg.push_str(`\n  tip: to pass '-${ch}' as a value, use '-- -${ch}'\n`.as_str()); }
+                            return Err(self.err(ErrorKind::UnknownArgument, msg, Some(c.full_usage(prog, path))));
+                        }
+                    };
+                    if a.takes_value() {
+                        let rest: String = cs[k + 1..].iter().collect();
+                        let rest = if rest.starts_with("=") { rest[1..].to_string() } else { rest };
+                        let inline = if rest.len() > 0 { Some(rest) } else { None };
+                        self.take(c, a, inline, &mut found, &mut used, prog, path, `-${ch}`.as_str())?;
+                        break;
+                    }
+                    self.take(c, a, None, &mut found, &mut used, prog, path, `-${ch}`.as_str())?;
+                    k += 1;
+                }
+                continue;
+            }
+            // A subcommand, if no positional is waiting for this value.
+            if !only_pos && (pi >= pos.len() || pos[pi].act() == ArgAction::Append && found.iter().any(|m| m.id == pos[pi].id) || !pos[pi].required) {
+                if let Some(s) = c.find_sub(t.as_str()) {
+                    if s.name == "help" && c.find_sub("help").is_some() {
+                        // help [subcommand]
+                        if self.i < self.toks.len() {
+                            if let Some(target) = c.find_sub(self.toks[self.i].as_str()) {
+                                let mut np = path.clone();
+                                np.push(target.name.clone());
+                                let tb = target.built(false);
+                                return Err(Error { kind: ErrorKind::DisplayHelp, text: tb.help_text(prog, &np) });
+                            }
+                        }
+                        return Err(Error { kind: ErrorKind::DisplayHelp, text: c.help_text(prog, path) });
+                    }
+                    let mut np = path.clone();
+                    for a in pos.iter() {
+                        if a.required { np.push(a.usage()); }
+                    }
+                    np.push(s.name.clone());
+                    let sb = s.built(false);
+                    let m = self.parse(&sb, prog, &np)?;
+                    sub = Some((s.name.clone(), &m));
+                    break;
+                }
+            }
+            if pi >= pos.len() {
+                // An argument nothing takes.
+                let mut names: Vec<String> = Vec::new();
+                for s in c.subs.iter() { names.push(s.name.clone()); }
+                if c.subs.len() > 0 {
+                    let mut msg = `unrecognized subcommand '${t}'\n`;
+                    if let Some(s) = suggest(t.as_str(), &names) { msg.push_str(`\n  tip: a similar subcommand exists: '${s}'\n`.as_str()); }
+                    return Err(self.err(ErrorKind::InvalidSubcommand, msg, Some(c.full_usage(prog, path))));
+                }
+                return Err(self.err(ErrorKind::UnknownArgument, `unexpected argument '${t}' found\n`, Some(c.full_usage(prog, path))));
+            }
+            let a = pos[pi];
+            if let Err(why) = a.parser.check(t.as_str()) { return Err(self.bad_value(a, t.as_str(), why, prog, path, &used, c)); }
+            add_value(&mut found, a, t.clone());
+            if !used.contains(&a.id) { used.push(a.id.clone()); }
+            if !(a.act() == ArgAction::Append || a.range().max > 1) { pi += 1; }
+        }
+        // Defaults and the environment.
+        for a in c.args.iter() {
+            if found.iter().any(|m| m.id == a.id) { continue; }
+            if let Some(e) = &a.env {
+                if let Ok(v) = crate::env::var(e.as_str()) {
+                    found.push(Matched { id: a.id.clone(), values: Vec::from([v]), count: 0, source: ValueSource::EnvVariable, flag: None });
+                    continue;
+                }
+            }
+            if a.default.len() > 0 {
+                found.push(Matched { id: a.id.clone(), values: a.default.clone(), count: 0, source: ValueSource::DefaultValue, flag: None });
+                continue;
+            }
+            match a.act() {
+                ArgAction::SetTrue => found.push(Matched { id: a.id.clone(), values: Vec::new(), count: 0, source: ValueSource::DefaultValue, flag: Some(false) }),
+                ArgAction::SetFalse => found.push(Matched { id: a.id.clone(), values: Vec::new(), count: 0, source: ValueSource::DefaultValue, flag: Some(true) }),
+                ArgAction::Count => found.push(Matched { id: a.id.clone(), values: Vec::new(), count: 0, source: ValueSource::DefaultValue, flag: None }),
+                _ => {}
+            }
+        }
+        // Required arguments and relations.
+        let mut missing: Vec<String> = Vec::new();
+        for a in c.args.iter() {
+            if a.required && !found.iter().any(|m| m.id == a.id && m.source != ValueSource::DefaultValue || m.id == a.id && a.default.len() > 0) { missing.push(a.usage()); }
+        }
+        if missing.len() > 0 {
+            let mut msg = "the following required arguments were not provided:\n".to_string();
+            for m in missing.iter() { msg.push_str(`  ${m}\n`.as_str()); }
+            return Err(self.err(ErrorKind::MissingRequiredArgument, msg, Some(c.smart_usage(prog, path, &used))));
+        }
+        for a in c.args.iter() {
+            if !used.contains(&a.id) { continue; }
+            for x in a.conflicts.iter() {
+                if used.contains(x) {
+                    let other = c.args.iter().find(|y| y.id == *x).unwrap();
+                    let msg = `the argument '${a.err_name()}' cannot be used with '${other.err_name()}'\n`;
+                    let only = Vec::from([a.id.clone()]);
+                    return Err(self.err(ErrorKind::ArgumentConflict, msg, Some(c.smart_usage(prog, path, &only))));
+                }
+            }
+            for x in a.requires.iter() {
+                if !used.contains(x) {
+                    let other = c.args.iter().find(|y| y.id == *x).unwrap();
+                    let msg = `the following required arguments were not provided:\n  ${other.usage()}\n`;
+                    let req = Vec::from([other.id.clone()]);
+                    return Err(self.err(ErrorKind::MissingRequiredArgument, msg, Some(c.smart_usage_req(prog, path, &used, &req))));
+                }
+            }
+        }
+        if sub.is_none() && c.subcommand_required && c.subs.len() > 0 {
+            let mut names: Vec<String> = Vec::new();
+            for s in c.subs.iter() { names.push(s.name.clone()); }
+            let msg = `'${prog}' requires a subcommand but one was not provided\n  [subcommands: ${names.join(", ")}]\n`;
+            return Err(self.err(ErrorKind::MissingSubcommand, msg, Some(c.full_usage(prog, path))));
+        }
+        Ok(ArgMatches { args: found, sub })
+    }
+
+    fn bad_value(&self, a: &Arg, v: &str, why: String, prog: &str, path: &Vec<String>, used: &Vec<String>, c: &Command) -> Error {
+        let mut msg = if why.len() > 0 { `invalid value '${v}' for '${a.err_name()}': ${why}\n` } else { `invalid value '${v}' for '${a.err_name()}'\n` };
+        if let ValueParser::Possible(ps) = &a.parser {
+            msg.push_str(`  [possible values: ${ps.join(", ")}]\n`.as_str());
+            if let Some(s) = suggest(v, ps) { msg.push_str(`\n  tip: a similar value exists: '${s}'\n`.as_str()); }
+        }
+        let _ = used;
+        let _ = c;
+        self.err(ErrorKind::InvalidValue, msg, None)
+    }
+
+    // An option or flag a was given (name as written); inline: its =value.
+    fn take(&mut self, c: &Command, a: &Arg, inline: Option<String>, found: &mut Vec<Matched>, used: &mut Vec<String>, prog: &str, path: &Vec<String>, name: &str) -> Result<(), Error> {
+        let act = a.act();
+        let mut u: Vec<String> = (*used).clone();
+        if !u.contains(&a.id) { u.push(a.id.clone()); }
+        match act {
+            ArgAction::Help => return Err(Error { kind: ErrorKind::DisplayHelp, text: c.help_text(prog, path) }),
+            ArgAction::Version => {
+                let v = c.version.clone().unwrap_or(String::new());
+                return Err(Error { kind: ErrorKind::DisplayVersion, text: `${c.name} ${v}\n` });
+            }
+            ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count => {
+                if let Some(v) = inline {
+                    let msg = `unexpected value '${v}' for '${a.flag_name()}' found; no more were expected\n`;
+                    return Err(self.err(ErrorKind::TooManyValues, msg, Some(c.smart_usage(prog, path, &u))));
+                }
+                if act != ArgAction::Count && used.contains(&a.id) {
+                    let msg = `the argument '${a.flag_name()}' cannot be used multiple times\n`;
+                    return Err(self.err(ErrorKind::ArgumentConflict, msg, Some(c.full_usage(prog, path))));
+                }
+                if act == ArgAction::Count {
+                    let mut done = false;
+                    for m in found.iter_mut() {
+                        if m.id == a.id {
+                            m.count += 1;
+                            done = true;
+                        }
+                    }
+                    if !done { found.push(Matched { id: a.id.clone(), values: Vec::new(), count: 1, source: ValueSource::CommandLine, flag: None }); }
+                } else {
+                    found.push(Matched { id: a.id.clone(), values: Vec::new(), count: 1, source: ValueSource::CommandLine, flag: Some(act == ArgAction::SetTrue) });
+                }
+            }
+            _ => {
+                if act == ArgAction::Set && used.contains(&a.id) {
+                    let msg = `the argument '${a.err_name()}' cannot be used multiple times\n`;
+                    return Err(self.err(ErrorKind::ArgumentConflict, msg, Some(c.full_usage(prog, path))));
+                }
+                let r = a.range();
+                let mut vals: Vec<String> = Vec::new();
+                match inline {
+                    Some(v) => vals.push(v),
+                    None => {
+                        while vals.len() < r.max && self.i < self.toks.len() {
+                            let n = self.toks[self.i].clone();
+                            if n.starts_with("-") && n.len() > 1 && !a.hyphen_values { break; }
+                            vals.push(n);
+                            self.i += 1;
+                        }
+                    }
+                }
+                if vals.len() == 0 && r.min > 0 && self.i < self.toks.len() {
+                    // What stopped the values is looked at first: an
+                    // unknown argument is that error.
+                    let n = self.toks[self.i].clone();
+                    let unknown = if n.starts_with("--") {
+                        let body = &n[2..];
+                        let nm = match body.find('=') { Some(k) => &body[0..k], None => body };
+                        c.find_long(nm).is_none()
+                    } else {
+                        match n[1..].chars().next() { Some(ch) => c.find_short(ch).is_none(), None => false }
+                    };
+                    if unknown {
+                        let shown = if n.starts_with("--") { n.clone() } else { n[0..1 + n[1..].chars().next().unwrap().len_utf8()].to_string() };
+                        let mut msg = `unexpected argument '${shown}' found\n`;
+                        if c.positionals().len() > 0 { msg.push_str(`\n  tip: to pass '${shown}' as a value, use '-- ${shown}'\n`.as_str()); }
+                        return Err(self.err(ErrorKind::UnknownArgument, msg, Some(c.full_usage(prog, path))));
+                    }
+                }
+                if vals.len() == 0 && r.min > 0 {
+                    let msg = `a value is required for '${a.err_name()}' but none was supplied\n`;
+                    return Err(Error { kind: ErrorKind::InvalidValue, text: `error: ${msg}\nFor more information, try '--help'.\n` });
+                }
+                if vals.len() < r.min {
+                    let msg = `${r.min} values required for '${a.err_name()}' but ${vals.len()} ${if vals.len() == 1 { "was" } else { "were" }} provided\n`;
+                    return Err(self.err(ErrorKind::WrongNumberOfValues, msg, Some(c.full_usage(prog, path))));
+                }
+                let mut split: Vec<String> = Vec::new();
+                for v in vals.iter() {
+                    match a.delimiter {
+                        Some(d) => { for p in v.split(d) { split.push(p.to_string()); } }
+                        None => split.push(v.clone()),
+                    }
+                }
+                for v in split.iter() {
+                    if let Err(why) = a.parser.check(v.as_str()) { return Err(self.bad_value(a, v.as_str(), why, prog, path, used, c)); }
+                }
+                let _ = name;
+                for v in split.iter() { add_value(found, a, v.clone()); }
+            }
+        }
+        if !used.contains(&a.id) { used.push(a.id.clone()); }
+        Ok(())
+    }
+}
+
+fn add_value(found: &mut Vec<Matched>, a: &Arg, v: String) {
+    for m in found.iter_mut() {
+        if m.id == a.id {
+            m.values.push(v);
+            m.count += 1;
+            return;
+        }
+    }
+    found.push(Matched { id: a.id.clone(), values: Vec::from([v]), count: 1, source: ValueSource::CommandLine, flag: None });
+}

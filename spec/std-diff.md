@@ -262,3 +262,17 @@ DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）�
 | `Target::Pipe` | `Box<dyn Write + Send>` | `&mut dyn Write` | 没有 `Box` |
 | 颜色、`WriteStyle` | 有 | 接受但不输出颜色 | 简化 |
 | `kv`（结构化字段）、`log::Log` 的 `&'static` 全局记录器以外的用法 | 有 | 没有 | 暂不需要 |
+
+### std::cli（clap 4 的 builder API）
+
+帮助、版本和错误的文本（包括相似参数提示、`--` 提示、错误里的用法行）和 clap 4.6 逐字相同，已经用同样的程序对比过。
+
+| 项目 | clap | navi | 原因 |
+|---|---|---|---|
+| derive API（`#[derive(Parser)]`） | 有 | 没有，只有 builder API | 没有过程宏 |
+| `value_parser!(u16).range(..)`、`["a", "b"]` | 宏和多种 `IntoResettable` | `ValueParser::i64_range(lo, hi)`、`u64_range`、`possible(&[..])`、`i64()`、`u64()`、`f64()`、`bool()`、`string()` | 没有宏 |
+| `get_one::<T>` | 返回 `Option<&T>`，值在解析时按 value_parser 转换；类型不符时 panic | 返回 `Option<T>`，取值时用 `FromStr` 转换，转换失败是 `None` | 简化（GC 语言里返回拷贝即可） |
+| `get_many::<T>` | `ValuesRef<T>` | `vec::IntoIter<T>` | 同上 |
+| builder 方法 | 消费 `self` | `&self`，返回修改后的拷贝 | 值语义 |
+| 颜色、自动换行到终端宽度、`long_help` 与 `help` 两种格式 | 有 | 不输出颜色、不按宽度换行；`render_long_help` 同 `render_help` | 简化 |
+| 负数作为值（`allow_negative_numbers`）、`ArgGroup`、`Command::mut_arg`、补全脚本 | 有 | 没有 | 暂不需要 |
