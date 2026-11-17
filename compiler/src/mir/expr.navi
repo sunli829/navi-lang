@@ -241,11 +241,34 @@ impl Builder {
         ptr.deref()
     }
 
+    // A 128-bit literal wider than 64 bits: (high << 64) | low (lowered to
+    // std::rt::int128 with the function's other 128-bit operations).
+    fn wide_literal(&mut self, value: &str, t: &Type) -> Operand {
+        let (hi, lo, _) = types::consteval::parse_int_bits128(value);
+        self.wide_bits(hi, lo, t)
+    }
+
+    fn wide_bits(&mut self, hi: u64, lo: u64, t: &Type) -> Operand {
+        let u64_ = self.ctx().int(types::U64);
+        let h = self.temp(t);
+        self.assign(h.clone(), Rvalue::Cast { kind: CAST_NUMERIC, x: int_const(C_INT, hi as i64, u64_), from: u64_, to: t });
+        let sh = self.temp(t);
+        self.assign(sh.clone(), Rvalue::Bin { op: SHL, x: copy(h), y: int_const(C_INT, 64, u64_), ty: t, pos: 0 });
+        let l = self.temp(t);
+        self.assign(l.clone(), Rvalue::Cast { kind: CAST_NUMERIC, x: int_const(C_INT, lo as i64, u64_), from: u64_, to: t });
+        let r = self.temp(t);
+        self.assign(r.clone(), Rvalue::Bin { op: BIT_OR, x: copy(sh), y: copy(l), ty: t, pos: 0 });
+        copy(r)
+    }
+
     fn literal(&mut self, x: &Expr, kind: LitKind, value: &str) -> Operand {
         let t = self.type_of(x);
         match kind {
             LitKind::Int => {
-                let (v, _) = parse_int(value);
+                let (v, ok) = parse_int(value);
+                if !ok && t.kind == types::K_INT && (t.int == types::I128 || t.int == types::U128) {
+                    return self.wide_literal(value, t);
+                }
                 if t.kind == types::K_FLOAT {
                     let c = cnst(C_FLOAT, Some(t));
                     c.float = v as f64;
@@ -538,6 +561,17 @@ impl Builder {
             let p = self.place(x, false);
             self.assign(dest, Rvalue::Use(copy(p)));
             return;
+        }
+        if op == token::MINUS && t.kind == types::K_INT && !crate::resolve::cfg::stage0_mode() {
+            // A negated literal is a constant (-128i8 does not overflow).
+            if let ExprKind::Lit { kind: LitKind::Int, value, .. } = &inner.kind {
+                let (hi, lo, _) = types::consteval::parse_int_bits128(value.as_str());
+                let nlo = (!lo).wrapping_add(1);
+                let nhi = (!hi).wrapping_add(if nlo == 0 { 1 } else { 0 });
+                let v = if t.int == types::I128 || t.int == types::U128 { self.wide_bits(nhi, nlo, t) } else { int_const(C_INT, nlo as i64, t) };
+                self.assign(dest, Rvalue::Use(v));
+                return;
+            }
         }
         if op == token::MINUS || op == token::NOT {
             let (uop, trait_name, method) = if op == token::NOT { (NOT, "Not", "not") } else { (NEG, "Neg", "neg") };

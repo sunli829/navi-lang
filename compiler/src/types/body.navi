@@ -367,6 +367,47 @@ impl FnCtx {
 
     /// Solves the remaining obligations, applies literal defaults and stores
     /// fully resolved results.
+    // Integer literals must fit their types (-128i8: the literal of a
+    // negation may be one more than the largest positive value).
+    fn check_int_literals(&mut self) {
+        let body = self.body;
+        let mut negated: HashMap<u32, bool> = HashMap::new();
+        for x in body.type_order.iter() {
+            if let ExprKind::Unary { op, x: inner, .. } = &x.kind {
+                if *op == crate::syntax::token::MINUS {
+                    if let ExprKind::Lit { kind: ast::LitKind::Int, .. } = &inner.kind { negated.insert(inner.id, true); }
+                }
+            }
+        }
+        for x in body.type_order.iter() {
+            let (pos, value) = match &x.kind {
+                ExprKind::Lit { pos, kind: ast::LitKind::Int, value } => (*pos, value),
+                _ => continue,
+            };
+            let t = body.types[&x.id];
+            if t.kind != K_INT { continue; }
+            let bits = crate::layout::int_size(t.int) * 8;
+            let signed = t.int <= ISIZE || t.int == I128;
+            let (hi, lo, ok) = crate::types::consteval::parse_int_bits128(value.as_str());
+            if !ok {
+                // More than 128 bits.
+                self.errorf(pos, `literal out of range for ${t}`);
+                continue;
+            }
+            // The largest magnitude: 2^bits - 1, or 2^(bits-1) - 1 (one more
+            // when negated) for signed types, as (high, low) halves.
+            let width = if signed { bits - 1 } else { bits };
+            let (mhi, mlo) = if width >= 128 { (u64::MAX, u64::MAX) } else if width >= 64 { ((1u64 << (width - 64) as u64) - 1, u64::MAX) } else { (0u64, (1u64 << width as u64) - 1) };
+            let mut fits = hi < mhi || (hi == mhi && lo <= mlo);
+            if !fits && signed && negated.contains_key(&x.id) {
+                // mag + 1 = 2^(bits-1).
+                let (ehi, elo) = if mlo == u64::MAX { (mhi + 1, 0u64) } else { (mhi, mlo + 1) };
+                fits = hi == ehi && lo == elo;
+            }
+            if !fits { self.errorf(pos, `literal out of range for ${t}`); }
+        }
+    }
+
     pub fn finish(&mut self) {
         self.solve_pending(false);
         // Literal fallback: integers default to i32, floats to f64.
@@ -419,6 +460,7 @@ impl FnCtx {
             let t = self.res_final(body.types[&x.id], x.pos(), &mut reported);
             body.types.insert(x.id, t);
         }
+        if !tainted { self.check_int_literals(); }
         for l in body.local_order.iter() {
             let t = self.res_final(body.locals[&l.id], l.pos, &mut reported);
             body.locals.insert(l.id, t);
