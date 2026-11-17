@@ -1,0 +1,534 @@
+// The client (as reqwest::blocking): connections are kept and reused per
+// host once a response's body has been read to the end.
+
+use crate::io::{self, Read, Write, BufReader};
+use crate::net::{TcpStream, ToSocketAddrs};
+use crate::sync::Mutex;
+use crate::time::Duration;
+use crate::url::Url;
+use crate::http::{Body, Error, ErrorKind, HeaderMap, Method, Request, Response, StatusCode, Version};
+use crate::http::wire;
+
+/// What can be turned into a URL (&str, String, Url).
+pub trait IntoUrl {
+    fn into_url(&self) -> Result<Url, Error>;
+}
+
+impl IntoUrl for &str {
+    fn into_url(&self) -> Result<Url, Error> { Ok(Url::parse(*self)?) }
+}
+
+impl IntoUrl for String {
+    fn into_url(&self) -> Result<Url, Error> { Ok(Url::parse(self.as_str())?) }
+}
+
+impl IntoUrl for Url {
+    fn into_url(&self) -> Result<Url, Error> { Ok(self.clone()) }
+}
+
+impl IntoUrl for &Url {
+    fn into_url(&self) -> Result<Url, Error> { Ok((*self).clone()) }
+}
+
+/// GETs url with a new Client.
+pub fn get<U: IntoUrl>(url: U) -> Result<Response, Error> { Client::new().get(url).send() }
+
+/// POSTs body to url with a new Client.
+pub fn post<U: IntoUrl, B: Into<Body>>(url: U, body: B) -> Result<Response, Error> { Client::new().post(url).body(body).send() }
+
+// An idle connection.
+#[derive(Clone)]
+struct Conn {
+    key: String,
+    stream: TcpStream,
+    r: &mut BufReader<TcpStream>,
+}
+
+/// Sends requests; clones share the connection pool.
+#[derive(Clone)]
+pub struct Client {
+    timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
+    max_redirects: usize,
+    user_agent: String,
+    headers: HeaderMap,
+    pool_max_idle: usize,
+    pool: &Mutex<Vec<Conn>>,
+}
+
+/// Configures a Client.
+#[derive(Clone)]
+pub struct ClientBuilder {
+    c: Client,
+}
+
+impl ClientBuilder {
+    /// The timeout of each connect, read and write (none by default).
+    pub fn timeout(&self, d: Duration) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.timeout = Some(d);
+        b
+    }
+
+    pub fn connect_timeout(&self, d: Duration) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.connect_timeout = Some(d);
+        b
+    }
+
+    /// Redirects followed (10 by default; 0: none).
+    pub fn max_redirects(&self, n: usize) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.max_redirects = n;
+        b
+    }
+
+    pub fn user_agent(&self, ua: &str) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.user_agent = ua.to_string();
+        b
+    }
+
+    /// Headers sent with every request.
+    pub fn default_headers(&self, h: HeaderMap) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.headers = h;
+        b
+    }
+
+    /// Idle connections kept per client (0: none).
+    pub fn pool_max_idle(&self, n: usize) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.pool_max_idle = n;
+        b
+    }
+
+    pub fn build(&self) -> Result<Client, Error> { Ok(self.c.clone()) }
+}
+
+impl Default for Client {
+    fn default() -> Client { Client::new() }
+}
+
+impl Client {
+    pub fn new() -> Client {
+        Client { timeout: None, connect_timeout: None, max_redirects: 10, user_agent: "navi-http/1.0".to_string(), headers: HeaderMap::new(), pool_max_idle: 32, pool: &Mutex::new(Vec::new()) }
+    }
+
+    pub fn builder() -> ClientBuilder { ClientBuilder { c: Client::new() } }
+
+    pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::GET, url) }
+    pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::POST, url) }
+    pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::PUT, url) }
+    pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::PATCH, url) }
+    pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::DELETE, url) }
+    pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::HEAD, url) }
+
+    pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
+        match url.into_url() {
+            Ok(u) => RequestBuilder { client: self.clone(), req: Request::new(method, u), err: None, timeout: None },
+            Err(e) => RequestBuilder { client: self.clone(), req: Request::new(method, Url::parse("http://invalid/").unwrap()), err: Some(e), timeout: None },
+        }
+    }
+
+    /// Sends req, following redirects.
+    pub fn execute(&self, req: Request) -> Result<Response, Error> { self.execute_timeout(req, self.timeout) }
+
+    fn execute_timeout(&self, req: Request, timeout: Option<Duration>) -> Result<Response, Error> {
+        let mut req = req;
+        let mut redirects = 0;
+        loop {
+            let resp = self.send_once(&mut req, timeout)?;
+            let code = resp.status.as_u16();
+            let location = resp.headers.get("location");
+            if !(code == 301 || code == 302 || code == 303 || code == 307 || code == 308) || location.is_none() || self.max_redirects == 0 {
+                return Ok(resp);
+            }
+            let next = match req.url.join(location.unwrap()) {
+                Ok(u) => u,
+                Err(_) => return Ok(resp),
+            };
+            if redirects == self.max_redirects {
+                let mut e = Error::new(ErrorKind::Redirect, "too many redirects");
+                e.url = Some(next);
+                return Err(e);
+            }
+            redirects += 1;
+            let keep_body = code == 307 || code == 308;
+            if keep_body && req.body.as_bytes().is_none() { return Ok(resp); }
+            // Frees the connection when the body is short.
+            let mut r = resp;
+            if r.content_length().unwrap_or(1 << 20) < 65536 { let _ = r.clone().bytes(); }
+            if !keep_body {
+                if req.method != Method::HEAD { req.method = Method::GET; }
+                req.body = Body::empty();
+                req.headers.remove("content-length");
+                req.headers.remove("content-type");
+                req.headers.remove("transfer-encoding");
+            } else {
+                // Sends the same bytes again.
+                let b = req.body.as_bytes().unwrap().to_vec();
+                req.body = Body::from(b);
+            }
+            if next.host_str() != req.url.host_str() || next.port_or_known_default() != req.url.port_or_known_default() {
+                req.headers.remove("authorization");
+                req.headers.remove("cookie");
+            }
+            req.target = wire::target_of(&next);
+            req.url = next;
+        }
+    }
+
+    // One request and its response's head.
+    fn send_once(&self, req: &mut Request, timeout: Option<Duration>) -> Result<Response, Error> {
+        let url = req.url.clone();
+        if url.scheme() == "https" {
+            let mut e = Error::new(ErrorKind::Builder, "https is not supported (std::http has no TLS)");
+            e.url = Some(url);
+            return Err(e);
+        }
+        if url.scheme() != "http" {
+            let mut e = Error::new(ErrorKind::Builder, `unsupported URL scheme ${url.scheme()}`);
+            e.url = Some(url);
+            return Err(e);
+        }
+        let host = match url.host_str() {
+            Some(h) => h.to_string(),
+            None => return Err(Error::new(ErrorKind::Builder, "URL without a host")),
+        };
+        let port = url.port_or_known_default().unwrap_or(80);
+        let key = `${host}:${port}`;
+        let head = self.request_head(req, url.port().is_some(), host.as_str(), port);
+        // A pooled connection may have been closed by the server: then the
+        // request is sent again on a new one (if its body can be).
+        let mut attempt = 0;
+        loop {
+            let (conn, reused) = match self.take_idle(key.as_str()) {
+                Some(c) => (c, true),
+                None => (self.connect(key.as_str(), url.host(), port, timeout, &url)?, false),
+            };
+            let mut stream = conn.stream.clone();
+            let _ = stream.set_read_timeout(timeout);
+            let _ = stream.set_write_timeout(timeout);
+            let r = self.round_trip(&conn, req, head.as_str(), &url);
+            match r {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    stream.close();
+                    attempt += 1;
+                    if !reused || attempt > 1 || req.body.as_bytes().is_none() || e.kind == ErrorKind::Timeout { return Err(e); }
+                }
+            }
+        }
+    }
+
+    fn request_head(&self, req: &Request, explicit_port: bool, host: &str, port: u16) -> String {
+        let mut h = String::with_capacity(256);
+        h.push_str(req.method.as_str());
+        h.push(' ');
+        h.push_str(req.target.as_str());
+        h.push_str(" HTTP/1.1\r\n");
+        if !req.headers.contains_key("host") {
+            h.push_str("Host: ");
+            h.push_str(host);
+            if explicit_port { h.push_str(`:${port}`.as_str()); }
+            h.push_str("\r\n");
+        }
+        if !req.headers.contains_key("user-agent") && !self.headers.contains_key("user-agent") && self.user_agent.len() > 0 {
+            h.push_str(`User-Agent: ${self.user_agent}\r\n`.as_str());
+        }
+        if !req.headers.contains_key("accept") && !self.headers.contains_key("accept") { h.push_str("Accept: */*\r\n"); }
+        let mut defaults = HeaderMap::new();
+        for (k, v) in self.headers.iter() {
+            if !req.headers.contains_key(k.as_str()) { defaults.append(k.as_str(), v.as_str()); }
+        }
+        wire::put_headers(&mut h, &defaults);
+        wire::put_headers(&mut h, &req.headers);
+        if !req.headers.contains_key("content-length") && !req.headers.contains_key("transfer-encoding") {
+            match req.body.len() {
+                Some(n) => if n > 0 || !(req.method == Method::GET || req.method == Method::HEAD) { h.push_str(`Content-Length: ${n}\r\n`.as_str()); },
+                None => h.push_str("Transfer-Encoding: chunked\r\n"),
+            }
+        }
+        h.push_str("\r\n");
+        h
+    }
+
+    fn take_idle(&self, key: &str) -> Option<Conn> {
+        let v = self.pool.lock();
+        let mut found: Option<Conn> = None;
+        let mut i = v.len();
+        while i > 0 {
+            i -= 1;
+            if v[i].key == key {
+                found = Some(v.remove(i));
+                break;
+            }
+        }
+        self.pool.unlock();
+        found
+    }
+
+    fn put_idle(&self, c: Conn) {
+        let v = self.pool.lock();
+        if v.len() < self.pool_max_idle {
+            v.push(c);
+            self.pool.unlock();
+        } else {
+            self.pool.unlock();
+            c.stream.close();
+        }
+    }
+
+    fn connect(&self, key: &str, host: Option<crate::url::Host>, port: u16, timeout: Option<Duration>, url: &Url) -> Result<Conn, Error> {
+        let addrs = match host {
+            Some(crate::url::Host::Domain(d)) => (d.as_str(), port).to_socket_addrs(),
+            Some(crate::url::Host::Ipv4(a)) => crate::net::SocketAddr::new(crate::net::IpAddr::V4(a), port).to_socket_addrs(),
+            Some(crate::url::Host::Ipv6(a)) => crate::net::SocketAddr::new(crate::net::IpAddr::V6(a), port).to_socket_addrs(),
+            None => return Err(Error::new(ErrorKind::Builder, "URL without a host")),
+        };
+        let addrs = match addrs {
+            Ok(a) => a,
+            Err(e) => {
+                let mut x = Error::new(ErrorKind::Connect, `cannot resolve ${key}: ${e}`);
+                x.url = Some(url.clone());
+                return Err(x);
+            }
+        };
+        let ct = match self.connect_timeout {
+            Some(d) => Some(d),
+            None => timeout,
+        };
+        let mut last: Option<io::Error> = None;
+        for a in addrs {
+            let r = match ct {
+                Some(d) => TcpStream::connect_timeout(&a, d),
+                None => TcpStream::connect(a.clone()),
+            };
+            match r {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    return Ok(Conn { key: key.to_string(), stream: s.clone(), r: &mut BufReader::new(s) });
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        let msg = match last {
+            Some(e) => {
+                if e.kind() == io::ErrorKind::TimedOut {
+                    let mut x = Error::new(ErrorKind::Timeout, `connect to ${key} timed out`);
+                    x.url = Some(url.clone());
+                    return Err(x);
+                }
+                `cannot connect to ${key}: ${e}`
+            }
+            None => `no addresses for ${key}`,
+        };
+        let mut x = Error::new(ErrorKind::Connect, msg);
+        x.url = Some(url.clone());
+        Err(x)
+    }
+
+    fn round_trip(&self, conn: &Conn, req: &mut Request, head: &str, url: &Url) -> Result<Response, Error> {
+        let mut w = conn.stream.clone();
+        let with_err_url = |e: Error| -> Error {
+            let mut x = e;
+            x.url = Some(url.clone());
+            x
+        };
+        let chunked = req.body.len().is_none() && !req.headers.contains_key("content-length");
+        // The head and a short body in one write.
+        match req.body.as_bytes() {
+            Some(b) if b.len() <= 16384 && !chunked => {
+                let mut all: Vec<u8> = Vec::with_capacity(head.len() + b.len());
+                all.extend_from_slice(head.as_bytes());
+                all.extend_from_slice(b);
+                if let Err(e) = w.write_all(all.as_slice()) { return Err(with_err_url(Error::from(e))); }
+            }
+            _ => {
+                if let Err(e) = w.write_all(head.as_bytes()) { return Err(with_err_url(Error::from(e))); }
+                if let Err(e) = wire::write_body(&mut w, &mut req.body, chunked) { return Err(with_err_url(Error::from(e))); }
+            }
+        }
+        // The status line, skipping 1xx responses.
+        let (version, code, headers) = loop {
+            let line = match wire::read_line(conn.r, 65536) {
+                Ok(Some(l)) => l,
+                Ok(None) => return Err(with_err_url(Error::new(ErrorKind::Connect, "connection closed before the response"))),
+                Err(e) => return Err(with_err_url(Error::from(e))),
+            };
+            let (v, c) = match parse_status_line(line.as_str()) {
+                Some(x) => x,
+                None => return Err(with_err_url(Error::new(ErrorKind::Protocol, `malformed status line ${line:?}`))),
+            };
+            let h = match wire::read_headers(conn.r, 1 << 20) {
+                Ok(h) => h,
+                Err(e) => return Err(with_err_url(Error::new(ErrorKind::Protocol, e.to_string()))),
+            };
+            if c >= 100 && c < 200 && c != 101 { continue; }
+            break (v, c, h);
+        };
+        let no_body = req.method == Method::HEAD || code == 204 || code == 304 || (code >= 100 && code < 200);
+        let (mode, len) = if no_body {
+            (wire::LEN, 0u64)
+        } else {
+            match wire::framing(&headers) {
+                Ok(f) => f,
+                Err(e) => return Err(with_err_url(Error::new(ErrorKind::Protocol, e.to_string()))),
+            }
+        };
+        let keep = mode != wire::TO_CLOSE && !headers.has_token("connection", "close") && !req.headers.has_token("connection", "close")
+            && (version == Version::HTTP_11 || headers.has_token("connection", "keep-alive"));
+        let inc = wire::incoming(conn.r, mode, len);
+        let me = self.clone();
+        let c = conn.clone();
+        if keep {
+            inc.set_on_done(|| me.put_idle(c));
+        }
+        let body_len = if mode == wire::LEN { Some(len) } else { None };
+        let mut resp = Response::new(StatusCode(code));
+        resp.version = version;
+        resp.headers = headers;
+        resp.body = Body::from_reader(inc, body_len);
+        resp.url = Some(url.clone());
+        Ok(resp)
+    }
+}
+
+// "HTTP/1.1 200 OK" -> (version, code).
+fn parse_status_line(line: &str) -> Option<(Version, u16)> {
+    let version = if line.starts_with("HTTP/1.1 ") {
+        Version::HTTP_11
+    } else if line.starts_with("HTTP/1.0 ") {
+        Version::HTTP_10
+    } else {
+        return None;
+    };
+    let rest = &line[9..];
+    if rest.len() < 3 { return None; }
+    let code = match rest[0..3].parse::<u16>() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    if code < 100 || (rest.len() > 3 && rest.as_bytes()[3] != b' ') { return None; }
+    Some((version, code))
+}
+
+/// A request being built (Client::get(url).header(..).send()).
+#[derive(Clone)]
+pub struct RequestBuilder {
+    client: Client,
+    req: Request,
+    err: Option<Error>,
+    timeout: Option<Duration>,
+}
+
+impl RequestBuilder {
+    /// Adds a header value.
+    pub fn header(&self, name: &str, value: &str) -> RequestBuilder {
+        let mut b = self.clone();
+        b.req.headers.append(name, value);
+        b
+    }
+
+    /// Adds the headers' values.
+    pub fn headers(&self, h: HeaderMap) -> RequestBuilder {
+        let mut b = self.clone();
+        for (k, v) in h.iter() { b.req.headers.append(k.as_str(), v.as_str()); }
+        b
+    }
+
+    /// Appends the pairs to the URL's query.
+    pub fn query(&self, pairs: &[(&str, &str)]) -> RequestBuilder {
+        let mut b = self.clone();
+        {
+            let mut q = b.req.url.query_pairs_mut();
+            for (k, v) in pairs.iter() { q.append_pair(*k, *v); }
+        }
+        b.req.target = wire::target_of(&b.req.url);
+        b
+    }
+
+    pub fn basic_auth(&self, user: &str, password: Option<&str>) -> RequestBuilder {
+        let cred = match password {
+            Some(p) => `${user}:${p}`,
+            None => `${user}:`,
+        };
+        self.header("Authorization", `Basic ${base64(cred.as_bytes())}`.as_str())
+    }
+
+    pub fn bearer_auth(&self, token: &str) -> RequestBuilder { self.header("Authorization", `Bearer ${token}`.as_str()) }
+
+    pub fn body<B: Into<Body>>(&self, body: B) -> RequestBuilder {
+        let mut b = self.clone();
+        b.req.body = body.into();
+        b
+    }
+
+    /// An application/x-www-form-urlencoded body of the pairs.
+    pub fn form(&self, pairs: &[(&str, &str)]) -> RequestBuilder {
+        let mut s = crate::url::form_urlencoded::Serializer::new(String::new());
+        for (k, v) in pairs.iter() { s.append_pair(*k, *v); }
+        let mut b = self.body(s.finish());
+        b.req.headers.insert("Content-Type", "application/x-www-form-urlencoded");
+        b
+    }
+
+    /// A JSON body of x (std::json).
+    pub fn json<T>(&self, x: &T) -> RequestBuilder {
+        let mut b = self.clone();
+        match crate::json::to_string(x) {
+            Ok(s) => {
+                b.req.body = Body::from(s);
+                if !b.req.headers.contains_key("content-type") { b.req.headers.insert("Content-Type", "application/json"); }
+            }
+            Err(e) => b.err = Some(Error::new(ErrorKind::Builder, e.to_string())),
+        }
+        b
+    }
+
+    /// The timeout of each connect, read and write of this request.
+    pub fn timeout(&self, d: Duration) -> RequestBuilder {
+        let mut b = self.clone();
+        b.timeout = Some(d);
+        b
+    }
+
+    pub fn version(&self, v: Version) -> RequestBuilder {
+        let mut b = self.clone();
+        b.req.version = v;
+        b
+    }
+
+    pub fn build(&self) -> Result<Request, Error> {
+        match &self.err {
+            Some(e) => Err(e.clone()),
+            None => Ok(self.req.clone()),
+        }
+    }
+
+    pub fn send(&self) -> Result<Response, Error> {
+        let req = self.build()?;
+        let t = match self.timeout {
+            Some(d) => Some(d),
+            None => self.client.timeout,
+        };
+        self.client.execute_timeout(req, t)
+    }
+}
+
+fn base64(b: &[u8]) -> String {
+    let t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".as_bytes();
+    let mut s = String::with_capacity((b.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i < b.len() {
+        let n = b.len() - i;
+        let x = (b[i] as u32) << 16 | (if n > 1 { b[i + 1] as u32 } else { 0 }) << 8 | (if n > 2 { b[i + 2] as u32 } else { 0 });
+        s.push(t[(x >> 18 & 63) as usize] as char);
+        s.push(t[(x >> 12 & 63) as usize] as char);
+        s.push(if n > 1 { t[(x >> 6 & 63) as usize] as char } else { '=' });
+        s.push(if n > 2 { t[(x & 63) as usize] as char } else { '=' });
+        i += 3;
+    }
+    s
+}

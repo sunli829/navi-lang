@@ -1,0 +1,306 @@
+// HTTP/1.1 messages on a connection (RFC 9112): heads, body framing and
+// chunked coding.
+
+use crate::io::{self, Read, Write, BufRead, BufReader};
+use crate::net::TcpStream;
+use crate::url::Url;
+use crate::http::{Body, HeaderMap, is_token};
+
+/// The request target of url: "/path?query".
+pub(crate) fn target_of(u: &Url) -> String {
+    let mut s = u.path().to_string();
+    if s.len() == 0 { s.push('/'); }
+    if let Some(q) = u.query() {
+        s.push('?');
+        s.push_str(q);
+    }
+    s
+}
+
+fn bad(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, msg) }
+
+/// Reads a line ending in LF (CRLF or LF; without them). None at the end of
+/// the stream before any byte.
+pub(crate) fn read_line(r: &mut BufReader<TcpStream>, max: usize) -> io::Result<Option<String>> {
+    let mut v: Vec<u8> = Vec::new();
+    loop {
+        let (n, found) = {
+            let buf = r.fill_buf()?;
+            if buf.len() == 0 {
+                if v.len() == 0 { return Ok(None); }
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed in the middle of a line"));
+            }
+            match buf.iter().position(|c| *c == b'\n') {
+                Some(i) => {
+                    v.extend_from_slice(&buf[0..i]);
+                    (i + 1, true)
+                }
+                None => {
+                    v.extend_from_slice(buf);
+                    (buf.len(), false)
+                }
+            }
+        };
+        r.consume(n);
+        if v.len() > max { return Err(bad("header line too long")); }
+        if found { break; }
+    }
+    if v.len() > 0 && v[v.len() - 1] == b'\r' { v.pop(); }
+    Ok(Some(String::from_utf8_lossy(v.as_slice())))
+}
+
+/// Reads header fields up to the empty line (at most max bytes).
+pub(crate) fn read_headers(r: &mut BufReader<TcpStream>, max: usize) -> io::Result<HeaderMap> {
+    let mut h = HeaderMap::new();
+    let mut total = 0;
+    loop {
+        let line = match read_line(r, max)? {
+            Some(l) => l,
+            None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed in the header")),
+        };
+        if line.len() == 0 { return Ok(h); }
+        total += line.len();
+        if total > max { return Err(bad("header too large")); }
+        let b = line.as_bytes();
+        if b[0] == b' ' || b[0] == b'\t' { return Err(bad("obsolete header line folding")); }
+        let colon = match line.find(':') {
+            Some(i) => i,
+            None => return Err(bad("malformed header line")),
+        };
+        let name = &line[0..colon];
+        if name.len() == 0 || !name.as_bytes().iter().all(|c| is_token(*c)) { return Err(bad("invalid header name")); }
+        let value = line[colon + 1..].trim_matches(|c: char| c == ' ' || c == '\t');
+        h.append(name, value);
+    }
+}
+
+pub(crate) const LEN: u8 = 0;
+pub(crate) const CHUNKED: u8 = 1;
+pub(crate) const TO_CLOSE: u8 = 2;
+
+/// A received body read from the connection: Content-Length bytes,
+/// chunked, or up to the end of the connection.
+pub(crate) struct Incoming {
+    r: &mut BufReader<TcpStream>,
+    mode: u8,
+    // Bytes left of the body (LEN) or of the chunk (CHUNKED).
+    remaining: u64,
+    pub(crate) done: bool,
+    // Called once the body has been read (the connection can be reused).
+    on_done: Option<fn()>,
+    pub(crate) failed: bool,
+}
+
+pub(crate) fn incoming(r: &mut BufReader<TcpStream>, mode: u8, len: u64) -> &mut Incoming {
+    let inc = &mut Incoming { r, mode, remaining: len, done: false, on_done: None, failed: false };
+    if mode == LEN && len == 0 { inc.done = true; }
+    inc
+}
+
+impl Incoming {
+    pub(crate) fn set_on_done(&mut self, f: fn()) {
+        if self.done { f(); } else { self.on_done = Some(f); }
+    }
+
+    fn finish(&mut self) {
+        self.done = true;
+        if let Some(f) = self.on_done {
+            self.on_done = None;
+            f();
+        }
+    }
+
+    /// Reads and drops what is left of the body, up to limit bytes;
+    /// returns whether it was all read.
+    pub(crate) fn drain(&mut self, limit: u64) -> bool {
+        let mut buf = [0u8; 4096];
+        let mut n = 0u64;
+        while !self.done && !self.failed {
+            match self.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => {
+                    n += k as u64;
+                    if n > limit { return false; }
+                }
+                Err(_) => return false,
+            }
+        }
+        self.done
+    }
+
+    // Starts the next chunk; false after the last one.
+    fn next_chunk(&mut self) -> io::Result<bool> {
+        let line = match read_line(self.r, 4096)? {
+            Some(l) => l,
+            None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed in a chunked body")),
+        };
+        let hex = match line.find(';') {
+            Some(i) => line[0..i].trim(),
+            None => line.trim(),
+        };
+        if hex.len() == 0 || hex.len() > 16 { return Err(bad("invalid chunk size")); }
+        let size = match u64::from_str_radix(hex, 16) {
+            Ok(n) => n,
+            Err(_) => return Err(bad("invalid chunk size")),
+        };
+        if size == 0 {
+            // Trailer fields (ignored) up to the empty line.
+            read_headers(self.r, 65536)?;
+            return Ok(false);
+        }
+        self.remaining = size;
+        Ok(true)
+    }
+}
+
+impl Read for Incoming {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.done || buf.len() == 0 { return Ok(0); }
+        let r = self.read_inner(buf);
+        if r.is_err() { self.failed = true; }
+        r
+    }
+}
+
+impl Incoming {
+    fn read_inner(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.mode == TO_CLOSE {
+            let n = self.r.read(buf)?;
+            if n == 0 { self.finish(); }
+            return Ok(n);
+        }
+        if self.mode == CHUNKED && self.remaining == 0 {
+            if !self.next_chunk()? {
+                self.finish();
+                return Ok(0);
+            }
+        }
+        let want = if (buf.len() as u64) < self.remaining { buf.len() } else { self.remaining as usize };
+        let n = self.r.read(&mut buf[0..want])?;
+        if n == 0 { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed in the body")); }
+        self.remaining -= n as u64;
+        if self.remaining == 0 {
+            if self.mode == LEN {
+                self.finish();
+            } else {
+                // The CRLF after the chunk's data.
+                match read_line(self.r, 16)? {
+                    Some(l) => if l.len() != 0 { return Err(bad("missing CRLF after chunk")); },
+                    None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed in a chunked body")),
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// The body framing of a message with headers h: (mode, length), or Err
+/// for invalid framing.
+pub(crate) fn framing(h: &HeaderMap) -> io::Result<(u8, u64)> {
+    if let Some(te) = h.get("transfer-encoding") {
+        // The last coding must be chunked (no other codings are applied).
+        let mut last = "";
+        for t in te.split(',') { last = t.trim(); }
+        if !last.eq_ignore_ascii_case("chunked") { return Err(bad("unsupported transfer coding")); }
+        return Ok((CHUNKED, 0));
+    }
+    let all = h.get_all("content-length");
+    if all.len() > 0 {
+        let mut n: Option<u64> = None;
+        for v in all.iter() {
+            for part in v.split(',') {
+                let x = match part.trim().parse::<u64>() {
+                    Ok(x) => x,
+                    Err(_) => return Err(bad("invalid Content-Length")),
+                };
+                if let Some(y) = n {
+                    if y != x { return Err(bad("conflicting Content-Length")); }
+                }
+                n = Some(x);
+            }
+        }
+        return Ok((LEN, n.unwrap_or(0)));
+    }
+    Ok((TO_CLOSE, 0))
+}
+
+/// Writes the body (chunked: in chunks, ending with the last chunk).
+pub(crate) fn write_body(w: &mut TcpStream, body: &mut Body, chunked: bool) -> io::Result<()> {
+    if let Some(b) = body.as_bytes() {
+        if b.len() == 0 {
+            if chunked { w.write_all(b"0\r\n\r\n")?; }
+            return Ok(());
+        }
+        if chunked {
+            w.write_all(`${b.len():x}\r\n`.to_string().as_bytes())?;
+            w.write_all(b)?;
+            w.write_all(b"\r\n0\r\n\r\n")?;
+        } else {
+            w.write_all(b)?;
+        }
+        return Ok(());
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    buf.resize(32768, 0);
+    loop {
+        let n = body.read(buf.as_mut_slice())?;
+        if n == 0 { break; }
+        if chunked {
+            w.write_all(`${n:x}\r\n`.to_string().as_bytes())?;
+            w.write_all(&buf[0..n])?;
+            w.write_all(b"\r\n")?;
+        } else {
+            w.write_all(&buf[0..n])?;
+        }
+    }
+    if chunked { w.write_all(b"0\r\n\r\n")?; }
+    Ok(())
+}
+
+/// Appends "Name: value\r\n" for each header.
+pub(crate) fn put_headers(out: &mut String, h: &HeaderMap) {
+    for (k, v) in h.iter() {
+        put_name(out, k.as_str());
+        out.push_str(": ");
+        // No CR or LF in values (header injection).
+        for c in v.chars() {
+            if c != '\r' && c != '\n' { out.push(c); }
+        }
+        out.push_str("\r\n");
+    }
+}
+
+// The canonical form of a name ("content-type" as "Content-Type").
+fn put_name(out: &mut String, k: &str) {
+    let mut up = true;
+    for c in k.chars() {
+        out.push(if up { c.to_ascii_uppercase() } else { c });
+        up = c == '-';
+    }
+}
+
+/// An IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") for Unix seconds.
+pub(crate) fn http_date(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let wd = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][(days % 7) as usize];
+    // Days to civil date (H. Hinnant).
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(m - 1) as usize];
+    `${wd}, ${d:02} ${mon} ${y} ${rem / 3600:02}:${rem / 60 % 60:02}:${rem % 60:02} GMT`
+}
+
+pub(crate) fn now_date() -> String {
+    match crate::time::SystemTime::now().duration_since(crate::time::UNIX_EPOCH) {
+        Ok(d) => http_date(d.as_secs()),
+        Err(_) => http_date(0),
+    }
+}

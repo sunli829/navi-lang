@@ -1,0 +1,124 @@
+// stage0: skip
+// std::http: a server with a Router and a client talking to it over
+// localhost (keep-alive, chunked bodies, redirects, JSON, errors).
+// out: 200 OK | hello navi | text/plain; charset=utf-8
+// out: user 42 GET
+// out: files a/b/c.txt
+// out: 404 | 404 page not found
+// out: 405 | POST
+// out: 301 -> /dir/
+// out: dir index after redirect: http://HOST/dir/
+// out: echo 11 bytes: hello world
+// out: chunked echo 30000 bytes, ok true
+// out: form a=1 b=x y
+// out: json Point { x: 3, y: -4 } -> 5
+// out: head 200 len Some(10) body 0
+// out: query q=a b&c
+// out: 500 err true
+// out: stream 1|2|3|
+// out: https error true
+// out: connections 2
+// out: closed
+use std::http::{self, Client, Router, Request, Response, Server, StatusCode, Body};
+use std::sync::Mutex;
+use std::io::Read;
+
+#[derive(Debug, Clone, Default)]
+struct Point { x: i64, y: i64 }
+
+fn main() {
+    let server = Server::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().port();
+    let base = `http://127.0.0.1:${port}`;
+    let ports: &Mutex<Vec<u16>> = &Mutex::new(Vec::new());
+    let mut r = Router::new();
+    r.route("GET /hello", |_req| Response::from_string("hello navi"));
+    r.route("GET /users/{id}", |req| Response::from_string(`user ${req.path_value("id").unwrap()} ${req.method()}`));
+    r.route("/files/{path...}", |req| Response::from_string(`files ${req.path_value("path").unwrap()}`));
+    r.route("POST /only-post", |_req| Response::from_string("posted"));
+    r.route("/dir/", |req| Response::from_string(`dir index after redirect: ${req.url()}`));
+    r.route("POST /echo", |req| {
+        let b = req.bytes().unwrap();
+        Response::from_body(b)
+    });
+    r.route("POST /form", |req| {
+        let mut s = String::new();
+        for (k, v) in req.form().unwrap() { s.push_str(`${k}=${v} `.as_str()); }
+        Response::from_string(s.trim_end().to_string())
+    });
+    r.route("POST /norm", |req| {
+        let p: Point = req.json().unwrap();
+        let n = ((p.x * p.x + p.y * p.y) as f64).sqrt();
+        Response::from_string(`json ${p:?} -> ${n}`)
+    });
+    r.route("/q", |req| {
+        let mut s = String::new();
+        for (k, v) in req.query_pairs() { s.push_str(`${k}=${v}`.as_str()); }
+        Response::from_string(s)
+    });
+    r.route("/fail", |_req| Response::error(StatusCode::INTERNAL_SERVER_ERROR, "boom"));
+    r.route("/stream", |_req| {
+        let data = "1|2|3|".as_bytes().to_vec();
+        let cur = &mut std::io::Cursor::new(data);
+        Response::new(StatusCode::OK).with_body(Body::from_reader(cur, None))
+    });
+    r.route("/conns", |_req| {
+        let n = ports.lock().len();
+        ports.unlock();
+        Response::from_string(`connections ${n}`)
+    });
+    let srv = server.clone();
+    let h = std::thread::spawn(|| {
+        srv.serve(|req| {
+            let p = req.remote_addr().unwrap().port();
+            let v = ports.lock();
+            if !v.contains(&p) { v.push(p); }
+            ports.unlock();
+            r.handle(req)
+        }).unwrap();
+        println("closed");
+    });
+
+    let c = Client::new();
+    let mut resp = c.get(`${base}/hello`).send().unwrap();
+    let ct = resp.headers().get("content-type").unwrap_or("").to_string();
+    println(`${resp.status()} | ${resp.text().unwrap()} | ${ct}`);
+    println(c.get(`${base}/users/42`).send().unwrap().text().unwrap());
+    println(c.get(`${base}/files/a/b/c.txt`).send().unwrap().text().unwrap());
+    let mut nf = c.get(`${base}/nope`).send().unwrap();
+    println(`${nf.status().as_u16()} | ${nf.text().unwrap().trim()}`);
+    let na = c.get(`${base}/only-post`).send().unwrap();
+    println(`${na.status().as_u16()} | ${na.headers().get("allow").unwrap_or("")}`);
+    na.text().unwrap();
+    let nr = Client::builder().max_redirects(0).build().unwrap();
+    let rd = nr.get(`${base}/dir`).send().unwrap();
+    println(`${rd.status().as_u16()} -> ${rd.headers().get("location").unwrap_or("")}`);
+    println(c.get(`${base}/dir`).send().unwrap().text().unwrap().replace(`127.0.0.1:${port}`.as_str(), "HOST"));
+    let mut e = c.post(`${base}/echo`).body("hello world").send().unwrap();
+    let et = e.text().unwrap();
+    println(`echo ${et.len()} bytes: ${et}`);
+
+    let mut big: Vec<u8> = Vec::new();
+    for i in 0..30000 { big.push((i % 251) as u8); }
+    let src = &mut std::io::Cursor::new(big.clone());
+    let mut ce = c.post(`${base}/echo`).body(Body::from_reader(src, None)).send().unwrap();
+    let got = ce.bytes().unwrap();
+    println(`chunked echo ${got.len()} bytes, ok ${got == big}`);
+
+    println(`form ${c.post(`${base}/form`).form(&[("a", "1"), ("b", "x y")]).send().unwrap().text().unwrap()}`);
+    println(c.post(`${base}/norm`).json(&Point { x: 3, y: -4 }).send().unwrap().text().unwrap());
+    let mut hd = c.head(`${base}/hello`).send().unwrap();
+    let hb = hd.bytes().unwrap();
+    println(`head ${hd.status().as_u16()} len ${hd.content_length():?} body ${hb.len()}`);
+    println(`query ${c.get(`${base}/q`).query(&[("q", "a b&c")]).send().unwrap().text().unwrap()}`);
+    let f = c.get(`${base}/fail`).send().unwrap();
+    println(`${f.status().as_u16()} err ${f.error_for_status().is_err()}`);
+    f.text().unwrap();
+    println(`stream ${c.get(`${base}/stream`).send().unwrap().text().unwrap()}`);
+    println(`https error ${http::get("https://example.com/").is_err()}`);
+    // Every request of c on one kept-alive connection (each body read to
+    // the end gives it back), and one of nr.
+    println(c.get(`${base}/conns`).send().unwrap().text().unwrap());
+    server.close();
+    h.join().unwrap();
+}

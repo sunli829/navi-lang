@@ -1,0 +1,740 @@
+//! HTTP/1.1 client and server (as Go's net/http; the types follow Rust's
+//! http crate, the client reqwest::blocking, the router Go's ServeMux).
+//! Connections are blocking calls on green threads: the server runs each
+//! connection on its own thread. There is no TLS (https URLs are an error).
+//!
+//!     let body = http::get("http://example.com/")?.text()?;
+//!
+//!     let resp = Client::new().post("http://localhost:8080/api")
+//!         .with_header("Content-Type", "application/json")
+//!         .body(r#"{"a": 1}"#)
+//!         .send()?;
+//!
+//!     let mut r = Router::new();
+//!     r.route("GET /users/{id}", |req| Response::from_string(`user ${req.path_value("id").unwrap()}`));
+//!     http::serve("127.0.0.1:8080", |req| r.handle(req))?;
+
+mod wire;
+mod client;
+mod server;
+mod router;
+
+pub use client::{Client, ClientBuilder, RequestBuilder, get, post};
+pub use server::{Server, serve};
+pub use router::Router;
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::io::{self, Read};
+use crate::str::FromStr;
+use crate::url::Url;
+use crate::net::SocketAddr;
+
+/// A request method.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Method {
+    s: &str,
+}
+
+impl Method {
+    pub const GET: Method = Method { s: "GET" };
+    pub const POST: Method = Method { s: "POST" };
+    pub const PUT: Method = Method { s: "PUT" };
+    pub const DELETE: Method = Method { s: "DELETE" };
+    pub const HEAD: Method = Method { s: "HEAD" };
+    pub const OPTIONS: Method = Method { s: "OPTIONS" };
+    pub const CONNECT: Method = Method { s: "CONNECT" };
+    pub const PATCH: Method = Method { s: "PATCH" };
+    pub const TRACE: Method = Method { s: "TRACE" };
+
+    /// A method from its name (a token: letters, digits and !#$%&'*+-.^_`|~).
+    pub fn from_bytes(b: &[u8]) -> Result<Method, InvalidMethod> {
+        if b.len() == 0 { return Err(InvalidMethod {}); }
+        for c in b.iter() {
+            if !is_token(*c) { return Err(InvalidMethod {}); }
+        }
+        let name = String::from_utf8_lossy(b);
+        Ok(Method { s: name.as_str() })
+    }
+
+    pub fn as_str(&self) -> &str { self.s }
+
+    /// Whether requests with it change nothing (GET, HEAD, OPTIONS, TRACE).
+    pub fn is_safe(&self) -> bool {
+        match self.s {
+            "GET" | "HEAD" | "OPTIONS" | "TRACE" => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_idempotent(&self) -> bool {
+        self.is_safe() || self.s == "PUT" || self.s == "DELETE"
+    }
+}
+
+impl Display for Method {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.s) }
+}
+
+impl Debug for Method {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.s) }
+}
+
+impl FromStr for Method {
+    type Err = InvalidMethod;
+    fn from_str(s: &str) -> Result<Method, InvalidMethod> { Method::from_bytes(s.as_bytes()) }
+}
+
+impl Default for Method {
+    fn default() -> Method { Method::GET }
+}
+
+/// Method::from_bytes's error.
+#[derive(Clone, Debug)]
+pub struct InvalidMethod {}
+
+impl Display for InvalidMethod {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("invalid HTTP method") }
+}
+
+pub(crate) fn is_token(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || match c {
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~' => true,
+        _ => false,
+    }
+}
+
+/// A response status code (100 to 999).
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StatusCode(u16);
+
+impl StatusCode {
+    pub const CONTINUE: StatusCode = StatusCode(100);
+    pub const SWITCHING_PROTOCOLS: StatusCode = StatusCode(101);
+    pub const OK: StatusCode = StatusCode(200);
+    pub const CREATED: StatusCode = StatusCode(201);
+    pub const ACCEPTED: StatusCode = StatusCode(202);
+    pub const NO_CONTENT: StatusCode = StatusCode(204);
+    pub const PARTIAL_CONTENT: StatusCode = StatusCode(206);
+    pub const MOVED_PERMANENTLY: StatusCode = StatusCode(301);
+    pub const FOUND: StatusCode = StatusCode(302);
+    pub const SEE_OTHER: StatusCode = StatusCode(303);
+    pub const NOT_MODIFIED: StatusCode = StatusCode(304);
+    pub const TEMPORARY_REDIRECT: StatusCode = StatusCode(307);
+    pub const PERMANENT_REDIRECT: StatusCode = StatusCode(308);
+    pub const BAD_REQUEST: StatusCode = StatusCode(400);
+    pub const UNAUTHORIZED: StatusCode = StatusCode(401);
+    pub const FORBIDDEN: StatusCode = StatusCode(403);
+    pub const NOT_FOUND: StatusCode = StatusCode(404);
+    pub const METHOD_NOT_ALLOWED: StatusCode = StatusCode(405);
+    pub const NOT_ACCEPTABLE: StatusCode = StatusCode(406);
+    pub const REQUEST_TIMEOUT: StatusCode = StatusCode(408);
+    pub const CONFLICT: StatusCode = StatusCode(409);
+    pub const GONE: StatusCode = StatusCode(410);
+    pub const LENGTH_REQUIRED: StatusCode = StatusCode(411);
+    pub const PAYLOAD_TOO_LARGE: StatusCode = StatusCode(413);
+    pub const URI_TOO_LONG: StatusCode = StatusCode(414);
+    pub const UNSUPPORTED_MEDIA_TYPE: StatusCode = StatusCode(415);
+    pub const EXPECTATION_FAILED: StatusCode = StatusCode(417);
+    pub const UNPROCESSABLE_ENTITY: StatusCode = StatusCode(422);
+    pub const TOO_MANY_REQUESTS: StatusCode = StatusCode(429);
+    pub const REQUEST_HEADER_FIELDS_TOO_LARGE: StatusCode = StatusCode(431);
+    pub const INTERNAL_SERVER_ERROR: StatusCode = StatusCode(500);
+    pub const NOT_IMPLEMENTED: StatusCode = StatusCode(501);
+    pub const BAD_GATEWAY: StatusCode = StatusCode(502);
+    pub const SERVICE_UNAVAILABLE: StatusCode = StatusCode(503);
+    pub const GATEWAY_TIMEOUT: StatusCode = StatusCode(504);
+    pub const HTTP_VERSION_NOT_SUPPORTED: StatusCode = StatusCode(505);
+
+    pub fn from_u16(code: u16) -> Result<StatusCode, InvalidStatusCode> {
+        if code < 100 || code > 999 { Err(InvalidStatusCode {}) } else { Ok(StatusCode(code)) }
+    }
+
+    pub fn as_u16(&self) -> u16 { self.0 }
+
+    /// "200", as the http crate.
+    pub fn as_str(&self) -> String { self.0.to_string() }
+
+    pub fn is_informational(&self) -> bool { self.0 >= 100 && self.0 < 200 }
+    pub fn is_success(&self) -> bool { self.0 >= 200 && self.0 < 300 }
+    pub fn is_redirection(&self) -> bool { self.0 >= 300 && self.0 < 400 }
+    pub fn is_client_error(&self) -> bool { self.0 >= 400 && self.0 < 500 }
+    pub fn is_server_error(&self) -> bool { self.0 >= 500 && self.0 < 600 }
+
+    /// The standard reason phrase ("Not Found").
+    pub fn canonical_reason(&self) -> Option<&str> {
+        let r = match self.0 {
+            100 => "Continue",
+            101 => "Switching Protocols",
+            102 => "Processing",
+            103 => "Early Hints",
+            200 => "OK",
+            201 => "Created",
+            202 => "Accepted",
+            203 => "Non Authoritative Information",
+            204 => "No Content",
+            205 => "Reset Content",
+            206 => "Partial Content",
+            207 => "Multi-Status",
+            208 => "Already Reported",
+            226 => "IM Used",
+            300 => "Multiple Choices",
+            301 => "Moved Permanently",
+            302 => "Found",
+            303 => "See Other",
+            304 => "Not Modified",
+            305 => "Use Proxy",
+            307 => "Temporary Redirect",
+            308 => "Permanent Redirect",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            402 => "Payment Required",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            406 => "Not Acceptable",
+            407 => "Proxy Authentication Required",
+            408 => "Request Timeout",
+            409 => "Conflict",
+            410 => "Gone",
+            411 => "Length Required",
+            412 => "Precondition Failed",
+            413 => "Payload Too Large",
+            414 => "URI Too Long",
+            415 => "Unsupported Media Type",
+            416 => "Range Not Satisfiable",
+            417 => "Expectation Failed",
+            418 => "I'm a teapot",
+            421 => "Misdirected Request",
+            422 => "Unprocessable Entity",
+            423 => "Locked",
+            424 => "Failed Dependency",
+            425 => "Too Early",
+            426 => "Upgrade Required",
+            428 => "Precondition Required",
+            429 => "Too Many Requests",
+            431 => "Request Header Fields Too Large",
+            451 => "Unavailable For Legal Reasons",
+            500 => "Internal Server Error",
+            501 => "Not Implemented",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            505 => "HTTP Version Not Supported",
+            506 => "Variant Also Negotiates",
+            507 => "Insufficient Storage",
+            508 => "Loop Detected",
+            510 => "Not Extended",
+            511 => "Network Authentication Required",
+            _ => return None,
+        };
+        Some(r)
+    }
+}
+
+impl Display for StatusCode {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self.canonical_reason() {
+            Some(r) => f.write_fmt(`${self.0} ${r}`),
+            None => f.write_fmt(`${self.0} <unknown status code>`),
+        }
+    }
+}
+
+impl Debug for StatusCode {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`${self.0}`) }
+}
+
+impl Default for StatusCode {
+    fn default() -> StatusCode { StatusCode::OK }
+}
+
+/// StatusCode::from_u16's error.
+#[derive(Clone, Debug)]
+pub struct InvalidStatusCode {}
+
+impl Display for InvalidStatusCode {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("invalid status code") }
+}
+
+/// The HTTP version of a message.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Version(u8);
+
+impl Version {
+    pub const HTTP_10: Version = Version(10);
+    pub const HTTP_11: Version = Version(11);
+}
+
+impl Debug for Version {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(if self.0 == 10 { "HTTP/1.0" } else { "HTTP/1.1" }) }
+}
+
+impl Default for Version {
+    fn default() -> Version { Version::HTTP_11 }
+}
+
+/// Header fields: names compare without case and are kept lowercase; a
+/// name may have several values (in order).
+#[derive(Clone, Default)]
+pub struct HeaderMap {
+    v: Vec<(String, String)>,
+}
+
+impl HeaderMap {
+    pub fn new() -> HeaderMap { HeaderMap { v: Vec::new() } }
+
+    pub fn len(&self) -> usize { self.v.len() }
+    pub fn is_empty(&self) -> bool { self.v.len() == 0 }
+
+    /// The first value of name.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        for (k, v) in self.v.iter() {
+            if k.eq_ignore_ascii_case(name) { return Some(v.as_str()); }
+        }
+        None
+    }
+
+    pub fn get_all(&self, name: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        for (k, v) in self.v.iter() {
+            if k.eq_ignore_ascii_case(name) { out.push(v.as_str()); }
+        }
+        out
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool { self.get(name).is_some() }
+
+    /// Sets name to value, replacing its values; returns the first old one.
+    pub fn insert(&mut self, name: &str, value: &str) -> Option<String> {
+        let old = self.remove(name);
+        self.v.push((name.to_ascii_lowercase(), value.to_string()));
+        old
+    }
+
+    /// Adds a value for name; returns whether name had values.
+    pub fn append(&mut self, name: &str, value: &str) -> bool {
+        let had = self.contains_key(name);
+        self.v.push((name.to_ascii_lowercase(), value.to_string()));
+        had
+    }
+
+    /// Removes name's values; returns the first.
+    pub fn remove(&mut self, name: &str) -> Option<String> {
+        let mut first: Option<String> = None;
+        let mut i = 0;
+        while i < self.v.len() {
+            if self.v[i].0.eq_ignore_ascii_case(name) {
+                let (_, v) = self.v.remove(i);
+                if first.is_none() { first = Some(v); }
+            } else {
+                i += 1;
+            }
+        }
+        first
+    }
+
+    pub fn clear(&mut self) { self.v.clear(); }
+
+    /// The (name, value) pairs, in order.
+    pub fn iter(&self) -> crate::slice::Iter<(String, String)> { self.v.iter() }
+
+    /// The names, each once.
+    pub fn keys(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for (k, _) in self.v.iter() {
+            if !out.contains(&k.as_str()) { out.push(k.as_str()); }
+        }
+        out
+    }
+
+    // Whether name's comma-separated values include token (without case).
+    pub(crate) fn has_token(&self, name: &str, token: &str) -> bool {
+        for (k, v) in self.v.iter() {
+            if k.eq_ignore_ascii_case(name) {
+                for t in v.split(',') {
+                    if t.trim().eq_ignore_ascii_case(token) { return true; }
+                }
+            }
+        }
+        false
+    }
+}
+
+impl Debug for HeaderMap {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut m = f.debug_map();
+        for (k, v) in self.v.iter() { m.entry(k, v); }
+        m.finish()
+    }
+}
+
+/// A message body: bytes, or a reader (the body of a received message
+/// reads from the connection). Read it with Read, or text()/bytes() on
+/// the message.
+#[derive(Clone)]
+pub struct Body {
+    bytes: Vec<u8>,
+    pos: usize,
+    reader: Option<&mut dyn Read>,
+    len: Option<u64>,
+}
+
+impl Body {
+    pub fn empty() -> Body { Body { bytes: Vec::new(), pos: 0, reader: None, len: Some(0) } }
+
+    /// A body read from r (len: its length if known; else it is sent
+    /// chunked).
+    pub fn from_reader(r: &mut dyn Read, len: Option<u64>) -> Body { Body { bytes: Vec::new(), pos: 0, reader: Some(r), len } }
+
+    /// Its length, if known.
+    pub fn len(&self) -> Option<u64> { self.len }
+
+    /// Its bytes, if it is not a reader (so it can be sent again).
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        if self.reader.is_some() { None } else { Some(self.bytes.as_slice()) }
+    }
+}
+
+impl Default for Body {
+    fn default() -> Body { Body::empty() }
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(v: Vec<u8>) -> Body {
+        let n = v.len() as u64;
+        Body { bytes: v, pos: 0, reader: None, len: Some(n) }
+    }
+}
+
+impl From<String> for Body {
+    fn from(s: String) -> Body { Body::from(s.into_bytes()) }
+}
+
+impl From<&str> for Body {
+    fn from(s: &str) -> Body { Body::from(s.as_bytes().to_vec()) }
+}
+
+impl From<&[u8]> for Body {
+    fn from(s: &[u8]) -> Body { Body::from(s.to_vec()) }
+}
+
+impl Read for Body {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(r) = self.reader { return r.read(buf); }
+        let n = crate::cmp::min(buf.len(), self.bytes.len() - self.pos);
+        buf[0..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+fn read_all(b: &mut Body) -> io::Result<Vec<u8>> {
+    let mut v = Vec::new();
+    b.read_to_end(&mut v)?;
+    Ok(v)
+}
+
+/// A request: sent by Client (built with RequestBuilder or new), or
+/// received by a server handler.
+#[derive(Clone)]
+pub struct Request {
+    method: Method,
+    url: Url,
+    target: String,
+    version: Version,
+    headers: HeaderMap,
+    body: Body,
+    remote: Option<SocketAddr>,
+    params: Vec<(String, String)>,
+}
+
+impl Request {
+    pub fn new(method: Method, url: Url) -> Request {
+        let target = wire::target_of(&url);
+        Request { method, url, target, version: Version::HTTP_11, headers: HeaderMap::new(), body: Body::empty(), remote: None, params: Vec::new() }
+    }
+
+    pub fn method(&self) -> &Method { &self.method }
+    pub fn method_mut(&mut self) -> &mut Method { &mut self.method }
+    /// The URL (for a received request: http://host/target, the host
+    /// from the Host header).
+    pub fn url(&self) -> &Url { &self.url }
+    pub fn url_mut(&mut self) -> &mut Url { &mut self.url }
+    /// The request target as sent: "/path?query".
+    pub fn uri(&self) -> &str { self.target.as_str() }
+    pub fn path(&self) -> &str { self.url.path() }
+    pub fn query(&self) -> Option<&str> { self.url.query() }
+    pub fn query_pairs(&self) -> crate::url::form_urlencoded::Parse { self.url.query_pairs() }
+    pub fn version(&self) -> Version { self.version }
+    pub fn headers(&self) -> &HeaderMap { &self.headers }
+    pub fn headers_mut(&mut self) -> &mut HeaderMap { &mut self.headers }
+    pub fn header(&self, name: &str) -> Option<&str> { self.headers.get(name) }
+    pub fn body(&self) -> &Body { &self.body }
+    pub fn body_mut(&mut self) -> &mut Body { &mut self.body }
+    pub fn set_body(&mut self, b: Body) { self.body = b; }
+    /// The client's address (received requests).
+    pub fn remote_addr(&self) -> Option<SocketAddr> { self.remote.clone() }
+
+    /// The value of a {name} wildcard of the Router pattern that matched.
+    pub fn path_value(&self, name: &str) -> Option<&str> {
+        for (k, v) in self.params.iter() {
+            if k == name { return Some(v.as_str()); }
+        }
+        None
+    }
+
+    pub fn set_path_value(&mut self, name: &str, value: &str) {
+        for p in self.params.iter_mut() {
+            if p.0 == name {
+                p.1 = value.to_string();
+                return;
+            }
+        }
+        self.params.push((name.to_string(), value.to_string()));
+    }
+
+    /// Reads the whole body.
+    pub fn bytes(&mut self) -> io::Result<Vec<u8>> { read_all(&mut self.body) }
+
+    pub fn text(&mut self) -> io::Result<String> {
+        let v = read_all(&mut self.body)?;
+        Ok(String::from_utf8_lossy(v.as_slice()))
+    }
+
+    /// The body as JSON (std::json).
+    pub fn json<T>(&mut self) -> Result<T, Error> {
+        let s = self.text()?;
+        match crate::json::from_str::<T>(s.as_str()) {
+            Ok(t) => Ok(t),
+            Err(e) => Err(Error::new(ErrorKind::Decode, e.to_string())),
+        }
+    }
+
+    /// The pairs of an application/x-www-form-urlencoded body.
+    pub fn form(&mut self) -> io::Result<Vec<(String, String)>> {
+        let v = read_all(&mut self.body)?;
+        let mut out = Vec::new();
+        for p in crate::url::form_urlencoded::parse(v.as_slice()) { out.push(p); }
+        Ok(out)
+    }
+}
+
+impl Debug for Request {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_struct("Request").field("method", &self.method).field("uri", &self.target).field("version", &self.version).field("headers", &self.headers).finish()
+    }
+}
+
+/// A response: received by Client, or made by a server handler
+/// (Response::text("hi"), Response::new(StatusCode::NOT_FOUND), ...).
+#[derive(Clone)]
+pub struct Response {
+    status: StatusCode,
+    version: Version,
+    headers: HeaderMap,
+    body: Body,
+    url: Option<Url>,
+}
+
+impl Response {
+    pub fn new(status: StatusCode) -> Response {
+        Response { status, version: Version::HTTP_11, headers: HeaderMap::new(), body: Body::empty(), url: None }
+    }
+
+    /// A 200 response with body.
+    pub fn from_body<B: Into<Body>>(body: B) -> Response {
+        let mut r = Response::new(StatusCode::OK);
+        r.body = body.into();
+        r
+    }
+
+    /// A text/plain response.
+    pub fn from_string<S: Into<String>>(s: S) -> Response {
+        Response::from_body(s.into()).with_header("Content-Type", "text/plain; charset=utf-8")
+    }
+
+    pub fn from_html<S: Into<String>>(s: S) -> Response {
+        Response::from_body(s.into()).with_header("Content-Type", "text/html; charset=utf-8")
+    }
+
+    /// x as JSON (std::json).
+    pub fn from_json<T>(x: &T) -> Response {
+        match crate::json::to_string(x) {
+            Ok(s) => Response::from_body(s).with_header("Content-Type", "application/json"),
+            Err(e) => Response::error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str()),
+        }
+    }
+
+    /// The status with a text/plain message (as Go's http.Error).
+    pub fn error(status: StatusCode, msg: &str) -> Response {
+        Response::from_string(`${msg}\n`).with_status(status).with_header("X-Content-Type-Options", "nosniff")
+    }
+
+    /// A redirect to location (a 3xx status).
+    pub fn redirect(location: &str, status: StatusCode) -> Response {
+        Response::new(status).with_header("Location", location)
+    }
+
+    /// The response with the status (builder style).
+    pub fn with_status(&self, s: StatusCode) -> Response {
+        let mut r = self.clone();
+        r.status = s;
+        r
+    }
+
+    /// The response with a header value added (builder style).
+    pub fn with_header(&self, name: &str, value: &str) -> Response {
+        let mut r = self.clone();
+        r.headers.append(name, value);
+        r
+    }
+
+    /// The response with the body (builder style).
+    pub fn with_body<B: Into<Body>>(&self, body: B) -> Response {
+        let mut r = self.clone();
+        r.body = body.into();
+        r
+    }
+
+    pub fn status(&self) -> StatusCode { self.status }
+    pub fn set_status(&mut self, s: StatusCode) { self.status = s; }
+    pub fn version(&self) -> Version { self.version }
+    pub fn headers(&self) -> &HeaderMap { &self.headers }
+    pub fn headers_mut(&mut self) -> &mut HeaderMap { &mut self.headers }
+    pub fn header(&self, name: &str) -> Option<&str> { self.headers.get(name) }
+    pub fn body(&self) -> &Body { &self.body }
+    pub fn body_mut(&mut self) -> &mut Body { &mut self.body }
+    pub fn set_body(&mut self, b: Body) { self.body = b; }
+
+    /// The URL it answers (after redirects; received responses).
+    pub fn url(&self) -> Option<&Url> {
+        match &self.url {
+            Some(u) => Some(u),
+            None => None,
+        }
+    }
+
+    /// The Content-Length, if given.
+    pub fn content_length(&self) -> Option<u64> {
+        match self.headers.get("content-length") {
+            Some(v) => v.trim().parse::<u64>().ok(),
+            None => None,
+        }
+    }
+
+    /// Reads the whole body.
+    pub fn bytes(self) -> Result<Vec<u8>, Error> { Ok(read_all(&mut self.body)?) }
+
+    pub fn text(self) -> Result<String, Error> {
+        let v = read_all(&mut self.body)?;
+        Ok(String::from_utf8_lossy(v.as_slice()))
+    }
+
+    /// The body as JSON (std::json).
+    pub fn json<T>(self) -> Result<T, Error> {
+        let s = self.text()?;
+        match crate::json::from_str::<T>(s.as_str()) {
+            Ok(t) => Ok(t),
+            Err(e) => Err(Error::new(ErrorKind::Decode, e.to_string())),
+        }
+    }
+
+    /// Err for a 4xx or 5xx status.
+    pub fn error_for_status(&self) -> Result<Response, Error> {
+        if self.status.is_client_error() || self.status.is_server_error() {
+            let mut e = Error::new(ErrorKind::Status, `HTTP status ${self.status}`);
+            e.status = Some(self.status);
+            e.url = self.url.clone();
+            return Err(e);
+        }
+        Ok(self.clone())
+    }
+}
+
+impl Read for Response {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.body.read(buf) }
+}
+
+impl Debug for Response {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_struct("Response").field("status", &self.status).field("version", &self.version).field("headers", &self.headers).finish()
+    }
+}
+
+/// What kind of failure an Error is.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ErrorKind {
+    /// A bad URL, or an unsupported scheme.
+    Builder,
+    /// Connecting or sending failed.
+    Connect,
+    /// A timeout.
+    Timeout,
+    /// Too many redirects.
+    Redirect,
+    /// A 4xx or 5xx status (error_for_status).
+    Status,
+    /// The peer broke the protocol.
+    Protocol,
+    /// Reading or decoding the body failed.
+    Decode,
+    Io,
+}
+
+/// An HTTP failure.
+#[derive(Clone)]
+pub struct Error {
+    kind: ErrorKind,
+    msg: String,
+    status: Option<StatusCode>,
+    url: Option<Url>,
+}
+
+impl Error {
+    pub(crate) fn new<S: Into<String>>(kind: ErrorKind, msg: S) -> Error { Error { kind, msg: msg.into(), status: None, url: None } }
+
+    pub fn kind(&self) -> ErrorKind { self.kind.clone() }
+    pub fn status(&self) -> Option<StatusCode> { self.status }
+    pub fn url(&self) -> Option<&Url> {
+        match &self.url {
+            Some(u) => Some(u),
+            None => None,
+        }
+    }
+    pub fn is_timeout(&self) -> bool { self.kind == ErrorKind::Timeout }
+    pub fn is_connect(&self) -> bool { self.kind == ErrorKind::Connect }
+    pub fn is_status(&self) -> bool { self.kind == ErrorKind::Status }
+    pub fn is_redirect(&self) -> bool { self.kind == ErrorKind::Redirect }
+    pub fn is_builder(&self) -> bool { self.kind == ErrorKind::Builder }
+    pub fn is_decode(&self) -> bool { self.kind == ErrorKind::Decode }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match &self.url {
+            Some(u) => f.write_fmt(`${self.msg} (${u})`),
+            None => f.write_str(self.msg.as_str()),
+        }
+    }
+}
+
+impl Debug for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`http::Error { kind: ${self.kind:?}, msg: ${self.msg:?} }`) }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Error {
+        let kind = if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock { ErrorKind::Timeout } else { ErrorKind::Io };
+        Error::new(kind, e.to_string())
+    }
+}
+
+impl From<crate::url::ParseError> for Error {
+    fn from(e: crate::url::ParseError) -> Error { Error::new(ErrorKind::Builder, `invalid URL: ${e}`) }
+}
+
+impl From<Error> for io::Error {
+    fn from(e: Error) -> io::Error {
+        io::Error::new(if e.kind == ErrorKind::Timeout { io::ErrorKind::TimedOut } else { io::ErrorKind::Other }, e.to_string())
+    }
+}

@@ -1,0 +1,1053 @@
+//! URLs (as Go's net/url, with the API of Rust's url crate): parsing and
+//! resolution follow the WHATWG URL Standard, except that non-ASCII host
+//! names are rejected (no IDNA).
+//!
+//!     let u = Url::parse("https://user@example.com:8443/a/b?x=1#top").unwrap();
+//!     u.scheme()     // "https"
+//!     u.host_str()   // Some("example.com")
+//!     u.port()       // Some(8443)
+//!     u.path()       // "/a/b"
+//!     let v = u.join("../c?y=2").unwrap();   // https://user@example.com:8443/c?y=2
+//!     for (k, v) in u.query_pairs() { ... }
+//!     u.query_pairs_mut().append_pair("q", "a b");   // ?x=1&q=a+b
+
+pub mod percent_encoding;
+pub mod form_urlencoded;
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::hash::{Hash, Hasher};
+use crate::cmp::Ordering;
+use crate::net::{Ipv4Addr, Ipv6Addr};
+use crate::str::FromStr;
+use percent_encoding::{AsciiSet, CONTROLS, encode_into};
+
+/// Why a URL could not be parsed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ParseError {
+    EmptyHost,
+    IdnaError,
+    InvalidPort,
+    InvalidIpv4Address,
+    InvalidIpv6Address,
+    InvalidDomainCharacter,
+    RelativeUrlWithoutBase,
+    RelativeUrlWithCannotBeABaseBase,
+    SetHostOnCannotBeABaseUrl,
+    Overflow,
+}
+
+impl Display for ParseError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.write_str(match self {
+            ParseError::EmptyHost => "empty host",
+            ParseError::IdnaError => "invalid international domain name",
+            ParseError::InvalidPort => "invalid port number",
+            ParseError::InvalidIpv4Address => "invalid IPv4 address",
+            ParseError::InvalidIpv6Address => "invalid IPv6 address",
+            ParseError::InvalidDomainCharacter => "invalid domain character",
+            ParseError::RelativeUrlWithoutBase => "relative URL without a base",
+            ParseError::RelativeUrlWithCannotBeABaseBase => "relative URL with a cannot-be-a-base base",
+            ParseError::SetHostOnCannotBeABaseUrl => "a cannot-be-a-base URL doesn’t have a host to set",
+            ParseError::Overflow => "URLs more than 4 GB are not supported",
+        })
+    }
+}
+
+/// A URL's host.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Host {
+    Domain(String),
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
+}
+
+impl Host {
+    /// Parses a host as in a special URL (http, https, ...).
+    pub fn parse(input: &str) -> Result<Host, ParseError> { parse_host(input, true) }
+
+    /// Parses a host as in a URL of another scheme (percent-encoded, not
+    /// lowercased).
+    pub fn parse_opaque(input: &str) -> Result<Host, ParseError> { parse_host(input, false) }
+}
+
+impl Display for Host {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Host::Domain(d) => f.write_str(d.as_str()),
+            Host::Ipv4(a) => f.write_fmt(`${a}`),
+            Host::Ipv6(a) => f.write_fmt(`[${a}]`),
+        }
+    }
+}
+
+/// The parts of a URL before its path.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Position {
+    BeforeScheme,
+    AfterScheme,
+    BeforeUsername,
+    AfterUsername,
+    BeforePassword,
+    AfterPassword,
+    BeforeHost,
+    AfterHost,
+    BeforePort,
+    AfterPort,
+    BeforePath,
+    AfterPath,
+    BeforeQuery,
+    AfterQuery,
+    BeforeFragment,
+    AfterFragment,
+}
+
+/// A parsed URL. Its parts are kept percent-encoded; as_str (and Display)
+/// is its serialization.
+#[derive(Clone)]
+pub struct Url {
+    s: String,
+    scheme: String,
+    username: String,
+    password: Option<String>,
+    host: Option<Host>,
+    port: Option<u16>,
+    path: String,
+    query: Option<String>,
+    fragment: Option<String>,
+    // A URL like mailto:x or data:..., whose path is not a list of segments.
+    opaque: bool,
+}
+
+// The percent-encode sets of the URL Standard.
+fn fragment_set() -> AsciiSet { CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`') }
+fn query_set() -> AsciiSet { CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>') }
+fn special_query_set() -> AsciiSet { query_set().add(b'\'') }
+fn path_set() -> AsciiSet { query_set().add(b'?').add(b'`').add(b'{').add(b'}') }
+fn userinfo_set() -> AsciiSet {
+    path_set().add(b'/').add(b':').add(b';').add(b'=').add(b'@').add(b'[').add(b'\\').add(b']').add(b'^').add(b'|')
+}
+
+/// The default port of a special scheme.
+pub fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        "ftp" => Some(21),
+        _ => None,
+    }
+}
+
+fn is_special(scheme: &str) -> bool { scheme == "file" || default_port(scheme).is_some() }
+
+impl Url {
+    /// Parses an absolute URL.
+    pub fn parse(input: &str) -> Result<Url, ParseError> { parse_url(input, None) }
+
+    /// Parses input and appends the pairs to its query.
+    pub fn parse_with_params<I: IntoIterator<Item = (K, V)>, K: AsRef<str>, V: AsRef<str>>(input: &str, iter: I) -> Result<Url, ParseError> {
+        let mut u = Url::parse(input)?;
+        {
+            let mut q = u.query_pairs_mut();
+            for (k, v) in iter { q.append_pair(k.as_ref(), v.as_ref()); }
+        }
+        Ok(u)
+    }
+
+    /// Resolves input (absolute or relative) against this URL.
+    pub fn join(&self, input: &str) -> Result<Url, ParseError> { parse_url(input, Some(self)) }
+
+    /// Url::options().base_url(Some(&base)).parse(s), as the crate.
+    pub fn options() -> ParseOptions { ParseOptions { base: None } }
+
+    pub fn as_str(&self) -> &str { self.s.as_str() }
+    pub fn into_string(self) -> String { self.s }
+
+    pub fn scheme(&self) -> &str { self.scheme.as_str() }
+    pub fn cannot_be_a_base(&self) -> bool { self.opaque }
+    pub fn is_special(&self) -> bool { is_special(self.scheme.as_str()) }
+
+    pub fn has_authority(&self) -> bool { self.host.is_some() }
+    /// "user:pass@host:port", or "" without a host.
+    pub fn authority(&self) -> &str {
+        if self.host.is_none() { return ""; }
+        let start = self.scheme.len() + 3;
+        let end = start + self.authority_len();
+        &self.s[start..end]
+    }
+
+    fn authority_len(&self) -> usize {
+        let mut n = self.host_string().len();
+        if self.username.len() > 0 || self.password.is_some() {
+            n += self.username.len() + 1;
+            if let Some(p) = &self.password { n += p.len() + 1; }
+        }
+        if let Some(p) = self.port { n += 1 + p.to_string().len(); }
+        n
+    }
+
+    /// The percent-encoded user name ("" when none).
+    pub fn username(&self) -> &str { self.username.as_str() }
+    pub fn password(&self) -> Option<&str> {
+        match &self.password {
+            Some(p) => Some(p.as_str()),
+            None => None,
+        }
+    }
+
+    pub fn has_host(&self) -> bool { self.host.is_some() }
+    /// The host as written in the URL (IPv6 addresses in brackets).
+    pub fn host_str(&self) -> Option<&str> {
+        if self.host.is_none() { return None; }
+        let start = self.scheme.len() + 3 + self.userinfo_len();
+        Some(&self.s[start..start + self.host_string().len()])
+    }
+
+    fn userinfo_len(&self) -> usize {
+        if self.username.len() == 0 && self.password.is_none() { return 0; }
+        let mut n = self.username.len() + 1;
+        if let Some(p) = &self.password { n += p.len() + 1; }
+        n
+    }
+
+    fn host_string(&self) -> String {
+        match &self.host {
+            Some(h) => h.to_string(),
+            None => String::new(),
+        }
+    }
+
+    pub fn host(&self) -> Option<Host> { self.host.clone() }
+
+    /// The host if it is a domain name.
+    pub fn domain(&self) -> Option<&str> {
+        match &self.host {
+            Some(Host::Domain(_)) => self.host_str(),
+            _ => None,
+        }
+    }
+
+    /// The port if it is not the scheme's default.
+    pub fn port(&self) -> Option<u16> { self.port }
+    pub fn port_or_known_default(&self) -> Option<u16> {
+        match self.port {
+            Some(p) => Some(p),
+            None => default_port(self.scheme.as_str()),
+        }
+    }
+
+    /// The host's addresses with the port (or default_port()'s).
+    pub fn socket_addrs(&self, default_port: fn() -> Option<u16>) -> crate::io::Result<Vec<crate::net::SocketAddr>> {
+        let port = match self.port_or_known_default() {
+            Some(p) => p,
+            None => match default_port() {
+                Some(p) => p,
+                None => return Err(crate::io::Error::new(crate::io::ErrorKind::InvalidInput, "no port number")),
+            },
+        };
+        let mut v = Vec::new();
+        match &self.host {
+            None => return Err(crate::io::Error::new(crate::io::ErrorKind::InvalidInput, "no host")),
+            Some(Host::Ipv4(a)) => v.push(crate::net::SocketAddr::new(crate::net::IpAddr::V4(a.clone()), port)),
+            Some(Host::Ipv6(a)) => v.push(crate::net::SocketAddr::new(crate::net::IpAddr::V6(a.clone()), port)),
+            Some(Host::Domain(d)) => {
+                for a in crate::net::ToSocketAddrs::to_socket_addrs(&(d.as_str(), port))? { v.push(a); }
+            }
+        }
+        Ok(v)
+    }
+
+    /// The percent-encoded path ("/" at least in special URLs).
+    pub fn path(&self) -> &str { self.path.as_str() }
+
+    /// The path's segments (None for a cannot-be-a-base URL).
+    pub fn path_segments(&self) -> Option<crate::str::Split<char>> {
+        if self.opaque || !self.path.starts_with("/") { return None; }
+        Some(self.path[1..].split('/'))
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        match &self.query {
+            Some(q) => Some(q.as_str()),
+            None => None,
+        }
+    }
+
+    /// The query's name/value pairs, decoded.
+    pub fn query_pairs(&self) -> form_urlencoded::Parse {
+        match &self.query {
+            Some(q) => form_urlencoded::parse(q.as_bytes()),
+            None => form_urlencoded::parse(b""),
+        }
+    }
+
+    pub fn fragment(&self) -> Option<&str> {
+        match &self.fragment {
+            Some(q) => Some(q.as_str()),
+            None => None,
+        }
+    }
+
+    /// A serializer appending to the query (each call updates the URL).
+    pub fn query_pairs_mut(&mut self) -> form_urlencoded::Serializer {
+        let start = match &self.query {
+            Some(q) => q.clone(),
+            None => String::new(),
+        };
+        let u: &mut Url = self;
+        form_urlencoded::Serializer::for_url(start, u)
+    }
+
+    // The serializer's result as the query (None when empty, as the crate
+    // does when nothing was appended).
+    pub(crate) fn set_query_raw(&mut self, q: String) {
+        self.query = Some(q);
+        self.serialize();
+    }
+
+    pub fn set_fragment(&mut self, fragment: Option<&str>) {
+        self.fragment = match fragment {
+            Some(f) => Some(encode(f, fragment_set())),
+            None => None,
+        };
+        self.serialize();
+    }
+
+    pub fn set_query(&mut self, query: Option<&str>) {
+        let set = if self.is_special() { special_query_set() } else { query_set() };
+        self.query = match query {
+            Some(q) => Some(encode(q, set)),
+            None => None,
+        };
+        self.serialize();
+    }
+
+    pub fn set_path(&mut self, path: &str) {
+        if self.opaque {
+            self.path = encode(path, CONTROLS);
+        } else {
+            let special = self.is_special();
+            let mut segs: Vec<String> = Vec::new();
+            let p = if path.starts_with("/") || (special && path.starts_with("\\")) { &path[1..] } else { path };
+            if path.len() > 0 || special { push_path(&mut segs, p, special); }
+            self.path = join_path(&segs, special, self.host.is_some());
+        }
+        self.serialize();
+    }
+
+    /// Changes the port (Err for a URL without a host or a file URL).
+    pub fn set_port(&mut self, port: Option<u16>) -> Result<(), ()> {
+        if self.host.is_none() || self.scheme == "file" { return Err(()); }
+        if let Some(Host::Domain(d)) = &self.host {
+            if d.len() == 0 { return Err(()); }
+        }
+        self.port = match port {
+            Some(p) => if Some(p) == default_port(self.scheme.as_str()) { None } else { Some(p) },
+            None => None,
+        };
+        self.serialize();
+        Ok(())
+    }
+
+    /// Changes the host (None removes it, for non-special URLs).
+    pub fn set_host(&mut self, host: Option<&str>) -> Result<(), ParseError> {
+        if self.opaque { return Err(ParseError::SetHostOnCannotBeABaseUrl); }
+        let special = self.is_special();
+        match host {
+            None => {
+                if special { return Err(ParseError::EmptyHost); }
+                self.host = None;
+                self.username = String::new();
+                self.password = None;
+                self.port = None;
+            }
+            Some(h) => {
+                if h.len() == 0 && special && self.scheme != "file" { return Err(ParseError::EmptyHost); }
+                self.host = Some(if h.len() == 0 { Host::Domain(String::new()) } else { parse_host(h, special)? });
+            }
+        }
+        self.serialize();
+        Ok(())
+    }
+
+    pub fn set_ip_host(&mut self, address: crate::net::IpAddr) -> Result<(), ()> {
+        if self.opaque { return Err(()); }
+        self.host = Some(match address {
+            crate::net::IpAddr::V4(a) => Host::Ipv4(a),
+            crate::net::IpAddr::V6(a) => Host::Ipv6(a),
+        });
+        self.serialize();
+        Ok(())
+    }
+
+    pub fn set_username(&mut self, username: &str) -> Result<(), ()> {
+        if !self.can_have_credentials() { return Err(()); }
+        self.username = encode(username, userinfo_set());
+        self.serialize();
+        Ok(())
+    }
+
+    pub fn set_password(&mut self, password: Option<&str>) -> Result<(), ()> {
+        if !self.can_have_credentials() { return Err(()); }
+        self.password = match password {
+            Some(p) => if p.len() == 0 { None } else { Some(encode(p, userinfo_set())) },
+            None => None,
+        };
+        self.serialize();
+        Ok(())
+    }
+
+    fn can_have_credentials(&self) -> bool {
+        match &self.host {
+            Some(Host::Domain(d)) => d.len() > 0 && self.scheme != "file",
+            Some(_) => self.scheme != "file",
+            None => false,
+        }
+    }
+
+    /// Changes the scheme (not between special and non-special ones).
+    pub fn set_scheme(&mut self, scheme: &str) -> Result<(), ()> {
+        let b = scheme.as_bytes();
+        if b.len() == 0 || !b[0].is_ascii_alphabetic() { return Err(()); }
+        for c in b.iter() {
+            if !(c.is_ascii_alphanumeric() || *c == b'+' || *c == b'-' || *c == b'.') { return Err(()); }
+        }
+        let s = scheme.to_ascii_lowercase();
+        if is_special(s.as_str()) != self.is_special() { return Err(()); }
+        if s == "file" && (self.username.len() > 0 || self.password.is_some() || self.port.is_some()) { return Err(()); }
+        self.scheme = s;
+        if self.port.is_some() && self.port == default_port(self.scheme.as_str()) { self.port = None; }
+        self.serialize();
+        Ok(())
+    }
+
+    /// The URL's ASCII origin ("null" for opaque origins).
+    pub fn origin(&self) -> Origin {
+        let s = self.scheme.as_str();
+        if default_port(s).is_some() {
+            if let Some(h) = &self.host {
+                return Origin { tuple: true, scheme: self.scheme.clone(), host: h.clone(), port: self.port_or_known_default().unwrap_or(0) };
+            }
+        }
+        if s == "blob" {
+            if let Ok(u) = Url::parse(self.path.as_str()) {
+                if u.scheme == "http" || u.scheme == "https" { return u.origin(); }
+            }
+        }
+        Origin { tuple: false, scheme: String::new(), host: Host::Domain(String::new()), port: 0 }
+    }
+
+    /// The serialization up to or from a part (url[..Position::AfterPath]
+    /// in the crate).
+    pub fn slice(&self, from: Position, to: Position) -> &str { &self.s[self.index(from)..self.index(to)] }
+
+    fn index(&self, p: Position) -> usize {
+        let after_scheme = self.scheme.len() + 1;
+        let auth = if self.host.is_some() { after_scheme + 2 } else { after_scheme };
+        let user_end = auth + self.username.len();
+        let pass_end = match &self.password {
+            Some(pw) => user_end + 1 + pw.len(),
+            None => user_end,
+        };
+        let host_start = auth + self.userinfo_len();
+        let host_end = host_start + self.host_string().len();
+        let port_end = match self.port {
+            Some(pt) => host_end + 1 + pt.to_string().len(),
+            None => host_end,
+        };
+        let path_end = port_end + self.path.len();
+        let query_end = match &self.query {
+            Some(q) => path_end + 1 + q.len(),
+            None => path_end,
+        };
+        match p {
+            Position::BeforeScheme => 0,
+            Position::AfterScheme => self.scheme.len(),
+            Position::BeforeUsername => auth,
+            Position::AfterUsername => user_end,
+            Position::BeforePassword => if self.password.is_some() { user_end + 1 } else { user_end },
+            Position::AfterPassword => pass_end,
+            Position::BeforeHost => host_start,
+            Position::AfterHost => host_end,
+            Position::BeforePort => if self.port.is_some() { host_end + 1 } else { host_end },
+            Position::AfterPort => port_end,
+            Position::BeforePath => port_end,
+            Position::AfterPath => path_end,
+            Position::BeforeQuery => if self.query.is_some() { path_end + 1 } else { path_end },
+            Position::AfterQuery => query_end,
+            Position::BeforeFragment => if self.fragment.is_some() { query_end + 1 } else { query_end },
+            Position::AfterFragment => self.s.len(),
+        }
+    }
+
+    // Rebuilds the serialization from the parts.
+    fn serialize(&mut self) {
+        let mut s = String::with_capacity(self.s.len() + 8);
+        s.push_str(self.scheme.as_str());
+        s.push(':');
+        if let Some(h) = &self.host {
+            s.push_str("//");
+            if self.username.len() > 0 || self.password.is_some() {
+                s.push_str(self.username.as_str());
+                if let Some(p) = &self.password {
+                    s.push(':');
+                    s.push_str(p.as_str());
+                }
+                s.push('@');
+            }
+            s.push_str(h.to_string().as_str());
+            if let Some(p) = self.port {
+                s.push(':');
+                s.push_str(p.to_string().as_str());
+            }
+        } else if !self.opaque && self.path.starts_with("//") {
+            // Keeps a path starting with "//" from reading as a host.
+            s.push_str("/.");
+        }
+        s.push_str(self.path.as_str());
+        if let Some(q) = &self.query {
+            s.push('?');
+            s.push_str(q.as_str());
+        }
+        if let Some(f) = &self.fragment {
+            s.push('#');
+            s.push_str(f.as_str());
+        }
+        self.s = s;
+    }
+}
+
+/// Url::options(): parsing relative to a base.
+#[derive(Clone)]
+pub struct ParseOptions {
+    base: Option<Url>,
+}
+
+impl ParseOptions {
+    pub fn base_url(&self, base: Option<&Url>) -> ParseOptions {
+        ParseOptions { base: match base { Some(b) => Some(b.clone()), None => None } }
+    }
+
+    pub fn parse(&self, input: &str) -> Result<Url, ParseError> {
+        match &self.base {
+            Some(b) => parse_url(input, Some(b)),
+            None => parse_url(input, None),
+        }
+    }
+}
+
+/// A URL's origin: scheme, host and port, or opaque.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Origin {
+    tuple: bool,
+    scheme: String,
+    host: Host,
+    port: u16,
+}
+
+impl Origin {
+    pub fn is_tuple(&self) -> bool { self.tuple }
+    /// "scheme://host[:port]", or "null".
+    pub fn ascii_serialization(&self) -> String {
+        if !self.tuple { return "null".to_string(); }
+        let mut s = `${self.scheme}://${self.host}`;
+        if Some(self.port) != default_port(self.scheme.as_str()) { s.push_str(`:${self.port}`.as_str()); }
+        s
+    }
+}
+
+impl Display for Url {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str(self.s.as_str()) }
+}
+
+impl Debug for Url {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_struct("Url")
+            .field("scheme", &self.scheme())
+            .field("cannot_be_a_base", &self.opaque)
+            .field("username", &self.username())
+            .field("password", &self.password())
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("path", &self.path())
+            .field("query", &self.query())
+            .field("fragment", &self.fragment())
+            .finish()
+    }
+}
+
+impl PartialEq for Url {
+    fn eq(&self, other: &Url) -> bool { self.s == other.s }
+}
+
+impl Eq for Url {}
+
+impl PartialOrd for Url {
+    fn partial_cmp(&self, other: &Url) -> Option<Ordering> { self.s.partial_cmp(&other.s) }
+}
+
+impl Ord for Url {
+    fn cmp(&self, other: &Url) -> Ordering { self.s.cmp(&other.s) }
+}
+
+impl Hash for Url {
+    fn hash<H: Hasher>(&self, state: &mut H) { self.s.hash(state); }
+}
+
+impl FromStr for Url {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Url, ParseError> { Url::parse(s) }
+}
+
+impl AsRef<str> for Url {
+    fn as_ref(&self) -> &str { self.s.as_str() }
+}
+
+impl From<Url> for String {
+    fn from(u: Url) -> String { u.s }
+}
+
+fn encode(s: &str, set: AsciiSet) -> String {
+    let mut out = String::with_capacity(s.len());
+    encode_into(&mut out, s.as_bytes(), set);
+    out
+}
+
+// The parser.
+
+fn is_c0_or_space(c: u8) -> bool { c <= b' ' }
+
+// input without leading and trailing C0 controls and spaces, and without
+// tabs and newlines.
+fn clean(input: &str) -> String {
+    let b = input.as_bytes();
+    let mut i = 0;
+    let mut j = b.len();
+    while i < j && is_c0_or_space(b[i]) { i += 1; }
+    while j > i && is_c0_or_space(b[j - 1]) { j -= 1; }
+    let mut v = Vec::with_capacity(j - i);
+    while i < j {
+        let c = b[i];
+        if c != b'\t' && c != b'\n' && c != b'\r' { v.push(c); }
+        i += 1;
+    }
+    unsafe { String::from_utf8_unchecked(v) }
+}
+
+// The scheme (lowercased) and the rest, if input starts with one.
+fn split_scheme(s: &str) -> Option<(String, &str)> {
+    let b = s.as_bytes();
+    if b.len() == 0 || !b[0].is_ascii_alphabetic() { return None; }
+    let mut i = 1;
+    while i < b.len() {
+        let c = b[i];
+        if c == b':' { return Some((s[0..i].to_ascii_lowercase(), &s[i + 1..])); }
+        if !(c.is_ascii_alphanumeric() || c == b'+' || c == b'-' || c == b'.') { return None; }
+        i += 1;
+    }
+    None
+}
+
+fn is_slash(c: u8, special: bool) -> bool { c == b'/' || (special && c == b'\\') }
+
+fn starts_with_two_slashes(s: &str, special: bool) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && is_slash(b[0], special) && is_slash(b[1], special)
+}
+
+fn new_url(scheme: String) -> Url {
+    Url { s: String::new(), scheme, username: String::new(), password: None, host: None, port: None, path: String::new(), query: None, fragment: None, opaque: false }
+}
+
+fn parse_url(input: &str, base: Option<&Url>) -> Result<Url, ParseError> {
+    let cleaned = clean(input);
+    let s = cleaned.as_str();
+    if s.len() > 0xffffffff { return Err(ParseError::Overflow); }
+    let mut u = match split_scheme(s) {
+        Some((scheme, rest)) => {
+            let special = is_special(scheme.as_str());
+            match base {
+                // "http:foo" against an http base is relative.
+                Some(b) if special && scheme != "file" && b.scheme == scheme && !(rest.len() > 0 && is_slash(rest.as_bytes()[0], true)) => relative(b, rest)?,
+                _ => absolute(scheme, rest, base)?,
+            }
+        }
+        None => match base {
+            Some(b) => relative(b, s)?,
+            None => return Err(ParseError::RelativeUrlWithoutBase),
+        },
+    };
+    u.serialize();
+    Ok(u)
+}
+
+fn absolute(scheme: String, rest: &str, base: Option<&Url>) -> Result<Url, ParseError> {
+    let special = is_special(scheme.as_str());
+    let mut u = new_url(scheme);
+    if u.scheme == "file" {
+        let fb = match base {
+            Some(b) if b.scheme == "file" => Some(b),
+            _ => None,
+        };
+        parse_file(&mut u, rest, fb)?;
+        return Ok(u);
+    }
+    if special {
+        let b = rest.as_bytes();
+        let mut i = 0;
+        while i < b.len() && is_slash(b[i], true) { i += 1; }
+        let tail = parse_authority(&mut u, &rest[i..], true)?;
+        parse_path_query_fragment(&mut u, tail, Vec::new());
+        return Ok(u);
+    }
+    if rest.starts_with("//") {
+        let tail = parse_authority(&mut u, &rest[2..], false)?;
+        parse_path_query_fragment(&mut u, tail, Vec::new());
+    } else if rest.starts_with("/") {
+        parse_path_query_fragment(&mut u, rest, Vec::new());
+    } else {
+        // An opaque path.
+        u.opaque = true;
+        let (p, q, f) = split_qf(rest);
+        u.path = encode(p, CONTROLS);
+        set_qf(&mut u, q, f);
+    }
+    Ok(u)
+}
+
+// The path, query and fragment of s (the query and fragment without their
+// '?' and '#').
+fn split_qf(s: &str) -> (&str, Option<&str>, Option<&str>) {
+    let (before, frag) = match s.find('#') {
+        Some(i) => (&s[0..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    match before.find('?') {
+        Some(i) => (&before[0..i], Some(&before[i + 1..]), frag),
+        None => (before, None, frag),
+    }
+}
+
+fn set_qf(u: &mut Url, q: Option<&str>, f: Option<&str>) {
+    let set = if u.is_special() { special_query_set() } else { query_set() };
+    u.query = match q {
+        Some(x) => Some(encode(x, set)),
+        None => None,
+    };
+    u.fragment = match f {
+        Some(x) => Some(encode(x, fragment_set())),
+        None => None,
+    };
+}
+
+// Parses "userinfo@host:port" up to the path, query or fragment; returns
+// the rest.
+fn parse_authority(u: &mut Url, s: &str, special: bool) -> Result<&str, ParseError> {
+    let b = s.as_bytes();
+    let mut end = 0;
+    while end < b.len() && !(is_slash(b[end], special) || b[end] == b'?' || b[end] == b'#') { end += 1; }
+    let auth = &s[0..end];
+    let hostport = match auth.rfind('@') {
+        Some(at) => {
+            let info = &auth[0..at];
+            match info.find(':') {
+                Some(c) => {
+                    u.username = encode(&info[0..c], userinfo_set());
+                    let p = &info[c + 1..];
+                    if p.len() > 0 { u.password = Some(encode(p, userinfo_set())); }
+                }
+                None => u.username = encode(info, userinfo_set()),
+            }
+            &auth[at + 1..]
+        }
+        None => auth,
+    };
+    let (host, port) = split_port(hostport)?;
+    if host.len() == 0 {
+        if special { return Err(ParseError::EmptyHost); }
+        if u.username.len() > 0 || u.password.is_some() || port.is_some() { return Err(ParseError::EmptyHost); }
+        u.host = Some(Host::Domain(String::new()));
+    } else {
+        u.host = Some(parse_host(host, special)?);
+    }
+    u.port = match port {
+        Some(p) => if Some(p) == default_port(u.scheme.as_str()) { None } else { Some(p) },
+        None => None,
+    };
+    Ok(&s[end..])
+}
+
+// "host:port" into the host and the port (None when absent or empty).
+fn split_port(s: &str) -> Result<(&str, Option<u16>), ParseError> {
+    let b = s.as_bytes();
+    let colon = if b.len() > 0 && b[0] == b'[' {
+        match s.find(']') {
+            Some(i) => if i + 1 < b.len() { if b[i + 1] == b':' { Some(i + 1) } else { return Err(ParseError::InvalidIpv6Address); } } else { None },
+            None => return Err(ParseError::InvalidIpv6Address),
+        }
+    } else {
+        s.find(':')
+    };
+    match colon {
+        None => Ok((s, None)),
+        Some(c) => {
+            let ps = &s[c + 1..];
+            if ps.len() == 0 { return Ok((&s[0..c], None)); }
+            let mut n = 0u32;
+            for d in ps.as_bytes().iter() {
+                if !d.is_ascii_digit() { return Err(ParseError::InvalidPort); }
+                n = n * 10 + (*d - b'0') as u32;
+                if n > 65535 { return Err(ParseError::InvalidPort); }
+            }
+            Ok((&s[0..c], Some(n as u16)))
+        }
+    }
+}
+
+fn forbidden_host_byte(c: u8) -> bool {
+    match c {
+        0 | b'\t' | b'\n' | b'\r' | b' ' | b'#' | b'/' | b':' | b'<' | b'>' | b'?' | b'@' | b'[' | b'\\' | b']' | b'^' | b'|' => true,
+        _ => false,
+    }
+}
+
+fn parse_host(s: &str, special: bool) -> Result<Host, ParseError> {
+    if s.starts_with("[") {
+        if !s.ends_with("]") { return Err(ParseError::InvalidIpv6Address); }
+        return match s[1..s.len() - 1].parse::<Ipv6Addr>() {
+            Ok(a) => Ok(Host::Ipv6(a)),
+            Err(_) => Err(ParseError::InvalidIpv6Address),
+        };
+    }
+    if !special {
+        for c in s.as_bytes().iter() {
+            if forbidden_host_byte(*c) { return Err(ParseError::InvalidDomainCharacter); }
+        }
+        return Ok(Host::Domain(encode(s, CONTROLS)));
+    }
+    let raw = percent_encoding::decode_bytes(s.as_bytes());
+    let mut d = String::with_capacity(raw.len());
+    for c in raw.iter() {
+        let c = *c;
+        if c >= 0x80 { return Err(ParseError::IdnaError); }
+        if c < 0x20 || c == 0x7f || c == b'%' || forbidden_host_byte(c) { return Err(ParseError::InvalidDomainCharacter); }
+        d.push(c.to_ascii_lowercase() as char);
+    }
+    if d.len() == 0 { return Err(ParseError::EmptyHost); }
+    if ends_in_number(d.as_str()) {
+        return match parse_ipv4(d.as_str()) {
+            Some(a) => Ok(Host::Ipv4(a)),
+            None => Err(ParseError::InvalidIpv4Address),
+        };
+    }
+    Ok(Host::Domain(d))
+}
+
+// Whether the last label (ignoring a final dot) is a number: then the host
+// must be an IPv4 address.
+fn ends_in_number(s: &str) -> bool {
+    let t = if s.ends_with(".") { &s[0..s.len() - 1] } else { s };
+    let last = match t.rfind('.') {
+        Some(i) => &t[i + 1..],
+        None => t,
+    };
+    if last.len() == 0 { return false; }
+    if last.as_bytes().iter().all(|c| c.is_ascii_digit()) { return true; }
+    parse_ipv4_number(last).is_some()
+}
+
+fn parse_ipv4_number(s: &str) -> Option<u64> {
+    if s.len() == 0 { return None; }
+    let b = s.as_bytes();
+    let (radix, digits) = if b.len() >= 2 && b[0] == b'0' && (b[1] == b'x' || b[1] == b'X') {
+        (16u64, &s[2..])
+    } else if b.len() >= 2 && b[0] == b'0' {
+        (8u64, &s[1..])
+    } else {
+        (10u64, s)
+    };
+    let mut n = 0u64;
+    for c in digits.as_bytes().iter() {
+        let v = match (*c as char).to_digit(radix as u32) {
+            Some(v) => v as u64,
+            None => return None,
+        };
+        n = n * radix + v;
+        if n > 0xffffffff { n = 0x100000000; }
+    }
+    Some(n)
+}
+
+// The URL Standard's IPv4 parser ("127.1", "0x7f.0.0.1", "2130706433").
+fn parse_ipv4(s: &str) -> Option<Ipv4Addr> {
+    let t = if s.ends_with(".") { &s[0..s.len() - 1] } else { s };
+    let mut nums: Vec<u64> = Vec::new();
+    for part in t.split('.') {
+        nums.push(parse_ipv4_number(part)?);
+    }
+    if nums.len() == 0 || nums.len() > 4 { return None; }
+    let n = nums.len();
+    let mut i = 0;
+    while i + 1 < n {
+        if nums[i] > 255 { return None; }
+        i += 1;
+    }
+    let limit = 1u64 << (8 * (5 - n) as u64);
+    if nums[n - 1] >= limit { return None; }
+    let mut v = nums[n - 1];
+    i = 0;
+    while i + 1 < n {
+        v += nums[i] << (8 * (3 - i) as u64);
+        i += 1;
+    }
+    Some(Ipv4Addr::new((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8))
+}
+
+// Whether a segment is "." or ".." (also percent-encoded).
+fn single_dot(s: &str) -> bool { s == "." || s.eq_ignore_ascii_case("%2e") }
+fn double_dot(s: &str) -> bool {
+    s == ".." || s.eq_ignore_ascii_case(".%2e") || s.eq_ignore_ascii_case("%2e.") || s.eq_ignore_ascii_case("%2e%2e")
+}
+
+// Appends the segments of p (after its leading slash) to segs, resolving
+// "." and "..".
+fn push_path(segs: &mut Vec<String>, p: &str, special: bool) {
+    let b = p.as_bytes();
+    let set = path_set();
+    let mut start = 0;
+    let mut i = 0;
+    loop {
+        let end = i == b.len();
+        if end || is_slash(b[i], special) {
+            let seg = &p[start..i];
+            if double_dot(seg) {
+                segs.pop();
+                if end { segs.push(String::new()); }
+            } else if single_dot(seg) {
+                if end { segs.push(String::new()); }
+            } else {
+                segs.push(encode(seg, set));
+            }
+            if end { break; }
+            start = i + 1;
+        }
+        i += 1;
+    }
+}
+
+fn join_path(segs: &Vec<String>, special: bool, has_host: bool) -> String {
+    if segs.len() == 0 { return if special { "/".to_string() } else { String::new() }; }
+    let mut s = String::new();
+    for x in segs.iter() {
+        s.push('/');
+        s.push_str(x.as_str());
+    }
+    s
+}
+
+// The path (from an optional leading slash), query and fragment.
+fn parse_path_query_fragment(u: &mut Url, s: &str, mut segs: Vec<String>) {
+    let special = u.is_special();
+    let (p, q, f) = split_qf(s);
+    let rel = if p.len() > 0 && is_slash(p.as_bytes()[0], special) { &p[1..] } else { p };
+    if p.len() > 0 || special { push_path(&mut segs, rel, special); }
+    u.path = join_path(&segs, special, u.host.is_some());
+    set_qf(u, q, f);
+}
+
+fn base_segments(b: &Url) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if b.path.starts_with("/") {
+        for s in b.path[1..].split('/') { v.push(s.to_string()); }
+    }
+    v
+}
+
+fn relative(base: &Url, s: &str) -> Result<Url, ParseError> {
+    if base.opaque {
+        if !s.starts_with("#") { return Err(ParseError::RelativeUrlWithCannotBeABaseBase); }
+        let mut u = base.clone();
+        u.fragment = Some(encode(&s[1..], fragment_set()));
+        return Ok(u);
+    }
+    if base.scheme == "file" {
+        let mut u = new_url(base.scheme.clone());
+        parse_file(&mut u, s, Some(base))?;
+        return Ok(u);
+    }
+    let special = base.is_special();
+    if starts_with_two_slashes(s, special) {
+        let mut u = new_url(base.scheme.clone());
+        let tail = parse_authority(&mut u, &s[2..], special)?;
+        parse_path_query_fragment(&mut u, tail, Vec::new());
+        return Ok(u);
+    }
+    let mut u = base.clone();
+    u.fragment = None;
+    let b = s.as_bytes();
+    if b.len() == 0 { return Ok(u); }
+    if is_slash(b[0], special) {
+        u.query = None;
+        parse_path_query_fragment(&mut u, s, Vec::new());
+    } else if b[0] == b'?' {
+        let (_, q, f) = split_qf(s);
+        set_qf(&mut u, q, f);
+    } else if b[0] == b'#' {
+        u.fragment = Some(encode(&s[1..], fragment_set()));
+    } else {
+        u.query = None;
+        let mut segs = base_segments(base);
+        segs.pop();
+        let (p, q, f) = split_qf(s);
+        push_path(&mut segs, p, special);
+        u.path = join_path(&segs, special, true);
+        set_qf(&mut u, q, f);
+    }
+    Ok(u)
+}
+
+// file: URLs (the host may be empty; "localhost" is empty).
+fn parse_file(u: &mut Url, s: &str, base: Option<&Url>) -> Result<(), ParseError> {
+    u.host = Some(Host::Domain(String::new()));
+    if starts_with_two_slashes(s, true) {
+        let rest = &s[2..];
+        let b = rest.as_bytes();
+        let mut end = 0;
+        while end < b.len() && !(is_slash(b[end], true) || b[end] == b'?' || b[end] == b'#') { end += 1; }
+        let h = &rest[0..end];
+        if h.len() > 0 {
+            let host = parse_host(h, true)?;
+            if host != Host::Domain("localhost".to_string()) { u.host = Some(host); }
+        }
+        parse_path_query_fragment(u, &rest[end..], Vec::new());
+        return Ok(());
+    }
+    match base {
+        Some(b) => {
+            u.host = b.host.clone();
+            let c = s.as_bytes();
+            if c.len() == 0 {
+                u.path = b.path.clone();
+                u.query = b.query.clone();
+            } else if is_slash(c[0], true) {
+                parse_path_query_fragment(u, s, Vec::new());
+            } else if c[0] == b'?' {
+                u.path = b.path.clone();
+                let (_, q, f) = split_qf(s);
+                set_qf(u, q, f);
+            } else if c[0] == b'#' {
+                u.path = b.path.clone();
+                u.query = b.query.clone();
+                u.fragment = Some(encode(&s[1..], fragment_set()));
+            } else {
+                let mut segs = base_segments(b);
+                segs.pop();
+                let (p, q, f) = split_qf(s);
+                push_path(&mut segs, p, true);
+                u.path = join_path(&segs, true, true);
+                set_qf(u, q, f);
+            }
+        }
+        None => parse_path_query_fragment(u, s, Vec::new()),
+    }
+    Ok(())
+}

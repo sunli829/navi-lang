@@ -1,0 +1,167 @@
+//! application/x-www-form-urlencoded (as the form_urlencoded crate): the
+//! format of URL queries and HTML form bodies.
+//!
+//!     for (k, v) in form_urlencoded::parse(b"a=1&b=x+y") { ... }   // ("a", "1"), ("b", "x y")
+//!     let s = form_urlencoded::Serializer::new(String::new())
+//!         .append_pair("q", "a&b")
+//!         .finish();                                              // "q=a%26b"
+
+use crate::fmt::{self, Display, Formatter};
+use crate::url::Url;
+use crate::url::percent_encoding::{self, AsciiSet, NON_ALPHANUMERIC};
+
+/// The pairs of an encoded string, decoded ('+' is a space; invalid UTF-8
+/// becomes U+FFFD).
+#[derive(Clone)]
+pub struct Parse {
+    input: &[u8],
+}
+
+pub fn parse(input: &[u8]) -> Parse { Parse { input } }
+
+fn decode(b: &[u8]) -> String {
+    let mut v: Vec<u8> = Vec::with_capacity(b.len());
+    for c in b.iter() { v.push(if *c == b'+' { b' ' } else { *c }); }
+    String::from_utf8_lossy(percent_encoding::decode_bytes(v.as_slice()).as_slice())
+}
+
+impl Iterator for Parse {
+    type Item = (String, String);
+    fn next(&mut self) -> Option<(String, String)> {
+        loop {
+            if self.input.len() == 0 { return None; }
+            let b = self.input;
+            let mut end = 0;
+            while end < b.len() && b[end] != b'&' { end += 1; }
+            let piece = &b[0..end];
+            self.input = if end < b.len() { &b[end + 1..] } else { &b[end..] };
+            if piece.len() == 0 { continue; }
+            let mut eq = 0;
+            while eq < piece.len() && piece[eq] != b'=' { eq += 1; }
+            let name = decode(&piece[0..eq]);
+            let value = if eq < piece.len() { decode(&piece[eq + 1..]) } else { String::new() };
+            return Some((name, value));
+        }
+    }
+}
+
+// Encoded as is: ASCII letters and digits and *-._
+fn form_set() -> AsciiSet { NON_ALPHANUMERIC.remove(b'*').remove(b'-').remove(b'.').remove(b'_') }
+
+fn append_encoded(out: &mut String, s: &[u8]) {
+    let set = form_set();
+    for c in s.iter() {
+        let c = *c;
+        if c == b' ' {
+            out.push('+');
+        } else if set.should_percent_encode(c) {
+            out.push_str(percent_encoding::percent_encode_byte(c));
+        } else {
+            out.push(c as char);
+        }
+    }
+}
+
+/// The bytes encoded as a name or value (Display; an Iterator of pieces).
+#[derive(Clone)]
+pub struct ByteSerialize {
+    bytes: &[u8],
+}
+
+pub fn byte_serialize(input: &[u8]) -> ByteSerialize { ByteSerialize { bytes: input } }
+
+impl Display for ByteSerialize {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut s = String::new();
+        append_encoded(&mut s, self.bytes);
+        f.write_str(s.as_str())
+    }
+}
+
+impl Iterator for ByteSerialize {
+    type Item = &str;
+    fn next(&mut self) -> Option<&str> {
+        if self.bytes.len() == 0 { return None; }
+        let set = form_set();
+        let b = self.bytes[0];
+        if b == b' ' {
+            self.bytes = &self.bytes[1..];
+            return Some("+");
+        }
+        if set.should_percent_encode(b) {
+            self.bytes = &self.bytes[1..];
+            return Some(percent_encoding::percent_encode_byte(b));
+        }
+        let mut i = 1;
+        while i < self.bytes.len() && self.bytes[i] != b' ' && !set.should_percent_encode(self.bytes[i]) { i += 1; }
+        let run = &self.bytes[0..i];
+        self.bytes = &self.bytes[i..];
+        Some(unsafe { crate::str::from_utf8_unchecked(run) })
+    }
+}
+
+/// Builds an encoded string of pairs (into a String, or into a URL's query
+/// for Url::query_pairs_mut, which it updates as pairs are appended).
+pub struct Serializer {
+    s: String,
+    start: usize,
+    url: Option<&mut Url>,
+}
+
+impl Serializer {
+    /// Appends to target (after what it holds).
+    pub fn new(target: String) -> Serializer {
+        let n = target.len();
+        Serializer { s: target, start: n, url: None }
+    }
+
+    /// Appends to target from start (what is before start is kept).
+    pub fn for_suffix(target: String, start: usize) -> Serializer { Serializer { s: target, start, url: None } }
+
+    pub(crate) fn for_url(query: String, url: &mut Url) -> Serializer { Serializer { s: query, start: 0, url: Some(url) } }
+
+    /// Removes the pairs appended so far.
+    pub fn clear(&mut self) -> &mut Serializer {
+        self.s.truncate(self.start);
+        self.update();
+        self
+    }
+
+    pub fn append_pair(&mut self, name: &str, value: &str) -> &mut Serializer {
+        self.separator();
+        append_encoded(&mut self.s, name.as_bytes());
+        self.s.push('=');
+        append_encoded(&mut self.s, value.as_bytes());
+        self.update();
+        self
+    }
+
+    pub fn append_key_only(&mut self, name: &str) -> &mut Serializer {
+        self.separator();
+        append_encoded(&mut self.s, name.as_bytes());
+        self.update();
+        self
+    }
+
+    pub fn extend_pairs<I: IntoIterator<Item = (K, V)>, K: AsRef<str>, V: AsRef<str>>(&mut self, iter: I) -> &mut Serializer {
+        for (k, v) in iter {
+            self.separator();
+            append_encoded(&mut self.s, k.as_ref().as_bytes());
+            self.s.push('=');
+            append_encoded(&mut self.s, v.as_ref().as_bytes());
+        }
+        self.update();
+        self
+    }
+
+    /// The encoded string (for a URL: the URL's query).
+    pub fn finish(&mut self) -> String { self.s.clone() }
+
+    fn separator(&mut self) {
+        if self.s.len() > self.start { self.s.push('&'); }
+    }
+
+    fn update(&mut self) {
+        if let Some(u) = self.url { u.set_query_raw(self.s.clone()); }
+    }
+}

@@ -1,0 +1,294 @@
+// Request routing by pattern (as Go 1.22's http.ServeMux).
+
+use crate::http::{Method, Request, Response, StatusCode};
+use crate::url::percent_encoding::percent_decode_str;
+
+#[derive(Clone)]
+enum Seg {
+    Lit(String),
+    // {name}: one segment.
+    Wild(String),
+    // {name...} or a final "/": the rest of the path.
+    Rest(String),
+}
+
+#[derive(Clone)]
+struct Route {
+    pattern: String,
+    method: Option<String>,
+    host: Option<String>,
+    segs: Vec<Seg>,
+    // Ends with {$}: the path must end with its final slash.
+    exact: bool,
+    handler: fn(&mut Request) -> Response,
+}
+
+/// Routes requests to handlers by patterns "[METHOD ][HOST]/path":
+///
+/// - "/users/{id}" matches /users/7 (req.path_value("id") is "7");
+/// - "/files/{path...}" matches /files/a/b ("a/b");
+/// - a pattern ending in "/" matches every path under it, "/{$}" only
+///   the path itself;
+/// - "GET /x" matches GET and HEAD requests only; "example.com/" only
+///   requests for that host.
+///
+/// The most specific matching pattern wins. Unmatched paths get 404, paths
+/// matched for other methods 405 (with Allow), and a path matched by
+/// "/dir/" but given as "/dir" a redirect.
+#[derive(Clone)]
+pub struct Router {
+    routes: Vec<Route>,
+    not_found: Option<fn(&mut Request) -> Response>,
+}
+
+impl Default for Router {
+    fn default() -> Router { Router::new() }
+}
+
+impl Router {
+    pub fn new() -> Router { Router { routes: Vec::new(), not_found: None } }
+
+    /// Adds a route (panics if the pattern is invalid or already
+    /// registered, as Go's).
+    pub fn route(&mut self, pattern: &str, handler: fn(&mut Request) -> Response) -> &mut Router {
+        let r = parse_pattern(pattern, handler);
+        for x in self.routes.iter() {
+            if x.method == r.method && x.host == r.host && same_segs(&x.segs, &r.segs) && x.exact == r.exact {
+                crate::panic::panic(`http::Router: pattern ${pattern:?} conflicts with ${x.pattern:?}`);
+            }
+        }
+        self.routes.push(r);
+        self
+    }
+
+    /// The handler for requests nothing matches (404 by default).
+    pub fn fallback(&mut self, handler: fn(&mut Request) -> Response) -> &mut Router {
+        self.not_found = Some(handler);
+        self
+    }
+
+    /// Answers req with the matching route's handler.
+    pub fn handle(&self, req: &mut Request) -> Response {
+        let path = req.path().to_string();
+        let segs = split_path(path.as_str());
+        let host = match req.url().host_str() {
+            Some(h) => h.to_string(),
+            None => String::new(),
+        };
+        let method = req.method().as_str().to_string();
+        let mut best: Option<usize> = None;
+        let mut path_matched = false;
+        let mut allow: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < self.routes.len() {
+            let r = &self.routes[i];
+            i += 1;
+            if let Some(h) = &r.host {
+                if !h.eq_ignore_ascii_case(host.as_str()) { continue; }
+            }
+            if !matches(r, &segs) { continue; }
+            path_matched = true;
+            if let Some(m) = &r.method {
+                if *m != method && !(m == "GET" && method == "HEAD") {
+                    if !allow.contains(m) { allow.push(m.clone()); }
+                    if m == "GET" && !allow.contains(&"HEAD".to_string()) { allow.push("HEAD".to_string()); }
+                    continue;
+                }
+            }
+            best = match best {
+                Some(b) => if more_specific(r, &self.routes[b]) { Some(i - 1) } else { Some(b) },
+                None => Some(i - 1),
+            };
+        }
+        // "/dir" when "/dir/" is a pattern and nothing more specific than a
+        // subtree matches: redirect to "/dir/".
+        let subtree = match best {
+            Some(b) => ends_in_rest(&self.routes[b]),
+            None => true,
+        };
+        if subtree && !path.ends_with("/") && self.would_match_dir(path.as_str(), host.as_str()) {
+            let mut to = `${path}/`;
+            if let Some(q) = req.query() { to = `${to}?${q}`; }
+            return Response::redirect(to.as_str(), StatusCode::MOVED_PERMANENTLY);
+        }
+        match best {
+            Some(b) => {
+                let r = &self.routes[b];
+                bind(r, &segs, req);
+                (r.handler)(req)
+            }
+            None => {
+                if path_matched && allow.len() > 0 {
+                    return Response::error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed").with_header("Allow", allow.join(", ").as_str());
+                }
+                match self.not_found {
+                    Some(h) => h(req),
+                    None => Response::error(StatusCode::NOT_FOUND, "404 page not found"),
+                }
+            }
+        }
+    }
+
+    // Whether path + "/" matches a pattern ending in a slash.
+    fn would_match_dir(&self, path: &str, host: &str) -> bool {
+        let p = `${path}/`;
+        let segs = split_path(p.as_str());
+        for r in self.routes.iter() {
+            if let Some(h) = &r.host {
+                if !h.eq_ignore_ascii_case(host) { continue; }
+            }
+            if r.segs.len() > 0 {
+                if let Seg::Rest(n) = &r.segs[r.segs.len() - 1] {
+                    if n.len() == 0 && r.segs.len() == segs.len() && matches(r, &segs) { return true; }
+                }
+            }
+        }
+        false
+    }
+}
+
+fn same_segs(a: &Vec<Seg>, b: &Vec<Seg>) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut i = 0;
+    while i < a.len() {
+        let same = match (&a[i], &b[i]) {
+            (Seg::Lit(x), Seg::Lit(y)) => x == y,
+            (Seg::Wild(_), Seg::Wild(_)) => true,
+            (Seg::Rest(_), Seg::Rest(_)) => true,
+            _ => false,
+        };
+        if !same { return false; }
+        i += 1;
+    }
+    true
+}
+
+fn parse_pattern(pattern: &str, handler: fn(&mut Request) -> Response) -> Route {
+    let fail = |why: &str| -> ! { crate::panic::panic(`http::Router: invalid pattern ${pattern:?}: ${why}`) };
+    let mut rest = pattern.trim();
+    let mut method: Option<String> = None;
+    if let Some(i) = rest.find(|c: char| c == ' ' || c == '\t') {
+        let m = &rest[0..i];
+        if Method::from_bytes(m.as_bytes()).is_err() { fail("bad method"); }
+        method = Some(m.to_string());
+        rest = rest[i..].trim_start();
+    }
+    let slash = match rest.find('/') {
+        Some(i) => i,
+        None => fail("missing /"),
+    };
+    let host = if slash > 0 { Some(rest[0..slash].to_string()) } else { None };
+    let path = &rest[slash..];
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut exact = false;
+    let parts: Vec<&str> = path[1..].split('/').collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let p = parts[i];
+        let last = i + 1 == parts.len();
+        if p.starts_with("{") && p.ends_with("}") {
+            let name = &p[1..p.len() - 1];
+            if name == "$" {
+                if !last { fail("{$} not at the end"); }
+                exact = true;
+            } else if name.ends_with("...") {
+                if !last { fail("{...} wildcard not at the end"); }
+                segs.push(Seg::Rest(name[0..name.len() - 3].to_string()));
+            } else {
+                if name.len() == 0 { fail("empty wildcard"); }
+                for s in segs.iter() {
+                    if let Seg::Wild(n) = s {
+                        if n == name { fail("duplicate wildcard name"); }
+                    }
+                }
+                segs.push(Seg::Wild(name.to_string()));
+            }
+        } else if p.contains("{") || p.contains("}") {
+            fail("wildcard must be a whole segment");
+        } else if last && p.len() == 0 {
+            // A final slash: everything under it.
+            segs.push(Seg::Rest(String::new()));
+        } else {
+            segs.push(Seg::Lit(percent_decode_str(p).decode_utf8_lossy()));
+        }
+        i += 1;
+    }
+    Route { pattern: pattern.to_string(), method, host, segs, exact, handler }
+}
+
+// The decoded segments of a path ("/a/b/" -> ["a", "b", ""]).
+fn split_path(path: &str) -> Vec<String> {
+    let p = if path.starts_with("/") { &path[1..] } else { path };
+    let mut v = Vec::new();
+    for s in p.split('/') { v.push(percent_decode_str(s).decode_utf8_lossy()); }
+    v
+}
+
+fn matches(r: &Route, segs: &Vec<String>) -> bool {
+    let mut i = 0;
+    while i < r.segs.len() {
+        match &r.segs[i] {
+            Seg::Rest(_) => return i <= segs.len(),
+            Seg::Wild(_) => {
+                if i >= segs.len() || segs[i].len() == 0 { return false; }
+            }
+            Seg::Lit(l) => {
+                if i >= segs.len() || segs[i] != *l { return false; }
+            }
+        }
+        i += 1;
+    }
+    if r.exact { return segs.len() == r.segs.len() + 1 && segs[segs.len() - 1].len() == 0; }
+    segs.len() == r.segs.len()
+}
+
+// Sets the request's wildcard values.
+fn bind(r: &Route, segs: &Vec<String>, req: &mut Request) {
+    let mut i = 0;
+    while i < r.segs.len() {
+        match &r.segs[i] {
+            Seg::Wild(n) => req.set_path_value(n.as_str(), segs[i].as_str()),
+            Seg::Rest(n) => {
+                if n.len() > 0 {
+                    let rest = if i < segs.len() { segs[i..].join("/") } else { String::new() };
+                    req.set_path_value(n.as_str(), rest.as_str());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+// Whether a is more specific than b (both match): a host beats none,
+// then segment by segment a literal beats a wildcard beats the rest, then
+// the longer one, then one with a method.
+fn more_specific(a: &Route, b: &Route) -> bool {
+    if a.host.is_some() != b.host.is_some() { return a.host.is_some(); }
+    let mut i = 0;
+    while i < a.segs.len() && i < b.segs.len() {
+        let ra = rank(&a.segs[i]);
+        let rb = rank(&b.segs[i]);
+        if ra != rb { return ra > rb; }
+        i += 1;
+    }
+    if a.segs.len() != b.segs.len() { return a.segs.len() > b.segs.len(); }
+    if a.exact != b.exact { return a.exact; }
+    a.method.is_some() && b.method.is_none()
+}
+
+fn ends_in_rest(r: &Route) -> bool {
+    if r.segs.len() == 0 { return false; }
+    match &r.segs[r.segs.len() - 1] {
+        Seg::Rest(_) => true,
+        _ => false,
+    }
+}
+
+fn rank(s: &Seg) -> u8 {
+    match s {
+        Seg::Lit(_) => 2,
+        Seg::Wild(_) => 1,
+        Seg::Rest(_) => 0,
+    }
+}

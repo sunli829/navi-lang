@@ -134,3 +134,51 @@ navic 编译的 std 在私有的 `std::sys` 之上实现这些模块（POSIX：�
 | `Child` | 不可 `Clone` | 拷贝共享同一个子进程和管道；`wait` 得到的状态只记在被调用的那份里 | 值语义 |
 | `fs::read_link`（Windows） | 读重解析点里的目标 | 返回最终目标（`GetFinalPathNameByHandleA`） | 简化；Windows 部分无法在这里运行测试 |
 | 平台扩展 | `std::os::unix`、`std::os::windows`、`std::os::fd` | 有 `std::os::unix::fs`（`symlink`、`PermissionsExt`、`MetadataExt`、`OpenOptionsExt::mode`、`DirBuilderExt::mode`、`FileTypeExt`）、`std::os::unix::process::ExitStatusExt`、`std::os::windows::fs`（`symlink_file`、`symlink_dir`、`MetadataExt`）、`std::os::windows::process::ExitStatusExt`；没有 `std::os::fd`（`AsRawFd` 等） | 先做常用的 |
+
+## 9. 网络（std::net）的偏离
+
+socket 底层都是非阻塞的：会阻塞的操作只挂起当前绿色线程，由运行时的网络轮询器（macOS 用 kqueue，Linux/Android 用 epoll）唤醒，和 Go 一样。
+
+| 项目 | Rust | navi | 原因 |
+|---|---|---|---|
+| 关闭 socket | drop 时关闭 | `TcpListener`、`TcpStream`、`UdpSocket` 提供 `close()`；拷贝共享同一个 socket，任何一份 `close()` 都会关闭它，正阻塞在上面的线程得到错误 | 没有 Drop |
+| `try_clone` | `dup` 出新的描述符 | 返回共享同一个 socket（和它的超时设置）的拷贝 | 值语义 |
+| `TcpListener::incoming` | 迭代器借用监听器 | 迭代器持有监听器的拷贝 | 没有生命周期 |
+| 超时 | `SO_RCVTIMEO` / `SO_SNDTIMEO` | 由轮询器计时，超时返回 `ErrorKind::TimedOut`（Rust 在 Unix 上是 `WouldBlock`） | 非阻塞 socket 不用内核超时 |
+| Windows | 有 | 只有地址类型（`IpAddr`、`SocketAddr` 等）；没有 socket，名字解析返回错误 | 还没做 ws2_32 |
+
+## 10. 照着常用 crate 做的模块
+
+Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std，API 照最常用的 crate，规则同第 1 节（去掉生命周期、闭包是 `fn` 类型、没有宏）。下面列出和 crate 不同的地方。
+
+### std::url（url crate）
+
+| 项目 | url crate | navi | 原因 |
+|---|---|---|---|
+| 国际化域名 | 用 IDNA 转成 punycode | 非 ASCII 的主机名返回 `ParseError::IdnaError` | 没有 IDNA 表 |
+| `Url::host` | `Option<Host<&str>>` | `Option<Host>`（`Host::Domain(String)`） | 没有默认类型参数 |
+| `url[Position::A..Position::B]` | 用 `Position` 区间切片 | `url.slice(Position::A, Position::B)` | 不能用自定义类型的区间做 `Index` |
+| `query_pairs_mut()` | 返回的 `Serializer` drop 时写回 URL | 每次 `append_pair` 等调用后立即写回 URL；`finish()` 返回查询串 | 没有 Drop |
+| `query_pairs()` | 迭代 `(Cow<str>, Cow<str>)` | 迭代 `(String, String)` | 没有 `Cow` |
+| `socket_addrs` | 参数是 `impl Fn() -> Option<u16>` | 参数是 `fn() -> Option<u16>` | 闭包类型 |
+| `percent_encoding::AsciiSet` | `const fn add`，`&'static AsciiSet` 常量 | `add`/`remove`/`r#union`/`complement` 是普通方法，常量是值（`NON_ALPHANUMERIC`、`CONTROLS`）；`union` 是保留字，写 `r#union` | 没有 `const fn` 方法链 |
+| `make_relative`、`from_file_path`、`to_file_path` | 有 | 没有 | 暂不需要 |
+
+### std::http（类型照 http crate，客户端照 reqwest::blocking，路由照 Go 的 ServeMux）
+
+| 项目 | 参考 | navi | 原因 |
+|---|---|---|---|
+| TLS | reqwest 支持 https | 没有 TLS：https URL 返回 `ErrorKind::Builder` 错误 | 还没有 TLS 实现 |
+| `HeaderMap` | 键是 `HeaderName`，值是 `HeaderValue` | 键和值都是字符串：`get` 返回 `Option<&str>`，`get_all` 返回 `Vec<&str>`；名字不区分大小写，存成小写，按插入顺序保留多个值 | 简化 |
+| `Request<T>` / `Response<T>` | 泛型 body | 不带类型参数，body 是 `Body`（字节或 `&mut dyn Read`）；收到的消息的 body 从连接上读 | 简化 |
+| `Method` | `Method::GET` 等常量 | 相同；不是 `Copy`（值类型，赋值即拷贝） | 没有 `Copy` |
+| 读取响应 | reqwest `text()` / `bytes()` / `json()` | 相同（按值接收）；`json::<T>()` 用 `std::json` | — |
+| 构造响应（服务端） | tiny_http `Response::from_string` 等 | `Response::from_string`、`from_html`、`from_json(&x)`、`from_body`、`error(status, msg)`（同 Go 的 `http.Error`）、`redirect`；链式修改用 `with_status`、`with_header`、`with_body` | `text`/`json` 已经是读取方法 |
+| 连接复用 | 响应 drop 时归还连接 | 响应体读到结尾时归还；没读完的响应占着它的连接，下一个请求开新连接 | 没有 Drop |
+| 客户端超时 | reqwest `timeout` 是整个请求的时限 | 每次连接、读、写各自的时限 | 简化 |
+| 服务端 | Go `http.Handler` 接口 | 处理函数是 `fn(&mut Request) -> Response`；每个连接一个绿色线程；`Router::handle` 自己也是这种函数，用闭包 `\|req\| r.handle(req)` 传给 `Server::serve` | 没有 `Fn` trait |
+| 处理函数 panic | Go 的服务器恢复 panic，只断开这个连接 | 结束整个程序 | 还没有 `catch_unwind` |
+| `Content-Type` | Go 用 `DetectContentType` 嗅探 | 有 body 又没设时一律 `text/plain; charset=utf-8` | 简化 |
+| 未读完的请求体 | Go 读掉最多 256 KiB 后复用连接 | 相同 | — |
+| 路由 | Go 1.22 `ServeMux` 模式 | 支持 `[METHOD ][HOST]/path`、`{name}`、`{name...}`、`{$}`、末尾 `/` 的子树、404/405（带 `Allow`）、子树根补斜杠的 301；不做路径清理（`//`、`..`）的重定向；冲突检查只查完全相同的模式 | 简化 |
+| HTTP/2、代理、Cookie jar、压缩 | reqwest 有 | 没有 | 暂不需要 |
