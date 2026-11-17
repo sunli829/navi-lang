@@ -1,0 +1,97 @@
+// stage0: skip
+// std::compress: decoding streams made by Python's zlib and gzip modules,
+// round trips through every level and format (writers and readers, a sync
+// flush, multi-member gzip), gzip headers, corrupt input.
+// out: python gzip: hello, gzip from python
+// out: python zlib: 250 bytes, zlib zlib
+// out: named: named member a.txt 99
+// out: round trips ok true
+// out: multi: one two | first only: one
+// out: header: b.txt note 7 255
+// out: corrupt: corrupt gzip stream: CRC mismatch
+// out: truncated: deflate stream ends early
+use std::compress::{Compression, GzBuilder};
+use std::compress::read::{GzDecoder, MultiGzDecoder, ZlibDecoder, DeflateDecoder};
+use std::compress::write::{GzEncoder, ZlibEncoder, DeflateEncoder};
+use std::io::{Read, Write};
+
+fn all<R: Read>(mut r: R) -> Vec<u8> {
+    let mut v = Vec::new();
+    r.read_to_end(&mut v).unwrap();
+    v
+}
+
+fn err<R: Read>(mut r: R) -> String {
+    let mut v = Vec::new();
+    match r.read_to_end(&mut v) {
+        Ok(_) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn gz(data: &[u8], level: u32) -> Vec<u8> {
+    let mut e = GzEncoder::new(Vec::new(), Compression::new(level));
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+fn main() {
+    let py: Vec<u8> = Vec::from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xd7, 0x51, 0x48, 0xaf, 0xca, 0x2c, 0x50, 0x48, 0x2b, 0xca, 0xcf, 0x55, 0x28, 0xa8, 0x2c, 0xc9, 0xc8, 0xcf, 0xe3, 0xca, 0x20, 0x51, 0x1c, 0x00, 0xc0, 0x30, 0x31, 0x1c, 0x48, 0x00, 0x00, 0x00]);
+    let s = String::from_utf8(all(GzDecoder::new(py.as_slice()))).unwrap();
+    println(`python gzip: ${s.lines().next().unwrap()}`);
+    let z = all(ZlibDecoder::new(&[0x78, 0x9c, 0xab, 0xca, 0xc9, 0x4c, 0x52, 0xa8, 0x1a, 0x89, 0x04, 0x00, 0xae, 0x9d, 0x5a, 0xd3][..]));
+    println(`python zlib: ${z.len()} bytes, ${String::from_utf8(z[0..10].to_vec()).unwrap().trim_end()}`);
+    let named: Vec<u8> = Vec::from([0x1f, 0x8b, 0x08, 0x08, 0x63, 0x00, 0x00, 0x00, 0x02, 0xff, 0x61, 0x2e, 0x74, 0x78, 0x74, 0x00, 0xcb, 0x4b, 0xcc, 0x4d, 0x4d, 0x51, 0xc8, 0x4d, 0xcd, 0x4d, 0x4a, 0x2d, 0x02, 0x00, 0xac, 0xb7, 0x3b, 0x43, 0x0c, 0x00, 0x00, 0x00]);
+    let mut d = GzDecoder::new(named.as_slice());
+    let body = all(&mut d);
+    let h = d.header().unwrap();
+    println(`named: ${String::from_utf8(body).unwrap()} ${String::from_utf8(h.filename().unwrap().to_vec()).unwrap()} ${h.mtime()}`);
+
+    // Text, runs, and bytes that do not compress.
+    let mut data: Vec<u8> = Vec::new();
+    for i in 0..20000u32 { data.extend_from_slice(`line ${i % 97} of the test\n`.as_bytes()); }
+    for i in 0..70000u32 { data.push((i.wrapping_mul(2654435761) >> 13) as u8); }
+    for _ in 0..100000 { data.push(b'z'); }
+    let mut ok = true;
+    for level in 0..10u32 {
+        let mut e = DeflateEncoder::new(Vec::new(), Compression::new(level));
+        e.write_all(&data[0..1000]).unwrap();
+        e.flush().unwrap();
+        e.write_all(&data[1000..]).unwrap();
+        let c = e.finish().unwrap();
+        ok = ok && all(DeflateDecoder::new(c.as_slice())) == data;
+        let mut zw = ZlibEncoder::new(Vec::new(), Compression::new(level));
+        zw.write_all(data.as_slice()).unwrap();
+        let zc = zw.finish().unwrap();
+        ok = ok && all(ZlibDecoder::new(zc.as_slice())) == data;
+        let gc = gz(data.as_slice(), level);
+        ok = ok && all(GzDecoder::new(gc.as_slice())) == data;
+        let rc = all(std::compress::read::ZlibEncoder::new(data.as_slice(), Compression::new(level)));
+        ok = ok && all(ZlibDecoder::new(rc.as_slice())) == data;
+        let mut wd = std::compress::write::GzDecoder::new(Vec::new());
+        wd.write_all(gc.as_slice()).unwrap();
+        ok = ok && wd.finish().unwrap() == data;
+        if level == 6 { ok = ok && gc.len() < data.len() / 3; }
+    }
+    ok = ok && all(GzDecoder::new(gz(b"", 6).as_slice())).len() == 0;
+    println(`round trips ok ${ok}`);
+
+    let mut two = gz(b"one ", 6);
+    two.extend_from_slice(gz(b"two", 1).as_slice());
+    println(`multi: ${String::from_utf8(all(MultiGzDecoder::new(two.as_slice()))).unwrap()} | first only: ${String::from_utf8(all(GzDecoder::new(two.as_slice()))).unwrap().trim_end()}`);
+
+    let mut b = GzBuilder::new().filename("b.txt").comment("note").mtime(7).write(Vec::new(), Compression::default());
+    b.write_all(b"x").unwrap();
+    let bc = b.finish().unwrap();
+    let mut bd = GzDecoder::new(bc.as_slice());
+    all(&mut bd);
+    let bh = bd.header().unwrap();
+    println(`header: ${String::from_utf8(bh.filename().unwrap().to_vec()).unwrap()} ${String::from_utf8(bh.comment().unwrap().to_vec()).unwrap()} ${bh.mtime()} ${bh.operating_system()}`);
+
+    let mut bad = gz(b"some data", 6);
+    let n = bad.len();
+    bad[n - 6] ^= 1;
+    println(`corrupt: ${err(GzDecoder::new(bad.as_slice()))}`);
+    let short = gz(data.as_slice(), 6);
+    println(`truncated: ${err(GzDecoder::new(&short[0..short.len() / 2]))}`);
+}

@@ -1,0 +1,398 @@
+// DEFLATE decoding (RFC 1951), pulling input from a reader as it needs it.
+
+use crate::io::{self, Read};
+
+// Lengths and distances of the length and distance codes.
+const LEN_BASE: [u16; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE: [u16; 30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+// The order of the code length code lengths.
+const CL_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+const FAST_BITS: u32 = 9;
+const WINDOW: usize = 32768;
+
+fn corrupt(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, `corrupt deflate stream: ${msg}`) }
+
+/// A canonical Huffman code: a table of the codes up to FAST_BITS long
+/// (symbol << 4 | length, 0 for none) and the counts and sorted symbols
+/// for the longer ones.
+#[derive(Clone)]
+pub(crate) struct Huffman {
+    fast: Vec<u16>,
+    counts: [u16; 16],
+    symbols: Vec<u16>,
+}
+
+impl Huffman {
+    /// The code of the lengths (0: unused); Err if over-subscribed or, for
+    /// more than one code, incomplete.
+    pub(crate) fn new(lengths: &[u8]) -> io::Result<Huffman> {
+        let mut counts = [0u16; 16];
+        for l in lengths.iter() { counts[*l as usize] += 1; }
+        counts[0] = 0;
+        let mut left: i32 = 1;
+        let mut len = 1;
+        while len < 16 {
+            left <<= 1;
+            left -= counts[len] as i32;
+            if left < 0 { return Err(corrupt("over-subscribed code")); }
+            len += 1;
+        }
+        let mut offs = [0u16; 16];
+        len = 1;
+        while len < 15 {
+            offs[len + 1] = offs[len] + counts[len];
+            len += 1;
+        }
+        let mut symbols: Vec<u16> = Vec::new();
+        symbols.resize(lengths.len(), 0);
+        let mut s = 0;
+        while s < lengths.len() {
+            let l = lengths[s] as usize;
+            if l != 0 {
+                symbols[offs[l] as usize] = s as u16;
+                offs[l] += 1;
+            }
+            s += 1;
+        }
+        // The fast table: codes are read least significant bit first, so
+        // a code's entries are at its reversed bits plus every suffix.
+        let mut fast: Vec<u16> = Vec::new();
+        fast.resize(1 << FAST_BITS, 0);
+        let mut code: u32 = 0;
+        let mut k = 0;
+        len = 1;
+        while len <= FAST_BITS as usize {
+            let mut i = 0;
+            while i < counts[len] as usize {
+                let sym = symbols[k] as u32;
+                let rev = reverse(code, len as u32);
+                let mut j = rev;
+                while j < (1 << FAST_BITS) {
+                    fast[j as usize] = (sym << 4 | len as u32) as u16;
+                    j += 1 << len;
+                }
+                code += 1;
+                k += 1;
+                i += 1;
+            }
+            code <<= 1;
+            len += 1;
+        }
+        Ok(Huffman { fast, counts, symbols })
+    }
+}
+
+fn reverse(code: u32, len: u32) -> u32 {
+    let mut r = 0;
+    let mut c = code;
+    let mut i = 0;
+    while i < len {
+        r = (r << 1) | (c & 1);
+        c >>= 1;
+        i += 1;
+    }
+    r
+}
+
+/// The bytes a decoder reads: an inner reader with its buffered bytes and
+/// bits.
+pub(crate) struct Bits<R: Read> {
+    pub(crate) inner: R,
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+    bitbuf: u64,
+    nbits: u32,
+    eof: bool,
+}
+
+impl<R: Read> Bits<R> {
+    pub(crate) fn new(inner: R) -> Bits<R> {
+        let mut buf = Vec::new();
+        buf.resize(32768, 0);
+        Bits { inner, buf, pos: 0, len: 0, bitbuf: 0, nbits: 0, eof: false }
+    }
+
+    // Refills the byte buffer; false at the end of the input.
+    fn fill(&mut self) -> io::Result<bool> {
+        if self.eof { return Ok(false); }
+        loop {
+            match self.inner.read(self.buf.as_mut_slice()) {
+                Ok(0) => {
+                    self.eof = true;
+                    return Ok(false);
+                }
+                Ok(n) => {
+                    self.pos = 0;
+                    self.len = n;
+                    return Ok(true);
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::Interrupted { continue; }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // At least n bits (up to 57) in the bit buffer if the input has them;
+    // returns how many there are.
+    fn want(&mut self, n: u32) -> io::Result<u32> {
+        while self.nbits < n {
+            if self.pos == self.len {
+                if !self.fill()? { break; }
+            }
+            self.bitbuf |= (self.buf[self.pos] as u64) << self.nbits;
+            self.pos += 1;
+            self.nbits += 8;
+        }
+        Ok(self.nbits)
+    }
+
+    pub(crate) fn bits(&mut self, n: u32) -> io::Result<u32> {
+        if n == 0 { return Ok(0); }
+        if self.want(n)? < n { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "deflate stream ends early")); }
+        let v = (self.bitbuf & ((1u64 << n) - 1)) as u32;
+        self.bitbuf >>= n;
+        self.nbits -= n;
+        Ok(v)
+    }
+
+    /// Drops the bits to the next byte boundary.
+    pub(crate) fn align(&mut self) {
+        let r = self.nbits % 8;
+        self.bitbuf >>= r;
+        self.nbits -= r;
+    }
+
+    /// The next byte (on a byte boundary), None at the end of the input.
+    pub(crate) fn byte(&mut self) -> io::Result<Option<u8>> {
+        if self.nbits >= 8 {
+            let b = (self.bitbuf & 0xff) as u8;
+            self.bitbuf >>= 8;
+            self.nbits -= 8;
+            return Ok(Some(b));
+        }
+        if self.pos == self.len {
+            if !self.fill()? { return Ok(None); }
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Ok(Some(b))
+    }
+
+    pub(crate) fn need_byte(&mut self) -> io::Result<u8> {
+        match self.byte()? {
+            Some(b) => Ok(b),
+            None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stream ends early")),
+        }
+    }
+
+    /// Whether the input has no more bytes.
+    pub(crate) fn at_end(&mut self) -> io::Result<bool> {
+        if self.nbits >= 8 || self.pos < self.len { return Ok(false); }
+        Ok(!self.fill()?)
+    }
+
+    fn decode(&mut self, h: &Huffman) -> io::Result<u32> {
+        let have = self.want(FAST_BITS)?;
+        let e = h.fast[(self.bitbuf & ((1u64 << FAST_BITS) - 1)) as usize] as u32;
+        if e != 0 && (e & 15) <= have {
+            let l = e & 15;
+            self.bitbuf >>= l;
+            self.nbits -= l;
+            return Ok(e >> 4);
+        }
+        // Longer codes, a bit at a time (as zlib's puff).
+        let mut code: i32 = 0;
+        let mut first: i32 = 0;
+        let mut index: i32 = 0;
+        let mut len = 1;
+        while len < 16 {
+            code |= self.bits(1)? as i32;
+            let count = h.counts[len] as i32;
+            if code - count < first { return Ok(h.symbols[(index + (code - first)) as usize] as u32); }
+            index += count;
+            first += count;
+            first <<= 1;
+            code <<= 1;
+            len += 1;
+        }
+        Err(corrupt("invalid code"))
+    }
+}
+
+fn fixed_tables() -> (Huffman, Huffman) {
+    let mut l = [0u8; 288];
+    let mut i = 0;
+    while i < 288 {
+        l[i] = if i < 144 { 8 } else if i < 256 { 9 } else if i < 280 { 7 } else { 8 };
+        i += 1;
+    }
+    let d = [5u8; 30];
+    (Huffman::new(&l).unwrap(), Huffman::new(&d).unwrap())
+}
+
+const HEADER: u8 = 0;
+const STORED: u8 = 1;
+const CODES: u8 = 2;
+const DONE: u8 = 3;
+
+/// A DEFLATE decoder over the bits of a reader: read gives the decoded
+/// bytes until the final block ends.
+pub(crate) struct Inflater<R: Read> {
+    pub(crate) src: Bits<R>,
+    window: Vec<u8>,
+    wpos: usize,
+    state: u8,
+    last: bool,
+    stored_left: u32,
+    lit: Option<Huffman>,
+    dist: Option<Huffman>,
+    // A match being copied.
+    copy_len: u32,
+    copy_dist: usize,
+}
+
+impl<R: Read> Inflater<R> {
+    pub(crate) fn new(src: Bits<R>) -> Inflater<R> {
+        let mut window = Vec::new();
+        window.resize(WINDOW, 0);
+        Inflater { src, window, wpos: 0, state: HEADER, last: false, stored_left: 0, lit: None, dist: None, copy_len: 0, copy_dist: 0 }
+    }
+
+    pub(crate) fn done(&self) -> bool { self.state == DONE }
+
+    /// Starts another stream on the same input (gzip members).
+    pub(crate) fn restart(&mut self) {
+        self.state = HEADER;
+        self.last = false;
+        self.wpos = 0;
+        self.copy_len = 0;
+    }
+
+    fn put(&mut self, out: &mut [u8], n: &mut usize, b: u8) {
+        out[*n] = b;
+        *n += 1;
+        self.window[self.wpos] = b;
+        self.wpos = (self.wpos + 1) & (WINDOW - 1);
+    }
+
+    /// Decodes into out; 0 at the end of the stream.
+    pub(crate) fn read_some(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let mut n = 0;
+        while n < out.len() {
+            if self.copy_len > 0 {
+                let from = (self.wpos + WINDOW - self.copy_dist) & (WINDOW - 1);
+                let b = self.window[from];
+                self.put(out, &mut n, b);
+                self.copy_len -= 1;
+                continue;
+            }
+            match self.state {
+                HEADER => {
+                    if self.last {
+                        self.state = DONE;
+                        continue;
+                    }
+                    self.last = self.src.bits(1)? == 1;
+                    let t = self.src.bits(2)?;
+                    if t == 0 {
+                        self.src.align();
+                        let len = self.src.bits(16)?;
+                        let nlen = self.src.bits(16)?;
+                        if len != (!nlen & 0xffff) { return Err(corrupt("stored block length mismatch")); }
+                        self.stored_left = len;
+                        self.state = STORED;
+                    } else if t == 1 {
+                        let (l, d) = fixed_tables();
+                        self.lit = Some(l);
+                        self.dist = Some(d);
+                        self.state = CODES;
+                    } else if t == 2 {
+                        self.dynamic()?;
+                        self.state = CODES;
+                    } else {
+                        return Err(corrupt("invalid block type"));
+                    }
+                }
+                STORED => {
+                    if self.stored_left == 0 {
+                        self.state = HEADER;
+                        continue;
+                    }
+                    let b = self.src.need_byte()?;
+                    self.put(out, &mut n, b);
+                    self.stored_left -= 1;
+                }
+                CODES => {
+                    let sym = self.src.decode(self.lit.as_ref().unwrap())?;
+                    if sym < 256 {
+                        self.put(out, &mut n, sym as u8);
+                    } else if sym == 256 {
+                        self.state = HEADER;
+                    } else {
+                        let i = (sym - 257) as usize;
+                        if i >= 29 { return Err(corrupt("invalid length code")); }
+                        let len = LEN_BASE[i] as u32 + self.src.bits(LEN_EXTRA[i] as u32)?;
+                        let ds = self.src.decode(self.dist.as_ref().unwrap())? as usize;
+                        if ds >= 30 { return Err(corrupt("invalid distance code")); }
+                        let dist = DIST_BASE[ds] as usize + self.src.bits(DIST_EXTRA[ds] as u32)? as usize;
+                        self.copy_len = len;
+                        self.copy_dist = dist;
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(n)
+    }
+
+    // The code lengths of a dynamic block.
+    fn dynamic(&mut self) -> io::Result<()> {
+        let nlen = self.src.bits(5)? as usize + 257;
+        let ndist = self.src.bits(5)? as usize + 1;
+        let ncode = self.src.bits(4)? as usize + 4;
+        if nlen > 286 || ndist > 30 { return Err(corrupt("too many codes")); }
+        let mut cl = [0u8; 19];
+        let mut i = 0;
+        while i < ncode {
+            cl[CL_ORDER[i]] = self.src.bits(3)? as u8;
+            i += 1;
+        }
+        let clh = Huffman::new(&cl)?;
+        let mut lens: Vec<u8> = Vec::new();
+        lens.resize(nlen + ndist, 0);
+        i = 0;
+        while i < nlen + ndist {
+            let sym = self.src.decode(&clh)?;
+            if sym < 16 {
+                lens[i] = sym as u8;
+                i += 1;
+                continue;
+            }
+            let (val, rep) = if sym == 16 {
+                if i == 0 { return Err(corrupt("repeat with no first length")); }
+                (lens[i - 1], 3 + self.src.bits(2)? as usize)
+            } else if sym == 17 {
+                (0u8, 3 + self.src.bits(3)? as usize)
+            } else {
+                (0u8, 11 + self.src.bits(7)? as usize)
+            };
+            if i + rep > nlen + ndist { return Err(corrupt("too many lengths")); }
+            let mut k = 0;
+            while k < rep {
+                lens[i] = val;
+                i += 1;
+                k += 1;
+            }
+        }
+        if lens[256] == 0 { return Err(corrupt("no end-of-block code")); }
+        self.lit = Some(Huffman::new(&lens[0..nlen])?);
+        self.dist = Some(Huffman::new(&lens[nlen..])?);
+        Ok(())
+    }
+}

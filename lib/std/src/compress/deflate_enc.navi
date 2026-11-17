@@ -1,0 +1,549 @@
+// DEFLATE encoding (RFC 1951): LZ77 over a 32 KiB window with hash chains
+// (lazy matching at the higher levels), each block in dynamic Huffman
+// codes (or stored when that is smaller). Input is taken in pieces; output
+// is appended to a Vec as blocks complete.
+
+const WINDOW: usize = 32768;
+const MIN_MATCH: usize = 3;
+const MAX_MATCH: usize = 258;
+const HASH_BITS: u32 = 15;
+// Symbols in a block before it is written.
+const BLOCK_SYMS: usize = 16384;
+
+const LEN_BASE: [u16; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE: [u16; 30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const CL_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+/// Appends bits least significant first.
+pub(crate) struct BitWriter {
+    pub(crate) out: Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl BitWriter {
+    pub(crate) fn new() -> BitWriter { BitWriter { out: Vec::new(), acc: 0, n: 0 } }
+
+    pub(crate) fn put(&mut self, v: u32, bits: u32) {
+        self.acc |= (v as u64) << self.n;
+        self.n += bits;
+        while self.n >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+
+    pub(crate) fn align(&mut self) {
+        if self.n > 0 {
+            self.out.push(self.acc as u8);
+            self.acc = 0;
+            self.n = 0;
+        }
+    }
+}
+
+// Code lengths (at most max) for the frequencies, as miniz does: Huffman
+// lengths, then the overlong ones cut down and the code made complete.
+fn code_lengths(freq: &[u32], max: u32) -> Vec<u8> {
+    let n = freq.len();
+    let mut lens: Vec<u8> = Vec::new();
+    lens.resize(n, 0);
+    let mut syms: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if freq[i] > 0 { syms.push(i); }
+    }
+    if syms.len() == 0 { return lens; }
+    if syms.len() == 1 {
+        lens[syms[0]] = 1;
+        return lens;
+    }
+    // Huffman tree by repeatedly joining the two lightest nodes.
+    syms.sort_by(|a, b| freq[*a].cmp(&freq[*b]).then(a.cmp(b)));
+    let m = syms.len();
+    let mut weight: Vec<u64> = Vec::new();
+    let mut parent: Vec<usize> = Vec::new();
+    for s in syms.iter() {
+        weight.push(freq[*s] as u64);
+        parent.push(0);
+    }
+    // Leaves in order of weight; internal nodes are made in order of
+    // weight too, so two queues suffice.
+    let mut li = 0;
+    let mut ni = m;
+    while weight.len() < 2 * m - 1 {
+        let mut pick = [0usize; 2];
+        let mut k = 0;
+        while k < 2 {
+            if li < m && (ni >= weight.len() || weight[li] <= weight[ni]) {
+                pick[k] = li;
+                li += 1;
+            } else {
+                pick[k] = ni;
+                ni += 1;
+            }
+            k += 1;
+        }
+        let id = weight.len();
+        weight.push(weight[pick[0]] + weight[pick[1]]);
+        parent.push(0);
+        parent[pick[0]] = id;
+        parent[pick[1]] = id;
+    }
+    // Depths from the root (the last node).
+    let total = weight.len();
+    let mut depth: Vec<u32> = Vec::new();
+    depth.resize(total, 0);
+    let mut i = total - 1;
+    while i > 0 {
+        i -= 1;
+        depth[i] = depth[parent[i]] + 1;
+    }
+    // Counts per length, the overlong ones moved to max, then the Kraft
+    // sum brought back to 1.
+    let mut count = [0u32; 33];
+    for k in 0..m {
+        let d = if depth[k] > 32 { 32 } else { depth[k] };
+        count[d as usize] += 1;
+    }
+    let mut l = max + 1;
+    while l <= 32 {
+        count[max as usize] += count[l as usize];
+        count[l as usize] = 0;
+        l += 1;
+    }
+    let mut kraft: u64 = 0;
+    l = 1;
+    while l <= max {
+        kraft += (count[l as usize] as u64) << (max - l);
+        l += 1;
+    }
+    while kraft > (1u64 << max) {
+        count[max as usize] -= 1;
+        let mut j = max - 1;
+        while j > 0 {
+            if count[j as usize] != 0 {
+                count[j as usize] -= 1;
+                count[(j + 1) as usize] += 2;
+                break;
+            }
+            j -= 1;
+        }
+        kraft -= 1;
+    }
+    // The shortest lengths to the most frequent symbols.
+    let mut k = m;
+    l = 1;
+    while l <= max {
+        let mut c = count[l as usize];
+        while c > 0 {
+            k -= 1;
+            lens[syms[k]] = l as u8;
+            c -= 1;
+        }
+        l += 1;
+    }
+    lens
+}
+
+// The canonical codes of the lengths, bit-reversed for writing.
+fn codes(lens: &[u8]) -> Vec<u16> {
+    let mut count = [0u16; 16];
+    for l in lens.iter() { count[*l as usize] += 1; }
+    count[0] = 0;
+    let mut next = [0u16; 16];
+    let mut code: u16 = 0;
+    let mut b = 1;
+    while b < 16 {
+        code = (code + count[b - 1]) << 1;
+        next[b] = code;
+        b += 1;
+    }
+    let mut out: Vec<u16> = Vec::new();
+    out.resize(lens.len(), 0);
+    let mut i = 0;
+    while i < lens.len() {
+        let l = lens[i] as usize;
+        if l > 0 {
+            let c = next[l];
+            next[l] += 1;
+            let mut r: u16 = 0;
+            let mut x = c;
+            let mut j = 0;
+            while j < l {
+                r = (r << 1) | (x & 1);
+                x >>= 1;
+                j += 1;
+            }
+            out[i] = r;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn len_code(len: usize) -> usize {
+    let mut i = 28;
+    while LEN_BASE[i] as usize > len { i -= 1; }
+    i
+}
+
+fn dist_code(d: usize) -> usize {
+    let mut i = 29;
+    while DIST_BASE[i] as usize > d { i -= 1; }
+    i
+}
+
+/// A streaming DEFLATE encoder.
+pub(crate) struct Deflater {
+    level: u32,
+    // History and pending input; data[base..] are absolute positions.
+    data: Vec<u8>,
+    base: usize,
+    pos: usize,
+    head: Vec<i64>,
+    prev: Vec<i64>,
+    // The symbols of the current block: literal (< 256), or length (>= 256:
+    // 256 + len) with a distance.
+    syms: Vec<u16>,
+    dists: Vec<u16>,
+    block_start: usize,
+    pub(crate) w: BitWriter,
+    max_chain: usize,
+    lazy: bool,
+    pub(crate) total_in: u64,
+    ended: bool,
+}
+
+impl Deflater {
+    pub(crate) fn new(level: u32) -> Deflater {
+        let lv = if level > 9 { 9 } else { level };
+        let chains = [0usize, 4, 8, 16, 24, 32, 64, 128, 512, 4096];
+        let mut head = Vec::new();
+        head.resize(1 << HASH_BITS, -1);
+        let mut prev = Vec::new();
+        prev.resize(WINDOW, -1);
+        Deflater { level: lv, data: Vec::new(), base: 0, pos: 0, head, prev, syms: Vec::new(), dists: Vec::new(), block_start: 0, w: BitWriter::new(), max_chain: chains[lv as usize], lazy: lv >= 4, total_in: 0, ended: false }
+    }
+
+    pub(crate) fn input(&mut self, b: &[u8]) {
+        self.data.extend_from_slice(b);
+        self.total_in += b.len() as u64;
+    }
+
+    fn at(&self, p: usize) -> u8 { self.data[p - self.base] }
+    fn end(&self) -> usize { self.base + self.data.len() }
+
+    fn hash(&self, p: usize) -> usize {
+        let i = p - self.base;
+        let h = (self.data[i] as u32) << 10 ^ (self.data[i + 1] as u32) << 5 ^ self.data[i + 2] as u32;
+        (h.wrapping_mul(2654435761) >> (32 - HASH_BITS)) as usize
+    }
+
+    fn insert(&mut self, p: usize) {
+        if p + MIN_MATCH > self.end() { return; }
+        let h = self.hash(p);
+        self.prev[p & (WINDOW - 1)] = self.head[h];
+        self.head[h] = p as i64;
+    }
+
+    // The longest match for p (length, distance), length 0 for none.
+    fn longest(&self, p: usize, limit: usize) -> (usize, usize) {
+        if p + MIN_MATCH > limit { return (0, 0); }
+        let h = self.hash(p);
+        let mut cand = self.head[h];
+        let maxlen = if limit - p < MAX_MATCH { limit - p } else { MAX_MATCH };
+        let mut best = 0;
+        let mut bestd = 0;
+        let mut chain = self.max_chain;
+        let d0 = self.data.as_slice();
+        let pi = p - self.base;
+        while cand >= 0 && chain > 0 {
+            let c = cand as usize;
+            if c >= p || p - c > WINDOW - 1 || c < self.base { break; }
+            let ci = c - self.base;
+            if d0[ci + best] == d0[pi + best] {
+                let mut l = 0;
+                while l < maxlen && d0[ci + l] == d0[pi + l] { l += 1; }
+                if l > best {
+                    best = l;
+                    bestd = p - c;
+                    if l == maxlen { break; }
+                }
+            }
+            cand = self.prev[c & (WINDOW - 1)];
+            chain -= 1;
+        }
+        if best >= MIN_MATCH { (best, bestd) } else { (0, 0) }
+    }
+
+    /// Compresses the input up to where matches can be found (all of it
+    /// with fin), writing full blocks; fin also writes the last block.
+    pub(crate) fn run(&mut self, fin: bool) {
+        if self.ended { return; }
+        let limit = self.end();
+        let stop = if fin { limit } else if limit >= MAX_MATCH { limit - MAX_MATCH } else { 0 };
+        if self.level == 0 {
+            // Stored blocks: full ones as input comes, the rest at the end.
+            while self.pos < limit && (fin || limit - self.pos >= 65535) {
+                let n = if limit - self.pos > 65535 { 65535 } else { limit - self.pos };
+                let last = fin && self.pos + n == limit;
+                self.stored(self.pos, n, last);
+                self.pos += n;
+                if last { self.ended = true; }
+            }
+            if fin && !self.ended {
+                self.stored(self.pos, 0, true);
+                self.ended = true;
+            }
+            self.block_start = self.pos;
+            self.trim();
+            return;
+        }
+        while self.pos < stop {
+            let (mut len, mut dist) = self.longest(self.pos, limit);
+            if self.lazy && len >= MIN_MATCH && len < 32 && self.pos + 1 < stop {
+                self.insert(self.pos);
+                let (l2, d2) = self.longest(self.pos + 1, limit);
+                if l2 > len {
+                    // A literal now, the longer match next.
+                    let b = self.at(self.pos);
+                    self.pos += 1;
+                    self.lit(b);
+                    len = l2;
+                    dist = d2;
+                    self.emit_match(len, dist);
+                    continue;
+                }
+                self.emit_match_inserted(len, dist);
+                continue;
+            }
+            if len >= MIN_MATCH {
+                self.emit_match(len, dist);
+            } else {
+                self.insert(self.pos);
+                let b = self.at(self.pos);
+                self.pos += 1;
+                self.lit(b);
+            }
+        }
+        if fin {
+            self.block(true);
+            self.ended = true;
+        }
+        self.trim();
+    }
+
+    fn lit(&mut self, b: u8) {
+        self.syms.push(b as u16);
+        self.dists.push(0);
+        if self.syms.len() >= BLOCK_SYMS { self.block(false); }
+    }
+
+    // A match at pos (pos not hashed yet).
+    fn emit_match(&mut self, len: usize, dist: usize) {
+        let p = self.pos;
+        let mut i = 0;
+        while i < len {
+            self.insert(p + i);
+            i += 1;
+        }
+        self.push_match(len, dist);
+    }
+
+    // A match at pos (pos already hashed).
+    fn emit_match_inserted(&mut self, len: usize, dist: usize) {
+        let p = self.pos;
+        let mut i = 1;
+        while i < len {
+            self.insert(p + i);
+            i += 1;
+        }
+        self.push_match(len, dist);
+    }
+
+    fn push_match(&mut self, len: usize, dist: usize) {
+        self.syms.push((256 + len) as u16);
+        self.dists.push(dist as u16);
+        self.pos += len;
+        if self.syms.len() >= BLOCK_SYMS { self.block(false); }
+    }
+
+    // Drops history more than a window behind pos.
+    fn trim(&mut self) {
+        let keep_from = if self.pos > WINDOW { self.pos - WINDOW } else { 0 };
+        let keep = if keep_from < self.block_start { keep_from } else { self.block_start };
+        if keep > self.base + 65536 {
+            let cut = keep - self.base;
+            self.data.drain(0..cut);
+            self.base = keep;
+        }
+    }
+
+    fn stored(&mut self, from: usize, n: usize, last: bool) {
+        self.w.put(if last { 1 } else { 0 }, 1);
+        self.w.put(0, 2);
+        self.w.align();
+        self.w.put(n as u32, 16);
+        self.w.put((!(n as u32)) & 0xffff, 16);
+        let s = from - self.base;
+        self.w.out.extend_from_slice(&self.data[s..s + n]);
+    }
+
+    /// An empty stored block (a sync flush).
+    pub(crate) fn sync(&mut self) {
+        if self.syms.len() > 0 { self.block(false); }
+        self.w.put(0, 3);
+        self.w.align();
+        self.w.put(0, 16);
+        self.w.put(0xffff, 16);
+    }
+
+    // Writes the symbols since block_start as one block.
+    fn block(&mut self, last: bool) {
+        let mut lf = [0u32; 286];
+        let mut df = [0u32; 30];
+        let mut i = 0;
+        while i < self.syms.len() {
+            let s = self.syms[i] as usize;
+            if s < 256 {
+                lf[s] += 1;
+            } else {
+                lf[257 + len_code(s - 256)] += 1;
+                df[dist_code(self.dists[i] as usize)] += 1;
+            }
+            i += 1;
+        }
+        lf[256] = 1;
+        let ll = code_lengths(&lf, 15);
+        let mut dl = code_lengths(&df, 15);
+        // At least one distance code.
+        if dl.iter().all(|x| *x == 0) { dl[0] = 1; }
+        let mut nlit = 286;
+        while nlit > 257 && ll[nlit - 1] == 0 { nlit -= 1; }
+        let mut ndist = 30;
+        while ndist > 1 && dl[ndist - 1] == 0 { ndist -= 1; }
+        // The code lengths, run-length coded.
+        let mut all: Vec<u8> = Vec::new();
+        all.extend_from_slice(&ll[0..nlit]);
+        all.extend_from_slice(&dl[0..ndist]);
+        let mut rle: Vec<(u8, u8)> = Vec::new();
+        let mut cf = [0u32; 19];
+        i = 0;
+        while i < all.len() {
+            let v = all[i];
+            let mut run = 1;
+            while i + run < all.len() && all[i + run] == v { run += 1; }
+            let mut r = run;
+            if v == 0 {
+                while r >= 11 {
+                    let k = if r > 138 { 138 } else { r };
+                    rle.push((18, (k - 11) as u8));
+                    cf[18] += 1;
+                    r -= k;
+                }
+                if r >= 3 {
+                    rle.push((17, (r - 3) as u8));
+                    cf[17] += 1;
+                    r = 0;
+                }
+            } else {
+                rle.push((v, 0));
+                cf[v as usize] += 1;
+                r -= 1;
+                while r >= 3 {
+                    let k = if r > 6 { 6 } else { r };
+                    rle.push((16, (k - 3) as u8));
+                    cf[16] += 1;
+                    r -= k;
+                }
+            }
+            while r > 0 {
+                rle.push((v, 0));
+                cf[v as usize] += 1;
+                r -= 1;
+            }
+            i += run;
+        }
+        let cl = code_lengths(&cf, 7);
+        let mut ncl = 19;
+        while ncl > 4 && cl[CL_ORDER[ncl - 1]] == 0 { ncl -= 1; }
+        let lcodes = codes(&ll);
+        let dcodes = codes(&dl);
+        let ccodes = codes(&cl);
+        // Sizes in bits of the dynamic and the stored forms.
+        let mut dyn_bits: u64 = 3 + 14 + 3 * ncl as u64;
+        for (s, _) in rle.iter() {
+            dyn_bits += cl[*s as usize] as u64;
+            if *s == 16 { dyn_bits += 2; } else if *s == 17 { dyn_bits += 3; } else if *s == 18 { dyn_bits += 7; }
+        }
+        let mut k = 0;
+        while k < 286 {
+            dyn_bits += lf[k] as u64 * ll[k] as u64;
+            if k >= 257 { dyn_bits += lf[k] as u64 * LEN_EXTRA[k - 257] as u64; }
+            k += 1;
+        }
+        k = 0;
+        while k < 30 {
+            dyn_bits += df[k] as u64 * (dl[k] as u64 + DIST_EXTRA[k] as u64);
+            k += 1;
+        }
+        let raw = self.pos - self.block_start;
+        let stored_bits = ((raw + 65534) / 65535 * 5 + raw) as u64 * 8 + 8;
+        if stored_bits < dyn_bits && raw > 0 {
+            let mut from = self.block_start;
+            while from < self.pos {
+                let n = if self.pos - from > 65535 { 65535 } else { self.pos - from };
+                let fin = last && from + n == self.pos;
+                self.stored(from, n, fin);
+                from += n;
+            }
+        } else {
+            self.w.put(if last { 1 } else { 0 }, 1);
+            self.w.put(2, 2);
+            self.w.put((nlit - 257) as u32, 5);
+            self.w.put((ndist - 1) as u32, 5);
+            self.w.put((ncl - 4) as u32, 4);
+            i = 0;
+            while i < ncl {
+                self.w.put(cl[CL_ORDER[i]] as u32, 3);
+                i += 1;
+            }
+            for (s, e) in rle.iter() {
+                self.w.put(ccodes[*s as usize] as u32, cl[*s as usize] as u32);
+                if *s == 16 { self.w.put(*e as u32, 2); } else if *s == 17 { self.w.put(*e as u32, 3); } else if *s == 18 { self.w.put(*e as u32, 7); }
+            }
+            i = 0;
+            while i < self.syms.len() {
+                let s = self.syms[i] as usize;
+                if s < 256 {
+                    self.w.put(lcodes[s] as u32, ll[s] as u32);
+                } else {
+                    let len = s - 256;
+                    let lc = len_code(len);
+                    self.w.put(lcodes[257 + lc] as u32, ll[257 + lc] as u32);
+                    self.w.put((len - LEN_BASE[lc] as usize) as u32, LEN_EXTRA[lc] as u32);
+                    let d = self.dists[i] as usize;
+                    let dc = dist_code(d);
+                    self.w.put(dcodes[dc] as u32, dl[dc] as u32);
+                    self.w.put((d - DIST_BASE[dc] as usize) as u32, DIST_EXTRA[dc] as u32);
+                }
+                i += 1;
+            }
+            self.w.put(lcodes[256] as u32, ll[256] as u32);
+        }
+        self.syms.clear();
+        self.dists.clear();
+        self.block_start = self.pos;
+        if last { self.w.align(); }
+    }
+
+    /// Takes the output written so far.
+    pub(crate) fn take(&mut self) -> Vec<u8> {
+        let mut v = Vec::new();
+        crate::mem::swap(&mut v, &mut self.w.out);
+        v
+    }
+}

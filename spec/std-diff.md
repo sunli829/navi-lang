@@ -237,3 +237,15 @@ API 照 base64 0.22（`Engine`）、hex、RustCrypto（`Digest`、`Mac`、`Hmac<
 | 哈希器写入 | `Digest::update`、`io::Write` | 相同（都实现 `io::Write`，可以 `io::copy` 进去） | — |
 | base64 的自定义 `GeneralPurpose` 配置、`read`/`write` 包装器 | 有 | 只有四个预设引擎（`STANDARD`、`STANDARD_NO_PAD`、`URL_SAFE`、`URL_SAFE_NO_PAD`） | 暂不需要 |
 | crc32 的 `Hasher::new_with_initial` | 有 | 有；没有 SIMD 加速 | — |
+
+### std::compress（flate2 crate）
+
+DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）：编码是哈希链 LZ77（4 级以上惰性匹配）加动态 Huffman，压缩率和 zlib 相当；解码支持全部块类型。已经和 Python 的 zlib/gzip、系统的 gzip 互相验证过。
+
+| 项目 | flate2 | navi | 原因 |
+|---|---|---|---|
+| 写入方向的编码器结束 | drop 时写完结尾 | 必须调用 `finish()`（返回内部的 writer）或 `try_finish()` | 没有 Drop |
+| `write::*Decoder` | 边写边解压 | 写入的数据先缓存，`try_finish`/`finish` 时一次解压写出 | 解码器是"拉"输入的 |
+| `bufread::*`、`Decompress`/`Compress` 底层接口、`GzHeader` 的 `mtime_as_datetime`、zlib 预设字典 | 有 | 没有 | 暂不需要 |
+| 写入编码器的 `flush` | 同步刷新（sync flush） | 相同 | — |
+| 性能 | miniz/zlib（C） | 约为 C 实现的十分之一到二十分之一（navic 还不内联） | — |
