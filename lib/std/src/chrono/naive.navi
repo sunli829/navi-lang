@@ -1,0 +1,863 @@
+//! Dates and times without a time zone: NaiveDate, NaiveTime,
+//! NaiveDateTime (the proleptic Gregorian calendar), with Weekday, Month,
+//! IsoWeek and the Datelike and Timelike traits.
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::ops::{Add, Sub};
+use crate::cmp::Ordering;
+use crate::str::FromStr;
+use crate::chrono::TimeDelta;
+use crate::chrono::format::{self, ParseError, ParseResult, DelayedFormat, Parsed};
+
+// --- Calendar arithmetic (H. Hinnant's days_from_civil) -----------------------------
+
+/// Days since 1970-01-01 of y-m-d.
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The y-m-d of days since 1970-01-01.
+pub(crate) fn civil_from_days(z0: i64) -> (i64, u32, u32) {
+    let z = z0 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
+}
+
+pub(crate) fn is_leap(y: i64) -> bool { y.rem_euclid(4) == 0 && (y.rem_euclid(100) != 0 || y.rem_euclid(400) == 0) }
+
+pub(crate) fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => if is_leap(y) { 29 } else { 28 },
+    }
+}
+
+// The supported years, as chrono's.
+const MIN_YEAR: i64 = -262143;
+const MAX_YEAR: i64 = 262142;
+
+// --- Weekday and Month ---------------------------------------------------------------
+
+/// A day of the week.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Weekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+const WEEKDAYS: [Weekday; 7] = [Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri, Weekday::Sat, Weekday::Sun];
+const WEEKDAY_NAMES: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+impl Weekday {
+    pub fn succ(&self) -> Weekday { WEEKDAYS[(self.num_days_from_monday() as usize + 1) % 7] }
+    pub fn pred(&self) -> Weekday { WEEKDAYS[(self.num_days_from_monday() as usize + 6) % 7] }
+    pub fn number_from_monday(&self) -> u32 { self.num_days_from_monday() + 1 }
+    pub fn number_from_sunday(&self) -> u32 { self.num_days_from_sunday() + 1 }
+    pub fn num_days_from_monday(&self) -> u32 {
+        match self {
+            Weekday::Mon => 0,
+            Weekday::Tue => 1,
+            Weekday::Wed => 2,
+            Weekday::Thu => 3,
+            Weekday::Fri => 4,
+            Weekday::Sat => 5,
+            Weekday::Sun => 6,
+        }
+    }
+    pub fn num_days_from_sunday(&self) -> u32 { (self.num_days_from_monday() + 1) % 7 }
+
+    /// Days from self forward to other (0..7).
+    pub fn days_since(&self, other: Weekday) -> u32 { (self.num_days_from_monday() + 7 - other.num_days_from_monday()) % 7 }
+
+    pub(crate) fn from_monday(n: u32) -> Weekday { WEEKDAYS[(n % 7) as usize] }
+    pub(crate) fn name(&self) -> &str { WEEKDAY_NAMES[self.num_days_from_monday() as usize] }
+}
+
+impl Display for Weekday {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.pad(&self.name()[0..3]) }
+}
+
+impl FromStr for Weekday {
+    type Err = ParseWeekdayError;
+    fn from_str(s: &str) -> Result<Weekday, ParseWeekdayError> {
+        let l = s.to_ascii_lowercase();
+        let mut i = 0;
+        while i < 7 {
+            let n = WEEKDAY_NAMES[i].to_ascii_lowercase();
+            if l == n || l == &n[0..3] { return Ok(WEEKDAYS[i]); }
+            i += 1;
+        }
+        Err(ParseWeekdayError {})
+    }
+}
+
+/// Weekday::from_str's error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseWeekdayError {}
+
+impl Display for ParseWeekdayError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("ParseWeekdayError { _dummy: () }") }
+}
+
+/// A month of the year.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum Month {
+    January,
+    February,
+    March,
+    April,
+    May,
+    June,
+    July,
+    August,
+    September,
+    October,
+    November,
+    December,
+}
+
+const MONTHS: [Month; 12] = [Month::January, Month::February, Month::March, Month::April, Month::May, Month::June, Month::July, Month::August, Month::September, Month::October, Month::November, Month::December];
+pub(crate) const MONTH_NAMES: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+impl Month {
+    /// 1 for January.
+    pub fn number_from_month(&self) -> u32 {
+        let mut i = 0;
+        while i < 12 {
+            if MONTHS[i] == *self { return i as u32 + 1; }
+            i += 1;
+        }
+        0
+    }
+    pub fn succ(&self) -> Month { MONTHS[(self.number_from_month() as usize) % 12] }
+    pub fn pred(&self) -> Month { MONTHS[(self.number_from_month() as usize + 10) % 12] }
+    pub fn name(&self) -> &str { MONTH_NAMES[self.number_from_month() as usize - 1] }
+
+    /// The month numbered n (1 to 12).
+    pub fn try_from_u32(n: u32) -> Option<Month> { if n >= 1 && n <= 12 { Some(MONTHS[n as usize - 1]) } else { None } }
+
+    pub fn num_days(&self, year: i32) -> Option<u8> { Some(days_in_month(year as i64, self.number_from_month()) as u8) }
+}
+
+impl FromStr for Month {
+    type Err = ParseMonthError;
+    fn from_str(s: &str) -> Result<Month, ParseMonthError> {
+        let l = s.to_ascii_lowercase();
+        let mut i = 0;
+        while i < 12 {
+            let n = MONTH_NAMES[i].to_ascii_lowercase();
+            if l == n || l == &n[0..3] { return Ok(MONTHS[i]); }
+            i += 1;
+        }
+        Err(ParseMonthError {})
+    }
+}
+
+/// Month::from_str's error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseMonthError {}
+
+impl Display for ParseMonthError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("ParseMonthError { _dummy: () }") }
+}
+
+/// A number of days (for checked_add_days and the like).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Days(u64);
+
+impl Days {
+    pub fn new(n: u64) -> Days { Days(n) }
+}
+
+/// A number of months (for checked_add_months and the like).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Months(u32);
+
+impl Months {
+    pub fn new(n: u32) -> Months { Months(n) }
+    pub fn as_u32(&self) -> u32 { self.0 }
+}
+
+// --- Datelike and Timelike -----------------------------------------------------------
+
+/// The date parts of a date or date and time.
+pub trait Datelike {
+    fn year(&self) -> i32;
+    fn month(&self) -> u32;
+    fn day(&self) -> u32;
+    fn ordinal(&self) -> u32;
+    fn weekday(&self) -> Weekday;
+    fn iso_week(&self) -> IsoWeek;
+    fn with_year(&self, year: i32) -> Option<Self>;
+    fn with_month(&self, month: u32) -> Option<Self>;
+    fn with_day(&self, day: u32) -> Option<Self>;
+    fn with_ordinal(&self, ordinal: u32) -> Option<Self>;
+
+    /// month - 1, day - 1 and ordinal - 1.
+    fn month0(&self) -> u32 { self.month() - 1 }
+    fn day0(&self) -> u32 { self.day() - 1 }
+    fn ordinal0(&self) -> u32 { self.ordinal() - 1 }
+    fn with_month0(&self, month0: u32) -> Option<Self> { self.with_month(month0 + 1) }
+    fn with_day0(&self, day0: u32) -> Option<Self> { self.with_day(day0 + 1) }
+    fn with_ordinal0(&self, ordinal0: u32) -> Option<Self> { self.with_ordinal(ordinal0 + 1) }
+
+    /// (true, year) for CE years, (false, 1 - year) for BCE ones.
+    fn year_ce(&self) -> (bool, u32) {
+        let y = self.year();
+        if y < 1 { (false, (1 - y) as u32) } else { (true, y as u32) }
+    }
+
+    /// Days since 0001-01-01 counting it as 1.
+    fn num_days_from_ce(&self) -> i32 {
+        let d = days_from_civil(self.year() as i64, self.month(), self.day());
+        (d + 719163) as i32
+    }
+
+    fn quarter(&self) -> u32 { (self.month() - 1) / 3 + 1 }
+}
+
+/// The time parts of a time or date and time.
+pub trait Timelike {
+    fn hour(&self) -> u32;
+    fn minute(&self) -> u32;
+    fn second(&self) -> u32;
+    /// Nanoseconds since the last whole second (1e9 and up in a leap
+    /// second).
+    fn nanosecond(&self) -> u32;
+    fn with_hour(&self, hour: u32) -> Option<Self>;
+    fn with_minute(&self, min: u32) -> Option<Self>;
+    fn with_second(&self, sec: u32) -> Option<Self>;
+    fn with_nanosecond(&self, nano: u32) -> Option<Self>;
+
+    /// (is_pm, hour 1 to 12).
+    fn hour12(&self) -> (bool, u32) {
+        let h = self.hour();
+        let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+        (h >= 12, h12)
+    }
+
+    fn num_seconds_from_midnight(&self) -> u32 { self.hour() * 3600 + self.minute() * 60 + self.second() }
+}
+
+/// An ISO 8601 week: a year and a week 1 to 53 (weeks start on Monday;
+/// week 1 has the year's first Thursday).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IsoWeek {
+    year: i32,
+    week: u32,
+}
+
+impl IsoWeek {
+    pub fn year(&self) -> i32 { self.year }
+    pub fn week(&self) -> u32 { self.week }
+    pub fn week0(&self) -> u32 { self.week - 1 }
+}
+
+impl Debug for IsoWeek {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        if self.year >= 0 && self.year <= 9999 { f.write_fmt(`${self.year:04}-W${self.week:02}`) } else { f.write_fmt(`${sign_year(self.year)}-W${self.week:02}`) }
+    }
+}
+
+fn sign_year(y: i32) -> String {
+    let a = if y < 0 { -(y as i64) } else { y as i64 };
+    let mut s = String::new();
+    s.push(if y < 0 { '-' } else { '+' });
+    let d = a.to_string();
+    let mut k = d.len();
+    while k < 4 {
+        s.push('0');
+        k += 1;
+    }
+    s.push_str(d.as_str());
+    s
+}
+
+/// The ISO 8601 weeks of year y.
+fn iso_weeks_in_year(y: i64) -> u32 {
+    let jan1 = (days_from_civil(y, 1, 1) + 3).rem_euclid(7); // 0 = Monday
+    if jan1 == 3 || (jan1 == 2 && is_leap(y)) { 53 } else { 52 }
+}
+
+// --- NaiveDate -----------------------------------------------------------------------
+
+/// A date without a time zone (from -262143-01-01 to +262142-12-31).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NaiveDate {
+    // Days since 1970-01-01.
+    days: i32,
+}
+
+impl NaiveDate {
+    pub const MIN: NaiveDate = NaiveDate { days: -96465658 };
+    pub const MAX: NaiveDate = NaiveDate { days: 95026601 };
+
+    pub(crate) fn from_days(days: i64) -> Option<NaiveDate> {
+        if days < NaiveDate::MIN.days as i64 || days > NaiveDate::MAX.days as i64 { return None; }
+        Some(NaiveDate { days: days as i32 })
+    }
+
+    pub(crate) fn days(&self) -> i64 { self.days as i64 }
+
+    pub fn from_ymd_opt(year: i32, month: u32, day: u32) -> Option<NaiveDate> {
+        let y = year as i64;
+        if y < MIN_YEAR || y > MAX_YEAR || month < 1 || month > 12 || day < 1 || day > days_in_month(y, month) { return None; }
+        NaiveDate::from_days(days_from_civil(y, month, day))
+    }
+
+    /// The ordinal-th day (1 = January 1) of year.
+    pub fn from_yo_opt(year: i32, ordinal: u32) -> Option<NaiveDate> {
+        let y = year as i64;
+        if y < MIN_YEAR || y > MAX_YEAR || ordinal < 1 || ordinal > if is_leap(y) { 366 } else { 365 } { return None; }
+        NaiveDate::from_days(days_from_civil(y, 1, 1) + ordinal as i64 - 1)
+    }
+
+    /// The weekday of ISO week week of ISO year year.
+    pub fn from_isoywd_opt(year: i32, week: u32, weekday: Weekday) -> Option<NaiveDate> {
+        let y = year as i64;
+        if week < 1 || week > iso_weeks_in_year(y) { return None; }
+        let jan4 = days_from_civil(y, 1, 4);
+        let monday = jan4 - (jan4 + 3).rem_euclid(7);
+        NaiveDate::from_days(monday + 7 * (week as i64 - 1) + weekday.num_days_from_monday() as i64)
+    }
+
+    /// Days since 0001-01-01 counting it as 1.
+    pub fn from_num_days_from_ce_opt(days: i32) -> Option<NaiveDate> { NaiveDate::from_days(days as i64 - 719163) }
+
+    /// The n-th weekday of a month (n from 1), if there is one.
+    pub fn from_weekday_of_month_opt(year: i32, month: u32, weekday: Weekday, n: u8) -> Option<NaiveDate> {
+        if n == 0 { return None; }
+        let first = NaiveDate::from_ymd_opt(year, month, 1)?;
+        let skip = weekday.days_since(first.weekday());
+        let day = 1 + skip + 7 * (n as u32 - 1);
+        NaiveDate::from_ymd_opt(year, month, day)
+    }
+
+    pub fn and_time(&self, time: NaiveTime) -> NaiveDateTime { NaiveDateTime { date: *self, time } }
+
+    pub fn and_hms_opt(&self, hour: u32, min: u32, sec: u32) -> Option<NaiveDateTime> {
+        Some(self.and_time(NaiveTime::from_hms_opt(hour, min, sec)?))
+    }
+
+    pub fn and_hms_milli_opt(&self, hour: u32, min: u32, sec: u32, milli: u32) -> Option<NaiveDateTime> {
+        Some(self.and_time(NaiveTime::from_hms_milli_opt(hour, min, sec, milli)?))
+    }
+
+    pub fn and_hms_micro_opt(&self, hour: u32, min: u32, sec: u32, micro: u32) -> Option<NaiveDateTime> {
+        Some(self.and_time(NaiveTime::from_hms_micro_opt(hour, min, sec, micro)?))
+    }
+
+    pub fn and_hms_nano_opt(&self, hour: u32, min: u32, sec: u32, nano: u32) -> Option<NaiveDateTime> {
+        Some(self.and_time(NaiveTime::from_hms_nano_opt(hour, min, sec, nano)?))
+    }
+
+    pub fn succ_opt(&self) -> Option<NaiveDate> { NaiveDate::from_days(self.days as i64 + 1) }
+    pub fn pred_opt(&self) -> Option<NaiveDate> { NaiveDate::from_days(self.days as i64 - 1) }
+
+    /// The date plus whole days of the span (its time part is dropped).
+    pub fn checked_add_signed(&self, d: TimeDelta) -> Option<NaiveDate> {
+        let days = d.num_days();
+        NaiveDate::from_days((self.days as i64).checked_add(days)?)
+    }
+
+    pub fn checked_sub_signed(&self, d: TimeDelta) -> Option<NaiveDate> {
+        let days = d.num_days();
+        NaiveDate::from_days((self.days as i64).checked_sub(days)?)
+    }
+
+    pub fn checked_add_days(&self, days: Days) -> Option<NaiveDate> {
+        if days.0 > i32::MAX as u64 { return None; }
+        NaiveDate::from_days(self.days as i64 + days.0 as i64)
+    }
+
+    pub fn checked_sub_days(&self, days: Days) -> Option<NaiveDate> {
+        if days.0 > i32::MAX as u64 { return None; }
+        NaiveDate::from_days(self.days as i64 - days.0 as i64)
+    }
+
+    /// The same day n months later (the month's last day if it is
+    /// shorter).
+    pub fn checked_add_months(&self, months: Months) -> Option<NaiveDate> { self.add_months(months.0 as i64) }
+    pub fn checked_sub_months(&self, months: Months) -> Option<NaiveDate> { self.add_months(-(months.0 as i64)) }
+
+    pub(crate) fn add_months(&self, n: i64) -> Option<NaiveDate> {
+        let (y, m, d) = civil_from_days(self.days as i64);
+        let total = y * 12 + (m as i64 - 1) + n;
+        let ny = total.div_euclid(12);
+        let nm = (total.rem_euclid(12) + 1) as u32;
+        if ny < MIN_YEAR || ny > MAX_YEAR { return None; }
+        let nd = crate::cmp::min(d, days_in_month(ny, nm));
+        NaiveDate::from_days(days_from_civil(ny, nm, nd))
+    }
+
+    /// self - rhs in days.
+    pub fn signed_duration_since(&self, rhs: NaiveDate) -> TimeDelta { TimeDelta::days(self.days as i64 - rhs.days as i64) }
+
+    /// Whole years from base to self.
+    pub fn years_since(&self, base: NaiveDate) -> Option<u32> {
+        let mut years = self.year() - base.year();
+        if (self.month(), self.day()) < (base.month(), base.day()) { years -= 1; }
+        if years >= 0 { Some(years as u32) } else { None }
+    }
+
+    pub fn leap_year(&self) -> bool { is_leap(self.year() as i64) }
+
+    /// The dates from self on (Iterator).
+    pub fn iter_days(&self) -> NaiveDateDaysIterator { NaiveDateDaysIterator { value: Some(*self) } }
+
+    pub fn iter_weeks(&self) -> NaiveDateWeeksIterator { NaiveDateWeeksIterator { value: Some(*self) } }
+
+    /// The week containing self, starting on start.
+    pub fn week(&self, start: Weekday) -> NaiveWeek { NaiveWeek { date: *self, start } }
+
+    pub fn format(&self, fmt: &str) -> DelayedFormat { DelayedFormat::new(Some(*self), None, None, fmt) }
+
+    pub fn parse_from_str(s: &str, fmt: &str) -> ParseResult<NaiveDate> {
+        let p = format::parse(s, fmt)?;
+        p.to_naive_date()
+    }
+
+    /// Parses a date and returns the rest of s.
+    pub fn parse_and_remainder(s: &str, fmt: &str) -> ParseResult<(NaiveDate, &str)> {
+        let (p, rest) = format::parse_and_remainder(s, fmt)?;
+        Ok((p.to_naive_date()?, rest))
+    }
+
+    fn ymd(&self) -> (i64, u32, u32) { civil_from_days(self.days as i64) }
+}
+
+impl Datelike for NaiveDate {
+    fn year(&self) -> i32 { self.ymd().0 as i32 }
+    fn month(&self) -> u32 { self.ymd().1 }
+    fn day(&self) -> u32 { self.ymd().2 }
+    fn ordinal(&self) -> u32 {
+        let (y, _, _) = self.ymd();
+        (self.days as i64 - days_from_civil(y, 1, 1) + 1) as u32
+    }
+    fn weekday(&self) -> Weekday { Weekday::from_monday((self.days as i64 + 3).rem_euclid(7) as u32) }
+    fn iso_week(&self) -> IsoWeek {
+        let (y, _, _) = self.ymd();
+        let wd = (self.days as i64 + 3).rem_euclid(7);
+        let ord = self.ordinal() as i64;
+        let w = (ord - wd - 1 + 10) / 7;
+        if w < 1 {
+            IsoWeek { year: (y - 1) as i32, week: iso_weeks_in_year(y - 1) }
+        } else if w > iso_weeks_in_year(y) as i64 {
+            IsoWeek { year: (y + 1) as i32, week: 1 }
+        } else {
+            IsoWeek { year: y as i32, week: w as u32 }
+        }
+    }
+    fn with_year(&self, year: i32) -> Option<NaiveDate> {
+        let (_, m, d) = self.ymd();
+        NaiveDate::from_ymd_opt(year, m, d)
+    }
+    fn with_month(&self, month: u32) -> Option<NaiveDate> {
+        let (y, _, d) = self.ymd();
+        NaiveDate::from_ymd_opt(y as i32, month, d)
+    }
+    fn with_day(&self, day: u32) -> Option<NaiveDate> {
+        let (y, m, _) = self.ymd();
+        NaiveDate::from_ymd_opt(y as i32, m, day)
+    }
+    fn with_ordinal(&self, ordinal: u32) -> Option<NaiveDate> { NaiveDate::from_yo_opt(self.year(), ordinal) }
+}
+
+/// "2024-01-02" (years outside 0 to 9999 with a sign).
+impl Debug for NaiveDate {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let (y, m, d) = self.ymd();
+        if y >= 0 && y <= 9999 { f.write_fmt(`${y:04}-${m:02}-${d:02}`) } else { f.write_fmt(`${sign_year(y as i32)}-${m:02}-${d:02}`) }
+    }
+}
+
+impl Display for NaiveDate {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { Debug::fmt(self, f) }
+}
+
+impl FromStr for NaiveDate {
+    type Err = ParseError;
+    fn from_str(s: &str) -> ParseResult<NaiveDate> { NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d") }
+}
+
+impl Default for NaiveDate {
+    fn default() -> NaiveDate { NaiveDate { days: 0 } }
+}
+
+impl Add<TimeDelta> for NaiveDate {
+    type Output = NaiveDate;
+    fn add(self, d: TimeDelta) -> NaiveDate { self.checked_add_signed(d).expect("`NaiveDate + TimeDelta` overflowed") }
+}
+
+impl Sub<TimeDelta> for NaiveDate {
+    type Output = NaiveDate;
+    fn sub(self, d: TimeDelta) -> NaiveDate { self.checked_sub_signed(d).expect("`NaiveDate - TimeDelta` overflowed") }
+}
+
+impl Sub<NaiveDate> for NaiveDate {
+    type Output = TimeDelta;
+    fn sub(self, rhs: NaiveDate) -> TimeDelta { self.signed_duration_since(rhs) }
+}
+
+impl Add<Days> for NaiveDate {
+    type Output = NaiveDate;
+    fn add(self, d: Days) -> NaiveDate { self.checked_add_days(d).expect("`NaiveDate + Days` out of range") }
+}
+
+impl Sub<Days> for NaiveDate {
+    type Output = NaiveDate;
+    fn sub(self, d: Days) -> NaiveDate { self.checked_sub_days(d).expect("`NaiveDate - Days` out of range") }
+}
+
+impl Add<Months> for NaiveDate {
+    type Output = NaiveDate;
+    fn add(self, m: Months) -> NaiveDate { self.checked_add_months(m).expect("`NaiveDate + Months` out of range") }
+}
+
+impl Sub<Months> for NaiveDate {
+    type Output = NaiveDate;
+    fn sub(self, m: Months) -> NaiveDate { self.checked_sub_months(m).expect("`NaiveDate - Months` out of range") }
+}
+
+/// NaiveDate::iter_days.
+#[derive(Clone)]
+pub struct NaiveDateDaysIterator {
+    value: Option<NaiveDate>,
+}
+
+impl Iterator for NaiveDateDaysIterator {
+    type Item = NaiveDate;
+    fn next(&mut self) -> Option<NaiveDate> {
+        let cur = self.value?;
+        self.value = cur.succ_opt();
+        Some(cur)
+    }
+}
+
+/// NaiveDate::iter_weeks.
+#[derive(Clone)]
+pub struct NaiveDateWeeksIterator {
+    value: Option<NaiveDate>,
+}
+
+impl Iterator for NaiveDateWeeksIterator {
+    type Item = NaiveDate;
+    fn next(&mut self) -> Option<NaiveDate> {
+        let cur = self.value?;
+        self.value = NaiveDate::from_days(cur.days as i64 + 7);
+        Some(cur)
+    }
+}
+
+/// The week of a date (NaiveDate::week).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NaiveWeek {
+    date: NaiveDate,
+    start: Weekday,
+}
+
+impl NaiveWeek {
+    pub fn first_day(&self) -> NaiveDate {
+        let back = self.date.weekday().days_since(self.start);
+        NaiveDate { days: self.date.days - back as i32 }
+    }
+    pub fn last_day(&self) -> NaiveDate { NaiveDate { days: self.first_day().days + 6 } }
+}
+
+// --- NaiveTime -----------------------------------------------------------------------
+
+/// A time of day without a time zone, to the nanosecond (a leap second
+/// is a nanosecond count of 1e9 and up during second 59).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NaiveTime {
+    secs: u32,
+    frac: u32,
+}
+
+impl NaiveTime {
+    pub const MIN: NaiveTime = NaiveTime { secs: 0, frac: 0 };
+
+    pub fn from_hms_opt(hour: u32, min: u32, sec: u32) -> Option<NaiveTime> { NaiveTime::from_hms_nano_opt(hour, min, sec, 0) }
+
+    pub fn from_hms_milli_opt(hour: u32, min: u32, sec: u32, milli: u32) -> Option<NaiveTime> {
+        if milli >= 2000 { return None; }
+        NaiveTime::from_hms_nano_opt(hour, min, sec, milli * 1_000_000)
+    }
+
+    pub fn from_hms_micro_opt(hour: u32, min: u32, sec: u32, micro: u32) -> Option<NaiveTime> {
+        if micro >= 2_000_000 { return None; }
+        NaiveTime::from_hms_nano_opt(hour, min, sec, micro * 1000)
+    }
+
+    pub fn from_hms_nano_opt(hour: u32, min: u32, sec: u32, nano: u32) -> Option<NaiveTime> {
+        if hour >= 24 || min >= 60 || sec >= 60 || nano >= 2_000_000_000 || (nano >= 1_000_000_000 && sec != 59) { return None; }
+        Some(NaiveTime { secs: hour * 3600 + min * 60 + sec, frac: nano })
+    }
+
+    pub fn from_num_seconds_from_midnight_opt(secs: u32, nano: u32) -> Option<NaiveTime> {
+        if secs >= 86400 || nano >= 2_000_000_000 || (nano >= 1_000_000_000 && secs % 60 != 59) { return None; }
+        Some(NaiveTime { secs, frac: nano })
+    }
+
+    /// self - rhs.
+    pub fn signed_duration_since(&self, rhs: NaiveTime) -> TimeDelta {
+        let a = self.secs as i64 * 1_000_000_000 + self.frac as i64;
+        let b = rhs.secs as i64 * 1_000_000_000 + rhs.frac as i64;
+        TimeDelta::nanoseconds(a - b)
+    }
+
+    /// The time plus d, and the whole seconds that wrapped past midnight.
+    pub fn overflowing_add_signed(&self, d: TimeDelta) -> (NaiveTime, i64) {
+        let (ds, dn) = d.parts();
+        let frac = if self.frac >= 1_000_000_000 { self.frac - 1_000_000_000 } else { self.frac };
+        let leap = if self.frac >= 1_000_000_000 { 1 } else { 0 };
+        let mut nanos = frac as i64 + dn as i64;
+        let mut secs = self.secs as i64 + leap + ds + nanos.div_euclid(1_000_000_000);
+        nanos = nanos.rem_euclid(1_000_000_000);
+        let day = secs.div_euclid(86400);
+        secs = secs.rem_euclid(86400);
+        (NaiveTime { secs: secs as u32, frac: nanos as u32 }, day * 86400)
+    }
+
+    pub fn overflowing_sub_signed(&self, d: TimeDelta) -> (NaiveTime, i64) {
+        let (t, s) = self.overflowing_add_signed(-d);
+        (t, -s)
+    }
+
+    pub fn format(&self, fmt: &str) -> DelayedFormat { DelayedFormat::new(None, Some(*self), None, fmt) }
+
+    pub fn parse_from_str(s: &str, fmt: &str) -> ParseResult<NaiveTime> {
+        let p = format::parse(s, fmt)?;
+        p.to_naive_time()
+    }
+
+    pub(crate) fn secs(&self) -> u32 { self.secs }
+    pub(crate) fn frac(&self) -> u32 { self.frac }
+}
+
+impl Timelike for NaiveTime {
+    fn hour(&self) -> u32 { self.secs / 3600 }
+    fn minute(&self) -> u32 { self.secs / 60 % 60 }
+    fn second(&self) -> u32 { self.secs % 60 }
+    fn nanosecond(&self) -> u32 { self.frac }
+    fn with_hour(&self, hour: u32) -> Option<NaiveTime> {
+        if hour >= 24 { return None; }
+        Some(NaiveTime { secs: hour * 3600 + self.secs % 3600, frac: self.frac })
+    }
+    fn with_minute(&self, min: u32) -> Option<NaiveTime> {
+        if min >= 60 { return None; }
+        Some(NaiveTime { secs: self.secs / 3600 * 3600 + min * 60 + self.secs % 60, frac: self.frac })
+    }
+    fn with_second(&self, sec: u32) -> Option<NaiveTime> {
+        if sec >= 60 { return None; }
+        Some(NaiveTime { secs: self.secs / 60 * 60 + sec, frac: self.frac })
+    }
+    fn with_nanosecond(&self, nano: u32) -> Option<NaiveTime> {
+        if nano >= 2_000_000_000 || (nano >= 1_000_000_000 && self.secs % 60 != 59) { return None; }
+        Some(NaiveTime { secs: self.secs, frac: nano })
+    }
+    fn num_seconds_from_midnight(&self) -> u32 { self.secs }
+}
+
+/// "03:04:05", with .fff, .ffffff or .fffffffff as needed.
+impl Debug for NaiveTime {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let (sec, nano) = if self.frac >= 1_000_000_000 { (self.secs % 60 + 1, self.frac - 1_000_000_000) } else { (self.secs % 60, self.frac) };
+        f.write_fmt(`${self.secs / 3600:02}:${self.secs / 60 % 60:02}:${sec:02}`)?;
+        f.write_str(format::frac_auto(nano).as_str())
+    }
+}
+
+impl Display for NaiveTime {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { Debug::fmt(self, f) }
+}
+
+impl FromStr for NaiveTime {
+    type Err = ParseError;
+    fn from_str(s: &str) -> ParseResult<NaiveTime> { NaiveTime::parse_from_str(s.trim(), "%H:%M:%S%.f") }
+}
+
+impl Default for NaiveTime {
+    fn default() -> NaiveTime { NaiveTime::MIN }
+}
+
+impl Add<TimeDelta> for NaiveTime {
+    type Output = NaiveTime;
+    fn add(self, d: TimeDelta) -> NaiveTime { self.overflowing_add_signed(d).0 }
+}
+
+impl Sub<TimeDelta> for NaiveTime {
+    type Output = NaiveTime;
+    fn sub(self, d: TimeDelta) -> NaiveTime { self.overflowing_sub_signed(d).0 }
+}
+
+impl Sub<NaiveTime> for NaiveTime {
+    type Output = TimeDelta;
+    fn sub(self, rhs: NaiveTime) -> TimeDelta { self.signed_duration_since(rhs) }
+}
+
+// --- NaiveDateTime -------------------------------------------------------------------
+
+/// A date and time without a time zone.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NaiveDateTime {
+    date: NaiveDate,
+    time: NaiveTime,
+}
+
+impl NaiveDateTime {
+    pub const MIN: NaiveDateTime = NaiveDateTime { date: NaiveDate::MIN, time: NaiveTime { secs: 0, frac: 0 } };
+    pub const MAX: NaiveDateTime = NaiveDateTime { date: NaiveDate::MAX, time: NaiveTime { secs: 86399, frac: 999_999_999 } };
+    pub const UNIX_EPOCH: NaiveDateTime = NaiveDateTime { date: NaiveDate { days: 0 }, time: NaiveTime { secs: 0, frac: 0 } };
+
+    pub fn new(date: NaiveDate, time: NaiveTime) -> NaiveDateTime { NaiveDateTime { date, time } }
+
+    pub fn date(&self) -> NaiveDate { self.date }
+    pub fn time(&self) -> NaiveTime { self.time }
+
+    /// Seconds since 1970-01-01 00:00:00 (as UTC).
+    pub(crate) fn unix_secs(&self) -> i64 { self.date.days as i64 * 86400 + self.time.secs as i64 }
+
+    pub(crate) fn from_unix(secs: i64, nanos: u32) -> Option<NaiveDateTime> {
+        let date = NaiveDate::from_days(secs.div_euclid(86400))?;
+        let time = NaiveTime::from_num_seconds_from_midnight_opt(secs.rem_euclid(86400) as u32, nanos)?;
+        Some(NaiveDateTime { date, time })
+    }
+
+    pub fn checked_add_signed(&self, d: TimeDelta) -> Option<NaiveDateTime> {
+        let (t, days_secs) = self.time.overflowing_add_signed(d);
+        let date = NaiveDate::from_days((self.date.days as i64).checked_add(days_secs / 86400)?)?;
+        Some(NaiveDateTime { date, time: t })
+    }
+
+    pub fn checked_sub_signed(&self, d: TimeDelta) -> Option<NaiveDateTime> { self.checked_add_signed(-d) }
+
+    pub fn checked_add_days(&self, days: Days) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date.checked_add_days(days)?, time: self.time }) }
+    pub fn checked_sub_days(&self, days: Days) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date.checked_sub_days(days)?, time: self.time }) }
+    pub fn checked_add_months(&self, m: Months) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date.checked_add_months(m)?, time: self.time }) }
+    pub fn checked_sub_months(&self, m: Months) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date.checked_sub_months(m)?, time: self.time }) }
+
+    /// self - rhs.
+    pub fn signed_duration_since(&self, rhs: NaiveDateTime) -> TimeDelta {
+        let days = TimeDelta::days(self.date.days as i64 - rhs.date.days as i64);
+        days + self.time.signed_duration_since(rhs.time)
+    }
+
+    /// The UTC date and time this one is, read as UTC.
+    pub fn and_utc(&self) -> crate::chrono::DateTime<crate::chrono::Utc> { crate::chrono::DateTime::from_naive_utc_and_offset(*self, crate::chrono::Utc) }
+
+    /// The same local date and time in tz.
+    pub fn and_local_timezone<Tz: crate::chrono::TimeZone>(&self, tz: Tz) -> crate::chrono::LocalResult<crate::chrono::DateTime<Tz>> { tz.from_local_datetime(self) }
+
+    pub fn format(&self, fmt: &str) -> DelayedFormat { DelayedFormat::new(Some(self.date), Some(self.time), None, fmt) }
+
+    pub fn parse_from_str(s: &str, fmt: &str) -> ParseResult<NaiveDateTime> {
+        let p = format::parse(s, fmt)?;
+        p.to_naive_datetime_with_offset(0)
+    }
+
+    pub fn parse_and_remainder(s: &str, fmt: &str) -> ParseResult<(NaiveDateTime, &str)> {
+        let (p, rest) = format::parse_and_remainder(s, fmt)?;
+        Ok((p.to_naive_datetime_with_offset(0)?, rest))
+    }
+}
+
+impl Datelike for NaiveDateTime {
+    fn year(&self) -> i32 { self.date.year() }
+    fn month(&self) -> u32 { self.date.month() }
+    fn day(&self) -> u32 { self.date.day() }
+    fn ordinal(&self) -> u32 { self.date.ordinal() }
+    fn weekday(&self) -> Weekday { self.date.weekday() }
+    fn iso_week(&self) -> IsoWeek { self.date.iso_week() }
+    fn with_year(&self, year: i32) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date.with_year(year)?, time: self.time }) }
+    fn with_month(&self, month: u32) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date.with_month(month)?, time: self.time }) }
+    fn with_day(&self, day: u32) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date.with_day(day)?, time: self.time }) }
+    fn with_ordinal(&self, ordinal: u32) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date.with_ordinal(ordinal)?, time: self.time }) }
+}
+
+impl Timelike for NaiveDateTime {
+    fn hour(&self) -> u32 { self.time.hour() }
+    fn minute(&self) -> u32 { self.time.minute() }
+    fn second(&self) -> u32 { self.time.second() }
+    fn nanosecond(&self) -> u32 { self.time.nanosecond() }
+    fn with_hour(&self, hour: u32) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date, time: self.time.with_hour(hour)? }) }
+    fn with_minute(&self, min: u32) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date, time: self.time.with_minute(min)? }) }
+    fn with_second(&self, sec: u32) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date, time: self.time.with_second(sec)? }) }
+    fn with_nanosecond(&self, nano: u32) -> Option<NaiveDateTime> { Some(NaiveDateTime { date: self.date, time: self.time.with_nanosecond(nano)? }) }
+}
+
+/// "2024-01-02T03:04:05".
+impl Debug for NaiveDateTime {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        Debug::fmt(&self.date, f)?;
+        f.write_str("T")?;
+        Debug::fmt(&self.time, f)
+    }
+}
+
+/// "2024-01-02 03:04:05".
+impl Display for NaiveDateTime {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        Display::fmt(&self.date, f)?;
+        f.write_str(" ")?;
+        Display::fmt(&self.time, f)
+    }
+}
+
+impl FromStr for NaiveDateTime {
+    type Err = ParseError;
+    fn from_str(s: &str) -> ParseResult<NaiveDateTime> { NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%dT%H:%M:%S%.f") }
+}
+
+impl Default for NaiveDateTime {
+    fn default() -> NaiveDateTime { NaiveDateTime::UNIX_EPOCH }
+}
+
+impl Add<TimeDelta> for NaiveDateTime {
+    type Output = NaiveDateTime;
+    fn add(self, d: TimeDelta) -> NaiveDateTime { self.checked_add_signed(d).expect("`NaiveDateTime + TimeDelta` overflowed") }
+}
+
+impl Sub<TimeDelta> for NaiveDateTime {
+    type Output = NaiveDateTime;
+    fn sub(self, d: TimeDelta) -> NaiveDateTime { self.checked_sub_signed(d).expect("`NaiveDateTime - TimeDelta` overflowed") }
+}
+
+impl Sub<NaiveDateTime> for NaiveDateTime {
+    type Output = TimeDelta;
+    fn sub(self, rhs: NaiveDateTime) -> TimeDelta { self.signed_duration_since(rhs) }
+}
+
+impl Add<Days> for NaiveDateTime {
+    type Output = NaiveDateTime;
+    fn add(self, d: Days) -> NaiveDateTime { self.checked_add_days(d).expect("`NaiveDateTime + Days` out of range") }
+}
+
+impl Add<Months> for NaiveDateTime {
+    type Output = NaiveDateTime;
+    fn add(self, m: Months) -> NaiveDateTime { self.checked_add_months(m).expect("`NaiveDateTime + Months` out of range") }
+}
+
+impl Sub<Months> for NaiveDateTime {
+    type Output = NaiveDateTime;
+    fn sub(self, m: Months) -> NaiveDateTime { self.checked_sub_months(m).expect("`NaiveDateTime - Months` out of range") }
+}

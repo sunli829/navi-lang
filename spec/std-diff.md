@@ -211,3 +211,17 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | `WeightedIndex::new` | 参数是元素可 `Borrow<X>` 的迭代器 | 元素就是 `X` 的迭代器（传数组或 `Vec`，不能传 `&[X]`） | 没有 `Borrow` |
 | `Distribution::map`、`sample_iter` | 闭包是 `FnMut` | `fn(T) -> U` | 闭包类型 |
 | `rand::distr` 的其他分布（`Slice`、`WeightedAliasIndex`、rand_distr 里的正态分布等） | 有 | 没有 | 暂不需要 |
+
+### std::chrono（chrono crate 0.4）
+
+格式化、解析、RFC 3339/2822、日历和 `TimeDelta` 的结果和 chrono 0.4.44 相同（用同一个程序对比过，包括 `TZ` 设为几个不同时区时的 `Local`）。
+
+| 项目 | chrono | navi | 原因 |
+|---|---|---|---|
+| `Local` | 读 tz 数据库（Unix）或 Win32 API | 用 C 库的 `localtime_r`（Windows：`_localtime64_s`），同样遵守 `TZ` | 不自带时区数据库 |
+| `Local` 的 `Ambiguous` | 文档说是 `(earliest, latest)`，0.4.44 在 Unix 上实际按偏移量从小到大排（较晚的在前） | 按文档：较早的在前 | 照文档的语义 |
+| `Copy` | `NaiveDate`、`DateTime` 等是 `Copy` | 值类型，赋值就是拷贝 | 没有 `Copy` |
+| `LocalResult::map` | 参数是 `FnOnce` | `fn(T) -> U` | 闭包类型 |
+| `format` 的返回值 | `DelayedFormat<StrftimeItems>` | `DelayedFormat`（不带类型参数）；格式串在显示时解析，不合法时 `to_string` panic（同 chrono） | 简化 |
+| `StrftimeItems`、`Parsed` 的逐字段 setter、`format::Locale`、`serde` 支持、`chrono-tz` | 有 | 没有（`Parsed` 只有 `to_*` 方法） | 暂不需要 |
+| `NaiveDate::from_ymd` 等会 panic 的旧接口（0.4 已弃用） | 有 | 只有 `_opt` 版本 | 照新接口 |

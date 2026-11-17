@@ -1,0 +1,1081 @@
+//! Formatting and parsing with strftime-like specifiers (as chrono's
+//! format module), and RFC 3339 / RFC 2822 parsing.
+//!
+//! Specifiers: %Y %C %y %m %b %B %h %d %e %a %A %w %u %U %W %G %g %V %j
+//! %D %x %F %v %H %k %I %l %P %p %M %S %f %.f %.3f %.6f %.9f %3f %6f %9f
+//! %R %T %X %r %Z %z %:z %::z %:::z %#z %c %+ %s %t %n %%, and the padding
+//! modifiers %-? (none), %_? (spaces) and %0? (zeros) on numbers.
+
+use crate::fmt::{self, Display, Debug, Formatter};
+use crate::chrono::{NaiveDate, NaiveTime, NaiveDateTime, DateTime, Datelike, Timelike, Weekday, TimeDelta};
+use crate::chrono::offset::{TimeZone, FixedOffset, Offset, LocalResult};
+use crate::chrono::naive::MONTH_NAMES;
+
+// --- Errors --------------------------------------------------------------------------
+
+/// What went wrong parsing.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub enum ParseErrorKind {
+    /// A field is out of its range (month 13).
+    OutOfRange,
+    /// The fields contradict each other (or the date does not exist).
+    Impossible,
+    /// Fields are missing.
+    NotEnough,
+    /// The input does not match the format.
+    Invalid,
+    /// The input ends early.
+    TooShort,
+    /// Input is left after the format.
+    TooLong,
+    /// The format string is invalid.
+    BadFormat,
+}
+
+/// A parse failure.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ParseError(ParseErrorKind);
+
+pub type ParseResult<T> = Result<T, ParseError>;
+
+impl ParseError {
+    pub fn kind(&self) -> ParseErrorKind { self.0 }
+}
+
+impl Display for ParseError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.write_str(match self.0 {
+            ParseErrorKind::OutOfRange => "input is out of range",
+            ParseErrorKind::Impossible => "no possible date and time matching input",
+            ParseErrorKind::NotEnough => "input is not enough for unique date and time",
+            ParseErrorKind::Invalid => "input contains invalid characters",
+            ParseErrorKind::TooShort => "premature end of input",
+            ParseErrorKind::TooLong => "trailing input",
+            ParseErrorKind::BadFormat => "bad or unsupported format string",
+        })
+    }
+}
+
+impl Debug for ParseError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`ParseError(${self.0:?})`) }
+}
+
+fn err<T>(k: ParseErrorKind) -> ParseResult<T> { Err(ParseError(k)) }
+pub(crate) fn not_enough() -> ParseError { ParseError(ParseErrorKind::NotEnough) }
+
+// --- Helpers -------------------------------------------------------------------------
+
+/// "", ".fff", ".ffffff" or ".fffffffff": the digits a nanosecond count
+/// needs.
+pub(crate) fn frac_auto(nano: u32) -> String {
+    if nano == 0 { String::new() } else if nano % 1_000_000 == 0 { `.${nano / 1_000_000:03}` } else if nano % 1000 == 0 { `.${nano / 1000:06}` } else { `.${nano:09}` }
+}
+
+/// "+0930", "+09:30" (colon) or "+09:30:15" (seconds, with colon).
+pub(crate) fn offset_string(off: i32, colon: bool, seconds: bool) -> String {
+    let (sign, a) = if off < 0 { ('-', -off) } else { ('+', off) };
+    let h = a / 3600;
+    let m = a / 60 % 60;
+    let s = a % 60;
+    if seconds { `${sign}${h:02}:${m:02}:${s:02}` } else if colon { `${sign}${h:02}:${m:02}` } else { `${sign}${h:02}${m:02}` }
+}
+
+fn year_str(y: i64, width: usize, pad: char) -> String {
+    if y >= 0 && y <= 9999 { return pad_num(y, width, pad); }
+    let d = if y < 0 { (-y).to_string() } else { y.to_string() };
+    let mut s = String::new();
+    s.push(if y < 0 { '-' } else { '+' });
+    let mut k = d.len();
+    while k < 4 {
+        s.push('0');
+        k += 1;
+    }
+    s.push_str(d.as_str());
+    s
+}
+
+fn pad_num(v: i64, width: usize, pad: char) -> String {
+    let d = if v < 0 { (-v).to_string() } else { v.to_string() };
+    let mut s = String::new();
+    if v < 0 { s.push('-'); }
+    if pad != ' ' && pad != '0' {
+        s.push_str(d.as_str());
+        return s;
+    }
+    let n = d.len() + if v < 0 { 1 } else { 0 };
+    let mut out = String::new();
+    if pad == ' ' {
+        let mut k = n;
+        while k < width {
+            out.push(' ');
+            k += 1;
+        }
+        out.push_str(s.as_str());
+        out.push_str(d.as_str());
+        return out;
+    }
+    let mut k = n;
+    while k < width {
+        s.push('0');
+        k += 1;
+    }
+    s.push_str(d.as_str());
+    s
+}
+
+// The expansions of the composite specifiers.
+fn composite(c: char) -> Option<&str> {
+    match c {
+        'D' | 'x' => Some("%m/%d/%y"),
+        'F' => Some("%Y-%m-%d"),
+        'v' => Some("%e-%b-%Y"),
+        'R' => Some("%H:%M"),
+        'T' | 'X' => Some("%H:%M:%S"),
+        'r' => Some("%I:%M:%S %p"),
+        'c' => Some("%a %b %e %H:%M:%S %Y"),
+        _ => None,
+    }
+}
+
+// --- Formatting ----------------------------------------------------------------------
+
+/// A date and/or time with a format string, formatted when displayed
+/// (fails for a specifier it lacks the fields of, or an invalid one).
+#[derive(Clone)]
+pub struct DelayedFormat {
+    date: Option<NaiveDate>,
+    time: Option<NaiveTime>,
+    off: Option<i32>,
+    off_name: String,
+    ts: Option<i64>,
+    fmt: String,
+}
+
+impl DelayedFormat {
+    pub(crate) fn new(date: Option<NaiveDate>, time: Option<NaiveTime>, off: Option<i32>, fmt: &str) -> DelayedFormat {
+        let ts = match (date, time) {
+            (Some(d), Some(t)) => Some(d.days() * 86400 + t.secs() as i64),
+            _ => None,
+        };
+        DelayedFormat { date, time, off, off_name: String::new(), ts, fmt: fmt.to_string() }
+    }
+
+    pub(crate) fn with_offset(local: NaiveDateTime, off: i32, name: String, ts: i64, fmt: &str) -> DelayedFormat {
+        DelayedFormat { date: Some(local.date()), time: Some(local.time()), off: Some(off), off_name: name, ts: Some(ts), fmt: fmt.to_string() }
+    }
+
+    fn write(&self, out: &mut String, fmt: &str) -> bool {
+        let cs: Vec<char> = fmt.chars().collect();
+        let mut i = 0;
+        while i < cs.len() {
+            let c = cs[i];
+            i += 1;
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            if i >= cs.len() { return false; }
+            let mut pad = '\0';
+            if cs[i] == '-' || cs[i] == '_' || cs[i] == '0' {
+                pad = if cs[i] == '-' { 'x' } else if cs[i] == '_' { ' ' } else { '0' };
+                i += 1;
+            }
+            let mut colons = 0;
+            while i < cs.len() && cs[i] == ':' {
+                colons += 1;
+                i += 1;
+            }
+            let mut hash = false;
+            if i < cs.len() && cs[i] == '#' {
+                hash = true;
+                i += 1;
+            }
+            let mut dot = false;
+            if i < cs.len() && cs[i] == '.' {
+                dot = true;
+                i += 1;
+            }
+            let mut digits = 0;
+            if i < cs.len() && (cs[i] == '3' || cs[i] == '6' || cs[i] == '9') && i + 1 < cs.len() && cs[i + 1] == 'f' {
+                digits = (cs[i] as u32 - '0' as u32) as usize;
+                i += 1;
+            }
+            if i >= cs.len() { return false; }
+            let spec = cs[i];
+            i += 1;
+            if (colons > 0 || hash) && spec != 'z' { return false; }
+            if (dot || digits > 0) && spec != 'f' { return false; }
+            if let Some(e) = composite(spec) {
+                if !self.write(out, e) { return false; }
+                continue;
+            }
+            if !self.item(out, spec, pad, colons, hash, dot, digits) { return false; }
+        }
+        true
+    }
+
+    fn item(&self, out: &mut String, spec: char, pad0: char, colons: i32, hash: bool, dot: bool, digits: usize) -> bool {
+        let num = |v: i64, width: usize, def: char| -> String { pad_num(v, width, if pad0 == '\0' { def } else { pad0 }) };
+        match spec {
+            '%' => out.push('%'),
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'Y' | 'C' | 'y' | 'm' | 'b' | 'h' | 'B' | 'd' | 'e' | 'a' | 'A' | 'w' | 'u' | 'U' | 'W' | 'G' | 'g' | 'V' | 'j' => {
+                let d = match self.date {
+                    Some(d) => d,
+                    None => return false,
+                };
+                let y = d.year() as i64;
+                let s = match spec {
+                    'Y' => year_str(y, 4, if pad0 == '\0' { '0' } else { pad0 }),
+                    'C' => num(y.div_euclid(100), 2, '0'),
+                    'y' => num(y.rem_euclid(100), 2, '0'),
+                    'm' => num(d.month() as i64, 2, '0'),
+                    'b' | 'h' => MONTH_NAMES[d.month() as usize - 1][0..3].to_string(),
+                    'B' => MONTH_NAMES[d.month() as usize - 1].to_string(),
+                    'd' => num(d.day() as i64, 2, '0'),
+                    'e' => num(d.day() as i64, 2, ' '),
+                    'a' => d.weekday().name()[0..3].to_string(),
+                    'A' => d.weekday().name().to_string(),
+                    'w' => num(d.weekday().num_days_from_sunday() as i64, 1, '0'),
+                    'u' => num(d.weekday().number_from_monday() as i64, 1, '0'),
+                    'U' => num(((d.ordinal() as i64 - 1) + 7 - d.weekday().num_days_from_sunday() as i64) / 7, 2, '0'),
+                    'W' => num(((d.ordinal() as i64 - 1) + 7 - d.weekday().num_days_from_monday() as i64) / 7, 2, '0'),
+                    'G' => year_str(d.iso_week().year() as i64, 4, if pad0 == '\0' { '0' } else { pad0 }),
+                    'g' => num((d.iso_week().year() as i64).rem_euclid(100), 2, '0'),
+                    'V' => num(d.iso_week().week() as i64, 2, '0'),
+                    _ => num(d.ordinal() as i64, 3, '0'),
+                };
+                out.push_str(s.as_str());
+            }
+            'H' | 'k' | 'I' | 'l' | 'P' | 'p' | 'M' | 'S' | 'f' => {
+                let t = match self.time {
+                    Some(t) => t,
+                    None => return false,
+                };
+                let nano = t.nanosecond() % 1_000_000_000;
+                let s = match spec {
+                    'H' => num(t.hour() as i64, 2, '0'),
+                    'k' => num(t.hour() as i64, 2, ' '),
+                    'I' => num(t.hour12().1 as i64, 2, '0'),
+                    'l' => num(t.hour12().1 as i64, 2, ' '),
+                    'P' => if t.hour() >= 12 { "pm".to_string() } else { "am".to_string() },
+                    'p' => if t.hour() >= 12 { "PM".to_string() } else { "AM".to_string() },
+                    'M' => num(t.minute() as i64, 2, '0'),
+                    'S' => num(if t.nanosecond() >= 1_000_000_000 { 60 } else { t.second() as i64 }, 2, '0'),
+                    _ => {
+                        if dot && digits == 0 {
+                            frac_auto(nano)
+                        } else if digits > 0 {
+                            let v = nano as u64 / [1u64, 100_000_000, 10_000_000, 1_000_000, 100_000, 10_000, 1000, 100, 10, 1][digits];
+                            let d = pad_num(v as i64, digits, '0');
+                            if dot { `.${d}` } else { d }
+                        } else {
+                            num(nano as i64, 9, '0')
+                        }
+                    }
+                };
+                out.push_str(s.as_str());
+            }
+            'Z' => {
+                if self.off.is_none() { return false; }
+                out.push_str(self.off_name.as_str());
+            }
+            'z' => {
+                let o = match self.off {
+                    Some(o) => o,
+                    None => return false,
+                };
+                let s = if colons == 3 {
+                    let (sign, a) = if o < 0 { ('-', -o) } else { ('+', o) };
+                    `${sign}${a / 3600:02}`
+                } else if colons == 2 {
+                    offset_string(o, true, true)
+                } else {
+                    offset_string(o, colons == 1, false)
+                };
+                let _ = hash;
+                out.push_str(s.as_str());
+            }
+            '+' => {
+                let (d, t, o) = match (self.date, self.time, self.off) {
+                    (Some(d), Some(t), Some(o)) => (d, t, o),
+                    _ => return false,
+                };
+                let sec = if t.nanosecond() >= 1_000_000_000 { 60 } else { t.second() };
+                out.push_str(year_str(d.year() as i64, 4, '0').as_str());
+                out.push_str(`-${d.month():02}-${d.day():02}T${t.hour():02}:${t.minute():02}:${sec:02}`.as_str());
+                out.push_str(frac_auto(t.nanosecond() % 1_000_000_000).as_str());
+                out.push_str(offset_string(o, true, false).as_str());
+            }
+            's' => {
+                let ts = match self.ts {
+                    Some(t) => t,
+                    None => return false,
+                };
+                out.push_str(num(ts, 1, '0').as_str());
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl Display for DelayedFormat {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut s = String::new();
+        if !self.write(&mut s, self.fmt.as_str()) { return Err(fmt::Error); }
+        f.pad(s.as_str())
+    }
+}
+
+impl Debug for DelayedFormat {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { Display::fmt(self, f) }
+}
+
+// --- Parsing -------------------------------------------------------------------------
+
+/// The fields parsed so far (as chrono's Parsed).
+#[derive(Clone, Default, Debug)]
+pub struct Parsed {
+    year: Option<i64>,
+    year_div_100: Option<i64>,
+    year_mod_100: Option<i64>,
+    isoyear: Option<i64>,
+    isoyear_mod_100: Option<i64>,
+    month: Option<i64>,
+    week_from_sun: Option<i64>,
+    week_from_mon: Option<i64>,
+    isoweek: Option<i64>,
+    weekday: Option<Weekday>,
+    ordinal: Option<i64>,
+    day: Option<i64>,
+    hour_div_12: Option<i64>,
+    hour_mod_12: Option<i64>,
+    minute: Option<i64>,
+    second: Option<i64>,
+    nanosecond: Option<i64>,
+    timestamp: Option<i64>,
+    offset: Option<i64>,
+}
+
+// Sets a field (Impossible if it was set to another value).
+fn set(f: &mut Option<i64>, v: i64) -> ParseResult<()> {
+    match *f {
+        Some(old) => if old != v { err(ParseErrorKind::Impossible) } else { Ok(()) },
+        None => {
+            *f = Some(v);
+            Ok(())
+        }
+    }
+}
+
+fn check(v: i64, lo: i64, hi: i64) -> ParseResult<i64> { if v < lo || v > hi { err(ParseErrorKind::OutOfRange) } else { Ok(v) } }
+
+impl Parsed {
+    pub fn new() -> Parsed { Parsed::default() }
+
+    pub(crate) fn offset(&self) -> Option<i32> {
+        match self.offset {
+            Some(o) => Some(o as i32),
+            None => None,
+        }
+    }
+
+    fn set_weekday(&mut self, w: Weekday) -> ParseResult<()> {
+        match self.weekday {
+            Some(old) => if old != w { err(ParseErrorKind::Impossible) } else { Ok(()) },
+            None => {
+                self.weekday = Some(w);
+                Ok(())
+            }
+        }
+    }
+
+    fn year_full(&self) -> ParseResult<Option<i64>> {
+        let from_parts = match (self.year_div_100, self.year_mod_100) {
+            (Some(q), Some(r)) => Some(q * 100 + r),
+            (None, Some(r)) => if self.year.is_none() { Some(if r < 70 { 2000 + r } else { 1900 + r }) } else { None },
+            _ => None,
+        };
+        match (self.year, from_parts) {
+            (Some(y), Some(p)) => if y != p { err(ParseErrorKind::Impossible) } else { Ok(Some(y)) },
+            (Some(y), None) => {
+                if let Some(r) = self.year_mod_100 {
+                    if y.rem_euclid(100) != r { return err(ParseErrorKind::Impossible); }
+                }
+                Ok(Some(y))
+            }
+            (None, p) => Ok(p),
+        }
+    }
+
+    /// The date of the parsed fields.
+    pub fn to_naive_date(&self) -> ParseResult<NaiveDate> {
+        if let Some(ts) = self.timestamp {
+            let local = ts + self.offset.unwrap_or(0);
+            let d = match NaiveDate::from_days(local.div_euclid(86400)) {
+                Some(d) => d,
+                None => return err(ParseErrorKind::OutOfRange),
+            };
+            return self.verify_date(d);
+        }
+        let year = self.year_full()?;
+        let d = if let (Some(y), Some(m), Some(day)) = (year, self.month, self.day) {
+            match NaiveDate::from_ymd_opt(y as i32, m as u32, day as u32) {
+                Some(d) => d,
+                None => return err(ParseErrorKind::OutOfRange),
+            }
+        } else if let (Some(y), Some(o)) = (year, self.ordinal) {
+            match NaiveDate::from_yo_opt(y as i32, o as u32) {
+                Some(d) => d,
+                None => return err(ParseErrorKind::OutOfRange),
+            }
+        } else if let (Some(y), Some(w), Some(wd)) = (year, self.week_from_sun, self.weekday) {
+            let jan1 = NaiveDate::from_ymd_opt(y as i32, 1, 1).unwrap();
+            let first_sun = (7 - jan1.weekday().num_days_from_sunday()) % 7;
+            let ord = first_sun as i64 + (w - 1) * 7 + wd.num_days_from_sunday() as i64 + 1;
+            match NaiveDate::from_days(jan1.days() + ord - 1) {
+                Some(d) => if d.year() as i64 == y { d } else { return err(ParseErrorKind::OutOfRange); },
+                None => return err(ParseErrorKind::OutOfRange),
+            }
+        } else if let (Some(y), Some(w), Some(wd)) = (year, self.week_from_mon, self.weekday) {
+            let jan1 = NaiveDate::from_ymd_opt(y as i32, 1, 1).unwrap();
+            let first_mon = (7 - jan1.weekday().num_days_from_monday()) % 7;
+            let ord = first_mon as i64 + (w - 1) * 7 + wd.num_days_from_monday() as i64 + 1;
+            match NaiveDate::from_days(jan1.days() + ord - 1) {
+                Some(d) => if d.year() as i64 == y { d } else { return err(ParseErrorKind::OutOfRange); },
+                None => return err(ParseErrorKind::OutOfRange),
+            }
+        } else if let (Some(iy), Some(w), Some(wd)) = (self.isoyear_full(), self.isoweek, self.weekday) {
+            match NaiveDate::from_isoywd_opt(iy as i32, w as u32, wd) {
+                Some(d) => d,
+                None => return err(ParseErrorKind::OutOfRange),
+            }
+        } else {
+            return err(ParseErrorKind::NotEnough);
+        };
+        self.verify_date(d)
+    }
+
+    fn isoyear_full(&self) -> Option<i64> {
+        match (self.isoyear, self.isoyear_mod_100) {
+            (Some(y), _) => Some(y),
+            (None, Some(r)) => Some(if r < 70 { 2000 + r } else { 1900 + r }),
+            _ => None,
+        }
+    }
+
+    // The other date fields agree with d.
+    fn verify_date(&self, d: NaiveDate) -> ParseResult<NaiveDate> {
+        let y = d.year() as i64;
+        let ok = self.year.map_or(true, |v| v == y)
+            && self.year_div_100.map_or(true, |v| v == y.div_euclid(100))
+            && self.year_mod_100.map_or(true, |v| v == y.rem_euclid(100))
+            && self.month.map_or(true, |v| v == d.month() as i64)
+            && self.day.map_or(true, |v| v == d.day() as i64)
+            && self.ordinal.map_or(true, |v| v == d.ordinal() as i64)
+            && self.weekday.map_or(true, |w| w == d.weekday())
+            && self.isoyear.map_or(true, |v| v == d.iso_week().year() as i64)
+            && self.isoweek.map_or(true, |v| v == d.iso_week().week() as i64);
+        if ok { Ok(d) } else { err(ParseErrorKind::Impossible) }
+    }
+
+    /// The time of the parsed fields (hour and minute at least).
+    pub fn to_naive_time(&self) -> ParseResult<NaiveTime> {
+        if let Some(ts) = self.timestamp {
+            let local = ts + self.offset.unwrap_or(0);
+            let s = local.rem_euclid(86400);
+            let t = NaiveTime::from_num_seconds_from_midnight_opt(s as u32, self.nanosecond.unwrap_or(0) as u32).unwrap();
+            return Ok(t);
+        }
+        let hdiv = match self.hour_div_12 {
+            Some(h) => h,
+            None => return err(ParseErrorKind::NotEnough),
+        };
+        let hmod = match self.hour_mod_12 {
+            Some(h) => h,
+            None => return err(ParseErrorKind::NotEnough),
+        };
+        let minute = match self.minute {
+            Some(m) => m,
+            None => return err(ParseErrorKind::NotEnough),
+        };
+        let mut second = self.second.unwrap_or(0);
+        let mut nano = self.nanosecond.unwrap_or(0);
+        if second == 60 {
+            second = 59;
+            nano += 1_000_000_000;
+        }
+        match NaiveTime::from_hms_nano_opt((hdiv * 12 + hmod) as u32, minute as u32, second as u32, nano as u32) {
+            Some(t) => Ok(t),
+            None => err(ParseErrorKind::OutOfRange),
+        }
+    }
+
+    pub fn to_naive_datetime_with_offset(&self, offset: i32) -> ParseResult<NaiveDateTime> {
+        if let Some(ts) = self.timestamp {
+            // The local date and time of the timestamp at the offset.
+            let local = ts + offset as i64;
+            let dt = match NaiveDateTime::from_unix(local, self.nanosecond.unwrap_or(0) as u32) {
+                Some(dt) => dt,
+                None => return err(ParseErrorKind::OutOfRange),
+            };
+            let mut p = self.clone();
+            p.timestamp = None;
+            p.verify_date(dt.date())?;
+            if p.hour_div_12.is_some() || p.minute.is_some() {
+                if let Ok(t) = p.to_naive_time() {
+                    if t.secs() != dt.time().secs() { return err(ParseErrorKind::Impossible); }
+                }
+            }
+            return Ok(dt);
+        }
+        let d = self.to_naive_date()?;
+        let t = self.to_naive_time()?;
+        Ok(d.and_time(t))
+    }
+
+    /// A date and time with the parsed offset.
+    pub fn to_datetime(&self) -> ParseResult<DateTime<FixedOffset>> {
+        let off = match self.offset {
+            Some(o) => o as i32,
+            None => return err(ParseErrorKind::NotEnough),
+        };
+        let fo = match FixedOffset::east_opt(off) {
+            Some(f) => f,
+            None => return err(ParseErrorKind::OutOfRange),
+        };
+        let local = self.to_naive_datetime_with_offset(off)?;
+        match local.checked_sub_signed(TimeDelta::seconds(off as i64)) {
+            Some(utc) => Ok(DateTime::from_naive_utc_and_offset(utc, fo)),
+            None => err(ParseErrorKind::OutOfRange),
+        }
+    }
+
+    /// A date and time in tz (the parsed offset must agree with it).
+    pub fn to_datetime_with_timezone<Tz: TimeZone>(&self, tz: &Tz) -> ParseResult<DateTime<Tz>> {
+        if let Some(o) = self.offset {
+            let dt = self.to_datetime()?;
+            let r = dt.with_timezone(tz);
+            if r.offset().fix().local_minus_utc() as i64 != o { return err(ParseErrorKind::Impossible); }
+            return Ok(r);
+        }
+        if self.timestamp.is_some() {
+            let utc = self.to_naive_datetime_with_offset(0)?;
+            return Ok(tz.from_utc_datetime(&utc));
+        }
+        let local = self.to_naive_datetime_with_offset(0)?;
+        match tz.from_local_datetime(&local) {
+            LocalResult::Single(t) => Ok(t),
+            LocalResult::Ambiguous(_, _) => err(ParseErrorKind::NotEnough),
+            LocalResult::None => err(ParseErrorKind::Impossible),
+        }
+    }
+}
+
+fn is_space(c: char) -> bool { c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\u{B}' || c == '\u{C}' }
+
+// A cursor over the input.
+struct Scan {
+    s: Vec<char>,
+    i: usize,
+}
+
+impl Scan {
+    fn skip_space(&mut self) {
+        while self.i < self.s.len() && is_space(self.s[self.i]) { self.i += 1; }
+    }
+
+    fn peek(&self) -> Option<char> { if self.i < self.s.len() { Some(self.s[self.i]) } else { None } }
+
+    // min..=max digits.
+    fn number(&mut self, min: usize, max: usize) -> ParseResult<i64> {
+        let start = self.i;
+        let mut v: i64 = 0;
+        while self.i < self.s.len() && self.i - start < max && self.s[self.i].is_ascii_digit() {
+            v = match v.checked_mul(10) {
+                Some(x) => match x.checked_add((self.s[self.i] as u32 - '0' as u32) as i64) {
+                    Some(y) => y,
+                    None => return err(ParseErrorKind::OutOfRange),
+                },
+                None => return err(ParseErrorKind::OutOfRange),
+            };
+            self.i += 1;
+        }
+        if self.i - start < min { return if self.i >= self.s.len() { err(ParseErrorKind::TooShort) } else { err(ParseErrorKind::Invalid) }; }
+        Ok(v)
+    }
+
+    // A number with an optional sign (without one, at most width digits).
+    fn signed(&mut self, width: usize) -> ParseResult<i64> {
+        match self.peek() {
+            Some('-') => {
+                self.i += 1;
+                Ok(-self.number(1, 20)?)
+            }
+            Some('+') => {
+                self.i += 1;
+                self.number(1, 20)
+            }
+            _ => self.number(1, width),
+        }
+    }
+
+    // Up to 9 digits as nanoseconds (more digits are skipped).
+    fn nanos(&mut self, min: usize) -> ParseResult<i64> {
+        let start = self.i;
+        let v = self.number(min, 9)?;
+        let n = self.i - start;
+        while self.i < self.s.len() && self.s[self.i].is_ascii_digit() { self.i += 1; }
+        let mut x = v;
+        let mut k = n;
+        while k < 9 {
+            x *= 10;
+            k += 1;
+        }
+        Ok(x)
+    }
+
+    // One of the names (short forms are their first three letters), any
+    // case; returns its index.
+    fn name(&mut self, names: &[&str]) -> ParseResult<usize> {
+        let rest: String = self.s[self.i..].iter().collect();
+        let low = rest.to_ascii_lowercase();
+        let mut k = 0;
+        while k < names.len() {
+            let full = names[k].to_ascii_lowercase();
+            if low.starts_with(full.as_str()) {
+                self.i += full.len();
+                return Ok(k);
+            }
+            k += 1;
+        }
+        k = 0;
+        while k < names.len() {
+            let short = &names[k].to_ascii_lowercase()[0..3];
+            if low.starts_with(short) {
+                self.i += 3;
+                return Ok(k);
+            }
+            k += 1;
+        }
+        if self.i >= self.s.len() { err(ParseErrorKind::TooShort) } else { err(ParseErrorKind::Invalid) }
+    }
+
+    // "+09:30", "+0930", "+09" (when minutes may be missing), with
+    // optional seconds after a colon.
+    fn offset(&mut self, allow_missing_minutes: bool, allow_z: bool) -> ParseResult<i64> {
+        let sign = match self.peek() {
+            Some('+') => 1,
+            Some('-') | Some('\u{2212}') => -1,
+            Some('Z') | Some('z') if allow_z => {
+                self.i += 1;
+                return Ok(0);
+            }
+            Some(_) => return err(ParseErrorKind::Invalid),
+            None => return err(ParseErrorKind::TooShort),
+        };
+        self.i += 1;
+        let h = self.fixed2()?;
+        let save = self.i;
+        if self.peek() == Some(':') { self.i += 1; }
+        let m = match self.fixed2() {
+            Ok(m) => m,
+            Err(e) => {
+                if allow_missing_minutes {
+                    self.i = save;
+                    0
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+        if m >= 60 { return err(ParseErrorKind::OutOfRange); }
+        let mut s = 0;
+        if self.peek() == Some(':') && self.i + 2 < self.s.len() + 1 {
+            let save2 = self.i;
+            self.i += 1;
+            match self.fixed2() {
+                Ok(x) => s = x,
+                Err(_) => self.i = save2,
+            }
+        }
+        Ok(sign * (h * 3600 + m * 60 + s))
+    }
+
+    fn fixed2(&mut self) -> ParseResult<i64> {
+        if self.i + 2 > self.s.len() { return err(ParseErrorKind::TooShort); }
+        if !self.s[self.i].is_ascii_digit() || !self.s[self.i + 1].is_ascii_digit() { return err(ParseErrorKind::Invalid); }
+        let v = (self.s[self.i] as u32 - '0' as u32) * 10 + (self.s[self.i + 1] as u32 - '0' as u32);
+        self.i += 2;
+        Ok(v as i64)
+    }
+}
+
+const WEEKDAY_ORDER: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+/// Parses s with fmt into its fields (all of s must be read).
+pub fn parse(s: &str, fmt: &str) -> ParseResult<Parsed> {
+    let mut p = Parsed::new();
+    let mut sc = Scan { s: s.chars().collect(), i: 0 };
+    parse_into(&mut p, &mut sc, fmt)?;
+    if sc.i < sc.s.len() { return err(ParseErrorKind::TooLong); }
+    Ok(p)
+}
+
+/// Parses the start of s with fmt; returns the fields and the rest.
+pub fn parse_and_remainder(s: &str, fmt: &str) -> ParseResult<(Parsed, &str)> {
+    let mut p = Parsed::new();
+    let mut sc = Scan { s: s.chars().collect(), i: 0 };
+    parse_into(&mut p, &mut sc, fmt)?;
+    let mut bytes = 0;
+    let mut k = 0;
+    while k < sc.i {
+        bytes += sc.s[k].len_utf8();
+        k += 1;
+    }
+    Ok((p, &s[bytes..]))
+}
+
+fn parse_into(p: &mut Parsed, sc: &mut Scan, fmt: &str) -> ParseResult<()> {
+    let cs: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        i += 1;
+        if is_space(c) {
+            sc.skip_space();
+            continue;
+        }
+        if c != '%' {
+            match sc.peek() {
+                Some(x) => if x == c { sc.i += 1; } else { return err(ParseErrorKind::Invalid); },
+                None => return err(ParseErrorKind::TooShort),
+            }
+            continue;
+        }
+        if i >= cs.len() { return err(ParseErrorKind::BadFormat); }
+        if cs[i] == '-' || cs[i] == '_' || cs[i] == '0' { i += 1; }
+        let mut colons = 0;
+        while i < cs.len() && cs[i] == ':' {
+            colons += 1;
+            i += 1;
+        }
+        let mut hash = false;
+        if i < cs.len() && cs[i] == '#' {
+            hash = true;
+            i += 1;
+        }
+        let mut dot = false;
+        if i < cs.len() && cs[i] == '.' {
+            dot = true;
+            i += 1;
+        }
+        let mut digits = 0;
+        if i < cs.len() && (cs[i] == '3' || cs[i] == '6' || cs[i] == '9') && i + 1 < cs.len() && cs[i + 1] == 'f' {
+            digits = (cs[i] as u32 - '0' as u32) as usize;
+            i += 1;
+        }
+        if i >= cs.len() { return err(ParseErrorKind::BadFormat); }
+        let spec = cs[i];
+        i += 1;
+        if (colons > 0 || hash) && spec != 'z' { return err(ParseErrorKind::BadFormat); }
+        if (dot || digits > 0) && spec != 'f' { return err(ParseErrorKind::BadFormat); }
+        if let Some(e) = composite(spec) {
+            parse_into(p, sc, e)?;
+            continue;
+        }
+        match spec {
+            '%' => {
+                match sc.peek() {
+                    Some('%') => sc.i += 1,
+                    Some(_) => return err(ParseErrorKind::Invalid),
+                    None => return err(ParseErrorKind::TooShort),
+                }
+            }
+            'n' | 't' => sc.skip_space(),
+            'Y' => {
+                sc.skip_space();
+                let v = sc.signed(4)?;
+                set(&mut p.year, v)?;
+            }
+            'G' => {
+                sc.skip_space();
+                let v = sc.signed(4)?;
+                set(&mut p.isoyear, v)?;
+            }
+            'C' | 'y' | 'g' | 'm' | 'd' | 'e' | 'U' | 'W' | 'V' | 'H' | 'k' | 'I' | 'l' | 'M' | 'S' | 'j' | 'w' | 'u' => {
+                sc.skip_space();
+                let width = if spec == 'j' { 3 } else if spec == 'w' || spec == 'u' { 1 } else { 2 };
+                let v = sc.number(1, width)?;
+                match spec {
+                    'C' => set(&mut p.year_div_100, v)?,
+                    'y' => set(&mut p.year_mod_100, check(v, 0, 99)?)?,
+                    'g' => set(&mut p.isoyear_mod_100, check(v, 0, 99)?)?,
+                    'm' => set(&mut p.month, check(v, 1, 12)?)?,
+                    'd' | 'e' => set(&mut p.day, check(v, 1, 31)?)?,
+                    'U' => set(&mut p.week_from_sun, check(v, 0, 53)?)?,
+                    'W' => set(&mut p.week_from_mon, check(v, 0, 53)?)?,
+                    'V' => set(&mut p.isoweek, check(v, 1, 53)?)?,
+                    'H' | 'k' => {
+                        check(v, 0, 23)?;
+                        set(&mut p.hour_div_12, v / 12)?;
+                        set(&mut p.hour_mod_12, v % 12)?;
+                    }
+                    'I' | 'l' => {
+                        check(v, 1, 12)?;
+                        set(&mut p.hour_mod_12, v % 12)?;
+                    }
+                    'M' => set(&mut p.minute, check(v, 0, 59)?)?,
+                    'S' => set(&mut p.second, check(v, 0, 60)?)?,
+                    'j' => set(&mut p.ordinal, check(v, 1, 366)?)?,
+                    'w' => {
+                        check(v, 0, 6)?;
+                        p.set_weekday(Weekday::from_monday(((v + 6) % 7) as u32))?;
+                    }
+                    _ => {
+                        check(v, 1, 7)?;
+                        p.set_weekday(Weekday::from_monday((v - 1) as u32))?;
+                    }
+                }
+            }
+            'b' | 'B' | 'h' => {
+                let k = sc.name(&MONTH_NAMES)?;
+                set(&mut p.month, k as i64 + 1)?;
+            }
+            'a' | 'A' => {
+                let k = sc.name(&WEEKDAY_ORDER)?;
+                p.set_weekday(Weekday::from_monday(k as u32))?;
+            }
+            'p' | 'P' => {
+                let rest: String = sc.s[sc.i..].iter().take(2).collect();
+                let l = rest.to_ascii_lowercase();
+                if l == "am" { set(&mut p.hour_div_12, 0)?; } else if l == "pm" { set(&mut p.hour_div_12, 1)?; } else if rest.len() < 2 { return err(ParseErrorKind::TooShort); } else { return err(ParseErrorKind::Invalid); }
+                sc.i += 2;
+            }
+            'f' => {
+                if digits == 0 && !dot {
+                    sc.skip_space();
+                    let v = sc.number(1, 9)?;
+                    set(&mut p.nanosecond, v)?;
+                } else if digits == 0 {
+                    // %.f: an optional fraction.
+                    if sc.peek() == Some('.') {
+                        sc.i += 1;
+                        let v = sc.nanos(1)?;
+                        set(&mut p.nanosecond, v)?;
+                    }
+                } else {
+                    if dot {
+                        match sc.peek() {
+                            Some('.') => sc.i += 1,
+                            Some(_) => return err(ParseErrorKind::Invalid),
+                            None => return err(ParseErrorKind::TooShort),
+                        }
+                    }
+                    let start = sc.i;
+                    let v = sc.number(digits, digits)?;
+                    let _ = start;
+                    let scale = [1i64, 100_000_000, 10_000_000, 1_000_000, 100_000, 10_000, 1000, 100, 10, 1][digits];
+                    set(&mut p.nanosecond, v * scale)?;
+                }
+            }
+            'Z' => {
+                // A zone name: skipped up to whitespace.
+                while sc.i < sc.s.len() && !is_space(sc.s[sc.i]) { sc.i += 1; }
+            }
+            'z' => {
+                sc.skip_space();
+                let v = sc.offset(hash || colons == 3, false)?;
+                set(&mut p.offset, v)?;
+            }
+            '+' => {
+                parse_into(p, sc, "%Y-%m-%d")?;
+                match sc.peek() {
+                    Some('T') | Some('t') | Some(' ') => sc.i += 1,
+                    Some(_) => return err(ParseErrorKind::Invalid),
+                    None => return err(ParseErrorKind::TooShort),
+                }
+                parse_into(p, sc, "%H:%M:%S%.f")?;
+                let v = sc.offset(false, true)?;
+                set(&mut p.offset, v)?;
+            }
+            's' => {
+                sc.skip_space();
+                let v = sc.signed(20)?;
+                set(&mut p.timestamp, v)?;
+            }
+            _ => return err(ParseErrorKind::BadFormat),
+        }
+    }
+    Ok(())
+}
+
+/// RFC 3339: "2018-01-26T18:30:09.453+00:00" or "...Z".
+pub(crate) fn parse_rfc3339(s: &str) -> ParseResult<DateTime<FixedOffset>> {
+    let mut p = Parsed::new();
+    let mut sc = Scan { s: s.chars().collect(), i: 0 };
+    let y = sc.number(4, 4)?;
+    set(&mut p.year, y)?;
+    rfc_char(&mut sc, '-')?;
+    set(&mut p.month, check(sc.fixed2()?, 1, 12)?)?;
+    rfc_char(&mut sc, '-')?;
+    set(&mut p.day, check(sc.fixed2()?, 1, 31)?)?;
+    match sc.peek() {
+        Some('T') | Some('t') | Some(' ') => sc.i += 1,
+        Some(_) => return err(ParseErrorKind::Invalid),
+        None => return err(ParseErrorKind::TooShort),
+    }
+    let h = check(sc.fixed2()?, 0, 23)?;
+    set(&mut p.hour_div_12, h / 12)?;
+    set(&mut p.hour_mod_12, h % 12)?;
+    rfc_char(&mut sc, ':')?;
+    set(&mut p.minute, check(sc.fixed2()?, 0, 59)?)?;
+    rfc_char(&mut sc, ':')?;
+    set(&mut p.second, check(sc.fixed2()?, 0, 60)?)?;
+    if sc.peek() == Some('.') {
+        sc.i += 1;
+        let n = sc.nanos(1)?;
+        set(&mut p.nanosecond, n)?;
+    }
+    let off = match sc.peek() {
+        Some('Z') | Some('z') => {
+            sc.i += 1;
+            0
+        }
+        Some('+') | Some('-') => {
+            let sign = if sc.peek() == Some('-') { -1 } else { 1 };
+            sc.i += 1;
+            let oh = sc.fixed2()?;
+            rfc_char(&mut sc, ':')?;
+            let om = sc.fixed2()?;
+            if oh > 23 || om > 59 { return err(ParseErrorKind::OutOfRange); }
+            sign * (oh * 3600 + om * 60)
+        }
+        Some(_) => return err(ParseErrorKind::Invalid),
+        None => return err(ParseErrorKind::TooShort),
+    };
+    set(&mut p.offset, off)?;
+    if sc.i < sc.s.len() { return err(ParseErrorKind::TooLong); }
+    p.to_datetime()
+}
+
+fn rfc_char(sc: &mut Scan, c: char) -> ParseResult<()> {
+    match sc.peek() {
+        Some(x) => if x == c {
+            sc.i += 1;
+            Ok(())
+        } else {
+            err(ParseErrorKind::Invalid)
+        },
+        None => err(ParseErrorKind::TooShort),
+    }
+}
+
+/// RFC 3339 with spaces allowed around the parts, "T" or spaces between
+/// date and time, and offsets as %z ("+0900", "+09:00", "Z", "UTC").
+pub(crate) fn parse_rfc3339_relaxed(s: &str) -> ParseResult<DateTime<FixedOffset>> {
+    let mut p = Parsed::new();
+    let mut sc = Scan { s: s.trim().chars().collect(), i: 0 };
+    parse_into(&mut p, &mut sc, "%Y-%m-%d")?;
+    match sc.peek() {
+        Some('T') | Some('t') => sc.i += 1,
+        Some(c) => if is_space(c) { sc.skip_space(); } else { return err(ParseErrorKind::Invalid); },
+        None => return err(ParseErrorKind::TooShort),
+    }
+    parse_into(&mut p, &mut sc, "%H:%M:%S%.f")?;
+    sc.skip_space();
+    let rest: String = sc.s[sc.i..].iter().collect();
+    let off = if rest == "UTC" || rest == "utc" {
+        sc.i = sc.s.len();
+        0
+    } else {
+        sc.offset(true, true)?
+    };
+    set(&mut p.offset, off)?;
+    if sc.i < sc.s.len() { return err(ParseErrorKind::TooLong); }
+    p.to_datetime()
+}
+
+/// RFC 2822: "Tue, 1 Jul 2003 10:52:37 +0200" (the day name, seconds and
+/// comments optional; GMT, UT and the US zones; two-digit years).
+pub(crate) fn parse_rfc2822(s: &str) -> ParseResult<DateTime<FixedOffset>> {
+    let mut p = Parsed::new();
+    let mut sc = Scan { s: s.chars().collect(), i: 0 };
+    sc.skip_space();
+    if let Some(c) = sc.peek() {
+        if c.is_ascii_alphabetic() {
+            let k = sc.name(&WEEKDAY_ORDER)?;
+            p.set_weekday(Weekday::from_monday(k as u32))?;
+            sc.skip_space();
+            rfc_char(&mut sc, ',')?;
+        }
+    }
+    sc.skip_space();
+    set(&mut p.day, check(sc.number(1, 2)?, 1, 31)?)?;
+    sc.skip_space();
+    let m = sc.name(&MONTH_NAMES)?;
+    set(&mut p.month, m as i64 + 1)?;
+    sc.skip_space();
+    let start = sc.i;
+    let mut y = sc.number(2, 4)?;
+    let n = sc.i - start;
+    if n == 2 { y += if y < 50 { 2000 } else { 1900 }; } else if n == 3 { y += 1900; }
+    set(&mut p.year, y)?;
+    sc.skip_space();
+    let h = check(sc.fixed2()?, 0, 23)?;
+    set(&mut p.hour_div_12, h / 12)?;
+    set(&mut p.hour_mod_12, h % 12)?;
+    sc.skip_space();
+    rfc_char(&mut sc, ':')?;
+    sc.skip_space();
+    set(&mut p.minute, check(sc.fixed2()?, 0, 59)?)?;
+    sc.skip_space();
+    if sc.peek() == Some(':') {
+        sc.i += 1;
+        sc.skip_space();
+        set(&mut p.second, check(sc.fixed2()?, 0, 60)?)?;
+    }
+    sc.skip_space();
+    let off = match sc.peek() {
+        Some('+') | Some('-') => {
+            let sign = if sc.peek() == Some('-') { -1 } else { 1 };
+            sc.i += 1;
+            let oh = sc.fixed2()?;
+            let om = sc.fixed2()?;
+            if om > 59 { return err(ParseErrorKind::OutOfRange); }
+            sign * (oh * 3600 + om * 60)
+        }
+        Some(_) => {
+            let mut name = String::new();
+            while sc.i < sc.s.len() && sc.s[sc.i].is_ascii_alphabetic() {
+                name.push(sc.s[sc.i].to_ascii_uppercase());
+                sc.i += 1;
+            }
+            let h: i64 = match name.as_str() {
+                "GMT" | "UT" | "UTC" | "Z" => 0,
+                "EDT" => -4,
+                "EST" | "CDT" => if name == "EST" { -5 } else { -5 },
+                "CST" | "MDT" => -6,
+                "MST" | "PDT" => -7,
+                "PST" => -8,
+                _ => {
+                    if name.len() == 1 { 0 } else { return err(ParseErrorKind::Invalid); }
+                }
+            };
+            h * 3600
+        }
+        None => return err(ParseErrorKind::TooShort),
+    };
+    set(&mut p.offset, off)?;
+    // Trailing comments and spaces.
+    sc.skip_space();
+    if sc.peek() == Some('(') {
+        while sc.i < sc.s.len() && sc.s[sc.i] != ')' { sc.i += 1; }
+        if sc.i < sc.s.len() { sc.i += 1; }
+        sc.skip_space();
+    }
+    if sc.i < sc.s.len() { return err(ParseErrorKind::TooLong); }
+    p.to_datetime()
+}
