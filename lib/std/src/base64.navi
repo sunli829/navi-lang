@@ -1,0 +1,466 @@
+//! Base64 (RFC 4648), with the API of Rust's base64 crate (0.22): an
+//! [`Engine`](engine::Engine) encodes and decodes, and the usual engines
+//! are constants in `engine::general_purpose`.
+//!
+//!     use std::base64::prelude::*;
+//!
+//!     let s = BASE64_STANDARD.encode(b"hello");          // "aGVsbG8="
+//!     let v = BASE64_STANDARD.decode("aGVsbG8=").unwrap(); // b"hello"
+//!     let u = BASE64_URL_SAFE_NO_PAD.encode(&[0xfbu8, 0xff]); // "-_8"
+//!
+//! Inputs are anything that is `AsRef<[u8]>` (`&str`, `String`, `&[u8]`,
+//! `Vec<u8>`). Decoding is strict as in the crate: no whitespace, the
+//! padding as the engine's `DecodePaddingMode` says, and no stray bits in
+//! the last symbol. Custom engines combine an alphabet and a config:
+//!
+//!     use std::base64::{alphabet, engine::{self, general_purpose}};
+//!     let e = engine::GeneralPurpose::new(&alphabet::CRYPT, general_purpose::NO_PAD);
+
+use crate::fmt::{self, Debug, Display, Formatter};
+use crate::string::String;
+
+pub use self::engine::Engine;
+
+/// Why base64 input could not be decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// A byte that is not a symbol of the alphabet, at an offset (padding
+    /// in the wrong place is reported this way too).
+    InvalidByte(usize, u8),
+    /// The number of symbols leaves a single symbol in the last quad.
+    InvalidLength(usize),
+    /// The last symbol (offset, byte) has bits set that do not belong to
+    /// any decoded byte.
+    InvalidLastSymbol(usize, u8),
+    /// The padding is missing, present when it must not be, or too short.
+    InvalidPadding,
+}
+
+impl Display for DecodeError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            DecodeError::InvalidByte(i, b) => f.write_fmt(`Invalid symbol ${*b}, offset ${*i}.`),
+            DecodeError::InvalidLength(n) => f.write_fmt(`Invalid input length: ${*n}`),
+            DecodeError::InvalidLastSymbol(i, b) => f.write_fmt(`Invalid last symbol ${*b}, offset ${*i}.`),
+            DecodeError::InvalidPadding => f.write_str("Invalid padding"),
+        }
+    }
+}
+
+/// Errors of `Engine::decode_slice`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeSliceError {
+    DecodeError(DecodeError),
+    OutputSliceTooSmall,
+}
+
+impl Display for DecodeSliceError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            DecodeSliceError::DecodeError(e) => Display::fmt(e, f),
+            DecodeSliceError::OutputSliceTooSmall => f.write_str("Output slice too small"),
+        }
+    }
+}
+
+impl From<DecodeError> for DecodeSliceError {
+    fn from(e: DecodeError) -> DecodeSliceError { DecodeSliceError::DecodeError(e) }
+}
+
+/// Errors of `Engine::encode_slice`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EncodeSliceError {
+    OutputSliceTooSmall,
+}
+
+impl Display for EncodeSliceError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("Output slice too small") }
+}
+
+/// The length of the encoding of bytes_len bytes (None on overflow).
+pub fn encoded_len(bytes_len: usize, padding: bool) -> Option<usize> {
+    let quads = bytes_len / 3;
+    let rem = bytes_len % 3;
+    let full = quads.checked_mul(4)?;
+    if rem == 0 { return Some(full); }
+    if padding { full.checked_add(4) } else { full.checked_add(rem + 1) }
+}
+
+/// An upper bound of the decoded length of encoded_len symbols.
+pub fn decoded_len_estimate(encoded_len: usize) -> usize { (encoded_len + 3) / 4 * 3 }
+
+/// The 64 symbols an engine uses.
+pub mod alphabet {
+    use crate::fmt::{self, Display, Formatter};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Alphabet {
+        pub(crate) symbols: [u8; 64],
+    }
+
+    /// Why a string is not an alphabet.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ParseAlphabetError {
+        /// Not 64 bytes long.
+        InvalidLength,
+        /// A byte occurs twice.
+        DuplicatedByte(u8),
+        /// A byte outside of the printable ASCII range.
+        UnprintableByte(u8),
+        /// The padding byte '='.
+        ReservedByte(u8),
+    }
+
+    impl Display for ParseAlphabetError {
+        fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+            match self {
+                ParseAlphabetError::InvalidLength => f.write_str("Invalid length - must be 64 bytes"),
+                ParseAlphabetError::DuplicatedByte(b) => f.write_fmt(`Duplicated byte: ${*b:#x}`),
+                ParseAlphabetError::UnprintableByte(b) => f.write_fmt(`Unprintable byte: ${*b:#x}`),
+                ParseAlphabetError::ReservedByte(b) => f.write_fmt(`Reserved byte: ${*b:#x}`),
+            }
+        }
+    }
+
+    const fn from_bytes(s: &[u8]) -> Alphabet {
+        let mut symbols = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            symbols[i] = s[i];
+            i += 1;
+        }
+        Alphabet { symbols }
+    }
+
+    impl Alphabet {
+        /// An alphabet of 64 distinct printable ASCII bytes other than '='.
+        pub fn new(alphabet: &str) -> Result<Alphabet, ParseAlphabetError> {
+            let b = alphabet.as_bytes();
+            if b.len() != 64 { return Err(ParseAlphabetError::InvalidLength); }
+            let mut i = 0;
+            while i < 64 {
+                let c = b[i];
+                if c < 32 || c > 126 { return Err(ParseAlphabetError::UnprintableByte(c)); }
+                if c == b'=' { return Err(ParseAlphabetError::ReservedByte(c)); }
+                let mut j = 0;
+                while j < i {
+                    if b[j] == c { return Err(ParseAlphabetError::DuplicatedByte(c)); }
+                    j += 1;
+                }
+                i += 1;
+            }
+            Ok(from_bytes(b))
+        }
+
+        /// The symbols, in order.
+        pub fn as_str(&self) -> &str { unsafe { crate::str::from_utf8_unchecked(&self.symbols) } }
+    }
+
+    /// RFC 4648's standard alphabet: A-Z a-z 0-9 + /.
+    pub const STANDARD: Alphabet = from_bytes(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
+    /// RFC 4648's URL- and filename-safe alphabet: A-Z a-z 0-9 - _.
+    pub const URL_SAFE: Alphabet = from_bytes(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_");
+    /// The crypt(3) alphabet: . / 0-9 A-Z a-z.
+    pub const CRYPT: Alphabet = from_bytes(b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+    /// The bcrypt alphabet: . / A-Z a-z 0-9.
+    pub const BCRYPT: Alphabet = from_bytes(b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
+    /// IMAP's modified UTF-7 alphabet (RFC 3501): A-Z a-z 0-9 + ,.
+    pub const IMAP_MUTF7: Alphabet = from_bytes(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,");
+    /// The BinHex 4.0 alphabet.
+    pub const BIN_HEX: Alphabet = from_bytes(b"!\"#$%&'()*+,-012345689@ABCDEFGHIJKLMNPQRSTUVXYZ[`abcdefhijklmpqr");
+}
+
+/// Engines: the `Engine` trait and the general-purpose engine.
+pub mod engine {
+    use crate::string::String;
+    use super::alphabet::Alphabet;
+    use super::{DecodeError, DecodeSliceError, EncodeSliceError};
+
+    /// How decoding treats '=' padding.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum DecodePaddingMode {
+        /// Padded and unpadded input are both accepted (padding, if
+        /// present, must be complete).
+        Indifferent,
+        /// The input must be padded to a multiple of 4.
+        RequireCanonical,
+        /// The input must not be padded.
+        RequireNone,
+    }
+
+    /// The settings of a `GeneralPurpose` engine.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct GeneralPurposeConfig {
+        encode_padding: bool,
+        decode_allow_trailing_bits: bool,
+        decode_padding_mode: DecodePaddingMode,
+    }
+
+    impl GeneralPurposeConfig {
+        /// Padding on encode, canonical padding and no trailing bits on
+        /// decode.
+        pub const fn new() -> GeneralPurposeConfig {
+            GeneralPurposeConfig {
+                encode_padding: true,
+                decode_allow_trailing_bits: false,
+                decode_padding_mode: DecodePaddingMode::RequireCanonical,
+            }
+        }
+        pub const fn with_encode_padding(self, padding: bool) -> GeneralPurposeConfig {
+            GeneralPurposeConfig { encode_padding: padding, ..self }
+        }
+        pub const fn with_decode_allow_trailing_bits(self, allow: bool) -> GeneralPurposeConfig {
+            GeneralPurposeConfig { decode_allow_trailing_bits: allow, ..self }
+        }
+        pub const fn with_decode_padding_mode(self, mode: DecodePaddingMode) -> GeneralPurposeConfig {
+            GeneralPurposeConfig { decode_padding_mode: mode, ..self }
+        }
+        pub fn encode_padding(&self) -> bool { self.encode_padding }
+    }
+
+    impl Default for GeneralPurposeConfig {
+        fn default() -> GeneralPurposeConfig { GeneralPurposeConfig::new() }
+    }
+
+    /// Encodes and decodes base64. The provided methods are the API; an
+    /// engine implements `internal_encode` and `internal_decode`.
+    pub trait Engine {
+        /// Appends the encoding of input to output.
+        fn internal_encode(&self, input: &[u8], output: &mut Vec<u8>);
+        /// Appends the decoding of input to output.
+        fn internal_decode(&self, input: &[u8], output: &mut Vec<u8>) -> Result<(), DecodeError>;
+
+        /// The encoding of input.
+        fn encode<T: AsRef<[u8]>>(&self, input: T) -> String {
+            let mut v = Vec::new();
+            self.internal_encode(input.as_ref(), &mut v);
+            unsafe { String::from_utf8_unchecked(v) }
+        }
+
+        /// Appends the encoding of input to output_buf.
+        fn encode_string<T: AsRef<[u8]>>(&self, input: T, output_buf: &mut String) {
+            let mut v = Vec::new();
+            self.internal_encode(input.as_ref(), &mut v);
+            output_buf.push_str(unsafe { crate::str::from_utf8_unchecked(v.as_slice()) });
+        }
+
+        /// Writes the encoding of input to the front of output_buf and
+        /// returns its length.
+        fn encode_slice<T: AsRef<[u8]>>(&self, input: T, output_buf: &mut [u8]) -> Result<usize, EncodeSliceError> {
+            let mut v = Vec::new();
+            self.internal_encode(input.as_ref(), &mut v);
+            if v.len() > output_buf.len() { return Err(EncodeSliceError::OutputSliceTooSmall); }
+            crate::rt::copy(v.as_ptr(), crate::rt::slice_ptr(output_buf) as *mut u8, v.len());
+            Ok(v.len())
+        }
+
+        /// The bytes input encodes.
+        fn decode<T: AsRef<[u8]>>(&self, input: T) -> Result<Vec<u8>, DecodeError> {
+            let mut v = Vec::new();
+            self.internal_decode(input.as_ref(), &mut v)?;
+            Ok(v)
+        }
+
+        /// Appends the bytes input encodes to buffer.
+        fn decode_vec<T: AsRef<[u8]>>(&self, input: T, buffer: &mut Vec<u8>) -> Result<(), DecodeError> {
+            self.internal_decode(input.as_ref(), buffer)
+        }
+
+        /// Writes the bytes input encodes to the front of output and
+        /// returns their number.
+        fn decode_slice<T: AsRef<[u8]>>(&self, input: T, output: &mut [u8]) -> Result<usize, DecodeSliceError> {
+            let mut v = Vec::new();
+            self.internal_decode(input.as_ref(), &mut v)?;
+            if v.len() > output.len() { return Err(DecodeSliceError::OutputSliceTooSmall); }
+            crate::rt::copy(v.as_ptr(), crate::rt::slice_ptr(output) as *mut u8, v.len());
+            Ok(v.len())
+        }
+    }
+
+    const INVALID: u8 = 0xff;
+
+    /// An engine for any alphabet and config, in plain code.
+    #[derive(Clone, Debug)]
+    pub struct GeneralPurpose {
+        encode_table: [u8; 64],
+        decode_table: [u8; 256],
+        config: GeneralPurposeConfig,
+    }
+
+    impl GeneralPurpose {
+        pub const fn new(alphabet: &Alphabet, config: GeneralPurposeConfig) -> GeneralPurpose {
+            let mut decode_table = [INVALID; 256];
+            let mut i = 0;
+            while i < 64 {
+                decode_table[alphabet.symbols[i] as usize] = i as u8;
+                i += 1;
+            }
+            GeneralPurpose { encode_table: alphabet.symbols, decode_table, config }
+        }
+
+        pub fn config(&self) -> &GeneralPurposeConfig { &self.config }
+    }
+
+    impl Engine for GeneralPurpose {
+        fn internal_encode(&self, input: &[u8], output: &mut Vec<u8>) {
+            let n = input.len();
+            let start = output.len();
+            let len = match super::encoded_len(n, self.config.encode_padding) {
+                Some(l) => l,
+                None => panic("base64: input too long"),
+            };
+            output.resize(start + len, 0u8);
+            let out = &mut output.as_mut_slice()[start..];
+            let t = &self.encode_table;
+            let mut i = 0;
+            let mut o = 0;
+            while i + 3 <= n {
+                let w = (input[i] as u32) << 16 | (input[i + 1] as u32) << 8 | input[i + 2] as u32;
+                out[o] = t[(w >> 18) as usize];
+                out[o + 1] = t[((w >> 12) & 63) as usize];
+                out[o + 2] = t[((w >> 6) & 63) as usize];
+                out[o + 3] = t[(w & 63) as usize];
+                i += 3;
+                o += 4;
+            }
+            let rem = n - i;
+            if rem == 0 { return; }
+            let w = if rem == 1 { (input[i] as u32) << 16 } else { (input[i] as u32) << 16 | (input[i + 1] as u32) << 8 };
+            out[o] = t[(w >> 18) as usize];
+            out[o + 1] = t[((w >> 12) & 63) as usize];
+            if rem == 2 {
+                out[o + 2] = t[((w >> 6) & 63) as usize];
+            } else if self.config.encode_padding {
+                out[o + 2] = b'=';
+            }
+            if self.config.encode_padding { out[o + 3] = b'='; }
+        }
+
+        fn internal_decode(&self, input: &[u8], output: &mut Vec<u8>) -> Result<(), DecodeError> {
+            let n = input.len();
+            if n == 0 { return Ok(()); }
+            let t = &self.decode_table;
+            // Whole quads, then the last one to four bytes (which may hold
+            // padding), as the crate splits them.
+            let start = (n - 1) / 4 * 4;
+            let base = output.len();
+            output.resize(base + start / 4 * 3 + 3, 0u8);
+            let out = &mut output.as_mut_slice()[base..];
+            let mut i = 0;
+            let mut o = 0;
+            while i < start {
+                let a = t[input[i] as usize] as u32;
+                let b = t[input[i + 1] as usize] as u32;
+                let c = t[input[i + 2] as usize] as u32;
+                let d = t[input[i + 3] as usize] as u32;
+                if (a | b | c | d) & 0x80 != 0 {
+                    let mut j = i;
+                    while t[input[j] as usize] != INVALID { j += 1; }
+                    output.truncate(base);
+                    return Err(DecodeError::InvalidByte(j, input[j]));
+                }
+                let w = a << 18 | b << 12 | c << 6 | d;
+                out[o] = (w >> 16) as u8;
+                out[o + 1] = (w >> 8) as u8;
+                out[o + 2] = w as u8;
+                i += 4;
+                o += 3;
+            }
+            // The last quad.
+            let mut acc = 0u32;
+            let mut morsels = 0;
+            let mut pads = 0;
+            let mut first_pad = 0;
+            let mut j = start;
+            while j < n {
+                let ch = input[j];
+                if ch == b'=' {
+                    if j - start < 2 {
+                        output.truncate(base);
+                        let at = if pads > 0 { first_pad } else { j };
+                        return Err(DecodeError::InvalidByte(at, ch));
+                    }
+                    if pads == 0 { first_pad = j; }
+                    pads += 1;
+                } else {
+                    if pads > 0 {
+                        output.truncate(base);
+                        return Err(DecodeError::InvalidByte(first_pad, b'='));
+                    }
+                    let v = t[ch as usize];
+                    if v == INVALID {
+                        output.truncate(base);
+                        return Err(DecodeError::InvalidByte(j, ch));
+                    }
+                    acc = acc << 6 | v as u32;
+                    morsels += 1;
+                }
+                j += 1;
+            }
+            if morsels == 1 {
+                output.truncate(base);
+                return Err(DecodeError::InvalidLength(start + 1));
+            }
+            let bad_padding = match self.config.decode_padding_mode {
+                DecodePaddingMode::Indifferent => pads > 0 && (pads + morsels) % 4 != 0,
+                DecodePaddingMode::RequireCanonical => (pads + morsels) % 4 != 0,
+                DecodePaddingMode::RequireNone => pads > 0,
+            };
+            if bad_padding {
+                output.truncate(base);
+                return Err(DecodeError::InvalidPadding);
+            }
+            // 2 symbols carry 1 byte and 4 spare bits, 3 symbols 2 bytes
+            // and 2 spare bits.
+            let nbytes = morsels * 6 / 8;
+            let spare = morsels * 6 - nbytes * 8;
+            if !self.config.decode_allow_trailing_bits && spare > 0 && (acc & ((1u32 << spare as u32) - 1)) != 0 {
+                output.truncate(base);
+                let last = start + morsels - 1;
+                return Err(DecodeError::InvalidLastSymbol(last, input[last]));
+            }
+            let w = acc >> spare as u32;
+            let mut k = 0;
+            while k < nbytes {
+                out[o + k] = (w >> (8 * (nbytes - 1 - k) as u32)) as u8;
+                k += 1;
+            }
+            output.truncate(base + o + nbytes);
+            Ok(())
+        }
+    }
+
+    /// Ready-made general-purpose engines and configs.
+    pub mod general_purpose {
+        use super::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+        use super::super::alphabet;
+
+        /// Padding on encode, required on decode.
+        pub const PAD: GeneralPurposeConfig = GeneralPurposeConfig::new();
+        /// No padding on encode, none allowed on decode.
+        pub const NO_PAD: GeneralPurposeConfig = GeneralPurposeConfig::new().with_encode_padding(false).with_decode_padding_mode(DecodePaddingMode::RequireNone);
+        /// No padding on encode, either on decode.
+        pub const NO_PAD_INDIFFERENT: GeneralPurposeConfig = GeneralPurposeConfig::new().with_encode_padding(false).with_decode_padding_mode(DecodePaddingMode::Indifferent);
+        /// Padding on encode, either on decode.
+        pub const PAD_INDIFFERENT: GeneralPurposeConfig = GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
+
+        /// The standard alphabet with padding.
+        pub const STANDARD: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, PAD);
+        /// The standard alphabet without padding.
+        pub const STANDARD_NO_PAD: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, NO_PAD);
+        /// The URL-safe alphabet with padding.
+        pub const URL_SAFE: GeneralPurpose = GeneralPurpose::new(&alphabet::URL_SAFE, PAD);
+        /// The URL-safe alphabet without padding.
+        pub const URL_SAFE_NO_PAD: GeneralPurpose = GeneralPurpose::new(&alphabet::URL_SAFE, NO_PAD);
+    }
+}
+
+/// `use std::base64::prelude::*;` brings in `Engine` and the four usual
+/// engines.
+pub mod prelude {
+    pub use super::engine::Engine;
+    pub use super::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    pub use super::engine::general_purpose::STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD;
+    pub use super::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
+    pub use super::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
+}

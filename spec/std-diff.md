@@ -225,3 +225,15 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | `format` 的返回值 | `DelayedFormat<StrftimeItems>` | `DelayedFormat`（不带类型参数）；格式串在显示时解析，不合法时 `to_string` panic（同 chrono） | 简化 |
 | `StrftimeItems`、`Parsed` 的逐字段 setter、`format::Locale`、`serde` 支持、`chrono-tz` | 有 | 没有（`Parsed` 只有 `to_*` 方法） | 暂不需要 |
 | `NaiveDate::from_ymd` 等会 panic 的旧接口（0.4 已弃用） | 有 | 只有 `_opt` 版本 | 照新接口 |
+
+### std::base64、std::hex、std::crypto、std::hash::{crc32, adler32}
+
+API 照 base64 0.22（`Engine`）、hex、RustCrypto（`Digest`、`Mac`、`Hmac<D>`）、crc32fast 和 adler32 crate。
+
+| 项目 | crate | navi | 原因 |
+|---|---|---|---|
+| `Digest::finalize` | 返回定长的 `GenericArray` | 返回 `Vec<u8>` | 没有 const 泛型数组输出 |
+| `Hmac<D>` | `Hmac<Sha256>` 等 | 相同；`Mac` trait 的 `finalize` 返回 `Vec<u8>`（crate 是 `CtOutput`，比较时恒定时间），比较请用 `verify_slice` 或 `crypto::subtle::constant_time_eq` | 简化 |
+| 哈希器写入 | `Digest::update`、`io::Write` | 相同（都实现 `io::Write`，可以 `io::copy` 进去） | — |
+| base64 的自定义 `GeneralPurpose` 配置、`read`/`write` 包装器 | 有 | 只有四个预设引擎（`STANDARD`、`STANDARD_NO_PAD`、`URL_SAFE`、`URL_SAFE_NO_PAD`） | 暂不需要 |
+| crc32 的 `Hasher::new_with_initial` | 有 | 有；没有 SIMD 加速 | — |

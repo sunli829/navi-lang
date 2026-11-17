@@ -1,0 +1,205 @@
+//! Cryptographic hashes and MACs, with the API of the RustCrypto crates
+//! (md-5, sha1, sha2, hmac, subtle):
+//!
+//! - `crypto::md5::Md5`, `crypto::sha1::Sha1`,
+//!   `crypto::sha2::{Sha224, Sha256, Sha384, Sha512}`: hashes, used
+//!   through the [`Digest`] trait.
+//! - `crypto::hmac::Hmac<D>`: HMAC (RFC 2104) over any of them, used
+//!   through the [`Mac`](hmac::Mac) trait.
+//! - `crypto::subtle::constant_time_eq`.
+//!
+//!     use std::crypto::sha2::{Digest, Sha256};
+//!     use std::hex;
+//!
+//!     let mut h = Sha256::new();
+//!     h.update(b"hello ");
+//!     h.update("world");
+//!     let sum: Vec<u8> = h.finalize();
+//!     println(hex::encode(&sum));       // b94d27b9...
+//!     let once = Sha256::digest(b"hello world");
+//!
+//!     use std::crypto::hmac::{Hmac, Mac};
+//!     let mut mac = Hmac::<Sha256>::new_from_slice(b"key").unwrap();
+//!     mac.update(b"message");
+//!     let tag = mac.finalize();         // 32 bytes
+//!
+//! Outputs are `Vec<u8>` (the crates return fixed-size `GenericArray`s).
+//! Hashers implement `io::Write`, so `io::copy(&mut file, &mut hasher)`
+//! hashes a whole stream. MD5 and SHA-1 are broken for collision
+//! resistance; use them only for compatibility.
+
+pub mod md5;
+pub mod sha1;
+pub mod sha2;
+pub mod hmac;
+pub mod subtle;
+
+/// A cryptographic hash function. Implementations provide `new`,
+/// `update_bytes`, `finalize_bytes` and `reset`; the rest is the API of
+/// RustCrypto's `Digest`. Hashers are values: copying one (or calling
+/// `finalize`, which takes it by value) forks the state.
+pub trait Digest {
+    /// The length of the hash in bytes.
+    const OUTPUT_SIZE: usize;
+    /// The length of the blocks the function works on (HMAC needs it).
+    const BLOCK_SIZE: usize;
+
+    /// A hasher with no input.
+    fn new() -> Self;
+    /// Feeds bytes (the non-generic form of `update`).
+    fn update_bytes(&mut self, data: &[u8]);
+    /// The hash of the input so far; the state is spent afterwards (call
+    /// `reset` before reusing it).
+    fn finalize_bytes(&mut self) -> Vec<u8>;
+    /// Forgets the input.
+    fn reset(&mut self);
+
+    /// A hasher that has been fed data.
+    fn new_with_prefix<T: AsRef<[u8]>>(data: T) -> Self {
+        let mut h = Self::new();
+        h.update_bytes(data.as_ref());
+        h
+    }
+
+    /// Feeds data.
+    fn update<T: AsRef<[u8]>>(&mut self, data: T) { self.update_bytes(data.as_ref()); }
+
+    /// Feeds data and returns the hasher, for chains.
+    fn chain_update<T: AsRef<[u8]>>(mut self, data: T) -> Self {
+        self.update_bytes(data.as_ref());
+        self
+    }
+
+    /// The hash of everything fed.
+    fn finalize(mut self) -> Vec<u8> { self.finalize_bytes() }
+
+    /// Writes the hash to out (which must be `output_size()` bytes).
+    fn finalize_into(mut self, out: &mut [u8]) {
+        let h = self.finalize_bytes();
+        out.copy_from_slice(h.as_slice());
+    }
+
+    /// The hash of everything fed, leaving the hasher reset.
+    fn finalize_reset(&mut self) -> Vec<u8> {
+        let h = self.finalize_bytes();
+        self.reset();
+        h
+    }
+
+    /// The length of the hash in bytes.
+    fn output_size() -> usize { Self::OUTPUT_SIZE }
+
+    /// The hash of data.
+    fn digest<T: AsRef<[u8]>>(data: T) -> Vec<u8> {
+        let mut h = Self::new();
+        h.update_bytes(data.as_ref());
+        h.finalize_bytes()
+    }
+}
+
+// --- Merkle-Damgard block buffering shared by the hashes ----------------------------
+
+/// A compression function over blocks of BLOCK_SIZE bytes.
+pub(crate) trait BlockCore {
+    const BLOCK: usize;
+    /// Compresses n whole blocks of data starting at at.
+    fn compress(&mut self, data: &[u8], at: usize, n: usize);
+}
+
+/// The state of a hash: its compression function, a partial block and
+/// the length so far. Plain values throughout, so copies are independent.
+#[derive(Clone)]
+pub(crate) struct Buffer<C: BlockCore> {
+    pub(crate) core: C,
+    buf: [u8; 128],
+    len: usize,
+    total: u64,
+}
+
+impl<C: BlockCore> Buffer<C> {
+    pub(crate) fn new(core: C) -> Buffer<C> { Buffer { core, buf: [0u8; 128], len: 0, total: 0 } }
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        let bs = C::BLOCK;
+        let n = data.len();
+        self.total = crate::intrinsics::wrapping_add(self.total, n as u64);
+        let mut i = 0;
+        if self.len > 0 {
+            while self.len < bs && i < n {
+                self.buf[self.len] = data[i];
+                self.len += 1;
+                i += 1;
+            }
+            if self.len < bs { return; }
+            self.core.compress(&self.buf, 0, 1);
+            self.len = 0;
+        }
+        let blocks = (n - i) / bs;
+        if blocks > 0 {
+            self.core.compress(data, i, blocks);
+            i += blocks * bs;
+        }
+        while i < n {
+            self.buf[self.len] = data[i];
+            self.len += 1;
+            i += 1;
+        }
+    }
+
+    /// Appends the padding: 0x80, zeros, and the length in bits in
+    /// len_bytes bytes (big-endian, or little-endian for MD5).
+    pub(crate) fn pad(&mut self, len_bytes: usize, big_endian: bool) {
+        let bs = C::BLOCK;
+        let bits = self.total << 3;
+        let hi = self.total >> 61;
+        self.buf[self.len] = 0x80;
+        self.len += 1;
+        if self.len > bs - len_bytes {
+            while self.len < bs { self.buf[self.len] = 0; self.len += 1; }
+            self.core.compress(&self.buf, 0, 1);
+            self.len = 0;
+        }
+        while self.len < bs { self.buf[self.len] = 0; self.len += 1; }
+        let mut k = 0;
+        while k < 8 {
+            if big_endian {
+                self.buf[bs - 1 - k] = (bits >> (8 * k as u64)) as u8;
+                if len_bytes == 16 { self.buf[bs - 9 - k] = (hi >> (8 * k as u64)) as u8; }
+            } else {
+                self.buf[bs - 8 + k] = (bits >> (8 * k as u64)) as u8;
+            }
+            k += 1;
+        }
+        self.core.compress(&self.buf, 0, 1);
+        self.len = 0;
+    }
+}
+
+pub(crate) fn be32(b: &[u8], i: usize) -> u32 {
+    (b[i] as u32) << 24 | (b[i + 1] as u32) << 16 | (b[i + 2] as u32) << 8 | b[i + 3] as u32
+}
+
+pub(crate) fn le32(b: &[u8], i: usize) -> u32 {
+    (b[i + 3] as u32) << 24 | (b[i + 2] as u32) << 16 | (b[i + 1] as u32) << 8 | b[i] as u32
+}
+
+pub(crate) fn be64(b: &[u8], i: usize) -> u64 { (be32(b, i) as u64) << 32 | be32(b, i + 4) as u64 }
+
+pub(crate) fn push_be32(out: &mut Vec<u8>, v: u32) {
+    out.push((v >> 24) as u8);
+    out.push((v >> 16) as u8);
+    out.push((v >> 8) as u8);
+    out.push(v as u8);
+}
+
+pub(crate) fn push_le32(out: &mut Vec<u8>, v: u32) {
+    out.push(v as u8);
+    out.push((v >> 8) as u8);
+    out.push((v >> 16) as u8);
+    out.push((v >> 24) as u8);
+}
+
+pub(crate) fn push_be64(out: &mut Vec<u8>, v: u64) {
+    push_be32(out, (v >> 32) as u32);
+    push_be32(out, v as u32);
+}

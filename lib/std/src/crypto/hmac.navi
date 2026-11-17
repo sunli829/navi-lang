@@ -1,0 +1,142 @@
+//! HMAC (RFC 2104) over any hash, as the hmac crate.
+//!
+//!     use std::crypto::hmac::{Hmac, Mac};
+//!     use std::crypto::sha2::Sha256;
+//!
+//!     type HmacSha256 = Hmac<Sha256>;
+//!     let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+//!     mac.update(b"message");
+//!     let tag: Vec<u8> = mac.finalize();
+//!
+//!     let mut check = HmacSha256::new_from_slice(b"secret").unwrap();
+//!     check.update(b"message");
+//!     check.verify_slice(&tag).unwrap();   // constant-time comparison
+
+use crate::fmt::{self, Debug, Display, Formatter};
+use crate::io;
+use super::Digest;
+use super::subtle::constant_time_eq;
+
+/// The key was not accepted (never for HMAC, which takes keys of any
+/// length; the type exists for the crate's signatures).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidLength;
+
+impl Display for InvalidLength {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("Invalid Length") }
+}
+
+/// A tag did not match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacError;
+
+impl Display for MacError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("MAC tag mismatch") }
+}
+
+/// A message authentication code (RustCrypto's `Mac`).
+pub trait Mac {
+    /// A MAC keyed with key.
+    fn new_from_slice(key: &[u8]) -> Result<Self, InvalidLength>;
+    /// Feeds data.
+    fn update<T: AsRef<[u8]>>(&mut self, data: T);
+    /// The tag of everything fed.
+    fn finalize(self) -> Vec<u8>;
+    /// The tag of everything fed, leaving the MAC reset (same key).
+    fn finalize_reset(&mut self) -> Vec<u8>;
+    /// Forgets the input (keeps the key).
+    fn reset(&mut self);
+    /// The length of the tag in bytes.
+    fn output_size() -> usize;
+
+    /// Feeds data and returns the MAC, for chains.
+    fn chain_update<T: AsRef<[u8]>>(mut self, data: T) -> Self {
+        self.update(data);
+        self
+    }
+
+    /// Checks the tag of everything fed against tag, in constant time.
+    fn verify_slice(self, tag: &[u8]) -> Result<(), MacError> {
+        let t = self.finalize();
+        if constant_time_eq(t.as_slice(), tag) { Ok(()) } else { Err(MacError) }
+    }
+
+    /// Checks tag against the leftmost bytes of the tag (truncated tags).
+    fn verify_truncated_left(self, tag: &[u8]) -> Result<(), MacError> {
+        let t = self.finalize();
+        if tag.len() == 0 || tag.len() > t.len() { return Err(MacError); }
+        if constant_time_eq(&t[0..tag.len()], tag) { Ok(()) } else { Err(MacError) }
+    }
+
+    /// Checks tag against the rightmost bytes of the tag.
+    fn verify_truncated_right(self, tag: &[u8]) -> Result<(), MacError> {
+        let t = self.finalize();
+        if tag.len() == 0 || tag.len() > t.len() { return Err(MacError); }
+        if constant_time_eq(&t[t.len() - tag.len()..], tag) { Ok(()) } else { Err(MacError) }
+    }
+}
+
+/// HMAC with the hash D (`Hmac<Sha256>` and so on).
+#[derive(Clone)]
+pub struct Hmac<D: Digest> {
+    inner: D,
+    outer: D,
+    // The states after the padded keys, for reset.
+    inner_start: D,
+    outer_start: D,
+}
+
+impl<D: Digest> Mac for Hmac<D> {
+    fn new_from_slice(key: &[u8]) -> Result<Hmac<D>, InvalidLength> {
+        let bs = D::BLOCK_SIZE;
+        let mut k = Vec::with_capacity(bs);
+        if key.len() > bs {
+            k = D::digest(key);
+        } else {
+            k.extend_from_slice(key);
+        }
+        k.resize(bs, 0u8);
+        let mut pad = Vec::with_capacity(bs);
+        pad.resize(bs, 0u8);
+        let mut i = 0;
+        while i < bs { pad[i] = k[i] ^ 0x36; i += 1; }
+        let mut inner = D::new();
+        inner.update_bytes(pad.as_slice());
+        i = 0;
+        while i < bs { pad[i] = k[i] ^ 0x5c; i += 1; }
+        let mut outer = D::new();
+        outer.update_bytes(pad.as_slice());
+        Ok(Hmac { inner, outer, inner_start: inner, outer_start: outer })
+    }
+
+    fn update<T: AsRef<[u8]>>(&mut self, data: T) { self.inner.update_bytes(data.as_ref()); }
+
+    fn finalize(mut self) -> Vec<u8> {
+        let h = self.inner.finalize_bytes();
+        self.outer.update_bytes(h.as_slice());
+        self.outer.finalize_bytes()
+    }
+
+    fn finalize_reset(&mut self) -> Vec<u8> {
+        let h = self.inner.finalize_bytes();
+        self.outer.update_bytes(h.as_slice());
+        let t = self.outer.finalize_bytes();
+        self.reset();
+        t
+    }
+
+    fn reset(&mut self) {
+        self.inner = self.inner_start;
+        self.outer = self.outer_start;
+    }
+
+    fn output_size() -> usize { D::OUTPUT_SIZE }
+}
+
+impl<D: Digest> io::Write for Hmac<D> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.update_bytes(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
