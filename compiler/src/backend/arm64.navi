@@ -380,9 +380,23 @@ pub struct Arm64 {
     lse: bool,
     /// Apple's calling convention: variadic arguments on the stack.
     apple: bool,
+    /// The frame size while SP is FP - frame (after the prologue, until SP
+    /// is set otherwise), -1 when not known: frame slots far below FP are
+    /// then addressed from SP (one instruction).
+    frame: i64,
 }
 
-pub fn new_machine(lse: bool, apple: bool) -> &mut Arm64 { &mut Arm64 { a: new_asm(), lse, apple } }
+pub fn new_machine(lse: bool, apple: bool) -> &mut Arm64 { &mut Arm64 { a: new_asm(), lse, apple, frame: -1 } }
+
+impl Arm64 {
+    // The SP offset of FP + off when it is better there (FP's offset does
+    // not fit one instruction, SP's does).
+    fn sp_off(&self, size: i64, base: lm::Reg, off: i64) -> Option<i64> {
+        if base != lm::FP || self.frame < 0 || (off >= -256 && off < 256) { return None; }
+        let so = self.frame + off;
+        if so >= 0 && so % size == 0 && so / size < 4096 { Some(so) } else { None }
+    }
+}
 
 const REGS: [R; 25] = [X10, X11, X12, X13, X14, X15, X16, X17, X0, X8, X9, XFP, XSP, 0, 1, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
 
@@ -401,6 +415,7 @@ impl Machine for Arm64 {
         self.a.relocs = Vec::new();
         self.a.calls = Vec::new();
         self.a.tag = 0;
+        self.frame = -1;
     }
 
     fn finish(&mut self) -> Code {
@@ -431,6 +446,7 @@ impl Machine for Arm64 {
             a.mov_imm(X16, frame);
             a.sub_ext(XSP, XSP, X16);
         }
+        self.frame = frame;
     }
 
     fn ret(&mut self) {
@@ -456,6 +472,7 @@ impl Machine for Arm64 {
     fn mov_imm(&mut self, x: lm::Reg, v: i64) { self.a.mov_imm(r(x), v); }
 
     fn mov(&mut self, dst: lm::Reg, src: lm::Reg) {
+        if dst == lm::SP { self.frame = -1; }
         if dst == lm::SP || src == lm::SP {
             self.a.mov_sp(r(dst), r(src));
             return;
@@ -463,12 +480,28 @@ impl Machine for Arm64 {
         self.a.mov(r(dst), r(src));
     }
 
-    fn load(&mut self, size: i64, dst: lm::Reg, base: lm::Reg, off: i64) { self.a.ldr(size, r(dst), r(base), off); }
-    fn store(&mut self, size: i64, src: lm::Reg, base: lm::Reg, off: i64) { self.a.str(size, r(src), r(base), off); }
-    fn store_zero(&mut self, size: i64, base: lm::Reg, off: i64) { self.a.str(size, ZR, r(base), off); }
+    fn load(&mut self, size: i64, dst: lm::Reg, base: lm::Reg, off: i64) {
+        match self.sp_off(size, base, off) {
+            Some(so) => self.a.ldr(size, r(dst), XSP, so),
+            None => self.a.ldr(size, r(dst), r(base), off),
+        }
+    }
+    fn store(&mut self, size: i64, src: lm::Reg, base: lm::Reg, off: i64) {
+        match self.sp_off(size, base, off) {
+            Some(so) => self.a.str(size, r(src), XSP, so),
+            None => self.a.str(size, r(src), r(base), off),
+        }
+    }
+    fn store_zero(&mut self, size: i64, base: lm::Reg, off: i64) {
+        match self.sp_off(size, base, off) {
+            Some(so) => self.a.str(size, ZR, XSP, so),
+            None => self.a.str(size, ZR, r(base), off),
+        }
+    }
     fn addr_of(&mut self, dst: lm::Reg, base: lm::Reg, off: i64) { self.a.addr_of(r(dst), r(base), off); }
 
     fn add_imm(&mut self, x: lm::Reg, v: i64) {
+        if x == lm::SP { self.frame = -1; }
         if v >= 0 && v < 4096 {
             self.a.add_imm(r(x), r(x), v);
         } else if v < 0 && v > -4096 {

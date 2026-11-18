@@ -1403,7 +1403,7 @@ impl FnGen {
             if fused {
                 if self.g.debug { self.note_line(stmt_pos(&b.stmts[n])); }
                 m.set_tag(pos);
-                self.compare_branch(bi, &b.stmts[n], &b.term);
+                self.compare_branch(bi, &b.stmts[n], &b.term, pos + 1);
                 pos += 2;
                 bi += 1;
                 continue;
@@ -1995,6 +1995,16 @@ impl FnGen {
         ty
     }
 
+    /// The register holding a scalar operand: its local's register when
+    /// promoted, else scratch with the value loaded.
+    fn opreg(&mut self, op: &Operand, scratch: Reg) -> Reg {
+        if op.kind == mir::OP_COPY {
+            if let Some(pr) = self.promoted(&op.place) { return pr; }
+        }
+        self.load_scalar(op, scratch);
+        scratch
+    }
+
     /// Loads a value of 1, 2, 4, 8 or 16 bytes into V1 (and V2).
     fn load_val(&mut self, op: &Operand, size: i64) {
         let m = self.m;
@@ -2335,6 +2345,27 @@ impl FnGen {
         match rv {
             Rvalue::Use(x) => {
                 if size == 0 { return; }
+                if size <= 8 && regs {
+                    // A promoted local takes the value directly; a promoted
+                    // value is stored directly.
+                    if let Some(pd) = self.promoted(place) {
+                        self.load_scalar(x, pd);
+                        // Registers and loads are in the canonical
+                        // (zero-extended) form of narrow values, and so are
+                        // constants (unsigned ones are masked) but negative
+                        // ones.
+                        let negative = match x.cnst { Some(c) => (c.kind == mir::C_INT || c.kind == mir::C_CHAR) && c.int < 0, None => false };
+                        if negative && size < 8 { m.zero_ext(pd, pd, size); }
+                        return;
+                    }
+                    if x.kind == mir::OP_COPY {
+                        if let Some(ps) = self.promoted(&x.place) {
+                            let (b, o, _) = self.place_addr(place);
+                            m.store(size, ps, b, o);
+                            return;
+                        }
+                    }
+                }
                 if regs {
                     self.load_val(x, size);
                     self.store_regs(place, size);
@@ -2541,25 +2572,35 @@ impl FnGen {
 
     // A block's last statement `t = x op y` (an integer comparison) and its
     // switch on t: compares and branches.
-    fn compare_branch(&mut self, bi: usize, st: &Stmt, t: &Term) {
+    fn compare_branch(&mut self, bi: usize, st: &Stmt, t: &Term, term_tag: i64) {
         let m = self.m;
         let (op, x, y, ty0) = match st { Stmt::Assign { rv: Rvalue::Bin { op, x, y, ty, .. }, .. } => (*op, x, y, *ty), _ => return };
-        let (vals, targets, els) = match t { Term::Switch { vals, targets, els, .. } => (vals, targets, *els), _ => return };
         let ty = self.conc(ty0);
-        self.load_scalar(x, V1);
-        self.load_scalar(y, V2);
+        let mut a = self.opreg(x, V1);
+        let mut b = self.opreg(y, V2);
         let signed = is_signed(ty);
         if signed {
             let size = self.scalar_size(ty);
-            m.sign_ext(V1, V1, size);
-            m.sign_ext(V2, V2, size);
+            m.sign_ext(V1, a, size);
+            m.sign_ext(V2, b, size);
+            a = V1;
+            b = V2;
         }
-        m.cmp(V1, V2);
+        m.cmp(a, b);
         let c = if op == mir::EQ { EQ } else if op == mir::NE { NE }
             else if op == mir::LT { if signed { LT } else { LTU } }
             else if op == mir::LE { if signed { LE } else { LEU } }
             else if op == mir::GT { if signed { GT } else { GTU } }
             else if signed { GE } else { GEU };
+        // assert c -> target: on to target when c holds, else the panic
+        // (its call tagged as the terminator).
+        if let Term::Assert { msg, target, pos, bounds, len, index, .. } = t {
+            m.branch_if(c, self.blocks[*target]);
+            m.set_tag(term_tag);
+            self.assert_failed(msg, *pos, *bounds, len, index);
+            return;
+        }
+        let (vals, targets, els) = match t { Term::Switch { vals, targets, els, .. } => (vals, targets, *els), _ => return };
         // switch t { v => target, _ => els }: v 1 jumps when c holds.
         let jc = if vals[0] != 0 { c } else { invert(c) };
         m.branch_if(jc, self.blocks[targets[0]]);
@@ -2574,9 +2615,9 @@ impl FnGen {
             self.g.errorf(`${self.f.name}: 128-bit operation not lowered to std::rt::int128`);
             return;
         }
-        self.load_scalar(x, V1);
-        self.load_scalar(y, V2);
         if ty.kind == types::K_FLOAT {
+            self.load_scalar(x, V1);
+            self.load_scalar(y, V2);
             let f64_ = ty.f64;
             m.fmov_to(F0, V1, f64_);
             m.fmov_to(F1, V2, f64_);
@@ -2616,9 +2657,16 @@ impl FnGen {
         }
         let size = self.scalar_size(ty);
         let signed = is_signed(ty);
+        // The operands where they are (promoted locals' registers).
+        let mut a = self.opreg(x, V1);
+        let mut b = self.opreg(y, V2);
         if signed {
-            m.sign_ext(V1, V1, size);
-            if op != mir::SHL && op != mir::SHR { m.sign_ext(V2, V2, size); }
+            m.sign_ext(V1, a, size);
+            a = V1;
+            if op != mir::SHL && op != mir::SHR {
+                m.sign_ext(V2, b, size);
+                b = V2;
+            }
         }
         let dbg = self.g.debug;
         match op {
@@ -2627,10 +2675,10 @@ impl FnGen {
                 let aop = if op == mir::ADD { ADD } else if op == mir::SUB { SUB } else { MUL };
                 if size == 8 && dbg {
                     let l = self.panic_stub(`attempt to ${what} with overflow`.as_str(), pos);
-                    m.arith_ovf(aop, signed, V1, V1, V2, l);
+                    m.arith_ovf(aop, signed, V1, a, b, l);
                     return;
                 }
-                m.arith(aop, V1, V1, V2);
+                m.arith(aop, V1, a, b);
                 if dbg {
                     let l = self.panic_stub(`attempt to ${what} with overflow`.as_str(), pos);
                     self.check_range(size, signed, l);
@@ -2638,49 +2686,49 @@ impl FnGen {
             }
             mir::DIV | mir::REM => {
                 let l = self.panic_stub("attempt to divide by zero", pos);
-                m.branch_zero(V2, l);
+                m.branch_zero(b, l);
                 if signed {
                     let skip = m.new_label();
-                    m.cmp_imm(V2, -1);
+                    m.cmp_imm(b, -1);
                     m.branch_if(NE, skip);
                     m.mov_imm(T1, int_min(size));
-                    m.cmp(V1, T1);
+                    m.cmp(a, T1);
                     let l2 = self.panic_stub("attempt to divide with overflow", pos);
                     m.branch_if(EQ, l2);
                     m.bind(skip);
                 }
                 let aop = if op == mir::DIV && signed { DIV_S } else if op == mir::DIV { DIV_U } else if signed { REM_S } else { REM_U };
-                m.arith(aop, V1, V1, V2);
+                m.arith(aop, V1, a, b);
             }
             mir::SHL | mir::SHR => {
-                m.cmp_imm(V2, size * 8);
+                m.cmp_imm(b, size * 8);
                 let l = self.panic_stub("attempt to shift with overflow", pos);
                 m.branch_if(GEU, l);
                 if op == mir::SHL {
-                    m.arith(SHL, V1, V1, V2);
+                    m.arith(SHL, V1, a, b);
                 } else if signed {
-                    m.arith(SHR_S, V1, V1, V2);
+                    m.arith(SHR_S, V1, a, b);
                 } else {
-                    m.arith(SHR_U, V1, V1, V2);
+                    m.arith(SHR_U, V1, a, b);
                 }
             }
             mir::BIT_AND => {
-                m.arith(AND, V1, V1, V2);
+                m.arith(AND, V1, a, b);
             }
             mir::BIT_OR => {
-                m.arith(OR, V1, V1, V2);
+                m.arith(OR, V1, a, b);
             }
             mir::BIT_XOR => {
-                m.arith(XOR, V1, V1, V2);
+                m.arith(XOR, V1, a, b);
             }
             mir::OFFSET => {
                 let et = self.reveal(ty.el());
                 let es = self.size(et);
                 m.mov_imm(T1, es);
-                m.mul_add(V1, V2, T1, V1);
+                m.mul_add(V1, b, T1, a);
             }
             _ => {
-                m.cmp(V1, V2);
+                m.cmp(a, b);
                 let c = if op == mir::EQ { EQ } else if op == mir::NE { NE }
                     else if op == mir::LT { if signed { LT } else { LTU } }
                     else if op == mir::LE { if signed { LE } else { LEU } }
@@ -2860,28 +2908,34 @@ impl FnGen {
             }
             Term::Unreachable => m.trap(),
             Term::Assert { cond, msg, target, pos, bounds, len, index } => {
-                self.load_scalar(cond, V1);
-                m.branch_non_zero(V1, self.blocks[*target]);
-                if *bounds {
-                    self.load_scalar(len, V1);
-                    m.store(8, V1, SP, 0);
-                    self.load_scalar(index, V1);
-                    m.store(8, V1, SP, 8);
-                    match self.f.file {
-                        Some(file) => self.store_file_pos(16, file, *pos),
-                        None => self.store_file_line(16, "<unknown>", 0, 0),
-                    }
-                    self.call_runtime("panic_bounds");
-                    m.trap();
-                    return;
-                }
-                self.call_panic(msg.as_str(), *pos);
+                let c = self.opreg(cond, V1);
+                m.branch_non_zero(c, self.blocks[*target]);
+                self.assert_failed(msg, *pos, *bounds, len, index);
             }
             Term::Call { fn_op, args, dest, target, pos } => self.call(fn_op, args, dest, *target, *pos),
             Term::None => {
                 self.g.errorf(`${self.f.name}: block without terminator`);
             }
         }
+    }
+
+    // The panic of a failed assert (its condition false).
+    fn assert_failed(&mut self, msg: &String, pos: Pos, bounds: bool, len: &Operand, index: &Operand) {
+        let m = self.m;
+        if bounds {
+            self.load_scalar(len, V1);
+            m.store(8, V1, SP, 0);
+            self.load_scalar(index, V1);
+            m.store(8, V1, SP, 8);
+            match self.f.file {
+                Some(file) => self.store_file_pos(16, file, pos),
+                None => self.store_file_line(16, "<unknown>", 0, 0),
+            }
+            self.call_runtime("panic_bounds");
+            m.trap();
+            return;
+        }
+        self.call_panic(msg.as_str(), pos);
     }
 
     /// Sets LOC to the location passed to a callee.
@@ -3215,12 +3269,10 @@ impl FnGen {
                 m.set_cond(V1, EQ);
             }
             "wrapping_add" | "wrapping_sub" | "wrapping_mul" => {
-                self.load_scalar(&args[1], V2);
-                m.store(8, V2, FP, self.res_off);
-                self.load_scalar(&args[0], V1);
-                m.load(8, V2, FP, self.res_off);
+                let a = self.opreg(&args[0], V1);
+                let b = self.opreg(&args[1], V2);
                 let op = match name { "wrapping_add" => ADD, "wrapping_sub" => SUB, _ => MUL };
-                m.arith(op, V1, V1, V2);
+                m.arith(op, V1, a, b);
             }
             "size_of" => {
                 let s = self.size(targ0.unwrap());
@@ -3231,19 +3283,15 @@ impl FnGen {
                 m.mov_imm(V1, a);
             }
             "ptr_offset" => {
-                self.load_scalar(&args[1], V2);
-                m.store(8, V2, FP, self.res_off);
-                self.load_scalar(&args[0], V1);
-                m.load(8, V2, FP, self.res_off);
+                let a = self.opreg(&args[0], V1);
+                let b = self.opreg(&args[1], V2);
                 let s = self.size(targ0.unwrap());
                 m.mov_imm(T1, s);
-                m.mul_add(V1, V2, T1, V1);
+                m.mul_add(V1, b, T1, a);
             }
             "slice_from_raw" | "slice_from_raw_mut" | "str_from_raw" => {
-                self.load_scalar(&args[1], V2);
-                m.store(8, V2, FP, self.res_off);
                 self.load_scalar(&args[0], V1);
-                m.load(8, V2, FP, self.res_off);
+                self.load_scalar(&args[1], V2);
             }
             "slice_len" => {
                 self.load_val(&args[0], 16);
@@ -3564,6 +3612,7 @@ fn fused_compare(b: &mir::Block, refs: &Vec<u32>) -> bool {
         Term::Switch { x, vals, .. } => {
             vals.len() == 1 && (vals[0] == 0 || vals[0] == 1) && x.kind == mir::OP_COPY && x.place.local == place.local && x.place.proj.len() == 0
         }
+        Term::Assert { cond, .. } => cond.kind == mir::OP_COPY && cond.place.local == place.local && cond.place.proj.len() == 0,
         _ => false,
     }
 }
