@@ -135,9 +135,7 @@ pub struct Gen {
     /// functions whose names contain it.
     ssa_check: i64,
     ssa_dump: String,
-    /// Generate with the SSA backend (NAVI_NOSSA: with the old lowering;
-    /// NAVI_NOSSAOPT: without the SSA optimizations).
-    ssa_on: bool,
+    /// NAVI_NOSSAOPT: without the SSA optimizations.
     ssa_noopt: bool,
     /// NAVI_SSATIME: report the time of the SSA backend's phases.
     ssa_time: bool,
@@ -146,8 +144,6 @@ pub struct Gen {
     pub ssa_cache: &mut crate::ssa::Cache,
     ssa_ra: &mut crate::ssa::regalloc::Alloc,
 
-    /// choose_registers' buffers, reused from one function to the next.
-    live: &mut Live,
     pub p: &mut Plan,
     o: &mut Object,
     m: &mut dyn Machine,
@@ -261,12 +257,12 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         loc_ids: HashMap::new(), str_ids: HashMap::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
-        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live(), cur_meta: Vec::new(), cur_masks: Vec::new(), cur_all: 0, ftab: Vec::new(), fmeta: Vec::new(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
+        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), cur_meta: Vec::new(), cur_masks: Vec::new(), cur_all: 0, ftab: Vec::new(), fmeta: Vec::new(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
         file_sym: HashMap::new(), floc_pos: HashMap::new(),
         sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string(),
         ssa_check: match std::env::var("NAVI_SSACHECK") { Ok(v) => if v == "2" { 2 } else if v == "3" { 3 } else { 1 }, Err(_) => 0 },
         ssa_dump: match std::env::var("NAVI_SSADUMP") { Ok(v) => v, Err(_) => String::new() },
-        ssa_on: std::env::var("NAVI_NOSSA").is_err(), ssa_noopt: std::env::var("NAVI_NOSSAOPT").is_ok(),
+        ssa_noopt: std::env::var("NAVI_NOSSAOPT").is_ok(),
         ssa_time: std::env::var("NAVI_SSATIME").is_ok(), ssa_cache: crate::ssa::new_cache(), ssa_ra: crate::ssa::regalloc::empty() }
 }
 
@@ -1195,7 +1191,7 @@ impl Gen {
         }
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
             res_off: 0, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), preg2: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
-            frame: 0, buf_top: 0, ssa: false, ssa_alloc: crate::ssa::regalloc::empty(), ssa_slots: 0, ptr_slots: Vec::new(), ssa_masks: Vec::new(),
+            frame: 0, buf_top: 0, ssa_alloc: crate::ssa::regalloc::empty(), ssa_slots: 0, ptr_slots: Vec::new(), ssa_masks: Vec::new(),
             ssa_var0: false, ssa_bridge: 0 };
         fg.gen();
         fg.stack_meta();
@@ -1262,7 +1258,6 @@ pub struct FnGen {
     /// The SSA backend's state: whether it made this function, its
     /// allocation, where the spill slots start, the pointer slots, the
     /// calls' masks and whether the result is a variable.
-    ssa: bool,
     ssa_alloc: &mut crate::ssa::regalloc::Alloc,
     ssa_slots: i64,
     ptr_slots: Vec<i64>,
@@ -1299,10 +1294,16 @@ impl FnGen {
         let sf = match built {
             Ok(sf) => sf,
             Err(why) => {
-                if self.g.ssa_check == 2 { eprintln(`ssa ${self.f.name}: not built: ${why}`); }
+                self.g.errorf(`${self.f.name}: SSA form not built: ${why}`);
                 return false;
             }
         };
+        // NAVI_SSACHECK: check the form as built; NAVI_SSADUMP: print it.
+        let dump = self.g.ssa_dump.len() > 0 && self.f.name.contains(self.g.ssa_dump.as_str());
+        if (self.g.ssa_check > 0 && self.g.ssa_check != 3) || dump {
+            let errs = crate::ssa::check::check(sf);
+            if errs.len() > 0 { eprintln(`ssa ${self.f.name}: invalid:\n${errs}${sf.to_string()}`); } else if dump { eprintln(sf.to_string()); }
+        }
         if let Err(why) = self.ssa_supported(sf) {
             if self.g.ssa_check == 2 { eprintln(`ssa ${self.f.name}: not generated: ${why}`); }
             crate::backend::ssagen::count(false);
@@ -1310,28 +1311,10 @@ impl FnGen {
             return false;
         }
         crate::backend::ssagen::count(true);
-        self.ssa = true;
         self.ssa_var0 = sf.is_var[0];
         self.gen_ssa(sf);
         crate::ssa::recycle(sf);
         true
-    }
-
-    /// Builds and checks the SSA form (NAVI_SSACHECK, NAVI_SSADUMP).
-    fn ssa_check(&mut self) {
-        let dump = self.g.ssa_dump.len() > 0 && self.f.name.contains(self.g.ssa_dump.as_str());
-        match crate::backend::ssagen::build(self) {
-            Ok(sf) => {
-                crate::backend::ssagen::count(true);
-                let errs = if self.g.ssa_check == 3 { String::new() } else { crate::ssa::check::check(sf) };
-                if errs.len() > 0 { eprintln(`ssa ${self.f.name}: invalid:\n${errs}${sf.to_string()}`); } else if dump { eprintln(sf.to_string()); }
-                crate::ssa::recycle(sf);
-            }
-            Err(why) => {
-                crate::backend::ssagen::count(false);
-                if dump || self.g.ssa_check == 2 { eprintln(`ssa ${self.f.name}: not built: ${why}`); }
-            }
-        }
     }
 
     /// The first local passed on the stack (closures receive the
@@ -1358,176 +1341,7 @@ impl FnGen {
             off += round8(self.size(self.ltypes[i]));
             i += 1;
         }
-        if self.g.ssa_on && self.try_ssa() { return; }
-        // Frame locals.
-        let mut cur = FIXED_FRAME;
-        i = 0;
-        while i < n {
-            if i >= self.first_arg() && i <= f.nargs {
-                i += 1;
-                continue;
-            }
-            let t = self.ltypes[i];
-            let mut size = 0i64;
-            let mut align = 1i64;
-            if t.kind != types::K_NEVER {
-                let l = self.g.lay_of(t);
-                size = l.size;
-                align = l.align;
-            }
-            if size == 0 { size = 1; }
-            if align < 1 { align = 1; }
-            cur = (cur + size + align - 1) / align * align;
-            self.loff[i] = -cur;
-            i += 1;
-        }
-        // Registers for the most used scalar locals.
-        self.choose_registers();
-        if self.g.ssa_check > 0 || self.g.ssa_dump.len() > 0 { self.ssa_check(); }
-        // Save slots are 8-byte aligned: the collector scans aligned words.
-        cur = (cur + 7) / 8 * 8;
-        let mut k = 0;
-        while k < self.saved.len() {
-            cur += 8;
-            self.saved[k].1 = -cur;
-            k += 1;
-        }
-        // Buffers and the outgoing argument area.
-        let mut max_res = 16i64;
-        let mut max_tmp = 16i64;
-        let mut max_out = 48i64;
-        for b in f.blocks.iter() {
-            for s in b.stmts.iter() {
-                if let Stmt::Assign { place, .. } = s {
-                    // Aggregates and large copies are staged in the buffer.
-                    let pt = self.place_type(place);
-                    let sz = self.size(pt);
-                    if sz > max_tmp { max_tmp = sz; }
-                }
-            }
-            if let Term::Call { args, dest, .. } = &b.term {
-                let dt = self.place_type(dest);
-                let sz = self.size(dt);
-                if sz > max_res { max_res = sz; }
-                let mut na = 0i64;
-                for a in args.iter() {
-                    let at = self.operand_type(a);
-                    na += round8(self.size(at));
-                }
-                if na > max_out { max_out = na; }
-            }
-        }
-        self.buf_top = -cur;
-        cur = (cur + max_res + 7) / 8 * 8;
-        self.res_off = -cur;
-        cur = (cur + max_tmp + 7) / 8 * 8;
-        self.tmp_off = -cur;
-        let frame = ((cur + 15) & !15) + ((max_out + 15) & !15);
-        self.frame = frame;
-
-        // The stack check, before the frame is made: the stack must reach
-        // the frame (and the saved FP and LR) above the limit, the first
-        // word of the running G. A collector stopping the world sets the
-        // limit to the maximum. morestack grows the stack (copying it), stops
-        // the G for the collector or fails; the function then goes on (a G
-        // that may not stop yet keeps its poisoned limit and passes here).
-        let overflow = m.new_label();
-        let resume = m.new_label();
-        let need = frame + 16;
-        m.load(8, I1, GREG, 0);
-        m.mov(I2, SP);
-        m.add_imm(I2, -need);
-        m.cmp(I2, I1);
-        m.branch_if(LTU, overflow);
-        m.bind(resume);
-        self.stub_list.push(Stub::Overflow(overflow, resume, need));
-        m.prologue(frame);
-        for sv in self.saved.iter() { m.store(8, sv.0, FP, sv.1); }
-        if f.closure {
-            if self.preg[1] >= 0 { m.mov(self.preg[1] as Reg, CTX); } else { m.store(8, CTX, FP, self.loff[1]); }
-            m.load(8, I1, CTX, -8);
-            m.store(8, I1, FP, SLOT_CTX);
-        } else {
-            m.store(8, CTX, FP, SLOT_CTX);
-        }
-        // Promoted arguments.
-        let mut ai = self.first_arg();
-        while ai <= f.nargs {
-            if self.preg[ai] >= 0 {
-                let sz = self.size(self.ltypes[ai]);
-                if self.preg2[ai] >= 0 {
-                    m.load(8, self.preg[ai] as Reg, FP, self.loff[ai]);
-                    m.load(8, self.preg2[ai] as Reg, FP, self.loff[ai] + 8);
-                } else {
-                    m.load(sz, self.preg[ai] as Reg, FP, self.loff[ai]);
-                }
-            }
-            ai += 1;
-        }
-        m.store(8, RET, FP, SLOT_RET);
-        m.store(8, LOC, FP, SLOT_LOC);
-        m.store_zero(8, FP, SLOT_DEFERS);
-
-        i = 0;
-        while i < f.blocks.len() {
-            self.blocks.push(m.new_label());
-            i += 1;
-        }
-        let refs = local_refs(f);
-        let mut pos = 1i64;
-        let mut bi = 0;
-        while bi < f.blocks.len() {
-            m.bind(self.blocks[bi]);
-            let b = f.blocks[bi];
-            // A block ending in a comparison only its switch reads compares
-            // and branches (the bool is not made).
-            let fused = fused_compare(b, &refs);
-            let mut si = 0;
-            let n = if fused { b.stmts.len() - 1 } else { b.stmts.len() };
-            while si < n {
-                if self.g.debug { self.note_line(stmt_pos(&b.stmts[si])); }
-                // Calls are tagged with their position (as choose_registers
-                // counts: from 1, statements then the terminator).
-                m.set_tag(pos);
-                self.stmt(bi, si, &b.stmts[si]);
-                si += 1;
-                pos += 1;
-            }
-            if fused {
-                if self.g.debug { self.note_line(stmt_pos(&b.stmts[n])); }
-                m.set_tag(pos);
-                self.compare_branch(bi, &b.stmts[n], &b.term, pos + 1);
-                pos += 2;
-                bi += 1;
-                continue;
-            }
-            if self.g.debug { self.note_line(term_pos(&b.term)); }
-            m.set_tag(pos);
-            self.term(bi, &b.term);
-            pos += 1;
-            bi += 1;
-        }
-        let mut k = 0;
-        while k < self.stub_list.len() {
-            match &self.stub_list[k] {
-                Stub::Overflow(l, resume, need) => {
-                    m.bind(*l);
-                    m.set_tag(0);
-                    // The bytes needed: the morestack stub records them
-                    // (in the G's third word) unless it is nested.
-                    m.mov_imm(I1, *need);
-                    m.call_morestack();
-                    m.jump(*resume);
-                }
-                Stub::Panic { label, msg, pos } => {
-                    m.bind(*label);
-                    m.set_tag(-1);
-                    let ms = msg.clone();
-                    self.call_panic(ms.as_str(), *pos);
-                }
-            }
-            k += 1;
-        }
+        if !self.try_ssa() { self.g.errorf(`${self.f.name}: not compiled`); }
     }
 
     // --- Places ------------------------------------------------------------------
@@ -1629,300 +1443,12 @@ impl FnGen {
             meta.push(k << 32 | (sv.1 as u64 & 0xffffffff));
         }
         self.g.cur_all = all;
-        if self.ssa {
-            // By call tag, from the register allocation.
-            let mut masks = self.g.cur_masks;
-            masks.clear();
-            for x in self.ssa_masks.iter() { masks.push(*x); }
-            self.g.cur_meta = meta;
-            self.g.cur_masks = masks;
-            return;
-        }
-        // Masks by position: the saved registers holding a live pointer
-        // (a local's range covers the position).
-        let lv = self.g.live;
-        let mut maxp = 0i64;
-        let n = self.f.locals.len();
-        let mut i = 0;
-        while i < n {
-            if self.preg[i] >= 0 && lv.hi[i] > maxp { maxp = lv.hi[i]; }
-            i += 1;
-        }
+        // By call tag, from the register allocation.
         let mut masks = self.g.cur_masks;
         masks.clear();
-        let mut p = 0;
-        while p <= maxp + 2 {
-            masks.push(0);
-            p += 1;
-        }
-        i = 0;
-        while i < n {
-            let t = self.ltypes[i];
-            if self.preg[i] >= 0 && (t.kind == types::K_REF || t.kind == types::K_PTR) {
-                let bit = 1u16 << (self.preg[i] - S0 as i64) as u32;
-                let mut q = lv.lo[i];
-                while q <= lv.hi[i] {
-                    if q >= 0 { masks[q as usize] = masks[q as usize] | bit; }
-                    q += 1;
-                }
-            }
-            i += 1;
-        }
+        for x in self.ssa_masks.iter() { masks.push(*x); }
         self.g.cur_meta = meta;
         self.g.cur_masks = masks;
-    }
-
-    /// Gives scalar locals (used whole, or as pointers to dereference) the
-    /// saved registers by linear scan over their live ranges: locals whose
-    /// ranges do not overlap share a register (calls preserve them). A
-    /// range runs from the first to the last position the local is live
-    /// at, in block order, with liveness from the blocks' data flow.
-    fn choose_registers(&mut self) {
-        let f = self.f;
-        let n = f.locals.len();
-        let nb = f.blocks.len();
-        let words = (n + 63) / 64;
-        let lv = self.g.live;
-        lv.words = words;
-        lv.b = 0;
-        lv.pos = 0;
-        lv.lo.clear();
-        lv.hi.clear();
-        lv.bad.clear();
-        let mut i = 0;
-        while i < n {
-            self.preg.push(-1);
-            self.preg2.push(-1);
-            let t = self.ltypes[i];
-            let k = t.kind;
-            let scalar = k == types::K_INT && layout::int_size(t.int) <= 8 || k == types::K_BOOL || k == types::K_CHAR || k == types::K_FLOAT
-                || k == types::K_REF || k == types::K_PTR || k == types::K_FN && t.abi == "C";
-            lv.lo.push(-1);
-            lv.hi.push(-1);
-            lv.bad.push(!scalar);
-            i += 1;
-        }
-        lv.gen.clear();
-        lv.kill.clear();
-        lv.live_in.clear();
-        lv.live_out.clear();
-        i = 0;
-        while i < nb * words {
-            lv.gen.push(0);
-            lv.kill.push(0);
-            lv.live_in.push(0);
-            lv.live_out.push(0);
-            i += 1;
-        }
-        // Position 0: the entry, where the arguments arrive.
-        i = 1;
-        while i <= f.nargs && i < n {
-            lv.touch(i);
-            i += 1;
-        }
-        // Per block: its first and last positions, and its successors
-        // (succ[succ_at[b]..succ_at[b + 1]]).
-        let mut starts = lv.starts;
-        let mut ends = lv.ends;
-        let mut succ = lv.succ;
-        let mut succ_at = lv.succ_at;
-        starts.clear();
-        ends.clear();
-        succ.clear();
-        succ_at.clear();
-        let mut pos = 1i64;
-        let mut bi = 0;
-        while bi < nb {
-            let b = f.blocks[bi];
-            lv.b = bi;
-            starts.push(pos);
-            for st in b.stmts.iter() {
-                lv.pos = pos;
-                match st {
-                    Stmt::Assign { place, rv } => {
-                        match rv {
-                            Rvalue::Use(x) => lv.op(x),
-                            Rvalue::Ref { place: p, .. } => lv.place(p, true, false),
-                            Rvalue::Bin { x, y, .. } => {
-                                lv.op(x);
-                                lv.op(y);
-                            }
-                            Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => lv.op(x),
-                            Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { lv.op(o); } }
-                            Rvalue::Discr(p) | Rvalue::Len(p) => lv.place(p, true, false),
-                        }
-                        lv.place(place, false, true);
-                    }
-                    Stmt::SetDiscr { place, .. } => lv.place(place, true, false),
-                    Stmt::Box { local, .. } => lv.def(*local),
-                    Stmt::PushDefer { fn_op, args } => {
-                        lv.op(fn_op);
-                        for a in args.iter() { lv.op(a); }
-                    }
-                    _ => {}
-                }
-                pos += 1;
-            }
-            lv.pos = pos;
-            succ_at.push(succ.len());
-            match &b.term {
-                Term::Goto(t) => succ.push(*t),
-                Term::Switch { x, targets, els, .. } => {
-                    lv.op(x);
-                    for t in targets.iter() { succ.push(*t); }
-                    succ.push(*els);
-                }
-                Term::Call { fn_op, args, dest, target, .. } => {
-                    lv.op(fn_op);
-                    for a in args.iter() { lv.op(a); }
-                    lv.place(dest, false, true);
-                    if *target >= 0 { succ.push(*target as usize); }
-                }
-                Term::Assert { cond, len, index, target, .. } => {
-                    lv.op(cond);
-                    lv.op(len);
-                    lv.op(index);
-                    succ.push(*target);
-                }
-                Term::Return => lv.use_(0),
-                _ => {}
-            }
-            ends.push(pos);
-            pos += 1;
-            bi += 1;
-        }
-        succ_at.push(succ.len());
-        // Liveness: in = gen | (out & !kill), out = the successors' ins.
-        let mut live_in = lv.live_in;
-        let mut live_out = lv.live_out;
-        let mut changed = true;
-        while changed {
-            changed = false;
-            let mut bj = nb;
-            while bj > 0 {
-                bj -= 1;
-                let o = bj * words;
-                let mut w = 0;
-                while w < words {
-                    let mut out = 0u64;
-                    let mut si = succ_at[bj];
-                    while si < succ_at[bj + 1] {
-                        out = out | live_in[succ[si] * words + w];
-                        si += 1;
-                    }
-                    live_out[o + w] = out;
-                    let inn = lv.gen[o + w] | (out & !lv.kill[o + w]);
-                    if inn != live_in[o + w] {
-                        live_in[o + w] = inn;
-                        changed = true;
-                    }
-                    w += 1;
-                }
-            }
-        }
-        bi = 0;
-        while bi < nb {
-            let o = bi * words;
-            let mut w = 0;
-            while w < words {
-                // Only the set bits (most words are 0).
-                let mut bits = live_in[o + w];
-                let mut l = w * 64;
-                while bits != 0 {
-                    if bits & 1 != 0 { lv.touch_at(l, starts[bi]); }
-                    bits = bits >> 1;
-                    l += 1;
-                }
-                bits = live_out[o + w];
-                l = w * 64;
-                while bits != 0 {
-                    if bits & 1 != 0 { lv.touch_at(l, ends[bi]); }
-                    bits = bits >> 1;
-                    l += 1;
-                }
-                w += 1;
-            }
-            bi += 1;
-        }
-        // Linear scan by start; out of registers, the range ending last
-        // stays in memory.
-        let mut order = lv.order;
-        order.clear();
-        i = 0;
-        while i < n {
-            if !lv.bad[i] && lv.lo[i] >= 0 { order.push(i); }
-            i += 1;
-        }
-        order.sort_by(|a, b| if lv.lo[*a] != lv.lo[*b] { lv.lo[*a].cmp(&lv.lo[*b]) } else { a.cmp(b) });
-        let mut active = lv.active;
-        active.clear();
-        let mut free: Vec<Reg> = Vec::new();
-        let mut used = [false; 9];
-        let mut r = self.g.tgt.num_saved;
-        while r > 0 {
-            r -= 1;
-            free.push(S0 + r as Reg);
-        }
-        for l in order.iter() {
-            let cur = *l;
-            // Ranges that ended before this one starts give their registers back.
-            let mut j = 0;
-            let mut kept = 0;
-            while j < active.len() {
-                let a = active[j];
-                if lv.hi[a] < lv.lo[cur] {
-                    free.push(self.preg[a] as Reg);
-                    if self.preg2[a] >= 0 { free.push(self.preg2[a] as Reg); }
-                } else {
-                    active[kept] = a;
-                    kept += 1;
-                }
-                j += 1;
-            }
-            active.truncate(kept);
-            // A fat pointer takes two registers, or stays in memory.
-            let t = self.ltypes[cur];
-            if (t.kind == types::K_REF || t.kind == types::K_PTR) && layout::is_fat(t.el()) {
-                if free.len() >= 2 {
-                    let reg = free.pop().unwrap();
-                    let reg2 = free.pop().unwrap();
-                    self.preg[cur] = reg as i64;
-                    self.preg2[cur] = reg2 as i64;
-                    used[(reg - S0) as usize] = true;
-                    used[(reg2 - S0) as usize] = true;
-                    active.push(cur);
-                }
-                continue;
-            }
-            if free.len() > 0 {
-                let reg = free.pop().unwrap();
-                self.preg[cur] = reg as i64;
-                used[(reg - S0) as usize] = true;
-                active.push(cur);
-                continue;
-            }
-            let mut far = 0;
-            let mut j = 1;
-            while j < active.len() {
-                if lv.hi[active[j]] > lv.hi[active[far]] { far = j; }
-                j += 1;
-            }
-            let victim = active[far];
-            if lv.hi[victim] > lv.hi[cur] {
-                self.preg[cur] = self.preg[victim];
-                self.preg[victim] = -1;
-                if self.preg2[victim] >= 0 {
-                    free.push(self.preg2[victim] as Reg);
-                    self.preg2[victim] = -1;
-                }
-                active[far] = cur;
-            }
-        }
-        let mut k = 0;
-        while k < self.g.tgt.num_saved {
-            if used[k] { self.saved.push((S0 + k as Reg, 0)); }
-            k += 1;
-        }
     }
 
     pub fn field_of(&mut self, ty: &Type, variant: i64, field: usize) -> (i64, &Type) {
@@ -2314,35 +1840,6 @@ impl FnGen {
         }
     }
 
-    /// Stores V1 (and V2) into the place; sizes 1, 2, 4, 8, 16.
-    fn store_regs(&mut self, pl: &Place, size: i64) {
-        let m = self.m;
-        if let Some(pr) = self.promoted(pl) {
-            if let Some(p2) = self.promoted2(pl) {
-                m.mov(pr, V1);
-                m.mov(p2, V2);
-            } else if size > 0 {
-                m.zero_ext(pr, V1, size);
-            }
-            return;
-        }
-        let (b, o, _) = self.place_addr(pl);
-        match size {
-            0 => {
-            }
-            1 | 2 | 4 | 8 => {
-                m.store(size, V1, b, o);
-            }
-            16 => {
-                m.store(8, V1, b, o);
-                m.store(8, V2, b, o + 8);
-            }
-            _ => {
-                self.g.errorf(`${self.f.name}: register store of ${size} bytes`);
-            }
-        }
-    }
-
     // --- Statements --------------------------------------------------------------
 
     /// Records that the code from here on comes from pos (debug builds).
@@ -2355,32 +1852,6 @@ impl FnGen {
             return;
         }
         ls.push((off, pos));
-    }
-
-    fn stmt(&mut self, bi: usize, si: usize, s: &Stmt) {
-        let m = self.m;
-        match s {
-            Stmt::Assign { place, rv } => self.assign(bi, si, place, rv),
-            Stmt::SetDiscr { place, variant } => {
-                let ty = self.place(place);
-                self.write_tag(RA, ty, *variant);
-            }
-            Stmt::Box { local, ty } => {
-                let ct = self.conc(*ty);
-                let size = self.g.lay_of(ct).size;
-                let ns = self.noscan(ct);
-                self.call_alloc(size, ns);
-                if self.preg[*local] >= 0 {
-                    m.load(8, self.preg[*local] as Reg, FP, self.res_off);
-                } else {
-                    m.load(8, V1, FP, self.res_off);
-                    self.local_addr(RA, *local);
-                    m.store(8, V1, RA, 0);
-                }
-            }
-            Stmt::PushDefer { fn_op, args } => self.push_defer(fn_op, args),
-            _ => {}
-        }
     }
 
     /// Calls std::rt::native::gc_alloc(size, noscan); the pointer is left in
@@ -2464,193 +1935,6 @@ impl FnGen {
             }
             _ => {
                 m.mov_imm(V1, 0);
-            }
-        }
-    }
-
-    fn assign(&mut self, bi: usize, si: usize, place: &Place, rv: &Rvalue) {
-        self.assign_value(bi, si, place, rv);
-        self.write_barrier(place);
-    }
-
-    /// After a write of pointers to a place that may be in the heap: while
-    /// a concurrent collection marks, the runtime shades what was written
-    /// (Dijkstra's insertion barrier; stacks and statics are rescanned when
-    /// marking ends).
-    fn write_barrier(&mut self, pl: &Place) {
-        let mut heap = false;
-        for pj in pl.proj.iter() {
-            if pj.kind == mir::P_DEREF { heap = true; }
-        }
-        if !heap { return; }
-        let ty = self.place_type(pl);
-        if ty.kind == types::K_NEVER { return; }
-        let l = self.g.lay_of(ty);
-        if l.ptrs.len() == 0 || l.unsized { return; }
-        let m = self.m;
-        let skip = m.new_label();
-        m.load_sym(I1, &self.g.sym_marking);
-        m.branch_zero(I1, skip);
-        // No stop for the collector until the marking is done: the G's
-        // nopreempt (its second word; gc_wb decrements it).
-        m.load(8, I1, GREG, 8);
-        m.add_imm(I1, 1);
-        m.store(8, I1, GREG, 8);
-        self.place(pl);
-        m.store(8, RA, SP, 0);
-        m.mov_imm(V1, l.size);
-        m.store(8, V1, SP, 8);
-        self.call_runtime("gc_wb");
-        m.bind(skip);
-    }
-
-    fn assign_value(&mut self, bi: usize, si: usize, place: &Place, rv: &Rvalue) {
-        let m = self.m;
-        let dt = self.place_type(place);
-        if dt.kind == types::K_NEVER { return; }
-        let size = self.size(dt);
-        let regs = size == 1 || size == 2 || size == 4 || size == 8 || size == 16;
-        match rv {
-            Rvalue::Use(x) => {
-                if size == 0 { return; }
-                if size <= 8 && regs {
-                    // A promoted local takes the value directly; a promoted
-                    // value is stored directly.
-                    if let Some(pd) = self.promoted(place) {
-                        self.load_scalar(x, pd);
-                        // Registers and loads are in the canonical
-                        // (zero-extended) form of narrow values, and so are
-                        // constants (unsigned ones are masked) but negative
-                        // ones.
-                        let negative = match x.cnst { Some(c) => (c.kind == mir::C_INT || c.kind == mir::C_CHAR) && c.int < 0, None => false };
-                        if negative && size < 8 { m.zero_ext(pd, pd, size); }
-                        return;
-                    }
-                    if x.kind == mir::OP_COPY {
-                        if let Some(ps) = self.promoted(&x.place) {
-                            let (b, o, _) = self.place_addr(place);
-                            m.store(size, ps, b, o);
-                            return;
-                        }
-                    }
-                }
-                if regs {
-                    self.load_val(x, size);
-                    self.store_regs(place, size);
-                    return;
-                }
-                m.addr_of(BASE, FP, self.tmp_off);
-                self.store_operand(x, BASE, 0);
-                let (b, o, _) = self.place_addr(place);
-                self.copy_mem(b, o, BASE, 0, size);
-            }
-            Rvalue::Ref { place: src, .. } => {
-                let (b, o, pt) = self.place_addr(src);
-                // A promoted thin pointer takes the address directly.
-                if !layout::is_fat(pt) && o > -4096 && o < 4096 {
-                    if let Some(pd) = self.promoted(place) {
-                        m.addr_of(pd, b, o);
-                        return;
-                    }
-                }
-                self.materialize(b, o);
-                m.mov(V1, RA);
-                if layout::is_fat(pt) { m.mov(V2, RM); }
-                self.store_regs(place, size);
-            }
-            Rvalue::Bin { op, x, y, ty, pos } => {
-                self.binop(*op, x, y, *ty, *pos);
-                self.store_regs(place, size);
-            }
-            Rvalue::Un { op, x, ty, pos } => {
-                self.unop(*op, x, *ty, *pos);
-                self.store_regs(place, size);
-            }
-            Rvalue::Cast { kind, x, .. } => {
-                self.cast(*kind, x, dt);
-                self.store_regs(place, size);
-            }
-            Rvalue::Discr(p) => {
-                let ty = self.place(p);
-                self.read_variant(ty);
-                self.store_regs(place, size);
-            }
-            Rvalue::Len(p) => {
-                let pt = self.place_type(p);
-                if pt.kind == types::K_ARRAY {
-                    m.mov_imm(V1, pt.len);
-                } else {
-                    self.place_addr(p);
-                    if let Some(pd) = self.promoted(place) {
-                        m.mov(pd, RM);
-                        return;
-                    }
-                    m.mov(V1, RM);
-                }
-                self.store_regs(place, size);
-            }
-            Rvalue::Unsize { x, len, .. } => {
-                // A negative len: the array's length is a const parameter.
-                let n = if *len >= 0 { *len } else { self.operand_type(x).el().len };
-                self.load_scalar(x, V1);
-                m.mov_imm(V2, n);
-                self.store_regs(place, size);
-            }
-            Rvalue::MakeDyn { x, .. } => {
-                self.load_scalar(x, V1);
-                let key = codegen::dyn_site(self.f, bi, si);
-                let (vt, slot) = self.g.p.site_vtable(self.inst, &key);
-                if slot >= 0 {
-                    m.load(8, I1, FP, SLOT_CTX);
-                    m.load(8, V2, I1, 16 * slot);
-                } else {
-                    m.adr_sym(V2, &vt.sym);
-                }
-                self.store_regs(place, size);
-            }
-            Rvalue::Aggregate { kind, ty, variant, ops, closure } => {
-                if *kind == mir::AGG_CLOSURE {
-                    self.closure(ops, closure.unwrap());
-                    self.store_regs(place, size);
-                    return;
-                }
-                if size == 0 { return; }
-                m.addr_of(BASE, FP, self.tmp_off);
-                let aty = self.conc(*ty);
-                let l = self.g.lay_of(aty);
-                if *kind == mir::AGG_TUPLE {
-                    let mut i = 0;
-                    while i < ops.len() {
-                        self.store_operand(&ops[i], BASE, l.fields[i]);
-                        i += 1;
-                    }
-                } else if *kind == mir::AGG_ARRAY {
-                    if ops.len() > 0 {
-                        let stride = l.size / ops.len() as i64;
-                        let mut i = 0;
-                        while i < ops.len() {
-                            self.store_operand(&ops[i], BASE, i as i64 * stride);
-                            i += 1;
-                        }
-                    }
-                } else {
-                    if !self.g.p.info.adts[&aty.d().id].is_enum {
-                        let mut i = 0;
-                        while i < ops.len() {
-                            self.store_operand(&ops[i], BASE, l.fields[i]);
-                            i += 1;
-                        }
-                    } else {
-                        let mut i = 0;
-                        while i < ops.len() {
-                            self.store_operand(&ops[i], BASE, l.variants[*variant][i]);
-                            i += 1;
-                        }
-                        self.write_tag(BASE, aty, *variant);
-                    }
-                }
-                let (b, o, _) = self.place_addr(place);
-                self.copy_mem(b, o, BASE, 0, size);
             }
         }
     }
@@ -2750,373 +2034,7 @@ impl FnGen {
         m.store(4, V1, SP, off + 24);
     }
 
-    // A block's last statement `t = x op y` (an integer comparison) and its
-    // switch on t: compares and branches.
-    fn compare_branch(&mut self, bi: usize, st: &Stmt, t: &Term, term_tag: i64) {
-        let m = self.m;
-        let (op, x, y, ty0) = match st { Stmt::Assign { rv: Rvalue::Bin { op, x, y, ty, .. }, .. } => (*op, x, y, *ty), _ => return };
-        let ty = self.conc(ty0);
-        let mut a = self.opreg(x, V1);
-        let mut b = self.opreg(y, V2);
-        let signed = is_signed(ty);
-        if signed {
-            let size = self.scalar_size(ty);
-            m.sign_ext(V1, a, size);
-            m.sign_ext(V2, b, size);
-            a = V1;
-            b = V2;
-        }
-        m.cmp(a, b);
-        let c = if op == mir::EQ { EQ } else if op == mir::NE { NE }
-            else if op == mir::LT { if signed { LT } else { LTU } }
-            else if op == mir::LE { if signed { LE } else { LEU } }
-            else if op == mir::GT { if signed { GT } else { GTU } }
-            else if signed { GE } else { GEU };
-        // assert c -> target: on to target when c holds, else the panic
-        // (its call tagged as the terminator).
-        if let Term::Assert { msg, target, pos, bounds, len, index, .. } = t {
-            m.branch_if(c, self.blocks[*target]);
-            m.set_tag(term_tag);
-            self.assert_failed(msg, *pos, *bounds, len, index);
-            return;
-        }
-        let (vals, targets, els) = match t { Term::Switch { vals, targets, els, .. } => (vals, targets, *els), _ => return };
-        // switch t { v => target, _ => els }: v 1 jumps when c holds.
-        let jc = if vals[0] != 0 { c } else { invert(c) };
-        m.branch_if(jc, self.blocks[targets[0]]);
-        if els != bi + 1 { m.jump(self.blocks[els]); }
-    }
-
-    /// Leaves the result in V1.
-    fn binop(&mut self, op: mir::BinOp, x: &Operand, y: &Operand, ty0: &Type, pos: Pos) {
-        let m = self.m;
-        let ty = self.conc(ty0);
-        if ty.kind == types::K_INT && layout::int_size(ty.int) == 16 {
-            self.g.errorf(`${self.f.name}: 128-bit operation not lowered to std::rt::int128`);
-            return;
-        }
-        if ty.kind == types::K_FLOAT {
-            self.load_scalar(x, V1);
-            self.load_scalar(y, V2);
-            let f64_ = ty.f64;
-            m.fmov_to(F0, V1, f64_);
-            m.fmov_to(F1, V2, f64_);
-            match op {
-                mir::ADD => {
-                    m.farith(ADD, F0, F0, F1, f64_);
-                }
-                mir::SUB => {
-                    m.farith(SUB, F0, F0, F1, f64_);
-                }
-                mir::MUL => {
-                    m.farith(MUL, F0, F0, F1, f64_);
-                }
-                mir::DIV => {
-                    m.farith(FDIV, F0, F0, F1, f64_);
-                }
-                mir::REM => {
-                    m.store(8, V1, SP, 0);
-                    m.store(8, V2, SP, 8);
-                    let name = if f64_ { "fmod" } else { "fmodf" };
-                    let s = self.g.extern_sym(name);
-                    let mut args = Vec::new();
-                    args.push(CArg { float: true, f64: f64_, variadic: false, size: if f64_ { 8 } else { 4 } });
-                    args.push(CArg { float: true, f64: f64_, variadic: false, size: if f64_ { 8 } else { 4 } });
-                    m.call_c(s.as_str(), 0, &args, true, f64_);
-                    return;
-                }
-                _ => {
-                    let c = if op == mir::EQ { EQ } else if op == mir::NE { NE } else if op == mir::LT { LT } else if op == mir::LE { LE }
-                        else if op == mir::GT { GT } else { GE };
-                    m.fcompare(V1, c, F0, F1, f64_);
-                    return;
-                }
-            }
-            m.fmov_from(V1, F0, f64_);
-            return;
-        }
-        let size = self.scalar_size(ty);
-        let signed = is_signed(ty);
-        // The operands where they are (promoted locals' registers).
-        let mut a = self.opreg(x, V1);
-        let mut b = self.opreg(y, V2);
-        if signed {
-            m.sign_ext(V1, a, size);
-            a = V1;
-            if op != mir::SHL && op != mir::SHR {
-                m.sign_ext(V2, b, size);
-                b = V2;
-            }
-        }
-        let dbg = self.g.debug;
-        match op {
-            mir::ADD | mir::SUB | mir::MUL => {
-                let what = if op == mir::ADD { "add" } else if op == mir::SUB { "subtract" } else { "multiply" };
-                let aop = if op == mir::ADD { ADD } else if op == mir::SUB { SUB } else { MUL };
-                if size == 8 && dbg {
-                    let l = self.panic_stub(`attempt to ${what} with overflow`.as_str(), pos);
-                    m.arith_ovf(aop, signed, V1, a, b, l);
-                    return;
-                }
-                m.arith(aop, V1, a, b);
-                if dbg {
-                    let l = self.panic_stub(`attempt to ${what} with overflow`.as_str(), pos);
-                    self.check_range(size, signed, l);
-                }
-            }
-            mir::DIV | mir::REM => {
-                let l = self.panic_stub("attempt to divide by zero", pos);
-                m.branch_zero(b, l);
-                if signed {
-                    let skip = m.new_label();
-                    m.cmp_imm(b, -1);
-                    m.branch_if(NE, skip);
-                    m.mov_imm(T1, int_min(size));
-                    m.cmp(a, T1);
-                    let l2 = self.panic_stub("attempt to divide with overflow", pos);
-                    m.branch_if(EQ, l2);
-                    m.bind(skip);
-                }
-                let aop = if op == mir::DIV && signed { DIV_S } else if op == mir::DIV { DIV_U } else if signed { REM_S } else { REM_U };
-                m.arith(aop, V1, a, b);
-            }
-            mir::SHL | mir::SHR => {
-                m.cmp_imm(b, size * 8);
-                let l = self.panic_stub("attempt to shift with overflow", pos);
-                m.branch_if(GEU, l);
-                if op == mir::SHL {
-                    m.arith(SHL, V1, a, b);
-                } else if signed {
-                    m.arith(SHR_S, V1, a, b);
-                } else {
-                    m.arith(SHR_U, V1, a, b);
-                }
-            }
-            mir::BIT_AND => {
-                m.arith(AND, V1, a, b);
-            }
-            mir::BIT_OR => {
-                m.arith(OR, V1, a, b);
-            }
-            mir::BIT_XOR => {
-                m.arith(XOR, V1, a, b);
-            }
-            mir::OFFSET => {
-                let et = self.reveal(ty.el());
-                let es = self.size(et);
-                m.mov_imm(T1, es);
-                m.mul_add(V1, b, T1, a);
-            }
-            _ => {
-                m.cmp(a, b);
-                let c = if op == mir::EQ { EQ } else if op == mir::NE { NE }
-                    else if op == mir::LT { if signed { LT } else { LTU } }
-                    else if op == mir::LE { if signed { LE } else { LEU } }
-                    else if op == mir::GT { if signed { GT } else { GTU } }
-                    else if signed { GE } else { GEU };
-                m.set_cond(V1, c);
-            }
-        }
-    }
-
-    /// Jumps to l unless V1 fits in size bytes.
-    fn check_range(&mut self, size: i64, signed: bool, l: Label) {
-        if size >= 8 { return; }
-        let m = self.m;
-        if signed {
-            m.sign_ext(T1, V1, size);
-            m.cmp(T1, V1);
-            m.branch_if(NE, l);
-        } else {
-            m.mov_imm(T1, (1i64 << (8 * size) as u32) - 1);
-            m.cmp(V1, T1);
-            m.branch_if(GTU, l);
-        }
-    }
-
-    fn unop(&mut self, op: mir::UnOp, x: &Operand, ty0: &Type, pos: Pos) {
-        let m = self.m;
-        let ty = self.conc(ty0);
-        if ty.kind == types::K_INT && layout::int_size(ty.int) == 16 {
-            self.g.errorf(`${self.f.name}: 128-bit operation not lowered to std::rt::int128`);
-            return;
-        }
-        self.load_scalar(x, V1);
-        match ty.kind {
-            types::K_FLOAT => {
-                m.fmov_to(F0, V1, ty.f64);
-                m.fneg(F0, F0, ty.f64);
-                m.fmov_from(V1, F0, ty.f64);
-            }
-            types::K_BOOL => {
-                m.mov_imm(V2, 1);
-                m.arith(XOR, V1, V1, V2);
-            }
-            _ if op == mir::NOT => {
-                m.not(V1, V1);
-            }
-            _ => {
-                let size = self.scalar_size(ty);
-                if is_signed(ty) && self.g.debug {
-                    m.sign_ext(V1, V1, size);
-                    m.mov_imm(T1, int_min(size));
-                    m.cmp(V1, T1);
-                    let l = self.panic_stub("attempt to negate with overflow", pos);
-                    m.branch_if(EQ, l);
-                }
-                m.neg(V1, V1);
-            }
-        }
-    }
-
-    fn cast(&mut self, kind: mir::CastKind, x: &Operand, to: &Type) {
-        let m = self.m;
-        match kind {
-            mir::CAST_PTR => {
-                let s = self.size(to);
-                self.load_val(x, s);
-                return;
-            }
-            mir::CAST_PTR_INT | mir::CAST_FN_PTR | mir::CAST_INT_PTR => {
-                self.load_scalar(x, V1);
-                return;
-            }
-            mir::CAST_ENUM => {
-                let from = self.operand_type(x);
-                if x.kind != mir::OP_COPY {
-                    self.load_scalar(x, V1);
-                    return;
-                }
-                self.place(&x.place);
-                let l = self.g.lay_of(from);
-                let vs = self.g.p.info.adts[&from.d().id].variants;
-                if l.tag != layout::TAG_INT {
-                    if vs.len() > 0 { m.mov_imm(V1, vs[0].discr); }
-                    return;
-                }
-                m.load(l.tag_size, V1, RA, l.tag_off);
-                for v in vs.iter() {
-                    if v.discr < 0 {
-                        m.sign_ext(V1, V1, l.tag_size);
-                        break;
-                    }
-                }
-                return;
-            }
-            _ => {}
-        }
-        let from = self.operand_type(x);
-        self.load_scalar(x, V1);
-        if from.kind == types::K_FLOAT && to.kind == types::K_FLOAT {
-            if from.f64 == to.f64 { return; }
-            m.fmov_to(F0, V1, from.f64);
-            m.float_conv(F0, F0, to.f64);
-            m.fmov_from(V1, F0, to.f64);
-        } else if from.kind == types::K_FLOAT {
-            m.fmov_to(F0, V1, from.f64);
-            let size = self.scalar_size(to);
-            if size == 8 {
-                m.float_to_int(V1, F0, is_signed(to), from.f64);
-                return;
-            }
-            m.float_to_int(V1, F0, true, from.f64);
-            let (lo, hi) = if is_signed(to) { (int_min(size), -int_min(size) - 1) } else { (0, (1i64 << (8 * size) as u32) - 1) };
-            m.mov_imm(V2, lo);
-            m.cmp(V1, V2);
-            m.select_reg(V1, V2, V1, LT);
-            m.mov_imm(V2, hi);
-            m.cmp(V1, V2);
-            m.select_reg(V1, V2, V1, GT);
-        } else if to.kind == types::K_FLOAT {
-            if is_signed(from) {
-                let s = self.scalar_size(from);
-                m.sign_ext(V1, V1, s);
-                m.int_to_float(F0, V1, true, to.f64);
-            } else {
-                m.int_to_float(F0, V1, false, to.f64);
-            }
-            m.fmov_from(V1, F0, to.f64);
-        } else {
-            if is_signed(from) {
-                let s = self.scalar_size(from);
-                m.sign_ext(V1, V1, s);
-            }
-        }
-    }
-
     // --- Terminators ---------------------------------------------------------------
-
-    fn term(&mut self, bi: usize, t: &Term) {
-        let m = self.m;
-        match t {
-            Term::Goto(target) => {
-                if *target != bi + 1 { m.jump(self.blocks[*target]); }
-            }
-            Term::Switch { x, ty, vals, targets, els } => {
-                let cty = self.conc(*ty);
-                self.load_scalar(x, V1);
-                if is_signed(cty) {
-                    let s = self.scalar_size(cty);
-                    m.sign_ext(V1, V1, s);
-                }
-                let mut i = 0;
-                while i < vals.len() {
-                    m.cmp_imm(V1, vals[i]);
-                    m.branch_if(EQ, self.blocks[targets[i]]);
-                    i += 1;
-                }
-                if *els != bi + 1 { m.jump(self.blocks[*els]); }
-            }
-            Term::Return => {
-                m.load(8, CTX, FP, SLOT_DEFERS);
-                let skip = m.new_label();
-                m.branch_zero(CTX, skip);
-                m.call(&self.g.sym_rundefers);
-                m.bind(skip);
-                let size = self.size(self.ltypes[0]);
-                if size > 0 {
-                    m.load(8, BASE, FP, SLOT_RET);
-                    if self.preg[0] >= 0 {
-                        self.store_promoted(&mir::local_place(0), size, BASE, 0);
-                    } else {
-                        self.local_addr(RA, 0);
-                        self.copy_mem(BASE, 0, RA, 0, size);
-                    }
-                }
-                for sv in self.saved.iter() { m.load(8, sv.0, FP, sv.1); }
-                m.ret();
-            }
-            Term::Unreachable => m.trap(),
-            Term::Assert { cond, msg, target, pos, bounds, len, index } => {
-                let c = self.opreg(cond, V1);
-                m.branch_non_zero(c, self.blocks[*target]);
-                self.assert_failed(msg, *pos, *bounds, len, index);
-            }
-            Term::Call { fn_op, args, dest, target, pos } => self.call(fn_op, args, dest, *target, *pos),
-            Term::None => {
-                self.g.errorf(`${self.f.name}: block without terminator`);
-            }
-        }
-    }
-
-    // The panic of a failed assert (its condition false).
-    fn assert_failed(&mut self, msg: &String, pos: Pos, bounds: bool, len: &Operand, index: &Operand) {
-        let m = self.m;
-        if bounds {
-            self.load_scalar(len, V1);
-            m.store(8, V1, SP, 0);
-            self.load_scalar(index, V1);
-            m.store(8, V1, SP, 8);
-            match self.f.file {
-                Some(file) => self.store_file_pos(16, file, pos),
-                None => self.store_file_line(16, "<unknown>", 0, 0),
-            }
-            self.call_runtime("panic_bounds");
-            m.trap();
-            return;
-        }
-        self.call_panic(msg.as_str(), pos);
-    }
 
     /// Sets LOC to the location passed to a callee.
     fn pass_loc(&mut self, pos: Pos) {
@@ -3126,134 +2044,6 @@ impl FnGen {
         }
         let l = self.g.loc(self.f.file, pos);
         self.m.adr_sym(LOC, &l);
-    }
-
-    /// Writes the arguments to the outgoing area. If thin_recv, the first
-    /// argument is a fat pointer of which only the data word is passed.
-    fn store_args(&mut self, args: &Vec<Operand>, thin_recv: bool) {
-        let mut off = 0i64;
-        let mut i = 0;
-        while i < args.len() {
-            if i == 0 && thin_recv {
-                self.load_scalar(&args[0], V1);
-                self.m.store(8, V1, SP, 0);
-                off = 8;
-                i += 1;
-                continue;
-            }
-            self.store_operand(&args[i], SP, off);
-            let at = self.operand_type(&args[i]);
-            off += round8(self.size(at));
-            i += 1;
-        }
-    }
-
-    fn call(&mut self, fn_op: &Operand, args: &Vec<Operand>, dest: &Place, target: i64, pos: Pos) {
-        let m = self.m;
-        let dt = self.place_type(dest);
-        let mut tgt: Option<&mut Target> = None;
-        let mut slot = -1i64;
-        if fn_op.kind == mir::OP_CONST && fn_op.cnst.unwrap().kind == mir::C_FN {
-            let (t, s) = self.g.p.site_target(self.inst, fn_op.cnst.unwrap());
-            tgt = Some(t);
-            slot = s;
-            if s < 0 && t.kind == codegen::T_INTRINSIC {
-                self.intrinsic(t, args, dest, target, pos, dt);
-                return;
-            }
-            if t.kind == codegen::T_INTRINSIC && t.intrinsic == "type_desc" {
-                // Shared code: the descriptor is in the dictionary.
-                m.load(8, V1, FP, SLOT_CTX);
-                m.load(8, V1, V1, 16 * s);
-                self.store_regs(dest, 8);
-                if target >= 0 { m.jump(self.blocks[target as usize]); } else { m.trap(); }
-                return;
-            }
-        }
-        match tgt {
-            None => {
-                let ft = self.operand_type(fn_op);
-                if ft.kind == types::K_FN && ft.abi == "C" {
-                    self.c_call(fn_op, args, dest, target, dt, "", true);
-                    return;
-                }
-                self.store_args(args, false);
-                self.load_val(fn_op, 16);
-                m.mov(BASE, V1);
-                m.mov(CTX, V2);
-                self.pass_loc(pos);
-                m.addr_of(RET, FP, self.res_off);
-                m.call_reg(BASE);
-            }
-            Some(t) => {
-                if slot >= 0 {
-                    self.store_args(args, false);
-                    m.load(8, BASE, FP, SLOT_CTX);
-                    m.load(8, CTX, BASE, 16 * slot + 8);
-                    m.load(8, BASE, BASE, 16 * slot);
-                    self.pass_loc(pos);
-                    m.addr_of(RET, FP, self.res_off);
-                    m.call_reg(BASE);
-                } else if t.kind == codegen::T_VIRTUAL {
-                    self.store_args(args, true);
-                    self.load_val(&args[0], 16);
-                    m.load(8, CTX, V2, (16 * t.method + 8) as i64);
-                    m.load(8, BASE, V2, (16 * t.method) as i64);
-                    self.pass_loc(pos);
-                    m.addr_of(RET, FP, self.res_off);
-                    m.call_reg(BASE);
-                } else {
-                    self.store_args(args, false);
-                    self.pass_loc(pos);
-                    m.addr_of(RET, FP, self.res_off);
-                    let i = t.inst.unwrap();
-                    m.adr_sym(CTX, &i.dict);
-                    m.call(&i.grp().sym);
-                }
-            }
-        }
-        self.after_call(dest, target, dt);
-    }
-
-    fn after_call(&mut self, dest: &Place, target: i64, dt: &Type) {
-        let m = self.m;
-        if target < 0 || dt.kind == types::K_NEVER {
-            m.trap();
-            return;
-        }
-        let size = self.size(dt);
-        if size > 0 {
-            if let Some(pr) = self.promoted(dest) {
-                if let Some(p2) = self.promoted2(dest) {
-                    m.load(8, pr, FP, self.res_off);
-                    m.load(8, p2, FP, self.res_off + 8);
-                } else {
-                    m.load(size, pr, FP, self.res_off);
-                }
-            } else {
-                let (b, o, _) = self.place_addr(dest);
-                self.copy_mem(b, o, FP, self.res_off, size);
-            }
-            self.write_barrier(dest);
-        }
-        m.jump(self.blocks[target as usize]);
-    }
-
-    /// Calls a C function (sym, or the C function pointer fn_op when via_fn)
-    /// with the platform's C convention.
-    fn c_call(&mut self, fn_op: &Operand, args: &Vec<Operand>, dest: &Place, target: i64, dt: &Type, sym: &str, via_fn: bool) {
-        let m = self.m;
-        if !self.c_call_body(fn_op, args, dt, sym, via_fn) { return; }
-        if target < 0 || dt.kind == types::K_NEVER {
-            m.trap();
-            return;
-        }
-        let size = self.size(dt);
-        if size > 0 {
-            self.store_regs(dest, size);
-            self.write_barrier(dest);
-        }
-        m.jump(self.blocks[target as usize]);
     }
 
     /// Makes a C call; the result (if any) is in V1. False if the call
@@ -3300,20 +2090,10 @@ impl FnGen {
         true
     }
 
-    /// Generates an inline intrinsic or a C call.
-    fn intrinsic(&mut self, t: &Target, args: &Vec<Operand>, dest: &Place, target: i64, pos: Pos, dt: &Type) {
-        let m = self.m;
-        let size = self.size(dt);
-        if !self.intrinsic_body(t, args, Some(dest), target, pos, dt) { return; }
-        self.store_regs(dest, size);
-        if size > 0 { self.write_barrier(dest); }
-        if target >= 0 { m.jump(self.blocks[target as usize]); } else { m.trap(); }
-    }
-
     /// An intrinsic's code: true if its result (if any) is then in V1 (and
     /// V2). Without dest (the SSA backend) C calls leave their result in V1
     /// and results in memory go to the result buffer.
-    fn intrinsic_body(&mut self, t: &Target, args: &Vec<Operand>, dest: Option<&Place>, target: i64, pos: Pos, dt: &Type) -> bool {
+    fn intrinsic_body(&mut self, t: &Target, args: &Vec<Operand>, target: i64, pos: Pos, dt: &Type) -> bool {
         let m = self.m;
         let size = self.size(dt);
         let name = t.intrinsic.as_str();
@@ -3324,19 +2104,10 @@ impl FnGen {
                 let fo = mir::copy(mir::local_place(0));
                 let decl = crate::types::collect::fn_decl(t.def);
                 self.nfixed = if decl.variadic { decl.params.len() as i64 } else { -1 };
-                match dest {
-                    Some(d) => {
-                        self.c_call(&fo, args, d, target, dt, s.as_str(), false);
-                        self.nfixed = -1;
-                        return false;
-                    }
-                    None => {
-                        let ok = self.c_call_body(&fo, args, dt, s.as_str(), false);
-                        self.nfixed = -1;
-                        if ok && (target < 0 || dt.kind == types::K_NEVER) { m.trap(); }
-                        return ok;
-                    }
-                }
+                let ok = self.c_call_body(&fo, args, dt, s.as_str(), false);
+                self.nfixed = -1;
+                if ok && (target < 0 || dt.kind == types::K_NEVER) { m.trap(); }
+                return ok;
             }
             "unreachable" => {
                 m.trap();
@@ -3525,17 +2296,8 @@ impl FnGen {
                     let l = self.g.loc(self.f.file, pos);
                     m.adr_sym(BASE, &l);
                 }
-                match dest {
-                    Some(d) => {
-                        self.place(d);
-                        self.copy_mem(RA, 0, BASE, 0, size);
-                        if target >= 0 { m.jump(self.blocks[target as usize]); }
-                    }
-                    None => {
-                        m.addr_of(RA, FP, self.res_off);
-                        self.copy_mem(RA, 0, BASE, 0, size);
-                    }
-                }
+                m.addr_of(RA, FP, self.res_off);
+                self.copy_mem(RA, 0, BASE, 0, size);
                 return false;
             }
             _ => {
@@ -3658,93 +2420,6 @@ fn copy_clone(t: &Type) -> bool {
     false
 }
 
-/// The source position of a statement, if it has one.
-fn stmt_pos(s: &Stmt) -> Pos {
-    if let Stmt::Assign { rv, .. } = s {
-        match rv {
-            Rvalue::Bin { pos, .. } | Rvalue::Un { pos, .. } => return *pos,
-            _ => {}
-        }
-    }
-    0
-}
-
-/// The source position of a terminator, if it has one.
-fn term_pos(t: &Term) -> Pos {
-    match t {
-        Term::Call { pos, .. } | Term::Assert { pos, .. } => *pos,
-        _ => 0,
-    }
-}
-
-// The positions and liveness of a function's locals (choose_registers).
-fn new_live() -> &mut Live {
-    &mut Live { lo: Vec::new(), hi: Vec::new(), bad: Vec::new(), words: 0, gen: Vec::new(), kill: Vec::new(), b: 0, pos: 0,
-        live_in: Vec::new(), live_out: Vec::new(), starts: Vec::new(), ends: Vec::new(), succ: Vec::new(), succ_at: Vec::new(),
-        order: Vec::new(), active: Vec::new() }
-}
-
-struct Live {
-    live_in: Vec<u64>,
-    live_out: Vec<u64>,
-    starts: Vec<i64>,
-    ends: Vec<i64>,
-    succ: Vec<usize>,
-    succ_at: Vec<usize>,
-    order: Vec<usize>,
-    active: Vec<usize>,
-    lo: Vec<i64>,
-    hi: Vec<i64>,
-    // Not a scalar, or its address is taken: stays in memory.
-    bad: Vec<bool>,
-    words: usize,
-    // Per block: the locals read before written (gen) and written (kill).
-    gen: Vec<u64>,
-    kill: Vec<u64>,
-    b: usize,
-    pos: i64,
-}
-
-impl Live {
-    fn touch_at(&mut self, l: usize, p: i64) {
-        if self.lo[l] < 0 || p < self.lo[l] { self.lo[l] = p; }
-        if p > self.hi[l] { self.hi[l] = p; }
-    }
-
-    fn touch(&mut self, l: usize) { let p = self.pos; self.touch_at(l, p); }
-
-    fn bit(&self, l: usize) -> (usize, u64) { (self.b * self.words + l / 64, 1u64 << (l % 64) as u32) }
-
-    fn use_(&mut self, l: usize) {
-        self.touch(l);
-        let (w, m) = self.bit(l);
-        if self.kill[w] & m == 0 { self.gen[w] = self.gen[w] | m; }
-    }
-
-    fn def(&mut self, l: usize) {
-        self.touch(l);
-        let (w, m) = self.bit(l);
-        self.kill[w] = self.kill[w] | m;
-    }
-
-    // A place read (or, def, written whole); as_ref: its address is used.
-    fn place(&mut self, pl: &Place, as_ref: bool, def: bool) {
-        for pr in pl.proj.iter() {
-            if pr.kind == mir::P_INDEX { self.use_(pr.index); }
-        }
-        if pl.proj.len() == 0 {
-            if as_ref { self.bad[pl.local] = true; }
-            if def && !as_ref { self.def(pl.local); } else { self.use_(pl.local); }
-        } else {
-            if pl.proj[0].kind != mir::P_DEREF { self.bad[pl.local] = true; }
-            self.use_(pl.local);
-        }
-    }
-
-    fn op(&mut self, x: &Operand) {
-        if x.kind == mir::OP_COPY { self.place(&x.place, false, false); }
-    }
-}
 
 fn invert(c: Cond) -> Cond {
     match c {
@@ -3758,83 +2433,6 @@ fn invert(c: Cond) -> Cond {
         GEU => LTU,
         LEU => GTU,
         _ => LEU,
-    }
-}
-
-// How many times each local appears in f (written or read, whole or in part).
-fn local_refs(f: &Func) -> Vec<u32> {
-    let mut n: Vec<u32> = Vec::new();
-    for _ in f.locals.iter() { n.push(0); }
-    for b in f.blocks.iter() {
-        for st in b.stmts.iter() {
-            match st {
-                Stmt::Assign { place, rv } => {
-                    ref_place(&mut n, place);
-                    match rv {
-                        Rvalue::Use(x) | Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => ref_op(&mut n, x),
-                        Rvalue::Ref { place: p, .. } | Rvalue::Discr(p) | Rvalue::Len(p) => ref_place(&mut n, p),
-                        Rvalue::Bin { x, y, .. } => {
-                            ref_op(&mut n, x);
-                            ref_op(&mut n, y);
-                        }
-                        Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { ref_op(&mut n, o); } }
-                    }
-                }
-                Stmt::SetDiscr { place, .. } => ref_place(&mut n, place),
-                Stmt::Box { local, .. } => { n[*local] += 1; }
-                Stmt::PushDefer { fn_op, args } => {
-                    ref_op(&mut n, fn_op);
-                    for a in args.iter() { ref_op(&mut n, a); }
-                }
-                Stmt::StorageLive(l) => { n[*l] += 1; }
-            }
-        }
-        match &b.term {
-            Term::Switch { x, .. } => ref_op(&mut n, x),
-            Term::Call { fn_op, args, dest, .. } => {
-                ref_op(&mut n, fn_op);
-                for a in args.iter() { ref_op(&mut n, a); }
-                ref_place(&mut n, dest);
-            }
-            Term::Assert { cond, len, index, .. } => {
-                ref_op(&mut n, cond);
-                ref_op(&mut n, len);
-                ref_op(&mut n, index);
-            }
-            Term::Return => { n[0] += 1; }
-            _ => {}
-        }
-    }
-    n
-}
-
-fn ref_place(n: &mut Vec<u32>, p: &Place) {
-    n[p.local] += 1;
-    for pr in p.proj.iter() { if pr.kind == mir::P_INDEX { n[pr.index] += 1; } }
-}
-
-fn ref_op(n: &mut Vec<u32>, x: &Operand) { if x.kind == mir::OP_COPY { ref_place(n, &x.place); } }
-
-// Whether b ends in `t = x cmp y` (integers, not 128-bit) and a switch with
-// one value on t, t appearing nowhere else.
-fn fused_compare(b: &mir::Block, refs: &Vec<u32>) -> bool {
-    if b.stmts.len() == 0 { return false; }
-    let (place, op, ty) = match &b.stmts[b.stmts.len() - 1] {
-        Stmt::Assign { place, rv: Rvalue::Bin { op, ty, .. } } => (place, *op, *ty),
-        _ => return false,
-    };
-    if place.proj.len() != 0 || refs[place.local] != 2 { return false; }
-    if !(op == mir::EQ || op == mir::NE || op == mir::LT || op == mir::LE || op == mir::GT || op == mir::GE) { return false; }
-    // Known integer-like types only (not a parameter that may be a float).
-    let k = ty.kind;
-    if !(k == types::K_INT || k == types::K_BOOL || k == types::K_CHAR) { return false; }
-    if k == types::K_INT && layout::int_size(ty.int) == 16 { return false; }
-    match &b.term {
-        Term::Switch { x, vals, .. } => {
-            vals.len() == 1 && (vals[0] == 0 || vals[0] == 1) && x.kind == mir::OP_COPY && x.place.local == place.local && x.place.proj.len() == 0
-        }
-        Term::Assert { cond, .. } => cond.kind == mir::OP_COPY && cond.place.local == place.local && cond.place.proj.len() == 0,
-        _ => false,
     }
 }
 
@@ -4757,7 +3355,7 @@ impl FnGen {
                 let mut off = 0i64;
                 let bargs = self.ssa_bridged(v, args, &mut ai, &mut off);
                 let dt = self.place_type(dest);
-                self.intrinsic_body(tg, &bargs, None, target, pos, dt);
+                self.intrinsic_body(tg, &bargs, target, pos, dt);
             }
             crate::ssa::OP_CLOSURE => {
                 let rv = match &v.aux { crate::ssa::Aux::Rv(rv) => *rv, _ => return };
