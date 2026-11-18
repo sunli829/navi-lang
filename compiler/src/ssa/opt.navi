@@ -210,22 +210,32 @@ pub fn prove(f: &mut Func, d: &dom::Dom) {
     let ch = children(f, d);
     // Known booleans: (value id, truth), a stack the walk unwinds.
     let mut facts: Vec<(u32, bool)> = Vec::new();
+    // Known unsigned orders (a, b, strict: a < b, else a <= b), unwound
+    // alongside.
+    let mut rel: Vec<(u32, u32, bool)> = Vec::new();
+    let mut rel_marks: Vec<usize> = Vec::new();
+    let low = lower_bounds(f);
     let mut changed = false;
     let mut stack: Vec<(&mut Block, usize, bool)> = Vec::new();
     stack.push((f.entry.unwrap(), 0, false));
     while let Some((b, mark, done)) = stack.pop() {
         if done {
             facts.truncate(mark);
+            let rm = rel_marks.pop().unwrap();
+            rel.truncate(rm);
             continue;
         }
         let m = facts.len();
         stack.push((b, m, true));
+        rel_marks.push(rel.len());
         // Entered from a branch only: its condition holds here.
         if b.preds.len() == 1 {
             let p = b.preds[0];
             if p.kind == B_IF && p.succs[0].id != p.succs[1].id {
                 let c = p.control.unwrap();
-                add_fact(&mut facts, c, p.succs[0].id == b.id);
+                let t = p.succs[0].id == b.id;
+                add_fact(&mut facts, c, t);
+                add_rel(&mut rel, c, t);
             }
         }
         if b.kind == B_IF {
@@ -234,6 +244,8 @@ pub fn prove(f: &mut Func, d: &dom::Dom) {
             for fc in facts.iter() {
                 if fc.0 == c.id { known = if fc.1 { 1 } else { 0 }; }
             }
+            // x < len from the orders known (bounds checks).
+            if known < 0 && c.op == OP_LT && c.aux_int & 2 == 0 && lt_known(&rel, &low, c.args[0], c.args[1]) { known = 1; }
             if known >= 0 {
                 // Keep the successor taken.
                 let drop = if known == 1 { 1 } else { 0 };
@@ -255,6 +267,69 @@ pub fn prove(f: &mut Func, d: &dom::Dom) {
         prune(f);
         copyelim(f);
     }
+}
+
+/// The unsigned order a branch on c tells (c is t).
+fn add_rel(rel: &mut Vec<(u32, u32, bool)>, c: &Value, t: bool) {
+    if c.aux_int & 2 != 0 || c.args.len() != 2 { return; }
+    let x = c.args[0].id;
+    let y = c.args[1].id;
+    if c.op == OP_LT {
+        if t { rel.push((x, y, true)); } else { rel.push((y, x, false)); }
+    } else if c.op == OP_LE {
+        if t { rel.push((x, y, false)); } else { rel.push((y, x, true)); }
+    }
+}
+
+// Whether a < b (or a <= b when !strict) directly.
+fn has_rel(rel: &Vec<(u32, u32, bool)>, a: u32, b: u32, strict: bool) -> bool {
+    for r in rel.iter() {
+        if r.0 == a && r.1 == b && (r.2 || !strict) { return true; }
+    }
+    false
+}
+
+/// Whether x < len (unsigned) follows: known, through one other value
+/// (x < y <= len, x <= y < len), or x = i - k with i < len and i >= k (an
+/// induction variable's start).
+fn lt_known(rel: &Vec<(u32, u32, bool)>, low: &Vec<i64>, x: &Value, len: &Value) -> bool {
+    if has_rel(rel, x.id, len.id, true) { return true; }
+    for r in rel.iter() {
+        if r.0 == x.id {
+            if r.2 && has_rel(rel, r.1, len.id, false) { return true; }
+            if !r.2 && has_rel(rel, r.1, len.id, true) { return true; }
+        }
+    }
+    if x.op == OP_SUB && x.args[1].op == OP_CONST && x.args[1].aux_int >= 1 {
+        let i = x.args[0];
+        let k = x.args[1].aux_int;
+        if low[i.id as usize] >= k && (has_rel(rel, i.id, len.id, true) || has_rel(rel, i.id, len.id, false)) { return true; }
+    }
+    false
+}
+
+/// By value: a lower bound of induction variables (phi(c0, phi + s) with
+/// c0 >= 0 a constant and s > 0: they only grow while the loop runs), -1
+/// for others.
+fn lower_bounds(f: &Func) -> Vec<i64> {
+    let mut low: Vec<i64> = Vec::new();
+    low.resize(f.values.len(), -1);
+    for b in f.blocks.iter() {
+        for v in b.values.iter() {
+            if v.op != OP_PHI || v.args.len() != 2 { continue; }
+            let mut c0 = -1i64;
+            let mut step = false;
+            for a in v.args.iter() {
+                if a.op == OP_CONST && a.aux_int >= 0 {
+                    c0 = a.aux_int;
+                } else if a.op == OP_ADD && a.args[0].id == v.id && a.args[1].op == OP_CONST && a.args[1].aux_int > 0 {
+                    step = true;
+                }
+            }
+            if c0 >= 0 && step { low[v.id as usize] = c0; }
+        }
+    }
+    low
 }
 
 /// Records that c is t, and what follows: not c is !t, and a comparison and
