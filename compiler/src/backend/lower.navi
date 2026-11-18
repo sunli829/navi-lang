@@ -130,9 +130,14 @@ pub struct Gen {
     /// Runtime symbols every function refers to (shared by relocations).
     sym_marking: String,
     sym_rundefers: String,
+    /// NAVI_SSACHECK: build and check every function's SSA form (2: also
+    /// report the ones not built); NAVI_SSADUMP: print the SSA form of the
+    /// functions whose names contain it.
+    ssa_check: i64,
+    ssa_dump: String,
     /// choose_registers' buffers, reused from one function to the next.
     live: &mut Live,
-    p: &mut Plan,
+    pub p: &mut Plan,
     o: &mut Object,
     m: &mut dyn Machine,
     tgt: TargetConv,
@@ -247,7 +252,9 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
         flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), main_ids: HashMap::new(), live: new_live(), cur_meta: Vec::new(), cur_masks: Vec::new(), cur_all: 0, ftab: Vec::new(), fmeta: Vec::new(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
         file_sym: HashMap::new(), floc_pos: HashMap::new(),
-        sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string() }
+        sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string(),
+        ssa_check: match std::env::var("NAVI_SSACHECK") { Ok(v) => if v == "2" { 2 } else if v == "3" { 3 } else { 1 }, Err(_) => 0 },
+        ssa_dump: match std::env::var("NAVI_SSADUMP") { Ok(v) => v, Err(_) => String::new() } }
 }
 
 /// Lowers the plan into a new object for arch, with a machine from new_m
@@ -342,6 +349,10 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
     g.gen_sched();
     g.gen_data();
     if g.errs.len() > 0 { return Err(g.errs.join("\n")); }
+    if g.ssa_check > 0 {
+        let (ok, not) = crate::backend::ssagen::counts();
+        eprintln(`ssa: ${ok} functions built, ${not} not`);
+    }
     Ok(g.o)
 }
 
@@ -528,7 +539,7 @@ impl Gen {
     }
 
     /// The layout of t (cached here; computed under the lock).
-    fn lay_of(&mut self, t: &Type) -> &mut Layout {
+    pub fn lay_of(&mut self, t: &Type) -> &mut Layout {
         if let Some(l) = self.lays.get(&t.id) { return *l; }
         let l = self.lay.of(t);
         self.lays.insert(t.id, l);
@@ -1198,13 +1209,13 @@ enum Stub {
 }
 
 /// Generates one function body.
-struct FnGen {
-    g: &mut Gen,
+pub struct FnGen {
+    pub g: &mut Gen,
     m: &mut dyn Machine,
     grp: &mut Group,
-    inst: &mut Inst,
-    f: &mut Func,
-    ltypes: Vec<&Type>,
+    pub inst: &mut Inst,
+    pub f: &mut Func,
+    pub ltypes: Vec<&Type>,
     /// FP-relative offsets of locals.
     loff: Vec<i64>,
     blocks: Vec<Label>,
@@ -1235,7 +1246,7 @@ struct FnGen {
 fn is_signed(t: &Type) -> bool { t.kind == types::K_INT && types::int_signed(t.int) }
 
 impl FnGen {
-    fn conc(&mut self, t: &Type) -> &Type {
+    pub fn conc(&mut self, t: &Type) -> &Type {
         if let Some(c) = self.concs.get(&t.id) { return *c; }
         let mut c = self.g.concrete(self.inst, t);
         if c.kind == types::K_OPAQUE {
@@ -1249,11 +1260,27 @@ impl FnGen {
         match t { Some(x) => Some(self.conc(x)), None => None }
     }
 
-    fn size(&mut self, t: &Type) -> i64 { self.g.size_of(Some(t)) }
+    pub fn size(&mut self, t: &Type) -> i64 { self.g.size_of(Some(t)) }
+
+    /// Builds and checks the SSA form (NAVI_SSACHECK, NAVI_SSADUMP).
+    fn ssa_check(&mut self) {
+        let dump = self.g.ssa_dump.len() > 0 && self.f.name.contains(self.g.ssa_dump.as_str());
+        match crate::backend::ssagen::build(self) {
+            Ok(sf) => {
+                crate::backend::ssagen::count(true);
+                let errs = if self.g.ssa_check == 3 { String::new() } else { crate::ssa::check::check(sf) };
+                if errs.len() > 0 { eprintln(`ssa ${self.f.name}: invalid:\n${errs}${sf.to_string()}`); } else if dump { eprintln(sf.to_string()); }
+            }
+            Err(why) => {
+                crate::backend::ssagen::count(false);
+                if dump || self.g.ssa_check == 2 { eprintln(`ssa ${self.f.name}: not built: ${why}`); }
+            }
+        }
+    }
 
     /// The first local passed on the stack (closures receive the
     /// environment in CTX).
-    fn first_arg(&self) -> usize { if self.f.closure { 2 } else { 1 } }
+    pub fn first_arg(&self) -> usize { if self.f.closure { 2 } else { 1 } }
 
     fn gen(&mut self) {
         let m = self.m;
@@ -1299,6 +1326,7 @@ impl FnGen {
         }
         // Registers for the most used scalar locals.
         self.choose_registers();
+        if self.g.ssa_check > 0 || self.g.ssa_dump.len() > 0 { self.ssa_check(); }
         // Save slots are 8-byte aligned: the collector scans aligned words.
         cur = (cur + 7) / 8 * 8;
         let mut k = 0;
@@ -1830,7 +1858,7 @@ impl FnGen {
         }
     }
 
-    fn field_of(&mut self, ty: &Type, variant: i64, field: usize) -> (i64, &Type) {
+    pub fn field_of(&mut self, ty: &Type, variant: i64, field: usize) -> (i64, &Type) {
         let l = self.g.lay_of(ty);
         if ty.kind == types::K_TUPLE { return (l.fields[field], ty.elems[field]); }
         if ty.kind == types::K_ADT {
@@ -1845,7 +1873,7 @@ impl FnGen {
         (0, ty)
     }
 
-    fn reveal(&mut self, t: &Type) -> &Type {
+    pub fn reveal(&mut self, t: &Type) -> &Type {
         if t.kind == types::K_OPAQUE {
             if let Some(h) = self.g.hidden_of(t) { return self.conc(h); }
         }
@@ -1853,7 +1881,7 @@ impl FnGen {
     }
 
     /// The type of a place (no code).
-    fn place_type(&mut self, pl: &Place) -> &Type {
+    pub fn place_type(&mut self, pl: &Place) -> &Type {
         let mut ty = self.ltypes[pl.local];
         let mut variant = -1i64;
         for pr in pl.proj.iter() {
@@ -1971,7 +1999,7 @@ impl FnGen {
 
     // --- Operands ----------------------------------------------------------------
 
-    fn operand_type(&mut self, op: &Operand) -> &Type {
+    pub fn operand_type(&mut self, op: &Operand) -> &Type {
         if op.kind == mir::OP_COPY { return self.place_type(&op.place); }
         self.conc(op.cnst.unwrap().ty.unwrap())
     }

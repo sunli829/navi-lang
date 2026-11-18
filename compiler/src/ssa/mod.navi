@@ -1,0 +1,458 @@
+//! The SSA form the backend optimizes and allocates registers on, after Go's
+//! cmd/compile/internal/ssa (see docs/ssa.md). A function is a list of
+//! blocks of values; a value is an operation on other values. The memory
+//! state is a value too: loads take one, stores and calls take one and make
+//! the next, so two loads with the same address and memory read the same.
+
+use crate::mir;
+use crate::syntax::source::Pos;
+use crate::types::Type;
+
+pub mod check;
+pub mod dom;
+
+/// The type of a value: its width and register class, and whether the
+/// collector must see it (PTR).
+pub type Ty = u8;
+pub const T_VOID: Ty = 0;
+pub const T_BOOL: Ty = 1;
+pub const T_I8: Ty = 2;
+pub const T_I16: Ty = 3;
+pub const T_I32: Ty = 4;
+pub const T_I64: Ty = 5;
+pub const T_F32: Ty = 6;
+pub const T_F64: Ty = 7;
+/// A pointer the collector follows (references and raw pointers).
+pub const T_PTR: Ty = 8;
+pub const T_MEM: Ty = 9;
+pub const T_FLAGS: Ty = 10;
+/// Two results (a value and the memory), taken apart with Select0/Select1.
+pub const T_TUPLE: Ty = 11;
+
+const TY_NAMES: [&str; 12] = ["void", "bool", "i8", "i16", "i32", "i64", "f32", "f64", "ptr", "mem", "flags", "tuple"];
+
+pub fn ty_name(t: Ty) -> &str { TY_NAMES[t as usize] }
+
+/// The size in bytes of a value of type t in memory.
+pub fn ty_size(t: Ty) -> i64 {
+    match t {
+        T_BOOL | T_I8 => 1,
+        T_I16 => 2,
+        T_I32 | T_F32 => 4,
+        T_I64 | T_F64 | T_PTR => 8,
+        _ => 0,
+    }
+}
+
+pub fn is_float(t: Ty) -> bool { t == T_F32 || t == T_F64 }
+
+pub type Op = u16;
+pub const OP_INVALID: Op = 0;
+/// The memory at entry.
+pub const OP_INITMEM: Op = 1;
+/// A word of an incoming argument: aux_int = local << 1 | word.
+pub const OP_ARG: Op = 2;
+/// A variable read before its definition in the block (construction only;
+/// aux_int = variable).
+pub const OP_FWDREF: Op = 3;
+pub const OP_PHI: Op = 4;
+pub const OP_COPY: Op = 5;
+/// An integer (or bool, or float bits) constant: aux_int.
+pub const OP_CONST: Op = 6;
+/// Word aux_int of a MIR constant that needs a symbol (strings, statics,
+/// function values).
+pub const OP_CONSTSYM: Op = 7;
+/// The frame address of a local kept in memory: aux_int = local.
+pub const OP_LOCALADDR: Op = 8;
+/// The address of the call result buffer.
+pub const OP_RESADDR: Op = 9;
+/// The address the caller wants the result at (from SLOT_RET).
+pub const OP_RETPTR: Op = 10;
+/// args[0] + aux_int.
+pub const OP_OFFPTR: Op = 11;
+/// args[0] + args[1] * aux_int.
+pub const OP_INDEXPTR: Op = 12;
+// Integer arithmetic on the type's width. aux_int bit 0: overflow checked
+// (panics at pos), bit 1: signed.
+pub const OP_ADD: Op = 13;
+pub const OP_SUB: Op = 14;
+pub const OP_MUL: Op = 15;
+pub const OP_DIV: Op = 16;
+pub const OP_REM: Op = 17;
+pub const OP_AND: Op = 18;
+pub const OP_OR: Op = 19;
+pub const OP_XOR: Op = 20;
+pub const OP_SHL: Op = 21;
+pub const OP_SHR: Op = 22;
+pub const OP_NEG: Op = 23;
+/// Bitwise not (bools: logical).
+pub const OP_NOT: Op = 24;
+// Comparisons (bool results); aux_int 1: signed. args[0] op args[1].
+pub const OP_EQ: Op = 25;
+pub const OP_NE: Op = 26;
+pub const OP_LT: Op = 27;
+pub const OP_LE: Op = 28;
+// Floating point (the type's width).
+pub const OP_FADD: Op = 29;
+pub const OP_FSUB: Op = 30;
+pub const OP_FMUL: Op = 31;
+pub const OP_FDIV: Op = 32;
+pub const OP_FREM: Op = 33;
+pub const OP_FNEG: Op = 34;
+pub const OP_FEQ: Op = 35;
+pub const OP_FNE: Op = 36;
+pub const OP_FLT: Op = 37;
+pub const OP_FLE: Op = 38;
+// Conversions; aux_int: the source's size (and for float ones bit 8:
+// signed integer side).
+pub const OP_SEXT: Op = 39;
+pub const OP_ZEXT: Op = 40;
+pub const OP_TRUNC: Op = 41;
+pub const OP_ITOF: Op = 42;
+pub const OP_FTOI: Op = 43;
+pub const OP_FCONV: Op = 44;
+/// Bits of a float as an integer and back (same width).
+pub const OP_FBITS: Op = 45;
+pub const OP_FFROMBITS: Op = 46;
+/// load args[0] (mem args[1]).
+pub const OP_LOAD: Op = 47;
+/// store args[1] at args[0] (mem args[2]); the value's type gives the size.
+pub const OP_STORE: Op = 48;
+/// copy aux_int bytes from args[1] to args[0] (mem args[2]).
+pub const OP_MOVE: Op = 49;
+/// zero aux_int bytes at args[0] (mem args[1]).
+pub const OP_ZERO: Op = 50;
+/// The write barrier after storing pointers into aux_int bytes at args[0]
+/// (mem args[1]).
+pub const OP_WB: Op = 51;
+/// The variant index of the enum (aux type) at args[0] (mem args[1]).
+pub const OP_DISCR: Op = 52;
+/// Sets the variant aux_int of the enum (aux type) at args[0] (mem
+/// args[1]).
+pub const OP_SETDISCR: Op = 53;
+/// A call (aux: the MIR call): args are the argument words or addresses,
+/// then the memory; makes the memory. The result is in the result buffer.
+pub const OP_CALL: Op = 54;
+/// A compiler intrinsic (aux: the MIR call): (value, mem).
+pub const OP_INTRINSIC: Op = 55;
+/// Allocates aux_int bytes (no pointers if aux type has none): (ptr, mem).
+pub const OP_ALLOC: Op = 56;
+/// A closure (aux: the MIR aggregate): args the captures, then mem;
+/// (env, mem). The code pointer is OP_CONSTSYM of the closure.
+pub const OP_CLOSURE: Op = 57;
+/// The code pointer of the closure (aux: the MIR aggregate).
+pub const OP_CLOSURECODE: Op = 58;
+/// The vtable of a MakeDyn (aux: the MIR statement).
+pub const OP_VTABLE: Op = 59;
+/// Registers a deferred call (aux: the MIR statement): args, mem -> mem.
+pub const OP_DEFER: Op = 60;
+/// Result aux_int of a tuple.
+pub const OP_SELECT: Op = 61;
+/// The same bits as another type (pointers and integers).
+pub const OP_RETYPE: Op = 62;
+/// Panics (aux_str message; for bounds checks args are len, index), then
+/// mem; ends an exit block.
+pub const OP_PANIC: Op = 63;
+/// The value of a const generic parameter (aux: the MIR constant).
+pub const OP_CONSTPARAM: Op = 64;
+/// Runs the defers and returns args (the result's words; none if the
+/// result is in its frame slot), then mem; ends a return block.
+pub const OP_RETURN: Op = 65;
+pub const NUM_OPS: usize = 66;
+
+const OP_NAMES: [&str; 66] = ["invalid", "InitMem", "Arg", "FwdRef", "Phi", "Copy", "Const", "ConstSym", "LocalAddr", "ResAddr", "RetPtr",
+    "OffPtr", "IndexPtr", "Add", "Sub", "Mul", "Div", "Rem", "And", "Or", "Xor", "Shl", "Shr", "Neg", "Not", "Eq", "Ne", "Lt", "Le",
+    "FAdd", "FSub", "FMul", "FDiv", "FRem", "FNeg", "FEq", "FNe", "FLt", "FLe", "SExt", "ZExt", "Trunc", "IToF", "FToI", "FConv",
+    "FBits", "FFromBits", "Load", "Store", "Move", "Zero", "WB", "Discr", "SetDiscr", "Call", "Intrinsic", "Alloc", "Closure",
+    "ClosureCode", "VTable", "Defer", "Select", "Retype", "Panic", "ConstParam", "Return"];
+
+pub fn op_name(op: Op) -> &str { OP_NAMES[op as usize] }
+
+/// Whether the op has an effect besides its result (kept when unused).
+pub fn has_effect(op: Op) -> bool {
+    op == OP_STORE || op == OP_MOVE || op == OP_ZERO || op == OP_WB || op == OP_SETDISCR || op == OP_CALL || op == OP_INTRINSIC
+        || op == OP_ALLOC || op == OP_CLOSURE || op == OP_DEFER || op == OP_PANIC || op == OP_INITMEM || op == OP_RETURN
+}
+
+/// Extra data of a value.
+pub enum Aux {
+    None,
+    Ty(&Type),
+    Cnst(&mir::Const),
+    Term(&mir::Term),
+    Stmt(&mir::Stmt),
+    Rv(&mir::Rvalue),
+    Str(String),
+}
+
+pub struct Value {
+    /// Index in Func.values.
+    pub id: u32,
+    pub op: Op,
+    pub ty: Ty,
+    pub args: Vec<&mut Value>,
+    pub aux_int: i64,
+    pub aux: Aux,
+    pub block: Option<&mut Block>,
+    /// The source position (calls, panics, line tables).
+    pub pos: Pos,
+    pub uses: i32,
+}
+
+pub type BlockKind = u8;
+/// One successor.
+pub const B_PLAIN: BlockKind = 0;
+/// Two successors: control true, false.
+pub const B_IF: BlockKind = 1;
+/// Returns (control: the memory).
+pub const B_RET: BlockKind = 2;
+/// No successors: after a panic or a call that never returns, or
+/// unreachable (control: the memory).
+pub const B_EXIT: BlockKind = 3;
+
+const BLOCK_NAMES: [&str; 4] = ["Plain", "If", "Ret", "Exit"];
+
+pub struct Block {
+    /// Index in Func.blocks.
+    pub id: u32,
+    pub kind: BlockKind,
+    /// In order (after scheduling, emission order).
+    pub values: Vec<&mut Value>,
+    pub succs: Vec<&mut Block>,
+    pub preds: Vec<&mut Block>,
+    pub control: Option<&mut Value>,
+    pub pos: Pos,
+}
+
+pub struct Func {
+    pub name: String,
+    pub blocks: Vec<&mut Block>,
+    /// Every value made, by id (removed ones stay with OP_INVALID).
+    pub values: Vec<&mut Value>,
+    pub entry: Option<&mut Block>,
+}
+
+pub fn new_func(name: String) -> &mut Func {
+    &mut Func { name, blocks: Vec::new(), values: Vec::new(), entry: None }
+}
+
+impl Func {
+    pub fn new_block(&mut self, kind: BlockKind) -> &mut Block {
+        let b = &mut Block { id: self.blocks.len() as u32, kind, values: Vec::new(), succs: Vec::new(), preds: Vec::new(), control: None, pos: 0 };
+        self.blocks.push(b);
+        b
+    }
+
+    /// A value not yet in a block.
+    pub fn new_value(&mut self, op: Op, ty: Ty, aux_int: i64) -> &mut Value {
+        let v = &mut Value { id: self.values.len() as u32, op, ty, args: Vec::new(), aux_int, aux: Aux::None, block: None, pos: 0, uses: 0 };
+        self.values.push(v);
+        v
+    }
+}
+
+impl Block {
+    /// Appends v.
+    pub fn add(&mut self, v: &mut Value) {
+        v.block = Some(self);
+        self.values.push(v);
+    }
+
+    pub fn add_succ(&mut self, s: &mut Block) {
+        self.succs.push(s);
+        s.preds.push(self);
+    }
+
+    pub fn set_control(&mut self, v: &mut Value) {
+        if let Some(c) = self.control { c.uses -= 1; }
+        v.uses += 1;
+        self.control = Some(v);
+    }
+}
+
+impl Value {
+    pub fn add_arg(&mut self, a: &mut Value) {
+        a.uses += 1;
+        self.args.push(a);
+    }
+
+    pub fn set_arg(&mut self, i: usize, a: &mut Value) {
+        self.args[i].uses -= 1;
+        a.uses += 1;
+        self.args[i] = a;
+    }
+
+    /// Makes v a copy of a (keeping its id; uses of v see a).
+    pub fn become_copy(&mut self, a: &mut Value) {
+        for x in self.args.iter() {
+            let a = *x;
+            a.uses -= 1;
+        }
+        self.args.clear();
+        self.op = OP_COPY;
+        self.aux_int = 0;
+        self.aux = Aux::None;
+        self.add_arg(a);
+    }
+}
+
+// --- Cleanup passes ------------------------------------------------------------
+
+/// The value v stands for after following copies.
+pub fn copy_source(v: &mut Value) -> &mut Value {
+    let mut w = v;
+    let mut n = 0;
+    while w.op == OP_COPY && n < 1000 {
+        w = w.args[0];
+        n += 1;
+    }
+    w
+}
+
+/// Removes phis whose inputs are all one value (or the phi itself) and
+/// copies (Go's phielim and copyelim): uses are pointed at the source.
+pub fn copyelim(f: &mut Func) {
+    // Phis made trivial by others becoming copies: repeat.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in f.blocks.iter() {
+            for vv in bb.values.iter() {
+                let v = *vv;
+                if v.op != OP_PHI { continue; }
+                let mut same: Option<&mut Value> = None;
+                let mut trivial = true;
+                for a in v.args.iter() {
+                    let s = copy_source(*a);
+                    if s.id == v.id { continue; }
+                    match same {
+                        Some(x) => if x.id != s.id { trivial = false; break; },
+                        None => same = Some(s),
+                    }
+                }
+                if trivial {
+                    if let Some(s) = same {
+                        v.become_copy(s);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        for vv in b.values.iter() {
+            let v = *vv;
+            let mut i = 0;
+            while i < v.args.len() {
+                let a = v.args[i];
+                if a.op == OP_COPY { v.set_arg(i, copy_source(a)); }
+                i += 1;
+            }
+        }
+        if let Some(c) = b.control {
+            if c.op == OP_COPY { b.set_control(copy_source(c)); }
+        }
+    }
+}
+
+/// Removes values nothing needs (Go's deadcode, without unreachable blocks:
+/// construction makes none).
+pub fn deadcode(f: &mut Func) {
+    let mut live: Vec<bool> = Vec::new();
+    live.resize(f.values.len(), false);
+    let mut work: Vec<&mut Value> = Vec::new();
+    for b in f.blocks.iter() {
+        if let Some(c) = b.control {
+            if !live[c.id as usize] {
+                live[c.id as usize] = true;
+                work.push(c);
+            }
+        }
+        for v in b.values.iter() {
+            if has_effect(v.op) && !live[v.id as usize] {
+                live[v.id as usize] = true;
+                work.push(*v);
+            }
+        }
+    }
+    while let Some(v) = work.pop() {
+        for a in v.args.iter() {
+            if !live[a.id as usize] {
+                live[a.id as usize] = true;
+                work.push(*a);
+            }
+        }
+    }
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        let mut kept = 0;
+        let mut i = 0;
+        while i < b.values.len() {
+            let v = b.values[i];
+            if live[v.id as usize] {
+                b.values[kept] = v;
+                kept += 1;
+            } else {
+                for aa in v.args.iter() {
+                    let a = *aa;
+                    a.uses -= 1;
+                }
+                v.args.clear();
+                v.op = OP_INVALID;
+                v.block = None;
+            }
+            i += 1;
+        }
+        b.values.truncate(kept);
+    }
+}
+
+// --- Printing --------------------------------------------------------------------
+
+pub fn value_string(v: &Value) -> String {
+    let mut s = `v${v.id} = ${op_name(v.op)} <${ty_name(v.ty)}>`;
+    if v.aux_int != 0 || v.op == OP_CONST { s.push_str(&` [${v.aux_int}]`); }
+    match &v.aux {
+        Aux::Ty(t) => s.push_str(&` {${*t}}`),
+        Aux::Cnst(c) => s.push_str(&` {${mir::operand_string(&mir::const_op(*c))}}`),
+        Aux::Str(m) => s.push_str(&` {${m}}`),
+        Aux::Term(_) => s.push_str(" {call}"),
+        Aux::Stmt(_) => s.push_str(" {stmt}"),
+        Aux::Rv(_) => s.push_str(" {rvalue}"),
+        Aux::None => {}
+    }
+    for a in v.args.iter() { s.push_str(&` v${a.id}`); }
+    s
+}
+
+impl Func {
+    pub fn to_string(&self) -> String {
+        let mut s = `ssa ${self.name}\n`;
+        for b in self.blocks.iter() {
+            s.push_str(&`  b${b.id} (${BLOCK_NAMES[b.kind as usize]})`);
+            if b.preds.len() > 0 {
+                s.push_str(" <-");
+                for p in b.preds.iter() { s.push_str(&` b${p.id}`); }
+            }
+            s.push('\n');
+            for v in b.values.iter() {
+                s.push_str("    ");
+                s.push_str(value_string(*v).as_str());
+                s.push('\n');
+            }
+            s.push_str("    ");
+            match b.kind {
+                B_PLAIN => s.push_str(&`goto b${b.succs[0].id}`),
+                B_IF => s.push_str(&`if v${b.control.unwrap().id} b${b.succs[0].id} b${b.succs[1].id}`),
+                B_RET => s.push_str(&`ret v${b.control.unwrap().id}`),
+                _ => {
+                    s.push_str("exit");
+                    if let Some(c) = b.control { s.push_str(&` v${c.id}`); }
+                }
+            }
+            s.push('\n');
+        }
+        s
+    }
+}

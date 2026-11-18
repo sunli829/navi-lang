@@ -1,0 +1,1194 @@
+//! Builds the SSA form of a function instance from its MIR (docs/ssa.md,
+//! after Go's ssagen). Locals used only whole (or as pointers to
+//! dereference) become variables: scalars one, fat pointers, closures and
+//! 128-bit integers two (their words). Every other local stays in its frame
+//! slot and is read and written through its address. Variables read before
+//! a block defines them get forward references, resolved at the end to the
+//! predecessors' values: copies for one predecessor, phis for several (Go's
+//! resolveFwdRefs).
+
+use std::collections::HashMap;
+use crate::mir::{self, Func as MFunc, Stmt, Term, Rvalue, Operand, Place};
+use crate::ssa::{self, Value, Block, Ty};
+use crate::types::{self, Type};
+use crate::layout;
+use crate::codegen;
+use crate::backend::lower::FnGen;
+
+/// How a type is held: not at all (zero-sized), in one or two words, or in
+/// memory.
+const C_NONE: u8 = 0;
+const C_ONE: u8 = 1;
+const C_TWO: u8 = 2;
+const C_MEM: u8 = 3;
+
+struct Class {
+    kind: u8,
+    t0: Ty,
+    t1: Ty,
+}
+
+struct Builder {
+    fg: &mut FnGen,
+    mf: &mut MFunc,
+    f: &mut ssa::Func,
+    /// By MIR local: its first variable (-1: in memory).
+    var_of: Vec<i32>,
+    /// By MIR local: a variable of two words.
+    pair: Vec<bool>,
+    /// By variable: its type. Variable 0 is the memory.
+    var_ty: Vec<Ty>,
+    /// The SSA block starting each MIR block.
+    blocks: Vec<&mut Block>,
+    cur: Option<&mut Block>,
+    /// The current block's definitions, by variable.
+    defs: Vec<Option<&mut Value>>,
+    touched: Vec<usize>,
+    /// Each block's last definitions: block id << 32 | variable.
+    end_defs: HashMap<u64, &mut Value>,
+    fwd: Vec<&mut Value>,
+    /// Why the function cannot be built ("" if it can).
+    fail: String,
+}
+
+static BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NOT_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts a function built (or not).
+pub fn count(ok: bool) {
+    if ok { BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } else { NOT_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+}
+
+/// The functions built and not built so far.
+pub fn counts() -> (usize, usize) {
+    (BUILT.load(std::sync::atomic::Ordering::Relaxed), NOT_BUILT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Builds f's SSA form; Err with the reason when it has something the SSA
+/// backend does not handle yet.
+pub fn build(fg: &mut FnGen) -> Result<&mut ssa::Func, String> {
+    let mf = fg.f;
+    let b = &mut Builder { fg, mf, f: ssa::new_func(mf.name.clone()), var_of: Vec::new(), pair: Vec::new(), var_ty: Vec::new(), blocks: Vec::new(), cur: None,
+        defs: Vec::new(), touched: Vec::new(), end_defs: HashMap::new(), fwd: Vec::new(), fail: String::new() };
+    b.run();
+    if b.fail.len() > 0 { return Err(b.fail.clone()); }
+    Ok(b.f)
+}
+
+impl Builder {
+    fn run(&mut self) {
+        let mf = self.mf;
+        self.choose_vars();
+        let entry = self.f.new_block(ssa::B_PLAIN);
+        self.f.entry = Some(entry);
+        let mut i = 0;
+        while i < mf.blocks.len() {
+            let blk = self.f.new_block(ssa::B_PLAIN);
+            self.blocks.push(blk);
+            i += 1;
+        }
+        // The entry: the memory and the arguments.
+        self.start(entry);
+        let mem = self.value0(ssa::OP_INITMEM, ssa::T_MEM, 0);
+        self.set_var(0, mem);
+        let first = self.fg.first_arg();
+        if self.mf.closure && self.var_of[1] >= 0 {
+            let env = self.value0(ssa::OP_ARG, ssa::T_PTR, 1 << 1);
+            self.set_var(self.var_of[1] as usize, env);
+        }
+        let mut a = first;
+        while a <= mf.nargs {
+            let v = self.var_of[a];
+            if v >= 0 {
+                let w0 = self.value0(ssa::OP_ARG, self.var_ty[v as usize], (a as i64) << 1);
+                self.set_var(v as usize, w0);
+                if self.two(a) {
+                    let w1 = self.value0(ssa::OP_ARG, self.var_ty[v as usize + 1], (a as i64) << 1 | 1);
+                    self.set_var(v as usize + 1, w1);
+                }
+            }
+            a += 1;
+        }
+        self.finish_plain(self.blocks[0]);
+        let mut bi = 0;
+        while bi < mf.blocks.len() {
+            if self.fail.len() > 0 { return; }
+            self.start(self.blocks[bi]);
+            let mb = mf.blocks[bi];
+            let mut si = 0;
+            while si < mb.stmts.len() {
+                self.stmt(bi, si, &mb.stmts[si]);
+                si += 1;
+            }
+            self.term(&mb.term);
+            bi += 1;
+        }
+        if self.fail.len() > 0 { return; }
+        self.prune();
+        self.resolve();
+        ssa::copyelim(self.f);
+        ssa::deadcode(self.f);
+        let mut i = 0;
+        while i < self.f.blocks.len() {
+            let b = self.f.blocks[i];
+            b.id = i as u32;
+            phis_first(b);
+            i += 1;
+        }
+    }
+
+    fn failf(&mut self, why: String) {
+        if self.fail.len() == 0 { self.fail = why; }
+    }
+
+    // --- Variables -------------------------------------------------------------
+
+    fn class(&mut self, t: &Type) -> Class {
+        let none = Class { kind: C_NONE, t0: ssa::T_VOID, t1: ssa::T_VOID };
+        match t.kind {
+            types::K_NEVER => none,
+            types::K_INT => {
+                let s = layout::int_size(t.int);
+                if s == 16 { return Class { kind: C_TWO, t0: ssa::T_I64, t1: ssa::T_I64 }; }
+                Class { kind: C_ONE, t0: int_ty(s), t1: ssa::T_VOID }
+            }
+            types::K_BOOL => Class { kind: C_ONE, t0: ssa::T_BOOL, t1: ssa::T_VOID },
+            types::K_CHAR => Class { kind: C_ONE, t0: ssa::T_I32, t1: ssa::T_VOID },
+            types::K_FLOAT => Class { kind: C_ONE, t0: if t.f64 { ssa::T_F64 } else { ssa::T_F32 }, t1: ssa::T_VOID },
+            types::K_REF | types::K_PTR => {
+                let el = self.fg.reveal(t.el());
+                if layout::is_fat(el) { Class { kind: C_TWO, t0: ssa::T_PTR, t1: ssa::T_I64 } } else { Class { kind: C_ONE, t0: ssa::T_PTR, t1: ssa::T_VOID } }
+            }
+            types::K_FN => {
+                if t.abi == "C" { Class { kind: C_ONE, t0: ssa::T_I64, t1: ssa::T_VOID } } else { Class { kind: C_TWO, t0: ssa::T_I64, t1: ssa::T_PTR } }
+            }
+            _ => {
+                if self.fg.size(t) == 0 { none } else { Class { kind: C_MEM, t0: ssa::T_VOID, t1: ssa::T_VOID } }
+            }
+        }
+    }
+
+    /// Whether a local is a variable of two words.
+    fn two(&self, local: usize) -> bool { self.pair[local] }
+
+    /// Which locals are variables: of a register class, never borrowed
+    /// whole, only projected through a dereference.
+    fn choose_vars(&mut self) {
+        let mf = self.mf;
+        let n = mf.locals.len();
+        let mut bad: Vec<bool> = Vec::new();
+        bad.resize(n, false);
+        for b in mf.blocks.iter() {
+            for st in b.stmts.iter() {
+                match st {
+                    Stmt::Assign { place, rv } => {
+                        mark_place(&mut bad, place, false);
+                        match rv {
+                            Rvalue::Use(x) | Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => mark_op(&mut bad, x),
+                            Rvalue::Bin { x, y, .. } => {
+                                mark_op(&mut bad, x);
+                                mark_op(&mut bad, y);
+                            }
+                            Rvalue::Ref { place: p, .. } => mark_place(&mut bad, p, true),
+                            Rvalue::Discr(p) | Rvalue::Len(p) => mark_place(&mut bad, p, false),
+                            Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { mark_op(&mut bad, o); } }
+                        }
+                    }
+                    Stmt::SetDiscr { place, .. } => mark_place(&mut bad, place, true),
+                    Stmt::PushDefer { fn_op, args } => {
+                        mark_op(&mut bad, fn_op);
+                        for a in args.iter() { mark_op(&mut bad, a); }
+                    }
+                    _ => {}
+                }
+            }
+            match &b.term {
+                Term::Switch { x, .. } => mark_op(&mut bad, x),
+                Term::Call { fn_op, args, dest, .. } => {
+                    mark_op(&mut bad, fn_op);
+                    for a in args.iter() { mark_op(&mut bad, a); }
+                    mark_place(&mut bad, dest, false);
+                }
+                Term::Assert { cond, len, index, .. } => {
+                    mark_op(&mut bad, cond);
+                    mark_op(&mut bad, len);
+                    mark_op(&mut bad, index);
+                }
+                _ => {}
+            }
+        }
+        self.var_ty.push(ssa::T_MEM);
+        let mut i = 0;
+        while i < n {
+            let t = self.fg.ltypes[i];
+            let c = self.class(t);
+            if !bad[i] && (c.kind == C_ONE || c.kind == C_TWO) {
+                self.var_of.push(self.var_ty.len() as i32);
+                self.pair.push(c.kind == C_TWO);
+                self.var_ty.push(c.t0);
+                if c.kind == C_TWO { self.var_ty.push(c.t1); }
+            } else {
+                self.var_of.push(-1);
+                self.pair.push(false);
+            }
+            i += 1;
+        }
+        self.defs.resize(self.var_ty.len(), None);
+    }
+
+    fn start(&mut self, b: &mut Block) {
+        self.cur = Some(b);
+        for v in self.touched.iter() { self.defs[*v] = None; }
+        self.touched.clear();
+    }
+
+    fn set_var(&mut self, v: usize, x: &mut Value) {
+        if self.defs[v].is_none() { self.touched.push(v); }
+        self.defs[v] = Some(x);
+    }
+
+    fn get_var(&mut self, v: usize) -> &mut Value {
+        if let Some(x) = self.defs[v] { return x; }
+        let b = self.cur.unwrap();
+        let x = self.fwdref(b, v);
+        self.set_var(v, x);
+        x
+    }
+
+    /// A forward reference to v at the start of b.
+    fn fwdref(&mut self, b: &mut Block, v: usize) -> &mut Value {
+        let x = self.f.new_value(ssa::OP_FWDREF, self.var_ty[v], v as i64);
+        x.block = Some(b);
+        b.values.insert(0, x);
+        self.fwd.push(x);
+        x
+    }
+
+    fn mem(&mut self) -> &mut Value { self.get_var(0) }
+
+    /// Ends the current block (its last definitions are kept).
+    fn end_block(&mut self) {
+        let b = self.cur.unwrap();
+        for v in self.touched.iter() {
+            let key = (b.id as u64) << 32 | *v as u64;
+            self.end_defs.insert(key, self.defs[*v].unwrap());
+        }
+        self.cur = None;
+    }
+
+    fn finish_plain(&mut self, to: &mut Block) {
+        let b = self.cur.unwrap();
+        b.kind = ssa::B_PLAIN;
+        b.add_succ(to);
+        self.end_block();
+    }
+
+    /// v's value at the end of b.
+    fn end_def(&mut self, b: &mut Block, v: usize) -> &mut Value {
+        let key = (b.id as u64) << 32 | v as u64;
+        if let Some(x) = self.end_defs.get(&key) { return *x; }
+        let x = self.fwdref(b, v);
+        self.end_defs.insert(key, x);
+        x
+    }
+
+    /// Drops the blocks the entry does not reach (no phis exist yet, so
+    /// predecessor lists may change).
+    fn prune(&mut self) {
+        let f = self.f;
+        let rpo = crate::ssa::dom::postorder_rev(f);
+        if rpo.len() == f.blocks.len() { return; }
+        let mut seen: Vec<bool> = Vec::new();
+        seen.resize(f.blocks.len(), false);
+        for b in rpo.iter() { seen[b.id as usize] = true; }
+        let mut kept: Vec<&mut Block> = Vec::new();
+        for bb in f.blocks.iter() {
+            let b = *bb;
+            if seen[b.id as usize] {
+                let mut ps: Vec<&mut Block> = Vec::new();
+                for p in b.preds.iter() { if seen[p.id as usize] { ps.push(*p); } }
+                b.preds = ps;
+                kept.push(b);
+                continue;
+            }
+            for vv in b.values.iter() {
+                let v = *vv;
+                for aa in v.args.iter() {
+                    let a = *aa;
+                    a.uses -= 1;
+                }
+                v.args.clear();
+                v.op = ssa::OP_INVALID;
+                v.block = None;
+            }
+            b.values.clear();
+            if let Some(c) = b.control { c.uses -= 1; }
+            b.control = None;
+        }
+        // Renumbered after resolve (end_defs are keyed by the ids).
+        f.blocks = kept;
+        // Forward references of dropped blocks are not resolved.
+        let mut fw: Vec<&mut Value> = Vec::new();
+        for x in self.fwd.iter() { if x.op == ssa::OP_FWDREF { fw.push(*x); } }
+        self.fwd = fw;
+    }
+
+    fn resolve(&mut self) {
+        let entry = self.f.entry.unwrap().id;
+        let mut i = 0;
+        while i < self.fwd.len() {
+            let x = self.fwd[i];
+            i += 1;
+            let b = x.block.unwrap();
+            let v = x.aux_int as usize;
+            if b.id == entry || b.preds.len() == 0 {
+                // Read before any assignment on some path: never used there.
+                x.op = ssa::OP_CONST;
+                x.aux_int = 0;
+                if x.ty == ssa::T_MEM { self.failf(`${self.mf.name}: memory read before the entry`); }
+                continue;
+            }
+            if b.preds.len() == 1 {
+                let p = b.preds[0];
+                let d = self.end_def(p, v);
+                x.op = ssa::OP_COPY;
+                x.aux_int = 0;
+                x.add_arg(d);
+                continue;
+            }
+            x.op = ssa::OP_PHI;
+            x.aux_int = 0;
+            let mut k = 0;
+            while k < b.preds.len() {
+                let d = self.end_def(b.preds[k], v);
+                x.add_arg(d);
+                k += 1;
+            }
+        }
+    }
+
+    // --- Values ------------------------------------------------------------------
+
+    fn value0(&mut self, op: ssa::Op, ty: Ty, aux_int: i64) -> &mut Value {
+        let v = self.f.new_value(op, ty, aux_int);
+        self.cur.unwrap().add(v);
+        v
+    }
+
+    fn value1(&mut self, op: ssa::Op, ty: Ty, aux_int: i64, a: &mut Value) -> &mut Value {
+        let v = self.value0(op, ty, aux_int);
+        v.add_arg(a);
+        v
+    }
+
+    fn value2(&mut self, op: ssa::Op, ty: Ty, aux_int: i64, a: &mut Value, b: &mut Value) -> &mut Value {
+        let v = self.value1(op, ty, aux_int, a);
+        v.add_arg(b);
+        v
+    }
+
+    fn cnst(&mut self, ty: Ty, x: i64) -> &mut Value { self.value0(ssa::OP_CONST, ty, x) }
+
+    fn off_ptr(&mut self, p: &mut Value, off: i64) -> &mut Value {
+        if off == 0 { return p; }
+        self.value1(ssa::OP_OFFPTR, ssa::T_PTR, off, p)
+    }
+
+    fn load(&mut self, ty: Ty, p: &mut Value) -> &mut Value {
+        let m = self.mem();
+        self.value2(ssa::OP_LOAD, ty, 0, p, m)
+    }
+
+    fn store(&mut self, p: &mut Value, x: &mut Value) {
+        let m = self.mem();
+        let s = self.value2(ssa::OP_STORE, ssa::T_MEM, 0, p, x);
+        s.add_arg(m);
+        self.set_var(0, s);
+    }
+
+    fn mem_op2(&mut self, op: ssa::Op, size: i64, a: &mut Value, b: &mut Value) {
+        let m = self.mem();
+        let s = self.value2(op, ssa::T_MEM, size, a, b);
+        s.add_arg(m);
+        self.set_var(0, s);
+    }
+
+    fn mem_op1(&mut self, op: ssa::Op, aux_int: i64, a: &mut Value) -> &mut Value {
+        let m = self.mem();
+        let s = self.value2(op, ssa::T_MEM, aux_int, a, m);
+        self.set_var(0, s);
+        s
+    }
+
+    // --- Places --------------------------------------------------------------------
+
+    /// The address of a place, its type and (unsized places) its metadata.
+    fn addr(&mut self, pl: &Place) -> (&mut Value, &Type, Option<&mut Value>) {
+        let mut ty = self.fg.ltypes[pl.local];
+        let mut start = 0;
+        let mut base: &mut Value;
+        let mut meta: Option<&mut Value> = None;
+        let v = self.var_of[pl.local];
+        if v >= 0 {
+            if pl.proj.len() == 0 || pl.proj[0].kind != mir::P_DEREF {
+                self.failf(`${self.mf.name}: address of variable _${pl.local}`);
+                return (self.cnst(ssa::T_PTR, 0), ty, None);
+            }
+            base = self.get_var(v as usize);
+            if self.two(pl.local) { meta = Some(self.get_var(v as usize + 1)); }
+            ty = self.fg.reveal(ty.el());
+            start = 1;
+        } else {
+            base = self.value0(ssa::OP_LOCALADDR, ssa::T_PTR, pl.local as i64);
+        }
+        let mut off = 0i64;
+        let mut variant = -1i64;
+        let mut i = start;
+        while i < pl.proj.len() {
+            let pr = &pl.proj[i];
+            i += 1;
+            match pr.kind {
+                mir::P_DEREF => {
+                    let el = self.fg.reveal(ty.el());
+                    let p = self.off_ptr(base, off);
+                    off = 0;
+                    if layout::is_fat(el) {
+                        let mp = self.off_ptr(p, 8);
+                        meta = Some(self.load(ssa::T_I64, mp));
+                    } else {
+                        meta = None;
+                    }
+                    base = self.load(ssa::T_PTR, p);
+                    ty = el;
+                    variant = -1;
+                }
+                mir::P_DOWNCAST => {
+                    variant = pr.variant as i64;
+                }
+                mir::P_FIELD => {
+                    let (fo, ft) = self.fg.field_of(ty, variant, pr.field);
+                    off += fo;
+                    ty = ft;
+                    variant = -1;
+                    meta = None;
+                }
+                _ => {
+                    let el = self.fg.reveal(ty.el());
+                    let p = self.off_ptr(base, off);
+                    off = 0;
+                    let ix = self.local_word(pr.index);
+                    let es = self.fg.size(el);
+                    base = self.value2(ssa::OP_INDEXPTR, ssa::T_PTR, es, p, ix);
+                    ty = el;
+                    variant = -1;
+                    meta = None;
+                }
+            }
+        }
+        (self.off_ptr(base, off), ty, meta)
+    }
+
+    /// The value of a usize local (indexes).
+    fn local_word(&mut self, l: usize) -> &mut Value {
+        let v = self.var_of[l];
+        if v >= 0 { return self.get_var(v as usize); }
+        let a = self.value0(ssa::OP_LOCALADDR, ssa::T_PTR, l as i64);
+        self.load(ssa::T_I64, a)
+    }
+
+    fn whole_var(&self, pl: &Place) -> i32 {
+        if pl.proj.len() == 0 { self.var_of[pl.local] } else { -1 }
+    }
+
+    // --- Operands ----------------------------------------------------------------
+
+    /// The words of a register-class operand.
+    fn operand(&mut self, op: &Operand, c: &Class) -> (&mut Value, Option<&mut Value>) {
+        if op.kind == mir::OP_COPY {
+            let v = self.whole_var(&op.place);
+            if v >= 0 {
+                let w0 = self.get_var(v as usize);
+                if c.kind == C_TWO { return (w0, Some(self.get_var(v as usize + 1))); }
+                return (w0, None);
+            }
+            let (a, _, _) = self.addr(&op.place);
+            let w0 = self.load(c.t0, a);
+            if c.kind == C_TWO {
+                let a1 = self.off_ptr(a, 8);
+                return (w0, Some(self.load(c.t1, a1)));
+            }
+            return (w0, None);
+        }
+        let k = op.cnst.unwrap();
+        match k.kind {
+            mir::C_INT | mir::C_CHAR | mir::C_BOOL => {
+                if c.kind == C_TWO {
+                    // A 128-bit integer: int is the low word; bytes, if set,
+                    // the high word.
+                    let mut h = 0i64;
+                    if k.bytes.len() == 8 {
+                        let mut i = 8;
+                        while i > 0 {
+                            i -= 1;
+                            h = h << 8 | k.bytes[i] as i64;
+                        }
+                    }
+                    let lo = self.cnst(ssa::T_I64, k.int);
+                    return (lo, Some(self.cnst(ssa::T_I64, h)));
+                }
+                (self.cnst(c.t0, canon(c.t0, k.int)), None)
+            }
+            mir::C_FLOAT => {
+                let bits = if c.t0 == ssa::T_F32 { (k.float as f32).to_bits() as i64 } else { k.float.to_bits() as i64 };
+                (self.cnst(c.t0, bits), None)
+            }
+            mir::C_STR | mir::C_BYTES | mir::C_FN | mir::C_STATIC => {
+                let w0 = self.value0(ssa::OP_CONSTSYM, c.t0, 0);
+                w0.aux = ssa::Aux::Cnst(k);
+                if c.kind == C_TWO {
+                    if k.kind == mir::C_STR || k.kind == mir::C_BYTES { return (w0, Some(self.cnst(ssa::T_I64, k.bytes.len() as i64))); }
+                    let w1 = self.value0(ssa::OP_CONSTSYM, c.t1, 1);
+                    w1.aux = ssa::Aux::Cnst(k);
+                    return (w0, Some(w1));
+                }
+                (w0, None)
+            }
+            mir::C_PARAM => {
+                let v = self.value0(ssa::OP_CONSTPARAM, c.t0, 0);
+                v.aux = ssa::Aux::Cnst(k);
+                (v, None)
+            }
+            _ => {
+                let w0 = self.cnst(c.t0, 0);
+                if c.kind == C_TWO { return (w0, Some(self.cnst(c.t1, 0))); }
+                (w0, None)
+            }
+        }
+    }
+
+    fn op_type(&mut self, op: &Operand) -> &Type { self.fg.operand_type(op) }
+
+    /// Stores the operand of type t at p (any class).
+    fn store_operand(&mut self, p: &mut Value, op: &Operand, t: &Type) {
+        let c = self.class(t);
+        match c.kind {
+            C_NONE => {}
+            C_MEM => {
+                let size = self.fg.size(t);
+                if op.kind == mir::OP_COPY {
+                    let (src, _, _) = self.addr(&op.place);
+                    self.mem_op2(ssa::OP_MOVE, size, p, src);
+                } else {
+                    let k = op.cnst.unwrap().kind;
+                    if k == mir::C_ZERO || k == mir::C_UNIT {
+                        self.mem_op1(ssa::OP_ZERO, size, p);
+                    } else {
+                        self.failf(`${self.mf.name}: constant of ${t} in memory`);
+                    }
+                }
+            }
+            _ => {
+                let (w0, w1) = self.operand(op, &c);
+                self.store(p, w0);
+                if let Some(x) = w1 {
+                    let p1 = self.off_ptr(p, 8);
+                    self.store(p1, x);
+                }
+            }
+        }
+    }
+
+    /// Assigns words to a place.
+    fn assign_words(&mut self, pl: &Place, c: &Class, w0: &mut Value, w1: Option<&mut Value>) {
+        let v = self.whole_var(pl);
+        if v >= 0 {
+            self.set_var(v as usize, w0);
+            if let Some(x) = w1 { self.set_var(v as usize + 1, x); }
+            return;
+        }
+        let (p, _, _) = self.addr(pl);
+        self.store(p, w0);
+        if let Some(x) = w1 {
+            let p1 = self.off_ptr(p, 8);
+            self.store(p1, x);
+        }
+        let _ = c;
+    }
+
+    /// The write barrier after writing a place that may be in the heap.
+    fn barrier(&mut self, pl: &Place) {
+        let mut heap = false;
+        for pj in pl.proj.iter() {
+            if pj.kind == mir::P_DEREF { heap = true; }
+        }
+        if !heap { return; }
+        let ty = self.fg.place_type(pl);
+        if ty.kind == types::K_NEVER { return; }
+        let l = self.fg.g.lay_of(ty);
+        if l.ptrs.len() == 0 || l.unsized { return; }
+        let (p, _, _) = self.addr(pl);
+        self.mem_op1(ssa::OP_WB, l.size, p);
+    }
+
+    // --- Statements --------------------------------------------------------------
+
+    fn stmt(&mut self, bi: usize, si: usize, st: &Stmt) {
+        match st {
+            Stmt::Assign { place, rv } => {
+                self.assign(bi, si, place, rv);
+                self.barrier(place);
+            }
+            Stmt::SetDiscr { place, variant } => {
+                let (p, ty, _) = self.addr(place);
+                let s = self.mem_op1(ssa::OP_SETDISCR, *variant as i64, p);
+                s.aux = ssa::Aux::Ty(ty);
+            }
+            Stmt::Box { local, ty } => {
+                let ct = self.fg.conc(*ty);
+                let size = self.fg.g.lay_of(ct).size;
+                let m = self.mem();
+                let a = self.value1(ssa::OP_ALLOC, ssa::T_TUPLE, size, m);
+                a.aux = ssa::Aux::Ty(ct);
+                let p = self.value1(ssa::OP_SELECT, ssa::T_PTR, 0, a);
+                let m2 = self.value1(ssa::OP_SELECT, ssa::T_MEM, 1, a);
+                self.set_var(0, m2);
+                let c = Class { kind: C_ONE, t0: ssa::T_PTR, t1: ssa::T_VOID };
+                self.assign_words(&mir::local_place(*local), &c, p, None);
+            }
+            Stmt::PushDefer { fn_op, args } => {
+                let d = self.f.new_value(ssa::OP_DEFER, ssa::T_MEM, 0);
+                d.aux = ssa::Aux::Stmt(st);
+                self.args_into(d, fn_op, args);
+                let m = self.mem();
+                d.add_arg(m);
+                self.cur.unwrap().add(d);
+                self.set_var(0, d);
+            }
+            _ => {}
+        }
+    }
+
+    /// Adds the call arguments to v: the words of register-class ones, the
+    /// addresses of ones in memory (constants in memory: a zero word).
+    fn args_into(&mut self, v: &mut Value, fn_op: &Operand, args: &Vec<Operand>) {
+        // The callee, unless it is a constant.
+        if fn_op.kind == mir::OP_COPY {
+            let t = self.op_type(fn_op);
+            let c = self.class(t);
+            self.word_args(v, fn_op, &c);
+        }
+        for a in args.iter() {
+            let t = self.op_type(a);
+            let c = self.class(t);
+            self.word_args(v, a, &c);
+        }
+    }
+
+    fn word_args(&mut self, v: &mut Value, a: &Operand, c: &Class) {
+        match c.kind {
+            C_NONE => {}
+            C_MEM => {
+                if a.kind == mir::OP_COPY {
+                    let (p, _, _) = self.addr(&a.place);
+                    v.add_arg(p);
+                } else {
+                    let z = self.cnst(ssa::T_PTR, 0);
+                    v.add_arg(z);
+                }
+            }
+            _ => {
+                let (w0, w1) = self.operand(a, c);
+                v.add_arg(w0);
+                if let Some(x) = w1 { v.add_arg(x); }
+            }
+        }
+    }
+
+    fn assign(&mut self, bi: usize, si: usize, place: &Place, rv: &Rvalue) {
+        let dt = self.fg.place_type(place);
+        if dt.kind == types::K_NEVER { return; }
+        let c = self.class(dt);
+        if c.kind == C_NONE { return; }
+        match rv {
+            Rvalue::Use(x) => {
+                if c.kind == C_MEM {
+                    let (p, _, _) = self.addr(place);
+                    self.store_operand(p, x, dt);
+                    return;
+                }
+                let (w0, w1) = self.operand(x, &c);
+                self.assign_words(place, &c, w0, w1);
+            }
+            Rvalue::Ref { place: src, .. } => {
+                let (p, pt, meta) = self.addr(src);
+                if layout::is_fat(pt) {
+                    match meta {
+                        Some(m) => self.assign_words(place, &c, p, Some(m)),
+                        None => {
+                            // An array behind the pointer: its length.
+                            self.failf(`${self.mf.name}: reference to an unsized place without metadata`);
+                        }
+                    }
+                } else {
+                    self.assign_words(place, &c, p, None);
+                }
+            }
+            Rvalue::Bin { op, x, y, ty, pos } => {
+                let r = self.bin(*op, x, y, *ty, *pos, &c);
+                self.assign_words(place, &c, r, None);
+            }
+            Rvalue::Un { op, x, ty, pos } => {
+                let t = self.fg.conc(*ty);
+                let xc = self.class(t);
+                let (a, _) = self.operand(x, &xc);
+                let r = if t.kind == types::K_FLOAT {
+                    self.value1(ssa::OP_FNEG, c.t0, 0, a)
+                } else if *op == mir::NOT || t.kind == types::K_BOOL {
+                    self.value1(ssa::OP_NOT, c.t0, 0, a)
+                } else {
+                    let chk = if is_signed(t) { 3 } else { 0 };
+                    let v = self.value1(ssa::OP_NEG, c.t0, chk, a);
+                    v.pos = *pos;
+                    v
+                };
+                self.assign_words(place, &c, r, None);
+            }
+            Rvalue::Cast { kind, x, from, .. } => {
+                let ft = self.fg.conc(*from);
+                self.cast(*kind, x, ft, dt, place, &c);
+            }
+            Rvalue::Aggregate { kind, ty, variant, ops, closure } => {
+                if *kind == mir::AGG_CLOSURE {
+                    let cl = self.f.new_value(ssa::OP_CLOSURE, ssa::T_TUPLE, 0);
+                    cl.aux = ssa::Aux::Rv(rv);
+                    for o in ops.iter() {
+                        let t = self.op_type(o);
+                        let oc = self.class(t);
+                        self.word_args(cl, o, &oc);
+                    }
+                    let m = self.mem();
+                    cl.add_arg(m);
+                    self.cur.unwrap().add(cl);
+                    let env = self.value1(ssa::OP_SELECT, ssa::T_PTR, 0, cl);
+                    let m2 = self.value1(ssa::OP_SELECT, ssa::T_MEM, 1, cl);
+                    self.set_var(0, m2);
+                    let code = self.value0(ssa::OP_CLOSURECODE, ssa::T_I64, 0);
+                    code.aux = ssa::Aux::Rv(rv);
+                    let _ = closure;
+                    self.assign_words(place, &c, code, Some(env));
+                    return;
+                }
+                if c.kind != C_MEM {
+                    self.failf(`${self.mf.name}: aggregate in a variable`);
+                    return;
+                }
+                let (p, _, _) = self.addr(place);
+                let aty = self.fg.conc(*ty);
+                let l = self.fg.g.lay_of(aty);
+                if *kind == mir::AGG_TUPLE {
+                    let mut i = 0;
+                    while i < ops.len() {
+                        let q = self.off_ptr(p, l.fields[i]);
+                        let t = self.op_type(&ops[i]);
+                        self.store_operand(q, &ops[i], t);
+                        i += 1;
+                    }
+                } else if *kind == mir::AGG_ARRAY {
+                    if ops.len() > 0 {
+                        let stride = l.size / ops.len() as i64;
+                        let mut i = 0;
+                        while i < ops.len() {
+                            let q = self.off_ptr(p, i as i64 * stride);
+                            let t = self.op_type(&ops[i]);
+                            self.store_operand(q, &ops[i], t);
+                            i += 1;
+                        }
+                    }
+                } else {
+                    let is_enum = self.fg.g.p.info.adts[&aty.d().id].is_enum;
+                    let mut i = 0;
+                    while i < ops.len() {
+                        let fo = if is_enum { l.variants[*variant][i] } else { l.fields[i] };
+                        let q = self.off_ptr(p, fo);
+                        let t = self.op_type(&ops[i]);
+                        self.store_operand(q, &ops[i], t);
+                        i += 1;
+                    }
+                    if is_enum {
+                        let s = self.mem_op1(ssa::OP_SETDISCR, *variant as i64, p);
+                        s.aux = ssa::Aux::Ty(aty);
+                    }
+                }
+            }
+            Rvalue::Discr(p) => {
+                let (a, ty, _) = self.addr(p);
+                let m = self.mem();
+                let d = self.value2(ssa::OP_DISCR, c.t0, 0, a, m);
+                d.aux = ssa::Aux::Ty(ty);
+                self.assign_words(place, &c, d, None);
+            }
+            Rvalue::Len(p) => {
+                let pt = self.fg.place_type(p);
+                if pt.kind == types::K_ARRAY {
+                    let n = self.cnst(c.t0, pt.len);
+                    self.assign_words(place, &c, n, None);
+                    return;
+                }
+                let (_, _, meta) = self.addr(p);
+                match meta {
+                    Some(m) => self.assign_words(place, &c, m, None),
+                    None => self.failf(`${self.mf.name}: length without metadata`),
+                }
+            }
+            Rvalue::Unsize { x, len, .. } => {
+                let n = if *len >= 0 { *len } else { self.op_type(x).el().len };
+                let pc = Class { kind: C_ONE, t0: ssa::T_PTR, t1: ssa::T_VOID };
+                let (a, _) = self.operand(x, &pc);
+                let l = self.cnst(ssa::T_I64, n);
+                self.assign_words(place, &c, a, Some(l));
+            }
+            Rvalue::MakeDyn { x, .. } => {
+                let pc = Class { kind: C_ONE, t0: ssa::T_PTR, t1: ssa::T_VOID };
+                let (a, _) = self.operand(x, &pc);
+                let vt = self.value0(ssa::OP_VTABLE, ssa::T_I64, (bi as i64) << 32 | si as i64);
+                vt.aux = ssa::Aux::Rv(rv);
+                self.assign_words(place, &c, a, Some(vt));
+            }
+        }
+    }
+
+    fn bin(&mut self, op: mir::BinOp, x: &Operand, y: &Operand, ty0: &Type, pos: crate::syntax::source::Pos, dc: &Class) -> &mut Value {
+        let t = self.fg.conc(ty0);
+        if op == mir::OFFSET {
+            let pc = Class { kind: C_ONE, t0: ssa::T_PTR, t1: ssa::T_VOID };
+            let (p, _) = self.operand(x, &pc);
+            let ic = Class { kind: C_ONE, t0: ssa::T_I64, t1: ssa::T_VOID };
+            let (n, _) = self.operand(y, &ic);
+            let pt = self.op_type(x);
+            let el = self.fg.reveal(pt.el());
+            let es = self.fg.size(el);
+            return self.value2(ssa::OP_INDEXPTR, ssa::T_PTR, es, p, n);
+        }
+        if t.kind == types::K_INT && layout::int_size(t.int) == 16 {
+            self.failf(`${self.mf.name}: 128-bit operation`);
+            return self.cnst(dc.t0, 0);
+        }
+        let xc = self.class(t);
+        let (a, _) = self.operand(x, &xc);
+        // Shift amounts have their own type.
+        let yt = self.op_type(y);
+        let yc = self.class(yt);
+        let (b, _) = self.operand(y, &yc);
+        let signed = if is_signed(t) { 2 } else { 0 };
+        if t.kind == types::K_FLOAT {
+            let fop = match op {
+                mir::ADD => ssa::OP_FADD,
+                mir::SUB => ssa::OP_FSUB,
+                mir::MUL => ssa::OP_FMUL,
+                mir::DIV => ssa::OP_FDIV,
+                mir::REM => ssa::OP_FREM,
+                mir::EQ => ssa::OP_FEQ,
+                mir::NE => ssa::OP_FNE,
+                mir::LT | mir::GT => ssa::OP_FLT,
+                _ => ssa::OP_FLE,
+            };
+            if op == mir::GT || op == mir::GE { return self.value2(fop, dc.t0, 0, b, a); }
+            return self.value2(fop, dc.t0, 0, a, b);
+        }
+        let (iop, aux) = match op {
+            mir::ADD => (ssa::OP_ADD, signed | 1),
+            mir::SUB => (ssa::OP_SUB, signed | 1),
+            mir::MUL => (ssa::OP_MUL, signed | 1),
+            mir::DIV => (ssa::OP_DIV, signed | 1),
+            mir::REM => (ssa::OP_REM, signed | 1),
+            mir::BIT_AND => (ssa::OP_AND, 0),
+            mir::BIT_OR => (ssa::OP_OR, 0),
+            mir::BIT_XOR => (ssa::OP_XOR, 0),
+            mir::SHL => (ssa::OP_SHL, signed | 1),
+            mir::SHR => (ssa::OP_SHR, signed | 1),
+            mir::EQ => (ssa::OP_EQ, 0),
+            mir::NE => (ssa::OP_NE, 0),
+            mir::LT | mir::GT => (ssa::OP_LT, signed),
+            _ => (ssa::OP_LE, signed),
+        };
+        let v = if op == mir::GT || op == mir::GE { self.value2(iop, dc.t0, aux, b, a) } else { self.value2(iop, dc.t0, aux, a, b) };
+        v.pos = pos;
+        v
+    }
+
+    fn cast(&mut self, kind: mir::CastKind, x: &Operand, from: &Type, to: &Type, place: &Place, dc: &Class) {
+        let fc = self.class(from);
+        match kind {
+            mir::CAST_PTR => {
+                let (w0, w1) = self.operand(x, &fc);
+                if dc.kind == C_TWO {
+                    match w1 {
+                        Some(m) => self.assign_words(place, dc, w0, Some(m)),
+                        None => self.failf(`${self.mf.name}: cast of a thin pointer to a fat one`),
+                    }
+                } else {
+                    self.assign_words(place, dc, w0, None);
+                }
+                return;
+            }
+            mir::CAST_PTR_INT | mir::CAST_FN_PTR | mir::CAST_INT_PTR => {
+                let (w0, _) = self.operand(x, &fc);
+                let r = if w0.ty == dc.t0 { w0 } else { self.value1(ssa::OP_RETYPE, dc.t0, 0, w0) };
+                self.assign_words(place, dc, r, None);
+                return;
+            }
+            mir::CAST_ENUM => {
+                if x.kind != mir::OP_COPY || fc.kind != C_MEM {
+                    let (w0, _) = self.operand(x, &fc);
+                    let r = self.int_conv(w0, false, ty_bytes(w0.ty), dc.t0);
+                    self.assign_words(place, dc, r, None);
+                    return;
+                }
+                let (p, _, _) = self.addr(&x.place);
+                let l = self.fg.g.lay_of(from);
+                let vs = self.fg.g.p.info.adts[&from.d().id].variants;
+                if l.tag != layout::TAG_INT {
+                    let d = if vs.len() > 0 { vs[0].discr } else { 0 };
+                    let r = self.cnst(dc.t0, canon(dc.t0, d));
+                    self.assign_words(place, dc, r, None);
+                    return;
+                }
+                let tp = self.off_ptr(p, l.tag_off);
+                let tag = self.load(int_ty(l.tag_size), tp);
+                let mut neg = false;
+                for v in vs.iter() { if v.discr < 0 { neg = true; } }
+                let r = self.int_conv(tag, neg, l.tag_size, dc.t0);
+                self.assign_words(place, dc, r, None);
+                return;
+            }
+            _ => {}
+        }
+        let (a, _) = self.operand(x, &fc);
+        let r = if from.kind == types::K_FLOAT && to.kind == types::K_FLOAT {
+            if from.f64 == to.f64 { a } else { self.value1(ssa::OP_FCONV, dc.t0, 0, a) }
+        } else if from.kind == types::K_FLOAT {
+            self.value1(ssa::OP_FTOI, dc.t0, if is_signed(to) { 256 } else { 0 }, a)
+        } else if to.kind == types::K_FLOAT {
+            self.value1(ssa::OP_ITOF, dc.t0, if is_signed(from) { 256 | ty_bytes(a.ty) } else { ty_bytes(a.ty) }, a)
+        } else {
+            self.int_conv(a, is_signed(from), ty_bytes(a.ty), dc.t0)
+        };
+        self.assign_words(place, dc, r, None);
+    }
+
+    /// An integer of size bytes (signed or not) as type t.
+    fn int_conv(&mut self, a: &mut Value, signed: bool, size: i64, t: Ty) -> &mut Value {
+        let ts = ty_bytes(t);
+        if ts == size {
+            if a.ty == t { return a; }
+            return self.value1(ssa::OP_RETYPE, t, 0, a);
+        }
+        if ts < size { return self.value1(ssa::OP_TRUNC, t, size, a); }
+        if signed { return self.value1(ssa::OP_SEXT, t, size, a); }
+        self.value1(ssa::OP_ZEXT, t, size, a)
+    }
+
+    // --- Terminators ---------------------------------------------------------------
+
+    fn term(&mut self, t: &Term) {
+        match t {
+            Term::Goto(target) => self.finish_plain(self.blocks[*target]),
+            Term::Switch { x, ty, vals, targets, els } => {
+                let st = self.fg.conc(*ty);
+                let xc = self.class(st);
+                let (v, _) = self.operand(x, &xc);
+                if vals.len() == 1 && (vals[0] == 0 || vals[0] == 1) && v.ty == ssa::T_BOOL {
+                    let (yes, no) = if vals[0] == 1 { (self.blocks[targets[0]], self.blocks[*els]) } else { (self.blocks[*els], self.blocks[targets[0]]) };
+                    self.finish_if(v, yes, no);
+                    return;
+                }
+                let mut i = 0;
+                while i < vals.len() {
+                    let k = self.cnst(v.ty, canon(v.ty, vals[i]));
+                    let c = self.value2(ssa::OP_EQ, ssa::T_BOOL, 0, v, k);
+                    let next = if i + 1 < vals.len() { self.f.new_block(ssa::B_PLAIN) } else { self.blocks[*els] };
+                    self.finish_if(c, self.blocks[targets[i]], next);
+                    if i + 1 < vals.len() { self.start(next); }
+                    i += 1;
+                }
+                if vals.len() == 0 { self.finish_plain(self.blocks[*els]); }
+            }
+            Term::Return => {
+                let r = self.f.new_value(ssa::OP_RETURN, ssa::T_MEM, 0);
+                let v = self.var_of[0];
+                if v >= 0 {
+                    r.add_arg(self.get_var(v as usize));
+                    if self.two(0) { r.add_arg(self.get_var(v as usize + 1)); }
+                }
+                let m = self.mem();
+                r.add_arg(m);
+                self.cur.unwrap().add(r);
+                self.finish_exit(ssa::B_RET, r);
+            }
+            Term::Unreachable => {
+                let m = self.mem();
+                self.finish_exit(ssa::B_EXIT, m);
+            }
+            Term::Call { fn_op, args, dest, target, pos } => self.call(t, fn_op, args, dest, *target, *pos),
+            Term::Assert { cond, msg, target, pos, bounds, len, index } => {
+                let bc = Class { kind: C_ONE, t0: ssa::T_BOOL, t1: ssa::T_VOID };
+                let (c, _) = self.operand(cond, &bc);
+                let fail = self.f.new_block(ssa::B_EXIT);
+                self.finish_if(c, self.blocks[*target], fail);
+                self.start(fail);
+                let p = self.f.new_value(ssa::OP_PANIC, ssa::T_MEM, 0);
+                p.aux = ssa::Aux::Str(msg.clone());
+                p.pos = *pos;
+                if *bounds {
+                    let ic = Class { kind: C_ONE, t0: ssa::T_I64, t1: ssa::T_VOID };
+                    let (l, _) = self.operand(len, &ic);
+                    let (ix, _) = self.operand(index, &ic);
+                    p.add_arg(l);
+                    p.add_arg(ix);
+                    p.aux_int = 1;
+                }
+                let m = self.mem();
+                p.add_arg(m);
+                self.cur.unwrap().add(p);
+                self.finish_exit(ssa::B_EXIT, p);
+            }
+            Term::None => self.failf(`${self.mf.name}: block without terminator`),
+        }
+    }
+
+    fn finish_if(&mut self, c: &mut Value, yes: &mut Block, no: &mut Block) {
+        let b = self.cur.unwrap();
+        b.kind = ssa::B_IF;
+        b.set_control(c);
+        b.add_succ(yes);
+        b.add_succ(no);
+        self.end_block();
+    }
+
+    fn finish_exit(&mut self, kind: ssa::BlockKind, m: &mut Value) {
+        let b = self.cur.unwrap();
+        b.kind = kind;
+        b.set_control(m);
+        self.end_block();
+    }
+
+    fn call(&mut self, t: &Term, fn_op: &Operand, args: &Vec<Operand>, dest: &Place, target: i64, pos: crate::syntax::source::Pos) {
+        let dt = self.fg.place_type(dest);
+        let dc = self.class(dt);
+        let mut intrinsic = false;
+        if fn_op.kind == mir::OP_CONST && fn_op.cnst.unwrap().kind == mir::C_FN {
+            let (tg, slot) = self.fg.g.p.site_target(self.fg.inst, fn_op.cnst.unwrap());
+            if tg.kind == codegen::T_INTRINSIC && (slot < 0 || tg.intrinsic == "type_desc") { intrinsic = true; }
+        }
+        if intrinsic {
+            let v = self.f.new_value(ssa::OP_INTRINSIC, ssa::T_TUPLE, 0);
+            v.aux = ssa::Aux::Term(t);
+            v.pos = pos;
+            self.args_into(v, fn_op, args);
+            let m = self.mem();
+            v.add_arg(m);
+            self.cur.unwrap().add(v);
+            let mut nw = 0;
+            if dc.kind == C_ONE { nw = 1; } else if dc.kind == C_TWO { nw = 2; }
+            if dc.kind == C_MEM {
+                // Results in memory: the intrinsic writes the result buffer.
+                nw = 0;
+            }
+            let m2 = self.value1(ssa::OP_SELECT, ssa::T_MEM, nw, v);
+            self.set_var(0, m2);
+            if target < 0 || dt.kind == types::K_NEVER {
+                self.finish_exit(ssa::B_EXIT, m2);
+                return;
+            }
+            if nw > 0 {
+                let w0 = self.value1(ssa::OP_SELECT, dc.t0, 0, v);
+                let w1 = if nw == 2 { Some(self.value1(ssa::OP_SELECT, dc.t1, 1, v)) } else { None };
+                self.assign_words(dest, &dc, w0, w1);
+                self.barrier(dest);
+            } else if dc.kind == C_MEM {
+                self.result_to(dest, dt, &dc);
+            }
+            self.finish_plain(self.blocks[target as usize]);
+            return;
+        }
+        let v = self.f.new_value(ssa::OP_CALL, ssa::T_MEM, 0);
+        v.aux = ssa::Aux::Term(t);
+        v.pos = pos;
+        self.args_into(v, fn_op, args);
+        let m = self.mem();
+        v.add_arg(m);
+        self.cur.unwrap().add(v);
+        self.set_var(0, v);
+        if target < 0 || dt.kind == types::K_NEVER {
+            self.finish_exit(ssa::B_EXIT, v);
+            return;
+        }
+        if dc.kind != C_NONE { self.result_to(dest, dt, &dc); }
+        self.finish_plain(self.blocks[target as usize]);
+    }
+
+    /// Copies the call result buffer to dest.
+    fn result_to(&mut self, dest: &Place, dt: &Type, dc: &Class) {
+        let r = self.value0(ssa::OP_RESADDR, ssa::T_PTR, 0);
+        if dc.kind == C_MEM {
+            let size = self.fg.size(dt);
+            let (p, _, _) = self.addr(dest);
+            self.mem_op2(ssa::OP_MOVE, size, p, r);
+        } else {
+            let w0 = self.load(dc.t0, r);
+            let w1 = if dc.kind == C_TWO {
+                let r1 = self.off_ptr(r, 8);
+                Some(self.load(dc.t1, r1))
+            } else { None };
+            self.assign_words(dest, dc, w0, w1);
+        }
+        self.barrier(dest);
+    }
+}
+
+fn mark_place(bad: &mut Vec<bool>, pl: &Place, as_ref: bool) {
+    if pl.proj.len() == 0 {
+        if as_ref { bad[pl.local] = true; }
+    } else if pl.proj[0].kind != mir::P_DEREF {
+        bad[pl.local] = true;
+    }
+}
+
+fn mark_op(bad: &mut Vec<bool>, x: &Operand) {
+    if x.kind == mir::OP_COPY { mark_place(bad, &x.place, false); }
+}
+
+/// Moves a block's phis before its other values.
+fn phis_first(b: &mut Block) {
+    let mut phis: Vec<&mut Value> = Vec::new();
+    let mut rest: Vec<&mut Value> = Vec::new();
+    for v in b.values.iter() {
+        if v.op == ssa::OP_PHI { phis.push(*v); } else { rest.push(*v); }
+    }
+    if phis.len() == 0 { return; }
+    for v in rest.iter() { phis.push(*v); }
+    b.values = phis;
+}
+
+fn int_ty(size: i64) -> Ty {
+    match size {
+        1 => ssa::T_I8,
+        2 => ssa::T_I16,
+        4 => ssa::T_I32,
+        _ => ssa::T_I64,
+    }
+}
+
+fn ty_bytes(t: Ty) -> i64 { ssa::ty_size(t) }
+
+/// x in the canonical form of type t: narrow integers zero-extended.
+fn canon(t: Ty, x: i64) -> i64 {
+    match t {
+        ssa::T_BOOL | ssa::T_I8 => x & 0xff,
+        ssa::T_I16 => x & 0xffff,
+        ssa::T_I32 => x & 0xffffffff,
+        _ => x,
+    }
+}
+
+fn is_signed(t: &Type) -> bool { t.kind == types::K_INT && types::int_signed(t.int) }
