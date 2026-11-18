@@ -1,0 +1,367 @@
+//! Copy propagation and dead assignment removal. A local assigned once as
+//! a whole, never borrowed or boxed, whose value is a constant or another
+//! such local (or an argument never assigned), is replaced by that value
+//! where it is read; then assignments to locals nothing reads go, when
+//! they cannot panic. Run on a function whose blocks are its own (after
+//! simplify).
+
+use crate::mir::*;
+
+// What the scan learns about each local.
+struct Info {
+    defs: Vec<u32>,
+    uses: Vec<u32>,
+    // Borrowed (a Ref of the local's own storage) or boxed: never touched.
+    pinned: Vec<bool>,
+    // The value of its single whole assignment `l = v`, if v is a copy of a
+    // whole local or a constant.
+    value: Vec<Option<Operand>>,
+}
+
+// Whether a place is the local's own storage (not behind a pointer).
+fn own_storage(p: &Place) -> bool { p.proj.len() == 0 || p.proj[0].kind != P_DEREF }
+
+impl Info {
+    fn read_place(&mut self, p: &Place) {
+        self.uses[p.local] += 1;
+        for pr in p.proj.iter() {
+            if pr.kind == P_INDEX { self.uses[pr.index] += 1; }
+        }
+    }
+
+    fn read(&mut self, o: &Operand) { if o.kind == OP_COPY { self.read_place(&o.place); } }
+
+    // A write to place: a definition of its local when the place is the
+    // local's own storage, else a read of the pointer it goes through.
+    fn write_place(&mut self, p: &Place) {
+        if own_storage(p) {
+            self.defs[p.local] += 1;
+            for pr in p.proj.iter() {
+                if pr.kind == P_INDEX { self.uses[pr.index] += 1; }
+            }
+            // A partial write keeps the local in memory as a whole.
+            if p.proj.len() > 0 { self.pinned[p.local] = true; }
+        } else {
+            self.read_place(p);
+        }
+    }
+}
+
+fn scan(f: &Func) -> Info {
+    let n = f.locals.len();
+    let mut info = Info { defs: Vec::new(), uses: Vec::new(), pinned: Vec::new(), value: Vec::new() };
+    info.defs.resize(n, 0);
+    info.uses.resize(n, 0);
+    info.pinned.resize(n, false);
+    let mut i = 0;
+    while i < n {
+        info.value.push(None);
+        i += 1;
+    }
+    // The result and the arguments are set from outside.
+    i = 0;
+    while i <= f.nargs && i < n {
+        info.defs[i] += 1;
+        info.pinned[i] = i == 0;
+        i += 1;
+    }
+    for b in f.blocks.iter() {
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::Assign { place, rv } => {
+                    match rv {
+                        Rvalue::Use(x) => info.read(x),
+                        Rvalue::Ref { place: p, .. } => {
+                            if own_storage(p) { info.pinned[p.local] = true; }
+                            info.read_place(p);
+                        }
+                        Rvalue::Bin { x, y, .. } => {
+                            info.read(x);
+                            info.read(y);
+                        }
+                        Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => info.read(x),
+                        Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { info.read(o); } }
+                        Rvalue::Discr(p) | Rvalue::Len(p) => info.read_place(p),
+                    }
+                    info.write_place(place);
+                    if place.proj.len() == 0 {
+                        if let Rvalue::Use(x) = rv {
+                            if x.kind == OP_CONST || x.place.proj.len() == 0 { info.value[place.local] = Some(x.clone()); }
+                        }
+                    }
+                }
+                Stmt::SetDiscr { place, .. } => info.write_place(place),
+                Stmt::Box { local, .. } => info.pinned[*local] = true,
+                Stmt::PushDefer { fn_op, args } => {
+                    info.read(fn_op);
+                    for a in args.iter() { info.read(a); }
+                }
+                _ => {}
+            }
+        }
+        match &b.term {
+            Term::Switch { x, .. } => info.read(x),
+            Term::Call { fn_op, args, dest, .. } => {
+                info.read(fn_op);
+                for a in args.iter() { info.read(a); }
+                info.write_place(dest);
+            }
+            Term::Assert { cond, len, index, .. } => {
+                info.read(cond);
+                info.read(len);
+                info.read(index);
+            }
+            Term::Return => info.uses[0] += 1,
+            _ => {}
+        }
+    }
+    info
+}
+
+// The rewriting: locals replaced by locals (any position) or constants
+// (whole-local operands only).
+struct Rw {
+    to_local: Vec<i64>,
+    to_const: Vec<Option<Operand>>,
+    changed: bool,
+}
+
+impl Rw {
+    fn loc(&self, l: usize) -> usize { if self.to_local[l] >= 0 { self.to_local[l] as usize } else { l } }
+
+    fn place(&mut self, p: &Place) -> Place {
+        let nl = self.loc(p.local);
+        let mut idx_change = false;
+        for pr in p.proj.iter() {
+            if pr.kind == P_INDEX && self.to_local[pr.index] >= 0 { idx_change = true; }
+        }
+        if nl == p.local && !idx_change { return Place { local: p.local, proj: p.proj }; }
+        self.changed = true;
+        if !idx_change { return Place { local: nl, proj: p.proj }; }
+        let mut ps = Vec::new();
+        for pr in p.proj.iter() {
+            let mut q = pr.clone();
+            if q.kind == P_INDEX { q.index = self.loc(q.index); }
+            ps.push(q);
+        }
+        Place { local: nl, proj: ps }
+    }
+
+    fn op(&mut self, o: &Operand) -> Operand {
+        if o.kind != OP_COPY { return Operand { kind: o.kind, place: Place { local: o.place.local, proj: o.place.proj }, cnst: o.cnst }; }
+        if o.place.proj.len() == 0 {
+            if let Some(c) = &self.to_const[o.place.local] {
+                self.changed = true;
+                return Operand { kind: c.kind, place: Place { local: c.place.local, proj: c.place.proj }, cnst: c.cnst };
+            }
+        }
+        copy(self.place(&o.place))
+    }
+
+    fn ops(&mut self, os: &Vec<Operand>) -> Vec<Operand> {
+        let mut v = Vec::new();
+        for o in os.iter() { v.push(self.op(o)); }
+        v
+    }
+
+    // A written place keeps its local (only index locals change).
+    fn dest(&mut self, p: &Place) -> Place {
+        if !own_storage(p) { return self.place(p); }
+        let mut idx_change = false;
+        for pr in p.proj.iter() {
+            if pr.kind == P_INDEX && self.to_local[pr.index] >= 0 { idx_change = true; }
+        }
+        if !idx_change { return Place { local: p.local, proj: p.proj }; }
+        self.changed = true;
+        let mut ps = Vec::new();
+        for pr in p.proj.iter() {
+            let mut q = pr.clone();
+            if q.kind == P_INDEX { q.index = self.loc(q.index); }
+            ps.push(q);
+        }
+        Place { local: p.local, proj: ps }
+    }
+
+    fn rv(&mut self, rv: &Rvalue) -> Rvalue {
+        match rv {
+            Rvalue::Use(x) => Rvalue::Use(self.op(x)),
+            Rvalue::Ref { is_mut, place } => Rvalue::Ref { is_mut: *is_mut, place: self.place(place) },
+            Rvalue::Bin { op, x, y, ty, pos } => Rvalue::Bin { op: *op, x: self.op(x), y: self.op(y), ty: *ty, pos: *pos },
+            Rvalue::Un { op, x, ty, pos } => Rvalue::Un { op: *op, x: self.op(x), ty: *ty, pos: *pos },
+            Rvalue::Cast { kind, x, from, to } => Rvalue::Cast { kind: *kind, x: self.op(x), from: *from, to: *to },
+            Rvalue::Aggregate { kind, ty, variant, ops, closure } => Rvalue::Aggregate { kind: *kind, ty: *ty, variant: *variant, ops: self.ops(ops), closure: *closure },
+            Rvalue::Discr(p) => Rvalue::Discr(self.place(p)),
+            Rvalue::Len(p) => Rvalue::Len(self.place(p)),
+            Rvalue::Unsize { x, len, to } => Rvalue::Unsize { x: self.op(x), len: *len, to: *to },
+            Rvalue::MakeDyn { x, concrete, to } => Rvalue::MakeDyn { x: self.op(x), concrete: *concrete, to: *to },
+        }
+    }
+}
+
+// Whether evaluating rv can do nothing but produce its value (no panic, no
+// call): then an assignment nothing reads may go.
+fn pure(rv: &Rvalue) -> bool {
+    match rv {
+        Rvalue::Bin { op, pos, .. } => {
+            let o = *op;
+            o == BIT_AND || o == BIT_OR || o == BIT_XOR || o == EQ || o == NE || o == LT || o == LE || o == GT || o == GE || o == OFFSET
+                || ((o == ADD || o == SUB || o == MUL) && *pos == 0)
+        }
+        Rvalue::Un { op, pos, .. } => *op == NOT || *pos == 0,
+        _ => true,
+    }
+}
+
+/// Propagates copies and constants in f and removes dead assignments.
+pub fn propagate(f: &mut Func) {
+    let n = f.locals.len();
+    if n == 0 { return; }
+    let info = scan(f);
+    let mut to_local: Vec<i64> = Vec::new();
+    to_local.resize(n, -1);
+    let mut to_const: Vec<Option<Operand>> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        to_const.push(None);
+        i += 1;
+    }
+    // A stable local keeps one value: assigned at most once, never
+    // borrowed or boxed.
+    let stable = |l: usize| -> bool { info.defs[l] <= 1 && !info.pinned[l] };
+    let mut any = false;
+    i = f.nargs + 1;
+    while i < n {
+        if info.defs[i] == 1 && !info.pinned[i] {
+            if let Some(v) = &info.value[i] {
+                if v.kind == OP_CONST {
+                    to_const[i] = Some(v.clone());
+                    any = true;
+                } else if v.place.local != i && stable(v.place.local) {
+                    to_local[i] = v.place.local as i64;
+                    any = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    if any {
+        // Chains end at a local that is not replaced (or at a constant).
+        i = 0;
+        while i < n {
+            let mut steps = 0;
+            while to_local[i] >= 0 && steps < n {
+                let t = to_local[i] as usize;
+                if to_local[t] >= 0 {
+                    to_local[i] = to_local[t];
+                } else {
+                    if let Some(c) = &to_const[t] {
+                        to_const[i] = Some(c.clone());
+                        to_local[i] = -1;
+                    }
+                    break;
+                }
+                steps += 1;
+            }
+            i += 1;
+        }
+        let rw = &mut Rw { to_local, to_const, changed: false };
+        rewrite(f, rw);
+    }
+    remove_dead(f);
+}
+
+// Whether the block reads or writes a replaced local.
+fn touched(b: &Block, rw: &Rw) -> bool {
+    let hit = |l: usize| -> bool { rw.to_local[l] >= 0 || rw.to_const[l].is_some() };
+    let pl = |p: &Place| -> bool {
+        if hit(p.local) { return true; }
+        for pr in p.proj.iter() {
+            if pr.kind == P_INDEX && hit(pr.index) { return true; }
+        }
+        false
+    };
+    let op = |o: &Operand| -> bool { o.kind == OP_COPY && pl(&o.place) };
+    for s in b.stmts.iter() {
+        let t = match s {
+            Stmt::Assign { place, rv } => pl(place) || match rv {
+                Rvalue::Use(x) | Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => op(x),
+                Rvalue::Ref { place: p, .. } | Rvalue::Discr(p) | Rvalue::Len(p) => pl(p),
+                Rvalue::Bin { x, y, .. } => op(x) || op(y),
+                Rvalue::Aggregate { ops, .. } => ops.iter().any(|o| op(o)),
+            },
+            Stmt::SetDiscr { place, .. } => pl(place),
+            Stmt::PushDefer { fn_op, args } => op(fn_op) || args.iter().any(|o| op(o)),
+            _ => false,
+        };
+        if t { return true; }
+    }
+    match &b.term {
+        Term::Switch { x, .. } => op(x),
+        Term::Call { fn_op, args, dest, .. } => op(fn_op) || args.iter().any(|o| op(o)) || pl(dest),
+        Term::Assert { cond, len, index, .. } => op(cond) || op(len) || op(index),
+        _ => false,
+    }
+}
+
+fn rewrite(f: &mut Func, rw: &mut Rw) {
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        if !touched(b, rw) {
+            bi += 1;
+            continue;
+        }
+        let mut stmts: Vec<Stmt> = Vec::new();
+        for s in b.stmts.iter() {
+            let ns = match s {
+                Stmt::Assign { place, rv } => Stmt::Assign { place: rw.dest(place), rv: rw.rv(rv) },
+                Stmt::SetDiscr { place, variant } => Stmt::SetDiscr { place: rw.dest(place), variant: *variant },
+                Stmt::PushDefer { fn_op, args } => Stmt::PushDefer { fn_op: rw.op(fn_op), args: rw.ops(args) },
+                _ => s.clone(),
+            };
+            stmts.push(ns);
+        }
+        let term = match &b.term {
+            Term::Switch { x, ty, vals, targets, els } => Term::Switch { x: rw.op(x), ty: *ty, vals: vals.clone(), targets: targets.clone(), els: *els },
+            Term::Call { fn_op, args, dest, target, pos } => Term::Call { fn_op: rw.op(fn_op), args: rw.ops(args), dest: rw.dest(dest), target: *target, pos: *pos },
+            Term::Assert { cond, msg, target, pos, bounds, len, index } => Term::Assert { cond: rw.op(cond), msg: msg.clone(), target: *target, pos: *pos, bounds: *bounds, len: rw.op(len), index: rw.op(index) },
+            _ => b.term.clone(),
+        };
+        b.stmts = stmts;
+        b.term = term;
+        bi += 1;
+    }
+}
+
+// Removes `l = rv` for locals nothing reads (rv pure, l a whole local that
+// is neither the result, an argument, borrowed nor boxed), until none is
+// left.
+fn remove_dead(f: &mut Func) {
+    let mut round = 0;
+    while round < 8 {
+        let info = scan(f);
+        let mut removed = false;
+        let mut bi = 0;
+        while bi < f.blocks.len() {
+            let b = f.blocks[bi];
+            let mut si = b.stmts.len();
+            while si > 0 {
+                si -= 1;
+                let dead = match &b.stmts[si] {
+                    Stmt::Assign { place, rv } => {
+                        let l = place.local;
+                        place.proj.len() == 0 && l > f.nargs && info.uses[l] == 0 && !info.pinned[l] && pure(rv)
+                    }
+                    _ => false,
+                };
+                if dead {
+                    b.stmts.remove(si);
+                    removed = true;
+                }
+            }
+            bi += 1;
+        }
+        if !removed { break; }
+        round += 1;
+    }
+}
