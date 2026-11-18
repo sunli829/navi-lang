@@ -76,6 +76,8 @@ struct OutReloc {
 
 struct FuncOut {
     sym: String,
+    /// Where the register entry (sym.r) starts in code.
+    reg_off: i64,
     name: String,
     code: Vec<u8>,
     relocs: Vec<OutReloc>,
@@ -139,6 +141,9 @@ pub struct Gen {
     ssa_noopt: bool,
     /// NAVI_SSATIME: report the time of the SSA backend's phases.
     ssa_time: bool,
+    /// Where the current function's register entry (.r) starts.
+    cur_reg_off: i64,
+
     /// This thread's reusable SSA values and blocks, and register
     /// allocation.
     pub ssa_cache: &mut crate::ssa::Cache,
@@ -263,7 +268,7 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         ssa_check: match std::env::var("NAVI_SSACHECK") { Ok(v) => if v == "2" { 2 } else if v == "3" { 3 } else { 1 }, Err(_) => 0 },
         ssa_dump: match std::env::var("NAVI_SSADUMP") { Ok(v) => v, Err(_) => String::new() },
         ssa_noopt: std::env::var("NAVI_NOSSAOPT").is_ok(),
-        ssa_time: std::env::var("NAVI_SSATIME").is_ok(), ssa_cache: crate::ssa::new_cache(), ssa_ra: crate::ssa::regalloc::empty() }
+        ssa_time: std::env::var("NAVI_SSATIME").is_ok(), ssa_cache: crate::ssa::new_cache(), ssa_ra: crate::ssa::regalloc::empty(), cur_reg_off: 0 }
 }
 
 /// Lowers the plan into a new object for arch, with a machine from new_m
@@ -474,6 +479,8 @@ impl Gen {
         for u in out.undef.iter() { self.o.undefined(u.as_str()); }
         let align = if self.o.arch == "amd64" { 16 } else { 4 };
         let off = self.o.define(out.sym.as_str(), obj::TEXT, align, false);
+        let rsym = `${out.sym}.r`;
+        self.o.define_at(rsym.as_str(), obj::TEXT, off + out.reg_off as u64, false);
         self.o.append(obj::TEXT, out.code.as_slice());
         if out.meta.len() > 0 {
             let mo = self.fmeta.len() as u64;
@@ -525,7 +532,9 @@ impl Gen {
             relocs.push(OutReloc { off: r.off, kind: r.kind, id, ph: 0, ix: 0, name: r.sym });
         }
         let meta = self.finish_meta(&c.calls);
-        let out = &mut FuncOut { sym: sym.to_string(), name, code: c.code, relocs, lines: Vec::new(), meta, file: self.cur_file, strs: self.fstrs,
+        let reg_off = self.cur_reg_off;
+        self.cur_reg_off = 0;
+        let out = &mut FuncOut { sym: sym.to_string(), reg_off, name, code: c.code, relocs, lines: Vec::new(), meta, file: self.cur_file, strs: self.fstrs,
             locs: self.flocs, undef: self.fundef, errs: self.errs, failed: false };
         if c.err.len() > 0 {
             out.errs.push(`${sym}: ${c.err}`);
@@ -589,6 +598,9 @@ impl Gen {
         }
         let align = if self.o.arch == "amd64" { 16 } else { 4 };
         let off = self.o.define(sym, obj::TEXT, align, global);
+        let rsym = `${sym}.r`;
+        self.o.define_at(rsym.as_str(), obj::TEXT, off + self.cur_reg_off as u64, false);
+        self.cur_reg_off = 0;
         self.o.append(obj::TEXT, c.code.as_slice());
         if self.debug {
             let name = if self.cur_name.len() > 0 { self.cur_name.clone() } else { sym.to_string() };
@@ -1183,6 +1195,7 @@ impl Gen {
 
     fn gen_func(&mut self, grp: &mut Group, f: &mut Func, sym: String) {
         self.m.begin();
+        self.cur_reg_off = 0;
         self.cur_lines = Vec::new();
         self.cur_file = f.file;
         self.cur_name = f.name.clone();
@@ -1192,7 +1205,7 @@ impl Gen {
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
             res_off: 0, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), preg2: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
             frame: 0, buf_top: 0, ssa_alloc: crate::ssa::regalloc::empty(), ssa_slots: 0, ptr_slots: Vec::new(), ssa_masks: Vec::new(),
-            ssa_var0: false, ssa_bridge: 0 };
+            ssa_var0: false, ssa_bridge: 0, ssa_pr: Vec::new() };
         fg.gen();
         fg.stack_meta();
         self.emit_func(sym.as_str(), false);
@@ -1265,6 +1278,9 @@ pub struct FnGen {
     ssa_var0: bool,
     /// The area where operands for the old helpers are put (bridge).
     ssa_bridge: i64,
+    /// By local: the first argument register its parameter comes in (-1:
+    /// on the stack only).
+    ssa_pr: Vec<i64>,
 }
 
 fn is_signed(t: &Type) -> bool { t.kind == types::K_INT && types::int_signed(t.int) }
@@ -2443,14 +2459,55 @@ fn invert(c: Cond) -> Cond {
 struct Loc {
     /// 0: register, 1: stack slot (FP offset), 2: made where used.
     kind: u8,
-    /// A floating point value.
+    /// A floating point value (f64: a double).
     fp: bool,
+    f64: bool,
     reg: Reg,
     off: i64,
     val: Option<&mut crate::ssa::Value>,
 }
 
 impl FnGen {
+    /// The registers direct calls pass argument words in (arm64 x1-x7;
+    /// amd64 the scratch registers no call sequence or prologue uses).
+    fn arg_regs(&self) -> Vec<Reg> {
+        let mut rs: Vec<Reg> = Vec::new();
+        if self.g.tgt.code_unit == 4 {
+            let mut k = 0;
+            while k < NUM_A {
+                rs.push(A1 + k as Reg);
+                k += 1;
+            }
+        } else {
+            rs.push(V1);
+            rs.push(V2);
+            rs.push(BASE);
+            rs.push(RA);
+            rs.push(RM);
+        }
+        rs
+    }
+
+    /// For each parameter type, its first argument register (index into
+    /// arg_regs) or -1 (on the stack): values of one or two words, in order,
+    /// while registers last. Callers and callees agree (word counts are the
+    /// same for every type of a shape).
+    fn reg_params(&mut self, types: &Vec<&Type>) -> Vec<i64> {
+        let n = self.arg_regs().len() as i64;
+        let mut out: Vec<i64> = Vec::new();
+        let mut k = 0i64;
+        for t in types.iter() {
+            let w = if self.size(*t) == 0 { 0 } else { self.ssa_words(*t) };
+            if w > 0 && k + w <= n {
+                out.push(k);
+                k += w;
+            } else {
+                out.push(-1);
+            }
+        }
+        out
+    }
+
     /// Whether the SSA backend handles every value of sf.
     fn ssa_supported(&mut self, sf: &crate::ssa::Func) -> Result<(), String> {
         for b in sf.blocks.iter() {
@@ -2794,6 +2851,43 @@ impl FnGen {
         self.ssa_bridge = -cur;
         let frame = ((cur + 15) & !15) + ((max_out + 15) & !15);
         self.frame = frame;
+        // The stack-ABI entry: the parameters passed in registers to direct
+        // calls are loaded from the stack, then the register entry (.r)
+        // follows.
+        let aregs = self.arg_regs();
+        let mut pi = 0;
+        while pi < n {
+            self.ssa_pr.push(-1);
+            pi += 1;
+        }
+        if !f.closure {
+            let mut ts: Vec<&Type> = Vec::new();
+            pi = self.first_arg();
+            while pi <= f.nargs {
+                ts.push(self.ltypes[pi]);
+                pi += 1;
+            }
+            let rp = self.reg_params(&ts);
+            let entry_arg = if self.g.tgt.code_unit == 4 { -16 } else { -8 };
+            pi = self.first_arg();
+            let mut k = 0;
+            while pi <= f.nargs {
+                self.ssa_pr[pi] = rp[k];
+                if rp[k] >= 0 {
+                    let t = self.ltypes[pi];
+                    let words = self.ssa_words(t);
+                    let mut w = 0;
+                    while w < words {
+                        let size = if words == 1 { self.size(t) } else { 8 };
+                        m.load(size, aregs[(rp[k] + w) as usize], SP, self.loff[pi] + entry_arg + 8 * w);
+                        w += 1;
+                    }
+                }
+                pi += 1;
+                k += 1;
+            }
+        }
+        self.g.cur_reg_off = m.offset() as i64;
         // The prologue (as gen's).
         let overflow = m.new_label();
         let resume = m.new_label();
@@ -2878,6 +2972,7 @@ impl FnGen {
             let bi = order[oi];
             let b = sf.blocks[bi];
             m.bind(labels[bi]);
+            if bi == 0 { self.ssa_entry_args(sf, b); }
             for vv in b.values.iter() {
                 let v = *vv;
                 if self.g.debug && v.pos > 0 { self.note_line(v.pos); }
@@ -2932,6 +3027,64 @@ impl FnGen {
         if let Some(t) = t3 { crate::backend::ssagen::add_time(3, t.elapsed().as_nanos() as u64); }
     }
 
+    /// Stores (or loads back) the register arguments at their stack slots,
+    /// before the frame is made (SP as at the entry).
+    fn ssa_spill_args(&mut self, store: bool) {
+        let m = self.m;
+        let aregs = self.arg_regs();
+        let entry_arg = if self.g.tgt.code_unit == 4 { -16 } else { -8 };
+        let mut l = 0;
+        while l < self.ssa_pr.len() {
+            if self.ssa_pr[l] >= 0 {
+                let words = self.ssa_words(self.ltypes[l]);
+                let mut w = 0;
+                while w < words {
+                    let r = aregs[(self.ssa_pr[l] + w) as usize];
+                    let off = self.loff[l] + entry_arg + 8 * w;
+                    if store { m.store(8, r, SP, off); } else { m.load(8, r, SP, off); }
+                    w += 1;
+                }
+            }
+            l += 1;
+        }
+    }
+
+    /// At the register entry: parameters in memory get their register words
+    /// stored home; the Arg values of the others are moved from their
+    /// registers (a parallel copy).
+    fn ssa_entry_args(&mut self, sf: &crate::ssa::Func, b: &crate::ssa::Block) {
+        let m = self.m;
+        let aregs = self.arg_regs();
+        let mut l = 0;
+        while l < self.ssa_pr.len() {
+            if self.ssa_pr[l] >= 0 && !sf.is_var[l] {
+                let words = self.ssa_words(self.ltypes[l]);
+                let mut w = 0;
+                while w < words {
+                    m.store(8, aregs[(self.ssa_pr[l] + w) as usize], FP, self.loff[l] + 8 * w);
+                    w += 1;
+                }
+            }
+            l += 1;
+        }
+        let mut ds: Vec<Loc> = Vec::new();
+        let mut ss: Vec<Loc> = Vec::new();
+        for vv in b.values.iter() {
+            let v = *vv;
+            if v.op != crate::ssa::OP_ARG { continue; }
+            let lv = (v.aux_int >> 1) as usize;
+            if self.ssa_pr[lv] < 0 { continue; }
+            let d = self.ssa_loc(v);
+            if d.kind == 2 { continue; }
+            let r = aregs[(self.ssa_pr[lv] + (v.aux_int & 1)) as usize];
+            let src = Loc { kind: 0, fp: false, f64: false, reg: r, off: 0, val: None };
+            if same_loc(&d, &src) { continue; }
+            ds.push(d);
+            ss.push(src);
+        }
+        self.ssa_parallel(&mut ds, &mut ss);
+    }
+
     /// Compares a fused comparison's operands; the condition its value is.
     fn ssa_compare(&mut self, c: &crate::ssa::Value) -> Cond {
         let m = self.m;
@@ -2976,15 +3129,29 @@ impl FnGen {
     fn ssa_loc(&self, v: &mut crate::ssa::Value) -> Loc {
         let id = v.id as usize;
         let fp = crate::ssa::is_float(v.ty);
+        let f64 = v.ty == crate::ssa::T_F64;
         let r = self.ssa_alloc.reg[id];
-        if r >= 0 { return Loc { kind: 0, fp, reg: r as Reg, off: 0, val: None }; }
+        if r >= 0 { return Loc { kind: 0, fp, f64, reg: r as Reg, off: 0, val: None }; }
         let s = self.ssa_alloc.slot[id];
-        if s >= 0 { return Loc { kind: 1, fp, reg: 0, off: self.ssa_slot_off(s), val: None }; }
-        Loc { kind: 2, fp, reg: 0, off: 0, val: Some(v) }
+        if s >= 0 { return Loc { kind: 1, fp, f64, reg: 0, off: self.ssa_slot_off(s), val: None }; }
+        Loc { kind: 2, fp, f64, reg: 0, off: 0, val: Some(v) }
     }
 
     fn ssa_move(&mut self, dst: &Loc, src: &Loc) {
         let m = self.m;
+        // Argument registers carry floats as bits.
+        if dst.fp && src.kind == 0 && !src.fp {
+            if dst.kind == 0 { m.fmov_to(dst.reg, src.reg, dst.f64); } else { m.store(8, src.reg, FP, dst.off); }
+            return;
+        }
+        if !dst.fp && dst.kind == 0 && src.fp {
+            match src.kind {
+                0 => m.fmov_from(dst.reg, src.reg, src.f64),
+                1 => m.load(8, dst.reg, FP, src.off),
+                _ => m.mov_imm(dst.reg, src.val.unwrap().aux_int),
+            }
+            return;
+        }
         if dst.fp {
             // Slots hold 8 bytes; slot to slot copies the bits.
             if dst.kind == 0 {
@@ -3050,8 +3217,13 @@ impl FnGen {
             dsts.push(d);
             srcs.push(sv);
         }
-        // Emit a move whose destination no other pending move reads; break
-        // cycles through I1.
+        self.ssa_parallel(&mut dsts, &mut srcs);
+    }
+
+    /// Emits moves dsts[i] <- srcs[i] as if at once: a move whose
+    /// destination no other pending move reads first; cycles broken through
+    /// I1 (floats: F0).
+    fn ssa_parallel(&mut self, dsts: &mut Vec<Loc>, srcs: &mut Vec<Loc>) {
         while dsts.len() > 0 {
             let mut done = false;
             let mut i = 0;
@@ -3073,7 +3245,7 @@ impl FnGen {
             }
             if done { continue; }
             // A cycle: park the first source in I1 (floats: F0).
-            let t = if srcs[0].fp { Loc { kind: 0, fp: true, reg: F0, off: 0, val: None } } else { Loc { kind: 0, fp: false, reg: I1, off: 0, val: None } };
+            let t = if srcs[0].fp { Loc { kind: 0, fp: true, f64: true, reg: F0, off: 0, val: None } } else { Loc { kind: 0, fp: false, f64: false, reg: I1, off: 0, val: None } };
             let first = srcs[0].clone();
             self.ssa_move(&t, &first);
             let mut j = 0;
@@ -3093,6 +3265,8 @@ impl FnGen {
             crate::ssa::OP_INITMEM | crate::ssa::OP_PHI => {}
             crate::ssa::OP_ARG => {
                 let l = (v.aux_int >> 1) as usize;
+                // Moved from its register at the entry.
+                if l < self.ssa_pr.len() && self.ssa_pr[l] >= 0 { return; }
                 let w = v.aux_int & 1;
                 let d = self.ssa_dst(v, V1);
                 if self.f.closure && l == 1 {
@@ -3582,6 +3756,18 @@ impl FnGen {
             ai = 2;
         }
         let mut vtable: Option<&mut crate::ssa::Value> = None;
+        // Direct calls take their words in registers (to the .r entry).
+        let direct = match tgt { Some(tt) => slot < 0 && tt.kind == codegen::T_INST, None => false };
+
+        let aregs = self.arg_regs();
+        let mut regp: Vec<i64> = Vec::new();
+        if direct {
+            let mut ts: Vec<&Type> = Vec::new();
+            for a in args.iter() { ts.push(self.operand_type(a)); }
+            regp = self.reg_params(&ts);
+        }
+        let mut mdst: Vec<Loc> = Vec::new();
+        let mut msrc: Vec<Loc> = Vec::new();
         let mut off = 0i64;
         let mut i = 0;
         while i < args.len() {
@@ -3607,6 +3793,19 @@ impl FnGen {
                 i += 1;
                 continue;
             }
+            if direct && regp[i] >= 0 {
+                let mut w = 0;
+                while w < words {
+                    let r = aregs[(regp[i] + w) as usize];
+                    mdst.push(Loc { kind: 0, fp: false, f64: false, reg: r, off: 0, val: None });
+                    msrc.push(self.ssa_loc(v.args[ai + w as usize]));
+                    w += 1;
+                }
+                ai += words as usize;
+                off += round8(size);
+                i += 1;
+                continue;
+            }
             let w0 = v.args[ai];
             let r0 = self.ssa_in(w0, V1);
             self.ssa_store_word(w0, r0, if words == 1 { size } else { 8 }, SP, off);
@@ -3622,6 +3821,20 @@ impl FnGen {
             ai += words as usize;
             off += if i == 0 && thin_recv { 8 } else { round8(size) };
             i += 1;
+        }
+        if mdst.len() > 0 {
+            // Values already where they go need no move.
+            let mut ds: Vec<Loc> = Vec::new();
+            let mut ss: Vec<Loc> = Vec::new();
+            let mut k = 0;
+            while k < mdst.len() {
+                if !same_loc(&mdst[k], &msrc[k]) {
+                    ds.push(mdst[k].clone());
+                    ss.push(msrc[k].clone());
+                }
+                k += 1;
+            }
+            self.ssa_parallel(&mut ds, &mut ss);
         }
         match tgt {
             None => {
@@ -3657,7 +3870,9 @@ impl FnGen {
                     m.addr_of(RET, FP, self.res_off);
                     let ins = tt.inst.unwrap();
                     m.adr_sym(CTX, &ins.dict);
-                    m.call(&ins.grp().sym);
+                    // Register arguments enter at .r, stack ones at the stub.
+                    let entry = if direct { `${ins.grp().sym}.r` } else { ins.grp().sym.clone() };
+                    m.call(&entry);
                 }
             }
         }
@@ -3686,8 +3901,14 @@ impl FnGen {
                 Stub::Overflow(l, resume, need) => {
                     m.bind(*l);
                     m.set_tag(0);
+                    // Register arguments go to their stack slots around
+                    // morestack (Go spills them likewise): a moved stack
+                    // has the caller's outgoing area adjusted, not these
+                    // registers.
+                    self.ssa_spill_args(true);
                     m.mov_imm(I1, *need);
                     m.call_morestack();
+                    self.ssa_spill_args(false);
                     m.jump(*resume);
                 }
                 Stub::Panic { label, msg, pos } => {
