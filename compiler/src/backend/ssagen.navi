@@ -28,6 +28,18 @@ struct Class {
     t1: Ty,
 }
 
+/// A local split into variables (struct, tuple or enum used only through
+/// its fields, its variant and whole copies among such locals).
+struct Agg {
+    /// The variant index's variable (enums; -1 for others).
+    tag: i64,
+    /// By variant, where its fields start in vars (structs: one variant).
+    base: Vec<usize>,
+    /// Each field's first variable, and whether it has two.
+    vars: Vec<usize>,
+    two: Vec<bool>,
+}
+
 struct Builder {
     fg: &mut FnGen,
     mf: &mut MFunc,
@@ -36,6 +48,9 @@ struct Builder {
     var_of: Vec<i32>,
     /// By MIR local: a variable of two words.
     pair: Vec<bool>,
+    /// By MIR local: its split form (index into aggs, -1: none).
+    agg_of: Vec<i64>,
+    aggs: Vec<Agg>,
     /// By variable: its type. Variable 0 is the memory.
     var_ty: Vec<Ty>,
     /// The SSA block starting each MIR block.
@@ -81,7 +96,7 @@ pub fn counts() -> (usize, usize) {
 /// backend does not handle yet.
 pub fn build(fg: &mut FnGen) -> Result<&mut ssa::Func, String> {
     let mf = fg.f;
-    let b = &mut Builder { fg, mf, f: ssa::new_func_in(mf.name.clone(), fg.g.ssa_cache), var_of: Vec::new(), pair: Vec::new(), var_ty: Vec::new(), blocks: Vec::new(), cur: None,
+    let b = &mut Builder { fg, mf, f: ssa::new_func_in(mf.name.clone(), fg.g.ssa_cache), var_of: Vec::new(), pair: Vec::new(), agg_of: Vec::new(), aggs: Vec::new(), var_ty: Vec::new(), blocks: Vec::new(), cur: None,
         defs: Vec::new(), touched: Vec::new(), end_head: Vec::new(), end_defs: Vec::new(), fwd: Vec::new(), head: Vec::new(), fail: String::new() };
     b.run();
     if b.fail.len() > 0 {
@@ -280,7 +295,12 @@ impl Builder {
             i += 1;
         }
         self.defs.resize(self.var_ty.len(), None);
-        for v in self.var_of.iter() { self.f.is_var.push(*v >= 0); }
+        self.choose_aggs();
+        let mut li = 0;
+        while li < n {
+            self.f.is_var.push(self.var_of[li] >= 0 || self.agg_of[li] >= 0);
+            li += 1;
+        }
     }
 
     fn start(&mut self, b: &mut Block) {
@@ -498,6 +518,10 @@ impl Builder {
         let mut start = 0;
         let mut base: &mut Value;
         let mut meta: Option<&mut Value> = None;
+        if self.agg_of[pl.local] >= 0 {
+            self.failf(`${self.mf.name}: address of split local _${pl.local}`);
+            return (self.cnst(ssa::T_PTR, 0), ty, None);
+        }
         let v = self.var_of[pl.local];
         if v >= 0 {
             if pl.proj.len() == 0 || pl.proj[0].kind != mir::P_DEREF {
@@ -566,6 +590,206 @@ impl Builder {
         self.load(ssa::T_I64, a)
     }
 
+    /// The fields' types of an aggregate type by variant (structs and
+    /// tuples: one), none if it cannot be split.
+    fn agg_fields(&mut self, t: &Type) -> Option<(bool, Vec<Vec<&Type>>)> {
+        let mut out: Vec<Vec<&Type>> = Vec::new();
+        if t.kind == types::K_TUPLE {
+            let mut fs: Vec<&Type> = Vec::new();
+            for e in t.elems.iter() { fs.push(self.fg.reveal(*e)); }
+            out.push(fs);
+            return Some((false, out));
+        }
+        if t.kind != types::K_ADT { return None; }
+        let ai = self.fg.g.p.info.adts[&t.d().id];
+        if ai.is_enum {
+            let mut v = 0;
+            while v < ai.variants.len() {
+                let mut fs: Vec<&Type> = Vec::new();
+                for ft in self.fg.g.field_types(t, v as i64).iter() { fs.push(self.fg.reveal(*ft)); }
+                out.push(fs);
+                v += 1;
+            }
+            return Some((true, out));
+        }
+        let mut fs: Vec<&Type> = Vec::new();
+        for ft in self.fg.g.field_types(t, -1).iter() { fs.push(self.fg.reveal(*ft)); }
+        out.push(fs);
+        Some((false, out))
+    }
+
+    /// Which aggregate locals are split: used only through their fields
+    /// (r.f, (r as V).f), their variant (Discr, SetDiscr), whole assignments
+    /// of aggregates and whole copies among split locals of their type.
+    fn choose_aggs(&mut self) {
+        let mf = self.mf;
+        let n = mf.locals.len();
+        let mut cand: Vec<bool> = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let t = self.fg.ltypes[i];
+            let mut ok = i > mf.nargs && !mf.locals[i].boxed && (t.kind == types::K_ADT || t.kind == types::K_TUPLE) && self.fg.size(t) > 0;
+            if ok {
+                match self.agg_fields(t) {
+                    Some((_, vs)) => {
+                        for fs in vs.iter() {
+                            for ft in fs.iter() {
+                                let c = self.class(*ft);
+                                if c.kind != C_ONE && c.kind != C_TWO { ok = false; }
+                            }
+                        }
+                    }
+                    None => ok = false,
+                }
+            }
+            cand.push(ok);
+            i += 1;
+        }
+        // Whole copies dest <- src among candidates.
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for b in mf.blocks.iter() {
+            for st in b.stmts.iter() {
+                match st {
+                    Stmt::Assign { place, rv } => {
+                        if place.proj.len() == 0 && cand[place.local] {
+                            match rv {
+                                Rvalue::Aggregate { kind, .. } => {
+                                    if *kind != mir::AGG_TUPLE && *kind != mir::AGG_ADT { cand[place.local] = false; }
+                                }
+                                Rvalue::Use(x) => {
+                                    if x.kind == mir::OP_COPY && x.place.proj.len() == 0 && cand[x.place.local] {
+                                        pairs.push((place.local, x.place.local));
+                                    } else if x.kind == mir::OP_COPY || x.cnst.unwrap().kind != mir::C_ZERO {
+                                        cand[place.local] = false;
+                                    }
+                                }
+                                _ => cand[place.local] = false,
+                            }
+                        } else {
+                            agg_place(&mut cand, place);
+                        }
+                        let whole_dest = place.proj.len() == 0 && cand[place.local];
+                        match rv {
+                            Rvalue::Use(x) => if !(x.kind == mir::OP_COPY && x.place.proj.len() == 0 && whole_dest) { agg_op(&mut cand, x); },
+                            Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => agg_op(&mut cand, x),
+                            Rvalue::Bin { x, y, .. } => {
+                                agg_op(&mut cand, x);
+                                agg_op(&mut cand, y);
+                            }
+                            Rvalue::Ref { place: p, .. } => cand[p.local] = false,
+                            Rvalue::Discr(p) => if p.proj.len() != 0 { agg_place(&mut cand, p); },
+                            Rvalue::Len(p) => cand[p.local] = false,
+                            Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { agg_op(&mut cand, o); } }
+                        }
+                    }
+                    Stmt::SetDiscr { place, .. } => if place.proj.len() != 0 { cand[place.local] = false; },
+                    Stmt::PushDefer { fn_op, args } => {
+                        agg_op(&mut cand, fn_op);
+                        for a in args.iter() { agg_op(&mut cand, a); }
+                    }
+                    _ => {}
+                }
+            }
+            match &b.term {
+                Term::Switch { x, .. } => agg_op(&mut cand, x),
+                Term::Call { fn_op, args, dest, .. } => {
+                    agg_op(&mut cand, fn_op);
+                    for a in args.iter() { agg_op(&mut cand, a); }
+                    if dest.proj.len() == 0 { cand[dest.local] = false; } else { agg_place(&mut cand, dest); }
+                }
+                Term::Assert { cond, len, index, .. } => {
+                    agg_op(&mut cand, cond);
+                    agg_op(&mut cand, len);
+                    agg_op(&mut cand, index);
+                }
+                _ => {}
+            }
+        }
+        // A copy between a split local and one that is not (or of another
+        // type) splits neither.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for pr in pairs.iter() {
+                let (d, s0) = *pr;
+                let same = self.fg.ltypes[d].id == self.fg.ltypes[s0].id;
+                if cand[d] != cand[s0] || (cand[d] && !same) {
+                    if cand[d] || cand[s0] { changed = true; }
+                    cand[d] = false;
+                    cand[s0] = false;
+                }
+            }
+        }
+        i = 0;
+        while i < n {
+            self.agg_of.push(-1);
+            i += 1;
+        }
+        i = 0;
+        while i < n {
+            if cand[i] && self.var_of[i] < 0 {
+                let t = self.fg.ltypes[i];
+                let (is_enum, vs) = self.agg_fields(t).unwrap();
+                let mut a = Agg { tag: -1, base: Vec::new(), vars: Vec::new(), two: Vec::new() };
+                if is_enum {
+                    a.tag = self.var_ty.len() as i64;
+                    self.var_ty.push(ssa::T_I64);
+                }
+                for fs in vs.iter() {
+                    a.base.push(a.vars.len());
+                    for ft in fs.iter() {
+                        let c = self.class(*ft);
+                        a.vars.push(self.var_ty.len());
+                        a.two.push(c.kind == C_TWO);
+                        self.var_ty.push(c.t0);
+                        if c.kind == C_TWO { self.var_ty.push(c.t1); }
+                    }
+                }
+                self.agg_of[i] = self.aggs.len() as i64;
+                self.aggs.push(a);
+            }
+            i += 1;
+        }
+        self.defs.resize(self.var_ty.len(), None);
+    }
+
+    /// The variable of a split local's field place (and whether it has two
+    /// words), or -1.
+    fn field_var(&self, pl: &Place) -> (i64, bool) {
+        let k = self.agg_of[pl.local];
+        if k < 0 { return (-1, false); }
+        let a = &self.aggs[k as usize];
+        let fi = if pl.proj.len() == 1 && pl.proj[0].kind == mir::P_FIELD {
+            a.base[0] + pl.proj[0].field
+        } else if pl.proj.len() == 2 && pl.proj[0].kind == mir::P_DOWNCAST && pl.proj[1].kind == mir::P_FIELD {
+            a.base[pl.proj[0].variant] + pl.proj[1].field
+        } else {
+            return (-1, false);
+        };
+        (a.vars[fi] as i64, a.two[fi])
+    }
+
+    /// A whole copy between split locals: every variable.
+    fn copy_agg(&mut self, d: usize, s0: usize) {
+        let ad = self.agg_of[d] as usize;
+        let as_ = self.agg_of[s0] as usize;
+        if self.aggs[ad].tag >= 0 {
+            let t = self.get_var(self.aggs[as_].tag as usize);
+            self.set_var(self.aggs[ad].tag as usize, t);
+        }
+        let mut i = 0;
+        while i < self.aggs[ad].vars.len() {
+            let w = if self.aggs[ad].two[i] { 2 } else { 1 };
+            let mut k = 0;
+            while k < w {
+                let x = self.get_var(self.aggs[as_].vars[i] + k);
+                self.set_var(self.aggs[ad].vars[i] + k, x);
+                k += 1;
+            }
+            i += 1;
+        }
+    }
+
     fn whole_var(&self, pl: &Place) -> i32 {
         if pl.proj.len() == 0 { self.var_of[pl.local] } else { -1 }
     }
@@ -575,6 +799,12 @@ impl Builder {
     /// The words of a register-class operand.
     fn operand(&mut self, op: &Operand, c: &Class) -> (&mut Value, Option<&mut Value>) {
         if op.kind == mir::OP_COPY {
+            let (fv, two) = self.field_var(&op.place);
+            if fv >= 0 {
+                let w0 = self.get_var(fv as usize);
+                if two { return (w0, Some(self.get_var(fv as usize + 1))); }
+                return (w0, None);
+            }
             let v = self.whole_var(&op.place);
             if v >= 0 {
                 let w0 = self.get_var(v as usize);
@@ -670,6 +900,12 @@ impl Builder {
 
     /// Assigns words to a place.
     fn assign_words(&mut self, pl: &Place, c: &Class, w0: &mut Value, w1: Option<&mut Value>) {
+        let (fv, _) = self.field_var(pl);
+        if fv >= 0 {
+            self.set_var(fv as usize, w0);
+            if let Some(x) = w1 { self.set_var(fv as usize + 1, x); }
+            return;
+        }
         let v = self.whole_var(pl);
         if v >= 0 {
             self.set_var(v as usize, w0);
@@ -709,6 +945,14 @@ impl Builder {
                 self.barrier(place);
             }
             Stmt::SetDiscr { place, variant } => {
+                if place.proj.len() == 0 && self.agg_of[place.local] >= 0 {
+                    let tag = self.aggs[self.agg_of[place.local] as usize].tag;
+                    if tag >= 0 {
+                        let t = self.cnst(ssa::T_I64, *variant as i64);
+                        self.set_var(tag as usize, t);
+                    }
+                    return;
+                }
                 let (p, ty, _) = self.addr(place);
                 let s = self.mem_op1(ssa::OP_SETDISCR, *variant as i64, p);
                 s.aux = ssa::Aux::Ty(ty);
@@ -777,6 +1021,10 @@ impl Builder {
     fn assign(&mut self, bi: usize, si: usize, place: &Place, rv: &Rvalue) {
         let dt = self.fg.place_type(place);
         if dt.kind == types::K_NEVER { return; }
+        if place.proj.len() == 0 && self.agg_of[place.local] >= 0 {
+            self.assign_agg(place.local, rv);
+            return;
+        }
         let c = self.class(dt);
         if c.kind == C_NONE { return; }
         match rv {
@@ -893,6 +1141,13 @@ impl Builder {
                 }
             }
             Rvalue::Discr(p) => {
+                if p.proj.len() == 0 && self.agg_of[p.local] >= 0 {
+                    let tag = self.aggs[self.agg_of[p.local] as usize].tag;
+                    let x = if tag >= 0 { self.get_var(tag as usize) } else { self.cnst(ssa::T_I64, 0) };
+                    let r = self.int_conv(x, false, 8, c.t0);
+                    self.assign_words(place, &c, r, None);
+                    return;
+                }
                 let (a, ty, _) = self.addr(p);
                 let m = self.mem();
                 let d = self.value2(ssa::OP_DISCR, c.t0, 0, a, m);
@@ -926,6 +1181,55 @@ impl Builder {
                 vt.aux = ssa::Aux::Rv(rv);
                 self.assign_words(place, &c, a, Some(vt));
             }
+        }
+    }
+
+    /// A whole assignment to a split local.
+    fn assign_agg(&mut self, l: usize, rv: &Rvalue) {
+        let k = self.agg_of[l] as usize;
+        match rv {
+            Rvalue::Use(x) => {
+                if x.kind == mir::OP_COPY {
+                    self.copy_agg(l, x.place.local);
+                    return;
+                }
+                // The zero value.
+                if self.aggs[k].tag >= 0 {
+                    let z = self.cnst(ssa::T_I64, 0);
+                    self.set_var(self.aggs[k].tag as usize, z);
+                }
+                let mut i = 0;
+                while i < self.aggs[k].vars.len() {
+                    let w = if self.aggs[k].two[i] { 2 } else { 1 };
+                    let mut j = 0;
+                    while j < w {
+                        let v = self.aggs[k].vars[i] + j;
+                        let z = self.cnst(self.var_ty[v], 0);
+                        self.set_var(v, z);
+                        j += 1;
+                    }
+                    i += 1;
+                }
+            }
+            Rvalue::Aggregate { variant, ops, .. } => {
+                let vi = if self.aggs[k].tag >= 0 { *variant } else { 0 };
+                if self.aggs[k].tag >= 0 {
+                    let t = self.cnst(ssa::T_I64, vi as i64);
+                    self.set_var(self.aggs[k].tag as usize, t);
+                }
+                let base = self.aggs[k].base[vi];
+                let mut i = 0;
+                while i < ops.len() {
+                    let v = self.aggs[k].vars[base + i];
+                    let two = self.aggs[k].two[base + i];
+                    let c = if two { Class { kind: C_TWO, t0: self.var_ty[v], t1: self.var_ty[v + 1] } } else { Class { kind: C_ONE, t0: self.var_ty[v], t1: ssa::T_VOID } };
+                    let (w0, w1) = self.operand(&ops[i], &c);
+                    self.set_var(v, w0);
+                    if let Some(x) = w1 { self.set_var(v + 1, x); }
+                    i += 1;
+                }
+            }
+            _ => self.failf(`${self.mf.name}: assignment to split local _${l}`),
         }
     }
 
@@ -1303,6 +1607,19 @@ fn all_zero(ops: &Vec<Operand>) -> bool {
         if !zero { return false; }
     }
     true
+}
+
+// A place used in part: a split candidate only through r.f or (r as V).f.
+fn agg_place(cand: &mut Vec<bool>, pl: &Place) {
+    if !cand[pl.local] { return; }
+    let n = pl.proj.len();
+    let ok = (n == 1 && pl.proj[0].kind == mir::P_FIELD) || (n == 2 && pl.proj[0].kind == mir::P_DOWNCAST && pl.proj[1].kind == mir::P_FIELD);
+    if !ok { cand[pl.local] = false; }
+}
+
+fn agg_op(cand: &mut Vec<bool>, x: &Operand) {
+    if x.kind != mir::OP_COPY { return; }
+    if x.place.proj.len() == 0 { cand[x.place.local] = false; } else { agg_place(cand, &x.place); }
 }
 
 fn mark_place(bad: &mut Vec<bool>, pl: &Place, as_ref: bool) {

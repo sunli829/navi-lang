@@ -1,0 +1,210 @@
+//! Reference forwarding: a local p assigned once `p = &r` (r a whole
+//! local) and otherwise only dereferenced has its places `(*p).x` read as
+//! `r.x`. Inlined methods take `self` this way (Range::next's &mut self), so
+//! the local they work on is then used only through its fields and can be
+//! split into variables (backend/ssagen).
+
+use crate::mir::*;
+
+/// Forwards f's single-assignment references to whole locals.
+pub fn forward_refs(f: &mut Func) {
+    let n = f.locals.len();
+    let mut defs: Vec<u32> = Vec::new();
+    defs.resize(n, 0);
+    let mut target: Vec<i64> = Vec::new();
+    target.resize(n, -1);
+    let mut bad: Vec<bool> = Vec::new();
+    bad.resize(n, false);
+    // Arguments and the result are defined outside.
+    let mut i = 0;
+    while i <= f.nargs && i < n {
+        bad[i] = true;
+        i += 1;
+    }
+    for b in f.blocks.iter() {
+        for st in b.stmts.iter() {
+            match st {
+                Stmt::Assign { place, rv } => {
+                    if place.proj.len() == 0 {
+                        defs[place.local] += 1;
+                        if let Rvalue::Ref { place: src, .. } = rv {
+                            if src.proj.len() == 0 && src.local != place.local { target[place.local] = src.local as i64; }
+                        }
+                    } else {
+                        use_place(&mut bad, place);
+                    }
+                    visit_rv(&mut bad, rv);
+                }
+                Stmt::SetDiscr { place, .. } => use_place(&mut bad, place),
+                Stmt::Box { local, .. } => bad[*local] = true,
+                Stmt::PushDefer { fn_op, args } => {
+                    use_op(&mut bad, fn_op);
+                    for a in args.iter() { use_op(&mut bad, a); }
+                }
+                _ => {}
+            }
+        }
+        match &b.term {
+            Term::Switch { x, .. } => use_op(&mut bad, x),
+            Term::Call { fn_op, args, dest, .. } => {
+                use_op(&mut bad, fn_op);
+                for a in args.iter() { use_op(&mut bad, a); }
+                if dest.proj.len() == 0 { bad[dest.local] = true; } else { use_place(&mut bad, dest); }
+            }
+            Term::Assert { cond, len, index, .. } => {
+                use_op(&mut bad, cond);
+                use_op(&mut bad, len);
+                use_op(&mut bad, index);
+            }
+            _ => {}
+        }
+    }
+    // The forwarded locals: one definition, a reference to a whole local
+    // that is not itself forwarded.
+    let mut fwd: Vec<i64> = Vec::new();
+    fwd.resize(n, -1);
+    let mut any = false;
+    i = 0;
+    while i < n {
+        if !bad[i] && defs[i] == 1 && target[i] >= 0 && f.locals[i].boxed == false {
+            fwd[i] = target[i];
+            any = true;
+        }
+        i += 1;
+    }
+    if !any { return; }
+    i = 0;
+    while i < n {
+        if fwd[i] >= 0 && fwd[fwd[i] as usize] >= 0 { fwd[i] = -1; }
+        i += 1;
+    }
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        if mentions(b, &fwd) {
+            let mut stmts: Vec<Stmt> = Vec::new();
+            for st in b.stmts.iter() {
+                // The reference itself is no longer read.
+                if let Stmt::Assign { place, .. } = st {
+                    if place.proj.len() == 0 && fwd[place.local] >= 0 { continue; }
+                }
+                stmts.push(map_stmt(st, &fwd));
+            }
+            f.blocks[bi] = &mut Block { stmts, term: map_term(&b.term, &fwd) };
+        }
+        bi += 1;
+    }
+}
+
+// A place read or written in part: fine if it dereferences first.
+fn use_place(bad: &mut Vec<bool>, p: &Place) {
+    if p.proj.len() == 0 || p.proj[0].kind != P_DEREF { bad[p.local] = true; }
+}
+
+fn use_op(bad: &mut Vec<bool>, x: &Operand) {
+    if x.kind == OP_COPY { use_place(bad, &x.place); }
+}
+
+fn visit_rv(bad: &mut Vec<bool>, rv: &Rvalue) {
+    match rv {
+        Rvalue::Use(x) | Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => use_op(bad, x),
+        Rvalue::Bin { x, y, .. } => {
+            use_op(bad, x);
+            use_op(bad, y);
+        }
+        Rvalue::Ref { place, .. } | Rvalue::Discr(place) | Rvalue::Len(place) => use_place(bad, place),
+        Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { use_op(bad, o); } }
+    }
+}
+
+fn place_hit(p: &Place, fwd: &Vec<i64>) -> bool { p.proj.len() > 0 && fwd[p.local] >= 0 }
+
+fn op_hit(x: &Operand, fwd: &Vec<i64>) -> bool { x.kind == OP_COPY && place_hit(&x.place, fwd) }
+
+fn mentions(b: &Block, fwd: &Vec<i64>) -> bool {
+    for st in b.stmts.iter() {
+        match st {
+            Stmt::Assign { place, rv } => {
+                if place_hit(place, fwd) || (place.proj.len() == 0 && fwd[place.local] >= 0) { return true; }
+                match rv {
+                    Rvalue::Use(x) | Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => if op_hit(x, fwd) { return true; },
+                    Rvalue::Bin { x, y, .. } => if op_hit(x, fwd) || op_hit(y, fwd) { return true; },
+                    Rvalue::Ref { place: p, .. } | Rvalue::Discr(p) | Rvalue::Len(p) => if place_hit(p, fwd) { return true; },
+                    Rvalue::Aggregate { ops, .. } => { for o in ops.iter() { if op_hit(o, fwd) { return true; } } }
+                }
+            }
+            Stmt::SetDiscr { place, .. } => if place_hit(place, fwd) { return true; },
+            Stmt::PushDefer { fn_op, args } => {
+                if op_hit(fn_op, fwd) { return true; }
+                for a in args.iter() { if op_hit(a, fwd) { return true; } }
+            }
+            _ => {}
+        }
+    }
+    match &b.term {
+        Term::Switch { x, .. } => op_hit(x, fwd),
+        Term::Call { fn_op, args, dest, .. } => {
+            if op_hit(fn_op, fwd) || place_hit(dest, fwd) { return true; }
+            for a in args.iter() { if op_hit(a, fwd) { return true; } }
+            false
+        }
+        Term::Assert { cond, len, index, .. } => op_hit(cond, fwd) || op_hit(len, fwd) || op_hit(index, fwd),
+        _ => false,
+    }
+}
+
+/// (*p).rest as r.rest.
+fn map_place(p: &Place, fwd: &Vec<i64>) -> Place {
+    if !place_hit(p, fwd) { return p.clone(); }
+    let mut ps: Vec<Proj> = Vec::new();
+    let mut i = 1;
+    while i < p.proj.len() {
+        ps.push(p.proj[i].clone());
+        i += 1;
+    }
+    Place { local: fwd[p.local] as usize, proj: ps }
+}
+
+fn map_op(x: &Operand, fwd: &Vec<i64>) -> Operand {
+    if !op_hit(x, fwd) { return x.clone(); }
+    copy(map_place(&x.place, fwd))
+}
+
+fn map_ops(xs: &Vec<Operand>, fwd: &Vec<i64>) -> Vec<Operand> {
+    let mut out: Vec<Operand> = Vec::new();
+    for x in xs.iter() { out.push(map_op(x, fwd)); }
+    out
+}
+
+fn map_rv(rv: &Rvalue, fwd: &Vec<i64>) -> Rvalue {
+    match rv {
+        Rvalue::Use(x) => Rvalue::Use(map_op(x, fwd)),
+        Rvalue::Ref { is_mut, place } => Rvalue::Ref { is_mut: *is_mut, place: map_place(place, fwd) },
+        Rvalue::Bin { op, x, y, ty, pos } => Rvalue::Bin { op: *op, x: map_op(x, fwd), y: map_op(y, fwd), ty: *ty, pos: *pos },
+        Rvalue::Un { op, x, ty, pos } => Rvalue::Un { op: *op, x: map_op(x, fwd), ty: *ty, pos: *pos },
+        Rvalue::Cast { kind, x, from, to } => Rvalue::Cast { kind: *kind, x: map_op(x, fwd), from: *from, to: *to },
+        Rvalue::Aggregate { kind, ty, variant, ops, closure } => Rvalue::Aggregate { kind: *kind, ty: *ty, variant: *variant, ops: map_ops(ops, fwd), closure: *closure },
+        Rvalue::Discr(p) => Rvalue::Discr(map_place(p, fwd)),
+        Rvalue::Len(p) => Rvalue::Len(map_place(p, fwd)),
+        Rvalue::Unsize { x, len, to } => Rvalue::Unsize { x: map_op(x, fwd), len: *len, to: *to },
+        Rvalue::MakeDyn { x, concrete, to } => Rvalue::MakeDyn { x: map_op(x, fwd), concrete: *concrete, to: *to },
+    }
+}
+
+fn map_stmt(st: &Stmt, fwd: &Vec<i64>) -> Stmt {
+    match st {
+        Stmt::Assign { place, rv } => Stmt::Assign { place: map_place(place, fwd), rv: map_rv(rv, fwd) },
+        Stmt::SetDiscr { place, variant } => Stmt::SetDiscr { place: map_place(place, fwd), variant: *variant },
+        Stmt::PushDefer { fn_op, args } => Stmt::PushDefer { fn_op: map_op(fn_op, fwd), args: map_ops(args, fwd) },
+        _ => st.clone(),
+    }
+}
+
+fn map_term(t: &Term, fwd: &Vec<i64>) -> Term {
+    match t {
+        Term::Switch { x, ty, vals, targets, els } => Term::Switch { x: map_op(x, fwd), ty: *ty, vals: vals.clone(), targets: targets.clone(), els: *els },
+        Term::Call { fn_op, args, dest, target, pos } => Term::Call { fn_op: map_op(fn_op, fwd), args: map_ops(args, fwd), dest: map_place(dest, fwd), target: *target, pos: *pos },
+        Term::Assert { cond, msg, target, pos, bounds, len, index } => Term::Assert { cond: map_op(cond, fwd), msg: msg.clone(), target: *target, pos: *pos, bounds: *bounds, len: map_op(len, fwd), index: map_op(index, fwd) },
+        _ => t.clone(),
+    }
+}
