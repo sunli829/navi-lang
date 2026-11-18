@@ -1166,7 +1166,7 @@ impl Gen {
             if let Some(d) = f.def { self.cur_lines.push((0, d.pos)); }
         }
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
-            res_off: 0, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
+            res_off: 0, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), preg2: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
             frame: 0, buf_top: 0 };
         fg.gen();
         fg.stack_meta();
@@ -1219,6 +1219,9 @@ struct FnGen {
     stub_list: Vec<Stub>,
     /// The register of each local kept in one (-1: in the frame).
     preg: Vec<i64>,
+    /// The second register of a promoted fat pointer (its length or
+    /// vtable), or -1.
+    preg2: Vec<i64>,
     /// The saved registers used, with their save slots.
     saved: Vec<(Reg, i64)>,
     /// conc's results, by type id.
@@ -1367,7 +1370,12 @@ impl FnGen {
         while ai <= f.nargs {
             if self.preg[ai] >= 0 {
                 let sz = self.size(self.ltypes[ai]);
-                m.load(sz, self.preg[ai] as Reg, FP, self.loff[ai]);
+                if self.preg2[ai] >= 0 {
+                    m.load(8, self.preg[ai] as Reg, FP, self.loff[ai]);
+                    m.load(8, self.preg2[ai] as Reg, FP, self.loff[ai] + 8);
+                } else {
+                    m.load(sz, self.preg[ai] as Reg, FP, self.loff[ai]);
+                }
             }
             ai += 1;
         }
@@ -1445,6 +1453,23 @@ impl FnGen {
     fn promoted(&self, pl: &Place) -> Option<Reg> {
         if pl.proj.len() == 0 && self.preg[pl.local] >= 0 { return Some(self.preg[pl.local] as Reg); }
         None
+    }
+
+    /// The second register of a promoted fat pointer local.
+    fn promoted2(&self, pl: &Place) -> Option<Reg> {
+        if pl.proj.len() == 0 && self.preg2[pl.local] >= 0 { return Some(self.preg2[pl.local] as Reg); }
+        None
+    }
+
+    /// Stores a promoted local's registers (one or two words) at base + off.
+    fn store_promoted(&mut self, pl: &Place, size: i64, base: Reg, off: i64) {
+        let pr = self.promoted(pl).unwrap();
+        if let Some(p2) = self.promoted2(pl) {
+            self.m.store(8, pr, base, off);
+            self.m.store(8, p2, base, off + 8);
+        } else {
+            self.m.store(size, pr, base, off);
+        }
     }
 
 
@@ -1572,10 +1597,11 @@ impl FnGen {
         let mut i = 0;
         while i < n {
             self.preg.push(-1);
+            self.preg2.push(-1);
             let t = self.ltypes[i];
             let k = t.kind;
             let scalar = k == types::K_INT && layout::int_size(t.int) <= 8 || k == types::K_BOOL || k == types::K_CHAR || k == types::K_FLOAT
-                || (k == types::K_REF || k == types::K_PTR) && !layout::is_fat(t.el()) || k == types::K_FN && t.abi == "C";
+                || k == types::K_REF || k == types::K_PTR || k == types::K_FN && t.abi == "C";
             lv.lo.push(-1);
             lv.hi.push(-1);
             lv.bad.push(!scalar);
@@ -1751,6 +1777,7 @@ impl FnGen {
                 let a = active[j];
                 if lv.hi[a] < lv.lo[cur] {
                     free.push(self.preg[a] as Reg);
+                    if self.preg2[a] >= 0 { free.push(self.preg2[a] as Reg); }
                 } else {
                     active[kept] = a;
                     kept += 1;
@@ -1758,6 +1785,20 @@ impl FnGen {
                 j += 1;
             }
             active.truncate(kept);
+            // A fat pointer takes two registers, or stays in memory.
+            let t = self.ltypes[cur];
+            if (t.kind == types::K_REF || t.kind == types::K_PTR) && layout::is_fat(t.el()) {
+                if free.len() >= 2 {
+                    let reg = free.pop().unwrap();
+                    let reg2 = free.pop().unwrap();
+                    self.preg[cur] = reg as i64;
+                    self.preg2[cur] = reg2 as i64;
+                    used[(reg - S0) as usize] = true;
+                    used[(reg2 - S0) as usize] = true;
+                    active.push(cur);
+                }
+                continue;
+            }
             if free.len() > 0 {
                 let reg = free.pop().unwrap();
                 self.preg[cur] = reg as i64;
@@ -1775,6 +1816,10 @@ impl FnGen {
             if lv.hi[victim] > lv.hi[cur] {
                 self.preg[cur] = self.preg[victim];
                 self.preg[victim] = -1;
+                if self.preg2[victim] >= 0 {
+                    free.push(self.preg2[victim] as Reg);
+                    self.preg2[victim] = -1;
+                }
                 active[far] = cur;
             }
         }
@@ -1843,20 +1888,27 @@ impl FnGen {
         let mut ty = self.ltypes[pl.local];
         let mut variant = -1i64;
         let mut first = true;
+        let mut pi = 0;
         for pr in pl.proj.iter() {
+            pi += 1;
+            // The metadata of an unsized place (in RM) is needed only where
+            // the place ends.
+            let last = pi == pl.proj.len();
             if first && self.preg[pl.local] >= 0 {
-                // A promoted pointer: its register is the base.
+                // A promoted pointer: its register is the base (and a fat
+                // one's second register the metadata).
                 first = false;
                 base = self.preg[pl.local] as Reg;
                 off = 0;
                 ty = self.reveal(ty.el());
+                if last && self.preg2[pl.local] >= 0 { m.mov(RM, self.preg2[pl.local] as Reg); }
                 continue;
             }
             first = false;
             match pr.kind {
                 mir::P_DEREF => {
                     let elem = self.reveal(ty.el());
-                    if layout::is_fat(elem) { m.load(8, RM, base, off + 8); }
+                    if layout::is_fat(elem) && last { m.load(8, RM, base, off + 8); }
                     m.load(8, RA, base, off);
                     base = RA;
                     off = 0;
@@ -1874,13 +1926,24 @@ impl FnGen {
                 }
                 _ => {
                     let elem = self.reveal(ty.el());
-                    self.materialize(base, off);
+                    // A register base is used as is.
+                    let b = if off == 0 && base != FP { base } else {
+                        self.materialize(base, off);
+                        RA
+                    };
+                    let ix = if self.preg[pr.index] >= 0 { self.preg[pr.index] as Reg } else {
+                        m.load(8, I1, FP, self.loff[pr.index]);
+                        I1
+                    };
+                    let es = self.size(elem);
+                    if es == 1 || es == 2 || es == 4 || es == 8 {
+                        m.add_scaled(RA, b, ix, if es == 1 { 0 } else if es == 2 { 1 } else if es == 4 { 2 } else { 3 });
+                    } else {
+                        m.mov_imm(I2, es);
+                        m.mul_add(RA, ix, I2, b);
+                    }
                     base = RA;
                     off = 0;
-                    if self.preg[pr.index] >= 0 { m.mov(I1, self.preg[pr.index] as Reg); } else { m.load(8, I1, FP, self.loff[pr.index]); }
-                    let es = self.size(elem);
-                    m.mov_imm(I2, es);
-                    m.mul_add(RA, I1, I2, RA);
                     ty = elem;
                 }
             }
@@ -2013,6 +2076,11 @@ impl FnGen {
             return;
         }
         if op.kind == mir::OP_COPY {
+            if let Some(p2) = self.promoted2(&op.place) {
+                m.mov(V1, self.preg[op.place.local] as Reg);
+                m.mov(V2, p2);
+                return;
+            }
             let (b, o, _) = self.place_addr(&op.place);
             m.load(8, V1, b, o);
             m.load(8, V2, b, o + 8);
@@ -2089,8 +2157,8 @@ impl FnGen {
         if op.kind == mir::OP_CONST && op.cnst.unwrap().kind == mir::C_FN && ty.kind == types::K_FN && ty.abi == "C" { size = 8; }
         if size == 0 { return; }
         if op.kind == mir::OP_COPY {
-            if let Some(pr) = self.promoted(&op.place) {
-                m.store(size, pr, dst, off);
+            if self.promoted(&op.place).is_some() {
+                self.store_promoted(&op.place, size, dst, off);
                 return;
             }
             let (b, o, _) = self.place_addr(&op.place);
@@ -2155,7 +2223,12 @@ impl FnGen {
     fn store_regs(&mut self, pl: &Place, size: i64) {
         let m = self.m;
         if let Some(pr) = self.promoted(pl) {
-            if size > 0 { m.zero_ext(pr, V1, size); }
+            if let Some(p2) = self.promoted2(pl) {
+                m.mov(pr, V1);
+                m.mov(p2, V2);
+            } else if size > 0 {
+                m.zero_ext(pr, V1, size);
+            }
             return;
         }
         let (b, o, _) = self.place_addr(pl);
@@ -2377,7 +2450,15 @@ impl FnGen {
                 self.copy_mem(b, o, BASE, 0, size);
             }
             Rvalue::Ref { place: src, .. } => {
-                let pt = self.place(src);
+                let (b, o, pt) = self.place_addr(src);
+                // A promoted thin pointer takes the address directly.
+                if !layout::is_fat(pt) && o > -4096 && o < 4096 {
+                    if let Some(pd) = self.promoted(place) {
+                        m.addr_of(pd, b, o);
+                        return;
+                    }
+                }
+                self.materialize(b, o);
                 m.mov(V1, RA);
                 if layout::is_fat(pt) { m.mov(V2, RM); }
                 self.store_regs(place, size);
@@ -2404,7 +2485,11 @@ impl FnGen {
                 if pt.kind == types::K_ARRAY {
                     m.mov_imm(V1, pt.len);
                 } else {
-                    self.place(p);
+                    self.place_addr(p);
+                    if let Some(pd) = self.promoted(place) {
+                        m.mov(pd, RM);
+                        return;
+                    }
                     m.mov(V1, RM);
                 }
                 self.store_regs(place, size);
@@ -2897,7 +2982,7 @@ impl FnGen {
                 if size > 0 {
                     m.load(8, BASE, FP, SLOT_RET);
                     if self.preg[0] >= 0 {
-                        m.store(size, self.preg[0] as Reg, BASE, 0);
+                        self.store_promoted(&mir::local_place(0), size, BASE, 0);
                     } else {
                         self.local_addr(RA, 0);
                         self.copy_mem(BASE, 0, RA, 0, size);
@@ -3044,7 +3129,12 @@ impl FnGen {
         let size = self.size(dt);
         if size > 0 {
             if let Some(pr) = self.promoted(dest) {
-                m.load(size, pr, FP, self.res_off);
+                if let Some(p2) = self.promoted2(dest) {
+                    m.load(8, pr, FP, self.res_off);
+                    m.load(8, p2, FP, self.res_off + 8);
+                } else {
+                    m.load(size, pr, FP, self.res_off);
+                }
             } else {
                 let (b, o, _) = self.place_addr(dest);
                 self.copy_mem(b, o, FP, self.res_off, size);
