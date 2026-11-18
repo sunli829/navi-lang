@@ -1,18 +1,27 @@
-//! Reference forwarding: a local p assigned once `p = &r` (r a whole
-//! local) and otherwise only dereferenced has its places `(*p).x` read as
-//! `r.x`. Inlined methods take `self` this way (Range::next's &mut self), so
+//! Reference forwarding: a local p assigned once `p = &r` (r a local and
+//! fields or variants of it: a fixed place) and otherwise only dereferenced
+//! has its places `(*p).x` read as `r.x`. Inlined methods take `self` this way (Range::next's &mut self), so
 //! the local they work on is then used only through its fields and can be
 //! split into variables (backend/ssagen).
 
 use crate::mir::*;
 
-/// Forwards f's single-assignment references to whole locals.
-pub fn forward_refs(f: &mut Func) {
+/// Forwards f's single-assignment references to fixed places, until none
+/// is left (forwarding one can make another's place fixed: &(*p).f).
+pub fn forward_refs(f: &mut Func) -> bool {
+    let mut k = 0;
+    while k < 4 && forward_once(f) { k += 1; }
+    k > 0
+}
+
+fn forward_once(f: &mut Func) -> bool {
     let n = f.locals.len();
     let mut defs: Vec<u32> = Vec::new();
     defs.resize(n, 0);
     let mut target: Vec<i64> = Vec::new();
     target.resize(n, -1);
+    let mut tplace: Vec<Option<Place>> = Vec::new();
+    tplace.resize(n, None);
     let mut bad: Vec<bool> = Vec::new();
     bad.resize(n, false);
     // Arguments and the result are defined outside.
@@ -28,7 +37,10 @@ pub fn forward_refs(f: &mut Func) {
                     if place.proj.len() == 0 {
                         defs[place.local] += 1;
                         if let Rvalue::Ref { place: src, .. } = rv {
-                            if src.proj.len() == 0 && src.local != place.local { target[place.local] = src.local as i64; }
+                            if fixed(src) && src.local != place.local {
+                                target[place.local] = src.local as i64;
+                                tplace[place.local] = Some(src.clone());
+                            }
                         }
                     } else {
                         use_place(&mut bad, place);
@@ -72,7 +84,7 @@ pub fn forward_refs(f: &mut Func) {
         }
         i += 1;
     }
-    if !any { return; }
+    if !any { return false; }
     i = 0;
     while i < n {
         if fwd[i] >= 0 && fwd[fwd[i] as usize] >= 0 { fwd[i] = -1; }
@@ -88,12 +100,13 @@ pub fn forward_refs(f: &mut Func) {
                 if let Stmt::Assign { place, .. } = st {
                     if place.proj.len() == 0 && fwd[place.local] >= 0 { continue; }
                 }
-                stmts.push(map_stmt(st, &fwd));
+                stmts.push(map_stmt(st, &fwd, &tplace));
             }
-            f.blocks[bi] = &mut Block { stmts, term: map_term(&b.term, &fwd) };
+            f.blocks[bi] = &mut Block { stmts, term: map_term(&b.term, &fwd, &tplace) };
         }
         bi += 1;
     }
+    true
 }
 
 // A place read or written in part: fine if it dereferences first.
@@ -153,10 +166,19 @@ fn mentions(b: &Block, fwd: &Vec<i64>) -> bool {
     }
 }
 
-/// (*p).rest as r.rest.
-fn map_place(p: &Place, fwd: &Vec<i64>) -> Place {
+// A place at a fixed address: a local and fields or variants of it.
+fn fixed(p: &Place) -> bool {
+    for pr in p.proj.iter() {
+        if pr.kind != P_FIELD && pr.kind != P_DOWNCAST { return false; }
+    }
+    true
+}
+
+/// (*p).rest as r.path.rest.
+fn map_place(p: &Place, fwd: &Vec<i64>, tp: &Vec<Option<Place>>) -> Place {
     if !place_hit(p, fwd) { return p.clone(); }
     let mut ps: Vec<Proj> = Vec::new();
+    for pr in tp[p.local].unwrap().proj.iter() { ps.push(pr.clone()); }
     let mut i = 1;
     while i < p.proj.len() {
         ps.push(p.proj[i].clone());
@@ -165,46 +187,46 @@ fn map_place(p: &Place, fwd: &Vec<i64>) -> Place {
     Place { local: fwd[p.local] as usize, proj: ps }
 }
 
-fn map_op(x: &Operand, fwd: &Vec<i64>) -> Operand {
+fn map_op(x: &Operand, fwd: &Vec<i64>, tp: &Vec<Option<Place>>) -> Operand {
     if !op_hit(x, fwd) { return x.clone(); }
-    copy(map_place(&x.place, fwd))
+    copy(map_place(&x.place, fwd, tp))
 }
 
-fn map_ops(xs: &Vec<Operand>, fwd: &Vec<i64>) -> Vec<Operand> {
+fn map_ops(xs: &Vec<Operand>, fwd: &Vec<i64>, tp: &Vec<Option<Place>>) -> Vec<Operand> {
     let mut out: Vec<Operand> = Vec::new();
-    for x in xs.iter() { out.push(map_op(x, fwd)); }
+    for x in xs.iter() { out.push(map_op(x, fwd, tp)); }
     out
 }
 
-fn map_rv(rv: &Rvalue, fwd: &Vec<i64>) -> Rvalue {
+fn map_rv(rv: &Rvalue, fwd: &Vec<i64>, tp: &Vec<Option<Place>>) -> Rvalue {
     match rv {
-        Rvalue::Use(x) => Rvalue::Use(map_op(x, fwd)),
-        Rvalue::Ref { is_mut, place } => Rvalue::Ref { is_mut: *is_mut, place: map_place(place, fwd) },
-        Rvalue::Bin { op, x, y, ty, pos } => Rvalue::Bin { op: *op, x: map_op(x, fwd), y: map_op(y, fwd), ty: *ty, pos: *pos },
-        Rvalue::Un { op, x, ty, pos } => Rvalue::Un { op: *op, x: map_op(x, fwd), ty: *ty, pos: *pos },
-        Rvalue::Cast { kind, x, from, to } => Rvalue::Cast { kind: *kind, x: map_op(x, fwd), from: *from, to: *to },
-        Rvalue::Aggregate { kind, ty, variant, ops, closure } => Rvalue::Aggregate { kind: *kind, ty: *ty, variant: *variant, ops: map_ops(ops, fwd), closure: *closure },
-        Rvalue::Discr(p) => Rvalue::Discr(map_place(p, fwd)),
-        Rvalue::Len(p) => Rvalue::Len(map_place(p, fwd)),
-        Rvalue::Unsize { x, len, to } => Rvalue::Unsize { x: map_op(x, fwd), len: *len, to: *to },
-        Rvalue::MakeDyn { x, concrete, to } => Rvalue::MakeDyn { x: map_op(x, fwd), concrete: *concrete, to: *to },
+        Rvalue::Use(x) => Rvalue::Use(map_op(x, fwd, tp)),
+        Rvalue::Ref { is_mut, place } => Rvalue::Ref { is_mut: *is_mut, place: map_place(place, fwd, tp) },
+        Rvalue::Bin { op, x, y, ty, pos } => Rvalue::Bin { op: *op, x: map_op(x, fwd, tp), y: map_op(y, fwd, tp), ty: *ty, pos: *pos },
+        Rvalue::Un { op, x, ty, pos } => Rvalue::Un { op: *op, x: map_op(x, fwd, tp), ty: *ty, pos: *pos },
+        Rvalue::Cast { kind, x, from, to } => Rvalue::Cast { kind: *kind, x: map_op(x, fwd, tp), from: *from, to: *to },
+        Rvalue::Aggregate { kind, ty, variant, ops, closure } => Rvalue::Aggregate { kind: *kind, ty: *ty, variant: *variant, ops: map_ops(ops, fwd, tp), closure: *closure },
+        Rvalue::Discr(p) => Rvalue::Discr(map_place(p, fwd, tp)),
+        Rvalue::Len(p) => Rvalue::Len(map_place(p, fwd, tp)),
+        Rvalue::Unsize { x, len, to } => Rvalue::Unsize { x: map_op(x, fwd, tp), len: *len, to: *to },
+        Rvalue::MakeDyn { x, concrete, to } => Rvalue::MakeDyn { x: map_op(x, fwd, tp), concrete: *concrete, to: *to },
     }
 }
 
-fn map_stmt(st: &Stmt, fwd: &Vec<i64>) -> Stmt {
+fn map_stmt(st: &Stmt, fwd: &Vec<i64>, tp: &Vec<Option<Place>>) -> Stmt {
     match st {
-        Stmt::Assign { place, rv } => Stmt::Assign { place: map_place(place, fwd), rv: map_rv(rv, fwd) },
-        Stmt::SetDiscr { place, variant } => Stmt::SetDiscr { place: map_place(place, fwd), variant: *variant },
-        Stmt::PushDefer { fn_op, args } => Stmt::PushDefer { fn_op: map_op(fn_op, fwd), args: map_ops(args, fwd) },
+        Stmt::Assign { place, rv } => Stmt::Assign { place: map_place(place, fwd, tp), rv: map_rv(rv, fwd, tp) },
+        Stmt::SetDiscr { place, variant } => Stmt::SetDiscr { place: map_place(place, fwd, tp), variant: *variant },
+        Stmt::PushDefer { fn_op, args } => Stmt::PushDefer { fn_op: map_op(fn_op, fwd, tp), args: map_ops(args, fwd, tp) },
         _ => st.clone(),
     }
 }
 
-fn map_term(t: &Term, fwd: &Vec<i64>) -> Term {
+fn map_term(t: &Term, fwd: &Vec<i64>, tp: &Vec<Option<Place>>) -> Term {
     match t {
-        Term::Switch { x, ty, vals, targets, els } => Term::Switch { x: map_op(x, fwd), ty: *ty, vals: vals.clone(), targets: targets.clone(), els: *els },
-        Term::Call { fn_op, args, dest, target, pos } => Term::Call { fn_op: map_op(fn_op, fwd), args: map_ops(args, fwd), dest: map_place(dest, fwd), target: *target, pos: *pos },
-        Term::Assert { cond, msg, target, pos, bounds, len, index } => Term::Assert { cond: map_op(cond, fwd), msg: msg.clone(), target: *target, pos: *pos, bounds: *bounds, len: map_op(len, fwd), index: map_op(index, fwd) },
+        Term::Switch { x, ty, vals, targets, els } => Term::Switch { x: map_op(x, fwd, tp), ty: *ty, vals: vals.clone(), targets: targets.clone(), els: *els },
+        Term::Call { fn_op, args, dest, target, pos } => Term::Call { fn_op: map_op(fn_op, fwd, tp), args: map_ops(args, fwd, tp), dest: map_place(dest, fwd, tp), target: *target, pos: *pos },
+        Term::Assert { cond, msg, target, pos, bounds, len, index } => Term::Assert { cond: map_op(cond, fwd, tp), msg: msg.clone(), target: *target, pos: *pos, bounds: *bounds, len: map_op(len, fwd, tp), index: map_op(index, fwd, tp) },
         _ => t.clone(),
     }
 }

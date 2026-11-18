@@ -695,7 +695,12 @@ impl Builder {
                 Term::Call { fn_op, args, dest, .. } => {
                     agg_op(&mut cand, fn_op);
                     for a in args.iter() { agg_op(&mut cand, a); }
-                    if dest.proj.len() == 0 { cand[dest.local] = false; } else { agg_place(&mut cand, dest); }
+                    if dest.proj.len() == 0 {
+                        // From the result buffer, field by field.
+                        if cand[dest.local] && !self.loadable(self.fg.ltypes[dest.local]) { cand[dest.local] = false; }
+                    } else {
+                        agg_place(&mut cand, dest);
+                    }
                 }
                 Term::Assert { cond, len, index, .. } => {
                     agg_op(&mut cand, cond);
@@ -751,6 +756,53 @@ impl Builder {
             i += 1;
         }
         self.defs.resize(self.var_ty.len(), None);
+    }
+
+    /// Whether a split local of type t may be loaded from memory: every
+    /// variant's fields read (enums: the inactive ones' bits too, so no
+    /// pointers among them).
+    fn loadable(&mut self, t: &Type) -> bool {
+        let (is_enum, vs) = match self.agg_fields(t) { Some(x) => x, None => return false };
+        if !is_enum { return true; }
+        for fs in vs.iter() {
+            for ft in fs.iter() {
+                let c = self.class(*ft);
+                if c.t0 == ssa::T_PTR || c.t1 == ssa::T_PTR { return false; }
+            }
+        }
+        true
+    }
+
+    /// Loads a split local from memory at p (its type's layout).
+    fn load_agg(&mut self, l: usize, p: &mut Value) {
+        let t = self.fg.ltypes[l];
+        let k = self.agg_of[l] as usize;
+        let (is_enum, vs) = self.agg_fields(t).unwrap();
+        if is_enum {
+            let m = self.mem();
+            let d = self.value2(ssa::OP_DISCR, ssa::T_I64, 0, p, m);
+            d.aux = ssa::Aux::Ty(t);
+            self.set_var(self.aggs[k].tag as usize, d);
+        }
+        let mut vi = 0;
+        while vi < vs.len() {
+            let mut fi = 0;
+            while fi < vs[vi].len() {
+                let (off, _) = self.fg.field_of(t, if is_enum { vi as i64 } else { -1 }, fi);
+                let idx = self.aggs[k].base[vi] + fi;
+                let v = self.aggs[k].vars[idx];
+                let q = self.off_ptr(p, off);
+                let w0 = self.load(self.var_ty[v], q);
+                self.set_var(v, w0);
+                if self.aggs[k].two[idx] {
+                    let q1 = self.off_ptr(p, off + 8);
+                    let w1 = self.load(self.var_ty[v + 1], q1);
+                    self.set_var(v + 1, w1);
+                }
+                fi += 1;
+            }
+            vi += 1;
+        }
     }
 
     /// The variable of a split local's field place (and whether it has two
@@ -1576,6 +1628,10 @@ impl Builder {
     /// Copies the call result buffer to dest.
     fn result_to(&mut self, dest: &Place, dt: &Type, dc: &Class) {
         let r = self.value0(ssa::OP_RESADDR, ssa::T_PTR, 0);
+        if dest.proj.len() == 0 && self.agg_of[dest.local] >= 0 {
+            self.load_agg(dest.local, r);
+            return;
+        }
         if dc.kind == C_MEM {
             let size = self.fg.size(dt);
             let (p, _, _) = self.addr(dest);
