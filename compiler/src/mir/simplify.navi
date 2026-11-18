@@ -1,0 +1,133 @@
+//! Control-flow cleanup: jumps through empty blocks go straight to their
+//! target, a block that is the only way into the next one absorbs it, and
+//! blocks that cannot be reached are dropped (the rest renumbered in
+//! order). Blocks may be shared with other functions (inlining copies the
+//! list), so changed ones are new blocks.
+
+use crate::mir::*;
+
+fn targets(t: &Term) -> Vec<usize> {
+    let mut v = Vec::new();
+    match t {
+        Term::Goto(b) => v.push(*b),
+        Term::Switch { targets, els, .. } => {
+            for b in targets.iter() { v.push(*b); }
+            v.push(*els);
+        }
+        Term::Call { target, .. } => if *target >= 0 { v.push(*target as usize); },
+        Term::Assert { target, .. } => v.push(*target),
+        _ => {}
+    }
+    v
+}
+
+// t with each target b replaced by m(b).
+fn retarget(t: &Term, m: &Vec<usize>) -> Term {
+    match t {
+        Term::Goto(b) => Term::Goto(m[*b]),
+        Term::Switch { x, ty, vals, targets, els } => {
+            let mut ts = Vec::new();
+            for b in targets.iter() { ts.push(m[*b]); }
+            Term::Switch { x: x.clone(), ty: *ty, vals: vals.clone(), targets: ts, els: m[*els] }
+        }
+        Term::Call { fn_op, args, dest, target, pos } => {
+            let tg = if *target >= 0 { m[*target as usize] as i64 } else { *target };
+            Term::Call { fn_op: fn_op.clone(), args: args.clone(), dest: dest.clone(), target: tg, pos: *pos }
+        }
+        Term::Assert { cond, msg, target, pos, bounds, len, index } => Term::Assert { cond: cond.clone(), msg: msg.clone(), target: m[*target], pos: *pos, bounds: *bounds, len: len.clone(), index: index.clone() },
+        _ => t.clone(),
+    }
+}
+
+/// Simplifies f's blocks in place.
+pub fn simplify(f: &mut Func) {
+    let n = f.blocks.len();
+    if n == 0 { return; }
+    // Where a jump to each block ends up: through empty blocks that only
+    // jump on (a cycle of them stays).
+    let mut dest: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let mut b = i;
+        let mut hops = 0;
+        while hops < 16 {
+            let blk = f.blocks[b];
+            if blk.stmts.len() != 0 { break; }
+            match &blk.term {
+                Term::Goto(c) => if *c == b { break; } else { b = *c; },
+                _ => break,
+            }
+            hops += 1;
+        }
+        dest.push(b);
+        i += 1;
+    }
+    let mut blocks: Vec<&mut Block> = Vec::new();
+    i = 0;
+    while i < n {
+        let blk = f.blocks[i];
+        blocks.push(&mut Block { stmts: blk.stmts.clone(), term: retarget(&blk.term, &dest) });
+        i += 1;
+    }
+    // Merging: a block ending in a jump to a block nothing else enters.
+    let mut preds: Vec<usize> = Vec::new();
+    preds.resize(n, 0);
+    for b in blocks.iter() {
+        for t in targets(&b.term).iter() { preds[*t] += 1; }
+    }
+    let mut dead: Vec<bool> = Vec::new();
+    dead.resize(n, false);
+    i = 0;
+    while i < n {
+        if !dead[i] {
+            loop {
+                let next = match &blocks[i].term {
+                    Term::Goto(c) => *c,
+                    _ => break,
+                };
+                if next == i || next == 0 || preds[next] != 1 || dead[next] { break; }
+                let nb = blocks[next];
+                let mut stmts = blocks[i].stmts.clone();
+                for s in nb.stmts.iter() { stmts.push(s.clone()); }
+                blocks[i] = &mut Block { stmts, term: nb.term.clone() };
+                dead[next] = true;
+            }
+        }
+        i += 1;
+    }
+    // Reachable blocks, renumbered in order.
+    let mut seen: Vec<bool> = Vec::new();
+    seen.resize(n, false);
+    let mut stack: Vec<usize> = Vec::new();
+    stack.push(0);
+    seen[0] = true;
+    while let Some(b) = stack.pop() {
+        for t in targets(&blocks[b].term).iter() {
+            if !seen[*t] {
+                seen[*t] = true;
+                stack.push(*t);
+            }
+        }
+    }
+    let mut num: Vec<usize> = Vec::new();
+    num.resize(n, 0);
+    let mut k = 0;
+    i = 0;
+    while i < n {
+        if seen[i] {
+            num[i] = k;
+            k += 1;
+        }
+        i += 1;
+    }
+    let mut out: Vec<&mut Block> = Vec::new();
+    i = 0;
+    while i < n {
+        if seen[i] {
+            let b = blocks[i];
+            out.push(&mut Block { stmts: b.stmts.clone(), term: retarget(&b.term, &num) });
+        }
+        i += 1;
+    }
+    f.blocks = out;
+}

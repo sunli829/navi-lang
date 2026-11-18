@@ -19,6 +19,9 @@ use crate::mir::*;
 /// Callees larger than this (statements plus terminators) are not inlined.
 const MAX_SIZE: usize = 6;
 const MAX_BLOCKS: usize = 3;
+/// The limits for functions marked #[inline].
+const HINT_SIZE: usize = 24;
+const HINT_BLOCKS: usize = 6;
 
 fn size(f: &Func) -> usize {
     let mut n = 0;
@@ -36,9 +39,25 @@ pub fn in_runtime(d: &Def) -> bool {
     false
 }
 
+// Whether d is marked #[inline] (not #[inline(never)]).
+fn inline_hint(d: &Def) -> bool {
+    let attrs = match &d.node { Node::Item(Item::Fn(f)) => f.base.attrs.clone(), _ => return false };
+    for a in attrs.iter() {
+        if a.path.segments.len() == 1 && a.path.segments[0].name.value == "inline" {
+            for t in a.args.iter() {
+                if t.text == "never" { return false; }
+            }
+            return true;
+        }
+    }
+    false
+}
+
 fn never_inline(d: &Def) -> bool {
     let attrs = match &d.node { Node::Item(Item::Fn(f)) => f.base.attrs.clone(), _ => return true };
-    if has_attr(&attrs, "track_caller") || has_attr(&attrs, "intrinsic") { return true; }
+    // #[track_caller] functions inline: the copy's positions are the call
+    // site's, which is the location they would report.
+    if has_attr(&attrs, "intrinsic") { return true; }
     for a in attrs.iter() {
         if a.path.segments.len() == 1 && a.path.segments[0].name.value == "inline" {
             for t in a.args.iter() {
@@ -60,7 +79,8 @@ fn leaf(f: &Func) -> bool {
 /// Whether f may be copied into its callers.
 fn inlinable(f: &Func) -> bool {
     let d = match f.def { Some(d) => d, None => return false };
-    if f.closure || f.shim || f.has_defer || f.blocks.len() > MAX_BLOCKS || size(f) > MAX_SIZE { return false; }
+    let (max_size, max_blocks) = if inline_hint(d) { (HINT_SIZE, HINT_BLOCKS) } else { (MAX_SIZE, MAX_BLOCKS) };
+    if f.closure || f.shim || f.has_defer || f.blocks.len() > max_blocks || size(f) > max_size { return false; }
     if d.kind != resolve::DEF_FN && d.kind != resolve::DEF_ASSOC_FN { return false; }
     if let Some(p) = d.parent {
         if p.kind == resolve::DEF_TRAIT { return false; }
@@ -192,7 +212,14 @@ impl Copier {
 }
 
 /// The function a call statically targets, if it may be inlined.
-fn target(t: &Term, by_def: &HashMap<u32, &mut Func>, ok: &HashMap<u32, bool>) -> Option<&mut Func> {
+fn concrete(t: &Type) -> bool {
+    let m = crate::types::lower::mentions;
+    !(m(t, types::K_INFER, false) || m(t, types::K_PARAM, false) || m(t, types::K_PROJ, false) || m(t, types::K_OPAQUE, false) || m(t, types::K_ERROR, false))
+}
+
+// The function a call runs and its generic arguments: a trait method on a
+// concrete type is its impl's method (v[i] is <Vec<T> as Index>::index).
+fn callee_of(info: &mut Info, t: &Term) -> Option<(&mut Def, Vec<&Type>)> {
     let fn_op = match t { Term::Call { fn_op, .. } => fn_op, _ => return None };
     if fn_op.kind != OP_CONST { return None; }
     let c = fn_op.cnst.unwrap();
@@ -200,8 +227,38 @@ fn target(t: &Term, by_def: &HashMap<u32, &mut Func>, ok: &HashMap<u32, bool>) -
     let r = c.fn_ref.unwrap();
     if r.closure.is_some() || r.ctor { return None; }
     let d = r.def?;
-    if !ok.contains_key(&d.id) { return None; }
-    match by_def.get(&d.id) { Some(f) => Some(*f), None => None }
+    let p = match d.parent {
+        Some(p) => p,
+        None => return Some((d, r.args.clone())),
+    };
+    if p.kind != resolve::DEF_TRAIT { return Some((d, r.args.clone())); }
+    let st = r.self_ty?;
+    if !concrete(st) { return None; }
+    for a in r.args.iter() {
+        if !concrete(*a) { return None; }
+    }
+    let inst = info.resolve_method(d, st, &r.args)?;
+    if inst.is_virtual || inst.builtin.len() > 0 || inst.derived.len() > 0 || inst.self_ty.is_some() { return None; }
+    Some((inst.def, inst.args.clone()))
+}
+
+// The resolved callees of the calls ending each block of each function
+// (by function index and block), when they may be inlined.
+fn plan_calls(info: &mut Info, funcs: &Vec<&mut Func>, by_def: &HashMap<u32, &mut Func>, ok: &HashMap<u32, bool>) -> HashMap<u64, (u32, Vec<&Type>)> {
+    let mut out: HashMap<u64, (u32, Vec<&Type>)> = HashMap::new();
+    let mut i = 0;
+    while i < funcs.len() {
+        let f = funcs[i];
+        let mut bi = 0;
+        while bi < f.blocks.len() {
+            if let Some((d, args)) = callee_of(info, &f.blocks[bi].term) {
+                if ok.contains_key(&d.id) && by_def.contains_key(&d.id) { out.insert((i as u64) << 32 | bi as u64, (d.id, args)); }
+            }
+            bi += 1;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Inlines the small direct callees of every function in funcs, callees
@@ -227,22 +284,28 @@ pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>) {
     }
     // The calls to inline, and the levels: a cycle of calls (a component)
     // is one above the highest of the components it calls.
+    let calls = plan_calls(info, funcs, &by_def, &ok);
     let mut skip: Vec<bool> = Vec::new();
     let mut deps: Vec<Vec<usize>> = Vec::new();
+    let mut fi = 0;
     for f in funcs.iter() {
         let caller = *f;
         let mut ds: Vec<usize> = Vec::new();
         // Runtime functions only get leaves.
         let rt = match caller.def { Some(d) => in_runtime(d), None => false };
         skip.push(false);
-        for b in caller.blocks.iter() {
-            if let Some(callee) = target(&b.term, &by_def, &ok) {
+        let mut bi = 0;
+        while bi < caller.blocks.len() {
+            if let Some((did, _)) = calls.get(&((fi as u64) << 32 | bi as u64)) {
+                let callee = by_def[did];
                 if callee.id != caller.id && (!rt || leaf(callee)) {
                     if let Some(j) = index.get(&callee.id) { ds.push(*j); }
                 }
             }
+            bi += 1;
         }
         deps.push(ds);
+        fi += 1;
     }
     let comps = crate::mir::escape::components(&deps);
     let mut comp_of: Vec<usize> = Vec::new();
@@ -281,8 +344,9 @@ pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>) {
             let n = body.blocks.len();
             let mut bi = 0;
             while bi < n {
-                if let Some(callee) = target(&body.blocks[bi].term, &by_def, &ok) {
-                    if callee.id != caller.id && (!rt || leaf(callee)) { inline_call(info, body, bi, callee); }
+                if let Some((did, args)) = calls.get(&((lv[k] as u64) << 32 | bi as u64)) {
+                    let callee = by_def[did];
+                    if callee.id != caller.id && (!rt || leaf(callee)) { inline_call(info, body, bi, callee, args); }
                 }
                 bi += 1;
             }
@@ -307,19 +371,18 @@ struct Body {
 }
 
 /// Replaces the call ending block bi of the body with a copy of callee.
-fn inline_call(info: &mut Info, body: &mut Body, bi: usize, callee: &Func) {
+fn inline_call(info: &mut Info, body: &mut Body, bi: usize, callee: &Func, targs: &Vec<&Type>) {
     let call = body.blocks[bi];
-    let (fn_op, args, dest, target, pos) = match &call.term {
-        Term::Call { fn_op, args, dest, target, pos } => (fn_op.clone(), args.clone(), dest.clone(), *target, *pos),
+    let (args, dest, target, pos) = match &call.term {
+        Term::Call { args, dest, target, pos, .. } => (args.clone(), dest.clone(), *target, *pos),
         _ => return,
     };
-    let r = fn_op.cnst.unwrap().fn_ref.unwrap();
-    let d = r.def.unwrap();
+    let d = callee.def.unwrap();
     let mut m: ParamMap = HashMap::new();
     let all = info.generics_of(d).all();
     let mut i = 0;
-    while i < all.len() && i < r.args.len() {
-        m.insert(all[i].def.id, r.args[i]);
+    while i < all.len() && i < targs.len() {
+        m.insert(all[i].def.id, targs[i]);
         i += 1;
     }
     let cp = &Copier { ctx: Some(info.ctx), m, base: body.locals.len(), block_base: body.blocks.len(), pos };

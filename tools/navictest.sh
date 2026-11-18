@@ -38,6 +38,14 @@ for f in tests/run/*.navi; do
 	if [ "$got_warn" != "$want_warn" ]; then
 		echo "FAIL $f (warnings)"; cat "$tmp/$n.build"; fail=1; continue
 	fi
+	# // stderr: text must appear in what the program writes to stderr.
+	err_ok=1
+	grep -E '^// stderr:' "$f" | sed -E 's#^// stderr: ?##' > "$tmp/$n.want_err"
+	while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		grep -qF -- "$line" "$tmp/$n.err" || { echo "FAIL $f (stderr lacks: $line)"; cat "$tmp/$n.err"; err_ok=0; }
+	done < "$tmp/$n.want_err"
+	if [ "$err_ok" = 0 ]; then fail=1; continue; fi
 	if [ "$got_out" = "$want_out" ] && [ "$code" = "$want_code" ]; then
 		echo "ok   $f"
 	else
