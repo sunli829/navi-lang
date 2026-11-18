@@ -39,6 +39,21 @@ pub fn in_runtime(d: &Def) -> bool {
     false
 }
 
+// Whether d is marked #[inline(always)]: inlined whatever its size (small
+// generic code that is large before its calls become operations, like
+// Range::next).
+fn inline_always(d: &Def) -> bool {
+    let attrs = match &d.node { Node::Item(Item::Fn(f)) => f.base.attrs.clone(), _ => return false };
+    for a in attrs.iter() {
+        if a.path.segments.len() == 1 && a.path.segments[0].name.value == "inline" {
+            for t in a.args.iter() {
+                if t.text == "always" { return true; }
+            }
+        }
+    }
+    false
+}
+
 // Whether d is marked #[inline] (not #[inline(never)]).
 fn inline_hint(d: &Def) -> bool {
     let attrs = match &d.node { Node::Item(Item::Fn(f)) => f.base.attrs.clone(), _ => return false };
@@ -79,7 +94,7 @@ fn leaf(f: &Func) -> bool {
 /// Whether f may be copied into its callers.
 fn inlinable(f: &Func) -> bool {
     let d = match f.def { Some(d) => d, None => return false };
-    let (max_size, max_blocks) = if inline_hint(d) { (HINT_SIZE, HINT_BLOCKS) } else { (MAX_SIZE, MAX_BLOCKS) };
+    let (max_size, max_blocks) = if inline_always(d) { (1000, 1000) } else if inline_hint(d) { (HINT_SIZE, HINT_BLOCKS) } else { (MAX_SIZE, MAX_BLOCKS) };
     if f.closure || f.shim || f.has_defer || f.blocks.len() > max_blocks || size(f) > max_size { return false; }
     if d.kind != resolve::DEF_FN && d.kind != resolve::DEF_ASSOC_FN { return false; }
     if let Some(p) = d.parent {
@@ -244,10 +259,16 @@ fn callee_of(info: &mut Info, t: &Term) -> Option<(&mut Def, Vec<&Type>)> {
 
 // The resolved callees of the calls ending each block of each function
 // (by function index and block), when they may be inlined.
-fn plan_calls(info: &mut Info, funcs: &Vec<&mut Func>, by_def: &HashMap<u32, &mut Func>, ok: &HashMap<u32, bool>) -> HashMap<u64, (u32, Vec<&Type>)> {
+fn plan_calls(info: &mut Info, funcs: &Vec<&mut Func>, by_def: &HashMap<u32, &mut Func>, ok: &HashMap<u32, bool>, only: Option<&Vec<bool>>) -> HashMap<u64, (u32, Vec<&Type>)> {
     let mut out: HashMap<u64, (u32, Vec<&Type>)> = HashMap::new();
     let mut i = 0;
     while i < funcs.len() {
+        if let Some(o) = only {
+            if !o[i] {
+                i += 1;
+                continue;
+            }
+        }
         let f = funcs[i];
         let mut bi = 0;
         while bi < f.blocks.len() {
@@ -268,7 +289,10 @@ fn plan_calls(info: &mut Info, funcs: &Vec<&mut Func>, by_def: &HashMap<u32, &mu
 /// and locals from the bodies as they were before the level; then they are
 /// installed. Within a cycle of calls the copies are of bodies not inlined
 /// into yet (so mutually recursive callees end).
-pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>) {
+/// only: the callers to look at (all if none). Returns the callers that
+/// got code inlined (for another round: calls in that code may have become
+/// concrete).
+pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>, only: Option<&Vec<bool>>) -> Vec<bool> {
     let mut by_def: HashMap<u32, &mut Func> = HashMap::new();
     let mut index: HashMap<u32, usize> = HashMap::new();
     let mut ok: HashMap<u32, bool> = HashMap::new();
@@ -284,7 +308,10 @@ pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>) {
     }
     // The calls to inline, and the levels: a cycle of calls (a component)
     // is one above the highest of the components it calls.
-    let calls = plan_calls(info, funcs, &by_def, &ok);
+    let calls = plan_calls(info, funcs, &by_def, &ok, only);
+    let mut changed: Vec<bool> = Vec::new();
+    changed.resize(funcs.len(), false);
+    for k in calls.keys() { changed[(*k >> 32) as usize] = true; }
     let mut skip: Vec<bool> = Vec::new();
     let mut deps: Vec<Vec<usize>> = Vec::new();
     let mut fi = 0;
@@ -361,6 +388,7 @@ pub fn inline_program(info: &mut Info, funcs: &Vec<&mut Func>) {
         }
     }
     info.ctx.par = false;
+    changed
 }
 
 // A caller's blocks and locals while calls are inlined (the function

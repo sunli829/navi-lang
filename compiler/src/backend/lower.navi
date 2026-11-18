@@ -3845,6 +3845,8 @@ fn fused_compare(b: &mir::Block, refs: &Vec<u32>) -> bool {
 struct Loc {
     /// 0: register, 1: stack slot (FP offset), 2: made where used.
     kind: u8,
+    /// A floating point value.
+    fp: bool,
     reg: Reg,
     off: i64,
     val: Option<&mut crate::ssa::Value>,
@@ -3864,13 +3866,16 @@ impl FnGen {
 
     /// The register holding v as an operand: its own, else scratch (made or
     /// loaded there).
-    fn ssa_in(&mut self, v: &crate::ssa::Value, scratch: Reg) -> Reg {
+    fn ssa_in(&mut self, v: &crate::ssa::Value, scratch0: Reg) -> Reg {
         let id = v.id as usize;
         let r = self.ssa_alloc.reg[id];
         if r >= 0 { return r as Reg; }
+        // Floats: scratch V2 or F1 means F1, others F0.
+        let fp = crate::ssa::is_float(v.ty);
+        let scratch = if !fp { scratch0 } else if scratch0 == V2 || scratch0 == F1 { F1 } else { F0 };
         let s = self.ssa_alloc.slot[id];
         if s >= 0 {
-            self.m.load(8, scratch, FP, self.ssa_slot_off(s));
+            if fp { self.m.fload(8, scratch, FP, self.ssa_slot_off(s)); } else { self.m.load(8, scratch, FP, self.ssa_slot_off(s)); }
             return scratch;
         }
         self.ssa_remat(v, scratch);
@@ -3883,19 +3888,33 @@ impl FnGen {
     /// to its slot by ssa_out).
     fn ssa_dst(&self, v: &crate::ssa::Value, scratch: Reg) -> Reg {
         let r = self.ssa_alloc.reg[v.id as usize];
-        if r >= 0 { r as Reg } else { scratch }
+        if r >= 0 { r as Reg } else if crate::ssa::is_float(v.ty) { F0 } else { scratch }
     }
 
     fn ssa_out(&mut self, v: &crate::ssa::Value, r: Reg) {
         let s = self.ssa_alloc.slot[v.id as usize];
-        if s >= 0 { self.m.store(8, r, FP, self.ssa_slot_off(s)); }
+        if s >= 0 {
+            if crate::ssa::is_float(v.ty) { self.m.fstore(8, r, FP, self.ssa_slot_off(s)); } else { self.m.store(8, r, FP, self.ssa_slot_off(s)); }
+        }
+    }
+
+    /// Stores a value's register (of its class) at base + off.
+    fn ssa_store_word(&mut self, v: &crate::ssa::Value, r: Reg, size: i64, base: Reg, off: i64) {
+        if crate::ssa::is_float(v.ty) { self.m.fstore(size, r, base, off); } else { self.m.store(size, r, base, off); }
     }
 
     /// Makes a value that has no register in r.
     fn ssa_remat(&mut self, v: &crate::ssa::Value, r: Reg) {
         let m = self.m;
         match v.op {
-            crate::ssa::OP_CONST => m.mov_imm(r, v.aux_int),
+            crate::ssa::OP_CONST => {
+                if crate::ssa::is_float(v.ty) {
+                    m.mov_imm(T1, v.aux_int);
+                    m.fmov_to(r, T1, v.ty == crate::ssa::T_F64);
+                } else {
+                    m.mov_imm(r, v.aux_int);
+                }
+            }
             crate::ssa::OP_LOCALADDR => m.addr_of(r, FP, self.loff[v.aux_int as usize]),
             crate::ssa::OP_RESADDR => m.addr_of(r, FP, self.res_off),
             crate::ssa::OP_CONSTPARAM => {
@@ -3971,10 +3990,10 @@ impl FnGen {
                 self.copy_mem(FP, at, RA, 0, size);
             } else {
                 let w0 = self.ssa_in(v.args[*ai], V1);
-                m.store(if words == 1 { size } else { 8 }, w0, FP, at);
+                self.ssa_store_word(v.args[*ai], w0, if words == 1 { size } else { 8 }, FP, at);
                 if words == 2 {
                     let w1 = self.ssa_in(v.args[*ai + 1], V1);
-                    m.store(8, w1, FP, at + 8);
+                    self.ssa_store_word(v.args[*ai + 1], w1, 8, FP, at + 8);
                 }
             }
             *ai += nargs;
@@ -4056,6 +4075,7 @@ impl FnGen {
             let d = crate::ssa::dom::dominators(sf);
             crate::ssa::opt::cse(sf, d);
             crate::ssa::opt::prove(sf, d);
+            crate::ssa::opt::licm(sf);
         }
         if let Some(t) = t1 { crate::backend::ssagen::add_time(1, t.elapsed().as_nanos() as u64); }
         let t2 = if self.g.ssa_time { Some(std::time::Instant::now()) } else { None };
@@ -4063,9 +4083,13 @@ impl FnGen {
         crate::ssa::prep::fold_offsets(sf);
         crate::ssa::deadcode(sf);
         let fused = crate::ssa::prep::fuse_compares(sf);
-        // arm64: x1-x7 besides the saved registers; amd64 has only the
-        // saved ones to spare.
+        // Registers calls clobber: CTX, RET and LOC (set only right before
+        // calls; their values are in the frame's fixed slots), and on arm64
+        // x1-x7.
         let mut caller: Vec<u8> = Vec::new();
+        caller.push(CTX);
+        caller.push(RET);
+        caller.push(LOC);
         let mut k = 0;
         while k < NUM_A && self.g.tgt.code_unit == 4 {
             caller.push(A1 + k as Reg);
@@ -4077,7 +4101,14 @@ impl FnGen {
             callee.push(S0 + k as Reg);
             k += 1;
         }
-        let cfg = &crate::ssa::regalloc::Config { caller, callee };
+        let mut fregs: Vec<u8> = Vec::new();
+        let nf = if self.g.tgt.code_unit == 4 { NUM_FA_ARM64 } else { NUM_FA_AMD64 };
+        k = 0;
+        while k < nf {
+            fregs.push(FA1 + k as Reg);
+            k += 1;
+        }
+        let cfg = &crate::ssa::regalloc::Config { caller, callee, fregs };
         crate::ssa::regalloc::allocate(sf, cfg, &fused, self.g.ssa_ra);
         self.ssa_alloc = self.g.ssa_ra;
         if let Some(t) = t2 { crate::backend::ssagen::add_time(2, t.elapsed().as_nanos() as u64); }
@@ -4200,8 +4231,53 @@ impl FnGen {
         for _ in sf.blocks.iter() { labels.push(m.new_label()); }
         let mut call_no = 0i64;
         let nb = sf.blocks.len();
-        let mut bi = 0;
-        while bi < nb {
+        // Layout: jumps through empty blocks (no values, no phi moves) go
+        // straight on; blocks that end in a panic come last (cold).
+        let mut to: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < nb {
+            to.push(i);
+            i += 1;
+        }
+        i = 0;
+        while i < nb {
+            let b = sf.blocks[i];
+            if b.kind == crate::ssa::B_PLAIN && b.values.len() == 0 && b.id != sf.entry.unwrap().id {
+                let s = b.succs[0];
+                let mut phis = false;
+                for v in s.values.iter() { if v.op == crate::ssa::OP_PHI { phis = true; } }
+                if !phis && s.id as usize != i { to[i] = s.id as usize; }
+            }
+            i += 1;
+        }
+        i = 0;
+        while i < nb {
+            // Follow chains (a cycle of empty blocks stays put).
+            let mut t = to[i];
+            let mut hops = 0;
+            while to[t] != t && hops < nb {
+                t = to[t];
+                hops += 1;
+            }
+            if hops >= nb { t = i; }
+            to[i] = t;
+            i += 1;
+        }
+        let mut order: Vec<usize> = Vec::new();
+        let mut cold: Vec<usize> = Vec::new();
+        i = 0;
+        while i < nb {
+            let b = sf.blocks[i];
+            if to[i] == i {
+                let panics = b.kind == crate::ssa::B_EXIT && b.control.unwrap().op == crate::ssa::OP_PANIC;
+                if panics && i != 0 { cold.push(i); } else { order.push(i); }
+            }
+            i += 1;
+        }
+        for c in cold.iter() { order.push(*c); }
+        let mut oi = 0;
+        while oi < order.len() {
+            let bi = order[oi];
             let b = sf.blocks[bi];
             m.bind(labels[bi]);
             for vv in b.values.iter() {
@@ -4216,32 +4292,33 @@ impl FnGen {
                 if fused[v.id as usize] { continue; }
                 self.ssa_value(v);
             }
-            let next = if bi + 1 < nb { sf.blocks[bi + 1].id as i64 } else { -1 };
+            let next = if oi + 1 < order.len() { order[oi + 1] as i64 } else { -1 };
             match b.kind {
                 crate::ssa::B_PLAIN => {
                     let s = b.succs[0];
                     self.ssa_phi_moves(b, s);
-                    if s.id as i64 != next { m.jump(labels[s.id as usize]); }
+                    let t = to[s.id as usize];
+                    if t as i64 != next { m.jump(labels[t]); }
                 }
                 crate::ssa::B_IF => {
                     let c = b.control.unwrap();
-                    let yes = b.succs[0];
-                    let no = b.succs[1];
+                    let yes = to[b.succs[0].id as usize];
+                    let no = to[b.succs[1].id as usize];
                     if fused[c.id as usize] {
                         let cond = self.ssa_compare(c);
-                        if yes.id as i64 == next {
-                            m.branch_if(invert(cond), labels[no.id as usize]);
+                        if yes as i64 == next {
+                            m.branch_if(invert(cond), labels[no]);
                         } else {
-                            m.branch_if(cond, labels[yes.id as usize]);
-                            if no.id as i64 != next { m.jump(labels[no.id as usize]); }
+                            m.branch_if(cond, labels[yes]);
+                            if no as i64 != next { m.jump(labels[no]); }
                         }
                     } else {
                         let r = self.ssa_in(c, V1);
-                        if yes.id as i64 == next {
-                            m.branch_zero(r, labels[no.id as usize]);
+                        if yes as i64 == next {
+                            m.branch_zero(r, labels[no]);
                         } else {
-                            m.branch_non_zero(r, labels[yes.id as usize]);
-                            if no.id as i64 != next { m.jump(labels[no.id as usize]); }
+                            m.branch_non_zero(r, labels[yes]);
+                            if no as i64 != next { m.jump(labels[no]); }
                         }
                     }
                 }
@@ -4251,7 +4328,7 @@ impl FnGen {
                     if c.op != crate::ssa::OP_PANIC { m.trap(); }
                 }
             }
-            bi += 1;
+            oi += 1;
         }
         self.emit_stubs();
         if let Some(t) = t3 { crate::backend::ssagen::add_time(3, t.elapsed().as_nanos() as u64); }
@@ -4300,15 +4377,40 @@ impl FnGen {
     /// The location of v for moves.
     fn ssa_loc(&self, v: &mut crate::ssa::Value) -> Loc {
         let id = v.id as usize;
+        let fp = crate::ssa::is_float(v.ty);
         let r = self.ssa_alloc.reg[id];
-        if r >= 0 { return Loc { kind: 0, reg: r as Reg, off: 0, val: None }; }
+        if r >= 0 { return Loc { kind: 0, fp, reg: r as Reg, off: 0, val: None }; }
         let s = self.ssa_alloc.slot[id];
-        if s >= 0 { return Loc { kind: 1, reg: 0, off: self.ssa_slot_off(s), val: None }; }
-        Loc { kind: 2, reg: 0, off: 0, val: Some(v) }
+        if s >= 0 { return Loc { kind: 1, fp, reg: 0, off: self.ssa_slot_off(s), val: None }; }
+        Loc { kind: 2, fp, reg: 0, off: 0, val: Some(v) }
     }
 
     fn ssa_move(&mut self, dst: &Loc, src: &Loc) {
         let m = self.m;
+        if dst.fp {
+            // Slots hold 8 bytes; slot to slot copies the bits.
+            if dst.kind == 0 {
+                match src.kind {
+                    0 => m.fmov(dst.reg, src.reg),
+                    1 => m.fload(8, dst.reg, FP, src.off),
+                    _ => self.ssa_remat(src.val.unwrap(), dst.reg),
+                }
+                return;
+            }
+            match src.kind {
+                0 => m.fstore(8, src.reg, FP, dst.off),
+                1 => {
+                    m.load(8, T1, FP, src.off);
+                    m.store(8, T1, FP, dst.off);
+                }
+                _ => {
+                    let c = src.val.unwrap();
+                    m.mov_imm(T1, c.aux_int);
+                    m.store(8, T1, FP, dst.off);
+                }
+            }
+            return;
+        }
         if dst.kind == 0 {
             match src.kind {
                 0 => m.mov(dst.reg, src.reg),
@@ -4372,8 +4474,8 @@ impl FnGen {
                 i += 1;
             }
             if done { continue; }
-            // A cycle: park the first source in I1.
-            let t = Loc { kind: 0, reg: I1, off: 0, val: None };
+            // A cycle: park the first source in I1 (floats: F0).
+            let t = if srcs[0].fp { Loc { kind: 0, fp: true, reg: F0, off: 0, val: None } } else { Loc { kind: 0, fp: false, reg: I1, off: 0, val: None } };
             let first = srcs[0].clone();
             self.ssa_move(&t, &first);
             let mut j = 0;
@@ -4399,14 +4501,18 @@ impl FnGen {
                     m.mov(d, CTX);
                 } else {
                     let size = if w == 0 && !self.ssa_two(v) { self.size(self.ltypes[l]) } else { 8 };
-                    m.load(if size > 8 { 8 } else { size }, d, FP, self.loff[l] + 8 * w);
+                    let sz = if size > 8 { 8 } else { size };
+                    if crate::ssa::is_float(v.ty) { m.fload(sz, d, FP, self.loff[l] + 8 * w); } else { m.load(sz, d, FP, self.loff[l] + 8 * w); }
                 }
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_COPY | crate::ssa::OP_RETYPE | crate::ssa::OP_ZEXT => {
                 let a = self.ssa_in(v.args[0], V1);
                 let d = self.ssa_dst(v, V1);
-                if a != d { m.mov(d, a); }
+                let fa = crate::ssa::is_float(v.args[0].ty);
+                let fd = crate::ssa::is_float(v.ty);
+                if fa && fd { m.fmov(d, a); } else if fa { m.fmov_from(d, a, v.args[0].ty == crate::ssa::T_F64); }
+                else if fd { m.fmov_to(d, a, v.ty == crate::ssa::T_F64); } else if a != d { m.mov(d, a); }
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_CONST | crate::ssa::OP_LOCALADDR | crate::ssa::OP_RESADDR | crate::ssa::OP_CONSTSYM | crate::ssa::OP_CONSTPARAM
@@ -4480,34 +4586,27 @@ impl FnGen {
             }
             crate::ssa::OP_FADD | crate::ssa::OP_FSUB | crate::ssa::OP_FMUL | crate::ssa::OP_FDIV => {
                 let f64_ = v.ty == crate::ssa::T_F64;
-                let a = self.ssa_in(v.args[0], V1);
-                let b = self.ssa_in(v.args[1], V2);
-                m.fmov_to(F0, a, f64_);
-                m.fmov_to(F1, b, f64_);
+                let a = self.ssa_in(v.args[0], F0);
+                let b = self.ssa_in(v.args[1], F1);
                 let fop = match op { crate::ssa::OP_FADD => ADD, crate::ssa::OP_FSUB => SUB, crate::ssa::OP_FMUL => MUL, _ => FDIV };
-                m.farith(fop, F0, F0, F1, f64_);
-                let d = self.ssa_dst(v, V1);
-                m.fmov_from(d, F0, f64_);
+                let d = self.ssa_dst(v, F0);
+                m.farith(fop, d, a, b, f64_);
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_FNEG => {
                 let f64_ = v.ty == crate::ssa::T_F64;
-                let a = self.ssa_in(v.args[0], V1);
-                m.fmov_to(F0, a, f64_);
-                m.fneg(F0, F0, f64_);
-                let d = self.ssa_dst(v, V1);
-                m.fmov_from(d, F0, f64_);
+                let a = self.ssa_in(v.args[0], F0);
+                let d = self.ssa_dst(v, F0);
+                m.fneg(d, a, f64_);
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_FEQ | crate::ssa::OP_FNE | crate::ssa::OP_FLT | crate::ssa::OP_FLE => {
                 let f64_ = v.args[0].ty == crate::ssa::T_F64;
-                let a = self.ssa_in(v.args[0], V1);
-                let b = self.ssa_in(v.args[1], V2);
-                m.fmov_to(F0, a, f64_);
-                m.fmov_to(F1, b, f64_);
+                let a = self.ssa_in(v.args[0], F0);
+                let b = self.ssa_in(v.args[1], F1);
                 let c = match op { crate::ssa::OP_FEQ => EQ, crate::ssa::OP_FNE => NE, crate::ssa::OP_FLT => LT, _ => LE };
                 let d = self.ssa_dst(v, V1);
-                m.fcompare(d, c, F0, F1, f64_);
+                m.fcompare(d, c, a, b, f64_);
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_SEXT => {
@@ -4525,12 +4624,10 @@ impl FnGen {
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_FCONV => {
-                let a = self.ssa_in(v.args[0], V1);
+                let a = self.ssa_in(v.args[0], F0);
                 let to64 = v.ty == crate::ssa::T_F64;
-                m.fmov_to(F0, a, !to64);
-                m.float_conv(F0, F0, to64);
-                let d = self.ssa_dst(v, V1);
-                m.fmov_from(d, F0, to64);
+                let d = self.ssa_dst(v, F0);
+                m.float_conv(d, a, to64);
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_ITOF => {
@@ -4538,27 +4635,25 @@ impl FnGen {
                 let to64 = v.ty == crate::ssa::T_F64;
                 let signed = v.aux_int & 256 != 0;
                 let size = v.aux_int & 255;
+                let d = self.ssa_dst(v, F0);
                 if signed {
                     m.sign_ext(V1, a, size);
-                    m.int_to_float(F0, V1, true, to64);
+                    m.int_to_float(d, V1, true, to64);
                 } else {
-                    m.int_to_float(F0, a, false, to64);
+                    m.int_to_float(d, a, false, to64);
                 }
-                let d = self.ssa_dst(v, V1);
-                m.fmov_from(d, F0, to64);
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_FTOI => {
-                let a = self.ssa_in(v.args[0], V1);
+                let a = self.ssa_in(v.args[0], F0);
                 let from64 = v.args[0].ty == crate::ssa::T_F64;
                 let signed = v.aux_int & 256 != 0;
                 let size = crate::ssa::ty_size(v.ty);
-                m.fmov_to(F0, a, from64);
                 let d = self.ssa_dst(v, V1);
                 if size == 8 {
-                    m.float_to_int(d, F0, signed, from64);
+                    m.float_to_int(d, a, signed, from64);
                 } else {
-                    m.float_to_int(d, F0, true, from64);
+                    m.float_to_int(d, a, true, from64);
                     let (lo, hi) = if signed { (int_min(size), -int_min(size) - 1) } else { (0, (1i64 << (8 * size) as u32) - 1) };
                     m.mov_imm(V2, lo);
                     m.cmp(d, V2);
@@ -4573,13 +4668,13 @@ impl FnGen {
             crate::ssa::OP_LOAD => {
                 let (b, o) = self.ssa_addr(v.args[0], v.aux_int, V2);
                 let d = self.ssa_dst(v, V1);
-                m.load(crate::ssa::ty_size(v.ty), d, b, o);
+                if crate::ssa::is_float(v.ty) { m.fload(crate::ssa::ty_size(v.ty), d, b, o); } else { m.load(crate::ssa::ty_size(v.ty), d, b, o); }
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_STORE => {
                 let (b, o) = self.ssa_addr(v.args[0], v.aux_int, V2);
                 let x = self.ssa_in(v.args[1], V1);
-                m.store(crate::ssa::ty_size(v.args[1].ty), x, b, o);
+                self.ssa_store_word(v.args[1], x, crate::ssa::ty_size(v.args[1].ty), b, o);
             }
             crate::ssa::OP_MOVE => {
                 let d = self.ssa_in(v.args[0], BASE);
@@ -4642,7 +4737,7 @@ impl FnGen {
                     // environment in V2.
                     let src = if t.op == crate::ssa::OP_CLOSURE || v.aux_int == 1 { V2 } else { V1 };
                     let d = self.ssa_dst(v, V1);
-                    if d != src { m.mov(d, src); }
+                    if crate::ssa::is_float(v.ty) { m.fmov_to(d, src, v.ty == crate::ssa::T_F64); } else if d != src { m.mov(d, src); }
                     self.ssa_out(v, d);
                     return;
                 }
@@ -4686,18 +4781,18 @@ impl FnGen {
             }
             crate::ssa::OP_FREM => {
                 let f64_ = v.ty == crate::ssa::T_F64;
-                let a = self.ssa_in(v.args[0], V1);
-                m.store(8, a, SP, 0);
-                let b = self.ssa_in(v.args[1], V1);
-                m.store(8, b, SP, 8);
+                let a = self.ssa_in(v.args[0], F0);
+                m.fstore(8, a, SP, 0);
+                let b = self.ssa_in(v.args[1], F1);
+                m.fstore(8, b, SP, 8);
                 let name = if f64_ { "fmod" } else { "fmodf" };
                 let sym = self.g.extern_sym(name);
                 let mut cargs = Vec::new();
                 cargs.push(CArg { float: true, f64: f64_, variadic: false, size: if f64_ { 8 } else { 4 } });
                 cargs.push(CArg { float: true, f64: f64_, variadic: false, size: if f64_ { 8 } else { 4 } });
                 m.call_c(sym.as_str(), 0, &cargs, true, f64_);
-                let d = self.ssa_dst(v, V1);
-                if d != V1 { m.mov(d, V1); }
+                let d = self.ssa_dst(v, F0);
+                m.fmov_to(d, V1, f64_);
                 self.ssa_out(v, d);
             }
             crate::ssa::OP_PANIC => {
@@ -4724,10 +4819,10 @@ impl FnGen {
                 if nargs > 1 && size > 0 {
                     m.load(8, BASE, FP, SLOT_RET);
                     let w0 = self.ssa_in(v.args[0], V1);
-                    m.store(if nargs > 2 { 8 } else { size }, w0, BASE, 0);
+                    self.ssa_store_word(v.args[0], w0, if nargs > 2 { 8 } else { size }, BASE, 0);
                     if nargs > 2 {
                         let w1 = self.ssa_in(v.args[1], V1);
-                        m.store(8, w1, BASE, 8);
+                        self.ssa_store_word(v.args[1], w1, 8, BASE, 8);
                     }
                 }
                 m.load(8, CTX, FP, SLOT_DEFERS);
@@ -4916,14 +5011,14 @@ impl FnGen {
             }
             let w0 = v.args[ai];
             let r0 = self.ssa_in(w0, V1);
-            m.store(if words == 1 { size } else { 8 }, r0, SP, off);
+            self.ssa_store_word(w0, r0, if words == 1 { size } else { 8 }, SP, off);
             if words == 2 {
                 let w1 = v.args[ai + 1];
                 if i == 0 && thin_recv {
                     vtable = Some(w1);
                 } else {
                     let r1 = self.ssa_in(w1, V1);
-                    m.store(8, r1, SP, off + 8);
+                    self.ssa_store_word(w1, r1, 8, SP, off + 8);
                 }
             }
             ai += words as usize;
@@ -4949,7 +5044,11 @@ impl FnGen {
                     m.addr_of(RET, FP, self.res_off);
                     m.call_reg(BASE);
                 } else if tt.kind == codegen::T_VIRTUAL {
-                    let vt = self.ssa_in(vtable.unwrap(), V2);
+                    let mut vt = self.ssa_in(vtable.unwrap(), V2);
+                    if vt == CTX {
+                        m.mov(V2, vt);
+                        vt = V2;
+                    }
                     m.load(8, CTX, vt, (16 * tt.method + 8) as i64);
                     m.load(8, BASE, vt, (16 * tt.method) as i64);
                     self.pass_loc(pos);
@@ -5006,5 +5105,5 @@ impl FnGen {
 }
 
 fn same_loc(a: &Loc, b: &Loc) -> bool {
-    a.kind == b.kind && ((a.kind == 0 && a.reg == b.reg) || (a.kind == 1 && a.off == b.off))
+    a.kind == b.kind && a.fp == b.fp && ((a.kind == 0 && a.reg == b.reg) || (a.kind == 1 && a.off == b.off))
 }

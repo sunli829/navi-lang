@@ -263,3 +263,100 @@ fn add_fact(facts: &mut Vec<(u32, bool)>, c: &Value, t: bool) {
     facts.push((c.id, t));
     if c.op == OP_NOT && c.ty == T_BOOL { facts.push((c.args[0].id, !t)); }
 }
+
+/// Whether v may run where it was not going to (no panic, no memory).
+fn safe_anywhere(v: &Value) -> bool {
+    match v.op {
+        OP_CONST | OP_LOCALADDR | OP_RESADDR | OP_RETPTR | OP_OFFPTR | OP_INDEXPTR | OP_AND | OP_OR | OP_XOR | OP_NOT | OP_SEXT | OP_ZEXT
+            | OP_TRUNC | OP_RETYPE | OP_CONSTPARAM | OP_CONSTSYM | OP_VTABLE | OP_CLOSURECODE => true,
+        OP_ADD | OP_SUB | OP_MUL | OP_NEG => v.aux_int & 1 == 0,
+        _ => false,
+    }
+}
+
+/// Loop-invariant code motion (Go's tighten in reverse; a part of LLVM's
+/// LICM): values of a natural loop whose arguments come from outside it
+/// move to the loop's preheader. All of the header's pure values may move
+/// (the header runs whenever the loop is entered), loads included when
+/// their memory is from outside; elsewhere only values that cannot panic
+/// or read memory. Comparisons stay (they are fused into branches).
+pub fn licm(f: &mut Func) {
+    let d = dom::dominators(f);
+    let n = f.blocks.len();
+    let mut in_loop: Vec<bool> = Vec::new();
+    in_loop.resize(n, false);
+    let mut work: Vec<&mut Block> = Vec::new();
+    let mut outside: Vec<bool> = Vec::new();
+    for hh in d.rpo.iter() {
+        let h = *hh;
+        // Latches: predecessors the header dominates.
+        let mut latches = false;
+        for p in h.preds.iter() {
+            if d.order[p.id as usize] >= 0 && d.dominates(h.id, p.id) { latches = true; }
+        }
+        if !latches { continue; }
+        let mut k = 0;
+        while k < n {
+            in_loop[k] = false;
+            k += 1;
+        }
+        in_loop[h.id as usize] = true;
+        for p in h.preds.iter() {
+            if d.order[p.id as usize] >= 0 && d.dominates(h.id, p.id) && !in_loop[p.id as usize] {
+                in_loop[p.id as usize] = true;
+                work.push(*p);
+            }
+        }
+        while let Some(b) = work.pop() {
+            for p in b.preds.iter() {
+                if !in_loop[p.id as usize] && d.order[p.id as usize] >= 0 {
+                    in_loop[p.id as usize] = true;
+                    work.push(*p);
+                }
+            }
+        }
+        // The preheader: the one predecessor from outside, ending in a jump.
+        let mut pre: Option<&mut Block> = None;
+        let mut entries = 0;
+        for p in h.preds.iter() {
+            if !in_loop[p.id as usize] {
+                entries += 1;
+                pre = Some(*p);
+            }
+        }
+        if entries != 1 { continue; }
+        let ph = pre.unwrap();
+        if ph.kind != B_PLAIN { continue; }
+        // Blocks in dominator order, header first (arguments move before
+        // their uses).
+        outside.clear();
+        outside.resize(f.values.len(), false);
+        for bb in d.rpo.iter() {
+            let b = *bb;
+            if !in_loop[b.id as usize] { continue; }
+            let header = b.id == h.id;
+            let mut kept = 0;
+            let mut i = 0;
+            while i < b.values.len() {
+                let v = b.values[i];
+                let mut moves = (header && pure(v) || safe_anywhere(v)) && !(v.op == OP_EQ || v.op == OP_NE || v.op == OP_LT || v.op == OP_LE);
+                if moves {
+                    for a in v.args.iter() {
+                        let ab = a.block.unwrap();
+                        if in_loop[ab.id as usize] && !outside[a.id as usize] { moves = false; }
+                    }
+                }
+                if moves {
+                    outside[v.id as usize] = true;
+                    v.block = Some(ph);
+                    ph.values.push(v);
+                } else {
+                    b.values[kept] = v;
+                    kept += 1;
+                }
+                i += 1;
+            }
+            b.values.truncate(kept);
+        }
+    }
+}
