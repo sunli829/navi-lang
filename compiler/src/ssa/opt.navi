@@ -1,0 +1,252 @@
+//! Machine-independent optimizations: common subexpression elimination by
+//! value numbering over the dominator tree (Go's cse: loads take part with
+//! their memory, so two loads of one address with no store between are
+//! one), and branch facts (a small part of Go's prove: below the edge of a
+//! branch its condition is known; a branch on a known condition becomes a
+//! jump, which removes repeated bounds checks).
+
+use std::collections::HashMap;
+use crate::ssa::*;
+use crate::ssa::dom;
+
+/// Whether two values with the same operation and arguments are equal.
+fn pure(v: &Value) -> bool {
+    match v.op {
+        OP_CONST | OP_LOCALADDR | OP_RESADDR | OP_RETPTR | OP_OFFPTR | OP_INDEXPTR | OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_REM | OP_AND
+            | OP_OR | OP_XOR | OP_SHL | OP_SHR | OP_NEG | OP_NOT | OP_EQ | OP_NE | OP_LT | OP_LE | OP_FADD | OP_FSUB | OP_FMUL | OP_FDIV
+            | OP_FNEG | OP_FEQ | OP_FNE | OP_FLT | OP_FLE | OP_SEXT | OP_ZEXT | OP_TRUNC | OP_ITOF | OP_FTOI | OP_FCONV | OP_FBITS
+            | OP_FFROMBITS | OP_LOAD | OP_DISCR | OP_RETYPE | OP_CONSTPARAM | OP_CONSTSYM | OP_VTABLE | OP_CLOSURECODE => true,
+        _ => false,
+    }
+}
+
+fn aux_id(a: &Aux) -> u64 {
+    match a {
+        Aux::Ty(t) => (t.id as u64) << 2 | 1,
+        Aux::Cnst(c) => (c.id as u64) << 2 | 2,
+        Aux::None => 0,
+        // Statements and terms: never equal (their values are unique).
+        _ => 3,
+    }
+}
+
+fn same(a: &Value, b: &Value) -> bool {
+    if a.op != b.op || a.ty != b.ty || a.aux_int != b.aux_int || a.args.len() != b.args.len() { return false; }
+    let x = aux_id(&a.aux);
+    if x == 3 || x != aux_id(&b.aux) { return false; }
+    let mut i = 0;
+    while i < a.args.len() {
+        if a.args[i].id != b.args[i].id { return false; }
+        i += 1;
+    }
+    true
+}
+
+fn hash(v: &Value) -> u64 {
+    let mut h = (v.op as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (v.ty as u64) << 16 ^ (v.aux_int as u64).wrapping_mul(31) ^ aux_id(&v.aux).wrapping_mul(1000003);
+    for a in v.args.iter() { h = (h ^ a.id as u64).wrapping_mul(0x100000001B3); }
+    h
+}
+
+/// The blocks each block immediately dominates.
+fn children(f: &Func, d: &dom::Dom) -> Vec<Vec<&mut Block>> {
+    let mut ch: Vec<Vec<&mut Block>> = Vec::new();
+    for _ in f.blocks.iter() { ch.push(Vec::new()); }
+    for b in d.rpo.iter() {
+        let p = d.idom[b.id as usize];
+        if p >= 0 { ch[p as usize].push(*b); }
+    }
+    ch
+}
+
+/// Replaces values equal to one that dominates them with copies of it.
+pub fn cse(f: &mut Func) {
+    let d = dom::dominators(f);
+    let ch = children(f, d);
+    let mut table: HashMap<u64, Vec<&mut Value>> = HashMap::new();
+    // The values each open block added (popped when it is left).
+    let mut added: Vec<u64> = Vec::new();
+    // (block, marks): the walk, with where each block's additions start.
+    let mut stack: Vec<(&mut Block, usize, bool)> = Vec::new();
+    stack.push((f.entry.unwrap(), 0, false));
+    while let Some((b, mark, done)) = stack.pop() {
+        if done {
+            while added.len() > mark {
+                let h = added.pop().unwrap();
+                let l = table.get_mut(&h).unwrap();
+                l.pop();
+            }
+            continue;
+        }
+        let m = added.len();
+        stack.push((b, m, true));
+        for vv in b.values.iter() {
+            let v = *vv;
+            if !pure(v) { continue; }
+            // Arguments are already replaced (dominators come first).
+            let mut i = 0;
+            while i < v.args.len() {
+                let a = v.args[i];
+                if a.op == OP_COPY { v.set_arg(i, copy_source(a)); }
+                i += 1;
+            }
+            let h = hash(v);
+            let mut found: Option<&mut Value> = None;
+            match table.get(&h) {
+                Some(l) => {
+                    for w in l.iter() {
+                        if same(*w, v) {
+                            found = Some(*w);
+                            break;
+                        }
+                    }
+                }
+                None => {}
+            }
+            match found {
+                Some(w) => v.become_copy(w),
+                None => {
+                    match table.get_mut(&h) {
+                        Some(l) => l.push(v),
+                        None => {
+                            let mut l: Vec<&mut Value> = Vec::new();
+                            l.push(v);
+                            table.insert(h, l);
+                        }
+                    }
+                    added.push(h);
+                }
+            }
+        }
+        for c in ch[b.id as usize].iter() { stack.push((*c, 0, false)); }
+    }
+    copyelim(f);
+    deadcode(f);
+}
+
+/// Removes the i-th successor edge of b (and the phi arguments for it).
+fn remove_edge(b: &mut Block, i: usize) {
+    let s = b.succs[i];
+    b.succs.remove(i);
+    let mut k = 0;
+    while k < s.preds.len() {
+        if s.preds[k].id == b.id { break; }
+        k += 1;
+    }
+    s.preds.remove(k);
+    for vv in s.values.iter() {
+        let v = *vv;
+        if v.op != OP_PHI { continue; }
+        let a = v.args[k];
+        a.uses -= 1;
+        v.args.remove(k);
+    }
+}
+
+/// Drops blocks no longer reachable from the entry and renumbers.
+pub fn prune(f: &mut Func) {
+    let rpo = dom::postorder_rev(f);
+    if rpo.len() == f.blocks.len() { return; }
+    let mut seen: Vec<bool> = Vec::new();
+    seen.resize(f.blocks.len(), false);
+    for b in rpo.iter() { seen[b.id as usize] = true; }
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        if seen[b.id as usize] { continue; }
+        // Its edges into live blocks.
+        while b.succs.len() > 0 {
+            let s = b.succs[0];
+            if seen[s.id as usize] {
+                remove_edge(b, 0);
+            } else {
+                b.succs.remove(0);
+            }
+        }
+        for vv in b.values.iter() {
+            let v = *vv;
+            for aa in v.args.iter() {
+                let a = *aa;
+                a.uses -= 1;
+            }
+            v.args.clear();
+            v.op = OP_INVALID;
+            v.block = None;
+        }
+        b.values.clear();
+        if let Some(c) = b.control { c.uses -= 1; }
+        b.control = None;
+    }
+    let mut kept: Vec<&mut Block> = Vec::new();
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        if seen[b.id as usize] {
+            let mut ps: Vec<&mut Block> = Vec::new();
+            for p in b.preds.iter() { if seen[p.id as usize] { ps.push(*p); } }
+            b.preds = ps;
+            kept.push(b);
+        }
+    }
+    let mut i = 0;
+    while i < kept.len() {
+        kept[i].id = i as u32;
+        i += 1;
+    }
+    f.blocks = kept;
+}
+
+/// Branch facts: below an edge of a branch on c, c is known; branches on a
+/// known value become jumps.
+pub fn prove(f: &mut Func) {
+    let d = dom::dominators(f);
+    let ch = children(f, d);
+    // Known booleans: (value id, truth), a stack the walk unwinds.
+    let mut facts: Vec<(u32, bool)> = Vec::new();
+    let mut changed = false;
+    let mut stack: Vec<(&mut Block, usize, bool)> = Vec::new();
+    stack.push((f.entry.unwrap(), 0, false));
+    while let Some((b, mark, done)) = stack.pop() {
+        if done {
+            facts.truncate(mark);
+            continue;
+        }
+        let m = facts.len();
+        stack.push((b, m, true));
+        // Entered from a branch only: its condition holds here.
+        if b.preds.len() == 1 {
+            let p = b.preds[0];
+            if p.kind == B_IF && p.succs[0].id != p.succs[1].id {
+                let c = p.control.unwrap();
+                add_fact(&mut facts, c, p.succs[0].id == b.id);
+            }
+        }
+        if b.kind == B_IF {
+            let c = b.control.unwrap();
+            let mut known = -1;
+            for fc in facts.iter() {
+                if fc.0 == c.id { known = if fc.1 { 1 } else { 0 }; }
+            }
+            if known >= 0 {
+                // Keep the successor taken.
+                let drop = if known == 1 { 1 } else { 0 };
+                remove_edge(b, drop);
+                b.kind = B_PLAIN;
+                c.uses -= 1;
+                b.control = None;
+                changed = true;
+            }
+        }
+        for c in ch[b.id as usize].iter() { stack.push((*c, 0, false)); }
+    }
+    if changed {
+        prune(f);
+        copyelim(f);
+        deadcode(f);
+    }
+}
+
+/// Records that c is t, and what follows: not c is !t, and a comparison and
+/// its negation.
+fn add_fact(facts: &mut Vec<(u32, bool)>, c: &Value, t: bool) {
+    facts.push((c.id, t));
+    if c.op == OP_NOT && c.ty == T_BOOL { facts.push((c.args[0].id, !t)); }
+}

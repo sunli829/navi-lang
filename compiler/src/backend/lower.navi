@@ -135,8 +135,10 @@ pub struct Gen {
     /// functions whose names contain it.
     ssa_check: i64,
     ssa_dump: String,
-    /// NAVI_SSA: generate with the SSA backend.
+    /// NAVI_SSA: generate with the SSA backend (NAVI_NOSSAOPT: without its
+    /// optimizations).
     ssa_on: bool,
+    ssa_noopt: bool,
     /// choose_registers' buffers, reused from one function to the next.
     live: &mut Live,
     pub p: &mut Plan,
@@ -257,7 +259,7 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string(),
         ssa_check: match std::env::var("NAVI_SSACHECK") { Ok(v) => if v == "2" { 2 } else if v == "3" { 3 } else { 1 }, Err(_) => 0 },
         ssa_dump: match std::env::var("NAVI_SSADUMP") { Ok(v) => v, Err(_) => String::new() },
-        ssa_on: std::env::var("NAVI_SSA").is_ok() }
+        ssa_on: std::env::var("NAVI_SSA").is_ok(), ssa_noopt: std::env::var("NAVI_NOSSAOPT").is_ok() }
 }
 
 /// Lowers the plan into a new object for arch, with a machine from new_m
@@ -4030,6 +4032,10 @@ impl FnGen {
     fn gen_ssa(&mut self, sf: &mut crate::ssa::Func) {
         let m = self.m;
         let f = self.f;
+        if !self.g.ssa_noopt {
+            crate::ssa::opt::cse(sf);
+            crate::ssa::opt::prove(sf);
+        }
         crate::ssa::prep::split_critical(sf);
         crate::ssa::prep::fold_offsets(sf);
         crate::ssa::deadcode(sf);
@@ -4222,17 +4228,35 @@ impl FnGen {
     /// Compares a fused comparison's operands; the condition its value is.
     fn ssa_compare(&mut self, c: &crate::ssa::Value) -> Cond {
         let m = self.m;
-        let mut a = self.ssa_in(c.args[0], V1);
-        let mut b = self.ssa_in(c.args[1], V2);
         let signed = c.aux_int & 2 != 0;
         let size = crate::ssa::ty_size(c.args[0].ty);
+        let mut a = self.ssa_in(c.args[0], V1);
         if signed && size < 8 {
             m.sign_ext(V1, a, size);
-            m.sign_ext(V2, b, size);
             a = V1;
-            b = V2;
         }
-        m.cmp(a, b);
+        let k = c.args[1];
+        let mut imm = false;
+        if k.op == crate::ssa::OP_CONST && self.ssa_alloc.reg[k.id as usize] < 0 && self.ssa_alloc.slot[k.id as usize] < 0 {
+            // The constant as the comparison sees it (signed: extended).
+            let mut x = k.aux_int;
+            if signed && size < 8 {
+                let sh = (64 - 8 * size) as u32;
+                x = (x << sh) >> sh;
+            }
+            if x > -4096 && x < 4096 {
+                m.cmp_imm(a, x);
+                imm = true;
+            }
+        }
+        if !imm {
+            let mut b = self.ssa_in(k, V2);
+            if signed && size < 8 {
+                m.sign_ext(V2, b, size);
+                b = V2;
+            }
+            m.cmp(a, b);
+        }
         match c.op {
             crate::ssa::OP_EQ => EQ,
             crate::ssa::OP_NE => NE,
@@ -4705,6 +4729,34 @@ impl FnGen {
         let size = crate::ssa::ty_size(v.ty);
         let signed = v.aux_int & 2 != 0;
         let checked = v.aux_int & 1 != 0;
+        // A constant right operand: an immediate.
+        let k = v.args[1];
+        if k.op == crate::ssa::OP_CONST && self.ssa_alloc.reg[k.id as usize] < 0 && self.ssa_alloc.slot[k.id as usize] < 0 {
+            let c = k.aux_int;
+            let shift = op == crate::ssa::OP_SHL || op == crate::ssa::OP_SHR;
+            if shift && c >= 0 && c < size * 8 {
+                let mut a = self.ssa_in(v.args[0], V1);
+                if signed && op == crate::ssa::OP_SHR && size < 8 {
+                    m.sign_ext(V1, a, size);
+                    a = V1;
+                }
+                let d = self.ssa_dst(v, V1);
+                let sop = if op == crate::ssa::OP_SHL { SHL } else if signed { SHR_S } else { SHR_U };
+                m.shift_imm(sop, d, a, c);
+                if size < 8 && !(op == crate::ssa::OP_SHR && !signed) { m.zero_ext(d, d, size); }
+                self.ssa_out(v, d);
+                return;
+            }
+            let plain = !(self.g.debug && checked);
+            if (op == crate::ssa::OP_ADD || op == crate::ssa::OP_SUB) && plain && c >= 0 && c < 4096 {
+                let a = self.ssa_in(v.args[0], V1);
+                let d = self.ssa_dst(v, V1);
+                m.addr_of(d, a, if op == crate::ssa::OP_ADD { c } else { -c });
+                if size < 8 { m.zero_ext(d, d, size); }
+                self.ssa_out(v, d);
+                return;
+            }
+        }
         let mut a = self.ssa_in(v.args[0], V1);
         let mut b = self.ssa_in(v.args[1], V2);
         let shift = op == crate::ssa::OP_SHL || op == crate::ssa::OP_SHR;
