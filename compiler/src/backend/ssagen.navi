@@ -44,15 +44,28 @@ struct Builder {
     /// The current block's definitions, by variable.
     defs: Vec<Option<&mut Value>>,
     touched: Vec<usize>,
-    /// Each block's last definitions: block id << 32 | variable.
-    end_defs: HashMap<u64, &mut Value>,
+    /// Each block's last definitions: by block id the first entry (index +
+    /// 1), entries (variable, value, next) chained (a block defines few
+    /// variables: searched linearly).
+    end_head: Vec<u32>,
+    end_defs: Vec<(usize, &mut Value, u32)>,
     fwd: Vec<&mut Value>,
+    /// Forward references made, put at the start of their blocks at the end.
+    head: Vec<&mut Value>,
     /// Why the function cannot be built ("" if it can).
     fail: String,
 }
 
 static BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static NOT_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+static TIMES: [std::sync::atomic::AtomicUsize; 4] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+
+/// Adds ns to phase i's time (NAVI_SSATIME).
+pub fn add_time(i: usize, ns: u64) { TIMES[i].fetch_add(ns as usize, std::sync::atomic::Ordering::Relaxed); }
+
+pub fn time(i: usize) -> u64 { TIMES[i].load(std::sync::atomic::Ordering::Relaxed) as u64 }
 
 /// Counts a function built (or not).
 pub fn count(ok: bool) {
@@ -68,10 +81,13 @@ pub fn counts() -> (usize, usize) {
 /// backend does not handle yet.
 pub fn build(fg: &mut FnGen) -> Result<&mut ssa::Func, String> {
     let mf = fg.f;
-    let b = &mut Builder { fg, mf, f: ssa::new_func(mf.name.clone()), var_of: Vec::new(), pair: Vec::new(), var_ty: Vec::new(), blocks: Vec::new(), cur: None,
-        defs: Vec::new(), touched: Vec::new(), end_defs: HashMap::new(), fwd: Vec::new(), fail: String::new() };
+    let b = &mut Builder { fg, mf, f: ssa::new_func_in(mf.name.clone(), fg.g.ssa_cache), var_of: Vec::new(), pair: Vec::new(), var_ty: Vec::new(), blocks: Vec::new(), cur: None,
+        defs: Vec::new(), touched: Vec::new(), end_head: Vec::new(), end_defs: Vec::new(), fwd: Vec::new(), head: Vec::new(), fail: String::new() };
     b.run();
-    if b.fail.len() > 0 { return Err(b.fail.clone()); }
+    if b.fail.len() > 0 {
+        ssa::recycle(b.f);
+        return Err(b.fail.clone());
+    }
     Ok(b.f)
 }
 
@@ -126,15 +142,39 @@ impl Builder {
         if self.fail.len() > 0 { return; }
         self.prune();
         self.resolve();
-        ssa::copyelim(self.f);
-        ssa::deadcode(self.f);
+        // The forward references (now phis, copies and constants) go first
+        // in their blocks.
+        let mut heads: Vec<Vec<&mut Value>> = Vec::new();
+        for _ in self.f.blocks.iter() { heads.push(Vec::new()); }
+        let mut maxid = 0usize;
+        for b in self.f.blocks.iter() { if b.id as usize > maxid { maxid = b.id as usize; } }
+        let mut pos: Vec<i32> = Vec::new();
+        pos.resize(maxid + 1, -1);
         let mut i = 0;
         while i < self.f.blocks.len() {
-            let b = self.f.blocks[i];
-            b.id = i as u32;
-            phis_first(b);
+            pos[self.f.blocks[i].id as usize] = i as i32;
             i += 1;
         }
+        for x in self.head.iter() {
+            if x.op == ssa::OP_INVALID { continue; }
+            let b = x.block.unwrap();
+            let k = pos[b.id as usize];
+            if k >= 0 { heads[k as usize].push(*x); }
+        }
+        i = 0;
+        while i < self.f.blocks.len() {
+            let b = self.f.blocks[i];
+            if heads[i].len() > 0 {
+                let mut vs: Vec<&mut Value> = Vec::new();
+                for x in heads[i].iter() { if x.op == ssa::OP_PHI { vs.push(*x); } }
+                for x in heads[i].iter() { if x.op != ssa::OP_PHI { vs.push(*x); } }
+                for x in b.values.iter() { vs.push(*x); }
+                b.values = vs;
+            }
+            b.id = i as u32;
+            i += 1;
+        }
+        ssa::copyelim(self.f);
     }
 
     fn failf(&mut self, why: String) {
@@ -144,6 +184,12 @@ impl Builder {
     // --- Variables -------------------------------------------------------------
 
     fn class(&mut self, t: &Type) -> Class {
+        // Only aggregates look at their layout (a cache costs more than
+        // the kinds).
+        self.class_of(t)
+    }
+
+    fn class_of(&mut self, t: &Type) -> Class {
         let none = Class { kind: C_NONE, t0: ssa::T_VOID, t1: ssa::T_VOID };
         match t.kind {
             types::K_NEVER => none,
@@ -260,7 +306,7 @@ impl Builder {
     fn fwdref(&mut self, b: &mut Block, v: usize) -> &mut Value {
         let x = self.f.new_value(ssa::OP_FWDREF, self.var_ty[v], v as i64);
         x.block = Some(b);
-        b.values.insert(0, x);
+        self.head.push(x);
         self.fwd.push(x);
         x
     }
@@ -270,9 +316,12 @@ impl Builder {
     /// Ends the current block (its last definitions are kept).
     fn end_block(&mut self) {
         let b = self.cur.unwrap();
+        let id = b.id as usize;
+        while self.end_head.len() <= id { self.end_head.push(0); }
         for v in self.touched.iter() {
-            let key = (b.id as u64) << 32 | *v as u64;
-            self.end_defs.insert(key, self.defs[*v].unwrap());
+            let next = self.end_head[id];
+            self.end_defs.push((*v, self.defs[*v].unwrap(), next));
+            self.end_head[id] = self.end_defs.len() as u32;
         }
         self.cur = None;
     }
@@ -286,10 +335,17 @@ impl Builder {
 
     /// v's value at the end of b.
     fn end_def(&mut self, b: &mut Block, v: usize) -> &mut Value {
-        let key = (b.id as u64) << 32 | v as u64;
-        if let Some(x) = self.end_defs.get(&key) { return *x; }
+        let id = b.id as usize;
+        while self.end_head.len() <= id { self.end_head.push(0); }
+        let mut k = self.end_head[id] as usize;
+        while k > 0 {
+            if self.end_defs[k - 1].0 == v { return self.end_defs[k - 1].1; }
+            k = self.end_defs[k - 1].2 as usize;
+        }
         let x = self.fwdref(b, v);
-        self.end_defs.insert(key, x);
+        let next = self.end_head[id];
+        self.end_defs.push((v, x, next));
+        self.end_head[id] = self.end_defs.len() as u32;
         x
     }
 
@@ -326,8 +382,19 @@ impl Builder {
             if let Some(c) = b.control { c.uses -= 1; }
             b.control = None;
         }
-        // Renumbered after resolve (end_defs are keyed by the ids).
+        // Renumbered after resolve (end_defs are kept by the ids).
         f.blocks = kept;
+        for xx in self.head.iter() {
+            let x = *xx;
+            if !seen[x.block.unwrap().id as usize] {
+                for aa in x.args.iter() {
+                    let a = *aa;
+                    a.uses -= 1;
+                }
+                x.args.clear();
+                x.op = ssa::OP_INVALID;
+            }
+        }
         // Forward references of dropped blocks are not resolved.
         let mut fw: Vec<&mut Value> = Vec::new();
         for x in self.fwd.iter() { if x.op == ssa::OP_FWDREF { fw.push(*x); } }
@@ -390,6 +457,8 @@ impl Builder {
 
     fn cnst(&mut self, ty: Ty, x: i64) -> &mut Value { self.value0(ssa::OP_CONST, ty, x) }
 
+    fn local_addr(&mut self, l: usize) -> &mut Value { self.value0(ssa::OP_LOCALADDR, ssa::T_PTR, l as i64) }
+
     fn off_ptr(&mut self, p: &mut Value, off: i64) -> &mut Value {
         if off == 0 { return p; }
         self.value1(ssa::OP_OFFPTR, ssa::T_PTR, off, p)
@@ -440,7 +509,7 @@ impl Builder {
             ty = self.fg.reveal(ty.el());
             start = 1;
         } else {
-            base = self.value0(ssa::OP_LOCALADDR, ssa::T_PTR, pl.local as i64);
+            base = self.local_addr(pl.local);
         }
         let mut off = 0i64;
         let mut variant = -1i64;
@@ -493,7 +562,7 @@ impl Builder {
     fn local_word(&mut self, l: usize) -> &mut Value {
         let v = self.var_of[l];
         if v >= 0 { return self.get_var(v as usize); }
-        let a = self.value0(ssa::OP_LOCALADDR, ssa::T_PTR, l as i64);
+        let a = self.local_addr(l);
         self.load(ssa::T_I64, a)
     }
 
@@ -1079,8 +1148,12 @@ impl Builder {
         let dt = self.fg.place_type(dest);
         let dc = self.class(dt);
         let mut intrinsic = false;
+        let mut site: Option<&mut codegen::Target> = None;
+        let mut site_slot = -1i64;
         if fn_op.kind == mir::OP_CONST && fn_op.cnst.unwrap().kind == mir::C_FN {
             let (tg, slot) = self.fg.g.p.site_target(self.fg.inst, fn_op.cnst.unwrap());
+            site = Some(tg);
+            site_slot = slot;
             if tg.kind == codegen::T_INTRINSIC && (slot < 0 || tg.intrinsic == "type_desc") {
                 if slot < 0 && target >= 0 && self.pure_intrinsic(tg, args, dest, dt, &dc) {
                     self.finish_plain(self.blocks[target as usize]);
@@ -1091,7 +1164,7 @@ impl Builder {
         }
         if intrinsic {
             let v = self.f.new_value(ssa::OP_INTRINSIC, ssa::T_TUPLE, 0);
-            v.aux = ssa::Aux::Term(t);
+            v.aux = ssa::Aux::Call(t, site, site_slot);
             v.pos = pos;
             self.args_into(v, fn_op, args);
             let m = self.mem();
@@ -1121,7 +1194,7 @@ impl Builder {
             return;
         }
         let v = self.f.new_value(ssa::OP_CALL, ssa::T_MEM, 0);
-        v.aux = ssa::Aux::Term(t);
+        v.aux = ssa::Aux::Call(t, site, site_slot);
         v.pos = pos;
         self.args_into(v, fn_op, args);
         let m = self.mem();

@@ -139,6 +139,13 @@ pub struct Gen {
     /// NAVI_NOSSAOPT: without the SSA optimizations).
     ssa_on: bool,
     ssa_noopt: bool,
+    /// NAVI_SSATIME: report the time of the SSA backend's phases.
+    ssa_time: bool,
+    /// This thread's reusable SSA values and blocks, and register
+    /// allocation.
+    pub ssa_cache: &mut crate::ssa::Cache,
+    ssa_ra: &mut crate::ssa::regalloc::Alloc,
+
     /// choose_registers' buffers, reused from one function to the next.
     live: &mut Live,
     pub p: &mut Plan,
@@ -259,7 +266,8 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string(),
         ssa_check: match std::env::var("NAVI_SSACHECK") { Ok(v) => if v == "2" { 2 } else if v == "3" { 3 } else { 1 }, Err(_) => 0 },
         ssa_dump: match std::env::var("NAVI_SSADUMP") { Ok(v) => v, Err(_) => String::new() },
-        ssa_on: std::env::var("NAVI_NOSSA").is_err(), ssa_noopt: std::env::var("NAVI_NOSSAOPT").is_ok() }
+        ssa_on: std::env::var("NAVI_NOSSA").is_err(), ssa_noopt: std::env::var("NAVI_NOSSAOPT").is_ok(),
+        ssa_time: std::env::var("NAVI_SSATIME").is_ok(), ssa_cache: crate::ssa::new_cache(), ssa_ra: crate::ssa::regalloc::empty() }
 }
 
 /// Lowers the plan into a new object for arch, with a machine from new_m
@@ -357,6 +365,10 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
     if g.ssa_check > 0 {
         let (ok, not) = crate::backend::ssagen::counts();
         eprintln(`ssa: ${ok} functions built, ${not} not`);
+    }
+    if g.ssa_time {
+        let ms = |i: usize| crate::backend::ssagen::time(i) / 1000000;
+        eprintln(`ssa: build ${ms(0)} ms, optimize ${ms(1)} ms, allocate ${ms(2)} ms, emit ${ms(3)} ms (cpu, all threads)`);
     }
     Ok(g.o)
 }
@@ -1281,7 +1293,10 @@ impl FnGen {
 
     /// Generates the function with the SSA backend if it can.
     fn try_ssa(&mut self) -> bool {
-        let sf = match crate::backend::ssagen::build(self) {
+        let t0 = if self.g.ssa_time { Some(std::time::Instant::now()) } else { None };
+        let built = crate::backend::ssagen::build(self);
+        if let Some(t) = t0 { crate::backend::ssagen::add_time(0, t.elapsed().as_nanos() as u64); }
+        let sf = match built {
             Ok(sf) => sf,
             Err(why) => {
                 if self.g.ssa_check == 2 { eprintln(`ssa ${self.f.name}: not built: ${why}`); }
@@ -1291,12 +1306,14 @@ impl FnGen {
         if let Err(why) = self.ssa_supported(sf) {
             if self.g.ssa_check == 2 { eprintln(`ssa ${self.f.name}: not generated: ${why}`); }
             crate::backend::ssagen::count(false);
+            crate::ssa::recycle(sf);
             return false;
         }
         crate::backend::ssagen::count(true);
         self.ssa = true;
         self.ssa_var0 = sf.is_var[0];
         self.gen_ssa(sf);
+        crate::ssa::recycle(sf);
         true
     }
 
@@ -1308,6 +1325,7 @@ impl FnGen {
                 crate::backend::ssagen::count(true);
                 let errs = if self.g.ssa_check == 3 { String::new() } else { crate::ssa::check::check(sf) };
                 if errs.len() > 0 { eprintln(`ssa ${self.f.name}: invalid:\n${errs}${sf.to_string()}`); } else if dump { eprintln(sf.to_string()); }
+                crate::ssa::recycle(sf);
             }
             Err(why) => {
                 crate::backend::ssagen::count(false);
@@ -3995,7 +4013,7 @@ impl FnGen {
             }
         };
         match &v.aux {
-            crate::ssa::Aux::Term(t) => {
+            crate::ssa::Aux::Call(t, _, _) => {
                 if let Term::Call { fn_op, args, .. } = *t {
                     let mut fo: Vec<Operand> = Vec::new();
                     fo.push(fn_op.clone());
@@ -4032,10 +4050,15 @@ impl FnGen {
     fn gen_ssa(&mut self, sf: &mut crate::ssa::Func) {
         let m = self.m;
         let f = self.f;
+        let t1 = if self.g.ssa_time { Some(std::time::Instant::now()) } else { None };
         if !self.g.ssa_noopt {
-            crate::ssa::opt::cse(sf);
-            crate::ssa::opt::prove(sf);
+            // CSE keeps the blocks: one dominator tree for both.
+            let d = crate::ssa::dom::dominators(sf);
+            crate::ssa::opt::cse(sf, d);
+            crate::ssa::opt::prove(sf, d);
         }
+        if let Some(t) = t1 { crate::backend::ssagen::add_time(1, t.elapsed().as_nanos() as u64); }
+        let t2 = if self.g.ssa_time { Some(std::time::Instant::now()) } else { None };
         crate::ssa::prep::split_critical(sf);
         crate::ssa::prep::fold_offsets(sf);
         crate::ssa::deadcode(sf);
@@ -4055,7 +4078,10 @@ impl FnGen {
             k += 1;
         }
         let cfg = &crate::ssa::regalloc::Config { caller, callee };
-        self.ssa_alloc = crate::ssa::regalloc::allocate(sf, cfg, &fused);
+        crate::ssa::regalloc::allocate(sf, cfg, &fused, self.g.ssa_ra);
+        self.ssa_alloc = self.g.ssa_ra;
+        if let Some(t) = t2 { crate::backend::ssagen::add_time(2, t.elapsed().as_nanos() as u64); }
+        let t3 = if self.g.ssa_time { Some(std::time::Instant::now()) } else { None };
         let al = self.ssa_alloc;
         // The old helpers look for promoted locals: none here.
         let mut li = 0;
@@ -4067,7 +4093,12 @@ impl FnGen {
         let mut bridge = 0i64;
         for b in sf.blocks.iter() {
             for v in b.values.iter() {
-                if v.op == crate::ssa::OP_INTRINSIC || v.op == crate::ssa::OP_CLOSURE || v.op == crate::ssa::OP_DEFER || v.op == crate::ssa::OP_CALL {
+                // Calls use the bridge only through C function pointers.
+                let mut bridged = v.op == crate::ssa::OP_INTRINSIC || v.op == crate::ssa::OP_CLOSURE || v.op == crate::ssa::OP_DEFER;
+                if v.op == crate::ssa::OP_CALL {
+                    if let crate::ssa::Aux::Call(_, None, _) = &v.aux { bridged = true; }
+                }
+                if bridged {
                     let n = self.ssa_bridge_size(*v);
                     if n > bridge { bridge = n; }
                 }
@@ -4223,6 +4254,7 @@ impl FnGen {
             bi += 1;
         }
         self.emit_stubs();
+        if let Some(t) = t3 { crate::backend::ssagen::add_time(3, t.elapsed().as_nanos() as u64); }
     }
 
     /// Compares a fused comparison's operands; the condition its value is.
@@ -4618,9 +4650,8 @@ impl FnGen {
             }
             crate::ssa::OP_CALL => self.ssa_call(v),
             crate::ssa::OP_INTRINSIC => {
-                let t = match &v.aux { crate::ssa::Aux::Term(t) => *t, _ => return };
-                let (fn_op, args, dest, target, pos) = match t { Term::Call { fn_op, args, dest, target, pos } => (fn_op, args, dest, *target, *pos), _ => return };
-                let (tg, slot) = self.g.p.site_target(self.inst, fn_op.cnst.unwrap());
+                let (t, tg, slot) = match &v.aux { crate::ssa::Aux::Call(t, Some(tg), slot) => (*t, *tg, *slot), _ => return };
+                let (args, dest, target, pos) = match t { Term::Call { args, dest, target, pos, .. } => (args, dest, *target, *pos), _ => return };
                 if slot >= 0 {
                     // type_desc in shared code: from the dictionary.
                     m.load(8, V1, FP, SLOT_CTX);
@@ -4828,15 +4859,8 @@ impl FnGen {
     /// A call: the arguments to the outgoing area, then the call as call's.
     fn ssa_call(&mut self, v: &mut crate::ssa::Value) {
         let m = self.m;
-        let t = match &v.aux { crate::ssa::Aux::Term(t) => *t, _ => return };
+        let (t, tgt, slot) = match &v.aux { crate::ssa::Aux::Call(t, tg, slot) => (*t, *tg, *slot), _ => return };
         let (fn_op, args, pos) = match t { Term::Call { fn_op, args, pos, .. } => (fn_op, args, *pos), _ => return };
-        let mut tgt: Option<&mut Target> = None;
-        let mut slot = -1i64;
-        if fn_op.kind == mir::OP_CONST && fn_op.cnst.unwrap().kind == mir::C_FN {
-            let (tt, s) = self.g.p.site_target(self.inst, fn_op.cnst.unwrap());
-            tgt = Some(tt);
-            slot = s;
-        }
         if fn_op.kind == mir::OP_COPY {
             let ft = self.operand_type(fn_op);
             if ft.kind == types::K_FN && ft.abi == "C" {

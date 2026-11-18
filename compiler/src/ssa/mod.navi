@@ -183,6 +183,9 @@ pub enum Aux {
     Ty(&Type),
     Cnst(&mir::Const),
     Term(&mir::Term),
+    /// A call, with its callee resolved (none: not a constant) and its
+    /// dictionary slot (-1: none).
+    Call(&mir::Term, Option<&mut crate::codegen::Target>, i64),
     Stmt(&mir::Stmt),
     Rv(&mir::Rvalue),
     Str(String),
@@ -236,22 +239,92 @@ pub struct Func {
     /// By MIR local: whether it is a variable (else it is in its frame
     /// slot).
     pub is_var: Vec<bool>,
+    /// Where values and blocks come from and go back to (Go's ssa.Cache).
+    pub cache: Option<&mut Cache>,
 }
 
+/// Values and blocks of finished functions, reused by the next ones (with
+/// their lists' buffers): one per thread, so that making a function
+/// allocates little.
+pub struct Cache {
+    values: Vec<&mut Value>,
+    blocks: Vec<&mut Block>,
+    /// CSE's buckets and entries.
+    pub cse_heads: Vec<u32>,
+    pub cse_entries: Vec<(u32, &mut Value, u32)>,
+}
+
+pub fn new_cache() -> &mut Cache { &mut Cache { values: Vec::new(), blocks: Vec::new(), cse_heads: Vec::new(), cse_entries: Vec::new() } }
+
 pub fn new_func(name: String) -> &mut Func {
-    &mut Func { name, blocks: Vec::new(), values: Vec::new(), entry: None, is_var: Vec::new() }
+    &mut Func { name, blocks: Vec::new(), values: Vec::new(), entry: None, is_var: Vec::new(), cache: None }
+}
+
+/// A function whose values and blocks come from c.
+pub fn new_func_in(name: String, c: &mut Cache) -> &mut Func {
+    let f = new_func(name);
+    f.cache = Some(c);
+    f
+}
+
+/// Gives f's values and blocks back to its cache (f is not used after).
+pub fn recycle(f: &mut Func) {
+    let c = match f.cache { Some(c) => c, None => return };
+    for vv in f.values.iter() {
+        let v = *vv;
+        v.args.clear();
+        v.aux = Aux::None;
+        v.block = None;
+        c.values.push(v);
+    }
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        b.values.clear();
+        b.succs.clear();
+        b.preds.clear();
+        b.control = None;
+        c.blocks.push(b);
+    }
+    f.values.clear();
+    f.blocks.clear();
 }
 
 impl Func {
     pub fn new_block(&mut self, kind: BlockKind) -> &mut Block {
-        let b = &mut Block { id: self.blocks.len() as u32, kind, values: Vec::new(), succs: Vec::new(), preds: Vec::new(), control: None, pos: 0 };
+        let id = self.blocks.len() as u32;
+        let mut reused: Option<&mut Block> = None;
+        if let Some(c) = self.cache { reused = c.blocks.pop(); }
+        let b = match reused {
+            Some(b) => {
+                b.id = id;
+                b.kind = kind;
+                b.control = None;
+                b.pos = 0;
+                b
+            }
+            None => &mut Block { id, kind, values: Vec::new(), succs: Vec::new(), preds: Vec::new(), control: None, pos: 0 },
+        };
         self.blocks.push(b);
         b
     }
 
     /// A value not yet in a block.
     pub fn new_value(&mut self, op: Op, ty: Ty, aux_int: i64) -> &mut Value {
-        let v = &mut Value { id: self.values.len() as u32, op, ty, args: Vec::new(), aux_int, aux: Aux::None, block: None, pos: 0, uses: 0 };
+        let id = self.values.len() as u32;
+        let mut reused: Option<&mut Value> = None;
+        if let Some(c) = self.cache { reused = c.values.pop(); }
+        let v = match reused {
+            Some(v) => {
+                v.id = id;
+                v.op = op;
+                v.ty = ty;
+                v.aux_int = aux_int;
+                v.pos = 0;
+                v.uses = 0;
+                v
+            }
+            None => &mut Value { id, op, ty, args: Vec::new(), aux_int, aux: Aux::None, block: None, pos: 0, uses: 0 },
+        };
         self.values.push(v);
         v
     }
@@ -423,7 +496,7 @@ pub fn value_string(v: &Value) -> String {
         Aux::Ty(t) => s.push_str(&` {${*t}}`),
         Aux::Cnst(c) => s.push_str(&` {${mir::operand_string(&mir::const_op(*c))}}`),
         Aux::Str(m) => s.push_str(&` {${m}}`),
-        Aux::Term(_) => s.push_str(" {call}"),
+        Aux::Term(_) | Aux::Call(_, _, _) => s.push_str(" {call}"),
         Aux::Stmt(_) => s.push_str(" {stmt}"),
         Aux::Rv(_) => s.push_str(" {rvalue}"),
         Aux::None => {}

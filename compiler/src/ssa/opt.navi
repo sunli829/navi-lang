@@ -5,7 +5,6 @@
 //! branch its condition is known; a branch on a known condition becomes a
 //! jump, which removes repeated bounds checks).
 
-use std::collections::HashMap;
 use crate::ssa::*;
 use crate::ssa::dom;
 
@@ -45,40 +44,56 @@ fn same(a: &Value, b: &Value) -> bool {
 fn hash(v: &Value) -> u64 {
     let mut h = (v.op as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (v.ty as u64) << 16 ^ (v.aux_int as u64).wrapping_mul(31) ^ aux_id(&v.aux).wrapping_mul(1000003);
     for a in v.args.iter() { h = (h ^ a.id as u64).wrapping_mul(0x100000001B3); }
-    h
+    h ^ h >> 29
 }
 
-/// The blocks each block immediately dominates.
-fn children(f: &Func, d: &dom::Dom) -> Vec<Vec<&mut Block>> {
-    let mut ch: Vec<Vec<&mut Block>> = Vec::new();
-    for _ in f.blocks.iter() { ch.push(Vec::new()); }
-    for b in d.rpo.iter() {
+/// The dominator tree: by block id its first child and next sibling
+/// (indexes into rpo + 1; 0: none).
+fn children(f: &Func, d: &dom::Dom) -> (Vec<u32>, Vec<u32>) {
+    let mut first: Vec<u32> = Vec::new();
+    let mut sib: Vec<u32> = Vec::new();
+    first.resize(f.blocks.len(), 0);
+    sib.resize(f.blocks.len(), 0);
+    let mut i = d.rpo.len();
+    while i > 0 {
+        i -= 1;
+        let b = d.rpo[i];
         let p = d.idom[b.id as usize];
-        if p >= 0 { ch[p as usize].push(*b); }
+        if p >= 0 {
+            sib[b.id as usize] = first[p as usize];
+            first[p as usize] = (i + 1) as u32;
+        }
     }
-    ch
+    (first, sib)
 }
 
 /// Replaces values equal to one that dominates them with copies of it.
-pub fn cse(f: &mut Func) {
-    let d = dom::dominators(f);
+pub fn cse(f: &mut Func, d: &dom::Dom) {
     let ch = children(f, d);
-    let mut table: HashMap<u64, Vec<&mut Value>> = HashMap::new();
-    // The values each open block added (popped when it is left).
-    let mut added: Vec<u64> = Vec::new();
+    // Buckets (a power of two, at least twice the values) hold the latest
+    // entry (index + 1); entries chain to the one they hid, and are popped
+    // when their block is left. Both are the cache's buffers.
+    let mut nbits = 4u32;
+    while (1usize << nbits) < 2 * f.values.len() { nbits += 1; }
+    let mask = (1u64 << nbits) - 1;
+    let c = f.cache.unwrap();
+    let mut table = c.cse_heads;
+    table.clear();
+    table.resize(1usize << nbits, 0);
+    let mut entries = c.cse_entries;
+    entries.clear();
     // (block, marks): the walk, with where each block's additions start.
     let mut stack: Vec<(&mut Block, usize, bool)> = Vec::new();
     stack.push((f.entry.unwrap(), 0, false));
     while let Some((b, mark, done)) = stack.pop() {
         if done {
-            while added.len() > mark {
-                let h = added.pop().unwrap();
-                let l = table.get_mut(&h).unwrap();
-                l.pop();
+            while entries.len() > mark {
+                let e = entries.pop().unwrap();
+                table[e.0 as usize] = e.2;
             }
             continue;
         }
-        let m = added.len();
+        let m = entries.len();
         stack.push((b, m, true));
         for vv in b.values.iter() {
             let v = *vv;
@@ -90,38 +105,33 @@ pub fn cse(f: &mut Func) {
                 if a.op == OP_COPY { v.set_arg(i, copy_source(a)); }
                 i += 1;
             }
-            let h = hash(v);
+            let bkt = (hash(v) & mask) as usize;
+            let head = table[bkt];
             let mut found: Option<&mut Value> = None;
-            match table.get(&h) {
-                Some(l) => {
-                    for w in l.iter() {
-                        if same(*w, v) {
-                            found = Some(*w);
-                            break;
-                        }
-                    }
+            let mut k = head as usize;
+            while k > 0 {
+                if same(entries[k - 1].1, v) {
+                    found = Some(entries[k - 1].1);
+                    break;
                 }
-                None => {}
+                k = entries[k - 1].2 as usize;
             }
             match found {
                 Some(w) => v.become_copy(w),
                 None => {
-                    match table.get_mut(&h) {
-                        Some(l) => l.push(v),
-                        None => {
-                            let mut l: Vec<&mut Value> = Vec::new();
-                            l.push(v);
-                            table.insert(h, l);
-                        }
-                    }
-                    added.push(h);
+                    entries.push((bkt as u32, v, head));
+                    table[bkt] = entries.len() as u32;
                 }
             }
         }
-        for c in ch[b.id as usize].iter() { stack.push((*c, 0, false)); }
+        let mut k = ch.0[b.id as usize];
+        while k > 0 {
+            let c = d.rpo[(k - 1) as usize];
+            stack.push((c, 0, false));
+            k = ch.1[c.id as usize];
+        }
     }
     copyelim(f);
-    deadcode(f);
 }
 
 /// Removes the i-th successor edge of b (and the phi arguments for it).
@@ -196,8 +206,7 @@ pub fn prune(f: &mut Func) {
 
 /// Branch facts: below an edge of a branch on c, c is known; branches on a
 /// known value become jumps.
-pub fn prove(f: &mut Func) {
-    let d = dom::dominators(f);
+pub fn prove(f: &mut Func, d: &dom::Dom) {
     let ch = children(f, d);
     // Known booleans: (value id, truth), a stack the walk unwinds.
     let mut facts: Vec<(u32, bool)> = Vec::new();
@@ -235,12 +244,16 @@ pub fn prove(f: &mut Func) {
                 changed = true;
             }
         }
-        for c in ch[b.id as usize].iter() { stack.push((*c, 0, false)); }
+        let mut k = ch.0[b.id as usize];
+        while k > 0 {
+            let c = d.rpo[(k - 1) as usize];
+            stack.push((c, 0, false));
+            k = ch.1[c.id as usize];
+        }
     }
     if changed {
         prune(f);
         copyelim(f);
-        deadcode(f);
     }
 }
 
