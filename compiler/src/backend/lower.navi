@@ -135,6 +135,8 @@ pub struct Gen {
     /// functions whose names contain it.
     ssa_check: i64,
     ssa_dump: String,
+    /// NAVI_SSA: generate with the SSA backend.
+    ssa_on: bool,
     /// choose_registers' buffers, reused from one function to the next.
     live: &mut Live,
     pub p: &mut Plan,
@@ -254,7 +256,8 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         file_sym: HashMap::new(), floc_pos: HashMap::new(),
         sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string(),
         ssa_check: match std::env::var("NAVI_SSACHECK") { Ok(v) => if v == "2" { 2 } else if v == "3" { 3 } else { 1 }, Err(_) => 0 },
-        ssa_dump: match std::env::var("NAVI_SSADUMP") { Ok(v) => v, Err(_) => String::new() } }
+        ssa_dump: match std::env::var("NAVI_SSADUMP") { Ok(v) => v, Err(_) => String::new() },
+        ssa_on: std::env::var("NAVI_SSA").is_ok() }
 }
 
 /// Lowers the plan into a new object for arch, with a machine from new_m
@@ -1178,7 +1181,8 @@ impl Gen {
         }
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
             res_off: 0, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), preg2: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
-            frame: 0, buf_top: 0 };
+            frame: 0, buf_top: 0, ssa: false, ssa_alloc: crate::ssa::regalloc::empty(), ssa_slots: 0, ptr_slots: Vec::new(), ssa_masks: Vec::new(),
+            ssa_var0: false, ssa_bridge: 0 };
         fg.gen();
         fg.stack_meta();
         self.emit_func(sym.as_str(), false);
@@ -1241,6 +1245,17 @@ pub struct FnGen {
     /// are the buffers and the outgoing area (any word may be a pointer).
     frame: i64,
     buf_top: i64,
+    /// The SSA backend's state: whether it made this function, its
+    /// allocation, where the spill slots start, the pointer slots, the
+    /// calls' masks and whether the result is a variable.
+    ssa: bool,
+    ssa_alloc: &mut crate::ssa::regalloc::Alloc,
+    ssa_slots: i64,
+    ptr_slots: Vec<i64>,
+    ssa_masks: Vec<u16>,
+    ssa_var0: bool,
+    /// The area where operands for the old helpers are put (bridge).
+    ssa_bridge: i64,
 }
 
 fn is_signed(t: &Type) -> bool { t.kind == types::K_INT && types::int_signed(t.int) }
@@ -1261,6 +1276,27 @@ impl FnGen {
     }
 
     pub fn size(&mut self, t: &Type) -> i64 { self.g.size_of(Some(t)) }
+
+    /// Generates the function with the SSA backend if it can.
+    fn try_ssa(&mut self) -> bool {
+        let sf = match crate::backend::ssagen::build(self) {
+            Ok(sf) => sf,
+            Err(why) => {
+                if self.g.ssa_check == 2 { eprintln(`ssa ${self.f.name}: not built: ${why}`); }
+                return false;
+            }
+        };
+        if let Err(why) = self.ssa_supported(sf) {
+            if self.g.ssa_check == 2 { eprintln(`ssa ${self.f.name}: not generated: ${why}`); }
+            crate::backend::ssagen::count(false);
+            return false;
+        }
+        crate::backend::ssagen::count(true);
+        self.ssa = true;
+        self.ssa_var0 = sf.is_var[0];
+        self.gen_ssa(sf);
+        true
+    }
 
     /// Builds and checks the SSA form (NAVI_SSACHECK, NAVI_SSADUMP).
     fn ssa_check(&mut self) {
@@ -1302,6 +1338,7 @@ impl FnGen {
             off += round8(self.size(self.ltypes[i]));
             i += 1;
         }
+        if self.g.ssa_on && self.try_ssa() { return; }
         // Frame locals.
         let mut cur = FIXED_FRAME;
         i = 0;
@@ -1549,6 +1586,7 @@ impl FnGen {
                 }
                 i += 1;
             }
+            for o in self.ptr_slots.iter() { set(*o); }
         }
         let mut meta = self.g.cur_meta;
         meta.clear();
@@ -1571,6 +1609,15 @@ impl FnGen {
             meta.push(k << 32 | (sv.1 as u64 & 0xffffffff));
         }
         self.g.cur_all = all;
+        if self.ssa {
+            // By call tag, from the register allocation.
+            let mut masks = self.g.cur_masks;
+            masks.clear();
+            for x in self.ssa_masks.iter() { masks.push(*x); }
+            self.g.cur_meta = meta;
+            self.g.cur_masks = masks;
+            return;
+        }
         // Masks by position: the saved registers holding a live pointer
         // (a local's range covers the position).
         let lv = self.g.live;
@@ -2332,7 +2379,7 @@ impl FnGen {
     }
 
     /// Whether values of t hold no pointers.
-    fn noscan(&mut self, t: &Type) -> bool {
+    pub fn noscan(&mut self, t: &Type) -> bool {
         if t.kind == types::K_NEVER { return true; }
         self.g.lay_of(t).ptrs.len() == 0
     }
@@ -3176,6 +3223,23 @@ impl FnGen {
     /// with the platform's C convention.
     fn c_call(&mut self, fn_op: &Operand, args: &Vec<Operand>, dest: &Place, target: i64, dt: &Type, sym: &str, via_fn: bool) {
         let m = self.m;
+        if !self.c_call_body(fn_op, args, dt, sym, via_fn) { return; }
+        if target < 0 || dt.kind == types::K_NEVER {
+            m.trap();
+            return;
+        }
+        let size = self.size(dt);
+        if size > 0 {
+            self.store_regs(dest, size);
+            self.write_barrier(dest);
+        }
+        m.jump(self.blocks[target as usize]);
+    }
+
+    /// Makes a C call; the result (if any) is in V1. False if the call
+    /// cannot be made.
+    fn c_call_body(&mut self, fn_op: &Operand, args: &Vec<Operand>, dt: &Type, sym: &str, via_fn: bool) -> bool {
+        let m = self.m;
         let mut cargs: Vec<CArg> = Vec::new();
         let mut i = 0;
         while i < args.len() {
@@ -3200,7 +3264,7 @@ impl FnGen {
                 cargs.push(CArg { float: false, f64: false, variadic: var, size: if sz > 0 { sz } else { 8 } });
             } else {
                 self.g.errorf(`${self.f.name}: unsupported C argument type ${ty}`);
-                return;
+                return false;
             }
             m.store(8, V1, SP, (8 * i) as i64);
             i += 1;
@@ -3213,20 +3277,23 @@ impl FnGen {
         } else {
             m.call_c(sym, 0, &cargs, float_ret, f64_);
         }
-        if target < 0 || dt.kind == types::K_NEVER {
-            m.trap();
-            return;
-        }
-        let size = self.size(dt);
-        if size > 0 {
-            self.store_regs(dest, size);
-            self.write_barrier(dest);
-        }
-        m.jump(self.blocks[target as usize]);
+        true
     }
 
     /// Generates an inline intrinsic or a C call.
     fn intrinsic(&mut self, t: &Target, args: &Vec<Operand>, dest: &Place, target: i64, pos: Pos, dt: &Type) {
+        let m = self.m;
+        let size = self.size(dt);
+        if !self.intrinsic_body(t, args, Some(dest), target, pos, dt) { return; }
+        self.store_regs(dest, size);
+        if size > 0 { self.write_barrier(dest); }
+        if target >= 0 { m.jump(self.blocks[target as usize]); } else { m.trap(); }
+    }
+
+    /// An intrinsic's code: true if its result (if any) is then in V1 (and
+    /// V2). Without dest (the SSA backend) C calls leave their result in V1
+    /// and results in memory go to the result buffer.
+    fn intrinsic_body(&mut self, t: &Target, args: &Vec<Operand>, dest: Option<&Place>, target: i64, pos: Pos, dt: &Type) -> bool {
         let m = self.m;
         let size = self.size(dt);
         let name = t.intrinsic.as_str();
@@ -3237,19 +3304,29 @@ impl FnGen {
                 let fo = mir::copy(mir::local_place(0));
                 let decl = crate::types::collect::fn_decl(t.def);
                 self.nfixed = if decl.variadic { decl.params.len() as i64 } else { -1 };
-                self.c_call(&fo, args, dest, target, dt, s.as_str(), false);
-                self.nfixed = -1;
-                return;
+                match dest {
+                    Some(d) => {
+                        self.c_call(&fo, args, d, target, dt, s.as_str(), false);
+                        self.nfixed = -1;
+                        return false;
+                    }
+                    None => {
+                        let ok = self.c_call_body(&fo, args, dt, s.as_str(), false);
+                        self.nfixed = -1;
+                        if ok && (target < 0 || dt.kind == types::K_NEVER) { m.trap(); }
+                        return ok;
+                    }
+                }
             }
             "unreachable" => {
                 m.trap();
-                return;
+                return false;
             }
             "abort" => {
                 let s = self.g.extern_sym("abort");
                 m.call_c(s.as_str(), 0, &Vec::new(), false, false);
                 m.trap();
-                return;
+                return false;
             }
             "has_pointers" => {
                 let ns = self.noscan(targ0.unwrap());
@@ -3316,7 +3393,7 @@ impl FnGen {
                 ca.push(int_arg());
                 m.call_c("_navi_longjmp", 0, &ca, false, false);
                 m.trap();
-                return;
+                return false;
             }
             "gstart_address" => {
                 m.adr_sym(V1, &"_navi_gstart".to_string());
@@ -3428,19 +3505,25 @@ impl FnGen {
                     let l = self.g.loc(self.f.file, pos);
                     m.adr_sym(BASE, &l);
                 }
-                self.place(dest);
-                self.copy_mem(RA, 0, BASE, 0, size);
-                if target >= 0 { m.jump(self.blocks[target as usize]); }
-                return;
+                match dest {
+                    Some(d) => {
+                        self.place(d);
+                        self.copy_mem(RA, 0, BASE, 0, size);
+                        if target >= 0 { m.jump(self.blocks[target as usize]); }
+                    }
+                    None => {
+                        m.addr_of(RA, FP, self.res_off);
+                        self.copy_mem(RA, 0, BASE, 0, size);
+                    }
+                }
+                return false;
             }
             _ => {
                 self.g.errorf(`${self.f.name}: intrinsic ${name} has no native implementation`);
-                return;
+                return false;
             }
         }
-        self.store_regs(dest, size);
-        if size > 0 { self.write_barrier(dest); }
-        if target >= 0 { m.jump(self.blocks[target as usize]); } else { m.trap(); }
+        true
     }
 
     // --- Defer ---------------------------------------------------------------------
@@ -3733,4 +3816,1119 @@ fn fused_compare(b: &mir::Block, refs: &Vec<u32>) -> bool {
         Term::Assert { cond, .. } => cond.kind == mir::OP_COPY && cond.place.local == place.local && cond.place.proj.len() == 0,
         _ => false,
     }
+}
+
+// --- SSA code generation (docs/ssa.md, stage S2: arm64) ---------------------------
+
+/// Where a value is for the moves of phis.
+#[derive(Clone)]
+struct Loc {
+    /// 0: register, 1: stack slot (FP offset), 2: made where used.
+    kind: u8,
+    reg: Reg,
+    off: i64,
+    val: Option<&mut crate::ssa::Value>,
+}
+
+impl FnGen {
+    /// Whether the SSA backend handles every value of sf.
+    fn ssa_supported(&mut self, sf: &crate::ssa::Func) -> Result<(), String> {
+        for b in sf.blocks.iter() {
+            for v in b.values.iter() {
+                let op = v.op;
+                if op == crate::ssa::OP_INVALID { return Err("invalid value".to_string()); }
+            }
+        }
+        Ok(())
+    }
+
+    /// The register holding v as an operand: its own, else scratch (made or
+    /// loaded there).
+    fn ssa_in(&mut self, v: &crate::ssa::Value, scratch: Reg) -> Reg {
+        let id = v.id as usize;
+        let r = self.ssa_alloc.reg[id];
+        if r >= 0 { return r as Reg; }
+        let s = self.ssa_alloc.slot[id];
+        if s >= 0 {
+            self.m.load(8, scratch, FP, self.ssa_slot_off(s));
+            return scratch;
+        }
+        self.ssa_remat(v, scratch);
+        scratch
+    }
+
+    fn ssa_slot_off(&self, s: i32) -> i64 { self.ssa_slots - 8 * s as i64 }
+
+    /// The register v's result is made in: its own, else scratch (stored
+    /// to its slot by ssa_out).
+    fn ssa_dst(&self, v: &crate::ssa::Value, scratch: Reg) -> Reg {
+        let r = self.ssa_alloc.reg[v.id as usize];
+        if r >= 0 { r as Reg } else { scratch }
+    }
+
+    fn ssa_out(&mut self, v: &crate::ssa::Value, r: Reg) {
+        let s = self.ssa_alloc.slot[v.id as usize];
+        if s >= 0 { self.m.store(8, r, FP, self.ssa_slot_off(s)); }
+    }
+
+    /// Makes a value that has no register in r.
+    fn ssa_remat(&mut self, v: &crate::ssa::Value, r: Reg) {
+        let m = self.m;
+        match v.op {
+            crate::ssa::OP_CONST => m.mov_imm(r, v.aux_int),
+            crate::ssa::OP_LOCALADDR => m.addr_of(r, FP, self.loff[v.aux_int as usize]),
+            crate::ssa::OP_RESADDR => m.addr_of(r, FP, self.res_off),
+            crate::ssa::OP_CONSTPARAM => {
+                if let crate::ssa::Aux::Cnst(c) = &v.aux {
+                    let t = self.conc(c.param.unwrap());
+                    m.mov_imm(r, t.len);
+                }
+            }
+            crate::ssa::OP_CONSTSYM => {
+                let c = match &v.aux { crate::ssa::Aux::Cnst(c) => *c, _ => return };
+                match c.kind {
+                    mir::C_STATIC => {
+                        let s = self.g.statics[&c.static_def.unwrap().id].clone();
+                        m.adr_sym(r, &s);
+                    }
+                    mir::C_STR | mir::C_BYTES => {
+                        let s = self.g.str_bytes(&c.bytes);
+                        m.adr_sym(r, &s);
+                    }
+                    _ => {
+                        if v.aux_int == 0 { self.fn_value(c, r, T1); } else { self.fn_value(c, T1, r); }
+                    }
+                }
+            }
+            crate::ssa::OP_VTABLE => {
+                let bi = (v.aux_int >> 32) as usize;
+                let si = (v.aux_int & 0xffffffff) as usize;
+                let key = codegen::dyn_site(self.f, bi, si);
+                let (vt, slot) = self.g.p.site_vtable(self.inst, &key);
+                if slot >= 0 {
+                    m.load(8, r, FP, SLOT_CTX);
+                    m.load(8, r, r, 16 * slot);
+                } else {
+                    m.adr_sym(r, &vt.sym);
+                }
+            }
+            crate::ssa::OP_CLOSURECODE => {
+                if let crate::ssa::Aux::Rv(rv) = &v.aux {
+                    if let Rvalue::Aggregate { closure, .. } = *rv {
+                        let s = self.g.closure_sym(self.grp, closure.unwrap());
+                        m.adr_sym(r, &s);
+                    }
+                }
+            }
+            _ => self.g.errorf(`${self.f.name}: no register for v${v.id} (${crate::ssa::op_name(v.op)})`),
+        }
+    }
+
+    /// MIR operands for the old helpers: each non-constant one's words
+    /// (v.args from *ai) put in the bridge area, read through a new local.
+    fn ssa_bridged(&mut self, v: &crate::ssa::Value, ops: &Vec<Operand>, ai: &mut usize, off: &mut i64) -> Vec<Operand> {
+        let m = self.m;
+        let mut out: Vec<Operand> = Vec::new();
+        for op in ops.iter() {
+            if op.kind == mir::OP_CONST {
+                // Constants stay (the builder gave them words too).
+                *ai += self.ssa_const_args(op);
+                out.push(op.clone());
+                continue;
+            }
+            let t = self.operand_type(op);
+            let size = self.size(t);
+            if size == 0 {
+                out.push(op.clone());
+                continue;
+            }
+            let words = self.ssa_words(t);
+            let nargs = if words == 0 { 1 } else { words as usize };
+            let at = self.ssa_bridge + *off;
+            if words == 0 {
+                let a = self.ssa_in(v.args[*ai], RA);
+                if a != RA { m.mov(RA, a); }
+                self.copy_mem(FP, at, RA, 0, size);
+            } else {
+                let w0 = self.ssa_in(v.args[*ai], V1);
+                m.store(if words == 1 { size } else { 8 }, w0, FP, at);
+                if words == 2 {
+                    let w1 = self.ssa_in(v.args[*ai + 1], V1);
+                    m.store(8, w1, FP, at + 8);
+                }
+            }
+            *ai += nargs;
+            *off += round8(size);
+            let l = self.ltypes.len();
+            self.ltypes.push(t);
+            self.loff.push(at);
+            self.preg.push(-1);
+            self.preg2.push(-1);
+            out.push(mir::copy(mir::local_place(l)));
+        }
+        out
+    }
+
+    /// How many SSA arguments the builder made for a constant operand (its
+    /// words; one for one in memory).
+    fn ssa_const_args(&mut self, op: &Operand) -> usize {
+        let c = op.cnst.unwrap();
+        let t = match c.ty {
+            Some(t) => self.conc(t),
+            None => return 0,
+        };
+        if self.size(t) == 0 { return 0; }
+        let w = self.ssa_words(t);
+        if w == 0 { 1 } else { w as usize }
+    }
+
+    /// The bytes the bridge needs for v's operands.
+    fn ssa_bridge_size(&mut self, v: &crate::ssa::Value) -> i64 {
+        let mut n = 0i64;
+        let mut add = |fg: &mut FnGen, ops: &Vec<Operand>| {
+            for op in ops.iter() {
+                if op.kind == mir::OP_CONST { continue; }
+                let t = fg.operand_type(op);
+                n += round8(fg.size(t));
+            }
+        };
+        match &v.aux {
+            crate::ssa::Aux::Term(t) => {
+                if let Term::Call { fn_op, args, .. } = *t {
+                    let mut fo: Vec<Operand> = Vec::new();
+                    fo.push(fn_op.clone());
+                    add(self, &fo);
+                    add(self, args);
+                }
+            }
+            crate::ssa::Aux::Stmt(st) => {
+                if let Stmt::PushDefer { fn_op, args } = *st {
+                    let mut fo: Vec<Operand> = Vec::new();
+                    fo.push(fn_op.clone());
+                    add(self, &fo);
+                    add(self, args);
+                }
+            }
+            crate::ssa::Aux::Rv(rv) => {
+                if let Rvalue::Aggregate { ops, .. } = *rv { add(self, ops); }
+            }
+            _ => {}
+        }
+        n
+    }
+
+    /// The base register and offset of a load or store's address.
+    fn ssa_addr(&mut self, a: &crate::ssa::Value, off: i64, scratch: Reg) -> (Reg, i64) {
+        if self.ssa_alloc.reg[a.id as usize] < 0 && self.ssa_alloc.slot[a.id as usize] < 0 {
+            if a.op == crate::ssa::OP_LOCALADDR { return (FP, self.loff[a.aux_int as usize] + off); }
+            if a.op == crate::ssa::OP_RESADDR { return (FP, self.res_off + off); }
+        }
+        (self.ssa_in(a, scratch), off)
+    }
+
+    /// Generates f from its SSA form.
+    fn gen_ssa(&mut self, sf: &mut crate::ssa::Func) {
+        let m = self.m;
+        let f = self.f;
+        crate::ssa::prep::split_critical(sf);
+        crate::ssa::prep::fold_offsets(sf);
+        crate::ssa::deadcode(sf);
+        let fused = crate::ssa::prep::fuse_compares(sf);
+        // arm64: x1-x7 besides the saved registers; amd64 has only the
+        // saved ones to spare.
+        let mut caller: Vec<u8> = Vec::new();
+        let mut k = 0;
+        while k < NUM_A && self.g.tgt.code_unit == 4 {
+            caller.push(A1 + k as Reg);
+            k += 1;
+        }
+        let mut callee: Vec<u8> = Vec::new();
+        k = 0;
+        while k < self.g.tgt.num_saved {
+            callee.push(S0 + k as Reg);
+            k += 1;
+        }
+        let cfg = &crate::ssa::regalloc::Config { caller, callee };
+        self.ssa_alloc = crate::ssa::regalloc::allocate(sf, cfg, &fused);
+        let al = self.ssa_alloc;
+        // The old helpers look for promoted locals: none here.
+        let mut li = 0;
+        while li < f.locals.len() {
+            self.preg.push(-1);
+            self.preg2.push(-1);
+            li += 1;
+        }
+        let mut bridge = 0i64;
+        for b in sf.blocks.iter() {
+            for v in b.values.iter() {
+                if v.op == crate::ssa::OP_INTRINSIC || v.op == crate::ssa::OP_CLOSURE || v.op == crate::ssa::OP_DEFER || v.op == crate::ssa::OP_CALL {
+                    let n = self.ssa_bridge_size(*v);
+                    if n > bridge { bridge = n; }
+                }
+            }
+        }
+        // The frame: the locals in memory, the saved registers, the spill
+        // slots, the buffers and the outgoing area.
+        let n = f.locals.len();
+        let mut cur = FIXED_FRAME;
+        let mut i = 0;
+        while i < n {
+            if (i >= self.first_arg() && i <= f.nargs) || sf.is_var[i] {
+                i += 1;
+                continue;
+            }
+            let t = self.ltypes[i];
+            let mut size = 0i64;
+            let mut align = 1i64;
+            if t.kind != types::K_NEVER {
+                let l = self.g.lay_of(t);
+                size = l.size;
+                align = l.align;
+            }
+            if size == 0 { size = 1; }
+            if align < 1 { align = 1; }
+            cur = (cur + size + align - 1) / align * align;
+            self.loff[i] = -cur;
+            i += 1;
+        }
+        cur = (cur + 7) / 8 * 8;
+        for r in al.used_callee.iter() {
+            cur += 8;
+            self.saved.push((*r, -cur));
+        }
+        let nslots = al.slot_ptr.len() as i64;
+        self.ssa_slots = -(cur + 8);
+        cur += 8 * nslots;
+        let mut s = 0;
+        while s < al.slot_ptr.len() {
+            if al.slot_ptr[s] { self.ptr_slots.push(self.ssa_slot_off(s as i32)); }
+            s += 1;
+        }
+        let mut max_res = 16i64;
+        let mut max_out = 48i64;
+        for b in f.blocks.iter() {
+            if let Term::Call { args, dest, .. } = &b.term {
+                let dt = self.place_type(dest);
+                let sz = self.size(dt);
+                if sz > max_res { max_res = sz; }
+                let mut na = 0i64;
+                for a in args.iter() {
+                    let at = self.operand_type(a);
+                    na += round8(self.size(at));
+                }
+                if na > max_out { max_out = na; }
+            }
+        }
+        self.buf_top = -cur;
+        cur = (cur + max_res + 7) / 8 * 8;
+        self.res_off = -cur;
+        cur = (cur + 16 + 7) / 8 * 8;
+        self.tmp_off = -cur;
+        cur += bridge;
+        self.ssa_bridge = -cur;
+        let frame = ((cur + 15) & !15) + ((max_out + 15) & !15);
+        self.frame = frame;
+        // The prologue (as gen's).
+        let overflow = m.new_label();
+        let resume = m.new_label();
+        let need = frame + 16;
+        m.load(8, I1, GREG, 0);
+        m.mov(I2, SP);
+        m.add_imm(I2, -need);
+        m.cmp(I2, I1);
+        m.branch_if(LTU, overflow);
+        m.bind(resume);
+        self.stub_list.push(Stub::Overflow(overflow, resume, need));
+        m.prologue(frame);
+        for sv in self.saved.iter() { m.store(8, sv.0, FP, sv.1); }
+        if f.closure {
+            // The environment (CTX) is read by the entry's Arg 1, or kept in
+            // its slot.
+            if !sf.is_var[1] { m.store(8, CTX, FP, self.loff[1]); }
+            m.load(8, I1, CTX, -8);
+            m.store(8, I1, FP, SLOT_CTX);
+        } else {
+            m.store(8, CTX, FP, SLOT_CTX);
+        }
+        m.store(8, RET, FP, SLOT_RET);
+        m.store(8, LOC, FP, SLOT_LOC);
+        m.store_zero(8, FP, SLOT_DEFERS);
+        // The calls' tags and masks.
+        let mut masks = self.g.cur_masks;
+        masks.clear();
+        masks.push(0);
+        for cm in al.call_masks.iter() { masks.push(cm.1 as u16); }
+        self.ssa_masks = masks.clone();
+        let mut labels: Vec<Label> = Vec::new();
+        for _ in sf.blocks.iter() { labels.push(m.new_label()); }
+        let mut call_no = 0i64;
+        let nb = sf.blocks.len();
+        let mut bi = 0;
+        while bi < nb {
+            let b = sf.blocks[bi];
+            m.bind(labels[bi]);
+            for vv in b.values.iter() {
+                let v = *vv;
+                if self.g.debug && v.pos > 0 { self.note_line(v.pos); }
+                if crate::ssa::regalloc::is_call(v) {
+                    call_no += 1;
+                    m.set_tag(call_no);
+                } else {
+                    m.set_tag(-1);
+                }
+                if fused[v.id as usize] { continue; }
+                self.ssa_value(v);
+            }
+            let next = if bi + 1 < nb { sf.blocks[bi + 1].id as i64 } else { -1 };
+            match b.kind {
+                crate::ssa::B_PLAIN => {
+                    let s = b.succs[0];
+                    self.ssa_phi_moves(b, s);
+                    if s.id as i64 != next { m.jump(labels[s.id as usize]); }
+                }
+                crate::ssa::B_IF => {
+                    let c = b.control.unwrap();
+                    let yes = b.succs[0];
+                    let no = b.succs[1];
+                    if fused[c.id as usize] {
+                        let cond = self.ssa_compare(c);
+                        if yes.id as i64 == next {
+                            m.branch_if(invert(cond), labels[no.id as usize]);
+                        } else {
+                            m.branch_if(cond, labels[yes.id as usize]);
+                            if no.id as i64 != next { m.jump(labels[no.id as usize]); }
+                        }
+                    } else {
+                        let r = self.ssa_in(c, V1);
+                        if yes.id as i64 == next {
+                            m.branch_zero(r, labels[no.id as usize]);
+                        } else {
+                            m.branch_non_zero(r, labels[yes.id as usize]);
+                            if no.id as i64 != next { m.jump(labels[no.id as usize]); }
+                        }
+                    }
+                }
+                crate::ssa::B_RET => {}
+                _ => {
+                    let c = b.control.unwrap();
+                    if c.op != crate::ssa::OP_PANIC { m.trap(); }
+                }
+            }
+            bi += 1;
+        }
+        self.emit_stubs();
+    }
+
+    /// Compares a fused comparison's operands; the condition its value is.
+    fn ssa_compare(&mut self, c: &crate::ssa::Value) -> Cond {
+        let m = self.m;
+        let mut a = self.ssa_in(c.args[0], V1);
+        let mut b = self.ssa_in(c.args[1], V2);
+        let signed = c.aux_int & 2 != 0;
+        let size = crate::ssa::ty_size(c.args[0].ty);
+        if signed && size < 8 {
+            m.sign_ext(V1, a, size);
+            m.sign_ext(V2, b, size);
+            a = V1;
+            b = V2;
+        }
+        m.cmp(a, b);
+        match c.op {
+            crate::ssa::OP_EQ => EQ,
+            crate::ssa::OP_NE => NE,
+            crate::ssa::OP_LT => if signed { LT } else { LTU },
+            _ => if signed { LE } else { LEU },
+        }
+    }
+
+    /// The location of v for moves.
+    fn ssa_loc(&self, v: &mut crate::ssa::Value) -> Loc {
+        let id = v.id as usize;
+        let r = self.ssa_alloc.reg[id];
+        if r >= 0 { return Loc { kind: 0, reg: r as Reg, off: 0, val: None }; }
+        let s = self.ssa_alloc.slot[id];
+        if s >= 0 { return Loc { kind: 1, reg: 0, off: self.ssa_slot_off(s), val: None }; }
+        Loc { kind: 2, reg: 0, off: 0, val: Some(v) }
+    }
+
+    fn ssa_move(&mut self, dst: &Loc, src: &Loc) {
+        let m = self.m;
+        if dst.kind == 0 {
+            match src.kind {
+                0 => m.mov(dst.reg, src.reg),
+                1 => m.load(8, dst.reg, FP, src.off),
+                _ => self.ssa_remat(src.val.unwrap(), dst.reg),
+            }
+            return;
+        }
+        let r = match src.kind {
+            0 => src.reg,
+            1 => {
+                m.load(8, T1, FP, src.off);
+                T1
+            }
+            _ => {
+                self.ssa_remat(src.val.unwrap(), T1);
+                T1
+            }
+        };
+        m.store(8, r, FP, dst.off);
+    }
+
+    /// The moves into s's phis at the end of b (a parallel copy).
+    fn ssa_phi_moves(&mut self, b: &crate::ssa::Block, s: &crate::ssa::Block) {
+        let mut pi = 0;
+        while pi < s.preds.len() {
+            if s.preds[pi].id == b.id { break; }
+            pi += 1;
+        }
+        let mut dsts: Vec<Loc> = Vec::new();
+        let mut srcs: Vec<Loc> = Vec::new();
+        for vv in s.values.iter() {
+            let v = *vv;
+            if v.op != crate::ssa::OP_PHI { break; }
+            let d = self.ssa_loc(v);
+            let sv = self.ssa_loc(v.args[pi]);
+            if d.kind == 2 { continue; }
+            if d.kind == sv.kind && ((d.kind == 0 && d.reg == sv.reg) || (d.kind == 1 && d.off == sv.off)) { continue; }
+            dsts.push(d);
+            srcs.push(sv);
+        }
+        // Emit a move whose destination no other pending move reads; break
+        // cycles through I1.
+        while dsts.len() > 0 {
+            let mut done = false;
+            let mut i = 0;
+            while i < dsts.len() {
+                let mut read = false;
+                let mut j = 0;
+                while j < srcs.len() {
+                    if j != i && same_loc(&srcs[j], &dsts[i]) { read = true; }
+                    j += 1;
+                }
+                if !read {
+                    let d = dsts.remove(i);
+                    let sv = srcs.remove(i);
+                    self.ssa_move(&d, &sv);
+                    done = true;
+                    break;
+                }
+                i += 1;
+            }
+            if done { continue; }
+            // A cycle: park the first source in I1.
+            let t = Loc { kind: 0, reg: I1, off: 0, val: None };
+            let first = srcs[0].clone();
+            self.ssa_move(&t, &first);
+            let mut j = 0;
+            while j < srcs.len() {
+                if same_loc(&srcs[j], &first) { srcs[j] = t.clone(); }
+                j += 1;
+            }
+        }
+    }
+
+    /// Generates one value.
+    fn ssa_value(&mut self, v: &mut crate::ssa::Value) {
+        let m = self.m;
+        let op = v.op;
+        let nargs = v.args.len();
+        match op {
+            crate::ssa::OP_INITMEM | crate::ssa::OP_PHI => {}
+            crate::ssa::OP_ARG => {
+                let l = (v.aux_int >> 1) as usize;
+                let w = v.aux_int & 1;
+                let d = self.ssa_dst(v, V1);
+                if self.f.closure && l == 1 {
+                    m.mov(d, CTX);
+                } else {
+                    let size = if w == 0 && !self.ssa_two(v) { self.size(self.ltypes[l]) } else { 8 };
+                    m.load(if size > 8 { 8 } else { size }, d, FP, self.loff[l] + 8 * w);
+                }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_COPY | crate::ssa::OP_RETYPE | crate::ssa::OP_ZEXT => {
+                let a = self.ssa_in(v.args[0], V1);
+                let d = self.ssa_dst(v, V1);
+                if a != d { m.mov(d, a); }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_CONST | crate::ssa::OP_LOCALADDR | crate::ssa::OP_RESADDR | crate::ssa::OP_CONSTSYM | crate::ssa::OP_CONSTPARAM
+                | crate::ssa::OP_VTABLE | crate::ssa::OP_CLOSURECODE => {
+                if self.ssa_alloc.reg[v.id as usize] >= 0 || self.ssa_alloc.slot[v.id as usize] >= 0 {
+                    let d = self.ssa_dst(v, V1);
+                    self.ssa_remat(v, d);
+                    self.ssa_out(v, d);
+                }
+            }
+            crate::ssa::OP_RETPTR => {
+                let d = self.ssa_dst(v, V1);
+                m.load(8, d, FP, SLOT_RET);
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_OFFPTR => {
+                let a = self.ssa_in(v.args[0], V1);
+                let d = self.ssa_dst(v, V1);
+                if a == d {
+                    m.add_imm(d, v.aux_int);
+                } else {
+                    m.addr_of(d, a, v.aux_int);
+                }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_INDEXPTR => {
+                let a = self.ssa_in(v.args[0], V1);
+                let ix = self.ssa_in(v.args[1], V2);
+                let d = self.ssa_dst(v, V1);
+                let es = v.aux_int;
+                if es == 1 || es == 2 || es == 4 || es == 8 {
+                    m.add_scaled(d, a, ix, if es == 1 { 0 } else if es == 2 { 1 } else if es == 4 { 2 } else { 3 });
+                } else {
+                    m.mov_imm(I2, es);
+                    m.mul_add(d, ix, I2, a);
+                }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_ADD | crate::ssa::OP_SUB | crate::ssa::OP_MUL | crate::ssa::OP_DIV | crate::ssa::OP_REM | crate::ssa::OP_AND
+                | crate::ssa::OP_OR | crate::ssa::OP_XOR | crate::ssa::OP_SHL | crate::ssa::OP_SHR => self.ssa_arith(v),
+            crate::ssa::OP_NEG | crate::ssa::OP_NOT => {
+                let a = self.ssa_in(v.args[0], V1);
+                let d = self.ssa_dst(v, V1);
+                let size = crate::ssa::ty_size(v.ty);
+                if op == crate::ssa::OP_NOT {
+                    if v.ty == crate::ssa::T_BOOL {
+                        m.mov_imm(V2, 1);
+                        m.arith(XOR, d, a, V2);
+                    } else {
+                        m.not(d, a);
+                        if size < 8 { m.zero_ext(d, d, size); }
+                    }
+                } else {
+                    if v.aux_int & 2 != 0 && self.g.debug {
+                        m.sign_ext(V2, a, size);
+                        m.mov_imm(T1, int_min(size));
+                        m.cmp(V2, T1);
+                        let l = self.panic_stub("attempt to negate with overflow", v.pos);
+                        m.branch_if(EQ, l);
+                    }
+                    m.neg(d, a);
+                    if size < 8 { m.zero_ext(d, d, size); }
+                }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_EQ | crate::ssa::OP_NE | crate::ssa::OP_LT | crate::ssa::OP_LE => {
+                let c = self.ssa_compare(v);
+                let d = self.ssa_dst(v, V1);
+                m.set_cond(d, c);
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_FADD | crate::ssa::OP_FSUB | crate::ssa::OP_FMUL | crate::ssa::OP_FDIV => {
+                let f64_ = v.ty == crate::ssa::T_F64;
+                let a = self.ssa_in(v.args[0], V1);
+                let b = self.ssa_in(v.args[1], V2);
+                m.fmov_to(F0, a, f64_);
+                m.fmov_to(F1, b, f64_);
+                let fop = match op { crate::ssa::OP_FADD => ADD, crate::ssa::OP_FSUB => SUB, crate::ssa::OP_FMUL => MUL, _ => FDIV };
+                m.farith(fop, F0, F0, F1, f64_);
+                let d = self.ssa_dst(v, V1);
+                m.fmov_from(d, F0, f64_);
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_FNEG => {
+                let f64_ = v.ty == crate::ssa::T_F64;
+                let a = self.ssa_in(v.args[0], V1);
+                m.fmov_to(F0, a, f64_);
+                m.fneg(F0, F0, f64_);
+                let d = self.ssa_dst(v, V1);
+                m.fmov_from(d, F0, f64_);
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_FEQ | crate::ssa::OP_FNE | crate::ssa::OP_FLT | crate::ssa::OP_FLE => {
+                let f64_ = v.args[0].ty == crate::ssa::T_F64;
+                let a = self.ssa_in(v.args[0], V1);
+                let b = self.ssa_in(v.args[1], V2);
+                m.fmov_to(F0, a, f64_);
+                m.fmov_to(F1, b, f64_);
+                let c = match op { crate::ssa::OP_FEQ => EQ, crate::ssa::OP_FNE => NE, crate::ssa::OP_FLT => LT, _ => LE };
+                let d = self.ssa_dst(v, V1);
+                m.fcompare(d, c, F0, F1, f64_);
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_SEXT => {
+                let a = self.ssa_in(v.args[0], V1);
+                let d = self.ssa_dst(v, V1);
+                m.sign_ext(d, a, v.aux_int);
+                let size = crate::ssa::ty_size(v.ty);
+                if size < 8 { m.zero_ext(d, d, size); }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_TRUNC => {
+                let a = self.ssa_in(v.args[0], V1);
+                let d = self.ssa_dst(v, V1);
+                m.zero_ext(d, a, crate::ssa::ty_size(v.ty));
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_FCONV => {
+                let a = self.ssa_in(v.args[0], V1);
+                let to64 = v.ty == crate::ssa::T_F64;
+                m.fmov_to(F0, a, !to64);
+                m.float_conv(F0, F0, to64);
+                let d = self.ssa_dst(v, V1);
+                m.fmov_from(d, F0, to64);
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_ITOF => {
+                let a = self.ssa_in(v.args[0], V1);
+                let to64 = v.ty == crate::ssa::T_F64;
+                let signed = v.aux_int & 256 != 0;
+                let size = v.aux_int & 255;
+                if signed {
+                    m.sign_ext(V1, a, size);
+                    m.int_to_float(F0, V1, true, to64);
+                } else {
+                    m.int_to_float(F0, a, false, to64);
+                }
+                let d = self.ssa_dst(v, V1);
+                m.fmov_from(d, F0, to64);
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_FTOI => {
+                let a = self.ssa_in(v.args[0], V1);
+                let from64 = v.args[0].ty == crate::ssa::T_F64;
+                let signed = v.aux_int & 256 != 0;
+                let size = crate::ssa::ty_size(v.ty);
+                m.fmov_to(F0, a, from64);
+                let d = self.ssa_dst(v, V1);
+                if size == 8 {
+                    m.float_to_int(d, F0, signed, from64);
+                } else {
+                    m.float_to_int(d, F0, true, from64);
+                    let (lo, hi) = if signed { (int_min(size), -int_min(size) - 1) } else { (0, (1i64 << (8 * size) as u32) - 1) };
+                    m.mov_imm(V2, lo);
+                    m.cmp(d, V2);
+                    m.select_reg(d, V2, d, LT);
+                    m.mov_imm(V2, hi);
+                    m.cmp(d, V2);
+                    m.select_reg(d, V2, d, GT);
+                    m.zero_ext(d, d, size);
+                }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_LOAD => {
+                let (b, o) = self.ssa_addr(v.args[0], v.aux_int, V2);
+                let d = self.ssa_dst(v, V1);
+                m.load(crate::ssa::ty_size(v.ty), d, b, o);
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_STORE => {
+                let (b, o) = self.ssa_addr(v.args[0], v.aux_int, V2);
+                let x = self.ssa_in(v.args[1], V1);
+                m.store(crate::ssa::ty_size(v.args[1].ty), x, b, o);
+            }
+            crate::ssa::OP_MOVE => {
+                let d = self.ssa_in(v.args[0], BASE);
+                if d != BASE { m.mov(BASE, d); }
+                let s = self.ssa_in(v.args[1], RA);
+                if s != RA { m.mov(RA, s); }
+                self.copy_mem(BASE, 0, RA, 0, v.aux_int);
+            }
+            crate::ssa::OP_ZERO => {
+                let d = self.ssa_in(v.args[0], BASE);
+                if d != BASE { m.mov(BASE, d); }
+                self.zero_mem(BASE, 0, v.aux_int);
+            }
+            crate::ssa::OP_WB => {
+                let a = self.ssa_in(v.args[0], RA);
+                if a != RA { m.mov(RA, a); }
+                let skip = m.new_label();
+                m.load_sym(I1, &self.g.sym_marking);
+                m.branch_zero(I1, skip);
+                m.load(8, I1, GREG, 8);
+                m.add_imm(I1, 1);
+                m.store(8, I1, GREG, 8);
+                m.store(8, RA, SP, 0);
+                m.mov_imm(V1, v.aux_int);
+                m.store(8, V1, SP, 8);
+                self.call_runtime("gc_wb");
+                m.bind(skip);
+            }
+            crate::ssa::OP_DISCR => {
+                let a = self.ssa_in(v.args[0], RA);
+                if a != RA { m.mov(RA, a); }
+                let t = match &v.aux { crate::ssa::Aux::Ty(t) => *t, _ => return };
+                self.read_variant(t);
+                let d = self.ssa_dst(v, V1);
+                if d != V1 { m.mov(d, V1); }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_SETDISCR => {
+                let a = self.ssa_in(v.args[0], BASE);
+                if a != BASE { m.mov(BASE, a); }
+                let t = match &v.aux { crate::ssa::Aux::Ty(t) => *t, _ => return };
+                self.write_tag(BASE, t, v.aux_int as usize);
+            }
+            crate::ssa::OP_ALLOC => {
+                let t = match &v.aux { crate::ssa::Aux::Ty(t) => *t, _ => return };
+                let ns = self.noscan(t);
+                self.call_alloc(v.aux_int, ns);
+            }
+            crate::ssa::OP_SELECT => {
+                let t = v.args[0];
+                if v.ty == crate::ssa::T_MEM { return; }
+                if t.op == crate::ssa::OP_ALLOC {
+                    let d = self.ssa_dst(v, V1);
+                    m.load(8, d, FP, self.res_off);
+                    self.ssa_out(v, d);
+                    return;
+                }
+                if t.op == crate::ssa::OP_INTRINSIC || t.op == crate::ssa::OP_CLOSURE {
+                    // Intrinsics leave their words in V1, V2; closures their
+                    // environment in V2.
+                    let src = if t.op == crate::ssa::OP_CLOSURE || v.aux_int == 1 { V2 } else { V1 };
+                    let d = self.ssa_dst(v, V1);
+                    if d != src { m.mov(d, src); }
+                    self.ssa_out(v, d);
+                    return;
+                }
+                self.g.errorf(`${self.f.name}: select of ${crate::ssa::op_name(t.op)}`);
+            }
+            crate::ssa::OP_CALL => self.ssa_call(v),
+            crate::ssa::OP_INTRINSIC => {
+                let t = match &v.aux { crate::ssa::Aux::Term(t) => *t, _ => return };
+                let (fn_op, args, dest, target, pos) = match t { Term::Call { fn_op, args, dest, target, pos } => (fn_op, args, dest, *target, *pos), _ => return };
+                let (tg, slot) = self.g.p.site_target(self.inst, fn_op.cnst.unwrap());
+                if slot >= 0 {
+                    // type_desc in shared code: from the dictionary.
+                    m.load(8, V1, FP, SLOT_CTX);
+                    m.load(8, V1, V1, 16 * slot);
+                    return;
+                }
+                let mut ai = 0usize;
+                let mut off = 0i64;
+                let bargs = self.ssa_bridged(v, args, &mut ai, &mut off);
+                let dt = self.place_type(dest);
+                self.intrinsic_body(tg, &bargs, None, target, pos, dt);
+            }
+            crate::ssa::OP_CLOSURE => {
+                let rv = match &v.aux { crate::ssa::Aux::Rv(rv) => *rv, _ => return };
+                let (ops, cf) = match rv { Rvalue::Aggregate { ops, closure, .. } => (ops, closure.unwrap()), _ => return };
+                let mut ai = 0usize;
+                let mut off = 0i64;
+                let bops = self.ssa_bridged(v, ops, &mut ai, &mut off);
+                self.closure(&bops, cf);
+            }
+            crate::ssa::OP_DEFER => {
+                let st = match &v.aux { crate::ssa::Aux::Stmt(st) => *st, _ => return };
+                let (fn_op, args) = match st { Stmt::PushDefer { fn_op, args } => (fn_op, args), _ => return };
+                let mut ai = 0usize;
+                let mut off = 0i64;
+                // A constant callee has no SSA arguments.
+                let mut fo: Vec<Operand> = Vec::new();
+                fo.push(fn_op.clone());
+                let bfn = if fn_op.kind == mir::OP_CONST { fo } else { self.ssa_bridged(v, &fo, &mut ai, &mut off) };
+                let bargs = self.ssa_bridged(v, args, &mut ai, &mut off);
+                self.push_defer(&bfn[0], &bargs);
+            }
+            crate::ssa::OP_FREM => {
+                let f64_ = v.ty == crate::ssa::T_F64;
+                let a = self.ssa_in(v.args[0], V1);
+                m.store(8, a, SP, 0);
+                let b = self.ssa_in(v.args[1], V1);
+                m.store(8, b, SP, 8);
+                let name = if f64_ { "fmod" } else { "fmodf" };
+                let sym = self.g.extern_sym(name);
+                let mut cargs = Vec::new();
+                cargs.push(CArg { float: true, f64: f64_, variadic: false, size: if f64_ { 8 } else { 4 } });
+                cargs.push(CArg { float: true, f64: f64_, variadic: false, size: if f64_ { 8 } else { 4 } });
+                m.call_c(sym.as_str(), 0, &cargs, true, f64_);
+                let d = self.ssa_dst(v, V1);
+                if d != V1 { m.mov(d, V1); }
+                self.ssa_out(v, d);
+            }
+            crate::ssa::OP_PANIC => {
+                if v.aux_int == 1 {
+                    let l = self.ssa_in(v.args[0], V1);
+                    m.store(8, l, SP, 0);
+                    let ix = self.ssa_in(v.args[1], V1);
+                    m.store(8, ix, SP, 8);
+                    match self.f.file {
+                        Some(file) => self.store_file_pos(16, file, v.pos),
+                        None => self.store_file_line(16, "<unknown>", 0, 0),
+                    }
+                    self.call_runtime("panic_bounds");
+                    m.trap();
+                    return;
+                }
+                let msg = match &v.aux { crate::ssa::Aux::Str(s) => s.clone(), _ => String::new() };
+                self.call_panic(msg.as_str(), v.pos);
+            }
+            crate::ssa::OP_RETURN => {
+                let size = self.size(self.ltypes[0]);
+                // The result's words go to the caller's slot first (the
+                // defers cannot change a variable).
+                if nargs > 1 && size > 0 {
+                    m.load(8, BASE, FP, SLOT_RET);
+                    let w0 = self.ssa_in(v.args[0], V1);
+                    m.store(if nargs > 2 { 8 } else { size }, w0, BASE, 0);
+                    if nargs > 2 {
+                        let w1 = self.ssa_in(v.args[1], V1);
+                        m.store(8, w1, BASE, 8);
+                    }
+                }
+                m.load(8, CTX, FP, SLOT_DEFERS);
+                let skip = m.new_label();
+                m.branch_zero(CTX, skip);
+                m.call(&self.g.sym_rundefers);
+                m.bind(skip);
+                if nargs == 1 && size > 0 && !self.ssa_var0 {
+                    m.load(8, BASE, FP, SLOT_RET);
+                    self.local_addr(RA, 0);
+                    self.copy_mem(BASE, 0, RA, 0, size);
+                }
+                for sv in self.saved.iter() { m.load(8, sv.0, FP, sv.1); }
+                m.ret();
+            }
+            _ => self.g.errorf(`${self.f.name}: SSA op ${crate::ssa::op_name(op)} not generated`),
+        }
+    }
+
+    /// Whether an Arg value is a word of a two-word variable.
+    fn ssa_two(&mut self, v: &crate::ssa::Value) -> bool {
+        let l = (v.aux_int >> 1) as usize;
+        let t = self.ltypes[l];
+        self.size(t) == 16
+    }
+
+    fn ssa_arith(&mut self, v: &mut crate::ssa::Value) {
+        let m = self.m;
+        let op = v.op;
+        let size = crate::ssa::ty_size(v.ty);
+        let signed = v.aux_int & 2 != 0;
+        let checked = v.aux_int & 1 != 0;
+        let mut a = self.ssa_in(v.args[0], V1);
+        let mut b = self.ssa_in(v.args[1], V2);
+        let shift = op == crate::ssa::OP_SHL || op == crate::ssa::OP_SHR;
+        if signed && size < 8 {
+            m.sign_ext(V1, a, size);
+            a = V1;
+            if !shift {
+                m.sign_ext(V2, b, size);
+                b = V2;
+            }
+        }
+        let d = self.ssa_dst(v, V1);
+        let dbg = self.g.debug && checked;
+        if op == crate::ssa::OP_ADD || op == crate::ssa::OP_SUB || op == crate::ssa::OP_MUL {
+            let what = if op == crate::ssa::OP_ADD { "add" } else if op == crate::ssa::OP_SUB { "subtract" } else { "multiply" };
+            let aop = if op == crate::ssa::OP_ADD { ADD } else if op == crate::ssa::OP_SUB { SUB } else { MUL };
+            if size == 8 && dbg {
+                let l = self.panic_stub(`attempt to ${what} with overflow`.as_str(), v.pos);
+                m.arith_ovf(aop, signed, d, a, b, l);
+                self.ssa_out(v, d);
+                return;
+            }
+            m.arith(aop, d, a, b);
+            if dbg && size < 8 {
+                let l = self.panic_stub(`attempt to ${what} with overflow`.as_str(), v.pos);
+                if signed {
+                    m.sign_ext(T1, d, size);
+                    m.cmp(T1, d);
+                    m.branch_if(NE, l);
+                } else {
+                    m.mov_imm(T1, (1i64 << (8 * size) as u32) - 1);
+                    m.cmp(d, T1);
+                    m.branch_if(GTU, l);
+                }
+            }
+        } else if op == crate::ssa::OP_DIV || op == crate::ssa::OP_REM {
+            let l = self.panic_stub("attempt to divide by zero", v.pos);
+            m.branch_zero(b, l);
+            if signed {
+                let skip = m.new_label();
+                m.cmp_imm(b, -1);
+                m.branch_if(NE, skip);
+                m.mov_imm(T1, int_min(size));
+                m.cmp(a, T1);
+                let l2 = self.panic_stub("attempt to divide with overflow", v.pos);
+                m.branch_if(EQ, l2);
+                m.bind(skip);
+            }
+            let aop = if op == crate::ssa::OP_DIV && signed { DIV_S } else if op == crate::ssa::OP_DIV { DIV_U } else if signed { REM_S } else { REM_U };
+            m.arith(aop, d, a, b);
+        } else if shift {
+            if checked {
+                m.cmp_imm(b, size * 8);
+                let l = self.panic_stub("attempt to shift with overflow", v.pos);
+                m.branch_if(GEU, l);
+            }
+            let aop = if op == crate::ssa::OP_SHL { SHL } else if signed { SHR_S } else { SHR_U };
+            m.arith(aop, d, a, b);
+        } else {
+            let aop = if op == crate::ssa::OP_AND { AND } else if op == crate::ssa::OP_OR { OR } else { XOR };
+            m.arith(aop, d, a, b);
+        }
+        if size < 8 && op != crate::ssa::OP_AND && op != crate::ssa::OP_OR && op != crate::ssa::OP_XOR && !(op == crate::ssa::OP_SHR && !signed) {
+            m.zero_ext(d, d, size);
+        }
+        self.ssa_out(v, d);
+    }
+
+    /// A call: the arguments to the outgoing area, then the call as call's.
+    fn ssa_call(&mut self, v: &mut crate::ssa::Value) {
+        let m = self.m;
+        let t = match &v.aux { crate::ssa::Aux::Term(t) => *t, _ => return };
+        let (fn_op, args, pos) = match t { Term::Call { fn_op, args, pos, .. } => (fn_op, args, *pos), _ => return };
+        let mut tgt: Option<&mut Target> = None;
+        let mut slot = -1i64;
+        if fn_op.kind == mir::OP_CONST && fn_op.cnst.unwrap().kind == mir::C_FN {
+            let (tt, s) = self.g.p.site_target(self.inst, fn_op.cnst.unwrap());
+            tgt = Some(tt);
+            slot = s;
+        }
+        if fn_op.kind == mir::OP_COPY {
+            let ft = self.operand_type(fn_op);
+            if ft.kind == types::K_FN && ft.abi == "C" {
+                // Through the old C call: operands bridged, the result to the
+                // result buffer.
+                let mut ai = 0usize;
+                let mut boff = 0i64;
+                let mut fo: Vec<Operand> = Vec::new();
+                fo.push(fn_op.clone());
+                let bfn = self.ssa_bridged(v, &fo, &mut ai, &mut boff);
+                let bargs = self.ssa_bridged(v, args, &mut ai, &mut boff);
+                let dt = match t { Term::Call { dest, .. } => self.place_type(dest), _ => return };
+                if self.c_call_body(&bfn[0], &bargs, dt, "", true) && self.size(dt) > 0 { m.store(8, V1, FP, self.res_off); }
+                return;
+            }
+        }
+        let thin_recv = match tgt { Some(tt) => slot < 0 && tt.kind == codegen::T_VIRTUAL, None => false };
+        // The SSA arguments: the callee's words (not constant), then each
+        // argument's words or address.
+        let mut ai = 0;
+        let mut code: Option<&mut crate::ssa::Value> = None;
+        let mut env: Option<&mut crate::ssa::Value> = None;
+        if fn_op.kind == mir::OP_COPY {
+            code = Some(v.args[0]);
+            env = Some(v.args[1]);
+            ai = 2;
+        }
+        let mut vtable: Option<&mut crate::ssa::Value> = None;
+        let mut off = 0i64;
+        let mut i = 0;
+        while i < args.len() {
+            let at = self.operand_type(&args[i]);
+            let size = self.size(at);
+            if size == 0 {
+                i += 1;
+                continue;
+            }
+            let words = self.ssa_words(at);
+            if words == 0 {
+                // In memory: v.args[ai] is its address (0: a zero constant).
+                let a = v.args[ai];
+                ai += 1;
+                if a.op == crate::ssa::OP_CONST && a.ty == crate::ssa::T_PTR && a.aux_int == 0 && args[i].kind == mir::OP_CONST {
+                    self.zero_mem(SP, off, size);
+                } else {
+                    let r = self.ssa_in(a, RA);
+                    if r != RA { m.mov(RA, r); }
+                    self.copy_mem(SP, off, RA, 0, size);
+                }
+                off += round8(size);
+                i += 1;
+                continue;
+            }
+            let w0 = v.args[ai];
+            let r0 = self.ssa_in(w0, V1);
+            m.store(if words == 1 { size } else { 8 }, r0, SP, off);
+            if words == 2 {
+                let w1 = v.args[ai + 1];
+                if i == 0 && thin_recv {
+                    vtable = Some(w1);
+                } else {
+                    let r1 = self.ssa_in(w1, V1);
+                    m.store(8, r1, SP, off + 8);
+                }
+            }
+            ai += words as usize;
+            off += if i == 0 && thin_recv { 8 } else { round8(size) };
+            i += 1;
+        }
+        match tgt {
+            None => {
+                let c = self.ssa_in(code.unwrap(), BASE);
+                if c != BASE { m.mov(BASE, c); }
+                let e = self.ssa_in(env.unwrap(), CTX);
+                if e != CTX { m.mov(CTX, e); }
+                self.pass_loc(pos);
+                m.addr_of(RET, FP, self.res_off);
+                m.call_reg(BASE);
+            }
+            Some(tt) => {
+                if slot >= 0 {
+                    m.load(8, BASE, FP, SLOT_CTX);
+                    m.load(8, CTX, BASE, 16 * slot + 8);
+                    m.load(8, BASE, BASE, 16 * slot);
+                    self.pass_loc(pos);
+                    m.addr_of(RET, FP, self.res_off);
+                    m.call_reg(BASE);
+                } else if tt.kind == codegen::T_VIRTUAL {
+                    let vt = self.ssa_in(vtable.unwrap(), V2);
+                    m.load(8, CTX, vt, (16 * tt.method + 8) as i64);
+                    m.load(8, BASE, vt, (16 * tt.method) as i64);
+                    self.pass_loc(pos);
+                    m.addr_of(RET, FP, self.res_off);
+                    m.call_reg(BASE);
+                } else {
+                    self.pass_loc(pos);
+                    m.addr_of(RET, FP, self.res_off);
+                    let ins = tt.inst.unwrap();
+                    m.adr_sym(CTX, &ins.dict);
+                    m.call(&ins.grp().sym);
+                }
+            }
+        }
+    }
+
+    /// The words of a type held in registers (0: in memory).
+    fn ssa_words(&mut self, t: &Type) -> i64 {
+        match t.kind {
+            types::K_INT => if layout::int_size(t.int) == 16 { 2 } else { 1 },
+            types::K_BOOL | types::K_CHAR | types::K_FLOAT => 1,
+            types::K_REF | types::K_PTR => {
+                let el = self.reveal(t.el());
+                if layout::is_fat(el) { 2 } else { 1 }
+            }
+            types::K_FN => if t.abi == "C" { 1 } else { 2 },
+            _ => 0,
+        }
+    }
+
+    /// The out-of-line stubs (stack growth, panics).
+    fn emit_stubs(&mut self) {
+        let m = self.m;
+        let mut k = 0;
+        while k < self.stub_list.len() {
+            match &self.stub_list[k] {
+                Stub::Overflow(l, resume, need) => {
+                    m.bind(*l);
+                    m.set_tag(0);
+                    m.mov_imm(I1, *need);
+                    m.call_morestack();
+                    m.jump(*resume);
+                }
+                Stub::Panic { label, msg, pos } => {
+                    m.bind(*label);
+                    m.set_tag(-1);
+                    let ms = msg.clone();
+                    self.call_panic(ms.as_str(), *pos);
+                }
+            }
+            k += 1;
+        }
+    }
+}
+
+fn same_loc(a: &Loc, b: &Loc) -> bool {
+    a.kind == b.kind && ((a.kind == 0 && a.reg == b.reg) || (a.kind == 1 && a.off == b.off))
 }

@@ -1,0 +1,370 @@
+//! Register allocation by linear scan over live intervals (Poletto and
+//! Sarkar), on the blocks in layout order. A value's interval runs from its
+//! definition to its last use, widened to the blocks it is live into or out
+//! of (one interval per value, no holes). Values live across a call get
+//! registers calls preserve (or a stack slot); others prefer the ones calls
+//! clobber. Out of registers, the interval ending last is spilled whole: its
+//! value lives in a stack slot, loaded before each use. Constants and frame
+//! addresses get no register (they are made again where used).
+
+use crate::ssa::*;
+
+pub struct Config {
+    /// Registers calls clobber, and ones they preserve (abstract numbers).
+    pub caller: Vec<u8>,
+    pub callee: Vec<u8>,
+}
+
+pub struct Alloc {
+    /// By value id: its register (-1: none), and its spill slot (-1: none).
+    pub reg: Vec<i32>,
+    pub slot: Vec<i32>,
+    /// By slot: whether it holds pointers.
+    pub slot_ptr: Vec<bool>,
+    /// The callee-saved registers used.
+    pub used_callee: Vec<u8>,
+    /// By value id: the position (layout order) of each value, and the
+    /// calls' positions with the callee-saved registers holding pointers
+    /// across them (bit k: callee[k]).
+    pub ord: Vec<i64>,
+    pub call_masks: Vec<(i64, u32)>,
+}
+
+/// An empty allocation.
+pub fn empty() -> &mut Alloc {
+    &mut Alloc { reg: Vec::new(), slot: Vec::new(), slot_ptr: Vec::new(), used_callee: Vec::new(), ord: Vec::new(), call_masks: Vec::new() }
+}
+
+/// Whether the op's value is made where used instead of held.
+pub fn remat(v: &Value) -> bool {
+    v.op == OP_CONST || v.op == OP_LOCALADDR || v.op == OP_RESADDR || v.op == OP_CONSTSYM || v.op == OP_CONSTPARAM || v.op == OP_VTABLE
+        || v.op == OP_CLOSURECODE
+}
+
+/// Whether the op calls (so registers calls clobber do not survive it).
+pub fn is_call(v: &Value) -> bool {
+    v.op == OP_CALL || v.op == OP_INTRINSIC || v.op == OP_ALLOC || v.op == OP_CLOSURE || v.op == OP_DEFER || v.op == OP_WB || v.op == OP_FREM
+        || v.op == OP_PANIC || v.op == OP_RETURN
+}
+
+/// Whether v needs a register for its result.
+pub fn needs_reg(v: &Value, fused: &Vec<bool>) -> bool {
+    let t = v.ty;
+    if t == T_VOID || t == T_MEM || t == T_TUPLE || t == T_FLAGS { return false; }
+    if remat(v) || fused[v.id as usize] { return false; }
+    true
+}
+
+/// Allocates f's values; fused marks comparisons a branch consumes (no
+/// register).
+pub fn allocate(f: &Func, cfg: &Config, fused: &Vec<bool>) -> &mut Alloc {
+    let n = f.values.len();
+    let nb = f.blocks.len();
+    let mut ord: Vec<i64> = Vec::new();
+    ord.resize(n, -1);
+    let mut bstart: Vec<i64> = Vec::new();
+    let mut bend: Vec<i64> = Vec::new();
+    let mut calls: Vec<i64> = Vec::new();
+    let mut p = 0i64;
+    for b in f.blocks.iter() {
+        bstart.push(p);
+        p += 2;
+        for v in b.values.iter() {
+            ord[v.id as usize] = p;
+            if is_call(*v) { calls.push(p); }
+            p += 2;
+        }
+        bend.push(p);
+        p += 2;
+    }
+    let mut start: Vec<i64> = Vec::new();
+    let mut end: Vec<i64> = Vec::new();
+    start.resize(n, -1);
+    end.resize(n, -1);
+    // Values used outside their block (or by phis) take part in liveness;
+    // dense numbers for them.
+    let mut gix: Vec<i32> = Vec::new();
+    gix.resize(n, -1);
+    let mut globals: Vec<u32> = Vec::new();
+    for b in f.blocks.iter() {
+        for v in b.values.iter() {
+            let o = ord[v.id as usize];
+            start[v.id as usize] = if v.op == OP_PHI { bstart[b.id as usize] } else { o };
+            if end[v.id as usize] < start[v.id as usize] { end[v.id as usize] = start[v.id as usize]; }
+            let mut i = 0;
+            while i < v.args.len() {
+                let a = v.args[i];
+                let ai = a.id as usize;
+                let at = if v.op == OP_PHI { bend[b.preds[i].id as usize] } else { o };
+                if at > end[ai] { end[ai] = at; }
+                let ab = a.block.unwrap().id;
+                if (ab != b.id || v.op == OP_PHI) && gix[ai] < 0 {
+                    gix[ai] = globals.len() as i32;
+                    globals.push(a.id);
+                }
+                i += 1;
+            }
+        }
+        if let Some(c) = b.control {
+            let ci = c.id as usize;
+            if bend[b.id as usize] > end[ci] { end[ci] = bend[b.id as usize]; }
+            if c.block.unwrap().id != b.id && gix[ci] < 0 {
+                gix[ci] = globals.len() as i32;
+                globals.push(c.id);
+            }
+        }
+    }
+    // Liveness of the globals: in = uses before defs | (out - defs), out =
+    // the successors' ins and the phi arguments for them.
+    let ng = globals.len();
+    if ng > 0 {
+        let words = (ng + 63) / 64;
+        let mut gen: Vec<u64> = Vec::new();
+        let mut kill: Vec<u64> = Vec::new();
+        let mut live_in: Vec<u64> = Vec::new();
+        let mut live_out: Vec<u64> = Vec::new();
+        let mut phi_out: Vec<u64> = Vec::new();
+        gen.resize(nb * words, 0);
+        kill.resize(nb * words, 0);
+        live_in.resize(nb * words, 0);
+        live_out.resize(nb * words, 0);
+        phi_out.resize(nb * words, 0);
+        for b in f.blocks.iter() {
+            let o = b.id as usize * words;
+            for v in b.values.iter() {
+                if v.op == OP_PHI {
+                    let mut i = 0;
+                    while i < v.args.len() {
+                        let g = gix[v.args[i].id as usize];
+                        let po = b.preds[i].id as usize * words;
+                        phi_out[po + g as usize / 64] = phi_out[po + g as usize / 64] | 1u64 << (g % 64) as u32;
+                        i += 1;
+                    }
+                } else {
+                    for a in v.args.iter() {
+                        let g = gix[a.id as usize];
+                        if g >= 0 && a.block.unwrap().id != b.id {
+                            let w = o + g as usize / 64;
+                            let m = 1u64 << (g % 64) as u32;
+                            if kill[w] & m == 0 { gen[w] = gen[w] | m; }
+                        }
+                    }
+                }
+                let g = gix[v.id as usize];
+                if g >= 0 { kill[o + g as usize / 64] = kill[o + g as usize / 64] | 1u64 << (g % 64) as u32; }
+            }
+            if let Some(c) = b.control {
+                let g = gix[c.id as usize];
+                if g >= 0 && c.block.unwrap().id != b.id { gen[o + g as usize / 64] = gen[o + g as usize / 64] | 1u64 << (g % 64) as u32; }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut bi = nb;
+            while bi > 0 {
+                bi -= 1;
+                let b = f.blocks[bi];
+                let o = bi * words;
+                let mut w = 0;
+                while w < words {
+                    let mut out = phi_out[o + w];
+                    for s in b.succs.iter() { out = out | live_in[s.id as usize * words + w]; }
+                    live_out[o + w] = out;
+                    let inn = gen[o + w] | (out & !kill[o + w]);
+                    if inn != live_in[o + w] {
+                        live_in[o + w] = inn;
+                        changed = true;
+                    }
+                    w += 1;
+                }
+            }
+        }
+        // Widen the intervals over the blocks they are live into or out of.
+        let mut bi = 0;
+        while bi < nb {
+            let o = bi * words;
+            let mut w = 0;
+            while w < words {
+                let mut bits = live_in[o + w];
+                let mut k = w * 64;
+                while bits != 0 {
+                    if bits & 1 != 0 {
+                        let id = globals[k] as usize;
+                        if bstart[bi] < start[id] { start[id] = bstart[bi]; }
+                        if bstart[bi] > end[id] { end[id] = bstart[bi]; }
+                    }
+                    bits = bits >> 1;
+                    k += 1;
+                }
+                bits = live_out[o + w];
+                k = w * 64;
+                while bits != 0 {
+                    if bits & 1 != 0 {
+                        let id = globals[k] as usize;
+                        if bend[bi] > end[id] { end[id] = bend[bi]; }
+                        if bend[bi] < start[id] { start[id] = bend[bi]; }
+                    }
+                    bits = bits >> 1;
+                    k += 1;
+                }
+                w += 1;
+            }
+            bi += 1;
+        }
+    }
+    // Linear scan.
+    let mut order: Vec<u32> = Vec::new();
+    for b in f.blocks.iter() {
+        for v in b.values.iter() {
+            if needs_reg(*v, fused) { order.push(v.id); }
+        }
+    }
+    order.sort_by(|a, b| if start[*a as usize] != start[*b as usize] { start[*a as usize].cmp(&start[*b as usize]) } else { a.cmp(b) });
+    let mut reg: Vec<i32> = Vec::new();
+    let mut slot: Vec<i32> = Vec::new();
+    reg.resize(n, -1);
+    slot.resize(n, -1);
+    let mut crosses: Vec<bool> = Vec::new();
+    crosses.resize(n, false);
+    for id in order.iter() {
+        let s = start[*id as usize];
+        let e = end[*id as usize];
+        // The first call after s.
+        let mut lo = 0;
+        let mut hi = calls.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if calls[mid] <= s { lo = mid + 1; } else { hi = mid; }
+        }
+        crosses[*id as usize] = lo < calls.len() && calls[lo] < e;
+    }
+    let ncaller = cfg.caller.len();
+    let nregs = ncaller + cfg.callee.len();
+    // free[k]: register k (callers first, then callees) is free.
+    let mut free: Vec<bool> = Vec::new();
+    free.resize(nregs, true);
+    let mut used: Vec<bool> = Vec::new();
+    used.resize(nregs, false);
+    let mut active: Vec<u32> = Vec::new();
+    let mut spilled: Vec<u32> = Vec::new();
+    for idr in order.iter() {
+        let id = *idr as usize;
+        let s = start[id];
+        // Expire.
+        let mut kept = 0;
+        let mut j = 0;
+        while j < active.len() {
+            let a = active[j] as usize;
+            if end[a] < s {
+                free[reg[a] as usize] = true;
+            } else {
+                active[kept] = active[j];
+                kept += 1;
+            }
+            j += 1;
+        }
+        active.truncate(kept);
+        let cross = crosses[id];
+        let mut k = -1i32;
+        if !cross {
+            let mut r = 0;
+            while r < ncaller {
+                if free[r] { k = r as i32; break; }
+                r += 1;
+            }
+        }
+        if k < 0 {
+            let mut r = ncaller;
+            while r < nregs {
+                if free[r] { k = r as i32; break; }
+                r += 1;
+            }
+        }
+        if k >= 0 {
+            reg[id] = k;
+            free[k as usize] = false;
+            used[k as usize] = true;
+            active.push(*idr);
+            continue;
+        }
+        // Spill the interval ending last among those whose register cur can
+        // use.
+        let mut far = -1i32;
+        let mut j = 0;
+        while j < active.len() {
+            let a = active[j] as usize;
+            if (!cross || reg[a] as usize >= ncaller) && (far < 0 || end[a] > end[active[far as usize] as usize]) { far = j as i32; }
+            j += 1;
+        }
+        if far >= 0 && end[active[far as usize] as usize] > end[id] {
+            let victim = active[far as usize] as usize;
+            reg[id] = reg[victim];
+            reg[victim] = -1;
+            spilled.push(victim as u32);
+            active[far as usize] = *idr;
+        } else {
+            spilled.push(*idr);
+        }
+    }
+    // Spill slots, reused once their intervals end (pointer and other slots
+    // apart: the stack map marks the pointer ones).
+    spilled.sort_by(|a, b| if start[*a as usize] != start[*b as usize] { start[*a as usize].cmp(&start[*b as usize]) } else { a.cmp(b) });
+    let mut slot_ptr: Vec<bool> = Vec::new();
+    let mut slot_end: Vec<i64> = Vec::new();
+    for idr in spilled.iter() {
+        let id = *idr as usize;
+        let ptr = f.values[id].ty == T_PTR;
+        let mut k = 0;
+        while k < slot_end.len() {
+            if slot_ptr[k] == ptr && slot_end[k] < start[id] { break; }
+            k += 1;
+        }
+        if k == slot_end.len() {
+            slot_end.push(end[id]);
+            slot_ptr.push(ptr);
+        } else {
+            slot_end[k] = end[id];
+        }
+        slot[id] = k as i32;
+    }
+    // Registers to abstract numbers; the masks of the calls.
+    let mut i = 0;
+    while i < n {
+        if reg[i] >= 0 {
+            let k = reg[i] as usize;
+            reg[i] = if k < ncaller { cfg.caller[k] as i32 } else { cfg.callee[k - ncaller] as i32 };
+        }
+        i += 1;
+    }
+    let mut used_callee: Vec<u8> = Vec::new();
+    let mut r = ncaller;
+    while r < nregs {
+        if used[r] { used_callee.push(cfg.callee[r - ncaller]); }
+        r += 1;
+    }
+    let mut call_masks: Vec<(i64, u32)> = Vec::new();
+    for c in calls.iter() { call_masks.push((*c, 0)); }
+    for idr in order.iter() {
+        let id = *idr as usize;
+        if reg[id] < 0 || f.values[id].ty != T_PTR || !crosses[id] { continue; }
+        let mut k = 0;
+        while k < cfg.callee.len() {
+            if cfg.callee[k] as i32 == reg[id] { break; }
+            k += 1;
+        }
+        if k == cfg.callee.len() { continue; }
+        // The calls inside the interval.
+        let mut lo = 0;
+        let mut hi = calls.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if calls[mid] <= start[id] { lo = mid + 1; } else { hi = mid; }
+        }
+        while lo < calls.len() && calls[lo] < end[id] {
+            call_masks[lo].1 = call_masks[lo].1 | 1u32 << k as u32;
+            lo += 1;
+        }
+    }
+    &mut Alloc { reg, slot, slot_ptr, used_callee, ord, call_masks }
+}
