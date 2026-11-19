@@ -5,7 +5,21 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # The Go prototype (stage0, frozen): only what bootstraps navic.
+  stage0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
+  # navic on each Unix target: stage0 -> stage1 -> stage2 -> stage3 (stage2
+  # and stage3 byte for byte the same), then the golden tests in tests/run
+  # (built and run) in several runtime modes.
+  navic:
     strategy:
       fail-fast: false
       matrix:
@@ -14,32 +28,65 @@ jobs:
           - { target: linux-arm64, os: ubuntu-24.04-arm }
           - { target: macos-arm64, os: macos-latest }
           - { target: macos-x64, os: macos-15-intel }
-          - { target: windows-x64, os: windows-latest }
-    name: ${{ matrix.target }}
+    name: navic ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      NAVI_CACHE: "off"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go vet ./...
-      # Native golden tests run for the host target (internal/build).
-      - run: go test ./...
-      # Apple Silicon runners also test x64 binaries under Rosetta 2.
-      - if: matrix.target == 'macos-arm64'
-        run: NAVI_TEST_TARGET=macos-x64 go test -count=1 ./internal/build
-
-  cross:
-    # Every target's object file is generated from one host.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go build -o navi ./cmd/navi
-      - run: |
+      - name: bootstrap
+        run: |
+          export NAVI_STD=$PWD/lib/std
+          go build -o navi0 ./cmd/navi
+          mkdir -p s1 s2 s3
+          ./navi0 build -o s1/navic compiler
+          s1/navic build -o s2/navic compiler
+          s2/navic build -o s3/navic compiler
+          cmp s2/navic s3/navic
+      - name: tests
+        run: NAVI_STD=$PWD/lib/std tools/navictest.sh s2/navic
+      - name: tests, one thread
+        run: NAVI_STD=$PWD/lib/std NAVI_MAXPROCS=1 tools/navictest.sh s2/navic
+      - name: tests, collector verification
+        run: NAVI_STD=$PWD/lib/std NAVI_GCVERIFY=1 tools/navictest.sh s2/navic
+      - name: tests, stacks moved at every growth
+        run: NAVI_STD=$PWD/lib/std NAVI_STACKMOVE=1 NAVI_MAXPROCS=16 tools/navictest.sh s2/navic
+      - name: determinism, std on every target, Windows compiler
+        if: matrix.target == 'linux-x64'
+        run: |
+          export NAVI_STD=$PWD/lib/std
+          mkdir -p d1 d16
+          NAVI_MAXPROCS=1 s2/navic build -o d1/navic compiler
+          NAVI_MAXPROCS=16 s2/navic build -o d16/navic compiler
+          cmp d1/navic d16/navic
+          printf 'fn main() {}\n' > empty.navi
           for t in macos-arm64 macos-x64 linux-x64 linux-arm64 windows-x64; do
-            ./navi build --target $t -c -o run-$t.o tests/run/structs.navi
+            NAVI_CHECK_STD=1 NAVI_TARGET=$t s2/navic build -o empty-$t empty.navi
           done
-          file run-*.o
+          NAVI_TARGET=windows-x64 s2/navic build -o navic.exe compiler
+      - if: matrix.target == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: navic-windows-x64
+          path: navic.exe
+
+  # navic.exe (cross-built by the Linux job with navic's own PE linker) runs
+  # the golden tests on Windows.
+  windows:
+    needs: navic
+    runs-on: windows-latest
+    env:
+      NAVI_CACHE: "off"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: navic-windows-x64
+      - name: tests
+        run: NAVI_STD=$(cygpath -m "$PWD/lib/std") tools/navictest.sh ./navic.exe
