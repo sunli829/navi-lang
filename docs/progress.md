@@ -409,7 +409,7 @@
   - 现在 runtime 在死锁时会列出每个没结束的 G 和它各帧的返回地址（同 Go 列出 goroutine），`tools/symbolize.py 程序 < 输出` 可以换成函数名；下次出现时有现场可查。
 - GitHub Actions（github.com/sunli829/navi-lang）：
   - linux-x64、linux-arm64、macos-arm64、macos-x64 上从 stage0 自举到定点，再在四种运行时模式下跑 golden 测试，全部通过。顺带修了 glibc 的 `cbrt` 不精确（改成 navi 自己算）和多个定时器同时到期时的唤醒顺序。
-  - Windows 上用交叉编译的 `navic.exe` 跑测试，全部通过（CI 失败时用 cdb 打印崩溃现场，`NAVI_LINKMAP` 让 PE 链接器写出符号地址）。修过的：C 返回值窄于寄存器时的扩展；amd64 在 Windows 上大于 4KB 的栈帧逐页探测（静态变量的初始化跑在 OS 栈上，用到 crc32 的程序在 main 之前就崩溃）；fmt 和 lsp 读标准输入不再用 `/dev/stdin`，lsp 认得 `file:///C:/...`；`.gitattributes` 固定 LF（Windows runner 默认 autocrlf，逐字节比较的测试都失败）。Windows 上的网络用 IOCP 实现，`net`、`http` 也通过（1000 个同时挂起的连接只用 9 个 OS 线程）；`env_process`、`fs_ops`（Unix 专有的 API）在 Windows 上跳过（`// skip: windows`）。顺带修了解析器：`fn` 的名字写成关键字（如 `fn select(...)`）时报错后跳过它，不再把参数解析错位、让后面的阶段死循环。
+  - Windows 上用交叉编译的 `navic.exe` 跑测试，全部通过（CI 失败时用 cdb 打印崩溃现场，`NAVI_LINKMAP` 让 PE 链接器写出符号地址）。修过的：C 返回值窄于寄存器时的扩展；amd64 在 Windows 上大于 4KB 的栈帧逐页探测（静态变量的初始化跑在 OS 栈上，用到 crc32 的程序在 main 之前就崩溃）；fmt 和 lsp 读标准输入不再用 `/dev/stdin`，lsp 认得 `file:///C:/...`；`.gitattributes` 固定 LF（Windows runner 默认 autocrlf，逐字节比较的测试都失败）。Windows 上的网络用 IOCP 实现，`net`、`http` 也通过（1000 个同时挂起的连接只用 9 个 OS 线程）；顺带查出轮询线程的一个老问题（Unix 也有）：它传给内核的缓冲区是局部变量，逃逸分析给了堆单元，分配在没有 GC 根的调度器记录上，被回收复用后内核和轮询线程还在写（Windows 上用 64KB 的 Op、GC 频繁时必现），现在是静态变量；`env_process`、`fs_ops`（Unix 专有的 API）在 Windows 上跳过（`// skip: windows`）。顺带修了解析器：`fn` 的名字写成关键字（如 `fn select(...)`）时报错后跳过它，不再把参数解析错位、让后面的阶段死循环。
 
 ## 下一步
 

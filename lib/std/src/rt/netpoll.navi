@@ -253,16 +253,21 @@ pub fn wait(pd: *mut PollDesc, write: bool, deadline: u64) -> i32 {
     }
 }
 
+// The poller's buffers are statics: a local whose address goes to the
+// kernel would get a heap cell (an extern call escapes its arguments),
+// allocated on the poller's scheduler record, which no collection sees: it
+// was freed and reused while the kernel and the poller still wrote it.
+static mut EVENTS: [u64; 256] = [0u64; 256];
+
 /// The poller thread: waits for events and readies the Gs waiting for
 /// them (no allocation: it runs on a scheduler record).
 #[cfg(not(target_os = "windows"))]
 pub fn poll_loop() -> ! {
-    let mut evs = [0u64; 256];
     loop {
-        let n = poll_events(&mut evs as *mut [u64; 256] as *mut u8);
+        let n = poll_events(unsafe { &mut EVENTS } as *mut [u64; 256] as *mut u8);
         let mut i = 0;
         while i < n {
-            let (pd, r, w) = event(&evs as *const [u64; 256] as *const u8, i);
+            let (pd, r, w) = event(unsafe { &EVENTS } as *const [u64; 256] as *const u8, i);
             if pd as usize != 0 {
                 sched::obj_lock(lkp(unsafe { &(*pd).lk }));
                 wake(pd, r, w);
@@ -329,6 +334,9 @@ extern "C" {
 
 #[cfg(target_os = "windows")]
 static mut PORT: usize = 0;
+// GetQueuedCompletionStatusEx's count (a static, as EVENTS).
+#[cfg(target_os = "windows")]
+static mut REMOVED: u32 = 0;
 // Ops in flight (a G waits for each).
 #[cfg(target_os = "windows")]
 static mut PENDING: usize = 0;
@@ -388,6 +396,19 @@ pub fn op_new(data: usize) -> usize {
     crate::rt::gc::alloc(OP_DATA + data, true) as usize
 }
 
+/// Makes op (its operation finished) new again for another, counted as in
+/// flight as op_new's.
+#[cfg(target_os = "windows")]
+pub fn op_reuse(op: usize) -> usize {
+    let mut i = 0;
+    while i < OP_BUF {
+        unsafe { *((op + i) as *mut usize) = 0; } // OVERLAPPED, lock, G, done
+        i += 8;
+    }
+    crate::rt::atomic_add(lkp(unsafe { &PENDING }), 1);
+    op
+}
+
 #[cfg(target_os = "windows")]
 pub fn op_failed(op: usize) { crate::rt::atomic_add(lkp(unsafe { &PENDING }), 18446744073709551615); }
 
@@ -428,14 +449,13 @@ pub fn active() -> bool { crate::rt::atomic_load(lkp(unsafe { &PENDING })) != 0 
 #[cfg(target_os = "windows")]
 pub fn poll_loop() -> ! {
     // OVERLAPPED_ENTRY: key, lpOverlapped, Internal, byte count (32 bytes).
-    let mut ents = [0u64; 256];
     loop {
-        let mut n = 0u32;
-        let ok = unsafe { GetQueuedCompletionStatusEx(PORT, &mut ents as *mut [u64; 256] as *mut u8, 64, &mut n as *mut u32, 0xffffffff, 0) };
+        let ok = unsafe { GetQueuedCompletionStatusEx(PORT, &mut EVENTS as *mut [u64; 256] as *mut u8, 64, &mut REMOVED as *mut u32, 0xffffffff, 0) };
         if ok == 0 { continue; }
+        let n = REMOVED as usize;
         let mut i = 0;
-        while i < n as usize {
-            let op = ents[4 * i + 1] as usize;
+        while i < n {
+            let op = EVENTS[4 * i + 1] as usize;
             if op != 0 {
                 let lk = (op + OP_LK) as *mut usize;
                 sched::obj_lock(lk);
