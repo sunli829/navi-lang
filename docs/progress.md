@@ -297,7 +297,7 @@
   - Neovim：`vim.lsp.start({ name = "navic", cmd = { "navic", "lsp" }, root_dir = vim.fs.root(0, { "navi.toml", "src" }) })`，文件类型 `navi`。
   - Helix（languages.toml）：`[language-server.navic] command = "navic"` 和 `args = ["lsp"]`，再加一个 `[[language]] name = "navi"`、`file-types = ["navi"]`、`language-servers = ["navic"]`。
   - VS Code 需要一个通用 LSP 客户端扩展（仓库里没有带）。
-- 没做的：Windows（读标准输入用的是 `/dev/stdin`）；代码操作（code actions）、调用层级；增量分析（每次都整个 crate 加 std 重新分析）；补全只认得局部变量、字段、方法调用结果这类接收者，泛型参数上的方法不补全。
+- 没做的：代码操作（code actions）、调用层级；增量分析（每次都整个 crate 加 std 重新分析）；补全只认得局部变量、字段、方法调用结果这类接收者，泛型参数上的方法不补全。
 
 ## 标准库补全（对标 Go 的标准库，API 照 Rust std 和常用 crate）
 
@@ -409,7 +409,7 @@
   - 现在 runtime 在死锁时会列出每个没结束的 G 和它各帧的返回地址（同 Go 列出 goroutine），`tools/symbolize.py 程序 < 输出` 可以换成函数名；下次出现时有现场可查。
 - GitHub Actions（github.com/sunli829/navi-lang）：
   - linux-x64、linux-arm64、macos-arm64、macos-x64 上从 stage0 自举到定点，再在四种运行时模式下跑 golden 测试，全部通过。顺带修了 glibc 的 `cbrt` 不精确（改成 navi 自己算）和多个定时器同时到期时的唤醒顺序。
-  - Windows 上用交叉编译的 `navic.exe` 跑测试：标准流改成二进制模式后 36 个通过；`navic.exe` 自身在构建时偶发崩溃，还在查（CI 失败时用 cdb 打印崩溃现场，`NAVI_LINKMAP` 让 PE 链接器写出符号地址）。
+  - Windows 上用交叉编译的 `navic.exe` 跑测试，全部通过（CI 失败时用 cdb 打印崩溃现场，`NAVI_LINKMAP` 让 PE 链接器写出符号地址）。修过的：C 返回值窄于寄存器时的扩展；amd64 在 Windows 上大于 4KB 的栈帧逐页探测（静态变量的初始化跑在 OS 栈上，用到 crc32 的程序在 main 之前就崩溃）；fmt 和 lsp 读标准输入不再用 `/dev/stdin`，lsp 认得 `file:///C:/...`；`.gitattributes` 固定 LF（Windows runner 默认 autocrlf，逐字节比较的测试都失败）。`env_process`、`fs_ops`（Unix 专有的 API）和 `net`、`http`（Windows 上还没有 socket）在 Windows 上跳过（`// skip: windows`）。
 
 ## 下一步
 

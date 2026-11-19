@@ -9,8 +9,14 @@ navic=${1:?usage: tools/navictest.sh path/to/navic}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*) os=windows ;;
+*) os=unix ;;
+esac
 for f in tests/run/*.navi; do
 	n=$(basename "$f" .navi)
+	# // skip: windows (or unix): the test needs what that OS lacks.
+	if grep -qxE "// skip: $os" "$f"; then echo "skip $f ($os)"; continue; fi
 	# // error: line:col msg: the build fails with these errors.
 	want_err=$(grep -E '^// error:' "$f" | sed -E 's#^// error: ?##')
 	if [ -n "$want_err" ]; then
@@ -113,9 +119,12 @@ fi
 # navic lsp: the recorded session tests/lsp/session.jsonl (one message a
 # line, the repository's path as @ROOT@) answers as tests/lsp/session.out.
 root=$(pwd)
-sed "s#@ROOT@#$root#g" tests/lsp/session.jsonl | LC_ALL=C awk '{ printf "Content-Length: %d\r\n\r\n%s", length($0), $0 }' \
+# Windows: navic.exe sees C:/dir, which a URI writes as file:///C:/dir.
+uroot=$root
+if [ "$os" = windows ]; then root=$(pwd -W); uroot=/$root; fi
+sed "s#@ROOT@#$uroot#g" tests/lsp/session.jsonl | LC_ALL=C awk '{ printf "Content-Length: %d\r\n\r\n%s", length($0), $0 }' \
 	| NAVI_STD="$root/lib/std" "$navic" lsp 2>/dev/null | perl -0777 -pe 's/Content-Length: \d+\r\n\r\n/\n/g' \
-	| sed "s#$root#@ROOT@#g" | sed '/^$/d' > "$tmp/lsp.out"
+	| sed "s#$uroot#@ROOT@#g" | sed '/^$/d' > "$tmp/lsp.out"
 if cmp -s "$tmp/lsp.out" tests/lsp/session.out; then
 	echo "ok   navic lsp tests/lsp/session.jsonl"
 else
