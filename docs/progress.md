@@ -393,6 +393,12 @@
   - 跳转线程化，拆分来自调用结果的局部变量，`for i in 0..v.len()` 的边界检查消失；
   - 归纳变量的下界和不等式事实，`v[i - 1]` 这类下标的边界检查也消失；
   - 直接调用的寄存器传参（regex 约快 10%）。
+- C 调用（FFI），照 Go 的 cgo：
+  - 调用 `extern "C"` 函数期间，绿色线程算作"阻塞"（`enter_c`/`exit_blocked`，由 MIR 包在调用两边），GC 不等它返回。原来 C 里阻塞 2 秒，其他线程跟着停 1.9 秒，现在是 0。
+  - 按阻塞处理的调用切到系统线程的调度栈上运行（`call_c` 的 sys，`G.c_stack`/`G.c_sp`），不再受绿色线程栈底 32KB 的限制。标了 `#[nonblocking]` 的不包、不切栈：每次约 1.4 ns，按阻塞处理的约 12 ns（arm64，单线程）。std 里会阻塞的函数（read、write、open、waitpid、poll、getaddrinfo 等）单独声明，其余都标 `#[nonblocking]`。
+  - C 回调 navi：有函数体的 `extern "C" fn` 多生成一个 C 入口（`sym.c`，`Machine::c_callback`），它的值就是这个入口。入口经线程局部变量（pthread key / TlsAlloc，`_navi_tls_key`）找到 M，在 M 的回调 G 上运行（`cb_enter`/`cb_exit`，回调 G 在第一次阻塞调用时创建；回调里再调 C、C 再回调时用下一层）。发起调用的 G 一直阻塞、栈不动，所以回调里栈可以增长和搬动。回调里等待锁或 channel 时系统线程睡眠（`stop_callback`，同 Go 回调期间锁定线程）。
+  - 监控线程（`sysmon`，第一次 spawn 时启动）：某个 M 的 G 阻塞了一整个检查周期（20µs 起，空闲时退到 10ms）又有活要干，就让另一个 M 接手（`retaken`，`NRETAKEN`）；它回来后，运行中的 M 超出上限时，`find_runnable` 让一个去空闲。`NAVI_MAXPROCS=1` 时阻塞的 C 调用也不再卡住其他线程。
+  - 测试：`tests/run/c_blocking`、`tests/run/c_callback`（qsort 回调里分配和 GC、栈增长、嵌套回调、浮点、回调里等待其他线程、8 个线程同时回调），arm64 各种压力模式和 x64 都通过。
 - 待查：全量验证中出现过一次编译器偶发死锁（`all goroutines are asleep`）。
   - 复现尝试：用 main 和当前编译器各编译约 1360 次，带诊断的编译器 5 路并行又编译 6450 次（其中 2580 次与出事时配置相同：x64 目标、`NAVI_MAXPROCS=4`），模拟 `par_for` 的调度器压测程序 9000 次，都没有复现。
   - 读过 channel、select、Mutex、wait list、空闲 M 管理和 STW，没找到丢唤醒的路径。

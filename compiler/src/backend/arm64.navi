@@ -661,8 +661,21 @@ impl Machine for Arm64 {
         self.a.cset(r(dst), fc);
     }
 
-    fn call_c(&mut self, sym: &str, fn_reg: lm::Reg, args: &Vec<CArg>, float_ret: bool, f64: bool) {
+    fn call_c(&mut self, sym: &str, fn_reg: lm::Reg, args: &Vec<CArg>, float_ret: bool, f64: bool, sys: bool) {
         let a = self.a;
+        // The arguments are read from base (the outgoing area): SP, or (sys)
+        // x17 keeping the G's SP while SP moves to the C stack.
+        let mut base = XSP;
+        if sys {
+            a.mov_sp(X17, XSP);
+            a.str(8, X17, 28, 48);
+            a.ldr(8, X16, 28, 40);
+            let same = a.new_label();
+            a.cbz(X16, same);
+            a.mov_sp(XSP, X16);
+            a.bind(same);
+            base = X17;
+        }
         let mut ints = 0u32;
         let mut floats = 0u32;
         let mut stack: Vec<usize> = Vec::new();
@@ -673,14 +686,14 @@ impl Machine for Arm64 {
                 stack.push(i);
             } else if args[i].float {
                 if floats < 8 {
-                    a.ldr(8, X17, XSP, (8 * i) as i64);
-                    a.fmov_to_f(floats, X17, args[i].f64);
+                    a.ldr(8, X16, base, (8 * i) as i64);
+                    a.fmov_to_f(floats, X16, args[i].f64);
                     floats += 1;
                 } else {
                     stack.push(i);
                 }
             } else if ints < 8 {
-                a.ldr(8, ints, XSP, (8 * i) as i64);
+                a.ldr(8, ints, base, (8 * i) as i64);
                 ints += 1;
             } else {
                 stack.push(i);
@@ -690,16 +703,115 @@ impl Machine for Arm64 {
         // The stack arguments, in order from SP, moved down from their
         // 8-byte slots once the register ones are loaded: 8 bytes each, or
         // (Apple, named arguments) their size at their alignment.
+        // On the C stack, room for them first.
+        if sys && stack.len() > 0 { a.sub_imm(XSP, XSP, ((8 * stack.len() + 15) / 16 * 16) as i64); }
         let mut off = 0i64;
         for k in stack.iter() {
             let sz = if self.apple && !args[*k].variadic { args[*k].size } else { 8 };
             off = (off + sz - 1) / sz * sz;
-            a.ldr(8, X17, XSP, (8 * *k) as i64);
-            a.str(sz, X17, XSP, off);
+            a.ldr(8, X16, base, (8 * *k) as i64);
+            a.str(sz, X16, XSP, off);
             off += sz;
         }
         if sym.len() > 0 { a.bl(&sym.to_string()); } else { a.blr(r(fn_reg)); }
         if float_ret { a.fmov_from_f(X12, 0, f64); } else { a.mov(X12, X0); }
+        if sys {
+            // Back on the G's stack (x28, the G register, is kept by C).
+            a.ldr(8, X16, 28, 48);
+            a.mov_sp(XSP, X16);
+            a.str(8, ZR, 28, 48);
+        }
+    }
+
+    fn c_callback(&mut self, cb: &lm::CCallback) {
+        let a = self.a;
+        // C's frame record and saved registers, then the argument registers:
+        // x19-x28 at sp, d8-d15 at sp + 80, x0-x7 at sp + 144, d0-d7 at
+        // sp + 208 (the arguments are all in registers: see lower).
+        a.stp_pre(XFP, LR, XSP, -16);
+        a.mov_sp(XFP, XSP);
+        a.sub_imm(XSP, XSP, 272);
+        let mut k = 0u32;
+        while k < 10 {
+            a.str(8, 19 + k, XSP, (8 * k) as i64);
+            k += 1;
+        }
+        k = 0;
+        while k < 8 {
+            a.ldst_v(8, 8 + k, XSP, (80 + 8 * k) as i64, true, 1 << 26);
+            a.str(8, k, XSP, (144 + 8 * k) as i64);
+            a.ldst_v(8, k, XSP, (208 + 8 * k) as i64, true, 1 << 26);
+            k += 1;
+        }
+        // The thread's M, its callback G (x28, the G register), whose stack
+        // the rest runs on; x19 keeps the C stack, x20 the M (navi code
+        // keeps both).
+        a.ldr_sym(X0, &"_navi_tls_key".to_string());
+        a.bl(&cb.tls_get);
+        let bad = a.new_label();
+        a.cbz(X0, bad);
+        a.ldr(8, 28, X0, 16);
+        a.cbz(28, bad);
+        a.mov_sp(19, XSP);
+        a.mov(20, X0);
+        a.ldr(8, X16, 28, 56);
+        a.mov_sp(XSP, X16);
+        let n = if cb.args.len() > 0 { cb.args.len() } else { 1 };
+        let res = (8 * n) as i64;
+        a.sub_imm(XSP, XSP, (res + 16 + 15) / 16 * 16);
+        // cb_enter(m), the function (arguments in words), cb_exit().
+        a.str(8, 20, XSP, 0);
+        a.add_imm(X8, XSP, res);
+        a.adr_sym(X9, &cb.loc);
+        a.adr_sym(X0, &cb.enter_dict);
+        a.bl(&cb.enter);
+        let mut ii = 0;
+        let mut fi = 0;
+        let mut i = 0;
+        while i < cb.args.len() {
+            if cb.args[i].float {
+                a.ldr(8, X16, 19, (208 + 8 * fi) as i64);
+                fi += 1;
+            } else {
+                a.ldr(8, X16, 19, (144 + 8 * ii) as i64);
+                ii += 1;
+            }
+            a.str(8, X16, XSP, (8 * i) as i64);
+            i += 1;
+        }
+        a.add_imm(X8, XSP, res);
+        a.adr_sym(X9, &cb.loc);
+        a.adr_sym(X0, &cb.dict);
+        a.bl(&cb.sym);
+        // The result to x0's slot (the stack may have moved: from sp).
+        if cb.ret != 0 {
+            a.ldr(8, X16, XSP, res);
+            a.str(8, X16, 19, 144);
+        }
+        a.add_imm(X8, XSP, res);
+        a.adr_sym(X9, &cb.loc);
+        a.adr_sym(X0, &cb.exit_dict);
+        a.bl(&cb.exit);
+        a.mov_sp(XSP, 19);
+        if cb.ret == 1 { a.ldr(8, X0, XSP, 144); }
+        if cb.ret == 2 { a.ldst_v(8, 0, XSP, 144, false, 1 << 26); }
+        k = 0;
+        while k < 10 {
+            a.ldr(8, 19 + k, XSP, (8 * k) as i64);
+            k += 1;
+        }
+        k = 0;
+        while k < 8 {
+            a.ldst_v(8, 8 + k, XSP, (80 + 8 * k) as i64, false, 1 << 26);
+            k += 1;
+        }
+        a.add_imm(XSP, XSP, 272);
+        a.ldp_post(XFP, LR, XSP, 16);
+        a.ret();
+        // A thread navi did not start (no M), or no callback G.
+        a.bind(bad);
+        a.bl(&cb.abort);
+        a.brk(0);
     }
 
     fn copy_words(&mut self, dst: lm::Reg, src: lm::Reg, n: i64) {

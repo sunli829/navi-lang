@@ -1,0 +1,103 @@
+// interp: skip (no C calls in the interpreter)
+// stage0: skip (stage0 has no C entries for navi functions)
+// out: sorted [1, 2, 3, 5, 8, 9]
+// out: deep 3000
+// out: nested [[1, 2], [3, 4]]
+// out: float 7.5
+// out: waited 42
+// out: threads 8000
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpmc::sync_channel;
+
+extern "C" {
+    fn qsort(base: *mut u8, n: usize, size: usize, cmp: extern "C" fn(*const u8, *const u8) -> i32);
+}
+
+static mut CALLS: usize = 0;
+
+fn deep(n: u64) -> u64 { if n == 0 { 0 } else { 1 + deep(n - 1) } }
+
+// Compares two i32 (allocating and collecting meanwhile).
+extern "C" fn cmp_i32(a: *const u8, b: *const u8) -> i32 {
+    let x = unsafe { *(a as *const i32) };
+    let y = unsafe { *(b as *const i32) };
+    let mut v: Vec<String> = Vec::new();
+    v.push(`${x} ${y}`);
+    CALLS += 1;
+    if CALLS % 5 == 0 { std::gc::collect(); }
+    if x < y { -1 } else if x > y { 1 } else { 0 }
+}
+
+// Grows its stack well past the first one.
+extern "C" fn cmp_deep(a: *const u8, b: *const u8) -> i32 {
+    let d = deep(3000);
+    if d != 3000 { return 0; }
+    let x = unsafe { *(a as *const i32) };
+    let y = unsafe { *(b as *const i32) };
+    x - y
+}
+
+// Sorts each pair (a C call from a callback, calling back in turn).
+extern "C" fn cmp_rows(a: *const u8, b: *const u8) -> i32 {
+    let pa = a as *mut [i32; 2];
+    let pb = b as *mut [i32; 2];
+    unsafe {
+        qsort(pa as *mut u8, 2, 4, cmp_i32);
+        qsort(pb as *mut u8, 2, 4, cmp_i32);
+        (*pa)[0] - (*pb)[0]
+    }
+}
+
+extern "C" fn scale(x: f64, k: i32) -> f64 { x * k as f64 }
+
+static mut WAITED: i32 = 0;
+
+// Waits for another thread inside a callback.
+extern "C" fn cmp_wait(a: *const u8, b: *const u8) -> i32 {
+    if WAITED == 0 {
+        let (tx, rx) = sync_channel::<i32>(0);
+        std::thread::spawn(|| { tx.send(42).unwrap(); });
+        WAITED = rx.recv().unwrap();
+    }
+    unsafe { *(a as *const i32) - *(b as *const i32) }
+}
+
+fn main() {
+    let mut v = Vec::from([5i32, 3, 9, 1, 8, 2]);
+    unsafe { qsort(v.as_mut_ptr() as *mut u8, v.len(), 4, cmp_i32); }
+    println(`sorted ${v:?}`);
+    let mut w = Vec::from([4i32, 2, 7, 1]);
+    unsafe { qsort(w.as_mut_ptr() as *mut u8, w.len(), 4, cmp_deep); }
+    println(`deep ${deep(3000)}`);
+    let mut rows = Vec::from([[4i32, 3], [2, 1]]);
+    unsafe { qsort(rows.as_mut_ptr() as *mut u8, 2, 8, cmp_rows); }
+    println(`nested ${rows:?}`);
+    let f: extern "C" fn(f64, i32) -> f64 = scale;
+    println(`float ${f(2.5, 3)}`);
+    let mut z = Vec::from([3i32, 1, 2]);
+    unsafe { qsort(z.as_mut_ptr() as *mut u8, z.len(), 4, cmp_wait); }
+    println(`waited ${WAITED}`);
+    // Callbacks on several threads at once.
+    let total = &AtomicUsize::new(0);
+    let mut hs = Vec::new();
+    let mut t = 0;
+    while t < 8 {
+        hs.push(std::thread::spawn(|| {
+            let mut r = 0;
+            while r < 100 {
+                let mut u: Vec<i32> = Vec::new();
+                let mut i = 0;
+                while i < 10 {
+                    u.push((i * 7 + r) % 10);
+                    i += 1;
+                }
+                unsafe { qsort(u.as_mut_ptr() as *mut u8, u.len(), 4, cmp_i32); }
+                total.fetch_add(u.len(), Ordering::Relaxed);
+                r += 1;
+            }
+        }));
+        t += 1;
+    }
+    for h in hs.iter() { h.join().unwrap(); }
+    println(`threads ${total.load(Ordering::Relaxed)}`);
+}

@@ -78,6 +78,8 @@ struct FuncOut {
     sym: String,
     /// Where the register entry (sym.r) starts in code.
     reg_off: i64,
+    /// Where the C entry (sym.c) starts in code (-1: none).
+    c_off: i64,
     name: String,
     code: Vec<u8>,
     relocs: Vec<OutReloc>,
@@ -102,9 +104,9 @@ struct Job {
 }
 
 // The runtime symbols generated code refers to by name.
-const RUNTIME_SYMS: [&str; 19] = ["_navi_argc", "_navi_argv", "_navi_data_end", "_navi_data_start", "_navi_g0boot", "_navi_gc_marking",
+const RUNTIME_SYMS: [&str; 20] = ["_navi_argc", "_navi_argv", "_navi_data_end", "_navi_data_start", "_navi_g0boot", "_navi_gc_marking",
     "_navi_gstart", "_navi_longjmp", "_navi_morestack", "_navi_mstart", "_navi_os_sp", "_navi_overflow", "_navi_rundefers",
-    "_navi_saved_greg", "_navi_scanw", "_navi_setjmp", "_navi_stack_lo", "_navi_stack_top", "_navi_swapctx"];
+    "_navi_saved_greg", "_navi_scanw", "_navi_setjmp", "_navi_stack_lo", "_navi_stack_top", "_navi_swapctx", "_navi_tls_key"];
 
 // The functions a worker takes at a time.
 const CHUNK: usize = 4;
@@ -143,6 +145,7 @@ pub struct Gen {
     ssa_time: bool,
     /// Where the current function's register entry (.r) starts.
     cur_reg_off: i64,
+    cur_c_off: i64,
 
     /// This thread's reusable SSA values and blocks, and register
     /// allocation.
@@ -268,7 +271,7 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
         ssa_check: match std::env::var("NAVI_SSACHECK") { Ok(v) => if v == "2" { 2 } else if v == "3" { 3 } else { 1 }, Err(_) => 0 },
         ssa_dump: match std::env::var("NAVI_SSADUMP") { Ok(v) => v, Err(_) => String::new() },
         ssa_noopt: std::env::var("NAVI_NOSSAOPT").is_ok(),
-        ssa_time: std::env::var("NAVI_SSATIME").is_ok(), ssa_cache: crate::ssa::new_cache(), ssa_ra: crate::ssa::regalloc::empty(), cur_reg_off: 0 }
+        ssa_time: std::env::var("NAVI_SSATIME").is_ok(), ssa_cache: crate::ssa::new_cache(), ssa_ra: crate::ssa::regalloc::empty(), cur_reg_off: 0, cur_c_off: -1 }
 }
 
 /// Lowers the plan into a new object for arch, with a machine from new_m
@@ -481,6 +484,10 @@ impl Gen {
         let off = self.o.define(out.sym.as_str(), obj::TEXT, align, false);
         let rsym = `${out.sym}.r`;
         self.o.define_at(rsym.as_str(), obj::TEXT, off + out.reg_off as u64, false);
+        if out.c_off >= 0 {
+            let csym = `${out.sym}.c`;
+            self.o.define_at(csym.as_str(), obj::TEXT, off + out.c_off as u64, false);
+        }
         self.o.append(obj::TEXT, out.code.as_slice());
         if out.meta.len() > 0 {
             let mo = self.fmeta.len() as u64;
@@ -534,7 +541,9 @@ impl Gen {
         let meta = self.finish_meta(&c.calls);
         let reg_off = self.cur_reg_off;
         self.cur_reg_off = 0;
-        let out = &mut FuncOut { sym: sym.to_string(), reg_off, name, code: c.code, relocs, lines: Vec::new(), meta, file: self.cur_file, strs: self.fstrs,
+        let c_off = self.cur_c_off;
+        self.cur_c_off = -1;
+        let out = &mut FuncOut { sym: sym.to_string(), reg_off, c_off, name, code: c.code, relocs, lines: Vec::new(), meta, file: self.cur_file, strs: self.fstrs,
             locs: self.flocs, undef: self.fundef, errs: self.errs, failed: false };
         if c.err.len() > 0 {
             out.errs.push(`${sym}: ${c.err}`);
@@ -601,6 +610,11 @@ impl Gen {
         let rsym = `${sym}.r`;
         self.o.define_at(rsym.as_str(), obj::TEXT, off + self.cur_reg_off as u64, false);
         self.cur_reg_off = 0;
+        if self.cur_c_off >= 0 {
+            let csym = `${sym}.c`;
+            self.o.define_at(csym.as_str(), obj::TEXT, off + self.cur_c_off as u64, false);
+            self.cur_c_off = -1;
+        }
         self.o.append(obj::TEXT, c.code.as_slice());
         if self.debug {
             let name = if self.cur_name.len() > 0 { self.cur_name.clone() } else { sym.to_string() };
@@ -816,7 +830,7 @@ impl Gen {
         // the entry point runs their initializers). The collector scans from
         // _navi_data_start to _navi_data_end.
         self.o.define("_navi_data_start", obj::DATA, 8, false);
-        for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv", "_navi_saved_greg", "_navi_gc_marking"].iter() {
+        for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv", "_navi_saved_greg", "_navi_gc_marking", "_navi_tls_key"].iter() {
             self.o.define(*sym, obj::DATA, 8, false);
             self.o.zeros(obj::DATA, 8);
         }
@@ -1088,7 +1102,7 @@ impl Gen {
         let es = self.extern_sym("exit");
         let mut a1 = Vec::new();
         a1.push(int_arg());
-        m.call_c(es.as_str(), 0, &a1, false, false);
+        m.call_c(es.as_str(), 0, &a1, false, false, false);
         m.trap();
         let name = `${self.tgt.c_prefix}main`;
         self.emit_func(name.as_str(), true);
@@ -1152,13 +1166,13 @@ impl Gen {
         a3.push(int_arg());
         a3.push(int_arg());
         a3.push(int_arg());
-        m.call_c(ws.as_str(), 0, &a3, false, false);
+        m.call_c(ws.as_str(), 0, &a3, false, false, false);
         m.mov_imm(V1, 2);
         m.store(8, V1, SP, 0);
         let es = self.extern_sym("exit");
         let mut a1 = Vec::new();
         a1.push(int_arg());
-        m.call_c(es.as_str(), 0, &a1, false, false);
+        m.call_c(es.as_str(), 0, &a1, false, false, false);
         m.trap();
         self.emit_func("_navi_overflow", false);
     }
@@ -1208,7 +1222,19 @@ impl Gen {
             ssa_var0: false, ssa_bridge: 0, ssa_pr: Vec::new() };
         fg.gen();
         fg.stack_meta();
+        if c_entry(f.def) { fg.gen_c_entry(); }
         self.emit_func(sym.as_str(), false);
+    }
+}
+
+/// Whether d is a navi function with the C ABI (extern "C" fn with a body):
+/// its code gets a C entry (sym.c), which is its value.
+fn c_entry(d: Option<&mut Def>) -> bool {
+    let d = match d { Some(d) => d, None => return false };
+    if d.kind != crate::resolve::DEF_FN && d.kind != crate::resolve::DEF_ASSOC_FN { return false; }
+    match &d.node {
+        Node::Item(Item::Fn(f)) => f.abi == "C" && f.body.is_some(),
+        _ => false,
     }
 }
 
@@ -1767,6 +1793,13 @@ impl FnGen {
         match t.kind {
             codegen::T_INST => {
                 let i = t.inst.unwrap();
+                if c_entry(Some(t.def)) {
+                    // A C function pointer: its C entry.
+                    let cs = `${i.grp().sym}.c`;
+                    m.adr_sym(code, &cs);
+                    m.mov_imm(ctx, 0);
+                    return;
+                }
                 m.adr_sym(code, &i.grp().sym);
                 m.adr_sym(ctx, &i.dict);
             }
@@ -1783,6 +1816,52 @@ impl FnGen {
                 self.g.errorf(`${self.f.name}: dynamic method ${t.def.name} used as a value`);
             }
         }
+    }
+
+    /// Appends the function's C entry (see Machine::c_callback).
+    fn gen_c_entry(&mut self) {
+        let f = self.f;
+        let mut args: Vec<CArg> = Vec::new();
+        let mut nint = 0;
+        let mut nflt = 0;
+        let mut i = 1;
+        while i <= f.nargs {
+            let t = f.locals[i].ty;
+            let size = self.size(t);
+            if size > 8 || size == 0 {
+                self.g.errorf(`${f.name}: a parameter of an extern "C" fn must be a number, bool, char or pointer`);
+                return;
+            }
+            let float = t.kind == types::K_FLOAT;
+            if float { nflt += 1; } else { nint += 1; }
+            args.push(CArg { float, f64: t.f64, variadic: false, size });
+            i += 1;
+        }
+        // The arguments must all come in registers.
+        let win = self.g.tgt.os == "windows";
+        let amd64 = self.g.o.arch == "amd64";
+        let fits = if win { nint + nflt <= 4 } else if amd64 { nint <= 6 && nflt <= 8 } else { nint <= 8 && nflt <= 8 };
+        if !fits {
+            self.g.errorf(`${f.name}: too many parameters for an extern "C" fn called from C`);
+            return;
+        }
+        let rt = f.locals[0].ty;
+        let rsize = self.size(rt);
+        if rsize > 8 {
+            self.g.errorf(`${f.name}: the result of an extern "C" fn must be a number, bool, char or pointer`);
+            return;
+        }
+        let ret = if rsize == 0 { 0 } else if rt.kind == types::K_FLOAT { 2 } else { 1 };
+        let enter = self.g.p.runtime[&"cb_enter".to_string()];
+        let exit = self.g.p.runtime[&"cb_exit".to_string()];
+        let tls_get = self.g.extern_sym(if win { "TlsGetValue" } else { "pthread_getspecific" });
+        let abort = self.g.extern_sym("abort");
+        let loc = self.g.loc_at("<C callback>", 0, 0);
+        let cb = &CCallback { sym: self.grp.sym.clone(), dict: self.inst.dict.clone(), loc,
+            enter: enter.grp().sym.clone(), enter_dict: enter.dict.clone(), exit: exit.grp().sym.clone(), exit_dict: exit.dict.clone(),
+            tls_get, abort, args, ret, ret_f64: rt.f64 };
+        self.g.cur_c_off = self.m.offset() as i64;
+        self.m.c_callback(cb);
     }
 
     /// Writes an operand to [dst + off]; dst must be BASE, FP or SP.
@@ -2064,7 +2143,7 @@ impl FnGen {
 
     /// Makes a C call; the result (if any) is in V1. False if the call
     /// cannot be made.
-    fn c_call_body(&mut self, fn_op: &Operand, args: &Vec<Operand>, dt: &Type, sym: &str, via_fn: bool) -> bool {
+    fn c_call_body(&mut self, fn_op: &Operand, args: &Vec<Operand>, dt: &Type, sym: &str, via_fn: bool, sys: bool) -> bool {
         let m = self.m;
         let mut cargs: Vec<CArg> = Vec::new();
         let mut i = 0;
@@ -2099,9 +2178,9 @@ impl FnGen {
         let f64_ = float_ret && dt.f64;
         if via_fn {
             self.load_scalar(fn_op, BASE);
-            m.call_c("", BASE, &cargs, float_ret, f64_);
+            m.call_c("", BASE, &cargs, float_ret, f64_, sys);
         } else {
-            m.call_c(sym, 0, &cargs, float_ret, f64_);
+            m.call_c(sym, 0, &cargs, float_ret, f64_, sys);
         }
         true
     }
@@ -2120,7 +2199,9 @@ impl FnGen {
                 let fo = mir::copy(mir::local_place(0));
                 let decl = crate::types::collect::fn_decl(t.def);
                 self.nfixed = if decl.variadic { decl.params.len() as i64 } else { -1 };
-                let ok = self.c_call_body(&fo, args, dt, s.as_str(), false);
+                // Calls that may block run on the C stack (the MIR wraps
+                // them in enter_blocked/exit_blocked).
+                let ok = self.c_call_body(&fo, args, dt, s.as_str(), false, !t.def.nonblocking);
                 self.nfixed = -1;
                 if ok && (target < 0 || dt.kind == types::K_NEVER) { m.trap(); }
                 return ok;
@@ -2131,7 +2212,7 @@ impl FnGen {
             }
             "abort" => {
                 let s = self.g.extern_sym("abort");
-                m.call_c(s.as_str(), 0, &Vec::new(), false, false);
+                m.call_c(s.as_str(), 0, &Vec::new(), false, false, false);
                 m.trap();
                 return false;
             }
@@ -2167,14 +2248,14 @@ impl FnGen {
                 let mut ca = Vec::new();
                 ca.push(int_arg());
                 ca.push(int_arg());
-                m.call_c("_navi_swapctx", 0, &ca, false, false);
+                m.call_c("_navi_swapctx", 0, &ca, false, false, false);
             }
             "save_context" => {
                 self.load_scalar(&args[0], V1);
                 m.store(8, V1, SP, 0);
                 let mut ca = Vec::new();
                 ca.push(int_arg());
-                m.call_c("_navi_setjmp", 0, &ca, false, false);
+                m.call_c("_navi_setjmp", 0, &ca, false, false, false);
             }
             "func_table" => {
                 m.adr_sym(V1, &"_navi_ftab".to_string());
@@ -2188,7 +2269,7 @@ impl FnGen {
                     ca.push(int_arg());
                     k += 1;
                 }
-                m.call_c("_navi_scanw", 0, &ca, false, false);
+                m.call_c("_navi_scanw", 0, &ca, false, false, false);
             }
             "resume_context" => {
                 self.load_scalar(&args[0], V1);
@@ -2198,7 +2279,7 @@ impl FnGen {
                 let mut ca = Vec::new();
                 ca.push(int_arg());
                 ca.push(int_arg());
-                m.call_c("_navi_longjmp", 0, &ca, false, false);
+                m.call_c("_navi_longjmp", 0, &ca, false, false, false);
                 m.trap();
                 return false;
             }
@@ -2236,6 +2317,9 @@ impl FnGen {
             }
             "gc_marking_flag" => {
                 m.adr_sym(V1, &"_navi_gc_marking".to_string());
+            }
+            "tls_key_slot" => {
+                m.adr_sym(V1, &"_navi_tls_key".to_string());
             }
             "atomic_load" => {
                 self.load_scalar(&args[0], I1);
@@ -3562,7 +3646,7 @@ impl FnGen {
                 let mut cargs = Vec::new();
                 cargs.push(CArg { float: true, f64: f64_, variadic: false, size: if f64_ { 8 } else { 4 } });
                 cargs.push(CArg { float: true, f64: f64_, variadic: false, size: if f64_ { 8 } else { 4 } });
-                m.call_c(sym.as_str(), 0, &cargs, true, f64_);
+                m.call_c(sym.as_str(), 0, &cargs, true, f64_, false);
                 let d = self.ssa_dst(v, F0);
                 m.fmov_to(d, V1, f64_);
                 self.ssa_out(v, d);
@@ -3740,7 +3824,7 @@ impl FnGen {
                 let bfn = self.ssa_bridged(v, &fo, &mut ai, &mut boff);
                 let bargs = self.ssa_bridged(v, args, &mut ai, &mut boff);
                 let dt = match t { Term::Call { dest, .. } => self.place_type(dest), _ => return };
-                if self.c_call_body(&bfn[0], &bargs, dt, "", true) && self.size(dt) > 0 { m.store(8, V1, FP, self.res_off); }
+                if self.c_call_body(&bfn[0], &bargs, dt, "", true, true) && self.size(dt) > 0 { m.store(8, V1, FP, self.res_off); }
                 return;
             }
         }
