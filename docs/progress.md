@@ -401,10 +401,15 @@
   - 测试：`tests/run/c_blocking`、`tests/run/c_callback`（qsort 回调里分配和 GC、栈增长、嵌套回调、浮点、回调里等待其他线程、8 个线程同时回调），arm64 各种压力模式和 x64 都通过。
 - `#[link(name, kind = "dylib" | "framework")]`：`extern` 块的函数从指定的动态库导入（resolve 记在 `Def.link`，目标文件记在 `Object.libs`，`obj::lib_file` 把名字换成各平台的文件）。Mach-O 每个库一条 LC_LOAD_DYLIB、按库序号绑定；ELF 加 DT_NEEDED；PE 每个 DLL 一个导入目录。`kind = "static"` 报错：navi 不链接外来的目标代码，所以从不需要系统链接器（spec 1.16）。`NAVI_LINKER=cc` 时作为 `-l`、`-framework` 传下去。macOS 上 libz 和 CoreFoundation 在 arm64、x64、cc 三条路上都验证过；Linux 和 Windows 的产物用 llvm-readobj 检查过 DT_NEEDED 和导入表。
 - 构建缓存的淘汰（同 Go）：5 天没用过的条目删掉；写入缓存的构建最多一天清理一次（`trim.txt` 记上次的时间）；命中时把条目标为刚用过（最多一小时一次）。原来缓存只增不减，这几天的压测把它涨到了 15GB。
-- 待查：全量验证中出现过一次编译器偶发死锁（`all goroutines are asleep`）。
-  - 复现尝试：用 main 和当前编译器各编译约 1360 次，带诊断的编译器 5 路并行又编译 6450 次（其中 2580 次与出事时配置相同：x64 目标、`NAVI_MAXPROCS=4`），模拟 `par_for` 的调度器压测程序 9000 次，都没有复现。
+- 编译器的偶发死锁（`all goroutines are asleep`），已修：
+  - 原因：类型查询的可重入锁把持有者记在 `Option<ThreadId>` 里，不加同步地读写。刚释放锁的线程可能读到下一个持有者写了一半的值（新的 Some 标签加上自己的旧 id），以为自己持有锁而跳过加锁，之后再替真正的持有者解锁，所有工作线程于是都等在锁上。现在持有者是一个原子字（`ThreadId::as_u64`）。
+  - 在 GitHub CI 的 macos-x64 机器上出现了两次，靠下面的 goroutine 现场打印定位。
+  - 之前的复现尝试：用 main 和当前编译器各编译约 1360 次，带诊断的编译器 5 路并行又编译 6450 次（其中 2580 次与出事时配置相同：x64 目标、`NAVI_MAXPROCS=4`），模拟 `par_for` 的调度器压测程序 9000 次，都没有复现。
   - 读过 channel、select、Mutex、wait list、空闲 M 管理和 STW，没找到丢唤醒的路径。
   - 现在 runtime 在死锁时会列出每个没结束的 G 和它各帧的返回地址（同 Go 列出 goroutine），`tools/symbolize.py 程序 < 输出` 可以换成函数名；下次出现时有现场可查。
+- GitHub Actions（github.com/sunli829/navi-lang）：
+  - linux-x64、linux-arm64、macos-arm64、macos-x64 上从 stage0 自举到定点，再在四种运行时模式下跑 golden 测试，全部通过。顺带修了 glibc 的 `cbrt` 不精确（改成 navi 自己算）和多个定时器同时到期时的唤醒顺序。
+  - Windows 上用交叉编译的 `navic.exe` 跑测试：标准流改成二进制模式后 36 个通过；`navic.exe` 自身在构建时偶发崩溃，还在查（CI 失败时用 cdb 打印崩溃现场，`NAVI_LINKMAP` 让 PE 链接器写出符号地址）。
 
 ## 下一步
 
