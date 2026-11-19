@@ -1,44 +1,51 @@
-//! Sockets over Winsock (ws2_32.dll): blocking sockets, as Rust's std on
-//! Windows. A call that waits (accept, connect, recv, send, select,
-//! getaddrinfo) counts its G as blocked: the scheduler lets another M run
-//! the other Gs meanwhile (as for any blocking C call), so there is no
-//! poller. Timeouts are SO_RCVTIMEO and SO_SNDTIMEO; a connect with a
-//! timeout waits in select.
+//! Sockets over Winsock (ws2_32.dll) and the runtime's I/O completion port
+//! (as Go's on Windows): sockets are opened overlapped and attached to the
+//! port; an operation (WSARecv, WSASend, AcceptEx, ConnectEx, ...) is
+//! issued with an Op of rt::netpoll and its G parks until the completion
+//! comes. A deadline cancels the operation (CancelIoEx), which then
+//! completes as aborted. The data goes through the Op (the kernel never
+//! writes into a G's stack, which may move): a read or write moves at most
+//! CHUNK bytes. Name resolution (getaddrinfo) is a blocking call.
 //!
 //! WSAGetLastError is per OS thread: it is read right after the failed
-//! call (the G stays on its M through a blocking call).
+//! call, with no park in between.
 
 use crate::io;
 use crate::net::ip::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use crate::rt::netpoll::{self, OP_BUF, OP_BYTES, OP_FLAGS, OP_ADDR, OP_ADDRLEN, OP_DATA};
 
 #[link(name = "ws2_32")]
 #[nonblocking]
 extern "C" {
     fn WSAStartup(version: u16, data: *mut u8) -> i32;
     fn WSAGetLastError() -> i32;
-    fn socket(af: i32, ty: i32, proto: i32) -> usize;
+    fn WSASocketW(af: i32, ty: i32, proto: i32, info: *const u8, group: u32, flags: u32) -> usize;
+    fn WSARecv(s: usize, bufs: *mut u8, n: u32, got: *mut u32, flags: *mut u32, ov: *mut u8, done: *const u8) -> i32;
+    fn WSASend(s: usize, bufs: *mut u8, n: u32, sent: *mut u32, flags: u32, ov: *mut u8, done: *const u8) -> i32;
+    fn WSARecvFrom(s: usize, bufs: *mut u8, n: u32, got: *mut u32, flags: *mut u32, from: *mut u8, fromlen: *mut i32, ov: *mut u8, done: *const u8) -> i32;
+    fn WSASendTo(s: usize, bufs: *mut u8, n: u32, sent: *mut u32, flags: u32, to: *const u8, tolen: i32, ov: *mut u8, done: *const u8) -> i32;
+    fn WSAGetOverlappedResult(s: usize, ov: *mut u8, bytes: *mut u32, wait: i32, flags: *mut u32) -> i32;
+    fn WSAIoctl(s: usize, code: u32, inb: *const u8, inlen: u32, outb: *mut u8, outlen: u32, got: *mut u32, ov: *mut u8, done: *const u8) -> i32;
     fn bind(s: usize, addr: *const u8, len: i32) -> i32;
     fn listen(s: usize, backlog: i32) -> i32;
+    fn connect(s: usize, addr: *const u8, len: i32) -> i32;
     fn getsockname(s: usize, addr: *mut u8, len: *mut i32) -> i32;
     fn getpeername(s: usize, addr: *mut u8, len: *mut i32) -> i32;
     fn shutdown(s: usize, how: i32) -> i32;
     fn closesocket(s: usize) -> i32;
     fn setsockopt(s: usize, level: i32, name: i32, val: *const u8, len: i32) -> i32;
     fn getsockopt(s: usize, level: i32, name: i32, val: *mut u8, len: *mut i32) -> i32;
-    fn ioctlsocket(s: usize, cmd: i32, arg: *mut u32) -> i32;
     fn freeaddrinfo(res: usize);
 }
-// These wait.
+// May block: the call counts its G as blocked.
 #[link(name = "ws2_32")]
 extern "C" {
-    fn accept(s: usize, addr: *mut u8, len: *mut i32) -> usize;
-    fn connect(s: usize, addr: *const u8, len: i32) -> i32;
-    fn recv(s: usize, buf: *mut u8, n: i32, flags: i32) -> i32;
-    fn send(s: usize, buf: *const u8, n: i32, flags: i32) -> i32;
-    fn recvfrom(s: usize, buf: *mut u8, n: i32, flags: i32, addr: *mut u8, len: *mut i32) -> i32;
-    fn sendto(s: usize, buf: *const u8, n: i32, flags: i32, addr: *const u8, len: i32) -> i32;
-    #[link_name = "select"] fn ws_select(nfds: i32, r: *mut u8, w: *mut u8, e: *mut u8, tv: *const u8) -> i32;
     fn getaddrinfo(node: *const u8, service: *const u8, hints: *const u8, res: *mut usize) -> i32;
+}
+#[link(name = "mswsock")]
+#[nonblocking]
+extern "C" {
+    fn AcceptEx(listen: usize, accept: usize, buf: *mut u8, recvlen: u32, local: u32, remote: u32, got: *mut u32, ov: *mut u8) -> i32;
 }
 
 pub const SOCK_STREAM: i32 = 1;
@@ -46,17 +53,23 @@ pub const SOCK_DGRAM: i32 = 2;
 const AF_INET: i32 = 2;
 const AF_INET6: i32 = 23;
 const SOL_SOCKET: i32 = 0xffff;
-const SO_ERROR: i32 = 0x1007;
-const SO_SNDTIMEO: i32 = 0x1005;
-const SO_RCVTIMEO: i32 = 0x1006;
 pub const SO_BROADCAST: i32 = 0x20;
+const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700b;
+const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 pub const IPPROTO_TCP: i32 = 6;
 pub const TCP_NODELAY: i32 = 1;
-const FIONBIO: i32 = -2147195266; // 0x8004667e
+const WSA_FLAG_OVERLAPPED: u32 = 1;
+const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xc8000006;
+const SIO_UDP_CONNRESET: u32 = 0x9800000c;
 const INVALID_SOCKET: usize = 18446744073709551615;
-const WSAEWOULDBLOCK: i32 = 10035;
+const WSA_IO_PENDING: i32 = 997;
+const ERROR_OPERATION_ABORTED: i32 = 995;
+// The most bytes one read or write moves (through its Op).
+const CHUNK: usize = 65536;
 
 static mut STARTED: usize = 0;
+static mut CONNECT_EX: usize = 0;
 
 // Winsock 2.2, once (WSAStartup counts its calls: two racing ones are fine).
 fn startup() {
@@ -79,6 +92,8 @@ fn timed_out() -> io::Error { io::Error::new(io::ErrorKind::TimedOut, "operation
 /// fd is the SOCKET (handles fit in 32 bits).
 pub struct Socket {
     pub fd: i32,
+    fam: i32,
+    ty: i32,
     /// Read and write timeouts in nanoseconds (0: none).
     pub rto: u64,
     pub wto: u64,
@@ -86,18 +101,32 @@ pub struct Socket {
     closed: usize,
 }
 
-/// A new socket for addresses like a.
-pub fn new_socket(a: &SocketAddr, ty: i32) -> io::Result<&mut Socket> {
+fn h(fd: i32) -> usize { fd as u32 as usize }
+
+// A new overlapped socket attached to the completion port.
+fn open(fam: i32, ty: i32) -> io::Result<&mut Socket> {
     startup();
-    let fam = if a.is_ipv4() { AF_INET } else { AF_INET6 };
-    let s = unsafe { socket(fam, ty, 0) };
+    let s = unsafe { WSASocketW(fam, ty, 0, 0 as *const u8, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT) };
     if s == INVALID_SOCKET { return Err(last_error()); }
-    Ok(wrap(s))
+    if !netpoll::attach(s) {
+        let e = io::Error::last_os_error();
+        unsafe { closesocket(s); }
+        return Err(e);
+    }
+    if ty == SOCK_DGRAM {
+        // A datagram refused by an earlier peer (ICMP port unreachable) is
+        // no error of the next receive.
+        let off = 0u32;
+        let mut got = 0u32;
+        unsafe { WSAIoctl(s, SIO_UDP_CONNRESET, &off as *const u32 as *const u8, 4, 0 as *mut u8, 0, &mut got as *mut u32, 0 as *mut u8, 0 as *const u8); }
+    }
+    Ok(&mut Socket { fd: s as i32, fam, ty, rto: 0, wto: 0, closed: 0 })
 }
 
-fn wrap(s: usize) -> &mut Socket { &mut Socket { fd: s as i32, rto: 0, wto: 0, closed: 0 } }
-
-fn h(fd: i32) -> usize { fd as u32 as usize }
+/// A new socket for addresses like a.
+pub fn new_socket(a: &SocketAddr, ty: i32) -> io::Result<&mut Socket> {
+    open(if a.is_ipv4() { AF_INET } else { AF_INET6 }, ty)
+}
 
 pub fn set_int(fd: i32, level: i32, name: i32, v: i32) -> io::Result<()> {
     let x = v;
@@ -169,23 +198,68 @@ pub fn decode(b: &[u8; 28]) -> SocketAddr {
     SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from_octets(o), port, fl, sc))
 }
 
-// A buffer length as Winsock takes it.
-fn clamp(n: usize) -> i32 { if n > 0x7fffffff { 0x7fffffff } else { n as i32 } }
+fn deadline(timeout: u64) -> u64 { if timeout == 0 { 0 } else { crate::rt::native::monotonic_nanos() + timeout } }
 
-// SO_RCVTIMEO / SO_SNDTIMEO: milliseconds (0: none).
-fn millis(ns: u64) -> i32 {
-    if ns == 0 { return 0; }
-    let ms = (ns + 999999) / 1000000;
-    if ms > 0x7fffffff { 0x7fffffff } else { ms as i32 }
+// --- Ops -----------------------------------------------------------------------------
+
+fn ov(op: usize) -> *mut u8 { op as *mut u8 }
+fn u32_at(op: usize, off: usize) -> *mut u32 { (op + off) as *mut u32 }
+
+// An Op whose WSABUF covers n bytes of its data.
+fn op_buf(n: usize) -> usize {
+    let op = netpoll::op_new(n);
+    unsafe {
+        *((op + OP_BUF) as *mut u32) = n as u32;
+        *((op + OP_BUF + 8) as *mut usize) = op + OP_DATA;
+    }
+    op
+}
+
+// The address in op (as a 28-byte sockaddr).
+fn op_addr(op: usize) -> SocketAddr {
+    let mut b = [0u8; 28];
+    let mut i = 0;
+    while i < 28 {
+        b[i] = unsafe { *((op + OP_ADDR + i) as *const u8) };
+        i += 1;
+    }
+    decode(&b)
+}
+
+fn op_set_addr(op: usize, a: &SocketAddr) -> i32 {
+    let (b, n) = encode(a);
+    let mut i = 0;
+    while i < 28 {
+        unsafe { *((op + OP_ADDR + i) as *mut u8) = b[i]; }
+        i += 1;
+    }
+    n
 }
 
 impl Socket {
-    // The error of a failed call: a socket closed meanwhile (closesocket
-    // ends a wait in it) reads as closed.
-    fn fail(&self) -> io::Error {
-        let e = unsafe { WSAGetLastError() };
-        if self.is_closed() { return closed(); }
-        os_error(e)
+    // Ends op issued on this socket: ok says the issuing call succeeded (a
+    // completion comes either way, as the socket does not skip it), else
+    // WSAGetLastError says pending (a completion comes) or failed (none).
+    // The bytes moved.
+    fn finish(&self, op: usize, ok: bool, dl: u64) -> io::Result<usize> {
+        if !ok {
+            let e = unsafe { WSAGetLastError() };
+            if e != WSA_IO_PENDING {
+                netpoll::op_failed(op);
+                if self.is_closed() { return Err(closed()); }
+                return Err(os_error(e));
+            }
+        }
+        let timed = netpoll::op_wait(op, h(self.fd), dl);
+        let mut n = 0u32;
+        let mut fl = 0u32;
+        if unsafe { WSAGetOverlappedResult(h(self.fd), ov(op), &mut n as *mut u32, 0, &mut fl as *mut u32) } == 0 {
+            let e = unsafe { WSAGetLastError() };
+            if self.is_closed() { return Err(closed()); }
+            if timed && e == ERROR_OPERATION_ABORTED { return Err(timed_out()); }
+            return Err(os_error(e));
+        }
+        Ok(n as usize)
     }
 
     pub fn bind(&self, a: &SocketAddr) -> io::Result<()> {
@@ -202,86 +276,101 @@ impl Socket {
 
     pub fn accept(&self) -> io::Result<(&mut Socket, SocketAddr)> {
         if self.is_closed() { return Err(closed()); }
-        let mut b = [0u8; 28];
-        let mut n = 28i32;
-        let s = unsafe { accept(h(self.fd), &mut b as *mut [u8; 28] as *mut u8, &mut n as *mut i32) };
-        if s == INVALID_SOCKET { return Err(self.fail()); }
-        Ok((wrap(s), decode(&b)))
+        let s = open(self.fam, self.ty)?;
+        // The addresses AcceptEx writes: each its sockaddr and 16 bytes.
+        let op = op_buf(2 * 44);
+        let ok = unsafe { AcceptEx(h(self.fd), h(s.fd), (op + OP_DATA) as *mut u8, 0, 44, 44, u32_at(op, OP_BYTES), ov(op)) } != 0;
+        if let Err(e) = self.finish(op, ok, deadline(self.rto)) {
+            s.close();
+            return Err(e);
+        }
+        // The accepted socket takes the listener's properties.
+        let l = h(self.fd);
+        unsafe { setsockopt(h(s.fd), SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &l as *const usize as *const u8, 8); }
+        match s.peer_addr() {
+            Ok(a) => Ok((s, a)),
+            Err(e) => {
+                s.close();
+                Err(e)
+            }
+        }
     }
 
     pub fn connect(&self, a: &SocketAddr, timeout: u64) -> io::Result<()> {
         let (b, n) = encode(a);
-        if timeout == 0 {
-            if unsafe { connect(h(self.fd), &b as *const [u8; 28] as *const u8, n) } != 0 { return Err(self.fail()); }
+        if self.ty != SOCK_STREAM {
+            // A datagram socket only records its peer.
+            if unsafe { connect(h(self.fd), &b as *const [u8; 28] as *const u8, n) } != 0 { return Err(last_error()); }
             return Ok(());
         }
-        // Non-blocking for the connect, then select until the deadline.
-        self.set_nonblocking(true)?;
-        let r = self.connect_wait(&b, n, timeout);
-        let back = self.set_nonblocking(false);
-        r?;
-        back
-    }
-
-    fn connect_wait(&self, b: &[u8; 28], n: i32, timeout: u64) -> io::Result<()> {
-        if unsafe { connect(h(self.fd), b as *const [u8; 28] as *const u8, n) } == 0 { return Ok(()); }
-        let e = unsafe { WSAGetLastError() };
-        if e != WSAEWOULDBLOCK { return Err(os_error(e)); }
-        // fd_set: a u32 count, then the SOCKETs (8-byte aligned).
-        let mut w = [0u64; 2];
-        w[0] = 1;
-        w[1] = h(self.fd) as u64;
-        let mut x = [0u64; 2];
-        x[0] = 1;
-        x[1] = h(self.fd) as u64;
-        // struct timeval: two 32-bit longs.
-        let us = timeout / 1000;
-        let mut tv = [0i32; 2];
-        tv[0] = if us / 1000000 > 0x7fffffff { 0x7fffffff } else { (us / 1000000) as i32 };
-        tv[1] = (us % 1000000) as i32;
-        let rc = unsafe { ws_select(0, 0 as *mut u8, &mut w as *mut [u64; 2] as *mut u8, &mut x as *mut [u64; 2] as *mut u8, &tv as *const [i32; 2] as *const u8) };
-        if rc < 0 { return Err(last_error()); }
-        if rc == 0 { return Err(timed_out()); }
-        let err = get_int(self.fd, SOL_SOCKET, SO_ERROR)?;
-        if err != 0 { return Err(os_error(err)); }
+        // ConnectEx wants a socket bound first (as Go's): to a port chosen
+        // without knowing the peer, so a port in TIME_WAIT cannot be reused
+        // as connect's own bind would (more than about 16000 connections
+        // closed within the TIME_WAIT delay run out of ports).
+        let any = if a.is_ipv4() { SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)) } else { SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from_octets([0u8; 16]), 0, 0, 0)) };
+        self.bind(&any)?;
+        let cx = self.connect_ex()?;
+        let op = netpoll::op_new(0);
+        let len = op_set_addr(op, a);
+        let ok = cx(h(self.fd), (op + OP_ADDR) as *const u8, len, 0 as *const u8, 0, u32_at(op, OP_BYTES), ov(op)) != 0;
+        self.finish(op, ok, deadline(timeout))?;
+        unsafe { setsockopt(h(self.fd), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, 0 as *const u8, 0); }
         Ok(())
     }
 
-    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
-        let mut v: u32 = if on { 1 } else { 0 };
-        if unsafe { ioctlsocket(h(self.fd), FIONBIO, &mut v as *mut u32) } != 0 { return Err(last_error()); }
-        Ok(())
+    // ConnectEx, from the provider (once).
+    fn connect_ex(&self) -> io::Result<extern "C" fn(usize, *const u8, i32, *const u8, u32, *mut u32, *mut u8) -> i32> {
+        let mut p = crate::rt::atomic_load(unsafe { &CONNECT_EX } as *const usize as *mut usize);
+        if p == 0 {
+            // WSAID_CONNECTEX {25a207b9-ddf3-4660-8ee9-76e58c74063e}.
+            let guid: [u8; 16] = [0xb9, 0x07, 0xa2, 0x25, 0xf3, 0xdd, 0x60, 0x46, 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e];
+            let mut got = 0u32;
+            if unsafe { WSAIoctl(h(self.fd), SIO_GET_EXTENSION_FUNCTION_POINTER, &guid as *const [u8; 16] as *const u8, 16,
+                &mut p as *mut usize as *mut u8, 8, &mut got as *mut u32, 0 as *mut u8, 0 as *const u8) } != 0 {
+                return Err(last_error());
+            }
+            crate::rt::atomic_store(unsafe { &CONNECT_EX } as *const usize as *mut usize, p);
+        }
+        Ok(unsafe { *(&p as *const usize as *const extern "C" fn(usize, *const u8, i32, *const u8, u32, *mut u32, *mut u8) -> i32) })
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         if self.is_closed() { return Err(closed()); }
-        let n = unsafe { recv(h(self.fd), crate::rt::slice_ptr(buf) as *mut u8, clamp(buf.len()), 0) };
-        if n < 0 { return Err(self.fail()); }
-        Ok(n as usize)
+        // A zero-byte read would wait for data and report none.
+        if buf.len() == 0 { return Ok(0); }
+        let want = if buf.len() < CHUNK { buf.len() } else { CHUNK };
+        let op = op_buf(want);
+        let ok = unsafe { WSARecv(h(self.fd), (op + OP_BUF) as *mut u8, 1, u32_at(op, OP_BYTES), u32_at(op, OP_FLAGS), ov(op), 0 as *const u8) } == 0;
+        let n = self.finish(op, ok, deadline(self.rto))?;
+        copy_out(op, buf, n);
+        Ok(n)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         if self.is_closed() { return Err(closed()); }
-        let n = unsafe { send(h(self.fd), crate::rt::slice_ptr(buf), clamp(buf.len()), 0) };
-        if n < 0 { return Err(self.fail()); }
-        Ok(n as usize)
+        let op = op_with(buf);
+        let ok = unsafe { WSASend(h(self.fd), (op + OP_BUF) as *mut u8, 1, u32_at(op, OP_BYTES), 0, ov(op), 0 as *const u8) } == 0;
+        self.finish(op, ok, deadline(self.wto))
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         if self.is_closed() { return Err(closed()); }
-        let mut b = [0u8; 28];
-        let mut an = 28i32;
-        let n = unsafe { recvfrom(h(self.fd), crate::rt::slice_ptr(buf) as *mut u8, clamp(buf.len()), 0, &mut b as *mut [u8; 28] as *mut u8, &mut an as *mut i32) };
-        if n < 0 { return Err(self.fail()); }
-        Ok((n as usize, decode(&b)))
+        let want = if buf.len() < CHUNK { buf.len() } else { CHUNK };
+        let op = op_buf(want);
+        unsafe { *((op + OP_ADDRLEN) as *mut i32) = 28; }
+        let ok = unsafe { WSARecvFrom(h(self.fd), (op + OP_BUF) as *mut u8, 1, u32_at(op, OP_BYTES), u32_at(op, OP_FLAGS),
+            (op + OP_ADDR) as *mut u8, (op + OP_ADDRLEN) as *mut i32, ov(op), 0 as *const u8) } == 0;
+        let n = self.finish(op, ok, deadline(self.rto))?;
+        copy_out(op, buf, n);
+        Ok((n, op_addr(op)))
     }
 
     pub fn send_to(&self, buf: &[u8], a: &SocketAddr) -> io::Result<usize> {
         if self.is_closed() { return Err(closed()); }
-        let (b, an) = encode(a);
-        let n = unsafe { sendto(h(self.fd), crate::rt::slice_ptr(buf), clamp(buf.len()), 0, &b as *const [u8; 28] as *const u8, an) };
-        if n < 0 { return Err(self.fail()); }
-        Ok(n as usize)
+        let op = op_with(buf);
+        let len = op_set_addr(op, a);
+        let ok = unsafe { WSASendTo(h(self.fd), (op + OP_BUF) as *mut u8, 1, u32_at(op, OP_BYTES), 0, (op + OP_ADDR) as *const u8, len, ov(op), 0 as *const u8) } == 0;
+        self.finish(op, ok, deadline(self.wto))
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -307,22 +396,39 @@ impl Socket {
 
     /// Sets the read and write timeouts (nanoseconds; 0: none). Sockets are
     /// shared by the copies of a TcpStream: they change through &self.
-    pub fn set_rto(&self, ns: u64) {
-        unsafe { *(&self.rto as *const u64 as *mut u64) = ns; }
-        let _ = set_int(self.fd, SOL_SOCKET, SO_RCVTIMEO, millis(ns));
-    }
-    pub fn set_wto(&self, ns: u64) {
-        unsafe { *(&self.wto as *const u64 as *mut u64) = ns; }
-        let _ = set_int(self.fd, SOL_SOCKET, SO_SNDTIMEO, millis(ns));
-    }
+    pub fn set_rto(&self, ns: u64) { unsafe { *(&self.rto as *const u64 as *mut u64) = ns; } }
+    pub fn set_wto(&self, ns: u64) { unsafe { *(&self.wto as *const u64 as *mut u64) = ns; } }
 
-    /// Closes the socket (a G waiting in it gets an error); again is a
-    /// no-op.
+    /// Closes the socket (its pending operations complete as aborted: a G
+    /// waiting in one gets an error); again is a no-op.
     pub fn close(&self) {
         let p = &self.closed as *const usize as *mut usize;
         if !crate::rt::atomic_cas(p, 0, 1) { return; }
         unsafe { closesocket(h(self.fd)); }
     }
+}
+
+// Copies the first n bytes of op's data into buf.
+fn copy_out(op: usize, buf: &mut [u8], n: usize) {
+    let mut i = 0;
+    let p = crate::rt::slice_ptr(buf) as *mut u8;
+    while i < n {
+        unsafe { *((p as usize + i) as *mut u8) = *((op + OP_DATA + i) as *const u8); }
+        i += 1;
+    }
+}
+
+// An Op holding the first CHUNK bytes (at most) of buf, to send.
+fn op_with(buf: &[u8]) -> usize {
+    let n = if buf.len() < CHUNK { buf.len() } else { CHUNK };
+    let op = op_buf(n);
+    let p = crate::rt::slice_ptr(buf);
+    let mut i = 0;
+    while i < n {
+        unsafe { *((op + OP_DATA + i) as *mut u8) = *((p as usize + i) as *const u8); }
+        i += 1;
+    }
+    op
 }
 
 fn cstr_owned(s: &str) -> Vec<u8> {

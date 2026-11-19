@@ -146,7 +146,7 @@ socket 底层都是非阻塞的：会阻塞的操作只挂起当前绿色线程�
 | `try_clone` | `dup` 出新的描述符 | 返回共享同一个 socket（和它的超时设置）的拷贝 | 值语义 |
 | `TcpListener::incoming` | 迭代器借用监听器 | 迭代器持有监听器的拷贝 | 没有生命周期 |
 | 超时 | `SO_RCVTIMEO` / `SO_SNDTIMEO` | 由轮询器计时，超时返回 `ErrorKind::TimedOut`（Rust 在 Unix 上是 `WouldBlock`） | 非阻塞 socket 不用内核超时 |
-| Windows | 阻塞 socket | 同 Rust：ws2_32 的阻塞 socket，超时用 `SO_RCVTIMEO` / `SO_SNDTIMEO`；阻塞的调用占住一个 OS 线程（调度器让别的 M 运行其余绿色线程），没有轮询器；不设 `SO_REUSEADDR` | 先做最简单的；IOCP 轮询器以后再说 |
+| Windows | 阻塞 socket | 同 Go：重叠 I/O 和完成端口，会阻塞的操作只挂起绿色线程，超时用 `CancelIoEx` 取消；数据经运行时的缓冲（每次读写至多 64KB）；`connect` 用 ConnectEx，要先 bind，临时端口不能和 TIME_WAIT 的连接共用；不设 `SO_REUSEADDR` | 绿色线程不占 OS 线程；内核不写绿色线程的栈（栈会移动） |
 
 ## 10. 照着常用 crate 做的模块
 

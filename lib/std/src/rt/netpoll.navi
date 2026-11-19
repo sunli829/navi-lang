@@ -2,7 +2,9 @@
 //! whose operation would block parks on its socket's readiness, and a
 //! poller thread waiting in kqueue (macOS) or epoll (Linux) readies it when
 //! the socket becomes readable or writable. Deadlines use the scheduler's
-//! timers. (Windows uses blocking sockets: no poller; see net/sys/windows.)
+//! timers. Windows has no readiness to wait for: there the poller thread
+//! waits on an I/O completion port, and a G parks on the completion of the
+//! overlapped operation it issued (as Go's netpoll_windows; see Op below).
 //!
 //! The poller thread is an M that runs no Gs. It only sets flags and
 //! readies Gs (no list of GC objects changes there, so it needs no write
@@ -55,6 +57,7 @@ extern "C" {
 }
 
 // Creates the poller (kqueue/epoll and its thread) on first use.
+#[cfg(not(target_os = "windows"))]
 fn init() {
     if crate::rt::atomic_load(lkp(unsafe { &POLL_READY })) != 0 { return; }
     sched::obj_lock(lkp(unsafe { &INIT_LK }));
@@ -70,6 +73,7 @@ fn init() {
 
 /// Whether sockets are registered (Gs may be waiting for them: all Ms
 /// idle is no deadlock).
+#[cfg(not(target_os = "windows"))]
 pub fn active() -> bool { crate::rt::atomic_load(lkp(unsafe { &REG_N })) != 0 }
 
 #[cfg(target_os = "macos")]
@@ -78,6 +82,7 @@ fn poll_create() -> i32 { unsafe { kqueue() } }
 fn poll_create() -> i32 { unsafe { epoll_create1(0x80000) } }
 
 /// Registers fd (non-blocking) with the poller.
+#[cfg(not(target_os = "windows"))]
 pub fn open(fd: i32) -> *mut PollDesc {
     init();
     let pd = crate::rt::gc::alloc(crate::intrinsics::size_of::<PollDesc>(), false) as *mut PollDesc;
@@ -250,6 +255,7 @@ pub fn wait(pd: *mut PollDesc, write: bool, deadline: u64) -> i32 {
 
 /// The poller thread: waits for events and readies the Gs waiting for
 /// them (no allocation: it runs on a scheduler record).
+#[cfg(not(target_os = "windows"))]
 pub fn poll_loop() -> ! {
     let mut evs = [0u64; 256];
     loop {
@@ -301,5 +307,146 @@ fn event(buf: *const u8, i: usize) -> (*mut PollDesc, bool, bool) {
         let pd = (*(d as *const u32) as u64 | (*((d + 4) as *const u32) as u64) << 32) as *mut PollDesc;
         let err = events & (8 | 0x10 | 0x2000) != 0; // EPOLLERR | EPOLLHUP | EPOLLRDHUP
         (pd, events & 1 != 0 || err, events & 4 != 0 || err)
+    }
+}
+
+// --- Windows: an I/O completion port ------------------------------------------------
+//
+// An Op is one overlapped operation: its OVERLAPPED first (the completion
+// hands back its address), then the waiting G, then what the kernel reads
+// and writes while the operation runs (a WSABUF, counts, an address and
+// the data itself). It is one noscan GC object, which the G issuing the
+// operation keeps (on its stack) until the completion has come: the
+// kernel never writes into a G's stack, which may move.
+
+#[cfg(target_os = "windows")]
+#[nonblocking]
+extern "C" {
+    fn CreateIoCompletionPort(file: usize, port: usize, key: usize, threads: u32) -> usize;
+    fn GetQueuedCompletionStatusEx(port: usize, entries: *mut u8, n: u32, removed: *mut u32, ms: u32, alertable: i32) -> i32;
+    fn CancelIoEx(file: usize, ov: *mut u8) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+static mut PORT: usize = 0;
+// Ops in flight (a G waits for each).
+#[cfg(target_os = "windows")]
+static mut PENDING: usize = 0;
+
+// Offsets in an Op.
+#[cfg(target_os = "windows")]
+const OP_LK: usize = 32;
+#[cfg(target_os = "windows")]
+const OP_G: usize = 40;
+#[cfg(target_os = "windows")]
+const OP_GEN: usize = 48;
+#[cfg(target_os = "windows")]
+const OP_DONE: usize = 56;
+/// WSABUF (a u32 length, a pointer), the byte count and flags (u32 each),
+/// a sockaddr (28 bytes) and its length (i32), then the data.
+#[cfg(target_os = "windows")]
+pub const OP_BUF: usize = 64;
+#[cfg(target_os = "windows")]
+pub const OP_BYTES: usize = 80;
+#[cfg(target_os = "windows")]
+pub const OP_FLAGS: usize = 88;
+#[cfg(target_os = "windows")]
+pub const OP_ADDR: usize = 96;
+#[cfg(target_os = "windows")]
+pub const OP_ADDRLEN: usize = 128;
+#[cfg(target_os = "windows")]
+pub const OP_DATA: usize = 136;
+
+// Creates the completion port and the poller thread on first use.
+#[cfg(target_os = "windows")]
+fn init() {
+    if crate::rt::atomic_load(lkp(unsafe { &POLL_READY })) != 0 { return; }
+    sched::obj_lock(lkp(unsafe { &INIT_LK }));
+    if POLL_READY == 0 {
+        let p = unsafe { CreateIoCompletionPort(18446744073709551615, 0, 0, 1) };
+        if p == 0 { crate::rt::native::fatal("netpoll: cannot create the completion port"); }
+        PORT = p;
+        sched::start_poller();
+        crate::rt::atomic_store(lkp(unsafe { &POLL_READY }), 1);
+    }
+    sched::obj_unlock(lkp(unsafe { &INIT_LK }));
+}
+
+/// Associates a socket (opened overlapped) with the completion port.
+#[cfg(target_os = "windows")]
+pub fn attach(h: usize) -> bool {
+    init();
+    unsafe { CreateIoCompletionPort(h, PORT, 0, 0) != 0 }
+}
+
+/// A new Op with data bytes after its header (zeroed), counted as in
+/// flight: the caller issues it, then op_wait (or op_failed if the issuing
+/// call failed, when no completion comes).
+#[cfg(target_os = "windows")]
+pub fn op_new(data: usize) -> usize {
+    crate::rt::atomic_add(lkp(unsafe { &PENDING }), 1);
+    crate::rt::gc::alloc(OP_DATA + data, true) as usize
+}
+
+#[cfg(target_os = "windows")]
+pub fn op_failed(op: usize) { crate::rt::atomic_add(lkp(unsafe { &PENDING }), 18446744073709551615); }
+
+/// Waits for op's completion. At deadline (monotonic nanoseconds; 0: none)
+/// the operation is cancelled (CancelIoEx on handle h) and the wait goes on
+/// until its completion comes: whether the deadline passed.
+#[cfg(target_os = "windows")]
+pub fn op_wait(op: usize, h: usize, deadline: u64) -> bool {
+    let lk = (op + OP_LK) as *mut usize;
+    let mut timed = false;
+    sched::obj_lock(lk);
+    loop {
+        if unsafe { *((op + OP_DONE) as *const usize) } != 0 { break; }
+        let g = sched::current();
+        unsafe {
+            *((op + OP_G) as *mut usize) = g as usize;
+            *((op + OP_GEN) as *mut usize) = sched::wait_gen(g);
+        }
+        let fired = sched::park_until(lk, if timed { 0 } else { deadline });
+        unsafe { *((op + OP_G) as *mut usize) = 0; }
+        if fired && !timed && unsafe { *((op + OP_DONE) as *const usize) } == 0 {
+            timed = true;
+            sched::obj_unlock(lk);
+            unsafe { CancelIoEx(h, op as *mut u8); }
+            sched::obj_lock(lk);
+        }
+    }
+    sched::obj_unlock(lk);
+    crate::rt::atomic_add(lkp(unsafe { &PENDING }), 18446744073709551615);
+    timed
+}
+
+#[cfg(target_os = "windows")]
+pub fn active() -> bool { crate::rt::atomic_load(lkp(unsafe { &PENDING })) != 0 }
+
+/// The poller thread: takes completions off the port and readies the Gs
+/// waiting for them (no allocation: it runs on a scheduler record).
+#[cfg(target_os = "windows")]
+pub fn poll_loop() -> ! {
+    // OVERLAPPED_ENTRY: key, lpOverlapped, Internal, byte count (32 bytes).
+    let mut ents = [0u64; 256];
+    loop {
+        let mut n = 0u32;
+        let ok = unsafe { GetQueuedCompletionStatusEx(PORT, &mut ents as *mut [u64; 256] as *mut u8, 64, &mut n as *mut u32, 0xffffffff, 0) };
+        if ok == 0 { continue; }
+        let mut i = 0;
+        while i < n as usize {
+            let op = ents[4 * i + 1] as usize;
+            if op != 0 {
+                let lk = (op + OP_LK) as *mut usize;
+                sched::obj_lock(lk);
+                unsafe {
+                    *((op + OP_DONE) as *mut usize) = 1;
+                    let g = *((op + OP_G) as *const usize) as *mut G;
+                    if g as usize != 0 { sched::wake_gen(g, *((op + OP_GEN) as *const usize)); }
+                }
+                sched::obj_unlock(lk);
+            }
+            i += 1;
+        }
     }
 }
