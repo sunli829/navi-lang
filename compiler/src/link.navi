@@ -197,8 +197,24 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     let libsystem = "/usr/lib/libSystem.B.dylib";
     let dylib_size = align_up((24 + libsystem.len() + 1) as u64, 8) as u32;
     cmds_size += dylib_size;
+    // The libraries of #[link] (ordinals 2..; libSystem is 1).
+    let mut dylibs: Vec<String> = Vec::new();
+    for l in o.libraries().iter() {
+        let f = obj::lib_file(l.as_str(), "macos")?;
+        if f != libsystem && !dylibs.contains(&f) { dylibs.push(f); }
+    }
+    let mut ordinal: HashMap<String, u64> = HashMap::new();
+    for (sym, l) in o.libs.iter() {
+        let f = obj::lib_file(l.as_str(), "macos")?;
+        let mut k = 0;
+        while k < dylibs.len() {
+            if dylibs[k] == f { ordinal.insert(sym.clone(), (k + 2) as u64); }
+            k += 1;
+        }
+    }
+    for f in dylibs.iter() { cmds_size += align_up((24 + f.len() + 1) as u64, 8) as u32; }
     cmds_size += 16; // LC_CODE_SIGNATURE
-    let mut ncmds = 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
+    let mut ncmds = 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + dylibs.len() as u32;
     // Debug builds: a __DWARF segment (between __DATA and __LINKEDIT).
     let has_dwarf = o.lines.len() > 0;
     if has_dwarf {
@@ -375,9 +391,17 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     le.pad_to(align_up(le.b.len() as u64, 8));
     let rebase_size = le.b.len() as u64;
     let bind_off = linkedit_off + rebase_size;
-    le.u8(0x11); // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM 1
     le.u8(0x51); // BIND_OPCODE_SET_TYPE_IMM POINTER
+    let mut cur_ord = 0u64;
     for bd in binds.iter() {
+        let ord = match ordinal.get(&bd.2) { Some(n) => *n, None => 1 };
+        if ord != cur_ord {
+            if ord < 16 { le.u8(0x10 | ord as u8); } else { // SET_DYLIB_ORDINAL_IMM
+                le.u8(0x20); // SET_DYLIB_ORDINAL_ULEB
+                le.uleb(ord);
+            }
+            cur_ord = ord;
+        }
         le.u8(0x40); // SET_SYMBOL_TRAILING_FLAGS_IMM
         le.cstr(bd.2.as_str());
         le.u8(0x70 | bd.0 as u8); // SET_SEGMENT_AND_OFFSET_ULEB
@@ -415,7 +439,8 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
         le.u8(0x01); // N_UNDF | N_EXT
         le.u8(0);
         le.u8(0);
-        le.u8(1); // library ordinal 1 (n_desc high byte)
+        // The library ordinal (n_desc high byte).
+        le.u8(match ordinal.get(name) { Some(n) => *n as u8, None => 1 });
         le.u64(0);
         strtab.cstr(name.as_str());
         nsyms += 1;
@@ -530,6 +555,19 @@ pub fn link(o: &Object, identifier: &str) -> Result<Vec<u8>, String> {
     w.u32(0x00010000);
     w.cstr(libsystem);
     w.pad_to((start2 as u64) + dylib_size as u64);
+    // LC_LOAD_DYLIB of each #[link] library (versions 0: any).
+    for f in dylibs.iter() {
+        let st = w.b.len();
+        let size = align_up((24 + f.len() + 1) as u64, 8) as u32;
+        w.u32(0xc);
+        w.u32(size);
+        w.u32(24);
+        w.u32(2);
+        w.u32(0);
+        w.u32(0);
+        w.cstr(f.as_str());
+        w.pad_to((st as u64) + size as u64);
+    }
     // LC_CODE_SIGNATURE
     w.u32(0x1d);
     w.u32(16);

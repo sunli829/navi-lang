@@ -399,6 +399,7 @@
   - C 回调 navi：有函数体的 `extern "C" fn` 多生成一个 C 入口（`sym.c`，`Machine::c_callback`），它的值就是这个入口。入口经线程局部变量（pthread key / TlsAlloc，`_navi_tls_key`）找到 M，在 M 的回调 G 上运行（`cb_enter`/`cb_exit`，回调 G 在第一次阻塞调用时创建；回调里再调 C、C 再回调时用下一层）。发起调用的 G 一直阻塞、栈不动，所以回调里栈可以增长和搬动。回调里等待锁或 channel 时系统线程睡眠（`stop_callback`，同 Go 回调期间锁定线程）。
   - 监控线程（`sysmon`，第一次 spawn 时启动）：某个 M 的 G 阻塞了一整个检查周期（20µs 起，空闲时退到 10ms）又有活要干，就让另一个 M 接手（`retaken`，`NRETAKEN`）；它回来后，运行中的 M 超出上限时，`find_runnable` 让一个去空闲。`NAVI_MAXPROCS=1` 时阻塞的 C 调用也不再卡住其他线程。
   - 测试：`tests/run/c_blocking`、`tests/run/c_callback`（qsort 回调里分配和 GC、栈增长、嵌套回调、浮点、回调里等待其他线程、8 个线程同时回调），arm64 各种压力模式和 x64 都通过。
+- `#[link(name, kind = "dylib" | "framework")]`：`extern` 块的函数从指定的动态库导入（resolve 记在 `Def.link`，目标文件记在 `Object.libs`，`obj::lib_file` 把名字换成各平台的文件）。Mach-O 每个库一条 LC_LOAD_DYLIB、按库序号绑定；ELF 加 DT_NEEDED；PE 每个 DLL 一个导入目录。`kind = "static"` 报错：navi 不链接外来的目标代码，所以从不需要系统链接器（spec 1.16）。`NAVI_LINKER=cc` 时作为 `-l`、`-framework` 传下去。macOS 上 libz 和 CoreFoundation 在 arm64、x64、cc 三条路上都验证过；Linux 和 Windows 的产物用 llvm-readobj 检查过 DT_NEEDED 和导入表。
 - 待查：全量验证中出现过一次编译器偶发死锁（`all goroutines are asleep`）。
   - 复现尝试：用 main 和当前编译器各编译约 1360 次，带诊断的编译器 5 路并行又编译 6450 次（其中 2580 次与出事时配置相同：x64 目标、`NAVI_MAXPROCS=4`），模拟 `par_for` 的调度器压测程序 9000 次，都没有复现。
   - 读过 channel、select、Mutex、wait list、空闲 M 管理和 STW，没找到丢唤醒的路径。

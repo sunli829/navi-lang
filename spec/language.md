@@ -114,9 +114,12 @@ mod parser;                                 // 加载 parser.navi 或 parser/mod
 mod util { pub fn clamp(x: i32) -> i32 { ... } }   // 内联模块
 
 // 外部函数（FFI）
-#[link(name = "c")]
-extern "C" {
+extern "C" {                                // 不写 #[link]：系统的 C 库
     fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+}
+#[link(name = "z")]                         // 别的动态库（见 1.16）
+extern "C" {
+    fn crc32(crc: u64, buf: *const u8, len: u32) -> u64;
 }
 #[export_name = "navi_cb"]
 extern "C" fn callback(x: i32) -> i32 { x }
@@ -495,7 +498,8 @@ let s: String = p.to_string();
 | `#[inline]`、`#[inline(never)]`、`#[cold]` | 内联提示 |
 | `#[track_caller]` | 隐式传入调用位置 |
 | `#[repr(C)]`、`#[repr(u8)]` | 内存布局 |
-| `#[link(name = "...")]`、`#[export_name = "..."]`、`#[asm]` | FFI 和 runtime 用 |
+| `#[link(name = "...", kind = "...")]` | `extern` 块的函数来自哪个动态库（见 1.16） |
+| `#[export_name = "..."]`、`#[asm]` | FFI 和 runtime 用 |
 | `#[intrinsic]` | 声明由编译器实现的函数（没有函数体），只有 std 能用 |
 | `#[link_name = "..."]` | `extern "C"` 函数在链接时使用的符号名（同 Rust） |
 | `#[nonblocking]` | 标在 `extern "C"` 块或其中的函数上：调用时不按"阻塞"处理（见 1.16） |
@@ -506,6 +510,12 @@ let s: String = p.to_string();
 - `unsafe fn`、`unsafe { }`、`unsafe impl`
 - 原始指针 `*const T` / `*mut T`：解引用、指针运算（`p.add(n)`）、和整数互相转换都要在 `unsafe` 里
 - `extern "C"` 的函数按各平台的 C ABI 调用；传给 C 的参数只能是基本类型、原始指针和 `#[repr(C)]` 结构体
+- **只链接动态库，不链接外来的目标代码**（静态库、C 编译器产出的目标文件都不支持，`kind = "static"` 报错）。所以 navi 不需要 C 编译器和系统链接器，自研链接器从任何平台生成任何平台的可执行文件（同 Go 不用 cgo 时）：
+  - `extern` 块不写 `#[link]` 时，函数来自系统的 C 库：macOS 的 libSystem，Linux 的 libc、libm、libpthread，Windows 首字母大写的来自 kernel32.dll、其余来自 ucrtbase.dll
+  - `#[link(name = "z")]`（`kind` 默认 `"dylib"`）：链接器只记下"这个块的函数来自这个库"，生成导入，不需要库文件本身（同 Go 的 `cgo_import_dynamic`、Rust 的 `kind = "raw-dylib"`）。名字到文件：macOS 是 `/usr/lib/libz.dylib`，Linux 是 `libz.so`，Windows 是 `z.dll`；`name` 里写了路径、`.so` 或 `.dll` 时原样使用（Linux 上没装开发包时要写带版本的 `"libz.so.1"`，macOS 上可以写 `"@rpath/libfoo.dylib"`）
+  - `#[link(name = "CoreFoundation", kind = "framework")]`：macOS 的 framework
+  - `name = "c"` 就是系统的 C 库
+  - `NAVI_LINKER=cc` 改用系统链接器时，这些库作为 `-l`、`-framework` 传给它
 - `extern "C" fn` 函数指针类型（见 1.3）用于 C 回调；navi 的 `fn(A) -> B` 带着闭包环境，不能直接传给 C
 - **C 函数可能阻塞或运行很久**（读写、等待、长时间计算），所以对 `extern "C"` 块里声明的函数，每次直接调用期间，当前绿色线程都算作"阻塞"（同 Go 的 cgo 调用进入系统调用状态）：
   - GC 不等它返回；其他线程照常分配和收集
