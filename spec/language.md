@@ -498,6 +498,7 @@ let s: String = p.to_string();
 | `#[link(name = "...")]`、`#[export_name = "..."]`、`#[asm]` | FFI 和 runtime 用 |
 | `#[intrinsic]` | 声明由编译器实现的函数（没有函数体），只有 std 能用 |
 | `#[link_name = "..."]` | `extern "C"` 函数在链接时使用的符号名（同 Rust） |
+| `#[nonblocking]` | 标在 `extern "C"` 块或其中的函数上：调用时不按"阻塞"处理（见 1.16） |
 | `#[deprecated]`、`#[allow(...)]`、`#[must_use]` | 诊断 |
 
 ## 1.16 unsafe 与 FFI
@@ -506,6 +507,12 @@ let s: String = p.to_string();
 - 原始指针 `*const T` / `*mut T`：解引用、指针运算（`p.add(n)`）、和整数互相转换都要在 `unsafe` 里
 - `extern "C"` 的函数按各平台的 C ABI 调用；传给 C 的参数只能是基本类型、原始指针和 `#[repr(C)]` 结构体
 - `extern "C" fn` 函数指针类型（见 1.3）用于 C 回调；navi 的 `fn(A) -> B` 带着闭包环境，不能直接传给 C
+- **C 函数可能阻塞或运行很久**（读写、等待、长时间计算），所以对 `extern "C"` 块里声明的函数，每次直接调用期间，当前绿色线程都算作"阻塞"（同 Go 的 cgo 调用进入系统调用状态）：
+  - GC 不等它返回；其他线程照常分配和收集
+  - 代价是每次调用多几纳秒
+  - 确定很快返回的函数（如 `labs`、`memcpy`）可以给函数或整个 `extern` 块标 `#[nonblocking]`，省掉这几纳秒；标错（实际会阻塞）的后果是阻塞期间 GC 等它
+  - 经 `extern "C" fn` 指针的调用不按阻塞处理
+- C 函数直接在绿色线程的栈上运行（不切栈，所以调用便宜），可用的栈空间至少 32KB；需要更多栈的 C 代码目前不支持
 - runtime 专用的编译器内建函数放在 `std::intrinsics`（如 `type_desc::<T>()`、`gc_write_barrier`），只有 std 内部（包括 `std::rt`）能用
 
 ## 1.17 和 Rust 的差异汇总

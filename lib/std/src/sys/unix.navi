@@ -1,29 +1,23 @@
 //! POSIX (macOS and Linux with glibc or bionic): file descriptors, stat,
 //! directories, the environment, posix_spawn and waitpid.
 //!
-//! errno is per OS thread and a green thread may move to another one at
-//! any navi call: it is read right after the failed C call, before any
-//! navi code runs. Calls that may block for long run between
-//! enter_blocked and exit_blocked (a collector proceeds meanwhile).
+//! errno is per OS thread and a green thread may move to another one when
+//! it parks: it is read right after the failed C call (exit_blocked, run
+//! after a blocking one, neither parks nor makes failing C calls). The C
+//! functions that may block for long are declared without #[nonblocking]:
+//! their calls count the G as blocked (a collector proceeds meanwhile).
 
 use crate::io::{self, Error, ErrorKind};
 use crate::string::String;
 use crate::sys::{FileAttr, DirEnt, cstring, from_cstr, zeroed, rd_u16, rd_u32, rd_u64, split_env};
-use crate::rt::sched::{enter_blocked, exit_blocked};
 
+#[nonblocking]
 extern "C" {
     fn strerror(e: i32) -> *const u8;
-    #[link_name = "read"]
-    fn c_read(fd: i32, buf: *mut u8, n: usize) -> isize;
-    #[link_name = "write"]
-    fn c_write(fd: i32, buf: *const u8, n: usize) -> isize;
-    #[link_name = "open"]
-    fn c_open(path: *const u8, flags: i32, ...) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn lseek(fd: i32, off: i64, whence: i32) -> i64;
     #[link_name = "close"]
     fn c_close(fd: i32) -> i32;
-    fn fsync(fd: i32) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
     #[link_name = "unlink"]
     fn c_unlink(path: *const u8) -> i32;
@@ -59,10 +53,8 @@ extern "C" {
     fn c_getpid() -> i32;
     fn closedir(d: *mut u8) -> i32;
     fn futimens(fd: i32, times: *const u8) -> i32;
-    fn waitpid(pid: i32, status: *mut u8, options: i32) -> i32;
     #[link_name = "kill"]
     fn c_kill(pid: i32, sig: i32) -> i32;
-    fn poll(fds: *mut u8, n: u64, timeout: i32) -> i32;
     fn signal(sig: i32, handler: usize) -> usize;
     fn sigemptyset(set: *mut u8) -> i32;
     fn sigaddset(set: *mut u8, sig: i32) -> i32;
@@ -77,10 +69,23 @@ extern "C" {
     fn posix_spawnattr_setsigdefault(a: *mut u8, set: *const u8) -> i32;
     #[link_name = "access"]
     fn c_access(path: *const u8, mode: i32) -> i32;
+}
+// May block: calls count the G as blocked (see sched::enter_blocked).
+extern "C" {
+    #[link_name = "read"]
+    fn c_read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    #[link_name = "write"]
+    fn c_write(fd: i32, buf: *const u8, n: usize) -> isize;
+    #[link_name = "open"]
+    fn c_open(path: *const u8, flags: i32, ...) -> i32;
+    fn fsync(fd: i32) -> i32;
+    fn waitpid(pid: i32, status: *mut u8, options: i32) -> i32;
+    fn poll(fds: *mut u8, n: u64, timeout: i32) -> i32;
     fn posix_spawnp(pid: *mut u8, file: *const u8, fa: *const u8, attr: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
 }
 
 #[cfg(target_os = "macos")]
+#[nonblocking]
 extern "C" {
     #[link_name = "__error"]
     fn errno_ptr() -> *mut i32;
@@ -93,6 +98,7 @@ extern "C" {
 
 // The 64-bit-inode stat and dirent (the only ones on arm64).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[nonblocking]
 extern "C" {
     #[link_name = "stat"]
     fn c_stat(path: *const u8, buf: *mut u8) -> i32;
@@ -105,6 +111,7 @@ extern "C" {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[nonblocking]
 extern "C" {
     #[link_name = "stat$INODE64"]
     fn c_stat(path: *const u8, buf: *mut u8) -> i32;
@@ -119,6 +126,7 @@ extern "C" {
 }
 
 #[cfg(target_os = "linux")]
+#[nonblocking]
 extern "C" {
     #[link_name = "__errno_location"]
     fn errno_ptr() -> *mut i32;
@@ -323,10 +331,8 @@ pub fn open(path: &str, access: u8, append: bool, creation: u8, mode: u32) -> io
     };
     loop {
         // Opening a FIFO waits for the other end.
-        enter_blocked();
         let fd = unsafe { c_open(c.as_ptr(), flags, mode) };
         let e = unsafe { *errno_ptr() };
-        exit_blocked();
         if fd >= 0 { return Ok(fd as i64); }
         if e != EINTR { return Err(os_err(e)); }
     }
@@ -336,10 +342,8 @@ pub fn read(fd: i64, buf: &mut [u8]) -> io::Result<usize> {
     let p = crate::rt::slice_ptr(buf) as *mut u8;
     let n = if buf.len() > IO_MAX { IO_MAX } else { buf.len() };
     loop {
-        enter_blocked();
         let r = unsafe { c_read(fd as i32, p, n) };
         let e = unsafe { *errno_ptr() };
-        exit_blocked();
         if r >= 0 { return Ok(r as usize); }
         if e != EINTR { return Err(os_err(e)); }
     }
@@ -349,10 +353,8 @@ pub fn write(fd: i64, buf: &[u8]) -> io::Result<usize> {
     let p = crate::rt::slice_ptr(buf);
     let n = if buf.len() > IO_MAX { IO_MAX } else { buf.len() };
     loop {
-        enter_blocked();
         let r = unsafe { c_write(fd as i32, p, n) };
         let e = unsafe { *errno_ptr() };
-        exit_blocked();
         if r >= 0 { return Ok(r as usize); }
         if e != EINTR { return Err(os_err(e)); }
     }
@@ -376,10 +378,8 @@ pub fn close(fd: i64) -> io::Result<()> {
 }
 
 pub fn sync(fd: i64) -> io::Result<()> {
-    enter_blocked();
     let r = unsafe { fsync(fd as i32) };
     let e = unsafe { *errno_ptr() };
-    exit_blocked();
     if r < 0 { Err(os_err(e)) } else { Ok(()) }
 }
 
@@ -842,9 +842,7 @@ pub fn spawn(program: &str, argv: &Vec<String>, env: &Vec<String>, cwd: Option<&
             posix_spawnattr_setflags(ap, POSIX_SPAWN_SETSIGDEF);
         }
         let pid = zeroed(8);
-        enter_blocked();
         r = unsafe { posix_spawnp(pid.as_ptr() as *mut u8, prog.as_ptr(), fa.as_ptr(), attr.as_ptr(), av.as_ptr(), ev.as_ptr()) };
-        exit_blocked();
         unsafe {
             posix_spawn_file_actions_destroy(fap);
             posix_spawnattr_destroy(ap);
@@ -901,10 +899,8 @@ pub fn wait(pid: i64, handle: i64, block: bool) -> io::Result<Option<i32>> {
     let st = zeroed(8);
     let p = st.as_ptr() as *mut u8;
     loop {
-        enter_blocked();
         let r = unsafe { waitpid(pid as i32, p, if block { 0 } else { WNOHANG }) };
         let e = unsafe { *errno_ptr() };
-        exit_blocked();
         if r > 0 { return Ok(Some(rd_u32(&st, 0) as i32)); }
         if r == 0 { return Ok(None); }
         if e != EINTR { return Err(os_err(e)); }
@@ -944,10 +940,8 @@ pub fn read2(fd1: i64, fd2: i64) -> io::Result<(Vec<u8>, Vec<u8>)> {
             k += 1;
         }
         let pp = pfd.as_ptr() as *mut u8;
-        enter_blocked();
         let r = unsafe { poll(pp, n as u64, -1) };
         let e = unsafe { *errno_ptr() };
-        exit_blocked();
         if r < 0 {
             if e == EINTR { continue; }
             return Err(os_err(e));
