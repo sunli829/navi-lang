@@ -50,6 +50,12 @@ for f in tests/run/*.navi; do
 		echo "ok   $f"
 	else
 		echo "FAIL $f (exit $code, want $want_code)"; fail=1
+		if [ "$got_out" != "$want_out" ]; then
+			printf '%s\n' "$want_out" > "$tmp/$n.want"
+			printf '%s\n' "$got_out" > "$tmp/$n.got"
+			diff "$tmp/$n.want" "$tmp/$n.got" | head -20
+			head -20 "$tmp/$n.err"
+		fi
 	fi
 done
 # navi test and navi bench on a crate with passing and failing tests.
