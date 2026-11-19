@@ -42,6 +42,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `thread::spawn` | 操作系统线程 | 绿色线程（M:N 调度） |
 | `thread::available_parallelism` | `io::Result<NonZero<usize>>` | `io::Result<usize>`（调度器同时使用的 OS 线程数：`NAVI_MAXPROCS`，否则 CPU 数） |
 | `thread::current()` | `Thread` 有 name、unpark 等 | 只有 `id() -> ThreadId` |
+| `ThreadId::as_u64` | 不稳定，返回 `NonZero<u64>` | 稳定，返回 `u64`（不为 0） |
 | `sync::atomic` | 各种整数宽度和 `AtomicBool`/`AtomicPtr`；Ordering 按指定的语义 | 只有 `AtomicUsize`（load/store/fetch_add/compare_exchange）；所有操作都是顺序一致的 |
 | 线程里 panic | 只结束该线程，`join()` 返回 `Err` | 相同（M9 起）。只有 native 后端；stage0 的解释器不捕获 panic，仍结束整个进程 |
 | panic 的载荷 | `Box<dyn Any + Send>`，通常装着消息 | `std::panic::PanicPayload`：`message()` 和 `location()`；`thread::Result<T> = Result<T, PanicPayload>` |
