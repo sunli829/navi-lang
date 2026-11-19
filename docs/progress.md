@@ -303,7 +303,7 @@
 
 - Rust std 补齐：集合（VecDeque、BTreeMap/BTreeSet、BinaryHeap）；str、slice、Iterator、Option、Result、char、数值类型的常用方法；fs、io（BufRead、Seek、Cursor、ErrorKind）、env、process（posix_spawn、管道）、std::os 扩展；sync（RwLock、Condvar、Once、OnceLock、LazyLock、Barrier）、原子类型、时间（SystemTime、sleep）。
 - 运行时：定时器（最小堆，空闲的 M 睡到下一个定时器）；网络轮询器（kqueue/epoll，边沿触发，一个专门的 M）。
-- 网络：std::net（地址、TcpListener/TcpStream/UdpSocket，阻塞只挂起绿色线程）、std::url（url crate，WHATWG 解析）、std::http（类型照 http crate，客户端照 reqwest::blocking，服务端每连接一个绿色线程，路由照 Go 1.22 的 ServeMux；没有 TLS）。Windows 上还没有 socket。
+- 网络：std::net（地址、TcpListener/TcpStream/UdpSocket，阻塞只挂起绿色线程）、std::url（url crate，WHATWG 解析）、std::http（类型照 http crate，客户端照 reqwest::blocking，服务端每连接一个绿色线程，路由照 Go 1.22 的 ServeMux；没有 TLS）。Windows 上用 ws2_32 的阻塞 socket（同 Rust；阻塞的调用占住一个 OS 线程，没有轮询器）。
 - 照 crate 做的模块：regex（RE2 语义，Pike VM 加有界回溯）、rand（0.9，同一个种子的值和 crate 相同）、chrono、base64、hex、crypto（MD5、SHA-1、SHA-2、HMAC）、hash::{crc32, adler32}、compress（自己实现的 DEFLATE，flate2 的 API）、log（log 加 env_logger）、cli（clap 4 的 builder API）、csv。
 - 验证方法：能拿到参照实现的都做了逐字对照——regex 对 Go 的 regexp（手写用例加 3600 个随机模式），rand、chrono、clap、csv 对本机缓存的 Rust crate，编码、哈希、压缩对 Python 的 hashlib/base64/zlib/gzip 和系统 gzip。和参照不同的地方都记在 spec/std-diff.md 第 9、10 节。
 - 顺带修的编译器问题：
@@ -315,7 +315,7 @@
   - std：`RangeInclusive` 到类型最大值不再溢出、可以反向迭代，char 区间跳过代理区；`AsRef` 照 Rust 对引用通用实现。
 - 已知的不足：
   - regex 的 Pike VM 和 compress 仍比 Go/C 慢很多。内联加强后，热点已经是 VM 和编码循环本身的代码质量（后端），见下一节。
-  - 没有 TLS；Windows 上没有 socket，fs/process 只编译过、没有运行过。
+  - 没有 TLS；Windows 上 fs/process 的 Unix 专有部分没有测试，网络是阻塞 socket（没有 IOCP 轮询器）。
 
 ## 内联加强（2026-11-18）
 
@@ -409,7 +409,7 @@
   - 现在 runtime 在死锁时会列出每个没结束的 G 和它各帧的返回地址（同 Go 列出 goroutine），`tools/symbolize.py 程序 < 输出` 可以换成函数名；下次出现时有现场可查。
 - GitHub Actions（github.com/sunli829/navi-lang）：
   - linux-x64、linux-arm64、macos-arm64、macos-x64 上从 stage0 自举到定点，再在四种运行时模式下跑 golden 测试，全部通过。顺带修了 glibc 的 `cbrt` 不精确（改成 navi 自己算）和多个定时器同时到期时的唤醒顺序。
-  - Windows 上用交叉编译的 `navic.exe` 跑测试，全部通过（CI 失败时用 cdb 打印崩溃现场，`NAVI_LINKMAP` 让 PE 链接器写出符号地址）。修过的：C 返回值窄于寄存器时的扩展；amd64 在 Windows 上大于 4KB 的栈帧逐页探测（静态变量的初始化跑在 OS 栈上，用到 crc32 的程序在 main 之前就崩溃）；fmt 和 lsp 读标准输入不再用 `/dev/stdin`，lsp 认得 `file:///C:/...`；`.gitattributes` 固定 LF（Windows runner 默认 autocrlf，逐字节比较的测试都失败）。`env_process`、`fs_ops`（Unix 专有的 API）和 `net`、`http`（Windows 上还没有 socket）在 Windows 上跳过（`// skip: windows`）。
+  - Windows 上用交叉编译的 `navic.exe` 跑测试，全部通过（CI 失败时用 cdb 打印崩溃现场，`NAVI_LINKMAP` 让 PE 链接器写出符号地址）。修过的：C 返回值窄于寄存器时的扩展；amd64 在 Windows 上大于 4KB 的栈帧逐页探测（静态变量的初始化跑在 OS 栈上，用到 crc32 的程序在 main 之前就崩溃）；fmt 和 lsp 读标准输入不再用 `/dev/stdin`，lsp 认得 `file:///C:/...`；`.gitattributes` 固定 LF（Windows runner 默认 autocrlf，逐字节比较的测试都失败）。Windows 上的网络改用 ws2_32 的阻塞 socket，`net`、`http` 也通过；`env_process`、`fs_ops`（Unix 专有的 API）在 Windows 上跳过（`// skip: windows`）。顺带修了解析器：`fn` 的名字写成关键字（如 `fn select(...)`）时报错后跳过它，不再把参数解析错位、让后面的阶段死循环。
 
 ## 下一步
 
