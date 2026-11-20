@@ -25,6 +25,16 @@ for f in tests/run/*.navi; do
 		if [ "$got_err" = "$want_err" ]; then echo "ok   $f"; else echo "FAIL $f (errors)"; cat "$tmp/$n.build"; fail=1; fi
 		continue
 	fi
+	# A file of #[test] functions (no // out:, // exit: or // stderr:
+	# lines): navi test runs them, all must pass.
+	if ! grep -qE '^// (out|exit|stderr|warn):' "$f" && grep -q '#\[test\]' "$f"; then
+		set +e
+		got=$(perl -e 'alarm(300); exec(@ARGV)' "$navi" test "$f" 2>&1)
+		code=$?
+		set -e
+		if [ "$code" = 0 ]; then echo "ok   $f ($(echo "$got" | tail -1))"; else echo "FAIL $f (navi test, exit $code)"; echo "$got" | grep -v '^ok ' | head -30; fail=1; fi
+		continue
+	fi
 	if ! "$navi" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1; then
 		echo "FAIL $f (build)"; cat "$tmp/$n.build"; fail=1; continue
 	fi
