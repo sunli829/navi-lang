@@ -1,6 +1,7 @@
 #!/bin/sh
-# Runs the golden tests in tests/run, and navi test / bench on
-# tests/harness, with a self-hosted compiler.
+# Runs the tests with a self-hosted navi: tests/run (navi test), tests/ui
+# (diagnostics), navi test / bench on tests/harness, fmt, lsp, the front
+# end's tests and dependencies.
 #
 #   tools/test.sh path/to/navi
 set -e
@@ -18,65 +19,72 @@ case "$(uname -s)" in
 MINGW* | MSYS* | CYGWIN*) os=windows ;;
 *) os=unix ;;
 esac
+# Diagnostic annotations, as rustc's ui tests: "//~ ERROR text" (or WARN)
+# expects a diagnostic on that line whose message contains text; "//~^"
+# is the line above (one ^ a line), "//~|" the previous annotation's line.
+# Prints "line<TAB>KIND<TAB>text" lines.
+annotations() {
+	awk '{
+		i = index($0, "//~"); if (i == 0) next
+		r = substr($0, i + 3); t = NR
+		if (substr(r, 1, 1) == "|") { t = last; r = substr(r, 2) }
+		else while (substr(r, 1, 1) == "^") { t--; r = substr(r, 2) }
+		last = t
+		sub(/^ +/, "", r); k = r; sub(/ .*/, "", k); m = substr(r, length(k) + 1); sub(/^ +/, "", m)
+		if (k == "WARNING") k = "WARN"
+		print t "\t" k "\t" m
+	}' "$1"
+}
+# The diagnostics of navi's output (path:line:col: [warning: ]message) in
+# annotations' format.
+diags() {
+	awk '{
+		if (!match($0, /:[0-9]+:[0-9]+: /)) next
+		split(substr($0, RSTART + 1, RLENGTH - 3), at, ":")
+		m = substr($0, RSTART + RLENGTH); k = "ERROR"
+		if (substr(m, 1, 9) == "warning: ") { k = "WARN"; m = substr(m, 10) }
+		print at[1] "\t" k "\t" m
+	}'
+}
+# Matches $tmp/diag.got against $tmp/diag.want (both from annotations'
+# format): each diagnostic needs an annotation of its line and kind whose
+# text it contains, and each annotation a diagnostic.
+match_diags() {
+	awk -F'\t' 'FILENAME == ARGV[1] { line[NR] = $1; kind[NR] = $2; text[NR] = $3; n = NR; next }
+		{ for (i = 1; i <= n; i++) if (!used[i] && line[i] == $1 && kind[i] == $2 && index($3, text[i]) > 0) { used[i] = 1; next }
+		  print "unexpected: " $1 ": " $2 " " $3; bad = 1 }
+		END { for (i = 1; i <= n; i++) if (!used[i]) { print "missing: " line[i] ": " kind[i] " " text[i]; bad = 1 } exit bad }' \
+		"$tmp/diag.want" "$tmp/diag.got" > "$tmp/diag.diff"
+}
+# tests/run: files of #[test] functions; navi test runs them, all must pass.
 for f in tests/run/*.navi; do
-	n=$(basename "$f" .navi)
-	# // skip: windows (or unix): the test needs what that OS lacks.
-	if grep -qxE "// skip: $os" "$f"; then echo "skip $f ($os)"; continue; fi
-	# // error: line:col msg: the build fails with these errors.
-	want_err=$(grep -E '^// error:' "$f" | sed -E 's#^// error: ?##')
-	if [ -n "$want_err" ]; then
-		"$navi" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1 && { echo "FAIL $f (built)"; fail=1; continue; }
-		got_err=$(sed -E 's#^[^:]*:([0-9]+:[0-9]+): #\1 #' "$tmp/$n.build")
-		if [ "$got_err" = "$want_err" ]; then echo "ok   $f"; else echo "FAIL $f (errors)"; cat "$tmp/$n.build"; fail=1; fi
-		continue
-	fi
-	# A file of #[test] functions (no // out:, // exit: or // stderr:
-	# lines): navi test runs them, all must pass.
-	if ! grep -qE '^// (out|exit|stderr|warn):' "$f" && grep -q '#\[test\]' "$f"; then
-		set +e
-		got=$(perl -e 'alarm(300); exec(@ARGV)' "$navi" test "$f" 2>&1)
-		code=$?
-		set -e
-		if [ "$code" = 0 ]; then echo "ok   $f ($(echo "$got" | tail -1))"; else echo "FAIL $f (navi test, exit $code)"; echo "$got" | grep -v '^ok ' | head -30; fail=1; fi
-		continue
-	fi
-	if ! "$navi" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1; then
-		echo "FAIL $f (build)"; cat "$tmp/$n.build"; fail=1; continue
-	fi
-	want_out=$(grep -E '^// out:' "$f" | sed -E 's#^// out: ?##')
-	want_code=$(grep -E '^// exit:' "$f" | sed -E 's#^// exit: *##')
-	[ -z "$want_code" ] && want_code=0
 	set +e
-	# A hung program fails after 5 minutes (perl's alarm: macOS has no
-	# timeout command).
-	got_out=$(cd "$tmp" && perl -e 'alarm(300); exec(@ARGV)' "./$n" 2>"$tmp/$n.err")
+	# A hung test fails after 5 minutes (perl's alarm: macOS has no timeout
+	# command).
+	got=$(perl -e 'alarm(300); exec(@ARGV)' "$navi" test "$f" 2>&1)
 	code=$?
-	if [ "$code" = 142 ]; then echo "FAIL $f (timed out)"; fail=1; continue; fi
 	set -e
-	# // warn: line:col msg lists the build's warnings.
-	want_warn=$(grep -E '^// warn:' "$f" | sed -E 's#^// warn: ?##')
-	got_warn=$(grep ': warning: ' "$tmp/$n.build" | sed -E 's#^[^:]*:([0-9]+:[0-9]+): warning: #\1 #')
-	if [ "$got_warn" != "$want_warn" ]; then
-		echo "FAIL $f (warnings)"; cat "$tmp/$n.build"; fail=1; continue
-	fi
-	# // stderr: text must appear in what the program writes to stderr.
-	err_ok=1
-	grep -E '^// stderr:' "$f" | sed -E 's#^// stderr: ?##' > "$tmp/$n.want_err"
-	while IFS= read -r line; do
-		[ -z "$line" ] && continue
-		grep -qF -- "$line" "$tmp/$n.err" || { echo "FAIL $f (stderr lacks: $line)"; cat "$tmp/$n.err"; err_ok=0; }
-	done < "$tmp/$n.want_err"
-	if [ "$err_ok" = 0 ]; then fail=1; continue; fi
-	if [ "$got_out" = "$want_out" ] && [ "$code" = "$want_code" ]; then
+	if [ "$code" = 0 ]; then echo "ok   $f ($(echo "$got" | tail -1))"; else echo "FAIL $f (navi test, exit $code)"; echo "$got" | grep -v '^ok ' | head -30; fail=1; fi
+done
+# tests/ui: navi build reports exactly the annotated errors and warnings;
+# a file without ERROR annotations builds.
+for f in tests/ui/*.navi; do
+	n=$(basename "$f" .navi)
+	set +e
+	"$navi" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1
+	code=$?
+	set -e
+	annotations "$f" > "$tmp/diag.want"
+	diags < "$tmp/$n.build" > "$tmp/diag.got"
+	if awk -F'\t' '$2 == "ERROR" { e = 1 } END { exit !e }' "$tmp/diag.want"; then want_fail=1; else want_fail=0; fi
+	if [ "$want_fail" = 1 ] && [ "$code" = 0 ]; then
+		echo "FAIL $f (built)"; fail=1
+	elif [ "$want_fail" = 0 ] && [ "$code" != 0 ]; then
+		echo "FAIL $f (build)"; cat "$tmp/$n.build"; fail=1
+	elif match_diags; then
 		echo "ok   $f"
 	else
-		echo "FAIL $f (exit $code, want $want_code)"; fail=1
-		if [ "$got_out" != "$want_out" ]; then
-			printf '%s\n' "$want_out" > "$tmp/$n.want"
-			printf '%s\n' "$got_out" > "$tmp/$n.got"
-			diff "$tmp/$n.want" "$tmp/$n.got" | head -20
-			head -20 "$tmp/$n.err"
-		fi
+		echo "FAIL $f (diagnostics)"; head -20 "$tmp/diag.diff"; fail=1
 	fi
 done
 # navi test and navi bench on a crate with passing and failing tests.
@@ -147,20 +155,16 @@ else
 fi
 # The front end: tests/syntax parses; in tests/resolve (name resolution),
 # tests/types and tests/check (type checking) the files of ok/ and sigs/
-# have no errors and those of err/ exactly the errors their comments
-# "// error: text" expect (an error on that line whose message has text).
+# have no errors and those of err/ exactly the errors annotated with
+# "//~ ERROR text" (see annotations).
 front() {
 	"$navi" "$1" "$2" > "$tmp/front.out" 2>&1
-	grep '^error ' "$tmp/front.out" | sed -E 's#^error [^:]*:([0-9]+):[0-9]+: #\1	#' > "$tmp/front.got"
-	grep -n '// error: ' "$2" | sed -E 's#^([0-9]+):.*// error: #\1	#' > "$tmp/front.want"
-	if awk -F'\t' 'FILENAME == ARGV[1] { want[NR] = $0; line[NR] = $1; text[NR] = $2; n = NR; next }
-		{ for (i = 1; i <= n; i++) if (!used[i] && line[i] == $1 && index($2, text[i]) > 0) { used[i] = 1; next }
-		  print "unexpected: " $1 ": " $2; bad = 1 }
-		END { for (i = 1; i <= n; i++) if (!used[i]) { print "missing: " line[i] ": " text[i]; bad = 1 } exit bad }' \
-		"$tmp/front.want" "$tmp/front.got" > "$tmp/front.diff"; then
+	grep '^error ' "$tmp/front.out" | diags > "$tmp/diag.got"
+	annotations "$2" > "$tmp/diag.want"
+	if match_diags; then
 		echo "ok   $2"
 	else
-		echo "FAIL $2 ($1)"; head -20 "$tmp/front.diff"; fail=1
+		echo "FAIL $2 ($1)"; head -20 "$tmp/diag.diff"; fail=1
 	fi
 }
 for f in tests/syntax/*.navi; do

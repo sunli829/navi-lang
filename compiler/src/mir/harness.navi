@@ -6,6 +6,7 @@ use crate::resolve::{self, Def};
 use crate::types::{self, Type};
 use crate::mir::*;
 use crate::mir::build::Program;
+use crate::syntax::token::{IDENT, EQ, STRING};
 
 /// The test's path within its crate (tests::lex_num).
 pub fn test_name(d: &Def) -> String {
@@ -16,6 +17,24 @@ pub fn test_name(d: &Def) -> String {
         x = p.parent;
     }
     name
+}
+
+/// What a test must do, for the runner: "" to return, "panic:" to panic,
+/// "panic:text" to panic with a message containing text (#[should_panic],
+/// #[should_panic(expected = "text")], as Rust's).
+pub fn panic_spec(d: &Def) -> Result<String, String> {
+    let fd = match &d.node { resolve::Node::Item(crate::syntax::ast::Item::Fn(f)) => *f, _ => return Ok(String::new()) };
+    for a in fd.base.attrs.iter() {
+        if a.path.segments.len() != 1 || a.path.segments[0].name.value != "should_panic" { continue; }
+        let t = &a.args;
+        if t.len() == 0 { return Ok("panic:".to_string()); }
+        if t.len() == 3 && t[0].kind == IDENT && t[0].text == "expected" && t[1].kind == EQ && t[2].kind == STRING {
+            let text = String::from_utf8_lossy(crate::mir::expr::unquote(t[2].text).as_slice());
+            return Ok(`panic:${text}`.to_string());
+        }
+        return Err(`${test_name(d)}: malformed #[should_panic]: expected #[should_panic] or #[should_panic(expected = "...")]`.to_string());
+    }
+    Ok(String::new())
 }
 
 /// A std function by path (the last segment in the value namespace).
@@ -67,7 +86,8 @@ fn str_op(ctx: &mut types::Ctx, s: &str) -> Operand {
     const_op(c)
 }
 
-/// Builds the entry: run_tests(names, tests), or for benchmarks
+/// Builds the entry: run_tests(names, tests, panics) (see panic_spec), or
+/// for benchmarks
 /// run_benches(names, plain, bench_names, with_bencher) where with_bencher
 /// are the functions taking &mut Bencher.
 pub fn harness(p: &mut Program, fns: &Vec<&mut Def>, bench: bool) -> &mut Func {
@@ -79,6 +99,7 @@ pub fn harness(p: &mut Program, fns: &Vec<&mut Def>, bench: bool) -> &mut Func {
     let plain_ty = ctx.func(Vec::new(), ctx.unit, "");
     let mut names: Vec<Operand> = Vec::new();
     let mut plain: Vec<Operand> = Vec::new();
+    let mut panics: Vec<Operand> = Vec::new();
     let mut bnames: Vec<Operand> = Vec::new();
     let mut with_b: Vec<Operand> = Vec::new();
     let bencher = p.std_type(&["bench", "Bencher"]);
@@ -90,6 +111,7 @@ pub fn harness(p: &mut Program, fns: &Vec<&mut Def>, bench: bool) -> &mut Func {
         if p.info.fn_sig_of(*d).params.len() == 0 {
             names.push(str_op(ctx, n.as_str()));
             plain.push(fn_op(fn_ref(*d, Vec::new(), None), Some(plain_ty)));
+            panics.push(str_op(ctx, match panic_spec(*d) { Ok(s) => s, Err(_) => String::new() }.as_str()));
         } else {
             bnames.push(str_op(ctx, n.as_str()));
             with_b.push(fn_op(fn_ref(*d, Vec::new(), None), Some(with_b_ty)));
@@ -103,6 +125,7 @@ pub fn harness(p: &mut Program, fns: &Vec<&mut Def>, bench: bool) -> &mut Func {
         args.push(h.slice(ctx, with_b_ty, with_b));
         std_fn(p, &["rt", "testing", "run_benches"])
     } else {
+        args.push(h.slice(ctx, ref_str, panics));
         std_fn(p, &["rt", "testing", "run_tests"])
     };
     let call = Term::Call { fn_op: fn_op(fn_ref(runner, Vec::new(), None), None), args, dest: local_place(0), target: 1, pos: 0 };

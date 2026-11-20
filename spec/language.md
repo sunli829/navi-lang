@@ -517,7 +517,8 @@ let s: String = p.to_string();
 | 属性 | 作用 |
 |---|---|
 | `#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]` | 编译器内置实现（属性，不是宏） |
-| `#[test]`、`#[bench]` | 只有 `navi test` / `navi bench` 才会编译 |
+| `#[test]`、`#[bench]` | 只有 `navi test` / `navi bench` 才会编译；`navi test` 运行测试时设置环境变量 `NAVI` 为 navi 自身的路径（同 Cargo 的 `CARGO`），测试可以用它编译程序 |
+| `#[should_panic]`、`#[should_panic(expected = "...")]` | 测试必须 panic（同 Rust），给了 `expected` 时 panic 信息必须包含它 |
 | `#[cfg(...)]`、`#![cfg(...)]` | 条件编译 |
 | `#[inline]`、`#[inline(never)]`、`#[cold]` | 内联提示 |
 | `#[track_caller]` | 隐式传入调用位置 |
