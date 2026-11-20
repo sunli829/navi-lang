@@ -59,7 +59,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | API | 说明 |
 |---|---|
 | `std::io::{print, println, eprint, eprintln}` | 代替 `print!` 系列宏，参数类型 `impl Display` |
-| `std::panic::{panic, assert, assert_eq, assert_ne}` | 代替对应的宏，带 `#[track_caller]`；`assert_eq<A: PartialEq<B> + Debug, B: Debug>(left: A, right: B)` 和宏一样允许两边类型不同（如 `String` 对 `&str`），参数按值传（没有 move，只是浅拷贝） |
+| `std::panic::{panic, assert, assert_eq, assert_ne}` | 代替对应的宏，带 `#[track_caller]`；没有 `debug_assert!` 系列：只有一种构建模式（spec 1.2），断言一直生效，用 `assert`；`assert_eq<A: PartialEq<B> + Debug, B: Debug>(left: A, right: B)` 和宏一样允许两边类型不同（如 `String` 对 `&str`），参数按值传（没有 move，只是浅拷贝） |
 | `Sender::close()` | 见第 3 节 |
 | `std::gc` | `collect()`、`stats()`、`set_min_heap(bytes)`（M9）、`set_percent(percent)`（同 Go 的 `debug.SetGCPercent`）；`Weak<T>`、finalizer 以后再做 |
 | `std::bench::Bencher` | `navi bench` 用（Rust 里是不稳定的 `test::Bencher`）：`iter(f)` |

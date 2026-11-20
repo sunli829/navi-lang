@@ -433,4 +433,5 @@
    - 输出放在 workspace（或项目）根目录的 `target/名字`，`-o` 仍可指定。
    - `navi new 名字` / `navi init`（`--lib` 建库）：写 `navi.toml` 和 `src/main.navi`（或 `src/lib.navi`），`git init` 并写 `.gitignore`（忽略 `target/`）；在 workspace 里创建时自动加进 `members`。
    - `navi run [-p name] [-- 参数]`：构建并运行，也能 `navi run x.navi`。
-   - 只有一种构建模式（同 Go）：去掉 `--release` 和 `cfg(debug_assertions)`（`debug_assert` 系列同 `assert` 一直生效）；整数溢出一律检查、溢出就 panic（实测编译器自身慢约 1%），要回绕显式用 `wrapping_*`；一律带 DWARF，另加一个去掉调试信息的选项。spec 1.2 的溢出规则随之改。
+   - 测试照 Rust：`navi test` 支持 `#[should_panic]` / `#[should_panic(expected = "...")]`；崩溃和输出类测试（死锁、栈溢出、panic 退出码、println、defer 顺序、track_caller 位置、stdout 日志、main 的参数）改成 `#[test]` 用 `std::env::current_exe()` 跑子进程再断言（同 Rust std 测栈溢出的写法），去掉 tools/test.sh 的 `// out:` / `// exit:` / `// stderr:`；编译错误测试照 rustc 的 ui 测试放到 `tests/ui/`，在出错的行写 `//~ ERROR 信息` / `//~ WARN`（`//~^` 指上一行），前端测试的 `// error:` 也改成这样；项目的 `tests/*.navi` 是集成测试（每个文件单独编译，链接项目的库），可用 `NAVI_BIN_EXE_名字` 找到项目的可执行文件（同 Cargo 的 `CARGO_BIN_EXE_`）。
+   - 只有一种构建模式（同 Go）：已完成（`--release`、`cfg(debug_assertions)`、`debug_assert` 去掉，溢出一律检查，`navi build -s` 去掉 DWARF）。
