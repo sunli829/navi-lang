@@ -187,6 +187,13 @@ const SYS_FSTAT: i64 = 80;
 const AT_FDCWD: i64 = -100;
 #[cfg(target_os = "linux")]
 const AT_SYMLINK_NOFOLLOW: i64 = 0x100;
+// statx (Linux 4.11): the creation time too, as Rust's std reads it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SYS_STATX: i64 = 332;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const SYS_STATX: i64 = 291;
+#[cfg(target_os = "linux")]
+const AT_EMPTY_PATH: i64 = 0x1000;
 
 #[cfg(target_os = "macos")]
 const UTIME_OMIT: i64 = -2;
@@ -480,8 +487,9 @@ pub fn fstat(fd: i64) -> io::Result<FileAttr> {
 #[cfg(target_os = "linux")]
 pub fn stat(path: &str, follow: bool) -> io::Result<FileAttr> {
     let c = cstring(path)?;
-    let b = zeroed(STAT_SIZE);
     let flags = if follow { 0 } else { AT_SYMLINK_NOFOLLOW };
+    if let Some(r) = statx(AT_FDCWD, c.as_ptr(), flags) { return r; }
+    let b = zeroed(STAT_SIZE);
     let r = unsafe { syscall(SYS_NEWFSTATAT, AT_FDCWD, c.as_ptr(), b.as_ptr(), flags) };
     if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
     Ok(attr(&b))
@@ -489,10 +497,34 @@ pub fn stat(path: &str, follow: bool) -> io::Result<FileAttr> {
 
 #[cfg(target_os = "linux")]
 pub fn fstat(fd: i64) -> io::Result<FileAttr> {
+    if let Some(r) = statx(fd, "\0".as_ptr(), AT_EMPTY_PATH) { return r; }
     let b = zeroed(STAT_SIZE);
     let r = unsafe { syscall(SYS_FSTAT, fd, b.as_ptr()) };
     if r < 0 { return Err(os_err(unsafe { *errno_ptr() })); }
     Ok(attr(&b))
+}
+
+// statx's FileAttr (the creation time when the file system has one); None
+// when the kernel (or a seccomp filter) does not have statx.
+#[cfg(target_os = "linux")]
+fn statx(dirfd: i64, path: *const u8, flags: i64) -> Option<io::Result<FileAttr>> {
+    let b = zeroed(256);
+    // STATX_BASIC_STATS | STATX_BTIME
+    let r = unsafe { syscall(SYS_STATX, dirfd, path, flags, 0xfff, b.as_ptr()) };
+    if r < 0 {
+        let e = unsafe { *errno_ptr() };
+        if e == 38 || e == 1 { return None; } // ENOSYS, EPERM
+        return Some(Err(os_err(e)));
+    }
+    let tsx = |at: usize| (rd_u64(&b, at) as i64) as i128 * 1000000000 + rd_u32(&b, at + 8) as i128;
+    let dev = |major: u64, minor: u64| (major & 0xfffff000) << 32 | (major & 0xfff) << 8 | (minor & 0xffffff00) << 12 | (minor & 0xff);
+    let has_btime = rd_u32(&b, 0) & 0x800 != 0;
+    Some(Ok(FileAttr {
+        mode: rd_u16(&b, 28) as u32, size: rd_u64(&b, 40), atime: tsx(64), mtime: tsx(112), ctime: tsx(96),
+        btime: if has_btime { tsx(80) } else { 0 }, has_btime, dev: dev(rd_u32(&b, 136), rd_u32(&b, 140)), ino: rd_u64(&b, 32),
+        nlink: rd_u32(&b, 16), uid: rd_u32(&b, 20) as u32, gid: rd_u32(&b, 24) as u32, rdev: dev(rd_u32(&b, 128), rd_u32(&b, 132)),
+        blksize: rd_u32(&b, 4), blocks: rd_u64(&b, 48), attrib: 0,
+    }))
 }
 
 // --- Paths and directories ------------------------------------------------------------
@@ -728,6 +760,17 @@ pub fn environ() -> Vec<(String, String)> {
 
 pub fn home_dir() -> Option<String> {
     match getenv("HOME") { Some(h) => if h.len() > 0 { Some(h) } else { None }, None => None }
+}
+
+/// The command line's arguments (C's argv).
+pub fn args() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < crate::rt::os_arg_count() {
+        out.push(crate::rt::os_arg(i).to_string());
+        i += 1;
+    }
+    out
 }
 
 pub fn temp_dir() -> String {

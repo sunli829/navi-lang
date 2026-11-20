@@ -109,12 +109,11 @@ std 在私有的 `std::sys` 之上实现这些模块（POSIX：文件描述符�
 
 | 项目 | Rust | navi | 原因 |
 |---|---|---|---|
-| `OsStr`/`OsString` | 文件名、环境变量、命令参数用 `OsStr` | 一律 UTF-8 字符串：`DirEntry::file_name`、`env::var_os`、`env::vars_os` 返回 `String`；`Command::new/arg/env`、`env::var/set_var` 的参数是 `AsRef<str>`；读到的非 UTF-8 名字按 lossy 转换 | 没有 `OsStr` |
+| `OsStr`/`OsString` | 文件名、环境变量、命令参数用 `OsStr` | 一律 UTF-8 字符串（Windows 上经 UTF-16 的 `*W` 函数，未配对的代理项读成 U+FFFD）：`DirEntry::file_name`、`env::var_os`、`env::vars_os` 返回 `String`；`Command::new/arg/env`、`env::var/set_var` 的参数是 `AsRef<str>`；读到的非 UTF-8 名字按 lossy 转换 | 没有 `OsStr` |
 | `io::Error::new(kind, error)` | `error` 是任意 `Into<Box<dyn Error>>` | 消息是 `AsRef<str>`（`&str` 或 `String`）；`get_ref` 返回 `Option<&str>`，`into_inner` 返回 `Option<String>`；没有 `source`、`downcast`，也没有 `std::error::Error` trait | 没有 `dyn Error` 装箱 |
 | `io::ErrorKind` | `Copy`，`as_str` 私有 | 不是 `Copy`（用 `clone()`）；`as_str()` 公开（即 `Display` 的文字）；`Uncategorized` 公开（Rust 隐藏） | 没有 `Copy` |
 | `fs::read_dir` | 惰性读目录，`ReadDir` drop 时关闭 | `read_dir` 调用时一次读完所有项并关闭目录，`ReadDir` 遍历这份列表 | 没有 Drop，惰性读会泄漏目录句柄 |
 | `fs::File` | 不可 `Clone`，drop 时关闭 | 拷贝 `File` 共享同一个描述符，只有 `close()` 关闭；没有 `try_clone`、`lock`、`&File` 上的 `Read`/`Write` | 没有 Drop；值语义 |
-| `Metadata::created` | Linux 上用 `statx` | Linux 上返回 `Unsupported` 错误（macOS、Windows 有） | 只用了 `newfstatat` 系统调用 |
 | `Permissions` | Unix 上是 mode | 相同（`std::os::unix::fs::PermissionsExt`）；Windows 上只有只读属性 | — |
 | `io::Stdin` | 全局 `BufReader` 加 `Mutex`，`lock()` 独占 | 全局缓冲区共享，但没有锁：`StdinLock` 不独占，多个绿色线程同时读标准输入会交错 | 简化 |
 | `io::Stdout` | 行缓冲，`lock()` 独占 | 不缓冲（每次 `write` 直接写出）；`StdoutLock`/`StderrLock` 只是转发，没有锁 | 沿用原来的实现 |
@@ -129,7 +128,6 @@ std 在私有的 `std::sys` 之上实现这些模块（POSIX：文件描述符�
 | `Command::get_args` / `get_envs` | `CommandArgs` / `CommandEnvs` 迭代器 | `slice::Iter<String>` / `slice::Iter<(String, Option<String>)>` | 简化 |
 | `Command::output` 同时读 stdout 和 stderr | `poll`（Windows：重叠 I/O） | POSIX 用 `poll`；Windows 上 stderr 在另一个绿色线程里读 | 匿名管道不能 poll |
 | `Child` | 不可 `Clone` | 拷贝共享同一个子进程和管道；`wait` 得到的状态只记在被调用的那份里 | 值语义 |
-| `fs::read_link`（Windows） | 读重解析点里的目标 | 返回最终目标（`GetFinalPathNameByHandleA`） | 简化；Windows 部分无法在这里运行测试 |
 | 平台扩展 | `std::os::unix`、`std::os::windows`、`std::os::fd` | 有 `std::os::unix::fs`（`symlink`、`PermissionsExt`、`MetadataExt`、`OpenOptionsExt::mode`、`DirBuilderExt::mode`、`FileTypeExt`）、`std::os::unix::process::ExitStatusExt`、`std::os::windows::fs`（`symlink_file`、`symlink_dir`、`MetadataExt`）、`std::os::windows::process::ExitStatusExt`；没有 `std::os::fd`（`AsRawFd` 等） | 先做常用的 |
 
 ## 9. 网络（std::net）的偏离

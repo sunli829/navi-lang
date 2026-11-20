@@ -61,9 +61,88 @@ pub fn write(fd: i32, p: *const u8, n: usize) {
     unsafe { c_write(fd, p, n); }
 }
 
+// Windows: to a console as UTF-16 (WriteConsoleW, as Rust's std): a
+// console shows bytes as characters of its code page.
 #[cfg(target_os = "windows")]
 pub fn write(fd: i32, p: *const u8, n: usize) {
+    if fd == 1 || fd == 2 {
+        let h = unsafe { GetStdHandle((-10 - fd) as u32) };
+        let mut mode = 0u32;
+        if unsafe { GetConsoleMode(h, &mut mode as *mut u32) } != 0 {
+            write_console(h, p, n);
+            return;
+        }
+    }
     unsafe { c_write(fd, p, n as u32); }
+}
+
+#[cfg(target_os = "windows")]
+extern "C" {
+    fn WriteConsoleW(h: usize, buf: *const u16, n: u32, written: *mut u32, reserved: usize) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[nonblocking]
+extern "C" {
+    fn GetStdHandle(n: u32) -> usize;
+    fn GetConsoleMode(h: usize, mode: *mut u32) -> i32;
+}
+
+// The UTF-8 bytes p[0..n] to console h, in pieces of up to 512 units
+// (invalid or cut sequences as U+FFFD).
+#[cfg(target_os = "windows")]
+fn write_console(h: usize, p: *const u8, n: usize) {
+    let mut buf = [0u16; 512];
+    let mut k = 0;
+    let mut i = 0;
+    while i < n {
+        let b0 = unsafe { *crate::rt::ptr_offset(p, i) } as u32;
+        let len = if b0 < 0x80 { 1 } else if b0 >> 5 == 6 { 2 } else if b0 >> 4 == 14 { 3 } else if b0 >> 3 == 30 { 4 } else { 0 };
+        let mut c = 0xFFFDu32;
+        let mut used = 1;
+        if len == 1 {
+            c = b0;
+        } else if len > 1 && i + len <= n {
+            let mut v = b0 & (0x7F >> len);
+            let mut ok = true;
+            let mut j = 1;
+            while j < len {
+                let b = unsafe { *crate::rt::ptr_offset(p, i + j) } as u32;
+                if b >> 6 != 2 { ok = false; }
+                v = v << 6 | (b & 0x3F);
+                j += 1;
+            }
+            if ok && v <= 0x10FFFF && !(v >= 0xD800 && v < 0xE000) {
+                c = v;
+                used = len;
+            }
+        }
+        i += used;
+        if c >= 0x10000 {
+            buf[k] = (0xD800 + ((c - 0x10000) >> 10)) as u16;
+            buf[k + 1] = (0xDC00 + ((c - 0x10000) & 0x3FF)) as u16;
+            k += 2;
+        } else {
+            buf[k] = c as u16;
+            k += 1;
+        }
+        if k >= 510 {
+            console_out(h, &buf, k);
+            k = 0;
+        }
+    }
+    if k > 0 { console_out(h, &buf, k); }
+}
+
+#[cfg(target_os = "windows")]
+fn console_out(h: usize, buf: &[u16; 512], n: usize) {
+    let mut done = 0;
+    while done < n {
+        let mut w = 0u32;
+        let ok = unsafe { WriteConsoleW(h, crate::rt::ptr_offset(buf as *const [u16; 512] as *const u16, done), (n - done) as u32, &mut w as *mut u32, 0) };
+        if ok == 0 || w == 0 { return; }
+        done += w as usize;
+    }
 }
 
 pub fn exit(code: i32) -> ! {
