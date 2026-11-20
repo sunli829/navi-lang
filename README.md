@@ -15,8 +15,11 @@ navi 是一门语法和 Rust 高度相似、带 GC 的编程语言，AOT 编译�
 ```sh
 tar xzf navi-v0.1.0-macos-arm64.tar.gz
 export PATH=$PWD/navi-v0.1.0-macos-arm64/bin:$PATH
-navi build -o hello hello.navi
-NAVI_TARGET=linux-x64 navi build -o hello-linux hello.navi   # 交叉编译
+navi new hello && cd hello    # navi.toml、src/main.navi（同 cargo new）
+navi run                      # 构建到 target/hello 并运行
+navi test                     # 单元测试和 tests/ 里的集成测试
+NAVI_TARGET=linux-x64 navi build -o hello-linux   # 交叉编译
+navi run hello.navi           # 单个文件不需要项目（同 go run）
 ```
 
 macOS 上用浏览器下载的包带隔离标记，第一次运行前执行 `xattr -dr com.apple.quarantine navi-*`（navi 只有 ad-hoc 签名）。

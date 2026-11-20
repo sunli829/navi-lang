@@ -1,0 +1,247 @@
+//! navi.toml, as Cargo.toml:
+//!
+//!     [package]
+//!     name = "app"
+//!
+//!     [dependencies]
+//!     foo = { path = "../foo" }
+//!     bar = { git = "https://github.com/x/bar", tag = "v1.2.0" }
+//!     baz = { workspace = true }
+//!
+//!     [workspace]
+//!     members = ["app", "crates/*"]
+//!     exclude = ["crates/old"]
+//!
+//!     [workspace.dependencies]
+//!     baz = { path = "crates/baz" }
+//!
+//!     [fmt]
+//!     comment_width = 100
+//!
+//! A directory with [package] is a crate (src/main.navi or src/lib.navi);
+//! one with [workspace] is the root of a workspace (and a crate too if it
+//! also has [package]).
+
+use crate::toml::{self, Table, Value};
+use crate::util;
+
+/// A dependency as a manifest declares it.
+pub struct Dep {
+    /// The name the crate uses (the key).
+    pub alias: String,
+    pub path: String,
+    pub git: String,
+    pub tag: String,
+    pub rev: String,
+    /// { workspace = true }: as the workspace's [workspace.dependencies].
+    pub workspace: bool,
+}
+
+pub struct Workspace {
+    pub members: Vec<String>,
+    pub exclude: Vec<String>,
+    /// [workspace.dependencies] (paths relative to the workspace root).
+    pub deps: Vec<&Dep>,
+}
+
+pub struct Manifest {
+    /// The navi.toml and its directory.
+    pub file: String,
+    pub dir: String,
+    /// [package] name (empty: no [package]).
+    pub name: String,
+    pub deps: Vec<&Dep>,
+    pub workspace: Option<&Workspace>,
+    /// [fmt] comment_width (0: not set).
+    pub comment_width: usize,
+}
+
+/// The manifest of the crate or workspace in dir (None: no navi.toml).
+pub fn load(dir: &str) -> Result<Option<&Manifest>, String> {
+    let file = util::path_join(dir, "navi.toml");
+    let text = match std::fs::read_to_string(file.as_str()) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    // A changed manifest is a different build (see cache::lookup).
+    crate::cache::note(file.as_str(), &text);
+    match parse(text.as_str(), file.as_str(), dir) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Parses the text of the navi.toml file in dir.
+pub fn parse(text: &str, file: &str, dir: &str) -> Result<&Manifest, String> {
+    let t = match toml::parse(text) {
+        Ok(t) => t,
+        Err(e) => return Err(`${file}: ${e}`.to_string()),
+    };
+    let m = &mut Manifest { file: file.to_string(), dir: dir.to_string(), name: String::new(), deps: Vec::new(), workspace: None, comment_width: 0 };
+    for k in t.keys().iter() {
+        let at = `${file}:${t.line(k.as_str())}`.to_string();
+        match k.as_str() {
+            "package" => {
+                let p = table_at(t, "package", at.as_str())?;
+                match p.get("name") {
+                    Some(Value::Str(s)) => m.name = s.clone(),
+                    Some(v) => return Err(`${at}: [package] name must be a string, not ${toml::kind(v)}`.to_string()),
+                    None => return Err(`${at}: [package] needs a name`.to_string()),
+                }
+                if !valid_name(m.name.as_str()) {
+                    return Err(`${at}: package name ${util::quote(m.name.as_str())}: letters, digits, _ and - only, not starting with a digit`.to_string());
+                }
+            }
+            "dependencies" => m.deps = deps(table_at(t, "dependencies", at.as_str())?, file, true)?,
+            "workspace" => {
+                let w = table_at(t, "workspace", at.as_str())?;
+                let ws = &mut Workspace { members: Vec::new(), exclude: Vec::new(), deps: Vec::new() };
+                for wk in w.keys().iter() {
+                    let wat = `${file}:${w.line(wk.as_str())}`.to_string();
+                    match wk.as_str() {
+                        "members" => ws.members = strings(w.get("members").unwrap(), "members", wat.as_str())?,
+                        "exclude" => ws.exclude = strings(w.get("exclude").unwrap(), "exclude", wat.as_str())?,
+                        "dependencies" => ws.deps = deps(table_at(w, "dependencies", wat.as_str())?, file, false)?,
+                        other => return Err(`${wat}: unknown key ${other} in [workspace] (members, exclude, dependencies)`.to_string()),
+                    }
+                }
+                m.workspace = Some(ws);
+            }
+            "fmt" => {
+                let f = table_at(t, "fmt", at.as_str())?;
+                match f.get("comment_width") {
+                    Some(Value::Int(n)) if *n > 0 => m.comment_width = *n as usize,
+                    Some(_) => return Err(`${file}:${f.line("comment_width")}: [fmt] comment_width must be a positive integer`.to_string()),
+                    None => {}
+                }
+            }
+            other => return Err(`${at}: unknown table [${other}] (package, dependencies, workspace, fmt)`.to_string()),
+        }
+    }
+    Ok(m)
+}
+
+// A package name as Cargo allows it.
+pub fn valid_name(s: &str) -> bool {
+    if s.len() == 0 || s.as_bytes()[0].is_ascii_digit() { return false; }
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn table_at(t: &Table, key: &str, at: &str) -> Result<&mut Table, String> {
+    match t.get(key) {
+        Some(Value::Table(x)) => Ok(*x),
+        Some(v) => Err(`${at}: ${key} must be a table, not ${toml::kind(v)}`.to_string()),
+        None => Err(`${at}: no ${key}`.to_string()),
+    }
+}
+
+fn strings(v: &Value, key: &str, at: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    match v {
+        Value::Array(a) => {
+            for x in a.iter() {
+                match x {
+                    Value::Str(s) => out.push(s.clone()),
+                    _ => return Err(`${at}: ${key} must be an array of strings`.to_string()),
+                }
+            }
+        }
+        _ => return Err(`${at}: ${key} must be an array of strings`.to_string()),
+    }
+    Ok(out)
+}
+
+// A [dependencies] table (in_package: { workspace = true } is allowed).
+fn deps(t: &Table, file: &str, in_package: bool) -> Result<Vec<&Dep>, String> {
+    let mut out: Vec<&Dep> = Vec::new();
+    for alias in t.keys().iter() {
+        let at = `${file}:${t.line(alias.as_str())}: dependency ${alias}`.to_string();
+        let spec = match t.get(alias.as_str()).unwrap() {
+            Value::Table(x) => *x,
+            Value::Str(_) => return Err(`${at}: versions from a registry are not supported; use { path = "..." } or { git = "...", tag = "..." }`.to_string()),
+            _ => return Err(`${at}: expected { path = "..." } or { git = "...", tag = "..." }`.to_string()),
+        };
+        let d = &mut Dep { alias: alias.clone(), path: String::new(), git: String::new(), tag: String::new(), rev: String::new(), workspace: false };
+        for k in spec.keys().iter() {
+            let v = spec.get(k.as_str()).unwrap();
+            if k == "workspace" {
+                match v {
+                    Value::Bool(true) if in_package => d.workspace = true,
+                    Value::Bool(_) if in_package => return Err(`${at}: workspace must be true`.to_string()),
+                    _ => return Err(`${at}: unknown key workspace (path, git, tag or rev)`.to_string()),
+                }
+                continue;
+            }
+            let s = match v {
+                Value::Str(s) => s.clone(),
+                _ => return Err(`${at}: ${k} must be a string`.to_string()),
+            };
+            match k.as_str() {
+                "path" => d.path = s,
+                "git" => d.git = s,
+                "tag" => d.tag = s,
+                "rev" => d.rev = s,
+                other => return Err(`${at}: unknown key ${other} (path, git, tag or rev${if in_package { ", or workspace" } else { "" }})`.to_string()),
+            }
+        }
+        if d.workspace {
+            if d.path.len() > 0 || d.git.len() > 0 || d.tag.len() > 0 || d.rev.len() > 0 {
+                return Err(`${at}: { workspace = true } takes everything from [workspace.dependencies]`.to_string());
+            }
+        } else {
+            if (d.path.len() > 0) == (d.git.len() > 0) { return Err(`${at}: needs path or git (one of them)`.to_string()); }
+            if d.path.len() > 0 && (d.tag.len() > 0 || d.rev.len() > 0) { return Err(`${at}: tag and rev go with git`.to_string()); }
+            if d.tag.len() > 0 && d.rev.len() > 0 { return Err(`${at}: tag or rev, not both`.to_string()); }
+        }
+        out.push(d);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_dependencies_and_workspace() {
+        let m = parse(r#"
+[package]
+name = "my-app"
+
+[dependencies]
+foo = { path = "../foo" }
+bar = { git = "https://x/bar", tag = "v1.0.0" }
+baz = { workspace = true }
+
+[workspace]
+members = ["crates/*"]
+exclude = ["crates/old"]
+
+[workspace.dependencies]
+baz = { path = "crates/baz" }
+
+[fmt]
+comment_width = 100
+"#, "w/navi.toml", "w").unwrap();
+        assert_eq(m.name, "my-app");
+        assert_eq(m.deps.len(), 3);
+        assert_eq(m.deps[1].tag, "v1.0.0");
+        assert(m.deps[2].workspace);
+        let w = m.workspace.unwrap();
+        assert_eq(w.members, Vec::from(["crates/*".to_string()]));
+        assert_eq(w.deps[0].path, "crates/baz");
+        assert_eq(m.comment_width, 100);
+    }
+
+    #[test]
+    fn errors() {
+        let e = |s: &str| parse(s, "navi.toml", ".").err().unwrap();
+        assert_eq(e("[package]\nversion = \"1\"\n"), "navi.toml:1: [package] needs a name");
+        assert_eq(e("[package]\nname = \"1x\"\n"), "navi.toml:1: package name \"1x\": letters, digits, _ and - only, not starting with a digit");
+        assert_eq(e("[dependencies]\nfoo = \"1.0\"\n"), "navi.toml:2: dependency foo: versions from a registry are not supported; use { path = \"...\" } or { git = \"...\", tag = \"...\" }");
+        assert_eq(e("[dependencies]\nfoo = { path = \"a\", tag = \"v1\" }\n"), "navi.toml:2: dependency foo: tag and rev go with git");
+        assert_eq(e("[workspace.dependencies]\nfoo = { workspace = true }\n"), "navi.toml:2: dependency foo: unknown key workspace (path, git, tag or rev)");
+        assert_eq(e("[profile]\nx = 1\n"), "navi.toml:1: unknown table [profile] (package, dependencies, workspace, fmt)");
+        assert_eq(e("[package\n"), "navi.toml: line 1: expected ]");
+    }
+}

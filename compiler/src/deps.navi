@@ -7,26 +7,22 @@
 //!     bar = { git = "https://github.com/x/bar", tag = "v1.2.0" }
 //!
 //! The key is the name the crate uses (`use bar::...`); a dependency is a
-//! library crate (src/lib.navi). Two versions of one repository can both be
-//! in a program (as Cargo's): they are different crates (the second named
-//! bar@v1.3.0 in messages). The commit each git dependency resolved to is
-//! kept in navi.lock next to the root crate's navi.toml, so that a moved tag
-//! does not change a build; `navi update` resolves them again. Checkouts are
-//! shared by every project: one per repository and commit in the cache's pkg
-//! directory (or $NAVI_PKG). git runs them (as for Go).
+//! library crate (src/lib.navi), in a git repository the one at its root or
+//! the workspace member of that name. { workspace = true } takes the
+//! dependency from the workspace's [workspace.dependencies]. Two versions of
+//! one repository can both be in a program (as Cargo's): they are different
+//! crates (the second named bar@v1.3.0 in messages). The commit each git
+//! dependency resolved to is kept in navi.lock at the project's root (one
+//! for a whole workspace), so that a moved tag does not change a build;
+//! `navi update` resolves them again. Checkouts are shared by every project:
+//! one per repository and commit in the cache's pkg directory (or
+//! $NAVI_PKG). git runs them (as for Go).
 
 use std::collections::HashMap;
+use crate::manifest::Dep;
+use crate::project::{self, canonical, Member, Project};
 use crate::resolve::CrateSpec;
 use crate::util;
-
-/// A dependency as navi.toml declares it.
-struct Dep {
-    alias: String,
-    path: String,
-    git: String,
-    tag: String,
-    rev: String,
-}
 
 /// A git dependency's resolved commit (an entry of navi.lock).
 #[derive(Clone)]
@@ -42,6 +38,8 @@ struct Graph {
     specs: Vec<&mut CrateSpec>,
     by_dir: HashMap<String, String>,
     names: HashMap<String, bool>,
+    // The members' directories and names.
+    members: HashMap<String, String>,
     // The directories being loaded (a dependency cycle comes back to one).
     stack: Vec<String>,
     old: Vec<Locked>,
@@ -49,33 +47,63 @@ struct Graph {
     offline: bool,
 }
 
-/// The crates of the program rooted at the crate at path, std first and the
-/// root last, with every dependency fetched and navi.lock up to date.
+/// The crates of a project: std, the dependencies of its members and the
+/// members, each crate after those it uses.
+pub struct Loaded {
+    pub specs: Vec<&CrateSpec>,
+    // The crate of each member (by directory).
+    by_member: HashMap<String, String>,
+}
+
+/// The crates of the program of the crate at path (a crate's directory, or
+/// a directory in it, or a single .navi file), std first and the crate
+/// last, with every dependency fetched and navi.lock up to date.
 /// offline: only what navi.lock and the checkouts already have (navi lsp);
 /// update: every git dependency resolved again (navi update).
 pub fn load_graph(path: &str, offline: bool, update: bool) -> Result<Vec<&CrateSpec>, String> {
-    let root = crate::driver::load_crate(path)?;
-    let mut specs: Vec<&CrateSpec> = Vec::new();
-    specs.push(crate::driver::std_crate());
-    // A single file has no navi.toml.
     if !std::path::Path::new(path).is_dir() {
-        specs.push(root);
+        let mut specs: Vec<&CrateSpec> = Vec::new();
+        specs.push(crate::driver::std_crate());
+        specs.push(crate::driver::load_crate(path)?);
         return Ok(specs);
     }
-    let lock = util::path_join(path, "navi.lock");
+    let p = project::find(path)?;
+    if p.selected.len() != 1 {
+        return Err(`${path}: the root of a workspace: name one of its members (${member_names(p)})`.to_string());
+    }
+    let l = load_project(p, offline, update)?;
+    Ok(program(l, p.selected[0]))
+}
+
+/// The members' names, for messages.
+pub fn member_names(p: &Project) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for m in p.members.iter() { names.push(m.manifest.name.clone()); }
+    names.join(", ")
+}
+
+/// Loads every crate of project p (see load_graph).
+pub fn load_project(p: &Project, offline: bool, update: bool) -> Result<&Loaded, String> {
+    let lock = util::path_join(p.root.as_str(), "navi.lock");
     let lock_text = match std::fs::read_to_string(lock.as_str()) { Ok(t) => t, Err(_) => String::new() };
     // A changed navi.lock is a different build (see cache::lookup).
     if lock_text.len() > 0 { crate::cache::note(lock.as_str(), &lock_text); }
-    let old = if update { Vec::new() } else { parse_lock(lock_text.as_str()) };
-    let g = &mut Graph { specs: Vec::new(), by_dir: HashMap::new(), names: HashMap::new(), stack: Vec::new(), old, used: Vec::new(), offline };
+    let old = if update { Vec::new() } else { parse_lock(lock_text.as_str(), lock.as_str())? };
+    let g = &mut Graph { specs: Vec::new(), by_dir: HashMap::new(), names: HashMap::new(), members: HashMap::new(), stack: Vec::new(), old, used: Vec::new(), offline };
     g.names.insert("std".to_string(), true);
-    g.names.insert(root.name.clone(), true);
-    let root_dir = canonical(path)?;
-    g.by_dir.insert(root_dir.clone(), root.name.clone());
-    g.stack.push(root_dir.clone());
-    root.deps = g.deps_of(root_dir.as_str())?;
-    for s in g.specs.iter() { specs.push(*s); }
-    specs.push(root);
+    for m in p.members.iter() {
+        g.names.insert(m.name.clone(), true);
+        g.members.insert(m.dir.clone(), m.name.clone());
+    }
+    for m in p.members.iter() {
+        if g.by_dir.contains_key(&m.dir) { continue; }
+        let spec = spec_of(m);
+        g.by_dir.insert(m.dir.clone(), m.name.clone());
+        g.stack.push(m.dir.clone());
+        spec.deps = g.deps_of(m.dir.as_str())?;
+        g.stack.pop();
+        g.specs.push(spec);
+    }
     if !offline {
         let text = render_lock(&g.used);
         if text != lock_text && (g.used.len() > 0 || lock_text.len() > 0) {
@@ -83,20 +111,55 @@ pub fn load_graph(path: &str, offline: bool, update: bool) -> Result<Vec<&CrateS
             crate::cache::note(lock.as_str(), &text);
         }
     }
-    Ok(specs)
+    let mut specs: Vec<&CrateSpec> = Vec::new();
+    specs.push(crate::driver::std_crate());
+    for sp in g.specs.iter() { specs.push(*sp); }
+    Ok(&Loaded { specs, by_member: g.by_dir.clone() })
+}
+
+/// The crates member m's program needs: std, the crates m reaches and m
+/// last.
+pub fn program(l: &Loaded, m: &Member) -> Vec<&CrateSpec> {
+    let name = match l.by_member.get(&m.dir) { Some(n) => n.clone(), None => m.name.clone() };
+    let mut want: HashMap<String, bool> = HashMap::new();
+    let mut work: Vec<String> = Vec::new();
+    work.push(name.clone());
+    while let Some(n) = work.pop() {
+        if want.contains_key(&n) { continue; }
+        want.insert(n.clone(), true);
+        for s in l.specs.iter() {
+            if s.name != n { continue; }
+            for d in s.deps.iter() {
+                if let Some((_, c)) = d.split_once('=') { work.push(c.to_string()); }
+            }
+        }
+    }
+    let mut out: Vec<&CrateSpec> = Vec::new();
+    let mut last: Option<&CrateSpec> = None;
+    for s in l.specs.iter() {
+        if s.name == "std" { out.push(*s); continue; }
+        if !want.contains_key(&s.name) { continue; }
+        if s.name == name { last = Some(*s); } else { out.push(*s); }
+    }
+    if let Some(s) = last { out.push(s); }
+    out
+}
+
+// A member's crate.
+fn spec_of(m: &Member) -> &mut CrateSpec {
+    &mut CrateSpec { name: m.name.clone(), fs_root: m.dir.clone(), root: m.root.clone(), deps: Vec::new(), dir: m.dir.clone() }
 }
 
 impl Graph {
     /// The dependencies of the crate in dir, as "alias=crate" (see
     /// resolve::resolve).
     fn deps_of(&mut self, dir: &str) -> Result<Vec<String>, String> {
-        let toml = util::path_join(dir, "navi.toml");
-        let text = match std::fs::read_to_string(toml.as_str()) { Ok(t) => t, Err(_) => return Ok(Vec::new()) };
-        crate::cache::note(toml.as_str(), &text);
+        let m = match crate::manifest::load(dir)? { Some(m) => m, None => return Ok(Vec::new()) };
         let mut out: Vec<String> = Vec::new();
-        for d in parse_deps(text.as_str(), toml.as_str())?.iter() {
+        for dd in m.deps.iter() {
+            let d = if dd.workspace { inherited(dir, *dd)? } else { *dd };
             let c = self.package(dir, d)?;
-            out.push(`${d.alias}=${c}`.to_string());
+            out.push(`${d.alias.replace("-", "_")}=${c}`.to_string());
         }
         Ok(out)
     }
@@ -111,17 +174,21 @@ impl Graph {
                 Err(_) => return Err(`${dir}: dependency ${d.alias}: no directory ${p}`.to_string()),
             }
         } else {
-            self.checkout(d)?
+            project::package_in(self.checkout(d)?.as_str(), d.alias.as_str())?
         };
         if let Some(c) = self.by_dir.get(&pdir) {
             if self.stack.contains(&pdir) { return Err(`${pdir}: a dependency cycle reaches this crate again`.to_string()); }
             return Ok(c.clone());
         }
-        let spec = crate::driver::load_crate(pdir.as_str())?;
-        if spec.root != "src/lib.navi" { return Err(`${pdir}: dependency ${d.alias} is not a library (no src/lib.navi)`.to_string()); }
-        // A name another crate has (another version of it): name@version.
+        let mem = project::crate_at(pdir.as_str())?;
+        if mem.is_bin() { return Err(`${pdir}: dependency ${d.alias} is not a library (no src/lib.navi)`.to_string()); }
+        let spec = spec_of(mem);
+        // A member of the project keeps its name; a name another crate has
+        // (another version of it) becomes name@version.
         let mut name = spec.name.clone();
-        if self.names.contains_key(&name) {
+        if let Some(n) = self.members.get(&pdir) {
+            name = n.clone();
+        } else if self.names.contains_key(&name) {
             let label = if d.tag.len() > 0 { d.tag.clone() } else if d.rev.len() > 0 { d.rev[0..d.rev.len().min(12)].to_string() } else { "path".to_string() };
             name = `${spec.name}@${label}`.to_string();
             let mut k = 2;
@@ -234,106 +301,40 @@ fn git(args: &[&str]) -> Result<String, String> {
     }
 }
 
-// The dependencies of navi.toml's [dependencies] table: name = { ... }
-// (inline tables of path, git, tag and rev).
-fn parse_deps(text: &str, file: &str) -> Result<Vec<&Dep>, String> {
-    let mut out: Vec<&Dep> = Vec::new();
-    let mut in_deps = false;
-    let mut ln = 0;
-    for raw in text.lines() {
-        ln += 1;
-        let line = strip_comment(raw).trim();
-        if line.len() == 0 { continue; }
-        if line.starts_with("[") {
-            in_deps = line == "[dependencies]";
-            continue;
-        }
-        if !in_deps { continue; }
-        let (k, v) = match line.split_once('=') { Some(p) => p, None => return Err(`${file}:${ln}: expected name = { ... }`.to_string()) };
-        let alias = k.trim().trim_matches('"').to_string();
-        let v = v.trim();
-        if !v.starts_with("{") || !v.ends_with("}") {
-            return Err(`${file}:${ln}: dependency ${alias}: expected { path = "..." } or { git = "...", tag = "..." }`.to_string());
-        }
-        let d = &mut Dep { alias: alias.clone(), path: String::new(), git: String::new(), tag: String::new(), rev: String::new() };
-        for field in split_fields(&v[1..v.len() - 1]).iter() {
-            let (fk, fv) = match field.split_once('=') { Some(p) => p, None => return Err(`${file}:${ln}: dependency ${alias}: expected key = "value"`.to_string()) };
-            let fv = fv.trim();
-            if !fv.starts_with("\"") || !fv.ends_with("\"") || fv.len() < 2 { return Err(`${file}:${ln}: dependency ${alias}: ${fk.trim()} must be a string`.to_string()); }
-            let val = fv[1..fv.len() - 1].to_string();
-            match fk.trim() {
-                "path" => d.path = val,
-                "git" => d.git = val,
-                "tag" => d.tag = val,
-                "rev" => d.rev = val,
-                other => return Err(`${file}:${ln}: dependency ${alias}: unknown key ${other} (path, git, tag or rev)`.to_string()),
+
+
+// navi.lock: [[git]] tables of url, tag, rev and commit.
+fn parse_lock(text: &str, file: &str) -> Result<Vec<Locked>, String> {
+    let mut out: Vec<Locked> = Vec::new();
+    let t = match crate::toml::parse(text) {
+        Ok(t) => t,
+        Err(e) => return Err(`${file}: ${e} (navi update writes it again)`.to_string()),
+    };
+    if let Some(crate::toml::Value::Array(a)) = t.get("git") {
+        for v in a.iter() {
+            if let crate::toml::Value::Table(g) = v {
+                let f = |k: &str| match g.str(k) { Some(s) => s.to_string(), None => String::new() };
+                let l = Locked { url: f("url"), tag: f("tag"), rev: f("rev"), commit: f("commit") };
+                if l.url.len() > 0 && l.commit.len() > 0 { out.push(l); }
             }
         }
-        if (d.path.len() > 0) == (d.git.len() > 0) { return Err(`${file}:${ln}: dependency ${alias}: needs path or git (one of them)`.to_string()); }
-        if d.path.len() > 0 && (d.tag.len() > 0 || d.rev.len() > 0) { return Err(`${file}:${ln}: dependency ${alias}: tag and rev go with git`.to_string()); }
-        if d.tag.len() > 0 && d.rev.len() > 0 { return Err(`${file}:${ln}: dependency ${alias}: tag or rev, not both`.to_string()); }
-        for o in out.iter() {
-            if o.alias == alias { return Err(`${file}:${ln}: dependency ${alias} declared twice`.to_string()); }
-        }
-        out.push(d);
     }
     Ok(out)
 }
 
-// line without a # comment (not one inside a string).
-fn strip_comment(line: &str) -> &str {
-    let mut in_str = false;
-    for (i, c) in line.char_indices() {
-        if c == '"' { in_str = !in_str; }
-        if c == '#' && !in_str { return &line[0..i]; }
+// d ({ workspace = true } in the crate in dir) as the workspace declares
+// it, a path relative to the workspace's root.
+fn inherited(dir: &str, d: &Dep) -> Result<&Dep, String> {
+    let (root, rm, w) = match project::workspace_of(dir)? {
+        Some(x) => x,
+        None => return Err(`${dir}: dependency ${d.alias}: { workspace = true } outside a workspace`.to_string()),
+    };
+    for wd in w.deps.iter() {
+        if wd.alias != d.alias { continue; }
+        let path = if wd.path.len() > 0 && !is_absolute(wd.path.as_str()) { util::path_join(root.as_str(), wd.path.as_str()) } else { wd.path.clone() };
+        return Ok(&Dep { alias: d.alias.clone(), path, git: wd.git.clone(), tag: wd.tag.clone(), rev: wd.rev.clone(), workspace: false });
     }
-    line
-}
-
-// The comma-separated fields of an inline table (commas in strings kept).
-fn split_fields(s: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_str = false;
-    for c in s.chars() {
-        if c == '"' { in_str = !in_str; }
-        if c == ',' && !in_str {
-            if cur.trim().len() > 0 { out.push(cur.trim().to_string()); }
-            cur = String::new();
-            continue;
-        }
-        cur.push(c);
-    }
-    if cur.trim().len() > 0 { out.push(cur.trim().to_string()); }
-    out
-}
-
-// navi.lock: [[git]] tables of url, tag, rev and commit.
-fn parse_lock(text: &str) -> Vec<Locked> {
-    let mut out: Vec<Locked> = Vec::new();
-    let mut cur: Option<Locked> = None;
-    for raw in text.lines() {
-        let line = strip_comment(raw).trim();
-        if line == "[[git]]" {
-            if let Some(l) = cur { if l.url.len() > 0 && l.commit.len() > 0 { out.push(l); } }
-            cur = Some(Locked { url: String::new(), tag: String::new(), rev: String::new(), commit: String::new() });
-            continue;
-        }
-        let (k, v) = match line.split_once('=') { Some(p) => p, None => continue };
-        let v = v.trim().trim_matches('"').to_string();
-        if let Some(mut l) = cur {
-            match k.trim() {
-                "url" => l.url = v,
-                "tag" => l.tag = v,
-                "rev" => l.rev = v,
-                "commit" => l.commit = v,
-                _ => {}
-            }
-            cur = Some(l);
-        }
-    }
-    if let Some(l) = cur { if l.url.len() > 0 && l.commit.len() > 0 { out.push(l); } }
-    out
+    Err(`${dir}: dependency ${d.alias}: not in [workspace.dependencies] of ${rm.file}`.to_string())
 }
 
 fn render_lock(used: &Vec<Locked>) -> String {
@@ -345,10 +346,10 @@ fn render_lock(used: &Vec<Locked>) -> String {
     });
     let mut s = "# The commits of the git dependencies (written by navi: keep it with the code;\n# navi update resolves them again).\n".to_string();
     for l in ls.iter() {
-        s.push_str(`\n[[git]]\nurl = \"${l.url}\"\n`.to_string().as_str());
-        if l.tag.len() > 0 { s.push_str(`tag = \"${l.tag}\"\n`.to_string().as_str()); }
-        if l.rev.len() > 0 { s.push_str(`rev = \"${l.rev}\"\n`.to_string().as_str()); }
-        s.push_str(`commit = \"${l.commit}\"\n`.to_string().as_str());
+        s.push_str(`\n[[git]]\nurl = ${crate::toml::quote(l.url.as_str())}\n`.to_string().as_str());
+        if l.tag.len() > 0 { s.push_str(`tag = ${crate::toml::quote(l.tag.as_str())}\n`.to_string().as_str()); }
+        if l.rev.len() > 0 { s.push_str(`rev = ${crate::toml::quote(l.rev.as_str())}\n`.to_string().as_str()); }
+        s.push_str(`commit = ${crate::toml::quote(l.commit.as_str())}\n`.to_string().as_str());
     }
     s
 }
@@ -357,16 +358,6 @@ fn is_absolute(p: &str) -> bool {
     p.starts_with("/") || p.len() > 2 && p.as_bytes()[1] == b':' && (p.as_bytes()[2] == b'/' || p.as_bytes()[2] == b'\\')
 }
 
-// The canonical path of an existing directory (links resolved, C:/dir).
-fn canonical(p: &str) -> Result<String, String> {
-    match std::fs::canonicalize(p) {
-        Ok(c) => match c.to_str() {
-            Some(s) => Ok(util::path_clean(util::without_verbatim(s).as_str())),
-            None => Err(`${p}: not a UTF-8 path`.to_string()),
-        },
-        Err(e) => Err(`${p}: ${e}`.to_string()),
-    }
-}
 
 // A directory name for a repository URL: 16 hex digits of its SHA-256.
 fn short_hash(url: &str) -> String {

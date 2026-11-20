@@ -1,0 +1,510 @@
+//! TOML for navi.toml and navi.lock: tables ([a.b]), arrays of tables
+//! ([[a]]), dotted and quoted keys, strings (basic and literal), integers,
+//! booleans, arrays and inline tables. Floats, dates and multi-line
+//! strings are not supported (navi's files do not use them).
+
+/// A TOML value.
+pub enum Value {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    Array(Vec<Value>),
+    Table(&mut Table),
+}
+
+/// A table: its keys in order, each with its value and the line it is on.
+pub struct Table {
+    keys: Vec<String>,
+    vals: Vec<Value>,
+    lines: Vec<u32>,
+    // Defined by a [header] or inline (not only through a dotted key).
+    explicit: bool,
+}
+
+impl Table {
+    pub fn new() -> &mut Table { &mut Table { keys: Vec::new(), vals: Vec::new(), lines: Vec::new(), explicit: false } }
+
+    pub fn keys(&self) -> &Vec<String> { &self.keys }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        let mut i = 0;
+        while i < self.keys.len() {
+            if self.keys[i] == key { return Some(&self.vals[i]); }
+            i += 1;
+        }
+        None
+    }
+
+    /// The line key is on (0 if there is no such key).
+    pub fn line(&self, key: &str) -> u32 {
+        let mut i = 0;
+        while i < self.keys.len() {
+            if self.keys[i] == key { return self.lines[i]; }
+            i += 1;
+        }
+        0
+    }
+
+    /// The table at key, if it is one.
+    pub fn table(&self, key: &str) -> Option<&mut Table> {
+        match self.get(key) { Some(Value::Table(t)) => Some(*t), _ => None }
+    }
+
+    /// The string at key, if it is one.
+    pub fn str(&self, key: &str) -> Option<&str> {
+        match self.get(key) { Some(Value::Str(s)) => Some(s.as_str()), _ => None }
+    }
+
+    fn put(&mut self, key: &str, v: Value, line: u32) {
+        self.keys.push(key.to_string());
+        self.vals.push(v);
+        self.lines.push(line);
+    }
+}
+
+/// What a value is, for messages.
+pub fn kind(v: &Value) -> &str {
+    match v {
+        Value::Str(_) => "a string",
+        Value::Int(_) => "an integer",
+        Value::Bool(_) => "a boolean",
+        Value::Array(_) => "an array",
+        Value::Table(_) => "a table",
+    }
+}
+
+/// Parses a TOML document; an error is "line N: message".
+pub fn parse(text: &str) -> Result<&mut Table, String> {
+    let p = &mut Parser { s: text.as_bytes(), i: 0, line: 1 };
+    let root = Table::new();
+    root.explicit = true;
+    let mut cur = root;
+    loop {
+        p.skip_space_lines();
+        if p.i >= p.s.len() { break; }
+        let line = p.line;
+        if p.s[p.i] == b'[' {
+            let array = p.i + 1 < p.s.len() && p.s[p.i + 1] == b'[';
+            p.i += if array { 2 } else { 1 };
+            p.skip_space();
+            let path = p.key()?;
+            p.skip_space();
+            if array {
+                p.expect(b']')?;
+                p.expect(b']')?;
+            } else {
+                p.expect(b']')?;
+            }
+            p.end_of_line()?;
+            cur = if array { array_table(root, &path, line)? } else { header_table(root, &path, line)? };
+            continue;
+        }
+        let path = p.key()?;
+        p.skip_space();
+        p.expect(b'=')?;
+        p.skip_space();
+        let v = p.value()?;
+        p.end_of_line()?;
+        insert(cur, &path, v, line)?;
+    }
+    Ok(root)
+}
+
+// The table [path] defines (a table a dotted key or another header made
+// may be defined once more, as TOML allows).
+fn header_table(root: &mut Table, path: &Vec<String>, line: u32) -> Result<&mut Table, String> {
+    let mut t = root;
+    let mut i = 0;
+    while i < path.len() {
+        let k = path[i].as_str();
+        let last = i + 1 == path.len();
+        t = match t.get(k) {
+            Some(Value::Table(x)) => {
+                if last && x.explicit { return Err(`line ${line}: table ${path.join(".")} defined twice`.to_string()); }
+                *x
+            }
+            // The last table of an array of tables.
+            Some(Value::Array(a)) if !last && a.len() > 0 => match &a[a.len() - 1] {
+                Value::Table(x) => *x,
+                _ => return Err(`line ${line}: ${k} is not a table`.to_string()),
+            },
+            Some(_) => return Err(`line ${line}: ${k} is not a table`.to_string()),
+            None => {
+                let n = Table::new();
+                t.put(k, Value::Table(n), line);
+                n
+            }
+        };
+        i += 1;
+    }
+    t.explicit = true;
+    Ok(t)
+}
+
+// A new table appended to the array of tables [[path]].
+fn array_table(root: &mut Table, path: &Vec<String>, line: u32) -> Result<&mut Table, String> {
+    let parent = if path.len() > 1 { header_table_quiet(root, &path[0..path.len() - 1], line)? } else { root };
+    let k = path[path.len() - 1].as_str();
+    let n = Table::new();
+    n.explicit = true;
+    let mut i = 0;
+    while i < parent.keys.len() {
+        if parent.keys[i] == k {
+            match &mut parent.vals[i] {
+                Value::Array(a) => {
+                    a.push(Value::Table(n));
+                    return Ok(n);
+                }
+                _ => return Err(`line ${line}: ${k} is not an array of tables`.to_string()),
+            }
+        }
+        i += 1;
+    }
+    let mut a: Vec<Value> = Vec::new();
+    a.push(Value::Table(n));
+    parent.put(k, Value::Array(a), line);
+    Ok(n)
+}
+
+// The table at path, made if missing, without defining it.
+fn header_table_quiet(root: &mut Table, path: &[String], line: u32) -> Result<&mut Table, String> {
+    let mut t = root;
+    for k in path.iter() {
+        t = match t.get(k.as_str()) {
+            Some(Value::Table(x)) => *x,
+            Some(Value::Array(a)) if a.len() > 0 => match &a[a.len() - 1] {
+                Value::Table(x) => *x,
+                _ => return Err(`line ${line}: ${k} is not a table`.to_string()),
+            },
+            Some(_) => return Err(`line ${line}: ${k} is not a table`.to_string()),
+            None => {
+                let n = Table::new();
+                t.put(k.as_str(), Value::Table(n), line);
+                n
+            }
+        };
+    }
+    Ok(t)
+}
+
+// key = v in t (a dotted key makes or extends tables on the way).
+fn insert(t: &mut Table, path: &Vec<String>, v: Value, line: u32) -> Result<(), String> {
+    let mut cur = t;
+    let mut i = 0;
+    while i + 1 < path.len() {
+        let k = path[i].as_str();
+        cur = match cur.get(k) {
+            Some(Value::Table(x)) => *x,
+            Some(_) => return Err(`line ${line}: ${k} is not a table`.to_string()),
+            None => {
+                let n = Table::new();
+                cur.put(k, Value::Table(n), line);
+                n
+            }
+        };
+        i += 1;
+    }
+    let k = path[path.len() - 1].as_str();
+    if cur.get(k).is_some() { return Err(`line ${line}: ${path.join(".")} defined twice`.to_string()); }
+    if let Value::Table(x) = v { x.explicit = true; }
+    cur.put(k, v, line);
+    Ok(())
+}
+
+struct Parser {
+    s: &[u8],
+    i: usize,
+    line: u32,
+}
+
+impl Parser {
+    fn err(&self, msg: &str) -> String { `line ${self.line}: ${msg}`.to_string() }
+
+    fn skip_space(&mut self) {
+        while self.i < self.s.len() && (self.s[self.i] == b' ' || self.s[self.i] == b'\t') { self.i += 1; }
+    }
+
+    fn skip_comment(&mut self) {
+        if self.i < self.s.len() && self.s[self.i] == b'#' {
+            while self.i < self.s.len() && self.s[self.i] != b'\n' { self.i += 1; }
+        }
+    }
+
+    // Spaces, comments and line ends.
+    fn skip_space_lines(&mut self) {
+        loop {
+            self.skip_space();
+            self.skip_comment();
+            if self.i < self.s.len() && (self.s[self.i] == b'\n' || self.s[self.i] == b'\r') {
+                if self.s[self.i] == b'\n' { self.line += 1; }
+                self.i += 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn end_of_line(&mut self) -> Result<(), String> {
+        self.skip_space();
+        self.skip_comment();
+        if self.i < self.s.len() && self.s[self.i] == b'\r' { self.i += 1; }
+        if self.i >= self.s.len() { return Ok(()); }
+        if self.s[self.i] != b'\n' { return Err(self.err("expected the end of the line")); }
+        Ok(())
+    }
+
+    fn expect(&mut self, c: u8) -> Result<(), String> {
+        if self.i < self.s.len() && self.s[self.i] == c {
+            self.i += 1;
+            return Ok(());
+        }
+        Err(self.err(`expected ${util_char(c)}`.to_string().as_str()))
+    }
+
+    // A key: bare or quoted parts joined by dots.
+    fn key(&mut self) -> Result<Vec<String>, String> {
+        let mut path: Vec<String> = Vec::new();
+        loop {
+            self.skip_space();
+            if self.i >= self.s.len() { return Err(self.err("expected a key")); }
+            let c = self.s[self.i];
+            if c == b'"' || c == b'\'' {
+                path.push(self.string()?);
+            } else {
+                let start = self.i;
+                while self.i < self.s.len() {
+                    let b = self.s[self.i];
+                    if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { break; }
+                    self.i += 1;
+                }
+                if self.i == start { return Err(self.err("expected a key")); }
+                path.push(String::from_utf8_lossy(&self.s[start..self.i]).to_string());
+            }
+            self.skip_space();
+            if self.i < self.s.len() && self.s[self.i] == b'.' {
+                self.i += 1;
+                continue;
+            }
+            return Ok(path);
+        }
+    }
+
+    fn value(&mut self) -> Result<Value, String> {
+        if self.i >= self.s.len() { return Err(self.err("expected a value")); }
+        let c = self.s[self.i];
+        if c == b'"' || c == b'\'' { return Ok(Value::Str(self.string()?)); }
+        if c == b'[' { return self.array(); }
+        if c == b'{' { return self.inline_table(); }
+        let start = self.i;
+        while self.i < self.s.len() {
+            let b = self.s[self.i];
+            if b == b',' || b == b']' || b == b'}' || b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' || b == b'#' { break; }
+            self.i += 1;
+        }
+        let word = String::from_utf8_lossy(&self.s[start..self.i]).to_string();
+        if word == "true" { return Ok(Value::Bool(true)); }
+        if word == "false" { return Ok(Value::Bool(false)); }
+        let digits = word.replace("_", "");
+        match digits.parse::<i64>() {
+            Ok(n) => Ok(Value::Int(n)),
+            Err(_) => Err(self.err(`unsupported value ${word} (strings, integers, booleans, arrays and tables)`.to_string().as_str())),
+        }
+    }
+
+    fn array(&mut self) -> Result<Value, String> {
+        self.i += 1;
+        let mut out: Vec<Value> = Vec::new();
+        loop {
+            self.skip_space_lines();
+            if self.i < self.s.len() && self.s[self.i] == b']' {
+                self.i += 1;
+                return Ok(Value::Array(out));
+            }
+            out.push(self.value()?);
+            self.skip_space_lines();
+            if self.i < self.s.len() && self.s[self.i] == b',' {
+                self.i += 1;
+                continue;
+            }
+            self.skip_space_lines();
+            self.expect(b']')?;
+            return Ok(Value::Array(out));
+        }
+    }
+
+    fn inline_table(&mut self) -> Result<Value, String> {
+        self.i += 1;
+        let t = Table::new();
+        self.skip_space();
+        if self.i < self.s.len() && self.s[self.i] == b'}' {
+            self.i += 1;
+            return Ok(Value::Table(t));
+        }
+        loop {
+            let line = self.line;
+            let path = self.key()?;
+            self.skip_space();
+            self.expect(b'=')?;
+            self.skip_space();
+            let v = self.value()?;
+            insert(t, &path, v, line)?;
+            self.skip_space();
+            if self.i < self.s.len() && self.s[self.i] == b',' {
+                self.i += 1;
+                continue;
+            }
+            self.expect(b'}')?;
+            return Ok(Value::Table(t));
+        }
+    }
+
+    // A basic ("...", with escapes) or literal ('...') string on one line.
+    fn string(&mut self) -> Result<String, String> {
+        let q = self.s[self.i];
+        self.i += 1;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            if self.i >= self.s.len() || self.s[self.i] == b'\n' { return Err(self.err("unterminated string")); }
+            let c = self.s[self.i];
+            self.i += 1;
+            if c == q { break; }
+            if c != b'\\' || q == b'\'' {
+                out.push(c);
+                continue;
+            }
+            if self.i >= self.s.len() { return Err(self.err("unterminated string")); }
+            let e = self.s[self.i];
+            self.i += 1;
+            match e {
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                b'n' => out.push(b'\n'),
+                b't' => out.push(b'\t'),
+                b'r' => out.push(b'\r'),
+                b'u' | b'U' => {
+                    let n = if e == b'u' { 4 } else { 8 };
+                    if self.i + n > self.s.len() { return Err(self.err("bad \\u escape")); }
+                    let hex = String::from_utf8_lossy(&self.s[self.i..self.i + n]).to_string();
+                    self.i += n;
+                    let ch = match u32::from_str_radix(hex.as_str(), 16) {
+                        Ok(v) => match char::from_u32(v) { Some(ch) => ch, None => return Err(self.err("bad \\u escape")) },
+                        Err(_) => return Err(self.err("bad \\u escape")),
+                    };
+                    let mut buf = String::new();
+                    buf.push(ch);
+                    out.extend_from_slice(buf.as_bytes());
+                }
+                _ => return Err(self.err(`unknown escape \\${util_char(e)}`.to_string().as_str())),
+            }
+        }
+        match String::from_utf8(out) {
+            Ok(s) => Ok(s),
+            Err(_) => Err(self.err("a string must be UTF-8")),
+        }
+    }
+}
+
+fn util_char(c: u8) -> String {
+    let mut s = String::new();
+    s.push(c as char);
+    s
+}
+
+/// A string as TOML writes it (a basic string).
+pub fn quote(s: &str) -> String {
+    let mut out = "\"".to_string();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tables_keys_and_values() {
+        let t = parse(r#"# a manifest
+[package]
+name = "app"   # comment
+
+[dependencies]
+foo = { path = "../foo" }
+baz.workspace = true
+"quoted key" = 'lit\n'
+
+[workspace]
+members = [
+    "app",       # the binary
+    "crates/*",
+]
+
+[workspace.dependencies]
+regex2 = { git = "https://x/r", tag = "v1.2.0" }
+
+[[git]]
+url = "a"
+
+[[git]]
+n = 1_000
+esc = "\"q\" é"
+"#).unwrap();
+        assert_eq(t.table("package").unwrap().str("name"), Some("app"));
+        let deps = t.table("dependencies").unwrap();
+        assert_eq(deps.table("foo").unwrap().str("path"), Some("../foo"));
+        assert(matches_bool(deps.table("baz").unwrap().get("workspace"), true));
+        assert_eq(deps.str("quoted key"), Some("lit\\n"));
+        assert_eq(deps.line("baz"), 7);
+        let ws = t.table("workspace").unwrap();
+        match ws.get("members") {
+            Some(Value::Array(a)) => assert_eq(a.len(), 2),
+            _ => panic("members"),
+        }
+        assert_eq(ws.table("dependencies").unwrap().table("regex2").unwrap().str("tag"), Some("v1.2.0"));
+        match t.get("git") {
+            Some(Value::Array(a)) => {
+                assert_eq(a.len(), 2);
+                match &a[1] {
+                    Value::Table(g) => {
+                        assert(matches(g.get("n"), 1000));
+                        assert_eq(g.str("esc"), Some("\"q\" é"));
+                    }
+                    _ => panic("git"),
+                }
+            }
+            _ => panic("git"),
+        }
+    }
+
+    fn matches_bool(v: Option<&Value>, want: bool) -> bool {
+        match v { Some(Value::Bool(b)) => *b == want, _ => false }
+    }
+
+    fn matches(v: Option<&Value>, want: i64) -> bool {
+        match v { Some(Value::Int(n)) => *n == want, _ => false }
+    }
+
+    #[test]
+    fn errors() {
+        assert_eq(parse("[a]\nx = 1\n[a]\n").err(), Some("line 3: table a defined twice".to_string()));
+        assert_eq(parse("x = 1\nx = 2\n").err(), Some("line 2: x defined twice".to_string()));
+        assert_eq(parse("x = 1.5\n").err(), Some("line 1: unsupported value 1.5 (strings, integers, booleans, arrays and tables)".to_string()));
+        assert_eq(parse("x = \"abc\n").err(), Some("line 1: unterminated string".to_string()));
+        assert_eq(parse("x = 1 y\n").err(), Some("line 1: expected the end of the line".to_string()));
+        assert(parse("[a.b]\nx = 1\n[a]\ny = 2\n").is_ok());
+    }
+
+    #[test]
+    fn quote_round_trips() {
+        let s = "a \"b\" \\ c\n";
+        assert_eq(parse(`x = ${quote(s)}\n`.to_string().as_str()).unwrap().str("x"), Some(s));
+    }
+}

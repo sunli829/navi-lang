@@ -119,8 +119,8 @@ fn exe_path() -> Option<String> {
 }
 fn crate_name(s: &str) -> String { s.replace('-', "_") }
 
-/// The crate at path: a directory with src/main.navi or src/lib.navi, or a
-/// single .navi file.
+/// The crate at path: a single .navi file, or the crate a directory is in
+/// (see project::find).
 pub fn load_crate(path: &str) -> Result<&mut CrateSpec, String> {
     let p = Path::new(path);
     if !p.exists() { return Err(`stat ${path}: no such file or directory`.to_string()); }
@@ -131,36 +131,10 @@ pub fn load_crate(path: &str) -> Result<&mut CrateSpec, String> {
         let dir = util::path_dir(path);
         return Ok(&mut CrateSpec { name, fs_root: dir.clone(), root: base, deps: Vec::new(), dir });
     }
-    let mut name = util::path_base(util::path_clean(path).as_str());
-    let toml = util::path_join(path, "navi.toml");
-    if let Ok(manifest) = std::fs::read_to_string(toml.as_str()) {
-        crate::cache::note(toml.as_str(), &manifest);
-        let n = package_name(manifest.as_str());
-        if n.len() > 0 { name = n; }
-    }
-    for root in ["src/main.navi", "src/lib.navi"].iter() {
-        if Path::new(util::path_join(path, *root).as_str()).exists() {
-            return Ok(&mut CrateSpec { name: crate_name(name.as_str()), fs_root: path.to_string(), root: root.to_string(), deps: Vec::new(), dir: path.to_string() });
-        }
-    }
-    Err(`${path}: no src/main.navi or src/lib.navi`.to_string())
-}
-
-// package_name reads name = "..." from the [package] table of navi.toml.
-fn package_name(manifest: &str) -> String {
-    let mut in_package = false;
-    for raw in manifest.lines() {
-        let line = raw.trim();
-        if line.starts_with("[") {
-            in_package = line == "[package]";
-            continue;
-        }
-        if !in_package { continue; }
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == "name" { return v.trim().trim_matches('"').to_string(); }
-        }
-    }
-    String::new()
+    let pr = crate::project::find(path)?;
+    if pr.selected.len() != 1 { return Err(`${path}: the root of a workspace: name one of its members (${crate::deps::member_names(pr)})`.to_string()); }
+    let m = pr.selected[0];
+    Ok(&mut CrateSpec { name: m.name.clone(), fs_root: m.dir.clone(), root: m.root.clone(), deps: Vec::new(), dir: m.dir.clone() })
 }
 
 static mut TIMINGS: bool = false;
@@ -361,97 +335,249 @@ pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, dwarf: 
 // Builds before 0.0.3 had a --release mode.
 const RELEASE_GONE: &str = "navi: there is no --release: navi has one build mode (as Go), with overflow always checked; -s leaves out the debugging information";
 
-/// navi build [-o output] [-s] [-c] [-a] [-timings] <crate or file>
-///
-/// There is one build mode (as Go): overflow is always checked. -s leaves
-/// out the debugging information (DWARF; as Go's -ldflags=-s); -c writes an
-/// object file; -a rebuilds even if the build cache has the output.
-pub fn build_command(args: &Vec<String>) -> i32 {
-    let mut out = String::new();
-    let mut strip = false;
-    let mut obj_only = false;
-    let mut force = false;
-    let mut paths: Vec<String> = Vec::new();
+/// What a command builds: a crate of the project a directory is in (or one
+/// .navi file alone), with the crates of its program.
+struct Unit {
+    name: String,
+    /// The crate's directory (a file's path): the build cache's key.
+    root: String,
+    specs: Vec<&CrateSpec>,
+    /// A program (src/main.navi, or a file).
+    bin: bool,
+    /// Where outputs go: the project's target/ (a file's: .).
+    out_dir: String,
+    member: Option<&crate::project::Member>,
+    /// The crate's directory relative to the project's root ("" at it).
+    rel: String,
+}
+
+// The units path (a .navi file or a directory) and -p package name.
+fn units(path: &str, package: &str) -> Result<Vec<&Unit>, String> {
+    if !Path::new(path).exists() { return Err(`${path}: no such file or directory`.to_string()); }
+    let mut out: Vec<&Unit> = Vec::new();
+    if !Path::new(path).is_dir() {
+        if package.len() > 0 { return Err("-p names a crate of a project, not a file".to_string()); }
+        let spec = load_crate(path)?;
+        let mut specs: Vec<&CrateSpec> = Vec::new();
+        specs.push(std_crate());
+        specs.push(spec);
+        out.push(&Unit { name: spec.name.clone(), root: path.to_string(), specs, bin: true, out_dir: ".".to_string(), member: None, rel: String::new() });
+        return Ok(out);
+    }
+    let p = crate::project::find(path)?;
+    let mut sel: Vec<&crate::project::Member> = Vec::new();
+    if package.len() > 0 {
+        match p.member(package) {
+            Some(m) => sel.push(m),
+            None => return Err(`no crate called ${package} in ${p.root} (${crate::deps::member_names(p)})`.to_string()),
+        }
+    } else {
+        sel = p.selected.clone();
+    }
+    let l = crate::deps::load_project(p, false, false)?;
+    for m in sel.iter() {
+        out.push(&Unit { name: m.name.clone(), root: m.dir.clone(), specs: crate::deps::program(l, *m), bin: m.is_bin(),
+            out_dir: util::path_join(p.root.as_str(), "target"), member: Some(*m), rel: relative(p.root.as_str(), m.dir.as_str()) });
+    }
+    Ok(out)
+}
+
+// dir relative to root, a directory at or below it ("" for root itself).
+fn relative(root: &str, dir: &str) -> String {
+    if dir == root { return String::new(); }
+    match dir.strip_prefix(`${root}/`.to_string().as_str()) { Some(r) => r.to_string(), None => dir.to_string() }
+}
+
+// The flags of build and run: what they set.
+struct BuildFlags {
+    out: String,
+    package: String,
+    strip: bool,
+    obj_only: bool,
+    force: bool,
+}
+
+// Parses build's (and run's) flags from args; the rest are positional.
+fn build_flags(args: &Vec<String>, rest: &mut Vec<String>) -> Result<&mut BuildFlags, i32> {
+    let f = &mut BuildFlags { out: String::new(), package: String::new(), strip: false, obj_only: false, force: false };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-o" => {
-                if i + 1 < args.len() {
-                    out = args[i + 1].clone();
-                    i += 1;
+            "-o" | "-p" | "--target" => {
+                if i + 1 >= args.len() {
+                    eprintln(`navi: ${args[i]} needs a value`);
+                    return Err(2);
                 }
-            }
-            "-s" => strip = true,
-            "--release" => { eprintln(RELEASE_GONE); return 2; }
-            "-c" => obj_only = true,
-            "-timings" => TIMINGS = true,
-            "-a" => force = true,
-            "--target" => {
-                if i + 1 < args.len() {
-                    if !set_target(args[i + 1].as_str()) {
-                        eprintln(`navi: unknown target ${args[i + 1]} (${known_targets()})`);
-                        return 2;
+                let v = args[i + 1].clone();
+                match args[i].as_str() {
+                    "-o" => f.out = v,
+                    "-p" => f.package = v,
+                    _ => {
+                        if !set_target(v.as_str()) {
+                            eprintln(`navi: unknown target ${v} (${known_targets()})`);
+                            return Err(2);
+                        }
                     }
-                    i += 1;
                 }
+                i += 1;
             }
-            _ => paths.push(args[i].clone()),
+            "-s" => f.strip = true,
+            "--release" => { eprintln(RELEASE_GONE); return Err(2); }
+            "-c" => f.obj_only = true,
+            "-timings" => TIMINGS = true,
+            "-a" => f.force = true,
+            "--" => {
+                // The rest is the program's (navi run).
+                for a in args[i..].iter() { rest.push(a.clone()); }
+                return Ok(f);
+            }
+            a => {
+                if a.starts_with("-") {
+                    eprintln(`navi: unknown flag ${a}`);
+                    return Err(2);
+                }
+                rest.push(args[i].clone());
+            }
         }
         i += 1;
     }
-    if paths.len() != 1 {
-        eprintln("usage: navi build [-o output] [-s] [--target os-arch] [-c] [-a] [-timings] <crate or file>");
+    Ok(f)
+}
+
+/// navi build [-p name] [-o output] [-s] [--target os-arch] [-c] [-a]
+/// [-timings] [dir or file]
+///
+/// Builds the crate the directory (default .) is in, or every member of a
+/// workspace at its root (-p: the member called name), or one .navi file.
+/// A program goes to the project's target/name (a file's to ./name), a
+/// library is checked. There is one build mode (as Go): overflow is always
+/// checked. -s leaves out the debugging information (DWARF; as Go's
+/// -ldflags=-s); -c writes an object file; -a rebuilds even if the build
+/// cache has the output.
+pub fn build_command(args: &Vec<String>) -> i32 {
+    let mut rest: Vec<String> = Vec::new();
+    let f = match build_flags(args, &mut rest) { Ok(f) => f, Err(c) => return c };
+    if rest.len() > 1 {
+        eprintln("usage: navi build [-p name] [-o output] [-s] [--target os-arch] [-c] [-a] [-timings] [dir or file]");
         return 2;
     }
-    let spec = match load_crate(paths[0].as_str()) {
-        Ok(s) => s,
+    let path = if rest.len() > 0 { rest[0].clone() } else { ".".to_string() };
+    let us = match units(path.as_str(), f.package.as_str()) {
+        Ok(u) => u,
         Err(e) => { eprintln(e); return 1; }
     };
+    let bins = us.iter().filter(|u| u.bin).count();
+    if f.out.len() > 0 && bins != 1 {
+        eprintln(`navi: -o names one output, and ${path} has ${bins} programs: choose one with -p`);
+        return 2;
+    }
+    let mut code = 0;
+    for u in us.iter() {
+        let r = if u.bin { build_unit(*u, f).map(|_| ()) } else { check_unit(*u) };
+        if let Err(e) = r {
+            if e.len() > 0 { eprintln(e); }
+            code = 1;
+        }
+    }
+    code
+}
+
+// Type-checks a library unit; its warnings printed.
+fn check_unit(u: &Unit) -> Result<(), String> {
+    let (_, errs) = check_specs(host_config(), &u.specs);
+    let (warnings, failed) = diagnostics(&errs);
+    if warnings.len() > 0 { eprintln(warnings); }
+    if failed { return Err(String::new()); }
+    Ok(())
+}
+
+// Builds a program unit (from the build cache if it has it); its output
+// file. An error already printed is "".
+fn build_unit(u: &Unit, f: &BuildFlags) -> Result<String, String> {
+    let mut out = f.out.clone();
     if out.len() == 0 {
         let win = target_os() == "windows";
-        out = if obj_only { `${spec.name}.${if win { "obj" } else { "o" }}`.to_string() } else if win { `${spec.name}.exe`.to_string() } else { spec.name.clone() };
+        let base = if f.obj_only { `${u.name}.${if win { "obj" } else { "o" }}`.to_string() } else if win { `${u.name}.exe`.to_string() } else { u.name.clone() };
+        if let Err(e) = std::fs::create_dir_all(u.out_dir.as_str()) { return Err(`${u.out_dir}: ${e}`.to_string()); }
+        out = util::path_join(u.out_dir.as_str(), base.as_str());
     }
     // The output's name is in a Mach-O executable (its code signature's
     // identifier).
-    let key = crate::cache::key(`${if obj_only { "obj" } else { "exe" }} strip=${strip} target=${target_name()} name=${util::path_base(out.as_str())}`.to_string().as_str(), paths[0].as_str());
+    let key = crate::cache::key(`${if f.obj_only { "obj" } else { "exe" }} strip=${f.strip} target=${target_name()} name=${util::path_base(out.as_str())}`.to_string().as_str(), u.root.as_str());
     if let Some(k) = key {
-        if !force && crate::cache::lookup(k.as_str(), out.as_str()) {
-            if !obj_only { chmod_x(out.as_str()); }
+        if !f.force && crate::cache::lookup(k.as_str(), out.as_str()) {
+            if !f.obj_only { chmod_x(out.as_str()); }
             phase("cached");
-            return 0;
+            return Ok(out);
         }
     }
-    let cfg = host_config();
-    let specs = match crate::deps::load_graph(paths[0].as_str(), false, false) {
-        Ok(s) => s,
-        Err(e) => { eprintln(e); return 1; }
-    };
-    let (info, errs) = check_specs(cfg, &specs);
+    let (info, errs) = check_specs(host_config(), &u.specs);
     let (warnings, failed) = diagnostics(&errs);
     if warnings.len() > 0 { eprintln(warnings); }
-    if failed { return 1; }
-    let main = match find_main(info, spec.name.as_str()) {
+    if failed { return Err(String::new()); }
+    let main = match find_main(info, u.name.as_str()) {
         Some(m) => m,
-        None => { eprintln(`${paths[0]}: no main function`); return 1; }
+        None => return Err(`${u.root}: no main function`.to_string()),
     };
-    if obj_only {
-        let r = match object(info, main_entry(main), !strip) {
-            Ok(data) => match std::fs::write(out.as_str(), data.as_slice()) { Ok(_) => Ok(()), Err(e) => Err(`${e}`.to_string()) },
-            Err(e) => Err(e),
-        };
-        if let Err(e) = r {
-            eprintln(e);
-            return 1;
-        }
-        if let Some(k) = key { crate::cache::store(k.as_str(), out.as_str(), warnings.as_str()); }
-        return 0;
-    }
-    if let Err(e) = native(info, main_entry(main), out.as_str(), !strip) {
-        eprintln(e);
-        return 1;
+    if f.obj_only {
+        let data = object(info, main_entry(main), !f.strip)?;
+        if let Err(e) = std::fs::write(out.as_str(), data.as_slice()) { return Err(`${out}: ${e}`.to_string()); }
+    } else {
+        native(info, main_entry(main), out.as_str(), !f.strip)?;
     }
     if let Some(k) = key { crate::cache::store(k.as_str(), out.as_str(), warnings.as_str()); }
-    0
+    Ok(out)
+}
+
+/// navi run [-p name] [-s] [--target os-arch] [dir or file] [-- args]:
+/// builds the program (as navi build) and runs it with args; its exit code.
+pub fn run_command(args: &Vec<String>) -> i32 {
+    let mut rest: Vec<String> = Vec::new();
+    let f = match build_flags(args, &mut rest) { Ok(f) => f, Err(c) => return c };
+    let mut prog_args: Vec<String> = Vec::new();
+    let mut pos: Vec<String> = Vec::new();
+    let mut after = false;
+    for a in rest.iter() {
+        if after { prog_args.push(a.clone()); } else if a == "--" { after = true; } else { pos.push(a.clone()); }
+    }
+    if pos.len() > 1 || f.out.len() > 0 || f.obj_only {
+        eprintln("usage: navi run [-p name] [-s] [dir or file] [-- arguments]");
+        return 2;
+    }
+    let path = if pos.len() > 0 { pos[0].clone() } else { ".".to_string() };
+    let us = match units(path.as_str(), f.package.as_str()) {
+        Ok(u) => u,
+        Err(e) => { eprintln(e); return 1; }
+    };
+    let bins: Vec<&Unit> = us.iter().filter(|u| u.bin).map(|u| *u).collect();
+    if bins.len() != 1 {
+        let names: Vec<String> = bins.iter().map(|u| u.name.clone()).collect();
+        eprintln(`navi: ${path} has ${bins.len()} programs${if names.len() > 0 { ` (${names.join(", ")}): choose one with -p`.to_string() } else { String::new() }}`);
+        return 1;
+    }
+    let mut u = *bins[0];
+    // A single file builds in a temporary directory (as go run).
+    let file_only = u.member.is_none();
+    let tmp = util::path_join(std::env::temp_dir().to_str().unwrap(), `navi-run-${std::process::id()}`.to_string().as_str());
+    if file_only {
+        let _ = std::fs::create_dir_all(tmp.as_str());
+        u.out_dir = tmp.clone();
+    }
+    let out = match build_unit(&u, f) {
+        Ok(o) => o,
+        Err(e) => {
+            if e.len() > 0 { eprintln(e); }
+            return 1;
+        }
+    };
+    let mut cmd = std::process::Command::new(out.as_str());
+    for a in prog_args.iter() { cmd.arg(a.as_str()); }
+    let st = cmd.status();
+    if file_only { let _ = std::fs::remove_dir_all(tmp.as_str()); }
+    match st {
+        Ok(s) => match s.code() { Some(c) => c, None => 1 },
+        Err(e) => { eprintln(`${out}: ${e}`); 1 }
+    }
 }
 
 /// Writes a new file at path (removing an old one first: macOS kills a
@@ -466,35 +592,108 @@ fn chmod_x(path: &str) {
     let _ = std::process::Command::new("chmod").arg("755").arg(path).status();
 }
 
-/// navi test|bench [crate or file] [filter]: builds the
-/// #[test] (or #[bench]) functions of the crate with cfg(test) into a
-/// harness and runs the ones whose name contains filter.
+/// navi test|bench [-p name] [dir or file] [filter]: builds the #[test]
+/// (or #[bench]) functions of each crate (as navi build chooses them) with
+/// cfg(test) into a harness and runs the ones whose name contains filter;
+/// then (navi test) each file of the crate's tests/ directory as a crate of
+/// its own (as Cargo's integration tests), using the crate if it is a
+/// library, with NAVI_BIN_EXE_name naming its program if it is one.
 pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
     let mut rest: Vec<String> = Vec::new();
-    for a in args.iter() {
-        match a.as_str() {
+    let mut package = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--release" => { eprintln(RELEASE_GONE); return 2; }
             "-timings" => TIMINGS = true,
-            _ => rest.push(a.clone()),
+            "-p" if i + 1 < args.len() => {
+                package = args[i + 1].clone();
+                i += 1;
+            }
+            _ => rest.push(args[i].clone()),
         }
+        i += 1;
     }
     let path = if rest.len() > 0 { rest[0].clone() } else { ".".to_string() };
-    let spec = match load_crate(path.as_str()) {
-        Ok(s) => s,
+    let filter = if rest.len() > 1 { rest[1].clone() } else { String::new() };
+    let us = match units(path.as_str(), package.as_str()) {
+        Ok(u) => u,
         Err(e) => { eprintln(e); return 1; }
     };
+    let mut code = 0;
+    for u in us.iter() {
+        let mut env: Vec<(String, String)> = Vec::new();
+        if let Some(p) = exe_path() { env.push(("NAVI".to_string(), p)); }
+        let label = match u.member { Some(m) => `unit tests ${util::path_join(u.rel.as_str(), m.root.as_str())}`.to_string(), None => u.root.clone() };
+        let c = run_harness(u.specs.clone(), u.name.as_str(), label.as_str(), filter.as_str(), bench, &env, u.member.is_some());
+        if c != 0 { code = c; }
+        if bench { continue; }
+        let m = match u.member { Some(m) => m, None => continue };
+        let files = test_files(m.dir.as_str());
+        if files.len() == 0 { continue; }
+        // The program for NAVI_BIN_EXE_name.
+        if m.is_bin() {
+            let f = &BuildFlags { out: String::new(), package: String::new(), strip: false, obj_only: false, force: false };
+            match build_unit(*u, f) {
+                Ok(out) => env.push((`NAVI_BIN_EXE_${m.manifest.name}`.to_string(), out)),
+                Err(e) => {
+                    if e.len() > 0 { eprintln(e); }
+                    code = 1;
+                    continue;
+                }
+            }
+        }
+        for file in files.iter() {
+            let stem = util::path_base(file.as_str());
+            let name = crate_name(&stem[0..stem.len() - 5]);
+            let mut specs: Vec<&CrateSpec> = Vec::new();
+            let mut deps: Vec<String> = Vec::new();
+            for s in u.specs.iter() {
+                // The crate itself only as a library; its dependencies too.
+                if s.name == u.name && !m.is_bin() { deps.push(`${u.name}=${u.name}`.to_string()); }
+                if s.name == u.name {
+                    for d in s.deps.iter() { deps.push(d.clone()); }
+                    if m.is_bin() { continue; }
+                }
+                specs.push(*s);
+            }
+            let tests_dir = util::path_join(m.dir.as_str(), "tests");
+            specs.push(&CrateSpec { name: name.clone(), fs_root: tests_dir.clone(), root: stem.clone(), deps, dir: tests_dir });
+            let c = run_harness(specs, name.as_str(), util::path_join(u.rel.as_str(), `tests/${stem}`.to_string().as_str()).as_str(), filter.as_str(), false, &env, true);
+            if c != 0 { code = c; }
+        }
+    }
+    code
+}
+
+// The .navi files of dir/tests (integration tests), sorted.
+fn test_files(dir: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let t = util::path_join(dir, "tests");
+    if let Ok(rd) = std::fs::read_dir(t.as_str()) {
+        for e in rd {
+            if let Ok(e) = e {
+                let n = e.file_name();
+                if n.ends_with(".navi") { out.push(util::path_join(t.as_str(), n.as_str())); }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+// Builds the harness of crate name (the last of specs) and runs it with
+// filter and env; its exit code. label names it in "Running" (on stderr,
+// as Cargo's), printed when several harnesses run.
+fn run_harness(specs: Vec<&CrateSpec>, name: &str, label: &str, filter: &str, bench: bool, env: &Vec<(String, String)>, announce: bool) -> i32 {
     let mut cfg = host_config();
     cfg.test = true;
-    let specs = match crate::deps::load_graph(path.as_str(), false, false) {
-        Ok(s) => s,
-        Err(e) => { eprintln(e); return 1; }
-    };
     let (info, errs) = check_specs(cfg, &specs);
     if report(&errs) { return 1; }
     let attr = if bench { "bench" } else { "test" };
     let mut fns: Vec<&mut resolve::Def> = Vec::new();
     for d in info.res.defs.iter() {
-        if d.krate.name != spec.name || d.kind != resolve::DEF_FN { continue; }
+        if d.krate.name != name || d.kind != resolve::DEF_FN { continue; }
         if let resolve::Node::Item(crate::syntax::ast::Item::Fn(fd)) = &d.node {
             if !types::collect::has_attr(&fd.base.attrs, attr) { continue; }
             let sig = info.fn_sig_of(*d);
@@ -512,16 +711,17 @@ pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
         }
     }
     let ext = if target_os() == "windows" { ".exe" } else { "" };
-    let exe = util::path_join(std::env::temp_dir().to_str().unwrap(), `navi-${attr}-${spec.name}${ext}`.to_string().as_str());
+    let exe = util::path_join(std::env::temp_dir().to_str().unwrap(), `navi-${attr}-${name}-${std::process::id()}${ext}`.to_string().as_str());
     let entry = &Entry { main: None, tests: fns, bench };
     if let Err(e) = native(info, entry, exe.as_str(), true) {
         eprintln(e);
         return 1;
     }
+    if announce { eprintln(`     Running ${label}`); }
     let mut cmd = std::process::Command::new(exe.as_str());
-    if rest.len() > 1 { cmd.arg(rest[1].as_str()); }
+    if filter.len() > 0 { cmd.arg(filter); }
     // The tests can build programs with navi (as Cargo sets CARGO).
-    if let Some(p) = exe_path() { cmd.env("NAVI", p.as_str()); }
+    for (k, v) in env.iter() { cmd.env(k.as_str(), v.as_str()); }
     let st = cmd.status();
     let _ = std::fs::remove_file(exe.as_str());
     match st {
@@ -530,11 +730,15 @@ pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
     }
 }
 
-/// navi update [crate]: resolves the git dependencies' tags again (and
-/// fetches them), rewriting navi.lock.
+/// navi update [dir]: resolves the git dependencies' tags again (and
+/// fetches them) for the whole project, rewriting navi.lock.
 pub fn update_command(args: &Vec<String>) -> i32 {
     let path = if args.len() > 0 { args[0].clone() } else { ".".to_string() };
-    match crate::deps::load_graph(path.as_str(), false, true) {
+    let p = match crate::project::find(path.as_str()) {
+        Ok(p) => p,
+        Err(e) => { eprintln(e); return 1; }
+    };
+    match crate::deps::load_project(p, false, true) {
         Ok(_) => 0,
         Err(e) => {
             eprintln(e);

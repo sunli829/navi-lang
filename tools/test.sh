@@ -208,4 +208,51 @@ else
 	echo "FAIL dependencies"; printf '%s\n' "$r1" "$locked" "$r2" "$r3" "$r4"; fail=1
 fi
 for f in tests/types/*/*.navi tests/check/*/*.navi; do front types-dump "$f"; done
+# The compiler's own unit tests (#[cfg(test)] modules).
+set +e
+got=$("$navi" test compiler 2>&1)
+code=$?
+set -e
+if [ "$code" = 0 ]; then echo "ok   navi test compiler ($(echo "$got" | tail -1))"; else echo "FAIL navi test compiler"; echo "$got" | grep -v '^ok ' | head -30; fail=1; fi
+# Projects (as Cargo's): navi new and init, navi.toml found from a
+# directory below, target/, navi run; a workspace with members by pattern,
+# an excluded crate, workspace dependencies, building and testing every
+# member at the root (unit and integration tests, NAVI_BIN_EXE_name), -p.
+pj=$tmp/projects
+mkdir -p "$pj"
+pr() { (cd "$pj/$1" && shift && "$navi" "$@" 2>&1); }
+p_ok=1
+p_fail() { echo "FAIL projects: $*"; p_ok=0; fail=1; }
+pr . new --vcs none one > /dev/null || p_fail "navi new"
+printf 'fn main() {\n    let a: Vec<String> = std::env::args().collect();\n    println(`args ${a[1..].join(" ")}`);\n    std::process::exit(3);\n}\n' > "$pj/one/src/main.navi"
+pr one/src build > /dev/null || p_fail "build below the crate"
+[ -x "$pj/one/target/one" ] || [ -f "$pj/one/target/one.exe" ] || p_fail "no target/one"
+set +e
+r=$(pr one run -- x y); c=$?
+set -e
+[ "$r" = "args x y" ] && [ "$c" = 3 ] || p_fail "navi run: $r ($c)"
+mkdir -p "$pj/none/src" && printf 'fn main() {}\n' > "$pj/none/src/main.navi"
+case "$(pr none build)" in *"could not find navi.toml"*) ;; *) p_fail "a directory without navi.toml" ;; esac
+mkdir -p "$pj/ws"
+printf '[workspace]\nmembers = [\n    "app",\n]\nexclude = ["crates/old"]\n\n[workspace.dependencies]\nutil = { path = "crates/util" }\n' > "$pj/ws/navi.toml"
+pr ws new --vcs none app > /dev/null && pr ws new --vcs none --lib crates/util > /dev/null || p_fail "navi new in a workspace"
+grep -q '"crates/util",' "$pj/ws/navi.toml" || p_fail "new did not add the member: $(cat "$pj/ws/navi.toml")"
+printf '\nutil = { workspace = true }\n' >> "$pj/ws/app/navi.toml"
+printf 'fn main() { println(`twice ${util::twice(21)}`); }\n#[test]\nfn unit() { assert_eq(util::twice(2), 4); }\n' > "$pj/ws/app/src/main.navi"
+mkdir -p "$pj/ws/app/tests" "$pj/ws/crates/util/tests"
+printf '#[test]\nfn runs_the_program() {\n    let out = std::process::Command::new(std::env::var("NAVI_BIN_EXE_app").unwrap()).output().unwrap();\n    assert_eq(String::from_utf8(out.stdout).unwrap(), "twice 42\\n");\n}\n' > "$pj/ws/app/tests/cli.navi"
+printf 'pub fn twice(x: i32) -> i32 { x * 2 }\n' > "$pj/ws/crates/util/src/lib.navi"
+printf 'use util::twice;\n#[test]\nfn from_outside() { assert_eq(twice(5), 10); }\n' > "$pj/ws/crates/util/tests/api.navi"
+mkdir -p "$pj/ws/crates/old/src" && printf '[package]\nname = "old"\n' > "$pj/ws/crates/old/navi.toml" && printf 'fn main() {}\n' > "$pj/ws/crates/old/src/main.navi"
+pr ws build > /dev/null || p_fail "build the workspace"
+[ "$(pr ws run)" = "twice 42" ] || p_fail "run in the workspace"
+r=$(pr ws test)
+[ "$(echo "$r" | grep -c '1 passed, 0 failed')" = 3 ] || p_fail "test the workspace: $r"
+[ "$(echo "$r" | grep -c 'Running')" = 4 ] || p_fail "test the workspace: $r"
+case "$(pr ws build -p nope)" in *"no crate called nope"*) ;; *) p_fail "-p nope" ;; esac
+pr ws/crates/old build > /dev/null || p_fail "an excluded crate builds alone"
+[ -f "$pj/ws/crates/old/target/old" ] || [ -f "$pj/ws/crates/old/target/old.exe" ] || p_fail "no target of the excluded crate"
+mkdir -p "$pj/ws/stray/src" && printf '[package]\nname = "stray"\n' > "$pj/ws/stray/navi.toml" && printf 'fn main() {}\n' > "$pj/ws/stray/src/main.navi"
+case "$(pr ws/stray build)" in *"not one of its members"*) ;; *) p_fail "a crate below a workspace, not a member" ;; esac
+[ "$p_ok" = 1 ] && echo "ok   projects"
 exit $fail

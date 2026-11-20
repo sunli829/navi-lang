@@ -294,13 +294,17 @@ match name { "admin" => ..., _ => ... }     // 字符串字面量模式
 
 ```
 myapp/
-  navi.toml              # [package] name = "myapp"；[dependencies] ...
+  navi.toml              # [package] name = "myapp"；[dependencies] ...（必须有）
+  navi.lock              # git 依赖的 commit（navi 写）
+  target/                # 构建输出（navi build 写到 target/myapp）
   src/
     main.navi            # 二进制 crate 的根（库 crate 是 src/lib.navi）
     parser.navi          # mod parser;
     parser/
       lexer.navi         # 在 parser.navi 里写 mod lexer;
       ast.navi
+  tests/
+    cli.navi             # 集成测试：每个文件单独编译，可以 use 本 crate（库）
 ```
 
 ```rust
@@ -328,8 +332,32 @@ pub use crate::parser::Ast;                 // 重新导出
   - 键名就是代码里用的名字（`use bar::...`），可以和依赖自己的包名不同；依赖必须是库 crate（`src/lib.navi`），依赖的依赖按它自己的 `navi.toml` 递归加载，路径相对于写它的 crate
   - 依赖以源码形式和程序一起编译（同 Go），没有二进制库
   - 同一个仓库的不同版本可以同时存在（同 Cargo）：它们是不同的 crate，类型互不相同；报错时第二个版本显示为 `bar@v1.3.0`
-  - git 依赖解析到的 commit 记在根 crate 旁边的 `navi.lock` 里，应提交进仓库：tag 被挪动也不改变构建；`navi update` 重新解析所有 tag
+  - git 依赖解析到的 commit 记在项目根目录（workspace 的根目录）的 `navi.lock` 里，应提交进仓库：tag 被挪动也不改变构建；`navi update` 重新解析所有 tag
+  - 也可以写 `{ workspace = true }`，从 workspace 的 `[workspace.dependencies]` 继承（见下）；不支持 Cargo 那样从 registry 取版本（`foo = "1.0"`）
   - `navi build` 和 `navi test` 会自动拉取缺少的依赖（需要装有 git），检出放在缓存目录的 `pkg/` 下（或 `NAVI_PKG`），所有项目共用；语言服务器只用已经拉取的
+- **项目**（同 Cargo）：
+  - 一个 crate 就是一个带 `navi.toml` 的目录，`[package]` 的 `name` 必填（字母、数字、`_`、`-`，不以数字开头；代码里 `-` 写成 `_`）。navi 从当前目录（或命令给的目录）往上找最近的 `navi.toml`
+  - 单个 `.navi` 文件不需要 `navi.toml`，可以直接 `navi build x.navi` / `navi run x.navi` / `navi test x.navi`（同 `go run x.go`），但不能有依赖
+  - `navi new 名字` / `navi init`（`--lib` 建库，`--vcs none` 不建 git 仓库）创建 crate：`navi.toml`、`src/main.navi`（或 `src/lib.navi`）、`.gitignore`，不在 git 仓库里时 `git init`
+  - `navi build` 把程序写到项目根目录的 `target/名字`（`-o` 另指），库只做检查；`navi run [-- 参数]` 构建并运行；`navi test` 运行单元测试（`#[test]`）和 `tests/*.navi` 集成测试：集成测试每个文件是一个单独的 crate，能用本 crate 的依赖，本 crate 是库时还能 `use` 它，是程序时环境变量 `NAVI_BIN_EXE_名字` 是它的路径（同 Cargo 的 `CARGO_BIN_EXE_`）
+- **workspace**（同 Cargo）：根目录的 `navi.toml` 写 `[workspace]`：
+
+  ```toml
+  [workspace]
+  members = ["app", "crates/*"]      # * 匹配一段路径里的任意字符
+  exclude = ["crates/old"]
+
+  [workspace.dependencies]
+  regex2 = { git = "https://github.com/x/regex2", tag = "v1.2.0" }
+  util = { path = "crates/util" }    # 路径相对于 workspace 根目录
+  ```
+
+  - 成员的 `navi.toml` 写 `regex2 = { workspace = true }`，版本只在根目录写一次
+  - 整个 workspace 共用根目录的一个 `navi.lock` 和 `target/`
+  - 在根目录运行 `navi build` / `navi test` 处理全部成员，`-p 名字` 选一个；在成员目录（或它下面）运行只处理这个成员
+  - 根目录可以只有 `[workspace]`，也可以同时有 `[package]`，自己也是一个成员
+  - 在 workspace 下面、但既不在 `members` 也不在 `exclude` 里的 crate 是错误；`navi new` 在 workspace 里创建 crate 时把它加进 `members`
+  - git 依赖的仓库本身是 workspace 时，用其中和键名同名的成员（同 Cargo）
 - **为了编译速度**（crate 粒度比 Go 的包粗，所以 crate 内部也要并行）：
   - crate 内所有文件并行解析
   - 先收集所有条目的签名，再并行检查各个函数体

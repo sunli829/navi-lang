@@ -1,0 +1,269 @@
+//! Projects, as Cargo's: the crate (or workspace) a directory is in is the
+//! nearest directory at or above it with a navi.toml; a crate in a
+//! workspace is one of the [workspace] members of a navi.toml above it.
+//! The project's root (the workspace's, else the crate's directory) holds
+//! navi.lock and target/.
+
+use crate::manifest::{self, Manifest, Workspace};
+use crate::util;
+
+/// A crate of the project.
+pub struct Member {
+    /// Its directory (canonical).
+    pub dir: String,
+    pub manifest: &Manifest,
+    /// The crate's name (the package name, - as _).
+    pub name: String,
+    /// src/main.navi (a program) or src/lib.navi (a library).
+    pub root: String,
+}
+
+impl Member {
+    pub fn is_bin(&self) -> bool { self.root == "src/main.navi" }
+}
+
+pub struct Project {
+    /// The workspace's directory, else the crate's (canonical).
+    pub root: String,
+    pub members: Vec<&Member>,
+    /// The members the directory named: the crate it is in, or all of a
+    /// workspace at its root.
+    pub selected: Vec<&Member>,
+}
+
+impl Project {
+    /// The member called name (the package or crate name).
+    pub fn member(&self, name: &str) -> Option<&Member> {
+        for m in self.members.iter() {
+            if m.manifest.name == name || m.name == name { return Some(*m); }
+        }
+        None
+    }
+
+    pub fn member_at(&self, dir: &str) -> Option<&Member> {
+        for m in self.members.iter() {
+            if m.dir == dir { return Some(*m); }
+        }
+        None
+    }
+}
+
+/// The canonical path of an existing directory (links resolved, C:/dir).
+pub fn canonical(p: &str) -> Result<String, String> {
+    match std::fs::canonicalize(p) {
+        Ok(c) => match c.to_str() {
+            Some(s) => Ok(util::path_clean(util::without_verbatim(s).as_str())),
+            None => Err(`${p}: not a UTF-8 path`.to_string()),
+        },
+        Err(e) => Err(`${p}: ${e}`.to_string()),
+    }
+}
+
+/// The project dir is in.
+pub fn find(dir: &str) -> Result<&Project, String> {
+    let start = canonical(dir)?;
+    let mut d = start.clone();
+    let m = loop {
+        if let Some(m) = manifest::load(d.as_str())? { break m; }
+        let up = util::path_dir(d.as_str());
+        if up == d { return Err(`could not find navi.toml in ${start} or any directory above it (navi new or navi init makes one)`.to_string()); }
+        d = up;
+    };
+    if let Some(w) = m.workspace {
+        let members = members_of(d.as_str(), m, w)?;
+        // Below the root: the member the directory is in, if any.
+        for mem in members.iter() {
+            if mem.dir != d && (start == mem.dir || start.starts_with(`${mem.dir}/`.to_string().as_str())) {
+                let mut sel: Vec<&Member> = Vec::new();
+                sel.push(*mem);
+                return Ok(&Project { root: d, members, selected: sel });
+            }
+        }
+        return Ok(&Project { root: d.clone(), members: members.clone(), selected: members });
+    }
+    let me = member(d.as_str(), m)?;
+    if let Some((root, rm, w)) = workspace_of(d.as_str())? {
+        let members = members_of(root.as_str(), rm, w)?;
+        for mem in members.iter() {
+            if mem.dir == d {
+                let mut sel: Vec<&Member> = Vec::new();
+                sel.push(*mem);
+                return Ok(&Project { root, members, selected: sel });
+            }
+        }
+    }
+    let mut ms: Vec<&Member> = Vec::new();
+    ms.push(me);
+    Ok(&Project { root: d, members: ms.clone(), selected: ms })
+}
+
+/// The workspace the crate in dir belongs to: the nearest navi.toml above
+/// it with [workspace] (its directory, manifest and table), if that lists
+/// dir as a member. One that does not (and does not exclude it) is an
+/// error, as in Cargo.
+pub fn workspace_of(dir: &str) -> Result<Option<(String, &Manifest, &Workspace)>, String> {
+    let mut d = util::path_dir(dir);
+    loop {
+        if let Some(m) = manifest::load(d.as_str())? {
+            if let Some(w) = m.workspace {
+                for e in w.exclude.iter() {
+                    let x = util::path_join(d.as_str(), e.as_str());
+                    if dir == x || dir.starts_with(`${x}/`.to_string().as_str()) { return Ok(None); }
+                }
+                for md in member_dirs(d.as_str(), w)?.iter() {
+                    if *md == dir { return Ok(Some((d, m, w))); }
+                }
+                return Err(`${dir}: the crate is below the workspace at ${d} but not one of its members (add it to members or exclude in ${m.file})`.to_string());
+            }
+        }
+        let up = util::path_dir(d.as_str());
+        if up == d { return Ok(None); }
+        d = up;
+    }
+}
+
+/// The crate in dir (canonical), which must have a navi.toml with
+/// [package].
+pub fn crate_at(dir: &str) -> Result<&Member, String> {
+    match manifest::load(dir)? {
+        Some(m) => member(dir, m),
+        None => Err(`${dir}: no navi.toml`.to_string()),
+    }
+}
+
+/// The crate called name in the repository checked out at dir: the one at
+/// its root, else the workspace member of that name (as Cargo finds a
+/// package in a git repository).
+pub fn package_in(dir: &str, name: &str) -> Result<String, String> {
+    let m = match manifest::load(dir)? {
+        Some(m) => m,
+        None => return Err(`${dir}: no navi.toml`.to_string()),
+    };
+    let want = name.replace("-", "_");
+    if m.name.len() > 0 && (m.workspace.is_none() || m.name.replace("-", "_") == want) { return Ok(dir.to_string()); }
+    if let Some(w) = m.workspace {
+        for mem in members_of(dir, m, w)?.iter() {
+            if mem.name == want { return Ok(mem.dir.clone()); }
+        }
+        return Err(`${dir}: the workspace has no member called ${name}`.to_string());
+    }
+    Err(`${m.file}: no [package]`.to_string())
+}
+
+// The crate in dir (its navi.toml m has [package]).
+fn member(dir: &str, m: &Manifest) -> Result<&Member, String> {
+    if m.name.len() == 0 { return Err(`${m.file}: no [package] (a crate needs [package] name = "...")`.to_string()); }
+    for root in ["src/main.navi", "src/lib.navi"].iter() {
+        if std::path::Path::new(util::path_join(dir, *root).as_str()).exists() {
+            return Ok(&Member { dir: dir.to_string(), manifest: m, name: m.name.replace("-", "_"), root: root.to_string() });
+        }
+    }
+    Err(`${dir}: no src/main.navi or src/lib.navi`.to_string())
+}
+
+// The members of the workspace at root (the root itself first if it is a
+// crate too); two with one name are an error.
+fn members_of(root: &str, rm: &Manifest, w: &Workspace) -> Result<Vec<&Member>, String> {
+    let mut out: Vec<&Member> = Vec::new();
+    if rm.name.len() > 0 { out.push(member(root, rm)?); }
+    for d in member_dirs(root, w)?.iter() {
+        if *d == root { continue; }
+        let m = match manifest::load(d.as_str())? {
+            Some(m) => m,
+            None => return Err(`${rm.file}: member ${d} has no navi.toml`.to_string()),
+        };
+        let mem = member(d.as_str(), m)?;
+        for o in out.iter() {
+            if o.name == mem.name { return Err(`${rm.file}: two members are called ${mem.manifest.name} (${o.dir} and ${mem.dir})`.to_string()); }
+        }
+        out.push(mem);
+    }
+    Ok(out)
+}
+
+// The directories members names (with * matching within a path segment),
+// less those exclude names, canonical and sorted per pattern.
+fn member_dirs(root: &str, w: &Workspace) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for pat in w.members.iter() {
+        let mut found = expand(root, pat.as_str())?;
+        found.sort();
+        if found.len() == 0 && !pat.contains("*") { return Err(`${root}/navi.toml: member ${pat} does not exist`.to_string()); }
+        for d in found.iter() {
+            let c = canonical(d.as_str())?;
+            let mut excluded = false;
+            for e in w.exclude.iter() {
+                let x = util::path_join(root, e.as_str());
+                if c == x || c.starts_with(`${x}/`.to_string().as_str()) { excluded = true; }
+            }
+            if !excluded && !out.contains(&c) { out.push(c); }
+        }
+    }
+    Ok(out)
+}
+
+// The directories with a navi.toml that pattern names below root.
+fn expand(root: &str, pattern: &str) -> Result<Vec<String>, String> {
+    let mut dirs: Vec<String> = Vec::new();
+    dirs.push(root.to_string());
+    for seg in pattern.split('/') {
+        if seg.len() == 0 || seg == "." { continue; }
+        let mut next: Vec<String> = Vec::new();
+        for d in dirs.iter() {
+            if !seg.contains("*") {
+                let p = util::path_join(d.as_str(), seg);
+                if std::path::Path::new(p.as_str()).is_dir() { next.push(p); }
+                continue;
+            }
+            let rd = match std::fs::read_dir(d.as_str()) { Ok(r) => r, Err(_) => continue };
+            for e in rd {
+                let e = match e { Ok(e) => e, Err(_) => continue };
+                let name = e.file_name();
+                let p = util::path_join(d.as_str(), name.as_str());
+                if !name.starts_with(".") && glob(seg, name.as_str()) && std::path::Path::new(p.as_str()).is_dir() { next.push(p); }
+            }
+        }
+        dirs = next;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for d in dirs.iter() {
+        if std::path::Path::new(util::path_join(d.as_str(), "navi.toml").as_str()).exists() { out.push(d.clone()); }
+    }
+    Ok(out)
+}
+
+// Whether name matches pattern, * standing for any characters.
+fn glob(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 { return pattern == name; }
+    if !name.starts_with(parts[0]) || !name.ends_with(parts[parts.len() - 1]) { return false; }
+    let mut at = parts[0].len();
+    let end = name.len() - parts[parts.len() - 1].len();
+    if at > end { return false; }
+    let mut i = 1;
+    while i + 1 < parts.len() {
+        match name[at..end].find(parts[i]) {
+            Some(k) => at += k + parts[i].len(),
+            None => return false,
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glob;
+
+    #[test]
+    fn globs() {
+        assert(glob("*", "abc"));
+        assert(glob("a*", "abc"));
+        assert(glob("*c", "abc"));
+        assert(glob("a*c", "abc"));
+        assert(glob("a*b*c", "aXbYc"));
+        assert(!glob("a*b*c", "aXc"));
+        assert(!glob("ab*", "a"));
+        assert(glob("abc", "abc"));
+    }
+}

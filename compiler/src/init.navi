@@ -1,0 +1,207 @@
+//! navi new and navi init, as cargo new and cargo init: a navi.toml, a
+//! src/main.navi (or with --lib a src/lib.navi), a .gitignore and a git
+//! repository (not inside one already, nor with --vcs none). A crate made
+//! below a workspace is added to its members.
+
+use crate::util;
+
+/// navi new [--lib] [--vcs git|none] [--name name] <path>
+pub fn new_command(args: &Vec<String>) -> i32 { make(args, true) }
+
+/// navi init [--lib] [--vcs git|none] [--name name] [path]
+pub fn init_command(args: &Vec<String>) -> i32 { make(args, false) }
+
+fn make(args: &Vec<String>, new: bool) -> i32 {
+    let cmd = if new { "new" } else { "init" };
+    let usage = `usage: navi ${cmd} [--lib] [--vcs git|none] [--name name] ${if new { "<path>" } else { "[path]" }}`.to_string();
+    let mut lib = false;
+    let mut vcs = true;
+    let mut name = String::new();
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--lib" => lib = true,
+            "--bin" => lib = false,
+            "--vcs" | "--name" if i + 1 < args.len() => {
+                let v = args[i + 1].clone();
+                if args[i] == "--name" {
+                    name = v;
+                } else if v == "none" {
+                    vcs = false;
+                } else if v != "git" {
+                    eprintln(`navi ${cmd}: --vcs is git or none`);
+                    return 2;
+                }
+                i += 1;
+            }
+            a => {
+                if a.starts_with("-") {
+                    eprintln(usage);
+                    return 2;
+                }
+                paths.push(args[i].clone());
+            }
+        }
+        i += 1;
+    }
+    if paths.len() > 1 || new && paths.len() == 0 {
+        eprintln(usage);
+        return 2;
+    }
+    let path = if paths.len() > 0 { paths[0].clone() } else { ".".to_string() };
+    match create(path.as_str(), new, lib, vcs, name.as_str()) {
+        Ok(msg) => {
+            eprintln(msg);
+            0
+        }
+        Err(e) => {
+            eprintln(`navi ${cmd}: ${e}`);
+            1
+        }
+    }
+}
+
+fn exists(p: &str) -> bool { std::path::Path::new(p).exists() }
+
+// Makes the crate at path; what it made.
+fn create(path: &str, new: bool, lib: bool, vcs: bool, name0: &str) -> Result<String, String> {
+    let base = if new { util::path_base(util::path_clean(path).as_str()) } else { String::new() };
+    if new && name0.len() == 0 && !crate::manifest::valid_name(base.as_str()) { return Err(bad_name(base.as_str())); }
+    if new {
+        if exists(path) { return Err(`${path} already exists`.to_string()); }
+        if let Err(e) = std::fs::create_dir_all(path) { return Err(`${path}: ${e}`.to_string()); }
+    } else if !std::path::Path::new(path).is_dir() {
+        return Err(`${path} is not a directory`.to_string());
+    }
+    let dir = crate::project::canonical(path)?;
+    let toml = util::path_join(dir.as_str(), "navi.toml");
+    if exists(toml.as_str()) { return Err(`${toml} already exists`.to_string()); }
+    let name = if name0.len() > 0 { name0.to_string() } else { util::path_base(dir.as_str()) };
+    if !crate::manifest::valid_name(name.as_str()) { return Err(bad_name(name.as_str())); }
+    // The workspace above, checked before anything is written.
+    let ws = workspace_above(dir.as_str())?;
+    write_new(toml.as_str(), `[package]\nname = ${crate::toml::quote(name.as_str())}\n\n[dependencies]\n`.to_string().as_str())?;
+    let src = util::path_join(dir.as_str(), "src");
+    if let Err(e) = std::fs::create_dir_all(src.as_str()) { return Err(`${src}: ${e}`.to_string()); }
+    // navi init keeps the sources there are (and takes a library for one).
+    let main = util::path_join(src.as_str(), "main.navi");
+    let librs = util::path_join(src.as_str(), "lib.navi");
+    let is_lib = if exists(main.as_str()) { false } else if exists(librs.as_str()) { true } else { lib };
+    if is_lib && !exists(librs.as_str()) {
+        write_new(librs.as_str(), LIB_TEMPLATE)?;
+    } else if !is_lib && !exists(main.as_str()) {
+        write_new(main.as_str(), MAIN_TEMPLATE)?;
+    }
+    let mut notes = String::new();
+    if let Some((root, file)) = ws {
+        if add_member(root.as_str(), file.as_str(), dir.as_str())? { notes.push_str(`\nadded to the members of ${file}`.to_string().as_str()); }
+    } else if vcs && !in_git(dir.as_str()) {
+        git_init(dir.as_str())?;
+    }
+    if vcs {
+        let gi = util::path_join(dir.as_str(), ".gitignore");
+        if !exists(gi.as_str()) { write_new(gi.as_str(), "/target\n")?; }
+    }
+    Ok(`created ${if is_lib { "library" } else { "binary (application)" }} ${name}${notes}`.to_string())
+}
+
+fn bad_name(name: &str) -> String {
+    `${util::quote(name)} is not a crate name (letters, digits, _ and - only, not starting with a digit; --name sets another)`.to_string()
+}
+
+const MAIN_TEMPLATE: &str = "fn main() {\n    println(\"Hello, world!\");\n}\n";
+
+const LIB_TEMPLATE: &str = "pub fn add(left: u64, right: u64) -> u64 {\n    left + right\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn it_works() {\n        let result = add(2, 2);\n        assert_eq(result, 4);\n    }\n}\n";
+
+fn write_new(path: &str, text: &str) -> Result<(), String> {
+    match std::fs::write(path, text.as_bytes()) { Ok(_) => Ok(()), Err(e) => Err(`${path}: ${e}`.to_string()) }
+}
+
+// The workspace above dir that does not exclude it: its root and
+// navi.toml.
+fn workspace_above(dir: &str) -> Result<Option<(String, String)>, String> {
+    let mut d = util::path_dir(dir);
+    loop {
+        if let Some(m) = crate::manifest::load(d.as_str())? {
+            if let Some(w) = m.workspace {
+                for e in w.exclude.iter() {
+                    let x = util::path_join(d.as_str(), e.as_str());
+                    if dir == x || dir.starts_with(`${x}/`.to_string().as_str()) { return Ok(None); }
+                }
+                return Ok(Some((d, m.file.clone())));
+            }
+        }
+        let up = util::path_dir(d.as_str());
+        if up == d { return Ok(None); }
+        d = up;
+    }
+}
+
+// Adds dir to the members of the workspace at root unless they name it
+// already; whether it did.
+fn add_member(root: &str, file: &str, dir: &str) -> Result<bool, String> {
+    if let Ok(Some(_)) = crate::project::workspace_of(dir) { return Ok(false); }
+    let rel = match dir.strip_prefix(`${root}/`.to_string().as_str()) { Some(r) => r.to_string(), None => return Ok(false) };
+    let text = match std::fs::read_to_string(file) { Ok(t) => t, Err(e) => return Err(`${file}: ${e}`.to_string()) };
+    let t = match crate::toml::parse(text.as_str()) { Ok(t) => t, Err(e) => return Err(`${file}: ${e}`.to_string()) };
+    let w = t.table("workspace").unwrap();
+    let item = crate::toml::quote(rel.as_str());
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let at = w.line("members") as usize;
+    if at == 0 {
+        // members = [...] after the [workspace] line.
+        let mut i = 0;
+        while i < lines.len() && lines[i].trim() != "[workspace]" { i += 1; }
+        if i == lines.len() { return Err(`${file}: cannot find [workspace] to add ${rel} to (add it to members)`.to_string()); }
+        lines.insert(i + 1, `members = [${item}]`.to_string());
+    } else {
+        // Before the array's ], on its line or the line of its own.
+        let mut i = at - 1;
+        loop {
+            if i >= lines.len() { return Err(`${file}: cannot find the end of members (add ${rel} to it)`.to_string()); }
+            if let Some(k) = closing(lines[i].as_str()) {
+                let before = lines[i][0..k].trim_end().to_string();
+                if before.trim().len() == 0 && i + 1 > at {
+                    // ] on a line of its own: a line before it.
+                    lines.insert(i, `    ${item},`.to_string());
+                } else {
+                    let sep = if before.ends_with("[") { "" } else if before.ends_with(",") { " " } else { ", " };
+                    lines[i] = `${before}${sep}${item}${&lines[i][k..]}`.to_string();
+                }
+                break;
+            }
+            i += 1;
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    write_new(file, out.as_str())?;
+    Ok(true)
+}
+
+// The index of the first ] outside strings on line (not after a #).
+fn closing(line: &str) -> Option<usize> {
+    let mut in_str = false;
+    for (i, c) in line.char_indices() {
+        if c == '"' { in_str = !in_str; }
+        if !in_str && c == '#' { return None; }
+        if !in_str && c == ']' { return Some(i); }
+    }
+    None
+}
+
+fn in_git(dir: &str) -> bool {
+    match std::process::Command::new("git").arg("-C").arg(dir).arg("rev-parse").arg("--is-inside-work-tree").output() {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn git_init(dir: &str) -> Result<(), String> {
+    match std::process::Command::new("git").arg("init").arg("-q").arg(dir).output() {
+        Ok(o) => if o.status.success() { Ok(()) } else { Err(`git init: ${String::from_utf8_lossy(o.stderr.as_slice()).trim()}`.to_string()) },
+        // No git: no repository (as cargo without git).
+        Err(_) => Ok(()),
+    }
+}
