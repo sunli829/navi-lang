@@ -426,7 +426,11 @@
 1. 冷编译提速：剩下的串行部分（plan 的按序遍历、codegen 合并之后的 gen_data、链接）；GC 标记占约四分之一 CPU（保守扫描，生成的代码不做寄存器分配）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。
 2. 运行时：每个 M 的运行队列、基于信号的抢占、栈收缩、最后一次 STW 的并行排空。
 3. DWARF 的变量和类型信息；PE 的调试信息（现在只有 Mach-O 和 ELF 带 DWARF）。
-4. v0.0.2：
-   - 依赖：`navi.toml` 的 `[dependencies]`，本地路径或 git 仓库（用 tag 指定版本），以源码编译（同 Go）。
-   - `navic` 改名为 `navi`（它不只是编译器，还有 test、fmt、lsp 等）；`tools/bootstrap.sh` 要认得 v0.0.1 包里的 `bin/navic`。
-   - 测试改成自检：`tests/run` 的 95 个用例只有 5 个用断言，其余靠 `// out:` 注释比对输出（为了同一程序在 stage0 解释器、原生后端和 navic 上对照，这个理由已经不在了）。大部分改成 `#[test]` 加 `assert_eq`，用 `navi test` 运行；只有输出本身就是被测对象的（格式化、panic 信息和退出码、警告和编译错误）保留输出比对。顺带检查断言失败时的信息（调用位置、两边的值）。
+4. v0.0.2：依赖、改名 `navi`、自检测试都已完成（见上），另外做了模板字符串总是 `fmt::Arguments`、`assert_eq` 两边可以不同类型、std 约束的 `where` 写法。剩下打 tag 发布。
+5. v0.0.3（项目管理，照 Cargo；构建模式照 Go）：
+   - 项目目录必须有 `navi.toml`（`[package]` 的 `name` 必填），从当前目录往上找最近的 `navi.toml`；单个 `.navi` 文件仍然可以直接编译（同 `go run x.go`）。
+   - workspace：根目录 `navi.toml` 的 `[workspace]`（`members` 支持 `*`、`exclude`）和 `[workspace.dependencies]`，成员写 `name = { workspace = true }`，路径相对于 workspace 根目录；整个 workspace 共用根目录的一个 `navi.lock`；成员往上找到列出自己的 `[workspace]`；根目录可以只有 `[workspace]`，也可以同时是一个 crate。在根目录运行 `navi build` / `navi test` 处理全部成员，`-p name` 选一个；在成员目录里只处理这个成员。
+   - 输出放在 workspace（或项目）根目录的 `target/名字`，`-o` 仍可指定。
+   - `navi new 名字` / `navi init`（`--lib` 建库）：写 `navi.toml` 和 `src/main.navi`（或 `src/lib.navi`），`git init` 并写 `.gitignore`（忽略 `target/`）；在 workspace 里创建时自动加进 `members`。
+   - `navi run [-p name] [-- 参数]`：构建并运行，也能 `navi run x.navi`。
+   - 只有一种构建模式（同 Go）：去掉 `--release` 和 `cfg(debug_assertions)`（`debug_assert` 系列同 `assert` 一直生效）；整数溢出一律检查、溢出就 panic（实测编译器自身慢约 1%），要回绕显式用 `wrapping_*`；一律带 DWARF，另加一个去掉调试信息的选项。spec 1.2 的溢出规则随之改。
