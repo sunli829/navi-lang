@@ -4,8 +4,13 @@
 #
 #   tools/test.sh path/to/navi
 set -e
-cd "$(dirname "$0")/.."
 navi=${1:?usage: tools/test.sh path/to/navi}
+# An absolute path: some tests run it from other directories.
+case "$navi" in
+/* | ?:*) ;;
+*) navi=$(pwd)/$navi ;;
+esac
+cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
