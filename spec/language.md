@@ -75,7 +75,7 @@ let d: &dyn Display = &pt;          // trait 对象：(数据指针, vtable)
 - **字符串**：
   - `&str`：不可变的 UTF-8 切片，可以随意保存
   - `String`：可增长的字符串
-  - 普通字符串字面量的类型是 `&str`；模板字符串默认是 `String`，期望类型是 `impl Display` 时是 `fmt::Arguments`（见 1.13）
+  - 普通字符串字面量的类型是 `&str`；模板字符串的类型总是 `fmt::Arguments`，要 `String` 时显式写 `.to_string()`（见 1.13）
 - **集合**：`Vec<T>`、`String`（以及以后的 `HashMap`、`HashSet`、`VecDeque`、`BTreeMap`）内部是指向堆对象的引用，所以**拷贝以后共享同一个容器**（类似 Go 的 map、Java 的 ArrayList），要独立副本时用 `.clone()`。这样避免了 Go 切片那种"共享底层数组、长度却各自独立"的陷阱
 - **引用上的 `.clone()` 克隆的是被引用的值**（同 Rust）：`x: &T` 或 `x: &mut T` 时 `x.clone()` 调用 `T::clone`，得到一个 `T`；`T` 没有实现 `Clone` 时是编译错误（Rust 里 `&mut T` 不能克隆，`&T` 会得到引用的拷贝并给出警告，navi 两种都报错）。要复制引用本身，直接赋值。引用本身仍然实现 `Clone`，用于泛型约束和 `#[derive(Clone)]` 里的引用字段，拷贝的是引用
 - 不支持 `union`；FFI 用 `#[repr(C)] struct`
@@ -142,7 +142,7 @@ pub trait Figure: Debug {                   // 超 trait
     type Unit;                              // 关联类型
     const SIDES: u32;                       // 关联常量
     fn area(&self) -> f64;
-    fn describe(&self) -> String { `area ${self.area()}` }   // 默认方法
+    fn describe(&self) -> String { `area ${self.area()}`.to_string() }   // 默认方法
 }
 
 impl Figure for Circle {
@@ -152,7 +152,7 @@ impl Figure for Circle {
 }
 
 impl<T: Display> ToString for T {           // blanket impl
-    fn to_string(&self) -> String { `${self}` }
+    fn to_string(&self) -> String { `${self}`.to_string() }
 }
 ```
 
@@ -197,7 +197,7 @@ Point { x: 1.0, y }                         // 字段简写
 Point { x: 0.0, ..origin }                  // 结构体更新语法
 Shape::Rect(1.0, 2.0)
 [1, 2, 3]   [0u8; 256]   (a, b)   ()
-`(${p.x}, ${p.y})`                          // 模板字符串，默认类型 String（见 1.13）
+`(${p.x}, ${p.y})`                          // 模板字符串，类型是 fmt::Arguments（见 1.13）
 
 // 运算符（优先级和结合性同 Rust）
 -x  !b  *p  &x  &mut x
@@ -379,7 +379,7 @@ select {
 
 ```rust
 let name = "navi";
-let s: String = `hello ${name}!`;           // 插值调用 Display
+let s: String = `hello ${name}!`.to_string();   // 插值调用 Display；String 要显式转
 let t = `sum = ${a + b}, first = ${v[0]}`;  // ${} 里可以是任意表达式
 let d = `${point:?}`;                       // : 后面是格式说明：? 调用 Debug
 let p = `${point:#?}`;                      // 多行美化的 Debug
@@ -394,10 +394,19 @@ let e = `价格 \${price}，反引号 \``;        // 转义
 - 编译器在编译期把模板展开成对 `fmt::Formatter` 的直接调用，运行时不再解析格式
 - 暂不支持 JS 的标签模板（`` tag`...` ``）
 
-**模板字符串的类型由上下文决定**（和整数字面量的类型由上下文决定是同一个思路）：
-- 期望类型是 `fmt::Arguments`、`impl Display`，或者带 `Display` 约束的类型参数时，模板字符串是 `fmt::Arguments`：一个**不分配内存的惰性格式化对象**。`${}` 里的表达式在创建时就求值，但要等写入时才格式化
-- 其他情况（包括没有期望类型）下是 `String`
-- 所以 ``println(`x=${x}`)`` 和 ``f.write_fmt(`...`)`` 都直接写到输出，不会先构造中间的 `String`；而 ``let s = `...`;`` 得到的是 `String`
+**模板字符串的类型总是 `fmt::Arguments`**，不随上下文变化（相当于 Rust 的 `format_args!`）：
+- `fmt::Arguments` 实现了 `Display`，是一个**惰性格式化对象**：`${}` 里的表达式在创建时就求值，值按 navi 的规则拷贝进去，但要等写入时才格式化
+- 打印、断言、panic 这类函数的参数是 `impl Display`，所以 ``println(`x=${x}`)`` 和 ``f.write_fmt(`...`)`` 都直接写到输出，不会先构造中间的 `String`
+- **要 `String` 时显式转换**：``let s = `...`.to_string();``（相当于 Rust 的 `format!`）。没有隐式转换，期望 `String` 的地方写模板字符串是类型错误。和 Rust 一样，除了解引用（`Deref` 强制转换）以外的操作都是显式的
+- 因为是惰性的，集合这类引用语义的值在创建之后、写出之前的修改会体现在结果里：
+  ```rust
+  let mut v = Vec::from([1]);
+  let a = `v = ${v:?}`;      // 拷贝的是 v 这个句柄，不是内容
+  v.push(2);
+  println(a);                // v = [1, 2]
+  let s = a.to_string();     // 在这一刻格式化，之后 v 再变 s 也不变
+  ```
+  需要固定下当时的内容就立即 `.to_string()`
 
 **每种格式说明对应一个 trait**，给自己的类型实现对应的 trait 就能用在插值里（同 Rust）：
 

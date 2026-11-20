@@ -10,7 +10,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | 去掉生命周期 | `fn iter(&self) -> Iter<'_, T>` | `fn iter(&self) -> Iter<T>` | 没有生命周期 |
 | 闭包参数 | `F: FnMut(T) -> U` | `fn(T) -> U` | 没有 `Fn*` trait，闭包统一为函数类型 |
 | 消费 `self` 的方法 | `into_iter(self)` 会 move | 名字不变，语义变为拷贝或共享 | 没有 move |
-| 宏 | `println!`、`panic!`、`assert_eq!`、`format!` | 普通函数和模板字符串 | 没有宏 |
+| 宏 | `println!`、`panic!`、`assert_eq!`、`format!`、`format_args!` | 普通函数和模板字符串：模板字符串是 `fmt::Arguments`（`format_args!`），`` `...`.to_string() `` 是 `format!` | 没有宏 |
 
 ## 2. 不提供的类型和 trait
 

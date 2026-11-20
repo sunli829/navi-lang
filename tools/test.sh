@@ -153,7 +153,7 @@ front() {
 	"$navi" "$1" "$2" > "$tmp/front.out" 2>&1
 	grep '^error ' "$tmp/front.out" | sed -E 's#^error [^:]*:([0-9]+):[0-9]+: #\1	#' > "$tmp/front.got"
 	grep -n '// error: ' "$2" | sed -E 's#^([0-9]+):.*// error: #\1	#' > "$tmp/front.want"
-	if awk -F'\t' 'NR == FNR { want[NR] = $0; line[NR] = $1; text[NR] = $2; n = NR; next }
+	if awk -F'\t' 'FILENAME == ARGV[1] { want[NR] = $0; line[NR] = $1; text[NR] = $2; n = NR; next }
 		{ for (i = 1; i <= n; i++) if (!used[i] && line[i] == $1 && index($2, text[i]) > 0) { used[i] = 1; next }
 		  print "unexpected: " $1 ": " $2; bad = 1 }
 		END { for (i = 1; i <= n; i++) if (!used[i]) { print "missing: " line[i] ": " text[i]; bad = 1 } exit bad }' \
@@ -174,7 +174,8 @@ for f in tests/resolve/*/*.navi; do front resolve-dump "$f"; done
 d=$tmp/deps
 mkdir -p "$d/bar/src" "$d/util/src" "$d/foo/src" "$d/app/src"
 dd=$d
-if [ "$os" = windows ]; then dd=$(cygpath -m "$d"); fi
+gu=file://$d
+if [ "$os" = windows ]; then dd=$(cygpath -m "$d"); gu=file:///$dd; fi
 g() { git -C "$d/bar" -c user.email=t@t -c user.name=t "$@" > /dev/null; }
 printf '[package]\nname = "bar"\n' > "$d/bar/navi.toml"
 printf 'pub struct Version { pub n: i32 }\npub fn version() -> Version { Version { n: %s } }\n' 100 > "$d/bar/src/lib.navi"
@@ -183,17 +184,17 @@ printf 'pub struct Version { pub n: i32 }\npub fn version() -> Version { Version
 g commit -qam two && g tag -a v1.1.0 -m two
 printf '[package]\nname = "util"\n' > "$d/util/navi.toml"
 printf 'pub fn twice(x: i32) -> i32 { x * 2 }\n' > "$d/util/src/lib.navi"
-printf '[package]\nname = "foo"\n\n[dependencies]\nutil = { path = "../util" }\nbar = { git = "file://%s/bar", tag = "v1.1.0" }\n' "$dd" > "$d/foo/navi.toml"
+printf '[package]\nname = "foo"\n\n[dependencies]\nutil = { path = "../util" }\nbar = { git = "%s/bar", tag = "v1.1.0" }\n' "$gu" > "$d/foo/navi.toml"
 printf 'pub fn value() -> i32 { util::twice(21) }\npub fn bar_n() -> i32 { bar::version().n }\npub fn get() -> bar::Version { bar::version() }\n' > "$d/foo/src/lib.navi"
-printf '[package]\nname = "app"\n\n[dependencies]\nf = { path = "../foo" }\nbar = { git = "file://%s/bar", tag = "v1.0.0" }\n' "$dd" > "$d/app/navi.toml"
+printf '[package]\nname = "app"\n\n[dependencies]\nf = { path = "../foo" }\nbar = { git = "%s/bar", tag = "v1.0.0" }\n' "$gu" > "$d/app/navi.toml"
 printf 'fn main() { println(`${f::value()} ${f::bar_n()} ${bar::version().n}`); }\n' > "$d/app/src/main.navi"
 deps() { (cd "$d/app" && NAVI_PKG="$dd/pkg" "$navi" "$@" 2>&1); }
-r1=$(deps build -o app . > /dev/null && "$d/app/app")
-locked=$(grep -c '^commit = ' "$d/app/navi.lock" 2> /dev/null)
+r1=$(deps build -o app . > /dev/null && "$d/app/app") || true
+locked=$(grep -c '^commit = ' "$d/app/navi.lock" 2> /dev/null) || true
 printf 'pub struct Version { pub n: i32 }\npub fn version() -> Version { Version { n: %s } }\n' 101 > "$d/bar/src/lib.navi"
 g commit -qam moved && g tag -f v1.0.0
-r2=$(deps build -o app . > /dev/null && "$d/app/app")
-r3=$(deps update > /dev/null && deps build -o app . > /dev/null && "$d/app/app")
+r2=$(deps build -o app . > /dev/null && "$d/app/app") || true
+r3=$(deps update > /dev/null && deps build -o app . > /dev/null && "$d/app/app") || true
 printf 'fn take(v: bar::Version) -> i32 { v.n }\nfn main() { println(`${take(f::get())}`); }\n' > "$d/app/src/main.navi"
 r4=$(deps build -o app . | sed -E 's#^[^ ]*:[0-9]+:[0-9]+: ##')
 if [ "$r1" = "42 110 100" ] && [ "$locked" = 2 ] && [ "$r2" = "42 110 100" ] && [ "$r3" = "42 110 101" ] \

@@ -417,6 +417,8 @@
 - v0.0.2 进行中：
   - `navic` 改名为 `navi`（`tools/navictest.sh` 改为 `tools/test.sh`；`tools/bootstrap.sh` 仍认得 v0.0.1 包里的 `bin/navic`）。
   - 依赖（`compiler/src/deps.navi`，spec 1.10）：`navi.toml` 的 `[dependencies]`，本地路径或 git（tag、rev 或默认分支），以源码编译；同一仓库的不同版本并存（选择同 Cargo），第二个版本命名为 `名字@版本`，类型名相同而 crate 不同时报错信息带上 crate；`navi.lock` 记录 git 依赖的 commit，`navi update` 重新解析；检出在缓存的 `pkg/`（`NAVI_PKG`），由系统 git 拉取（先按 commit 浅拉取，不行再全量）；语言服务器只用已拉取的；依赖循环和非库依赖报错。`tools/test.sh` 用本地临时 git 仓库测这些（两版本并存、tag 挪动后锁住、update、类型报错）。
+  - 测试改成自检：`tests/run` 里 80 个用例改成 `#[test]` 函数加 `assert_eq` / `assert`（格式化按字符串比较），由 `navi test` 运行（`tools/test.sh` 对没有 `// out:`、`// exit:`、`// stderr:`、`// warn:` 的文件用 `navi test`）；输出本身就是被测对象的（println、panic 和退出码、警告和错误、stdout 日志、要用 main 参数的）保留输出比对。
+  - 模板字符串的类型总是 `fmt::Arguments`（spec 1.13，相当于 Rust 的 `format_args!`），不再随上下文变成 `String`；要 `String` 时显式写 `` `...`.to_string() ``（相当于 `format!`），编译器对这个写法直接生成字符串，不经过 `Arguments`。惰性：`${}` 在创建时求值，写出时才格式化。编译器、std、测试里约一千处补上 `.to_string()`（这个写法 v0.0.1 也能编译，自举不受影响）。`tools/test.sh` 的前端用例在没有 `// error:` 标注时也能报出多余的错误（以前 awk 把空的期望文件跳过，错误被当成期望）；依赖测试失败时报 FAIL，不再因为 `set -e` 直接退出。
 
 ## 下一步
 
