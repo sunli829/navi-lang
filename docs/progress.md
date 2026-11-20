@@ -427,7 +427,7 @@
 2. 运行时：每个 M 的运行队列、基于信号的抢占、栈收缩、最后一次 STW 的并行排空。
 3. DWARF 的变量和类型信息；PE 的调试信息（现在只有 Mach-O 和 ELF 带 DWARF）。
 4. v0.0.2：依赖、改名 `navi`、自检测试都已完成（见上），另外做了模板字符串总是 `fmt::Arguments`、`assert_eq` 两边可以不同类型、std 约束的 `where` 写法。剩下打 tag 发布。
-5. v0.0.3（项目管理，照 Cargo；构建模式照 Go）：
+5. v0.0.3（项目管理，照 Cargo；构建模式照 Go）：已发布（tag 在 727a407），自举起点改为 v0.0.3。
    - 已完成：项目目录必须有 `navi.toml`（`[package]` 的 `name` 必填），从当前目录往上找；单个 `.navi` 文件仍然可以直接编译。`navi.toml` 和 `navi.lock` 由真正的 TOML 解析器读（`compiler/src/toml.navi`，`manifest.navi`），不认识的表和键报错；项目和 workspace 在 `project.navi`，依赖图以整个 workspace 为单位加载（`deps.navi`）。编译器自己的单元测试（`#[cfg(test)]`，`navi test compiler`）和项目场景都进了 tools/test.sh。
    - workspace：根目录 `navi.toml` 的 `[workspace]`（`members` 支持 `*`、`exclude`）和 `[workspace.dependencies]`，成员写 `name = { workspace = true }`，路径相对于 workspace 根目录；整个 workspace 共用根目录的一个 `navi.lock`；成员往上找到列出自己的 `[workspace]`；根目录可以只有 `[workspace]`，也可以同时是一个 crate。在根目录运行 `navi build` / `navi test` 处理全部成员，`-p name` 选一个；在成员目录里只处理这个成员。
    - 输出放在 workspace（或项目）根目录的 `target/名字`，`-o` 仍可指定。
