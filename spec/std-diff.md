@@ -44,9 +44,8 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `thread::current()` | `Thread` 有 name、unpark 等 | 只有 `id() -> ThreadId` |
 | `ThreadId::as_u64` | 不稳定，返回 `NonZero<u64>` | 稳定，返回 `u64`（不为 0） |
 | `sync::atomic` | 各种整数宽度和 `AtomicBool`/`AtomicPtr`；Ordering 按指定的语义 | 只有 `AtomicUsize`（load/store/fetch_add/compare_exchange）；所有操作都是顺序一致的 |
-| 线程里 panic | 只结束该线程，`join()` 返回 `Err` | 相同（M9 起）。只有 native 后端；stage0 的解释器不捕获 panic，仍结束整个进程 |
+| 线程里 panic | 只结束该线程，`join()` 返回 `Err` | 相同 |
 | panic 的载荷 | `Box<dyn Any + Send>`，通常装着消息 | `std::panic::PanicPayload`：`message()` 和 `location()`；`thread::Result<T> = Result<T, PanicPayload>` |
-| `Duration::as_nanos` / `as_micros` / `as_millis` | `u128` | 相同；只有用 stage0 编译 std 时是 `u64`（stage0 没有 128 位整数） |
 | `catch_unwind` 的参数 | `F: FnOnce() -> R + UnwindSafe` | `fn() -> R`（没有 `UnwindSafe`）；被捕获的 panic 仍会先打印消息（同 Rust 的默认 hook） |
 | `&T` | 共享借用，保证期间没有人写 | 浅只读：只禁止通过这条路径直接写，不保证别人没在写（见 language.md 1.3） |
 
@@ -54,7 +53,6 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 
 | Rust | navi 现在 | 原因 | 何时消除 |
 |---|---|---|---|
-| `impl From<[T; N]> for Vec<T>` | navic：两者都有；stage0：只有 `impl From<&[T]> for Vec<T>` | stage0 没有 const 泛型 | — |
 
 ## 6. 新增的 API
 
@@ -76,22 +74,20 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | 文件关闭 | `File` drop 时关闭 | `File::close()`；`fs::read`/`fs::write` 等整文件函数自己关闭 | 没有 Drop |
 | `io::BufWriter` | drop 时 flush | 必须显式 `flush()` 或 `into_inner()` | 没有 Drop |
 | `Path`/`PathBuf` | 基于 `OsStr`，`Path` 是 unsized 类型 | 基于 UTF-8 字符串；`Path` 是持有 `&str` 的普通结构体；`file_name`/`extension`/`file_stem` 返回 `Option<&str>` 而不是 `Option<&OsStr>` | 没有 `OsStr`；unsized 结构体暂不支持 |
-| `process::Command` | 直接 fork/exec，可配置 stdin/stdout | navic：POSIX 用 `posix_spawn`（Windows 用 `CreateProcessA`），API 同 Rust（见第 7 节）；只有 stage0 编译的 std 仍通过系统 shell 执行、只有 `status()` | stage0 冻结 |
+| `process::Command` | 直接 fork/exec，可配置 stdin/stdout | POSIX 用 `posix_spawn`（Windows 用 `CreateProcessA`），API 同 Rust（见第 7 节） | — |
 | `Vec::drain` | 返回 `Drain<'_, T>` 惰性迭代器 | 立即移走元素，返回 `vec::IntoIter<T>` | 没有生命周期绑定的借用迭代器 |
 | `hash::DefaultHasher` | SipHash-1-3（抗哈希洪水） | FxHash（快，但不抗攻击） | 编译器式负载优先速度 |
 | `HashMap` 迭代顺序 | 随机种子 | 确定（取决于插入历史） | 便于编译器输出稳定 |
-| `str` 的模式参数 | `Pattern` 支持 `&str`、`char`、`&[char]`、`[char; N]`、闭包 | `std::str::pattern::Pattern` 支持 `&str`、`&String`、`char`、`fn(char) -> bool`；navic 还支持 `&[char]`、`[char; N]`、`&[char; N]` | stage0 没有常量泛型 |
+| `str` 的模式参数 | `Pattern` 支持 `&str`、`char`、`&[char]`、`[char; N]`、闭包 | `std::str::pattern::Pattern` 支持 `&str`、`&String`、`char`、`fn(char) -> bool`、`&[char]`、`[char; N]`、`&[char; N]` | — |
 | `f32` 解析 | 精确舍入 | 先精确解析成 `f64` 再转换（极少数情况下有两次舍入） | 简化 |
 | `BTreeSet::union` | `a.union(&b)` | `a.r#union(&b)` | `union` 在 navi 是保留字 |
 | `BTreeMap`/`BTreeSet` 的查找参数 | `get<Q>(&self, key: &Q) where K: Borrow<Q>`；`range<T, R: RangeBounds<T>>` | `get(&self, key: &K)`；`range<R: RangeBounds<K>>`（同 `HashMap`） | 没有 `Borrow` |
 | `BinaryHeap::peek_mut` | 返回 `PeekMut`，drop 时下沉 | 不提供；用 `pop` 再 `push` | 没有 Drop |
 | `BinaryHeap::into_sorted_vec` | 原地排序 | 返回排好序的新 Vec，堆本身不变 | 没有 move：原地排序会破坏仍共享缓冲区的堆 |
 | `BinaryHeap::drain` | 返回惰性 `Drain<'_, T>` | 立即取走，返回 `vec::IntoIter<T>` | 同 `Vec::drain` |
-| `str::matches` | 返回迭代器 | navic：迭代器（另有 `matches_count`）；stage0 编译的 std 只有 `matches_count` | 新增的方法只对 navic 开放 |
+| `str::matches` | 返回迭代器 | 迭代器（另有 `matches_count`） | — |
 
 ## 7. 补全常用方法时新增的偏离
-
-str、String、切片、Vec、Iterator、Option、Result、char 和数值类型补全的方法（以及整数之间的 `From`/`TryFrom`、`std::f64::consts`/`std::f32::consts`、`std::num::{TryFromIntError, FpCategory}`、`std::array::IntoIter`、`std::cmp::Reverse`）都用 `#[cfg(feature = "navic")]` 对 stage0 隐藏：用 stage0 编译的 std 没有它们。
 
 | 项目 | Rust | navi | 原因 |
 |---|---|---|---|
@@ -102,14 +98,14 @@ str、String、切片、Vec、Iterator、Option、Result、char 和数值类型�
 | `Flatten`、`FlatMap`、`StepBy` 的 `DoubleEndedIterator` | 有 | 不提供 | 简化 |
 | `[T]::get` | 参数可以是下标或区间 | 只能是下标（`str::get` 只接受区间，同 Rust） | 没有 `SliceIndex` |
 | `char::to_uppercase` / `to_lowercase`、`is_uppercase` / `is_lowercase` | 完整的 Unicode 大小写映射 | 只覆盖拉丁字母（ASCII、Latin-1、扩展 A、扩展附加）、希腊字母、西里尔字母、亚美尼亚字母和全角拉丁字母（另有 `ß` → `SS`、`İ` → `i̇`）；其他字符映射为自身。`str::to_uppercase` / `to_lowercase` 按字符调用它们，词尾的 `Σ` 变成 `ς` | 没有 Unicode 表 |
-| `char::is_whitespace` | Unicode White_Space | 相同（navic）；stage0 编译的 std 只认 ASCII 空白 | — |
+| `char::is_whitespace` | Unicode White_Space | 相同 | — |
 | `f32` 的数学函数 | 调用 `f32` 版本的 libm 函数 | 转成 `f64` 计算再舍入回 `f32` | 简化 |
 | `RangeInclusive` 迭代 | 有 `exhausted` 标志，`0..=u8::MAX` 能迭代完 | 没有该标志：正向迭代到类型最大值时溢出（已有问题），反向迭代 `MAX..=MAX` 溢出 | 结构体由编译器构造，加字段要改编译器 |
 | `String::drain` | 惰性迭代器，drop 时移走 | 立即移走文本，返回被移走字符的迭代器 `string::Drain` | 同 `Vec::drain` |
 
 ## 8. 操作系统层（std::fs / io / env / process）的偏离
 
-navic 编译的 std 在私有的 `std::sys` 之上实现这些模块（POSIX：文件描述符、`stat`、`opendir`、`posix_spawn`、`waitpid`；Windows：Win32 句柄、`FindFirstFileA`、`CreateProcessA`）。stage0 编译的 std 保留原来基于 stdio 和 shell 的版本（只有自举用到的那部分）。
+std 在私有的 `std::sys` 之上实现这些模块（POSIX：文件描述符、`stat`、`opendir`、`posix_spawn`、`waitpid`；Windows：Win32 句柄、`FindFirstFileA`、`CreateProcessA`）。
 
 | 项目 | Rust | navi | 原因 |
 |---|---|---|---|

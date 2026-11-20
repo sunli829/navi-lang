@@ -33,7 +33,7 @@
 
 | 类型 | 说明 |
 |---|---|
-| `i8 i16 i32 i64 isize i128` / `u8 u16 u32 u64 usize u128` | 整数。`i128` / `u128` 从 M9 起由 navic 支持（stage0 不支持）；它们的字面量最大到 `u64::MAX`，更大的值用运算得到（如 `u128::MAX`、`1 << 100`）；对齐是 8 字节 |
+| `i8 i16 i32 i64 isize i128` / `u8 u16 u32 u64 usize u128` | 整数；它们的字面量最大到 `u64::MAX`，更大的值用运算得到（如 `u128::MAX`、`1 << 100`）；对齐是 8 字节 |
 | `f32 f64` | 浮点 |
 | `bool` | `true` / `false` |
 | `char` | 4 字节的 Unicode 标量值 |
@@ -174,7 +174,7 @@ enum Tree<K: Ord, V> { Leaf, Node(&Tree<K, V>, K, V, &Tree<K, V>) }
 
 fn evens(v: &[i32]) -> impl Iterator<Item = i32> { ... }   // 返回位置的 impl Trait
 fn sum(it: impl Iterator<Item = i32>) -> i32 { ... }       // 参数位置的 impl Trait
-trait Shape { fn parts(&self) -> impl Iterator<Item = i32>; }  // trait 方法返回 impl Trait（navic）
+trait Shape { fn parts(&self) -> impl Iterator<Item = i32>; }  // trait 方法返回 impl Trait
 
 let v = parse::<i64>("42");                 // turbofish
 let n = <T as Figure>::SIDES;               // 完全限定路径

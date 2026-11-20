@@ -410,13 +410,17 @@
 - GitHub Actions（github.com/sunli829/navi-lang）：
   - linux-x64、linux-arm64、macos-arm64、macos-x64 上从 stage0 自举到定点，再在四种运行时模式下跑 golden 测试，全部通过。顺带修了 glibc 的 `cbrt` 不精确（改成 navi 自己算）和多个定时器同时到期时的唤醒顺序。
   - Windows 上用交叉编译的 `navic.exe` 跑测试，全部通过（CI 失败时用 cdb 打印崩溃现场，`NAVI_LINKMAP` 让 PE 链接器写出符号地址）。修过的：C 返回值窄于寄存器时的扩展；amd64 在 Windows 上大于 4KB 的栈帧逐页探测（静态变量的初始化跑在 OS 栈上，用到 crc32 的程序在 main 之前就崩溃）；fmt 和 lsp 读标准输入不再用 `/dev/stdin`，lsp 认得 `file:///C:/...`；`.gitattributes` 固定 LF（Windows runner 默认 autocrlf，逐字节比较的测试都失败）。Windows 上的网络用 IOCP 实现，`net`、`http` 也通过（1000 个同时挂起的连接只用 9 个 OS 线程）；顺带查出轮询线程的一个老问题（Unix 也有）：它传给内核的缓冲区是局部变量，逃逸分析给了堆单元，分配在没有 GC 根的调度器记录上，被回收复用后内核和轮询线程还在写（Windows 上用 64KB 的 Op、GC 频繁时必现），现在是静态变量；`env_process`、`fs_ops`（Unix 专有的 API）在 Windows 上跳过（`// skip: windows`）。顺带修了解析器：`fn` 的名字写成关键字（如 `fn select(...)`）时报错后跳过它，不再把参数解析错位、让后面的阶段死循环。
+- 删掉了 stage0（Go 写的原型编译器）和所有 Go 代码：`internal/`、`cmd/`、`go.mod`、`stdlib.go`，生成器 `tools/gennum`、`tools/genregex`（它们生成的 std 文件改为手工维护），编译速度基准 `bench/` 和 `tools/bench.sh`（拿 `go build` 作对照），`tools/selfcheck.sh`（拿 navic 和 stage0 的输出对照）。
+  - 自举从上一个 release 开始（`tools/bootstrap.sh`，`tools/bootstrap-version`）；规则同 Go：编译器和 std 只能使用那个 release 支持的功能。
+  - std 里给 stage0 的 `#[cfg(not(feature = "navic"))]` 分支和 `#[cfg(feature = "navic")]` 标记都去掉了（约 1200 行），编译器里的 `NAVI_STAGE0` 模式（模仿 stage0 的编号，用来对照输出）也去掉了；`feature = "..."` 现在一律为假。
+  - 原来由 Go 测试驱动的前端用例改由 `tools/navictest.sh` 跑：`tests/syntax` 要能解析，`tests/resolve`、`tests/types`、`tests/check` 的 `ok`/`sigs` 没有错误、`err` 的错误和 `// error:` 标注一一对应（`// type:`、`// sig:` 这两种更细的断言没有沿用）。测试里的 `// stage0: skip`、`// interp: skip` 标记去掉了。
 
 ## 下一步
 
 1. 冷编译提速：剩下的串行部分（plan 的按序遍历、codegen 合并之后的 gen_data、链接）；GC 标记占约四分之一 CPU（保守扫描，生成的代码不做寄存器分配）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。
 2. 运行时：每个 M 的运行队列、基于信号的抢占、栈收缩、最后一次 STW 的并行排空。
 3. DWARF 的变量和类型信息；PE 的调试信息（现在只有 Mach-O 和 ELF 带 DWARF）。
-4. 删掉 stage0：
-   - 先在真实的 Linux（glibc）和 Windows 上跑一遍测试（CI），尤其是两个自研链接器的输出。
-   - 再定引导方式：照 Go/Rust，用上一版 navic 的二进制引导。
-   - 然后删 Go 代码，以及 `NAVI_STAGE0`、`// stage0: skip`、编译器源码不能用新语法这些兼容包袱。
+4. v0.0.2：
+   - 依赖：`navi.toml` 的 `[dependencies]`，本地路径或 git 仓库（用 tag 指定版本），以源码编译（同 Go）。
+   - `navic` 改名为 `navi`（它不只是编译器，还有 test、fmt、lsp 等）；`tools/bootstrap.sh` 要认得 v0.0.1 包里的 `bin/navic`。
+   - 测试改成自检：`tests/run` 的 95 个用例只有 5 个用断言，其余靠 `// out:` 注释比对输出（为了同一程序在 stage0 解释器、原生后端和 navic 上对照，这个理由已经不在了）。大部分改成 `#[test]` 加 `assert_eq`，用 `navi test` 运行；只有输出本身就是被测对象的（格式化、panic 信息和退出码、警告和编译错误）保留输出比对。顺带检查断言失败时的信息（调用位置、两边的值）。

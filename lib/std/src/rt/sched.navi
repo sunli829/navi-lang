@@ -4,13 +4,13 @@
 //! space, committed by the OS on first touch); function prologues check the
 //! running G's stack limit.
 //!
-//! Built by navic, Gs run on up to one OS thread (M) per CPU (M:N; at most
-//! NAVI_MAXPROCS). Each M runs its scheduler loop on its own record (g0):
+//! Gs run on up to one OS thread (M) per CPU (M:N; at most NAVI_MAXPROCS).
+//! Each M runs its scheduler loop on its own record (g0):
 //! a G that blocks switches to its M's g0, which picks the next runnable G
 //! from the global run queue, or sleeps until there is one. One runtime
 //! lock guards the scheduler, the channels and the heap; it is only taken
 //! once a second M exists. The collector stops the world: see
-//! stop_the_world. Built by stage0 (to bootstrap navic), there is one M.
+//! stop_the_world.
 //!
 //! Waiting follows the interpreter's semantics (a condition variable per
 //! waitable object): a blocked G registers on the wait lists it cares
@@ -38,11 +38,7 @@ const MAP_FLAGS: i32 = 0x4022;
 const MAP_FLAGS: i32 = 0;
 
 const MAIN_STACK: usize = 67108864; // 64 MiB
-// The first stack of a spawned G (navic: grown by copying, up to
-// MAX_STACK; stage0 builds keep it).
-#[cfg(not(feature = "navic"))]
-const STACK: usize = 1048576;
-#[cfg(feature = "navic")]
+// The first stack of a spawned G (grown by copying, up to MAX_STACK).
 const STACK: usize = 65536;
 const MAX_STACK: usize = 1073741824; // 1 GiB
 // The bottom of every stack is left for C calls made near the limit.
@@ -140,9 +136,6 @@ struct WaitNode { g: *mut G, gen: usize, key: usize, next: *mut WaitNode }
 /// A list of Gs waiting for a change of some object, in arrival order.
 pub struct WaitList { head: *mut WaitNode, tail: *mut WaitNode }
 
-static mut CUR: usize = 0;
-static mut RUN_HEAD: usize = 0;
-static mut RUN_TAIL: usize = 0;
 static mut ALL: usize = 0;
 static mut FREE_GS: usize = 0; // dead Gs whose records and stacks are reused (linked by next)
 
@@ -198,36 +191,18 @@ pub fn init() -> usize {
     base + MAIN_STACK
 }
 
-#[cfg(not(feature = "navic"))]
-fn init_ms(main: *mut G) {}
 
-// The running G: navic keeps it in a register (each OS thread has its own),
-// stage0 in CUR.
-#[cfg(feature = "navic")]
+// The running G, kept in a register (each OS thread has its own).
 pub fn current() -> *mut G { crate::rt::current_g() as *mut G }
-#[cfg(not(feature = "navic"))]
-pub fn current() -> *mut G { CUR as *mut G }
 
-#[cfg(feature = "navic")]
 fn set_current(g: *mut G) { crate::rt::set_current_g(g as usize); }
-#[cfg(not(feature = "navic"))]
-fn set_current(g: *mut G) {
-    CUR = g as usize;
-    unsafe { crate::rt::set_stack_limit((*g).guard); }
-}
 
-// Switches from prev to next. navic's context switch also switches the G
-// register; stage0 code reads CUR and the global stack limit.
-#[cfg(feature = "navic")]
+// Switches from prev to next (the context switch also switches the G
+// register).
 fn switch(prev: *mut G, next: *mut G) {
     // From an M's scheduler record: next's C calls run below this frame
     // (swap_context's save area included).
     unsafe { if (*prev).is_g0 && !(*next).is_g0 { (*next).c_stack = (crate::rt::stack_pointer() as usize - 256) & !15; } }
-    unsafe { crate::rt::swap_context(&mut (*prev).sp as *mut usize as *mut u8, &mut (*next).sp as *mut usize as *mut u8); }
-}
-#[cfg(not(feature = "navic"))]
-fn switch(prev: *mut G, next: *mut G) {
-    set_current(next);
     unsafe { crate::rt::swap_context(&mut (*prev).sp as *mut usize as *mut u8, &mut (*next).sp as *mut usize as *mut u8); }
 }
 
@@ -258,7 +233,6 @@ pub fn current_stack_hi() -> usize {
 /// the frames of user code by their stack maps (as Go's scanframe), the
 /// rest (the runtime, std, code without maps) conservatively, as are the
 /// registers the G saved when it stopped (below fp).
-#[cfg(feature = "navic")]
 pub fn scan_stack(sp: usize, fp0: usize, hi: usize) {
     stack_mode();
     if STACKMAP != 1 || fp0 < sp || fp0 >= hi {
@@ -320,8 +294,6 @@ pub fn scan_stack(sp: usize, fp0: usize, hi: usize) {
         k += 1;
     }
 }
-#[cfg(not(feature = "navic"))]
-pub fn scan_stack(sp: usize, fp0: usize, hi: usize) { crate::rt::gc::scan_range(sp, hi); }
 
 /// Scans the saved stack of every other live G.
 pub fn scan_other_stacks() {
@@ -390,114 +362,6 @@ pub fn gmain() -> ! {
     exit_current()
 }
 
-#[cfg(not(feature = "navic"))]
-fn exit_current() -> ! {
-    lock();
-    let g = current();
-    // The record and its stack are reused by a later G once this one has
-    // switched away for good. Dead Gs stay on the ALL list (so they stay
-    // allocated) but their stacks are not scanned.
-    unsafe {
-        (*g).status = DEAD;
-        (*g).entry = || {};
-        (*g).next = FREE_GS as *mut G;
-    }
-    FREE_GS = g as usize;
-    block_current();
-    crate::rt::native::fatal("dead goroutine resumed")
-}
-
-// Queues g (the runtime lock is held).
-fn enqueue(g: *mut G) {
-    unsafe {
-        (*g).status = RUNNABLE;
-        (*g).next = 0 as *mut G;
-        if RUN_TAIL == 0 {
-            RUN_HEAD = g as usize;
-        } else {
-            (*(RUN_TAIL as *mut G)).next = g;
-        }
-    }
-    RUN_TAIL = g as usize;
-}
-
-fn dequeue() -> *mut G {
-    let g = RUN_HEAD as *mut G;
-    if g as usize != 0 {
-        unsafe {
-            RUN_HEAD = (*g).next as usize;
-            if RUN_HEAD == 0 { RUN_TAIL = 0; }
-        }
-    }
-    g
-}
-
-// schedule switches to the next runnable G. The current G must already be
-// queued, waiting or dead.
-#[cfg(not(feature = "navic"))]
-fn schedule() {
-    if RUN_HEAD == 0 {
-        crate::rt::native::fatal("all goroutines are asleep - deadlock!");
-    }
-    let next = RUN_HEAD as *mut G;
-    unsafe {
-        RUN_HEAD = (*next).next as usize;
-        if RUN_HEAD == 0 { RUN_TAIL = 0; }
-        (*next).status = RUNNING;
-    }
-    let prev = current();
-    if next as usize == prev as usize { return; }
-    switch(prev, next);
-}
-
-/// Lets other Gs run.
-#[cfg(not(feature = "navic"))]
-pub fn yield_now() {
-    lock();
-    ready(current());
-    block_current();
-    unlock();
-}
-
-// --- One OS thread (stage0) -----------------------------------------------------
-
-#[cfg(not(feature = "navic"))]
-fn ready(g: *mut G) { enqueue(g); }
-
-// The running G stops (it is queued, waiting or dead) until it is resumed.
-#[cfg(not(feature = "navic"))]
-fn block_current() { schedule(); }
-
-// Blocks the running G (its wait nodes are enlisted) until woken.
-#[cfg(not(feature = "navic"))]
-fn park_on(locks: *const usize, n: usize) {
-    let g = current();
-    unsafe { (*g).status = WAITING; }
-    schedule();
-}
-#[cfg(not(feature = "navic"))]
-pub fn obj_lock(lk: *mut usize) {}
-#[cfg(not(feature = "navic"))]
-pub fn obj_unlock(lk: *mut usize) {}
-
-#[cfg(not(feature = "navic"))]
-pub fn lock() {}
-#[cfg(not(feature = "navic"))]
-pub fn unlock() {}
-#[cfg(not(feature = "navic"))]
-pub fn enter_blocked() {}
-#[cfg(not(feature = "navic"))]
-pub fn exit_blocked() {}
-#[cfg(not(feature = "navic"))]
-pub fn stop_the_world() {}
-#[cfg(not(feature = "navic"))]
-pub fn preempt_off() {}
-#[cfg(not(feature = "navic"))]
-pub fn preempt_on() {}
-#[cfg(not(feature = "navic"))]
-pub fn flush_caches() {}
-#[cfg(not(feature = "navic"))]
-pub fn start_the_world() {}
 
 // --- Waiting -------------------------------------------------------------------
 
@@ -883,7 +747,7 @@ fn case_send(c: &crate::sync::mpmc::SelectCase) -> bool { crate::sync::mpmc::sel
 
 // The OS's threads and locks: pthreads, or Windows' slim reader/writer
 // locks, condition variables and CreateThread.
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 #[nonblocking]
 extern "C" {
     fn pthread_mutex_init(m: *mut u8, attr: *const u8) -> i32;
@@ -899,20 +763,20 @@ extern "C" {
     fn sysconf(name: i32) -> i64;
 }
 
-#[cfg(all(feature = "navic", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[nonblocking]
 extern "C" {
     fn pthread_cond_timedwait_relative_np(c: *mut u8, m: *mut u8, ts: *const i64) -> i32;
 }
 
-#[cfg(all(feature = "navic", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[nonblocking]
 extern "C" {
     fn pthread_cond_timedwait(c: *mut u8, m: *mut u8, ts: *const i64) -> i32;
     fn clock_gettime(clock: i32, ts: *mut i64) -> i32;
 }
 
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 #[nonblocking]
 extern "C" {
     fn InitializeSRWLock(l: *mut u8);
@@ -928,41 +792,40 @@ extern "C" {
     fn GetSystemInfo(info: *mut u8);
 }
 
-#[cfg(feature = "navic")]
 #[nonblocking]
 extern "C" {
     fn calloc(n: usize, size: usize) -> *mut u8;
     fn free(p: *mut u8);
 }
 
-#[cfg(all(feature = "navic", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const SC_NPROCESSORS_ONLN: i32 = 58;
-#[cfg(all(feature = "navic", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const SC_NPROCESSORS_ONLN: i32 = 84;
 
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_mutex_init(m: *mut u8) { pthread_mutex_init(m, 0 as *const u8); }
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_mutex_lock(m: *mut u8) { pthread_mutex_lock(m); }
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_mutex_trylock(m: *mut u8) -> bool { pthread_mutex_trylock(m) == 0 }
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_mutex_unlock(m: *mut u8) { pthread_mutex_unlock(m); }
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_cond_init(c: *mut u8) { pthread_cond_init(c, 0 as *const u8); }
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_cond_wait(c: *mut u8, m: *mut u8) { pthread_cond_wait(c, m); }
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_cond_signal(c: *mut u8) { pthread_cond_signal(c); }
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_yield() { sched_yield(); }
 // Waits on c (m held) for at most ns nanoseconds.
-#[cfg(all(feature = "navic", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
     let ts = [(ns / 1000000000) as i64, (ns % 1000000000) as i64];
     pthread_cond_timedwait_relative_np(c, m, &ts as *const [i64; 2] as *const i64);
 }
-#[cfg(all(feature = "navic", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
     // An absolute CLOCK_REALTIME deadline.
     let mut ts = [0i64; 2];
@@ -972,11 +835,11 @@ unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
     ts[1] = (t % 1000000000) as i64;
     pthread_cond_timedwait(c, m, &ts as *const [i64; 2] as *const i64);
 }
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 fn os_ncpu() -> i64 { unsafe { sysconf(SC_NPROCESSORS_ONLN) } }
 // Starts an OS thread at the C function start with arg; false if it
 // cannot.
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 unsafe fn os_thread(start: usize, arg: usize) -> bool {
     // The thread id in C memory: the monitor starts Ms too, and has no GC.
     let tp = calloc(1, 8) as *mut usize;
@@ -989,29 +852,29 @@ unsafe fn os_thread(start: usize, arg: usize) -> bool {
     true
 }
 
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_mutex_init(m: *mut u8) { InitializeSRWLock(m); }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_mutex_lock(m: *mut u8) { AcquireSRWLockExclusive(m); }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_mutex_trylock(m: *mut u8) -> bool { TryAcquireSRWLockExclusive(m) != 0 }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_mutex_unlock(m: *mut u8) { ReleaseSRWLockExclusive(m); }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_cond_init(c: *mut u8) { InitializeConditionVariable(c); }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_cond_wait(c: *mut u8, m: *mut u8) { SleepConditionVariableSRW(c, m, 0xffffffff, 0); }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_cond_signal(c: *mut u8) { WakeConditionVariable(c); }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_yield() { SwitchToThread(); }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
     let ms = (ns + 999999) / 1000000;
     SleepConditionVariableSRW(c, m, if ms >= 0xfffffffe { 0xfffffffe } else { ms as u32 }, 0);
 }
 // SYSTEM_INFO.dwNumberOfProcessors is at 32.
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn os_ncpu() -> i64 {
     let mut info = [0u64; 8];
     unsafe {
@@ -1019,7 +882,7 @@ fn os_ncpu() -> i64 {
         *((&mut info as *mut [u64; 8] as usize + 32) as *const u32) as i64
     }
 }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 unsafe fn os_thread(start: usize, arg: usize) -> bool {
     let h = CreateThread(0 as *const u8, 0, start, arg, 0, 0 as *mut u32);
     if h == 0 { return false; }
@@ -1028,11 +891,9 @@ unsafe fn os_thread(start: usize, arg: usize) -> bool {
 }
 
 // The stack of M0's scheduler record (other Ms use their thread's stack).
-#[cfg(feature = "navic")]
 const G0_STACK: usize = 262144;
 
 /// An OS thread running Gs.
-#[cfg(feature = "navic")]
 struct M {
     // First to third: fixed (backend c_callback reads cur and cb).
     g0: *mut G,
@@ -1074,34 +935,23 @@ struct M {
 }
 
 // The runtime lock (pthread mutex) and the condition idle Ms wait on.
-#[cfg(feature = "navic")]
 static mut MU: usize = 0;
-#[cfg(feature = "navic")]
 static mut IDLE_CV: usize = 0;
 // Whether a second M exists: before, the lock is not needed.
-#[cfg(feature = "navic")]
 static mut MULTI: bool = false;
-#[cfg(feature = "navic")]
 static mut NUM_M: usize = 1;
-#[cfg(feature = "navic")]
 static mut MAX_M: usize = 1;
-#[cfg(feature = "navic")]
 static mut IDLE: usize = 0;
-#[cfg(feature = "navic")]
 static mut MS: usize = 0;
 // Set while a collector stops the world.
-#[cfg(feature = "navic")]
 static mut STW: usize = 0;
 // The G that stopped the world (morestack does not stop it).
-#[cfg(feature = "navic")]
 static mut STW_OWNER: usize = 0;
 
-#[cfg(feature = "navic")]
 pub fn multi() -> bool { MULTI }
 
 /// The running M's span cache (an array of 64 words).
 /// The running M's write barrier buffer (0: none, the G has no M).
-#[cfg(feature = "navic")]
 pub fn m_wbuf() -> usize {
     let g = current();
     unsafe {
@@ -1111,12 +961,9 @@ pub fn m_wbuf() -> usize {
         (*m).wbuf
     }
 }
-#[cfg(not(feature = "navic"))]
-pub fn m_wbuf() -> usize { 0 }
 
 /// The write barrier buffer of the i-th M (0: none; WBUF_END past the
 /// last; the world is stopped).
-#[cfg(feature = "navic")]
 pub fn wbuf_at(i: usize) -> usize {
     let mut m = MS as *mut M;
     let mut k = 0;
@@ -1127,20 +974,16 @@ pub fn wbuf_at(i: usize) -> usize {
     }
     WBUF_END
 }
-#[cfg(not(feature = "navic"))]
-pub fn wbuf_at(i: usize) -> usize { WBUF_END }
 
 /// What wbuf_at gives past the last M.
 pub const WBUF_END: usize = 18446744073709551615;
 
-#[cfg(feature = "navic")]
 pub fn m_cache() -> usize {
     let g = current();
     unsafe { &mut (*((*g).m as *mut M)).cache as *mut [usize; 64] as usize }
 }
 
 /// Empties every M's span cache (the world is stopped).
-#[cfg(feature = "navic")]
 pub fn flush_caches() {
     let mut m = MS as *mut M;
     while m as usize != 0 {
@@ -1157,7 +1000,6 @@ pub fn flush_caches() {
 
 // M0 (the main OS thread) and its scheduler record, whose loop runs on a
 // stack of its own the first time the main G blocks.
-#[cfg(feature = "navic")]
 fn init_ms(main: *mut G) {
     let m = unsafe { calloc(1, crate::intrinsics::size_of::<M>()) } as *mut M;
     let g0 = new_g();
@@ -1195,15 +1037,11 @@ fn init_ms(main: *mut G) {
 }
 
 /// The most OS threads running Gs at once.
-#[cfg(feature = "navic")]
 pub fn procs() -> usize {
     if MAX_M == 0 { max_procs() } else { MAX_M }
 }
-#[cfg(not(feature = "navic"))]
-pub fn procs() -> usize { 1 }
 
 // NAVI_MAXPROCS, else the number of CPUs.
-#[cfg(feature = "navic")]
 fn max_procs() -> usize {
     if let Some(v) = crate::rt::native::os_getenv("NAVI_MAXPROCS") {
         let b = v.as_bytes();
@@ -1221,7 +1059,6 @@ fn max_procs() -> usize {
 
 /// Takes the runtime lock (recursively). Waiting for it counts as being
 /// blocked outside navi code, so that a collector holding it can proceed.
-#[cfg(feature = "navic")]
 pub fn lock() {
     let g = current();
     unsafe {
@@ -1234,7 +1071,6 @@ pub fn lock() {
     }
 }
 
-#[cfg(feature = "navic")]
 pub fn unlock() {
     let g = current();
     unsafe {
@@ -1244,16 +1080,12 @@ pub fn unlock() {
 }
 
 /// Whether the running code is an M's scheduler record (navic).
-#[cfg(feature = "navic")]
 pub fn on_g0() -> bool { unsafe { (*current()).is_g0 } }
-#[cfg(not(feature = "navic"))]
-pub fn on_g0() -> bool { false }
 
 /// Before a call that may block outside navi code (waiting for the lock, a
 /// system call): saves the stack pointer and registers for a collector.
 // (Also with one OS thread: a callback from C may collect, scanning the
 // blocked G's stack from what this saves, and start threads.)
-#[cfg(feature = "navic")]
 #[inline(never)]
 pub fn enter_blocked() {
     let g = current();
@@ -1268,7 +1100,6 @@ pub fn enter_blocked() {
 }
 
 /// After such a call: waits while a collector that claimed the G runs.
-#[cfg(feature = "navic")]
 pub fn exit_blocked() {
     let g = current();
     unsafe {
@@ -1295,7 +1126,6 @@ pub fn exit_blocked() {
 
 /// Before a C call that may block or call back (the MIR wraps such calls):
 /// the M's callback G is made on first use, then the G counts as blocked.
-#[cfg(feature = "navic")]
 #[inline(never)]
 pub fn enter_c() {
     let g = current();
@@ -1311,10 +1141,7 @@ pub fn enter_c() {
     }
     enter_blocked();
 }
-#[cfg(not(feature = "navic"))]
-pub fn enter_c() {}
 
-#[cfg(feature = "navic")]
 fn netpoll_active() -> bool { crate::rt::netpoll::active() }
 
 // --- Timers -----------------------------------------------------------------------
@@ -1324,7 +1151,6 @@ fn netpoll_active() -> bool { crate::rt::netpoll::active() }
 // the expired ones whenever they look for work; an idle M sleeps until the
 // next one.
 
-#[cfg(feature = "navic")]
 struct Timer {
     when: usize,
     g: *mut G,
@@ -1332,28 +1158,19 @@ struct Timer {
     fired: bool,
 }
 
-#[cfg(feature = "navic")]
 const NO_TIMER: usize = 18446744073709551615;
 // The heap (an array of *mut Timer, GC memory), its size and capacity.
-#[cfg(feature = "navic")]
 static mut TIMERS: usize = 0;
-#[cfg(feature = "navic")]
 static mut TIMER_N: usize = 0;
-#[cfg(feature = "navic")]
 static mut TIMER_CAP: usize = 0;
-#[cfg(feature = "navic")]
 static mut TIMER_LK: usize = 0;
 // The earliest deadline (NO_TIMER: none), read without the lock.
-#[cfg(feature = "navic")]
 static mut TIMER_NEXT: usize = 18446744073709551615;
 
-#[cfg(feature = "navic")]
 fn theap(i: usize) -> *mut Timer { unsafe { *((TIMERS + 8 * i) as *const *mut Timer) } }
-#[cfg(feature = "navic")]
 fn theap_set(i: usize, t: *mut Timer) { unsafe { *((TIMERS + 8 * i) as *mut *mut Timer) = t; } }
 
 // Adds a timer for the running G at when (TIMER_LK held).
-#[cfg(feature = "navic")]
 fn add_timer(when: usize) -> *mut Timer {
     let g = current();
     let t = crate::rt::gc::alloc(crate::intrinsics::size_of::<Timer>(), false) as *mut Timer;
@@ -1388,7 +1205,6 @@ fn add_timer(when: usize) -> *mut Timer {
 }
 
 // Removes the earliest timer (TIMER_LK held).
-#[cfg(feature = "navic")]
 fn pop_timer() -> *mut Timer {
     let top = theap(0);
     TIMER_N -= 1;
@@ -1412,7 +1228,6 @@ fn pop_timer() -> *mut Timer {
 }
 
 // Readies the Gs whose timers expired (no allocation: Ms run it).
-#[cfg(feature = "navic")]
 fn run_timers() {
     let next = crate::rt::atomic_load(&mut TIMER_NEXT as *mut usize);
     if next == NO_TIMER { return; }
@@ -1434,7 +1249,6 @@ fn run_timers() {
 }
 
 /// Parks the running G for ns nanoseconds (its OS thread runs others).
-#[cfg(feature = "navic")]
 pub fn sleep_ns(ns: u64) {
     if ns == 0 {
         yield_now();
@@ -1449,7 +1263,6 @@ pub fn sleep_ns(ns: u64) {
 }
 
 /// wait, for at most ns nanoseconds: whether the time ran out.
-#[cfg(feature = "navic")]
 pub fn wait_ns(w: *mut WaitList, lk: *mut usize, ns: u64) -> bool {
     enlist_key(w, 0);
     let when = crate::rt::native::monotonic_nanos() as usize + ns as usize;
@@ -1470,32 +1283,20 @@ pub fn wait_ns(w: *mut WaitList, lk: *mut usize, ns: u64) -> bool {
 // list. A readied G wakes an idle M unless one is already looking for work.
 // The runtime lock is not used on these paths.
 
-#[cfg(feature = "navic")]
 static mut GQ_LK: usize = 0;
-#[cfg(feature = "navic")]
 static mut GQ_HEAD: usize = 0;
-#[cfg(feature = "navic")]
 static mut GQ_TAIL: usize = 0;
-#[cfg(feature = "navic")]
 static mut IDLE_LK: usize = 0;
-#[cfg(feature = "navic")]
 static mut IDLE_MS: usize = 0;
-#[cfg(feature = "navic")]
 static mut NIDLE: usize = 0;
 // Ms looking for work (stealing).
-#[cfg(feature = "navic")]
 static mut NSPIN: usize = 0;
 
-#[cfg(feature = "navic")]
 const AFTER_NONE: usize = 0;
-#[cfg(feature = "navic")]
 const AFTER_PARK: usize = 1;
-#[cfg(feature = "navic")]
 const AFTER_YIELD: usize = 2;
-#[cfg(feature = "navic")]
 const AFTER_EXIT: usize = 3;
 
-#[cfg(feature = "navic")]
 fn gq_push(g: *mut G) {
     obj_lock(&mut GQ_LK as *mut usize);
     unsafe {
@@ -1506,7 +1307,6 @@ fn gq_push(g: *mut G) {
     obj_unlock(&mut GQ_LK as *mut usize);
 }
 
-#[cfg(feature = "navic")]
 fn gq_pop() -> *mut G {
     if crate::rt::atomic_load(&mut GQ_HEAD as *mut usize) == 0 { return 0 as *mut G; }
     obj_lock(&mut GQ_LK as *mut usize);
@@ -1520,7 +1320,6 @@ fn gq_pop() -> *mut G {
 }
 
 // m's queue (qlk held).
-#[cfg(feature = "navic")]
 fn q_push(m: *mut M, g: *mut G) {
     unsafe {
         (*g).next = 0 as *mut G;
@@ -1530,7 +1329,6 @@ fn q_push(m: *mut M, g: *mut G) {
     }
 }
 
-#[cfg(feature = "navic")]
 fn q_pop(m: *mut M) -> *mut G {
     unsafe {
         let g = (*m).qhead as *mut G;
@@ -1543,16 +1341,13 @@ fn q_pop(m: *mut M) -> *mut G {
     }
 }
 
-#[cfg(feature = "navic")]
 fn qlk(m: *mut M) -> *mut usize { unsafe { &mut (*m).qlk as *mut usize } }
 
 // Queues g (runnable now) and wakes an M for it if needed.
-#[cfg(feature = "navic")]
 fn ready(g: *mut G) { ready_at(g, false); }
 
 // ready, g to the M's runnext (it runs soon, as Go's), or with fifo to its
 // queue's tail (Gs readied together run in that order: timers).
-#[cfg(feature = "navic")]
 fn ready_at(g: *mut G, fifo: bool) {
     unsafe { (*g).status = RUNNABLE; }
     if unsafe { (*g).cb_prev } as usize != 0 {
@@ -1592,7 +1387,6 @@ fn ready_at(g: *mut G, fifo: bool) {
 }
 
 // Wakes an idle M (or starts one) unless an M is already looking for work.
-#[cfg(feature = "navic")]
 fn wakep() {
     if MAX_M <= 1 && crate::rt::atomic_load(&mut NRETAKEN as *mut usize) == 0 { return; }
     if crate::rt::atomic_load(&mut NSPIN as *mut usize) != 0 { return; }
@@ -1618,7 +1412,6 @@ fn wakep() {
 }
 
 // Wakes an idle M, if any (else starts one if allowed).
-#[cfg(feature = "navic")]
 fn wake_idle() {
     obj_lock(&mut IDLE_LK as *mut usize);
     let m = IDLE_MS as *mut M;
@@ -1637,7 +1430,6 @@ fn wake_idle() {
     wakep();
 }
 
-#[cfg(feature = "navic")]
 fn note_wake(m: *mut M) {
     unsafe {
         os_mutex_lock((*m).note_mu as *mut u8);
@@ -1647,7 +1439,6 @@ fn note_wake(m: *mut M) {
     }
 }
 
-#[cfg(feature = "navic")]
 fn note_sleep(m: *mut M) {
     unsafe {
         os_mutex_lock((*m).note_mu as *mut u8);
@@ -1658,7 +1449,6 @@ fn note_sleep(m: *mut M) {
 }
 
 // note_sleep for at most ns nanoseconds: whether the note was set.
-#[cfg(feature = "navic")]
 fn note_sleep_ns(m: *mut M, ns: u64) -> bool {
     unsafe {
         os_mutex_lock((*m).note_mu as *mut u8);
@@ -1670,7 +1460,6 @@ fn note_sleep_ns(m: *mut M, ns: u64) -> bool {
     }
 }
 
-#[cfg(feature = "navic")]
 fn new_note(m: *mut M) {
     unsafe {
         (*m).note_mu = calloc(1, 128) as usize;
@@ -1681,7 +1470,6 @@ fn new_note(m: *mut M) {
 }
 
 // A runnable G of m's own (runnext first).
-#[cfg(feature = "navic")]
 fn local_pop(m: *mut M) -> *mut G {
     unsafe { if (*m).runnext == 0 && (*m).qhead == 0 { return 0 as *mut G; } }
     obj_lock(qlk(m));
@@ -1692,7 +1480,6 @@ fn local_pop(m: *mut M) -> *mut G {
 }
 
 // A G taken from another M: the head of its queue, else its runnext.
-#[cfg(feature = "navic")]
 fn steal(me: *mut M) -> *mut G {
     let mut v = unsafe { (*me).next };
     let mut k = 0;
@@ -1718,7 +1505,6 @@ fn steal(me: *mut M) -> *mut G {
 }
 
 // Whether any G is runnable (a look without locks).
-#[cfg(feature = "navic")]
 fn work_exists() -> bool {
     if crate::rt::atomic_load(&mut GQ_HEAD as *mut usize) != 0 { return true; }
     let mut v = MS as *mut M;
@@ -1733,7 +1519,6 @@ fn work_exists() -> bool {
 }
 
 // Takes m off the idle list; false if a waker took it (it will be woken).
-#[cfg(feature = "navic")]
 fn unidle(m: *mut M) -> bool {
     obj_lock(&mut IDLE_LK as *mut usize);
     let mut found = false;
@@ -1759,7 +1544,6 @@ fn unidle(m: *mut M) -> bool {
 }
 
 // The next G for m to run (waits for one; not while the world is stopped).
-#[cfg(feature = "navic")]
 fn find_runnable(m: *mut M) -> *mut G {
     loop {
         while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { unsafe { os_yield(); } }
@@ -1824,7 +1608,6 @@ fn find_runnable(m: *mut M) -> *mut G {
 // The waiting Gs and the return addresses of their frames (as Go lists the
 // goroutines at a deadlock), and mstart's address for symbolizing them
 // against the binary (tools/symbolize.py).
-#[cfg(feature = "navic")]
 fn deadlock() -> ! {
     crate::rt::native::put(2, "fatal error: all goroutines are asleep - deadlock!\n\nmstart at ");
     crate::rt::native::put_hex(2, crate::rt::mstart_address() as u64);
@@ -1858,7 +1641,6 @@ fn deadlock() -> ! {
 }
 
 // What m's scheduler record does once the G that switched to it stopped.
-#[cfg(feature = "navic")]
 fn do_after(m: *mut M) {
     unsafe {
         let g = (*m).after_g as *mut G;
@@ -1880,7 +1662,6 @@ fn do_after(m: *mut M) {
 
 // The running G stops (its M's scheduler record does what) until it is
 // readied and resumed.
-#[cfg(feature = "navic")]
 fn stop_current(what: usize) {
     let g = current();
     if unsafe { (*g).cb_prev } as usize != 0 {
@@ -1905,32 +1686,31 @@ fn stop_current(what: usize) {
 // thread: the C frames below the scheduler's are the thread's, so where it
 // would wait for another G the thread sleeps instead (stop_callback).
 
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 #[nonblocking]
 extern "C" {
     fn pthread_key_create(key: *mut usize, dtor: usize) -> i32;
     fn pthread_setspecific(key: usize, v: usize) -> i32;
 }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 #[nonblocking]
 extern "C" {
     fn TlsAlloc() -> u32;
     fn TlsSetValue(idx: u32, v: usize) -> i32;
 }
 
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 fn tls_init() { unsafe { pthread_key_create(crate::rt::tls_key_slot(), 0); } }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn tls_init() { unsafe { *crate::rt::tls_key_slot() = TlsAlloc() as usize; } }
 
 // Makes m the running OS thread's M for callbacks.
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 fn tls_set(m: *mut M) { unsafe { pthread_setspecific(*crate::rt::tls_key_slot(), m as usize); } }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn tls_set(m: *mut M) { unsafe { TlsSetValue(*crate::rt::tls_key_slot() as u32, m as usize); } }
 
 // A callback G, idle (dead to the collector) until a callback runs on it.
-#[cfg(feature = "navic")]
 fn new_cb_g() -> *mut G {
     let g = new_g();
     let stack = reserve(STACK);
@@ -1947,7 +1727,6 @@ fn new_cb_g() -> *mut G {
 /// The start of a callback from C, on m's callback G (the running G): it
 /// becomes m's G. The runtime lock keeps a collection from stopping the
 /// world meanwhile.
-#[cfg(feature = "navic")]
 pub fn cb_enter(mp: usize) {
     let g = current();
     let m = mp as *mut M;
@@ -1969,7 +1748,6 @@ pub fn cb_enter(mp: usize) {
 }
 
 /// The end of a callback: the G whose C call it served is m's G again.
-#[cfg(feature = "navic")]
 pub fn cb_exit() {
     let g = current();
     lock();
@@ -1988,7 +1766,6 @@ pub fn cb_exit() {
 // A callback G stops: it cannot switch to the scheduler (whose stack holds
 // the C frames below it), so a yield is the OS thread's and a wait sleeps
 // the thread until ready wakes it (blocked meanwhile, for the collector).
-#[cfg(feature = "navic")]
 fn stop_callback(g: *mut G, what: usize) {
     if what == AFTER_YIELD {
         unsafe {
@@ -2007,14 +1784,12 @@ fn stop_callback(g: *mut G, what: usize) {
 }
 
 /// Lets other Gs run (the G goes to the global queue, as in Go).
-#[cfg(feature = "navic")]
 pub fn yield_now() {
     let g = current();
     unsafe { (*g).status = RUNNABLE; }
     stop_current(AFTER_YIELD);
 }
 
-#[cfg(feature = "navic")]
 fn exit_current() -> ! {
     let g = current();
     // The record and its stack are reused by a later G once this one has
@@ -2029,7 +1804,6 @@ fn exit_current() -> ! {
 }
 
 // A new OS thread with its scheduler record (the runtime lock is held).
-#[cfg(feature = "navic")]
 fn start_m() {
     if !MULTI {
         // From now on the lock is real: the running G holds it.
@@ -2055,7 +1829,6 @@ fn start_m() {
 }
 
 /// The first navi code of a new M (its G register is its scheduler record).
-#[cfg(feature = "navic")]
 pub fn mstart() -> ! {
     let m = unsafe { (*current()).m } as *mut M;
     if unsafe { (*m).poller } { crate::rt::netpoll::poll_loop(); }
@@ -2066,7 +1839,6 @@ pub fn mstart() -> ! {
 
 /// Starts the network poller's thread: an M outside the list of Ms (it
 /// runs no Gs, and the collector need not stop it).
-#[cfg(feature = "navic")]
 pub fn start_poller() {
     lock();
     if !MULTI {
@@ -2097,30 +1869,27 @@ pub fn start_poller() {
 // another M take over (retake, as Go hands off the P of a G in a system
 // call for 20 microseconds), and find_runnable idles one when it is back.
 
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 #[nonblocking]
 extern "C" {
     fn usleep(us: u32) -> i32;
 }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 #[nonblocking]
 extern "C" {
     fn Sleep(ms: u32);
 }
 // Sleeps the OS thread (without GC memory: the monitor runs no G).
-#[cfg(all(feature = "navic", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 fn os_sleep_us(us: u64) { unsafe { usleep(us as u32); } }
-#[cfg(all(feature = "navic", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn os_sleep_us(us: u64) { unsafe { Sleep(((us + 999) / 1000) as u32); } }
 
-#[cfg(feature = "navic")]
 static mut NRETAKEN: usize = 0;
-#[cfg(feature = "navic")]
 static mut SYSMON_ON: bool = false;
 
 // Whether more Ms run Gs (m included) than MAX_M and those sysmon
 // replaced.
-#[cfg(feature = "navic")]
 fn too_many(m: *mut M) -> bool {
     let busy = NUM_M - NIDLE;
     busy > MAX_M + crate::rt::atomic_load(&mut NRETAKEN as *mut usize) && unsafe { !(*m).idle }
@@ -2128,7 +1897,6 @@ fn too_many(m: *mut M) -> bool {
 
 /// Starts the monitor's thread (once, with the first spawned G; the
 /// runtime lock is held).
-#[cfg(feature = "navic")]
 fn start_sysmon() {
     if SYSMON_ON { return; }
     SYSMON_ON = true;
@@ -2151,14 +1919,11 @@ fn start_sysmon() {
         crate::rt::native::fatal("cannot create an OS thread");
     }
 }
-#[cfg(not(feature = "navic"))]
-fn start_sysmon() {}
 
 // The monitor's loop: every 20 us (up to 10 ms while nothing is blocked;
 // me is its M, unused),
 // an M whose G has been blocked in the same call since the last look is
 // replaced if work waits.
-#[cfg(feature = "navic")]
 fn sysmon_loop(me: *mut M) -> ! {
     let mut delay: u64 = 20;
     loop {
@@ -2193,11 +1958,9 @@ fn sysmon_loop(me: *mut M) -> ! {
 
 /// The running G's wait generation (a waker that saw it readies the G
 /// only if it has not been woken otherwise since: wake_gen).
-#[cfg(feature = "navic")]
 pub fn wait_gen(g: *mut G) -> usize { unsafe { crate::rt::atomic_load(&mut (*g).wait_gen as *mut usize) } }
 
 /// Readies g unless it was woken since its wait generation was gen.
-#[cfg(feature = "navic")]
 pub fn wake_gen(g: *mut G, gen: usize) {
     if unsafe { word_cas(&mut (*g).wait_gen as *mut usize, gen, gen + 1) } { ready(g); }
 }
@@ -2205,7 +1968,6 @@ pub fn wake_gen(g: *mut G, gen: usize) {
 /// Parks the running G, releasing lk (held again on return), until a
 /// wake_gen or deadline (monotonic nanoseconds; 0: none): whether the
 /// deadline woke it.
-#[cfg(feature = "navic")]
 pub fn park_until(lk: *mut usize, deadline: u64) -> bool {
     if deadline == 0 {
         let one = [lk as usize];
@@ -2220,12 +1982,10 @@ pub fn park_until(lk: *mut usize, deadline: u64) -> bool {
     unsafe { (*t).fired }
 }
 
-#[cfg(feature = "navic")]
 fn lock_held_mloop() { mloop(); }
 
 // The scheduler loop of an M, on its scheduler record: runs runnable Gs
 // until each stops, sleeps while there are none.
-#[cfg(feature = "navic")]
 fn mloop() -> ! {
     let g0 = current();
     let m = unsafe { (*g0).m } as *mut M;
@@ -2269,22 +2029,17 @@ fn mloop() -> ! {
 // An object lock (a word in a channel or thread handle; 0: free). A G
 // spinning on one calls a function each time round, a safepoint for a
 // collector.
-#[cfg(feature = "navic")]
 pub fn obj_lock(lk: *mut usize) {
     while !crate::rt::atomic_cas(lk, 0, 1) { spin_wait(); }
 }
 
-#[cfg(feature = "navic")]
 pub fn obj_unlock(lk: *mut usize) { crate::rt::atomic_store(lk, 0); }
 
-#[cfg(feature = "navic")]
 fn spin_wait() { unsafe { os_yield(); } }
 
 /// Keeps the running G from stopping for the collector until preempt_on:
 /// a store and the write barrier's marking happen in one step.
-#[cfg(feature = "navic")]
 pub fn preempt_off() { unsafe { (*current()).nopreempt += 1; } }
-#[cfg(feature = "navic")]
 pub fn preempt_on() { unsafe { (*current()).nopreempt -= 1; } }
 
 static mut NEXT_TID: u64 = 1;
@@ -2297,31 +2052,10 @@ pub fn current_id() -> u64 {
 }
 
 /// The atomic word operations of std::sync::atomic.
-#[cfg(feature = "navic")]
 pub fn word_load(w: *mut usize) -> usize { crate::rt::atomic_load(w) }
-#[cfg(feature = "navic")]
 pub fn word_store(w: *mut usize, v: usize) { crate::rt::atomic_store(w, v); }
-#[cfg(feature = "navic")]
 pub fn word_add(w: *mut usize, v: usize) -> usize { crate::rt::atomic_add(w, v) }
-#[cfg(feature = "navic")]
 pub fn word_cas(w: *mut usize, old: usize, new: usize) -> bool { crate::rt::atomic_cas(w, old, new) }
-// One OS thread: plain memory operations.
-#[cfg(not(feature = "navic"))]
-pub fn word_load(w: *mut usize) -> usize { unsafe { *w } }
-#[cfg(not(feature = "navic"))]
-pub fn word_store(w: *mut usize, v: usize) { unsafe { *w = v; } }
-#[cfg(not(feature = "navic"))]
-pub fn word_add(w: *mut usize, v: usize) -> usize {
-    let old = unsafe { *w };
-    unsafe { *w = old + v; }
-    old
-}
-#[cfg(not(feature = "navic"))]
-pub fn word_cas(w: *mut usize, old: usize, new: usize) -> bool {
-    if unsafe { *w } != old { return false; }
-    unsafe { *w = new; }
-    true
-}
 
 /// A std::sync::Mutex (as Go's sync.Mutex): its word is 0 (free), 1
 /// (held) or 2 (held, Gs may wait); lk guards the wait list q. A locker
@@ -2362,14 +2096,12 @@ pub fn mutex_unlock(w: *mut usize, lk: *mut usize, q: *mut WaitList) {
 }
 
 /// Gives the CPU to another thread while spinning.
-#[cfg(feature = "navic")]
 pub fn cpu_relax() { unsafe { os_yield(); } }
 
 // Blocks the running G (its wait nodes are enlisted) until woken: it holds
 // the n object locks at locks, which its M's scheduler record releases
 // after the switch (so a waker cannot see it before it stopped); they are
 // held again on return.
-#[cfg(feature = "navic")]
 fn park_on(locks: *const usize, n: usize) {
     let g = current();
     unsafe {
@@ -2386,7 +2118,6 @@ fn park_on(locks: *const usize, n: usize) {
 }
 
 // Releases the object locks a G that just switched away held (park_on).
-#[cfg(feature = "navic")]
 // The addresses are copied first: once one lock is free the G may be woken,
 // run (its stack, which holds the list, changes) and park again.
 fn release_locks(g: *mut G) {
@@ -2420,7 +2151,6 @@ fn release_locks(g: *mut G) {
 /// spawned G's moves to one twice as large (or more). Called with the G's
 /// limit cleared; returns how far the stack moved (its stub moves SP and
 /// FP as much).
-#[cfg(feature = "navic")]
 pub fn morestack() -> usize {
     let g = current();
     unsafe {
@@ -2516,7 +2246,6 @@ const POISON: usize = 18446744073709551615;
 /// FPs, addresses of locals, the registers the stub saved) is moved as
 /// much, as are the catch_unwind records (on the heap). Nothing else
 /// points into a stack: escape analysis keeps such locals on the heap.
-#[cfg(feature = "navic")]
 fn grow(g: *mut G) -> usize {
     unsafe {
         let lo = (*g).stack_lo;
@@ -2586,17 +2315,13 @@ fn grow(g: *mut G) -> usize {
 
 // Stacks move by their maps (as Go's adjustframe), not every word that
 // looks like an address in the old stack (NAVI_STACKCONS=1 does that).
-#[cfg(feature = "navic")]
 static mut STACKMAP: usize = 0;
-#[cfg(feature = "navic")]
 static mut STACKCHECK: bool = false;
 // NAVI_STACKMOVE=1 (debugging the stack maps): every morestack of a
 // spawned G using under 256 KiB of stack moves it, and the new limit is
 // just below where it is, so nearly every deeper call moves it again.
-#[cfg(feature = "navic")]
 static mut STACKMOVE: bool = false;
 
-#[cfg(feature = "navic")]
 fn stack_mode() {
     if STACKMAP == 0 {
         STACKMAP = if crate::rt::native::env_set(b"NAVI_STACKCONS\0") { 2 } else { 1 };
@@ -2606,11 +2331,9 @@ fn stack_mode() {
 }
 
 // The word at old address a, in the copy.
-#[cfg(feature = "navic")]
 fn mv_rd(a: usize, delta: usize) -> usize { unsafe { *(a.wrapping_add(delta) as *const usize) } }
 
 // Moves the word at old address a (in the copy) if it points into the old stack.
-#[cfg(feature = "navic")]
 fn mv_adj(a: usize, lo: usize, hi: usize, delta: usize) {
     let p = a.wrapping_add(delta) as *mut usize;
     unsafe {
@@ -2621,7 +2344,6 @@ fn mv_adj(a: usize, lo: usize, hi: usize, delta: usize) {
 
 // The stack map of the function containing return address pc and the
 // function's start (0, 0 for code without one).
-#[cfg(feature = "navic")]
 fn find_map(pc: usize) -> (usize, usize) {
     let tab = crate::rt::func_table();
     let (n, text, maps) = unsafe { (*(tab as *const usize), *((tab + 8) as *const usize), tab + *((tab + 16) as *const usize)) };
@@ -2650,7 +2372,6 @@ const CODE_UNIT: usize = 1;
 // The saved-register pointer mask of the call returning to offset ret in
 // a function's map (all registers if the call is not listed).
 
-#[cfg(feature = "navic")]
 fn call_mask(calls: usize, ret: usize) -> usize {
     // Entries of 4 bytes: (return offset / code unit) << 9 | mask.
     let n = unsafe { *(calls as *const usize) };
@@ -2673,7 +2394,6 @@ fn call_mask(calls: usize, ret: usize) -> usize {
 // mask at the call says (the value of x19 + k a frame saved belongs to the
 // next frame out that uses the register), the saved frame pointers. Code
 // without a map (the runtime's routines): every word of its frame.
-#[cfg(feature = "navic")]
 fn move_frames(sp: usize, lo: usize, hi: usize, delta: usize) {
     // The stub saved x0-x15 at sp, x19-x28 at sp + 128, x16-x17 at sp + 208;
     // at a function's entry only CTX (x0), RET (x8), LOC (x9) and the
@@ -2757,7 +2477,6 @@ fn move_frames(sp: usize, lo: usize, hi: usize, delta: usize) {
 
 // NAVI_STACKCHECK=1: reports the words of the moved stack still pointing
 // into the old one (a pointer a map missed, or an integer that looks like one).
-#[cfg(feature = "navic")]
 fn check_moved(nsp: usize, nhi: usize, lo: usize, hi: usize, delta: usize) {
     // The frames of the new stack: (frame pointer, return address into the
     // frame's function), from the stub's record out.
@@ -2798,7 +2517,6 @@ fn check_moved(nsp: usize, nhi: usize, lo: usize, hi: usize, delta: usize) {
 // Grows the stack now (if need be) so that a collection, which runs with
 // the world stopped, has 256 KiB below the caller's frame (Go runs its
 // collector on the system stack instead).
-#[cfg(feature = "navic")]
 fn stack_headroom() {
     let mut pad = [0u64; 32768];
     let i = (crate::rt::stack_pointer() as usize >> 4) & 32767;
@@ -2810,7 +2528,6 @@ fn stack_headroom() {
 /// lock): each is asked to stop at its next function prologue (its stack
 /// limit is made unreachable) or, if blocked outside navi code, claimed so
 /// that it waits before running navi code again.
-#[cfg(feature = "navic")]
 pub fn stop_the_world() {
     if !MULTI { return; }
     if crate::rt::native::env_set(b"NAVI_GCPOISON\0") { crate::rt::gc::POISON_FREE = true; }
@@ -2854,7 +2571,6 @@ pub fn stop_the_world() {
 }
 
 /// Lets the stopped Gs run again.
-#[cfg(feature = "navic")]
 pub fn start_the_world() {
     if !MULTI { return; }
     let me = current();

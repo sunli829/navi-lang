@@ -130,4 +130,27 @@ if cmp -s "$tmp/lsp.out" tests/lsp/session.out; then
 else
 	echo "FAIL navic lsp tests/lsp/session.jsonl"; diff tests/lsp/session.out "$tmp/lsp.out" | head -20; fail=1
 fi
+# The front end: tests/syntax parses; in tests/resolve (name resolution),
+# tests/types and tests/check (type checking) the files of ok/ and sigs/
+# have no errors and those of err/ exactly the errors their comments
+# "// error: text" expect (an error on that line whose message has text).
+front() {
+	"$navic" "$1" "$2" > "$tmp/front.out" 2>&1
+	grep '^error ' "$tmp/front.out" | sed -E 's#^error [^:]*:([0-9]+):[0-9]+: #\1	#' > "$tmp/front.got"
+	grep -n '// error: ' "$2" | sed -E 's#^([0-9]+):.*// error: #\1	#' > "$tmp/front.want"
+	if awk -F'\t' 'NR == FNR { want[NR] = $0; line[NR] = $1; text[NR] = $2; n = NR; next }
+		{ for (i = 1; i <= n; i++) if (!used[i] && line[i] == $1 && index($2, text[i]) > 0) { used[i] = 1; next }
+		  print "unexpected: " $1 ": " $2; bad = 1 }
+		END { for (i = 1; i <= n; i++) if (!used[i]) { print "missing: " line[i] ": " text[i]; bad = 1 } exit bad }' \
+		"$tmp/front.want" "$tmp/front.got" > "$tmp/front.diff"; then
+		echo "ok   $2"
+	else
+		echo "FAIL $2 ($1)"; head -20 "$tmp/front.diff"; fail=1
+	fi
+}
+for f in tests/syntax/*.navi; do
+	if "$navic" parse "$f" > "$tmp/parse.out" 2>&1; then echo "ok   $f"; else echo "FAIL $f (parse)"; head -5 "$tmp/parse.out"; fail=1; fi
+done
+for f in tests/resolve/*/*.navi; do front resolve-dump "$f"; done
+for f in tests/types/*/*.navi tests/check/*/*.navi; do front types-dump "$f"; done
 exit $fail
