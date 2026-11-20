@@ -414,6 +414,9 @@
   - 自举从上一个 release 开始（`tools/bootstrap.sh`，`tools/bootstrap-version`）；规则同 Go：编译器和 std 只能使用那个 release 支持的功能。
   - std 里给 stage0 的 `#[cfg(not(feature = "navic"))]` 分支和 `#[cfg(feature = "navic")]` 标记都去掉了（约 1200 行），编译器里的 `NAVI_STAGE0` 模式（模仿 stage0 的编号，用来对照输出）也去掉了；`feature = "..."` 现在一律为假。
   - 原来由 Go 测试驱动的前端用例改由 `tools/navictest.sh` 跑：`tests/syntax` 要能解析，`tests/resolve`、`tests/types`、`tests/check` 的 `ok`/`sigs` 没有错误、`err` 的错误和 `// error:` 标注一一对应（`// type:`、`// sig:` 这两种更细的断言没有沿用）。测试里的 `// stage0: skip`、`// interp: skip` 标记去掉了。
+- v0.0.2 进行中：
+  - `navic` 改名为 `navi`（`tools/navictest.sh` 改为 `tools/test.sh`；`tools/bootstrap.sh` 仍认得 v0.0.1 包里的 `bin/navic`）。
+  - 依赖（`compiler/src/deps.navi`，spec 1.10）：`navi.toml` 的 `[dependencies]`，本地路径或 git（tag、rev 或默认分支），以源码编译；同一仓库的不同版本并存（选择同 Cargo），第二个版本命名为 `名字@版本`，类型名相同而 crate 不同时报错信息带上 crate；`navi.lock` 记录 git 依赖的 commit，`navi update` 重新解析；检出在缓存的 `pkg/`（`NAVI_PKG`），由系统 git 拉取（先按 commit 浅拉取，不行再全量）；语言服务器只用已拉取的；依赖循环和非库依赖报错。`tools/test.sh` 用本地临时 git 仓库测这些（两版本并存、tag 挪动后锁住、update、类型报错）。
 
 ## 下一步
 

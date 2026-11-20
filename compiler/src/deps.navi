@@ -1,0 +1,383 @@
+//! Dependencies, written as Cargo's and built from source as Go's modules:
+//! a crate's navi.toml lists them in [dependencies], each a local path or a
+//! git repository at a tag (or a commit, or its default branch):
+//!
+//!     [dependencies]
+//!     foo = { path = "../foo" }
+//!     bar = { git = "https://github.com/x/bar", tag = "v1.2.0" }
+//!
+//! The key is the name the crate uses (`use bar::...`); a dependency is a
+//! library crate (src/lib.navi). Two versions of one repository can both be
+//! in a program (as Cargo's): they are different crates (the second named
+//! bar@v1.3.0 in messages). The commit each git dependency resolved to is
+//! kept in navi.lock next to the root crate's navi.toml, so that a moved tag
+//! does not change a build; `navi update` resolves them again. Checkouts are
+//! shared by every project: one per repository and commit in the cache's pkg
+//! directory (or $NAVI_PKG). git runs them (as for Go).
+
+use std::collections::HashMap;
+use crate::resolve::CrateSpec;
+use crate::util;
+
+/// A dependency as navi.toml declares it.
+struct Dep {
+    alias: String,
+    path: String,
+    git: String,
+    tag: String,
+    rev: String,
+}
+
+/// A git dependency's resolved commit (an entry of navi.lock).
+#[derive(Clone)]
+struct Locked {
+    url: String,
+    tag: String,
+    rev: String,
+    commit: String,
+}
+
+struct Graph {
+    // The dependencies loaded so far, a crate per directory (or checkout).
+    specs: Vec<&mut CrateSpec>,
+    by_dir: HashMap<String, String>,
+    names: HashMap<String, bool>,
+    // The directories being loaded (a dependency cycle comes back to one).
+    stack: Vec<String>,
+    old: Vec<Locked>,
+    used: Vec<Locked>,
+    offline: bool,
+}
+
+/// The crates of the program rooted at the crate at path, std first and the
+/// root last, with every dependency fetched and navi.lock up to date.
+/// offline: only what navi.lock and the checkouts already have (navi lsp);
+/// update: every git dependency resolved again (navi update).
+pub fn load_graph(path: &str, offline: bool, update: bool) -> Result<Vec<&CrateSpec>, String> {
+    let root = crate::driver::load_crate(path)?;
+    let mut specs: Vec<&CrateSpec> = Vec::new();
+    specs.push(crate::driver::std_crate());
+    // A single file has no navi.toml.
+    if !std::path::Path::new(path).is_dir() {
+        specs.push(root);
+        return Ok(specs);
+    }
+    let lock = util::path_join(path, "navi.lock");
+    let lock_text = match std::fs::read_to_string(lock.as_str()) { Ok(t) => t, Err(_) => String::new() };
+    // A changed navi.lock is a different build (see cache::lookup).
+    if lock_text.len() > 0 { crate::cache::note(lock.as_str(), &lock_text); }
+    let old = if update { Vec::new() } else { parse_lock(lock_text.as_str()) };
+    let g = &mut Graph { specs: Vec::new(), by_dir: HashMap::new(), names: HashMap::new(), stack: Vec::new(), old, used: Vec::new(), offline };
+    g.names.insert("std".to_string(), true);
+    g.names.insert(root.name.clone(), true);
+    let root_dir = canonical(path)?;
+    g.by_dir.insert(root_dir.clone(), root.name.clone());
+    g.stack.push(root_dir.clone());
+    root.deps = g.deps_of(root_dir.as_str())?;
+    for s in g.specs.iter() { specs.push(*s); }
+    specs.push(root);
+    if !offline {
+        let text = render_lock(&g.used);
+        if text != lock_text && (g.used.len() > 0 || lock_text.len() > 0) {
+            if let Err(e) = std::fs::write(lock.as_str(), text.as_bytes()) { return Err(`${lock}: ${e}`); }
+            crate::cache::note(lock.as_str(), &text);
+        }
+    }
+    Ok(specs)
+}
+
+impl Graph {
+    /// The dependencies of the crate in dir, as "alias=crate" (see
+    /// resolve::resolve).
+    fn deps_of(&mut self, dir: &str) -> Result<Vec<String>, String> {
+        let toml = util::path_join(dir, "navi.toml");
+        let text = match std::fs::read_to_string(toml.as_str()) { Ok(t) => t, Err(_) => return Ok(Vec::new()) };
+        crate::cache::note(toml.as_str(), &text);
+        let mut out: Vec<String> = Vec::new();
+        for d in parse_deps(text.as_str(), toml.as_str())?.iter() {
+            let c = self.package(dir, d)?;
+            out.push(`${d.alias}=${c}`);
+        }
+        Ok(out)
+    }
+
+    /// The crate of dependency d of the crate in dir (loaded once per
+    /// directory or checkout).
+    fn package(&mut self, dir: &str, d: &Dep) -> Result<String, String> {
+        let pdir = if d.path.len() > 0 {
+            let p = if is_absolute(d.path.as_str()) { d.path.clone() } else { util::path_join(dir, d.path.as_str()) };
+            match canonical(p.as_str()) {
+                Ok(c) => c,
+                Err(_) => return Err(`${dir}: dependency ${d.alias}: no directory ${p}`),
+            }
+        } else {
+            self.checkout(d)?
+        };
+        if let Some(c) = self.by_dir.get(&pdir) {
+            if self.stack.contains(&pdir) { return Err(`${pdir}: a dependency cycle reaches this crate again`); }
+            return Ok(c.clone());
+        }
+        let spec = crate::driver::load_crate(pdir.as_str())?;
+        if spec.root != "src/lib.navi" { return Err(`${pdir}: dependency ${d.alias} is not a library (no src/lib.navi)`); }
+        // A name another crate has (another version of it): name@version.
+        let mut name = spec.name.clone();
+        if self.names.contains_key(&name) {
+            let label = if d.tag.len() > 0 { d.tag.clone() } else if d.rev.len() > 0 { d.rev[0..d.rev.len().min(12)].to_string() } else { "path".to_string() };
+            name = `${spec.name}@${label}`;
+            let mut k = 2;
+            while self.names.contains_key(&name) {
+                name = `${spec.name}@${label}-${k}`;
+                k += 1;
+            }
+        }
+        self.names.insert(name.clone(), true);
+        spec.name = name.clone();
+        self.by_dir.insert(pdir.clone(), name.clone());
+        self.stack.push(pdir.clone());
+        spec.deps = self.deps_of(pdir.as_str())?;
+        self.stack.pop();
+        self.specs.push(spec);
+        Ok(name)
+    }
+
+    /// The checkout of git dependency d (fetched if missing).
+    fn checkout(&mut self, d: &Dep) -> Result<String, String> {
+        let commit = self.commit_of(d)?;
+        let base = match crate::cache::pkg_dir() { Some(b) => b, None => return Err("no directory for dependencies (set NAVI_PKG)".to_string()) };
+        let repo = util::path_join(base.as_str(), `git/${short_hash(d.git.as_str())}`.as_str());
+        let dir = util::path_join(repo.as_str(), commit.as_str());
+        let ok = util::path_join(dir.as_str(), ".navi-ok");
+        if std::path::Path::new(ok.as_str()).exists() { return Ok(canonical(dir.as_str())?); }
+        if self.offline { return Err(`${d.git} ${describe(d)}: not fetched yet (run navi build)`); }
+        eprintln(`navi: fetching ${d.git} ${describe(d)}`);
+        let tmp = `${dir}.tmp${std::process::id()}`;
+        let _ = std::fs::remove_dir_all(tmp.as_str());
+        if let Err(e) = std::fs::create_dir_all(tmp.as_str()) { return Err(`${tmp}: ${e}`); }
+        git(&["init", "-q", tmp.as_str()])?;
+        // The commit alone; servers that refuse that send everything.
+        if git(&["-C", tmp.as_str(), "fetch", "-q", "--depth", "1", d.git.as_str(), commit.as_str()]).is_err() {
+            git(&["-C", tmp.as_str(), "fetch", "-q", d.git.as_str(), "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*"])?;
+        }
+        git(&["-C", tmp.as_str(), "-c", "advice.detachedHead=false", "checkout", "-q", commit.as_str()])?;
+        if let Err(e) = std::fs::write(util::path_join(tmp.as_str(), ".navi-ok").as_str(), commit.as_bytes()) { return Err(`${tmp}: ${e}`); }
+        // Another navi may have fetched it meanwhile.
+        if std::fs::rename(tmp.as_str(), dir.as_str()).is_err() {
+            let _ = std::fs::remove_dir_all(tmp.as_str());
+            if !std::path::Path::new(ok.as_str()).exists() { return Err(`${dir}: cannot move the checkout there`); }
+        }
+        Ok(canonical(dir.as_str())?)
+    }
+
+    /// The commit git dependency d stands for: navi.lock's, else its rev,
+    /// else what its tag (or the default branch) names now.
+    fn commit_of(&mut self, d: &Dep) -> Result<String, String> {
+        for l in self.used.iter() {
+            if l.url == d.git && l.tag == d.tag && l.rev == d.rev { return Ok(l.commit.clone()); }
+        }
+        let mut commit = String::new();
+        for l in self.old.iter() {
+            if l.url == d.git && l.tag == d.tag && l.rev == d.rev { commit = l.commit.clone(); }
+        }
+        if commit.len() == 0 {
+            if d.rev.len() > 0 {
+                if d.rev.len() != 40 || !d.rev.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(`${d.git}: rev ${util::quote(d.rev.as_str())} must be a full commit hash (40 hex digits)`);
+                }
+                commit = d.rev.to_lowercase();
+            } else if self.offline {
+                return Err(`${d.git} ${describe(d)}: not in navi.lock (run navi build)`);
+            } else {
+                commit = remote_commit(d)?;
+            }
+        }
+        self.used.push(Locked { url: d.git.clone(), tag: d.tag.clone(), rev: d.rev.clone(), commit: commit.clone() });
+        Ok(commit)
+    }
+}
+
+fn describe(d: &Dep) -> String {
+    if d.tag.len() > 0 { `tag ${d.tag}` } else if d.rev.len() > 0 { `rev ${d.rev}` } else { "(default branch)".to_string() }
+}
+
+// What d's tag (or the remote's HEAD) names now: the commit, an annotated
+// tag peeled.
+fn remote_commit(d: &Dep) -> Result<String, String> {
+    let out = if d.tag.len() > 0 {
+        let r = `refs/tags/${d.tag}`;
+        let peeled = `refs/tags/${d.tag}^{}`;
+        git(&["ls-remote", d.git.as_str(), r.as_str(), peeled.as_str()])?
+    } else {
+        git(&["ls-remote", d.git.as_str(), "HEAD"])?
+    };
+    let mut commit = String::new();
+    for line in out.lines() {
+        let (sha, name) = match line.split_once('\t') { Some(p) => p, None => continue };
+        // The peeled line (the commit of an annotated tag) wins.
+        if commit.len() == 0 || name.ends_with("^{}") { commit = sha.to_string(); }
+    }
+    if commit.len() == 0 { return Err(`${d.git}: no ${describe(d)}`); }
+    Ok(commit)
+}
+
+// Runs git (no prompts: a build must not wait for a password); its output.
+fn git(args: &[&str]) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("git");
+    for a in args.iter() { cmd.arg(*a); }
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    match cmd.output() {
+        Ok(o) => {
+            if o.status.success() { return Ok(String::from_utf8_lossy(o.stdout.as_slice()).to_string()); }
+            let msg = String::from_utf8_lossy(o.stderr.as_slice()).to_string();
+            Err(`git ${args.join(" ")}: ${msg.trim()}`)
+        }
+        Err(e) => Err(`git: ${e} (dependencies from git need git installed)`),
+    }
+}
+
+// The dependencies of navi.toml's [dependencies] table: name = { ... }
+// (inline tables of path, git, tag and rev).
+fn parse_deps(text: &str, file: &str) -> Result<Vec<&Dep>, String> {
+    let mut out: Vec<&Dep> = Vec::new();
+    let mut in_deps = false;
+    let mut ln = 0;
+    for raw in text.lines() {
+        ln += 1;
+        let line = strip_comment(raw).trim();
+        if line.len() == 0 { continue; }
+        if line.starts_with("[") {
+            in_deps = line == "[dependencies]";
+            continue;
+        }
+        if !in_deps { continue; }
+        let (k, v) = match line.split_once('=') { Some(p) => p, None => return Err(`${file}:${ln}: expected name = { ... }`) };
+        let alias = k.trim().trim_matches('"').to_string();
+        let v = v.trim();
+        if !v.starts_with("{") || !v.ends_with("}") {
+            return Err(`${file}:${ln}: dependency ${alias}: expected { path = "..." } or { git = "...", tag = "..." }`);
+        }
+        let d = &mut Dep { alias: alias.clone(), path: String::new(), git: String::new(), tag: String::new(), rev: String::new() };
+        for field in split_fields(&v[1..v.len() - 1]).iter() {
+            let (fk, fv) = match field.split_once('=') { Some(p) => p, None => return Err(`${file}:${ln}: dependency ${alias}: expected key = "value"`) };
+            let fv = fv.trim();
+            if !fv.starts_with("\"") || !fv.ends_with("\"") || fv.len() < 2 { return Err(`${file}:${ln}: dependency ${alias}: ${fk.trim()} must be a string`); }
+            let val = fv[1..fv.len() - 1].to_string();
+            match fk.trim() {
+                "path" => d.path = val,
+                "git" => d.git = val,
+                "tag" => d.tag = val,
+                "rev" => d.rev = val,
+                other => return Err(`${file}:${ln}: dependency ${alias}: unknown key ${other} (path, git, tag or rev)`),
+            }
+        }
+        if (d.path.len() > 0) == (d.git.len() > 0) { return Err(`${file}:${ln}: dependency ${alias}: needs path or git (one of them)`); }
+        if d.path.len() > 0 && (d.tag.len() > 0 || d.rev.len() > 0) { return Err(`${file}:${ln}: dependency ${alias}: tag and rev go with git`); }
+        if d.tag.len() > 0 && d.rev.len() > 0 { return Err(`${file}:${ln}: dependency ${alias}: tag or rev, not both`); }
+        for o in out.iter() {
+            if o.alias == alias { return Err(`${file}:${ln}: dependency ${alias} declared twice`); }
+        }
+        out.push(d);
+    }
+    Ok(out)
+}
+
+// line without a # comment (not one inside a string).
+fn strip_comment(line: &str) -> &str {
+    let mut in_str = false;
+    for (i, c) in line.char_indices() {
+        if c == '"' { in_str = !in_str; }
+        if c == '#' && !in_str { return &line[0..i]; }
+    }
+    line
+}
+
+// The comma-separated fields of an inline table (commas in strings kept).
+fn split_fields(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    for c in s.chars() {
+        if c == '"' { in_str = !in_str; }
+        if c == ',' && !in_str {
+            if cur.trim().len() > 0 { out.push(cur.trim().to_string()); }
+            cur = String::new();
+            continue;
+        }
+        cur.push(c);
+    }
+    if cur.trim().len() > 0 { out.push(cur.trim().to_string()); }
+    out
+}
+
+// navi.lock: [[git]] tables of url, tag, rev and commit.
+fn parse_lock(text: &str) -> Vec<Locked> {
+    let mut out: Vec<Locked> = Vec::new();
+    let mut cur: Option<Locked> = None;
+    for raw in text.lines() {
+        let line = strip_comment(raw).trim();
+        if line == "[[git]]" {
+            if let Some(l) = cur { if l.url.len() > 0 && l.commit.len() > 0 { out.push(l); } }
+            cur = Some(Locked { url: String::new(), tag: String::new(), rev: String::new(), commit: String::new() });
+            continue;
+        }
+        let (k, v) = match line.split_once('=') { Some(p) => p, None => continue };
+        let v = v.trim().trim_matches('"').to_string();
+        if let Some(mut l) = cur {
+            match k.trim() {
+                "url" => l.url = v,
+                "tag" => l.tag = v,
+                "rev" => l.rev = v,
+                "commit" => l.commit = v,
+                _ => {}
+            }
+            cur = Some(l);
+        }
+    }
+    if let Some(l) = cur { if l.url.len() > 0 && l.commit.len() > 0 { out.push(l); } }
+    out
+}
+
+fn render_lock(used: &Vec<Locked>) -> String {
+    let mut ls: Vec<Locked> = used.clone();
+    ls.sort_by(|a, b| {
+        if a.url != b.url { return a.url.cmp(&b.url); }
+        if a.tag != b.tag { return a.tag.cmp(&b.tag); }
+        a.rev.cmp(&b.rev)
+    });
+    let mut s = "# The commits of the git dependencies (written by navi: keep it with the code;\n# navi update resolves them again).\n".to_string();
+    for l in ls.iter() {
+        s.push_str(`\n[[git]]\nurl = \"${l.url}\"\n`.as_str());
+        if l.tag.len() > 0 { s.push_str(`tag = \"${l.tag}\"\n`.as_str()); }
+        if l.rev.len() > 0 { s.push_str(`rev = \"${l.rev}\"\n`.as_str()); }
+        s.push_str(`commit = \"${l.commit}\"\n`.as_str());
+    }
+    s
+}
+
+fn is_absolute(p: &str) -> bool {
+    p.starts_with("/") || p.len() > 2 && p.as_bytes()[1] == b':' && (p.as_bytes()[2] == b'/' || p.as_bytes()[2] == b'\\')
+}
+
+// The canonical path of an existing directory (links resolved, C:/dir).
+fn canonical(p: &str) -> Result<String, String> {
+    match std::fs::canonicalize(p) {
+        Ok(c) => match c.to_str() {
+            Some(s) => Ok(util::path_clean(s)),
+            None => Err(`${p}: not a UTF-8 path`),
+        },
+        Err(e) => Err(`${p}: ${e}`),
+    }
+}
+
+// A directory name for a repository URL: 16 hex digits of its SHA-256.
+fn short_hash(url: &str) -> String {
+    let d = crate::sha256::sum(url.as_bytes());
+    let digits = "0123456789abcdef".as_bytes();
+    let mut s = String::new();
+    let mut i = 0;
+    while i < 8 {
+        s.push(digits[(d[i] >> 4) as usize] as char);
+        s.push(digits[(d[i] & 15) as usize] as char);
+        i += 1;
+    }
+    s
+}

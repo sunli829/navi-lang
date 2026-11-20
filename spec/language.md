@@ -315,7 +315,20 @@ pub use crate::parser::Ast;                 // 重新导出
 - **crate 是编译单位**，也是孤儿规则和 `pub(crate)` 的边界；crate 之间不能循环依赖，crate 内的模块可以互相引用
 - 文件查找规则同 Rust：`mod foo;` 加载 `foo.navi` 或 `foo/mod.navi`
 - 路径以 `crate::`、`self::`、`super::`、外部 crate 名或 `std::` 开头
-- **条件编译**：`#[cfg(target_os = "windows")]` 可以加在条目和 `mod` 声明上，`#![cfg(...)]` 写在文件开头作用于整个模块。可用的条件有 `target_os`、`target_arch`、`test`、`debug_assertions`、`feature = "..."`
+- **条件编译**：`#[cfg(target_os = "windows")]` 可以加在条目和 `mod` 声明上，`#![cfg(...)]` 写在文件开头作用于整个模块。可用的条件有 `target_os`、`target_arch`、`test`、`debug_assertions`（`feature = "..."` 目前恒为假）
+- **依赖**写在 `navi.toml` 的 `[dependencies]` 里（写法同 Cargo），可以是本地路径，也可以是 git 仓库的某个 tag（或 `rev = "完整 commit"`，都不写就是默认分支）：
+
+  ```toml
+  [dependencies]
+  foo = { path = "../foo" }
+  bar = { git = "https://github.com/x/bar", tag = "v1.2.0" }
+  ```
+
+  - 键名就是代码里用的名字（`use bar::...`），可以和依赖自己的包名不同；依赖必须是库 crate（`src/lib.navi`），依赖的依赖按它自己的 `navi.toml` 递归加载，路径相对于写它的 crate
+  - 依赖以源码形式和程序一起编译（同 Go），没有二进制库
+  - 同一个仓库的不同版本可以同时存在（同 Cargo）：它们是不同的 crate，类型互不相同；报错时第二个版本显示为 `bar@v1.3.0`
+  - git 依赖解析到的 commit 记在根 crate 旁边的 `navi.lock` 里，应提交进仓库：tag 被挪动也不改变构建；`navi update` 重新解析所有 tag
+  - `navi build` 和 `navi test` 会自动拉取缺少的依赖（需要装有 git），检出放在缓存目录的 `pkg/` 下（或 `NAVI_PKG`），所有项目共用；语言服务器只用已经拉取的
 - **为了编译速度**（crate 粒度比 Go 的包粗，所以 crate 内部也要并行）：
   - crate 内所有文件并行解析
   - 先收集所有条目的签名，再并行检查各个函数体

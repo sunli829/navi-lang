@@ -152,5 +152,40 @@ for f in tests/syntax/*.navi; do
 	if "$navi" parse "$f" > "$tmp/parse.out" 2>&1; then echo "ok   $f"; else echo "FAIL $f (parse)"; head -5 "$tmp/parse.out"; fail=1; fi
 done
 for f in tests/resolve/*/*.navi; do front resolve-dump "$f"; done
+# Dependencies (see compiler/src/deps.navi): app needs foo (a path, as f)
+# and bar v1.0.0 (git); foo needs util (a path) and bar v1.1.0, so both
+# versions of bar are in app. navi.lock keeps a tag that moves; navi update
+# follows it.
+d=$tmp/deps
+mkdir -p "$d/bar/src" "$d/util/src" "$d/foo/src" "$d/app/src"
+dd=$d
+if [ "$os" = windows ]; then dd=$(cygpath -m "$d"); fi
+g() { git -C "$d/bar" -c user.email=t@t -c user.name=t "$@" > /dev/null; }
+printf '[package]\nname = "bar"\n' > "$d/bar/navi.toml"
+printf 'pub struct Version { pub n: i32 }\npub fn version() -> Version { Version { n: %s } }\n' 100 > "$d/bar/src/lib.navi"
+g init -q && g add -A && g commit -qm one && g tag v1.0.0
+printf 'pub struct Version { pub n: i32 }\npub fn version() -> Version { Version { n: %s } }\n' 110 > "$d/bar/src/lib.navi"
+g commit -qam two && g tag -a v1.1.0 -m two
+printf '[package]\nname = "util"\n' > "$d/util/navi.toml"
+printf 'pub fn twice(x: i32) -> i32 { x * 2 }\n' > "$d/util/src/lib.navi"
+printf '[package]\nname = "foo"\n\n[dependencies]\nutil = { path = "../util" }\nbar = { git = "file://%s/bar", tag = "v1.1.0" }\n' "$dd" > "$d/foo/navi.toml"
+printf 'pub fn value() -> i32 { util::twice(21) }\npub fn bar_n() -> i32 { bar::version().n }\npub fn get() -> bar::Version { bar::version() }\n' > "$d/foo/src/lib.navi"
+printf '[package]\nname = "app"\n\n[dependencies]\nf = { path = "../foo" }\nbar = { git = "file://%s/bar", tag = "v1.0.0" }\n' "$dd" > "$d/app/navi.toml"
+printf 'fn main() { println(`${f::value()} ${f::bar_n()} ${bar::version().n}`); }\n' > "$d/app/src/main.navi"
+deps() { (cd "$d/app" && NAVI_PKG="$dd/pkg" "$navi" "$@" 2>&1); }
+r1=$(deps build -o app . > /dev/null && "$d/app/app")
+locked=$(grep -c '^commit = ' "$d/app/navi.lock" 2> /dev/null)
+printf 'pub struct Version { pub n: i32 }\npub fn version() -> Version { Version { n: %s } }\n' 101 > "$d/bar/src/lib.navi"
+g commit -qam moved && g tag -f v1.0.0
+r2=$(deps build -o app . > /dev/null && "$d/app/app")
+r3=$(deps update > /dev/null && deps build -o app . > /dev/null && "$d/app/app")
+printf 'fn take(v: bar::Version) -> i32 { v.n }\nfn main() { println(`${take(f::get())}`); }\n' > "$d/app/src/main.navi"
+r4=$(deps build -o app . | sed -E 's#^[^ ]*:[0-9]+:[0-9]+: ##')
+if [ "$r1" = "42 110 100" ] && [ "$locked" = 2 ] && [ "$r2" = "42 110 100" ] && [ "$r3" = "42 110 101" ] \
+	&& [ "$r4" = "mismatched types: expected bar@v1.0.0::Version, found bar::Version" ]; then
+	echo "ok   dependencies"
+else
+	echo "FAIL dependencies"; printf '%s\n' "$r1" "$locked" "$r2" "$r3" "$r4"; fail=1
+fi
 for f in tests/types/*/*.navi tests/check/*/*.navi; do front types-dump "$f"; done
 exit $fail
