@@ -23,14 +23,14 @@ macOS 上用浏览器下载的包带隔离标记，第一次运行前执行 `xat
 
 ## 从源码构建
 
-目前用 stage0（Go 写的原型编译器，已冻结）引导，需要 Go 1.26：
+用上一个 release 的 navic 引导（同 Go 用旧版 Go 编译自己），不需要 Go 和 C 工具链：
 
 ```sh
-go build -o navi0 ./cmd/navi
-NAVI_STD=$PWD/lib/std ./navi0 build -o s1/navic compiler
-NAVI_STD=$PWD/lib/std s1/navic build -o s2/navic compiler
-tools/navictest.sh s2/navic
+tools/bootstrap.sh build        # 下载 tools/bootstrap-version 指定的 release，自举到定点
+tools/navictest.sh build/stage2/navic
 ```
+
+所以 `compiler/` 和 `lib/std` 只能使用那个 release 已经支持的语言功能和 intrinsic：新功能要等发布了支持它的版本、`tools/bootstrap-version` 改到那个版本之后才能在这两处使用。也可以用 `NAVI_BOOTSTRAP=某个 navic` 指定引导用的编译器。
 
 ## 目标平台
 

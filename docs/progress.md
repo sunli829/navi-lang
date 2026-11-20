@@ -57,7 +57,7 @@
 | 类型检查 | 完成 | `types-dump`（所有签名，及每个函数体里每个表达式、局部变量、模式的类型、被调对象、隐式转换），错误信息逐条一致 |
 | MIR 构建 | 完成 | `mir-dump`（每个函数体和闭包的 MIR 打印） |
 | 布局、shim、代码生成规划、lowering、arm64、Mach-O、驱动 | 完成 | `build -c` 的目标文件与 stage0 逐字节相同（全部 22 个运行测试和编译器自身） |
-| 自举 | 完成 | `tools/bootstrap.sh`：stage0 → stage1 → stage2 → stage3，stage1 编译自身得到的目标文件与 stage0 相同，stage2 与 stage3 逐字节相同；stage2 编译的 22 个 golden 测试全部通过 |
+| 自举 | 完成 | `tools/bootstrap.sh`：上一个 release 的 navic（`tools/bootstrap-version`，现为 v0.0.1）→ stage1 → stage2 → stage3，stage2 与 stage3 逐字节相同（原来从 stage0 引导；两条路得到的 stage2 逐字节相同） |
 
 （当时）navic 只生成 macos-arm64（Mach-O）；amd64、ELF、COFF 后来在 M9 移植过来了（见 M9 的“其他平台”）。navic 编译自身约 48 秒（stage0 约 0.6 秒），生成代码没有寄存器分配、没有内联、所有被取地址的局部变量都装箱，这是 M9 性能工作的起点。
 
