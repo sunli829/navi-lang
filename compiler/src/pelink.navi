@@ -4,8 +4,12 @@
 //!
 //! Sections: .text (code, the import stubs and the entry point), .rdata,
 //! .data (the object's read-only data with pointers, then its data),
-//! .idata (import descriptors, lookup and address tables, names) and
-//! .reloc (base relocations: the image may load anywhere). Win32 functions
+//! .idata (import descriptors, lookup and address tables, names), .pdata
+//! and .xdata (unwind tables: debuggers and Windows walk the stack
+//! through them), the DWARF sections (unless navi build -s) and .reloc
+//! (base relocations: the image may load anywhere). As Go's linker it also
+//! writes a COFF symbol table (no PDB): gdb, lldb and nm read the names
+//! and lines. Win32 functions
 //! (capitalized names) come from kernel32.dll, the C library's from
 //! ucrtbase.dll; calls go through stubs that jump via the import address
 //! table. The entry point asks ucrtbase for argc and argv, calls main and
@@ -166,25 +170,85 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
         idata.data.push(0);
     }
 
-    // Layout.
+    // .pdata and .xdata: a RUNTIME_FUNCTION for each function with a frame
+    // (see obj::Object::frames), its UNWIND_INFO saying that the prologue
+    // pushes rbp and makes it the frame pointer (rsp is rbp's then; the
+    // functions whose prologue is at the same offset share one). The
+    // runtime's assembly and the stubs have none (leaf functions to
+    // Windows).
+    let pdata = sec(".pdata", IDATA | READ);
+    let xdata = sec(".xdata", IDATA | READ);
+    let mut frames = o.frames.clone();
+    frames.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut unwind_at: HashMap<u64, u64> = HashMap::new();
+    let mut runtime_fns: Vec<(u64, u64, u64)> = Vec::new();
+    for f in frames.iter() {
+        let push = f.2;
+        if push + 4 > 255 { continue; }
+        let x = match unwind_at.get(&push) {
+            Some(x) => *x,
+            None => {
+                let x = xdata.data.len() as u64;
+                // Version 1; the prologue's size; 2 codes; rbp (5) the frame
+                // register at offset 0. The codes, last first: SET_FPREG after
+                // mov rbp, rsp; PUSH_NONVOL rbp after push rbp.
+                let info = [1u8, (push + 4) as u8, 2, 5, (push + 4) as u8, 0x03, (push + 1) as u8, 0x50];
+                xdata.data.extend_from_slice(&info);
+                unwind_at.insert(push, x);
+                x
+            }
+        };
+        runtime_fns.push((f.0, f.0 + f.1, x));
+    }
+    pad(&mut pdata.data, 12 * runtime_fns.len() as u64);
+
+    // Layout: the sections in order, .reloc last (sized once the others
+    // are placed); the DWARF sections need .text's address, known first.
     let mut secs: Vec<&mut Sec> = Vec::new();
     secs.push(text);
     secs.push(rdata);
     secs.push(data);
     secs.push(idata);
+    if runtime_fns.len() > 0 {
+        secs.push(pdata);
+        secs.push(xdata);
+    }
+    let debug_names = [".debug_abbrev", ".debug_info", ".debug_line"];
+    let mut debug: Vec<&mut Sec> = Vec::new();
+    if o.lines.len() > 0 {
+        for n in debug_names.iter() {
+            let d = sec(*n, IDATA | READ | DISCARDABLE);
+            debug.push(d);
+            secs.push(d);
+        }
+    }
     let reloc = sec(".reloc", IDATA | READ | DISCARDABLE);
     secs.push(reloc);
     let nsec = secs.len() as u64;
     let headers = align_up(0x80 + 4 + 20 + 240 + 40 * nsec, FILE_ALIGN);
     let mut rva = align_up(headers, SECT_ALIGN);
-    // .reloc is sized below, after the others are placed.
+    text.rva = rva;
+    if debug.len() > 0 {
+        let pwd = match std::env::var("PWD") { Ok(p) => p, Err(_) => ".".to_string() };
+        let ds = crate::dwarf::sections(o, IMAGE_BASE + text.rva, text.data.len() as u64, pwd.as_str());
+        debug[0].data = ds.abbrev;
+        debug[1].data = ds.info;
+        debug[2].data = ds.line;
+    }
     let mut j = 0;
-    while j < 4 {
+    while j + 1 < secs.len() {
         secs[j].rva = rva;
         rva = align_up(rva + secs[j].data.len() as u64, SECT_ALIGN);
         j += 1;
     }
     reloc.rva = rva;
+    let mut k = 0;
+    for f in runtime_fns.iter() {
+        set32(&mut pdata.data, k, (text.rva + f.0) as u32);
+        set32(&mut pdata.data, k + 4, (text.rva + f.1) as u32);
+        set32(&mut pdata.data, k + 8, (xdata.rva + f.2) as u32);
+        k += 12;
+    }
 
     // The import tables, now that .idata's address is known.
     j = 0;
@@ -221,7 +285,7 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     }
     if main_rva == 0 { return Err("link: no main".to_string()); }
     // NAVI_LINKMAP=file: each symbol's RVA, for reading crash addresses
-    // (the executable has no symbol table).
+    // without a tool that reads the symbol table.
     if let Ok(path) = std::env::var("NAVI_LINKMAP") {
         let mut lines: Vec<(u64, String)> = Vec::new();
         for sy in o.syms.iter() { lines.push((sect_rva(sy.sec) + sy.off, sy.name.clone())); }
@@ -302,6 +366,49 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
         off += align_up(secs[j].data.len() as u64, FILE_ALIGN);
         j += 1;
     }
+    // The COFF symbol table after the sections, then its string table
+    // (which also holds section names longer than 8 bytes, as "/offset").
+    let symtab_off = off;
+    let mut strtab: Vec<u8> = Vec::new();
+    put32(&mut strtab, 0);
+    let mut sec_names: Vec<Vec<u8>> = Vec::new();
+    for s in secs.iter() {
+        let nm = s.name.as_bytes();
+        if nm.len() <= 8 {
+            sec_names.push(nm.to_vec());
+        } else {
+            sec_names.push(`/${strtab.len()}`.to_string().as_bytes().to_vec());
+            strtab.extend_from_slice(nm);
+            strtab.push(0);
+        }
+    }
+    let mut symtab: Vec<u8> = Vec::new();
+    let mut nsym = 0u32;
+    for sy in o.syms.iter() {
+        // The PE section (1-based) and the offset in it.
+        let (sn, v) = if sy.sec == obj::TEXT { (1, sy.off) } else if sy.sec == obj::RO_DATA { (2, sy.off) } else if sy.sec == obj::DATA_CONST { (3, sy.off) } else { (3, data_off + sy.off) };
+        let nm = sy.name.as_bytes();
+        if nm.len() <= 8 {
+            let mut c = 0;
+            while c < 8 {
+                symtab.push(if c < nm.len() { nm[c] } else { 0 });
+                c += 1;
+            }
+        } else {
+            put32(&mut symtab, 0);
+            put32(&mut symtab, strtab.len() as u32);
+            strtab.extend_from_slice(nm);
+            strtab.push(0);
+        }
+        put32(&mut symtab, v as u32);
+        put16(&mut symtab, sn);
+        put16(&mut symtab, if sy.sec == obj::TEXT { 0x20 } else { 0 }); // a function
+        symtab.push(2); // IMAGE_SYM_CLASS_EXTERNAL
+        symtab.push(0);
+        nsym += 1;
+    }
+    let total = strtab.len() as u32;
+    set32(&mut strtab, 0, total);
 
     // Headers: a minimal DOS header pointing at the PE header at 0x80.
     let mut b: Vec<u8> = Vec::new();
@@ -314,8 +421,8 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     put16(&mut b, 0x8664);
     put16(&mut b, nsec as u16);
     put32(&mut b, 0); // timestamp
-    put32(&mut b, 0);
-    put32(&mut b, 0);
+    put32(&mut b, symtab_off as u32);
+    put32(&mut b, nsym);
     put16(&mut b, 240);
     put16(&mut b, 0x22); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
     // Optional header (PE32+).
@@ -323,7 +430,9 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     b.push(14);
     b.push(0);
     put32(&mut b, align_up(text.data.len() as u64, FILE_ALIGN) as u32);
-    put32(&mut b, (align_up(rdata.data.len() as u64, FILE_ALIGN) + align_up(data.data.len() as u64, FILE_ALIGN) + align_up(idata.data.len() as u64, FILE_ALIGN) + align_up(reloc.data.len() as u64, FILE_ALIGN)) as u32);
+    let mut init_data = 0u64;
+    for s in secs.iter() { if s.flags & CODE == 0 { init_data += align_up(s.data.len() as u64, FILE_ALIGN); } }
+    put32(&mut b, init_data as u32);
     put32(&mut b, 0);
     put32(&mut b, (text.rva + entry_off) as u32);
     put32(&mut b, text.rva as u32);
@@ -348,12 +457,16 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     put64(&mut b, 0x1000);
     put32(&mut b, 0);
     put32(&mut b, 16);
-    // Data directories: import (1), base relocation (5), IAT (12).
+    // Data directories: import (1), exception (3), base relocation (5),
+    // IAT (12).
     let mut d = 0;
     while d < 16 {
         if d == 1 {
             put32(&mut b, idata.rva as u32);
             put32(&mut b, desc_size as u32);
+        } else if d == 3 && runtime_fns.len() > 0 {
+            put32(&mut b, pdata.rva as u32);
+            put32(&mut b, pdata.data.len() as u32);
         } else if d == 5 {
             put32(&mut b, reloc.rva as u32);
             put32(&mut b, reloc.data.len() as u32);
@@ -365,8 +478,10 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
         }
         d += 1;
     }
+    let mut si2 = 0;
     for s in secs.iter() {
-        let nm = s.name.as_bytes();
+        let nm = sec_names[si2].as_slice();
+        si2 += 1;
         let mut c = 0;
         while c < 8 {
             b.push(if c < nm.len() { nm[c] } else { 0 });
@@ -387,6 +502,9 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
         b.extend_from_slice(s.data.as_slice());
         pad(&mut b, s.off + align_up(s.data.len() as u64, FILE_ALIGN));
     }
+    pad(&mut b, symtab_off);
+    b.extend_from_slice(symtab.as_slice());
+    b.extend_from_slice(strtab.as_slice());
     Ok(b)
 }
 

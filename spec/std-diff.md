@@ -74,7 +74,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | 文件关闭 | `File` drop 时关闭 | `File::close()`；`fs::read`/`fs::write` 等整文件函数自己关闭 | 没有 Drop |
 | `io::BufWriter` | drop 时 flush | 必须显式 `flush()` 或 `into_inner()` | 没有 Drop |
 | `Path`/`PathBuf` | 基于 `OsStr`，`Path` 是 unsized 类型 | 基于 UTF-8 字符串；`Path` 是持有 `&str` 的普通结构体；`file_name`/`extension`/`file_stem` 返回 `Option<&str>` 而不是 `Option<&OsStr>` | 没有 `OsStr`；unsized 结构体暂不支持 |
-| `process::Command` | 直接 fork/exec，可配置 stdin/stdout | POSIX 用 `posix_spawn`（Windows 用 `CreateProcessA`），API 同 Rust（见第 7 节） | — |
+| `process::Command` | 直接 fork/exec，可配置 stdin/stdout | POSIX 用 `posix_spawn`（Windows 用 `CreateProcessW`），API 同 Rust（见第 7 节） | — |
 | `Vec::drain` | 返回 `Drain<'_, T>` 惰性迭代器 | 立即移走元素，返回 `vec::IntoIter<T>` | 没有生命周期绑定的借用迭代器 |
 | `hash::DefaultHasher` | SipHash-1-3（抗哈希洪水） | FxHash（快，但不抗攻击） | 编译器式负载优先速度 |
 | `HashMap` 迭代顺序 | 随机种子 | 确定（取决于插入历史） | 便于编译器输出稳定 |
@@ -105,7 +105,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 
 ## 8. 操作系统层（std::fs / io / env / process）的偏离
 
-std 在私有的 `std::sys` 之上实现这些模块（POSIX：文件描述符、`stat`、`opendir`、`posix_spawn`、`waitpid`；Windows：Win32 句柄、`FindFirstFileA`、`CreateProcessA`）。
+std 在私有的 `std::sys` 之上实现这些模块（POSIX：文件描述符、`stat`、`opendir`、`posix_spawn`、`waitpid`；Windows：Win32 句柄和 UTF-16 的 `*W` 函数，如 `FindFirstFileW`、`CreateProcessW`；命令行从 `GetCommandLineW` 按 C 运行时的规则拆分，控制台输出用 `WriteConsoleW`，同 Rust）。
 
 | 项目 | Rust | navi | 原因 |
 |---|---|---|---|

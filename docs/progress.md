@@ -425,8 +425,8 @@
 
 1. 冷编译提速：剩下的串行部分（plan 的按序遍历、codegen 合并之后的 gen_data、链接）；GC 标记占约四分之一 CPU（保守扫描，生成的代码不做寄存器分配）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。
 2. 运行时：每个 M 的运行队列、基于信号的抢占、栈收缩、最后一次 STW 的并行排空。
-3. DWARF 的变量和类型信息；PE 的调试信息（现在只有 Mach-O 和 ELF 带 DWARF）。
-4. v0.0.2：依赖、改名 `navi`、自检测试都已完成（见上），另外做了模板字符串总是 `fmt::Arguments`、`assert_eq` 两边可以不同类型、std 约束的 `where` 写法。剩下打 tag 发布。
+3. DWARF 的变量和类型信息（三种格式现在都只有函数和行号）。
+4. v0.0.2：依赖、改名 `navi`、自检测试都已完成（见上），另外做了模板字符串总是 `fmt::Arguments`、`assert_eq` 两边可以不同类型、std 约束的 `where` 写法。已发布。
 5. v0.0.3（项目管理，照 Cargo；构建模式照 Go）：已发布（tag 在 727a407），自举起点改为 v0.0.3。
    - 已完成：项目目录必须有 `navi.toml`（`[package]` 的 `name` 必填），从当前目录往上找；单个 `.navi` 文件仍然可以直接编译。`navi.toml` 和 `navi.lock` 由真正的 TOML 解析器读（`compiler/src/toml.navi`，`manifest.navi`），不认识的表和键报错；项目和 workspace 在 `project.navi`，依赖图以整个 workspace 为单位加载（`deps.navi`）。编译器自己的单元测试（`#[cfg(test)]`，`navi test compiler`）和项目场景都进了 tools/test.sh。
    - workspace：根目录 `navi.toml` 的 `[workspace]`（`members` 支持 `*`、`exclude`）和 `[workspace.dependencies]`，成员写 `name = { workspace = true }`，路径相对于 workspace 根目录；整个 workspace 共用根目录的一个 `navi.lock`；成员往上找到列出自己的 `[workspace]`；根目录可以只有 `[workspace]`，也可以同时是一个 crate。在根目录运行 `navi build` / `navi test` 处理全部成员，`-p name` 选一个；在成员目录里只处理这个成员。
@@ -435,3 +435,6 @@
    - `navi run [-p name] [-- 参数]`：构建并运行，也能 `navi run x.navi`。
    - 测试照 Rust：已完成大部分。`navi test` 支持 `#[should_panic]` / `#[should_panic(expected = "...")]`，运行测试时设置 `NAVI`（同 Cargo 的 `CARGO`）；tests/run 全是 `#[test]`：panic 用 `should_panic`，未捕获的 panic 和致命错误（死锁、栈溢出）由测试用 `NAVI` 编译一个小程序再检查退出码和输出（同 Go 的 runtime 测试），defer 顺序和 track_caller 位置用 `catch_unwind` 断言，env_process 的子进程是测试程序自己（`current_exe` 加名字过滤）；`// skip: windows` 换成 `#![cfg(not(target_os = "windows"))]`。编译错误和警告的测试在 `tests/ui/`，前端测试同样用 rustc 的 `//~ ERROR` / `//~ WARN` / `//~^` / `//~|` 标注。tools/test.sh 不再有 `// out:` / `// exit:` / `// stderr:` / `// skip:`。`assert_msg` 加进 prelude。修了一个老问题：结果没被使用的带检查运算（`let _ = x + 1`）被 SSA 的死代码删除去掉，溢出不再 panic（现在可能 panic 的运算不删）。剩下项目的集成测试目录（`tests/*.navi`、`NAVI_BIN_EXE_名字`），和项目管理一起做。
    - 只有一种构建模式（同 Go）：已完成（`--release`、`cfg(debug_assertions)`、`debug_assert` 去掉，溢出一律检查，`navi build -s` 去掉 DWARF）。
+6. 平台缺口（2026-11-20 排查：Windows 最多，Linux 几处，macOS 没有独有的）：
+   - 已完成：Windows 的字符串都走 UTF-16 的 `*W` 函数（路径、环境变量、`CreateProcessW` 和 UTF-16 环境块、`GetCommandLineW` 按 C 运行时规则拆参数、控制台输出 `WriteConsoleW`），`temp_dir` 用 `GetTempPathW`，`current_exe` 不限长度，`read_link` 读重解析点（链接本身的内容）；Linux 的 `Metadata::created` 用 `statx`；`str::encode_utf16`。PE 照 Go 的链接器：COFF 符号表、DWARF 段（行号）、`.pdata`/`.xdata` unwind 表（序言 `push rbp; mov rbp, rsp`，序言位置相同的函数共用一份），不做 PDB。Windows 测试：`fs_ops`、`env_process` 在 Windows 上也跑（`sh` 或 `cmd`），新增 `unicode_os`，C 调用测试在 Windows 上用 msvcrt 的 `_snprintf` 和 ntdll 的 `RtlComputeCrc32`，gc 的内存上限用峰值工作集；Windows CI 加上单线程、GC 校验、栈搬移三种模式。`navi test --no-run` 只编译测试程序并打印路径（同 cargo）。
+   - 剩下（较小）：Windows 绿色线程栈一次提交、定时器毫秒精度、网络读写经 64KB 缓冲、出站连接端口；Linux arm64 原子操作不用 LSE；Linux 定时器用 CLOCK_REALTIME 绝对时间；`env::vars` 看不到 C 代码加的变量（Linux）；Windows 权限只有只读位、`os::windows` 扩展少、C 回调至多 4 个参数；编译器的 SHA-256 在 Linux/Windows 是纯软件；Android 不在 CI（`tools/androidtest.sh` 可以改用 `navi test --no-run`）。
