@@ -1,11 +1,11 @@
 #!/bin/sh
-# Runs the golden tests in tests/run, and navic test / bench on
+# Runs the golden tests in tests/run, and navi test / bench on
 # tests/harness, with a self-hosted compiler.
 #
-#   tools/navictest.sh path/to/navic
+#   tools/test.sh path/to/navi
 set -e
 cd "$(dirname "$0")/.."
-navic=${1:?usage: tools/navictest.sh path/to/navic}
+navi=${1:?usage: tools/test.sh path/to/navi}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
@@ -20,12 +20,12 @@ for f in tests/run/*.navi; do
 	# // error: line:col msg: the build fails with these errors.
 	want_err=$(grep -E '^// error:' "$f" | sed -E 's#^// error: ?##')
 	if [ -n "$want_err" ]; then
-		"$navic" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1 && { echo "FAIL $f (built)"; fail=1; continue; }
+		"$navi" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1 && { echo "FAIL $f (built)"; fail=1; continue; }
 		got_err=$(sed -E 's#^[^:]*:([0-9]+:[0-9]+): #\1 #' "$tmp/$n.build")
 		if [ "$got_err" = "$want_err" ]; then echo "ok   $f"; else echo "FAIL $f (errors)"; cat "$tmp/$n.build"; fail=1; fi
 		continue
 	fi
-	if ! "$navic" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1; then
+	if ! "$navi" build -o "$tmp/$n" "$f" > "$tmp/$n.build" 2>&1; then
 		echo "FAIL $f (build)"; cat "$tmp/$n.build"; fail=1; continue
 	fi
 	want_out=$(grep -E '^// out:' "$f" | sed -E 's#^// out: ?##')
@@ -66,76 +66,76 @@ for f in tests/run/*.navi; do
 done
 # navi test and navi bench on a crate with passing and failing tests.
 set +e
-got_out=$("$navic" test tests/harness 2>/dev/null)
+got_out=$("$navi" test tests/harness 2>/dev/null)
 code=$?
 set -e
 if [ "$got_out" = "$(cat tests/harness/expected.out)" ] && [ "$code" = 1 ]; then
-	echo "ok   navic test tests/harness"
+	echo "ok   navi test tests/harness"
 else
-	echo "FAIL navic test tests/harness (exit $code)"; echo "$got_out"; fail=1
+	echo "FAIL navi test tests/harness (exit $code)"; echo "$got_out"; fail=1
 fi
-if [ "$("$navic" bench tests/harness 2>&1 | grep -c ' ns/iter ')" = 2 ]; then
-	echo "ok   navic bench tests/harness"
+if [ "$("$navi" bench tests/harness 2>&1 | grep -c ' ns/iter ')" = 2 ]; then
+	echo "ok   navi bench tests/harness"
 else
-	echo "FAIL navic bench tests/harness"; fail=1
+	echo "FAIL navi bench tests/harness"; fail=1
 fi
-# navic fmt: tests/fmt/x.navi formats to x.out, which stays as it is;
+# navi fmt: tests/fmt/x.navi formats to x.out, which stays as it is;
 # --check reports a file that would change and passes one that would not.
 for f in tests/fmt/*.navi; do
 	want="${f%.navi}.out"
-	if "$navic" fmt - < "$f" > "$tmp/fmt.out" 2>&1 && cmp -s "$tmp/fmt.out" "$want" \
-		&& "$navic" fmt - < "$want" > "$tmp/fmt2.out" 2>&1 && cmp -s "$tmp/fmt2.out" "$want"; then
-		echo "ok   navic fmt $f"
+	if "$navi" fmt - < "$f" > "$tmp/fmt.out" 2>&1 && cmp -s "$tmp/fmt.out" "$want" \
+		&& "$navi" fmt - < "$want" > "$tmp/fmt2.out" 2>&1 && cmp -s "$tmp/fmt2.out" "$want"; then
+		echo "ok   navi fmt $f"
 	else
-		echo "FAIL navic fmt $f"; diff "$want" "$tmp/fmt.out" | head -20; fail=1
+		echo "FAIL navi fmt $f"; diff "$want" "$tmp/fmt.out" | head -20; fail=1
 	fi
 done
 cp tests/fmt/exprs.navi "$tmp/check.navi"
 set +e
-"$navic" fmt --check "$tmp/check.navi" > /dev/null 2>&1; c1=$?
-"$navic" fmt "$tmp/check.navi" > /dev/null 2>&1; c2=$?
-"$navic" fmt --check "$tmp/check.navi" > /dev/null 2>&1; c3=$?
+"$navi" fmt --check "$tmp/check.navi" > /dev/null 2>&1; c1=$?
+"$navi" fmt "$tmp/check.navi" > /dev/null 2>&1; c2=$?
+"$navi" fmt --check "$tmp/check.navi" > /dev/null 2>&1; c3=$?
 set -e
 if [ "$c1" = 1 ] && [ "$c2" = 0 ] && [ "$c3" = 0 ] && cmp -s "$tmp/check.navi" tests/fmt/exprs.out; then
-	echo "ok   navic fmt --check"
+	echo "ok   navi fmt --check"
 else
-	echo "FAIL navic fmt --check ($c1 $c2 $c3)"; fail=1
+	echo "FAIL navi fmt --check ($c1 $c2 $c3)"; fail=1
 fi
 # comment_width from navi.toml's [fmt] table, and --comment-width over it.
 mkdir -p "$tmp/cw/src"
 printf '[package]\nname = "cw"\n\n[fmt]\ncomment_width = 40\n' > "$tmp/cw/navi.toml"
 long='// one two three four five six seven eight nine ten'
 printf '%s\nfn main() {}\n' "$long" > "$tmp/cw/src/main.navi"
-"$navic" fmt --comment-width 100 "$tmp/cw" > /dev/null 2>&1
+"$navi" fmt --comment-width 100 "$tmp/cw" > /dev/null 2>&1
 w100=$(cat "$tmp/cw/src/main.navi")
-"$navic" fmt "$tmp/cw" > /dev/null 2>&1
+"$navi" fmt "$tmp/cw" > /dev/null 2>&1
 w40=$(cat "$tmp/cw/src/main.navi")
 if [ "$w100" = "$(printf '%s\nfn main() {}' "$long")" ] \
 	&& [ "$w40" = "$(printf '// one two three four five six seven\n// eight nine ten\nfn main() {}')" ]; then
-	echo "ok   navic fmt comment_width"
+	echo "ok   navi fmt comment_width"
 else
-	echo "FAIL navic fmt comment_width"; echo "$w100"; echo "$w40"; fail=1
+	echo "FAIL navi fmt comment_width"; echo "$w100"; echo "$w40"; fail=1
 fi
-# navic lsp: the recorded session tests/lsp/session.jsonl (one message a
+# navi lsp: the recorded session tests/lsp/session.jsonl (one message a
 # line, the repository's path as @ROOT@) answers as tests/lsp/session.out.
 root=$(pwd)
-# Windows: navic.exe sees C:/dir, which a URI writes as file:///C:/dir.
+# Windows: navi.exe sees C:/dir, which a URI writes as file:///C:/dir.
 uroot=$root
 if [ "$os" = windows ]; then root=$(pwd -W); uroot=/$root; fi
 sed "s#@ROOT@#$uroot#g" tests/lsp/session.jsonl | LC_ALL=C awk '{ printf "Content-Length: %d\r\n\r\n%s", length($0), $0 }' \
-	| NAVI_STD="$root/lib/std" "$navic" lsp 2>/dev/null | perl -0777 -pe 's/Content-Length: \d+\r\n\r\n/\n/g' \
+	| NAVI_STD="$root/lib/std" "$navi" lsp 2>/dev/null | perl -0777 -pe 's/Content-Length: \d+\r\n\r\n/\n/g' \
 	| sed "s#$uroot#@ROOT@#g" | sed '/^$/d' > "$tmp/lsp.out"
 if cmp -s "$tmp/lsp.out" tests/lsp/session.out; then
-	echo "ok   navic lsp tests/lsp/session.jsonl"
+	echo "ok   navi lsp tests/lsp/session.jsonl"
 else
-	echo "FAIL navic lsp tests/lsp/session.jsonl"; diff tests/lsp/session.out "$tmp/lsp.out" | head -20; fail=1
+	echo "FAIL navi lsp tests/lsp/session.jsonl"; diff tests/lsp/session.out "$tmp/lsp.out" | head -20; fail=1
 fi
 # The front end: tests/syntax parses; in tests/resolve (name resolution),
 # tests/types and tests/check (type checking) the files of ok/ and sigs/
 # have no errors and those of err/ exactly the errors their comments
 # "// error: text" expect (an error on that line whose message has text).
 front() {
-	"$navic" "$1" "$2" > "$tmp/front.out" 2>&1
+	"$navi" "$1" "$2" > "$tmp/front.out" 2>&1
 	grep '^error ' "$tmp/front.out" | sed -E 's#^error [^:]*:([0-9]+):[0-9]+: #\1	#' > "$tmp/front.got"
 	grep -n '// error: ' "$2" | sed -E 's#^([0-9]+):.*// error: #\1	#' > "$tmp/front.want"
 	if awk -F'\t' 'NR == FNR { want[NR] = $0; line[NR] = $1; text[NR] = $2; n = NR; next }
@@ -149,7 +149,7 @@ front() {
 	fi
 }
 for f in tests/syntax/*.navi; do
-	if "$navic" parse "$f" > "$tmp/parse.out" 2>&1; then echo "ok   $f"; else echo "FAIL $f (parse)"; head -5 "$tmp/parse.out"; fail=1; fi
+	if "$navi" parse "$f" > "$tmp/parse.out" 2>&1; then echo "ok   $f"; else echo "FAIL $f (parse)"; head -5 "$tmp/parse.out"; fail=1; fi
 done
 for f in tests/resolve/*/*.navi; do front resolve-dump "$f"; done
 for f in tests/types/*/*.navi tests/check/*/*.navi; do front types-dump "$f"; done

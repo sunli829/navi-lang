@@ -182,8 +182,8 @@ let n = <T as Figure>::SIDES;               // 完全限定路径
 
 - 泛型函数体**在定义处只检查一次**，只能使用约束里 trait 提供的方法和运算符；报错位置就在写错的地方
 - 自举前支持：trait 约束、`where`、`+` 组合约束、默认方法、关联类型和关联常量、blanket impl、`impl Trait`、带自己类型参数的方法（如 `Iterator::map<B>`）、默认类型参数（`trait PartialEq<Rhs = Self>`，有默认值的参数必须排在最后，同 Rust）
-- const 泛型（M9 起，只有 navic）：`struct Matrix<const R: usize, const C: usize>`、`fn sum<const N: usize>(xs: [i32; N])`、`impl<T, const N: usize> From<[T; N]> for Vec<T>`。参数的类型是整数、`bool` 或 `char`；实参是字面量、`{ 常量表达式 }` 或别的 const 参数，也可以从数组类型推断；函数体里 `N` 是值，`[x; N]` 可用。关联常量也可以做数组长度：`[u8; T::N]`、`[u8; Self::LEN]`（`T` 的约束里声明了 `N` 的 trait；`T` 确定后取 impl 里的值）。还不支持含参数的常量表达式（如 `[T; N + 1]`）
-- trait 方法可以返回 `impl Trait`（M9 起，只有 navic；同 Rust 1.75）：每个 impl 的方法决定实际类型（可以写自己的 `impl Trait`，也可以写具体类型），经泛型调用时按 Self 找到那个 impl。`impl Trait` 必须是整个返回类型，trait 里的这种方法不能有默认方法体
+- const 泛型（M9 起，只有 navi）：`struct Matrix<const R: usize, const C: usize>`、`fn sum<const N: usize>(xs: [i32; N])`、`impl<T, const N: usize> From<[T; N]> for Vec<T>`。参数的类型是整数、`bool` 或 `char`；实参是字面量、`{ 常量表达式 }` 或别的 const 参数，也可以从数组类型推断；函数体里 `N` 是值，`[x; N]` 可用。关联常量也可以做数组长度：`[u8; T::N]`、`[u8; Self::LEN]`（`T` 的约束里声明了 `N` 的 trait；`T` 确定后取 impl 里的值）。还不支持含参数的常量表达式（如 `[T; N + 1]`）
+- trait 方法可以返回 `impl Trait`（M9 起，只有 navi；同 Rust 1.75）：每个 impl 的方法决定实际类型（可以写自己的 `impl Trait`，也可以写具体类型），经泛型调用时按 Self 找到那个 impl。`impl Trait` 必须是整个返回类型，trait 里的这种方法不能有默认方法体
 - 不做：GAT、高阶 trait bound（`for<'a>`）、特化
 - **闭包没有专门的 `Fn` / `FnMut` / `FnOnce` trait**，统一用函数类型 `fn(A) -> B`。例如 `fn map<B>(self, f: fn(Self::Item) -> B) -> Map<Self, B>`。这样泛型和 shape 共享都简单得多
 

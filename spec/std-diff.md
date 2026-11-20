@@ -121,7 +121,7 @@ std 在私有的 `std::sys` 之上实现这些模块（POSIX：文件描述符�
 | `Cursor<Vec<u8>>` | 拥有这个 Vec | Vec 是引用类型：写入会出现在创建它的那个 Vec 里 | 见第 4 节集合赋值 |
 | `Seek::stream_len`、`Read::read_vectored`、`read_buf`、`IoSlice` | 有（部分不稳定） | 没有 | 暂不需要 |
 | `env::set_var` / `remove_var` | Rust 2024 起是 `unsafe fn` | 相同（`unsafe fn`）；名字为空或含 `=`、NUL 时 panic | — |
-| `env::vars`（Linux） | 读 libc 的 `environ` | 由初始环境（`argv` 之后的 `envp`）里的名字加上之后用 `set_var` 设过的名字，逐个 `getenv` 得到；C 代码直接加进 `environ` 的变量看不到 | navic 的链接器只导入函数，拿不到 `environ` 变量 |
+| `env::vars`（Linux） | 读 libc 的 `environ` | 由初始环境（`argv` 之后的 `envp`）里的名字加上之后用 `set_var` 设过的名字，逐个 `getenv` 得到；C 代码直接加进 `environ` 的变量看不到 | navi 的链接器只导入函数，拿不到 `environ` 变量 |
 | `env::home_dir` | 没有 `HOME` 时查 `getpwuid_r` | 只看 `HOME`（Windows：`USERPROFILE`） | 简化 |
 | `env::split_paths` / `join_paths` | `SplitPaths` 迭代器 / `Result<OsString, _>` | `vec::IntoIter<PathBuf>` / `Result<String, JoinPathsError>` | 没有 `OsString` |
 | SIGPIPE | 程序启动时忽略 | 第一次创建管道（`Stdio::piped()`）时才忽略；子进程恢复默认处理 | 运行时不处理信号 |
@@ -193,7 +193,7 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | `regex::bytes`、`Regex::captures_read`、`CaptureLocations`、`RegexSet` 的 `matches_read_at` | 有 | 没有 | 暂不需要 |
 | `\p{..}` | 全部 Unicode 属性 | 一般类别、文字（script）和 `Alphabetic`、`White_Space`、`Lowercase`、`Uppercase` 等少数属性 | 表的大小 |
 | 大小写折叠 | 简单折叠（simple case folding） | 相同 | — |
-| 性能 | 惰性 DFA、字面量优化 | 字面量前缀和首字节跳跃，之后是 Pike VM（求分组时短匹配用有界回溯）；没有 DFA，Pike VM 路径比 Go 的 regexp 慢一个数量级（navic 还不做内联） | 先保证正确 |
+| 性能 | 惰性 DFA、字面量优化 | 字面量前缀和首字节跳跃，之后是 Pike VM（求分组时短匹配用有界回溯）；没有 DFA，Pike VM 路径比 Go 的 regexp 慢一个数量级（navi 还不做内联） | 先保证正确 |
 
 ### std::rand（rand crate 0.9）
 
@@ -245,7 +245,7 @@ DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）�
 | `write::*Decoder` | 边写边解压 | 写入的数据先缓存，`try_finish`/`finish` 时一次解压写出 | 解码器是"拉"输入的 |
 | `bufread::*`、`Decompress`/`Compress` 底层接口、`GzHeader` 的 `mtime_as_datetime`、zlib 预设字典 | 有 | 没有 | 暂不需要 |
 | 写入编码器的 `flush` | 同步刷新（sync flush） | 相同 | — |
-| 性能 | miniz/zlib（C） | 约为 C 实现的十分之一到二十分之一（navic 还不内联） | — |
+| 性能 | miniz/zlib（C） | 约为 C 实现的十分之一到二十分之一（navi 还不内联） | — |
 
 ### std::log（log crate 加 env_logger）
 
