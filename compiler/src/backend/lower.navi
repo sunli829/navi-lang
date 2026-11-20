@@ -83,7 +83,7 @@ struct FuncOut {
     name: String,
     code: Vec<u8>,
     relocs: Vec<OutReloc>,
-    /// (offset in code, file, line) in debug builds.
+    /// (offset in code, file, line) when recording DWARF.
     // Offset and line, in file.
     lines: Vec<(u64, u32)>,
     /// The stack map (see stack_meta), with the calls' masks.
@@ -158,7 +158,9 @@ pub struct Gen {
     o: &mut Object,
     m: &mut dyn Machine,
     tgt: TargetConv,
-    debug: bool,
+    /// Whether to record DWARF (functions and line rows): navi build -s
+    /// leaves it out.
+    dwarf: bool,
     lay: &mut Computer,
     locs: HashMap<String, String>,
     loc_list: Vec<LocData>,
@@ -169,7 +171,7 @@ pub struct Gen {
     statics: HashMap<u32, String>,
     errs: Vec<String>,
     /// The current function's line rows (code offset, position) and file,
-    /// recorded in debug builds.
+    /// recorded for DWARF.
     cur_lines: Vec<(usize, Pos)>,
     cur_file: Option<&File>,
     cur_name: String,
@@ -263,8 +265,8 @@ fn link_name(d: &Def) -> String {
     d.name.clone()
 }
 
-fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug: bool, lock: &Mutex<u8>, loc_ty: &Type) -> &mut Gen {
-    &mut Gen { p, o: obj::new_object(arch), m, tgt, debug, lay: p.lay, locs: HashMap::new(), loc_list: Vec::new(),
+fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, dwarf: bool, lock: &Mutex<u8>, loc_ty: &Type) -> &mut Gen {
+    &mut Gen { p, o: obj::new_object(arch), m, tgt, dwarf, lay: p.lay, locs: HashMap::new(), loc_list: Vec::new(),
         loc_ids: HashMap::new(), str_ids: HashMap::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
@@ -281,12 +283,12 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, debug
 /// per thread: the functions are lowered by as many threads as can run at
 /// once (std::thread::available_parallelism) and placed in the object in
 /// order.
-pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: TargetConv, debug: bool) -> Result<&mut Object, String> {
+pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: TargetConv, dwarf: bool) -> Result<&mut Object, String> {
     if p.errors.len() > 0 { return Err(p.errors.join("\n")); }
     let lock = &Mutex::new(0u8);
     let loc_def = p.info.lang_def("Location").unwrap();
     let loc_ty = p.info.ctx.adt(loc_def, Vec::new());
-    let g = new_gen(p, arch, new_m(), tgt.clone(), debug, lock, loc_ty);
+    let g = new_gen(p, arch, new_m(), tgt.clone(), dwarf, lock, loc_ty);
     let mut i = 0;
     while i < p.statics.len() {
         let d = p.statics[i];
@@ -437,7 +439,7 @@ impl Gen {
     /// A generator for a worker thread (sharing the plan, the statics and
     /// the closure symbols, read only).
     fn worker_gen(&mut self, m: &mut dyn Machine, arch: &str, ids: HashMap<String, u32>) -> &mut Gen {
-        let w = new_gen(self.p, arch, m, self.tgt.clone(), self.debug, self.lock, self.loc_ty);
+        let w = new_gen(self.p, arch, m, self.tgt.clone(), self.dwarf, self.lock, self.loc_ty);
         w.worker = true;
         // Its own layouts (the type context and the type checker's queries
         // are safe to share while ctx.par is set).
@@ -504,7 +506,7 @@ impl Gen {
             }
             self.ftab.push((off, out.code.len() as u64, mo));
         }
-        if self.debug {
+        if self.dwarf {
             self.o.funcs.push(obj::FuncRange { name: out.name.clone(), off, size: out.code.len() as u64 });
             if let Some(f) = out.file {
                 if out.lines.len() > 0 {
@@ -553,7 +555,7 @@ impl Gen {
             out.errs.push(`${sym}: ${c.err}`.to_string());
             out.failed = true;
         }
-        if self.debug {
+        if self.dwarf {
             if let Some(f) = self.cur_file {
                 for (o, pos) in self.cur_lines.iter() {
                     out.lines.push((*o as u64, f.line_of(*pos)));
@@ -621,7 +623,7 @@ impl Gen {
             self.cur_c_off = -1;
         }
         self.o.append(obj::TEXT, c.code.as_slice());
-        if self.debug {
+        if self.dwarf {
             let name = if self.cur_name.len() > 0 { self.cur_name.clone() } else { sym.to_string() };
             self.o.funcs.push(obj::FuncRange { name, off, size: c.code.len() as u64 });
             if let Some(f) = self.cur_file {
@@ -1228,7 +1230,7 @@ impl Gen {
         self.cur_lines = Vec::new();
         self.cur_file = f.file;
         self.cur_name = f.name.clone();
-        if self.debug {
+        if self.dwarf {
             if let Some(d) = f.def { self.cur_lines.push((0, d.pos)); }
         }
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
@@ -1952,7 +1954,7 @@ impl FnGen {
 
     // --- Statements --------------------------------------------------------------
 
-    /// Records that the code from here on comes from pos (debug builds).
+    /// Records that the code from here on comes from pos (for DWARF).
     fn note_line(&mut self, pos: Pos) {
         if pos <= 0 { return; }
         let off = self.m.offset();
@@ -3080,7 +3082,7 @@ impl FnGen {
             if bi == 0 { self.ssa_entry_args(sf, b); }
             for vv in b.values.iter() {
                 let v = *vv;
-                if self.g.debug && v.pos > 0 { self.note_line(v.pos); }
+                if self.g.dwarf && v.pos > 0 { self.note_line(v.pos); }
                 if crate::ssa::regalloc::is_call(v) {
                     call_no += 1;
                     m.set_tag(call_no);
@@ -3443,7 +3445,7 @@ impl FnGen {
                         if size < 8 { m.zero_ext(d, d, size); }
                     }
                 } else {
-                    if v.aux_int & 2 != 0 && self.g.debug {
+                    if v.aux_int & 2 != 0 {
                         m.sign_ext(V2, a, size);
                         m.mov_imm(T1, int_min(size));
                         m.cmp(V2, T1);
@@ -3750,7 +3752,7 @@ impl FnGen {
                 self.ssa_out(v, d);
                 return;
             }
-            let plain = !(self.g.debug && checked);
+            let plain = !checked;
             if (op == crate::ssa::OP_ADD || op == crate::ssa::OP_SUB) && plain && c >= 0 && c < 4096 {
                 let a = self.ssa_in(v.args[0], V1);
                 let d = self.ssa_dst(v, V1);
@@ -3772,7 +3774,7 @@ impl FnGen {
             }
         }
         let d = self.ssa_dst(v, V1);
-        let dbg = self.g.debug && checked;
+        let dbg = checked;
         if op == crate::ssa::OP_ADD || op == crate::ssa::OP_SUB || op == crate::ssa::OP_MUL {
             let what = if op == crate::ssa::OP_ADD { "add" } else if op == crate::ssa::OP_SUB { "subtract" } else { "multiply" };
             let aop = if op == crate::ssa::OP_ADD { ADD } else if op == crate::ssa::OP_SUB { SUB } else { MUL };

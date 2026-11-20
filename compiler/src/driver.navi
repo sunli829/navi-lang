@@ -73,7 +73,7 @@ pub fn target_arch() -> String {
 /// The #[cfg] settings for the target.
 pub fn host_config() -> Config {
     let arch = if target_arch() == "arm64" { "aarch64" } else { "x86_64" };
-    Config { target_os: target_os(), target_arch: arch.to_string(), test: false, debug: true }
+    Config { target_os: target_os(), target_arch: arch.to_string(), test: false }
 }
 
 #[cfg(target_os = "macos")]
@@ -254,7 +254,7 @@ pub struct Entry {
 pub fn main_entry(main: &mut resolve::Def) -> &Entry { &Entry { main: Some(main), tests: Vec::new(), bench: false } }
 
 /// Compiles a checked program into the object model for the target.
-pub fn code(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Result<&mut crate::obj::Object, String> {
+pub fn code(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Result<&mut crate::obj::Object, String> {
     let mut roots: Vec<&mut resolve::Def> = Vec::new();
     match entry.main {
         Some(m) => roots.push(m),
@@ -289,22 +289,22 @@ pub fn code(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Resu
     let o = if arm {
         // NAVI_LLSC=1 tests linux-arm64's atomics on macOS.
         if os == "macos" && std::env::var("NAVI_LLSC").is_err() {
-            crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(true, os == "macos") }, tgt, debug)
+            crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(true, os == "macos") }, tgt, dwarf)
         } else {
-            crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(false, os == "macos") }, tgt, debug)
+            crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(false, os == "macos") }, tgt, dwarf)
         }
     } else if os == "windows" {
-        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(true) }, tgt, debug)
+        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(true) }, tgt, dwarf)
     } else {
-        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(false) }, tgt, debug)
+        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(false) }, tgt, dwarf)
     };
     phase("codegen");
     o
 }
 
 /// Compiles a checked program into an object file for the target.
-pub fn object(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Result<Vec<u8>, String> {
-    let o = code(info, entry, debug)?;
+pub fn object(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Result<Vec<u8>, String> {
+    let o = code(info, entry, dwarf)?;
     let os = target_os();
     if os == "macos" { return crate::macho::write(o); }
     if os == "linux" { return crate::elf::write(o); }
@@ -314,11 +314,11 @@ pub fn object(info: &mut types::collect::Info, entry: &Entry, debug: bool) -> Re
 /// Compiles a checked program into the executable out with navi's own
 /// linker (NAVI_LINKER=cc, and targets it does not handle, use the system
 /// linker instead).
-pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, debug: bool) -> Result<(), String> {
+pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, dwarf: bool) -> Result<(), String> {
     let use_cc = match std::env::var("NAVI_LINKER") { Ok(v) => v == "cc", Err(_) => false };
     let os = target_os();
     if !use_cc {
-        let o = code(info, entry, debug)?;
+        let o = code(info, entry, dwarf)?;
         let exe = if os == "macos" { crate::link::link(o, util::path_base(out).as_str())? }
             else if os == "linux" { crate::elflink::link(o)? }
             else { crate::pelink::link(o)? };
@@ -327,7 +327,7 @@ pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, debug: 
         chmod_x(out);
         return Ok(());
     }
-    let o = code(info, entry, debug)?;
+    let o = code(info, entry, dwarf)?;
     let libs = o.libraries();
     let data = if os == "macos" { crate::macho::write(o)? } else if os == "linux" { crate::elf::write(o)? } else { crate::coff::write(o)? };
     let obj_path = if os == "windows" { `${out}.navi.obj`.to_string() } else { `${out}.navi.o`.to_string() };
@@ -358,13 +358,17 @@ pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, debug: 
     }
 }
 
-/// navi build [-o output] [--release] [-c] [-a] [-timings] <crate or file>
+// Builds before 0.0.3 had a --release mode.
+const RELEASE_GONE: &str = "navi: there is no --release: navi has one build mode (as Go), with overflow always checked; -s leaves out the debugging information";
+
+/// navi build [-o output] [-s] [-c] [-a] [-timings] <crate or file>
 ///
-/// -c writes an object file; -a rebuilds even if the build cache has the
-/// output.
+/// There is one build mode (as Go): overflow is always checked. -s leaves
+/// out the debugging information (DWARF; as Go's -ldflags=-s); -c writes an
+/// object file; -a rebuilds even if the build cache has the output.
 pub fn build_command(args: &Vec<String>) -> i32 {
     let mut out = String::new();
-    let mut release = false;
+    let mut strip = false;
     let mut obj_only = false;
     let mut force = false;
     let mut paths: Vec<String> = Vec::new();
@@ -377,7 +381,8 @@ pub fn build_command(args: &Vec<String>) -> i32 {
                     i += 1;
                 }
             }
-            "--release" => release = true,
+            "-s" => strip = true,
+            "--release" => { eprintln(RELEASE_GONE); return 2; }
             "-c" => obj_only = true,
             "-timings" => TIMINGS = true,
             "-a" => force = true,
@@ -395,7 +400,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
         i += 1;
     }
     if paths.len() != 1 {
-        eprintln("usage: navi build [-o output] [--release] [--target os-arch] [-c] [-a] [-timings] <crate or file>");
+        eprintln("usage: navi build [-o output] [-s] [--target os-arch] [-c] [-a] [-timings] <crate or file>");
         return 2;
     }
     let spec = match load_crate(paths[0].as_str()) {
@@ -408,7 +413,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
     }
     // The output's name is in a Mach-O executable (its code signature's
     // identifier).
-    let key = crate::cache::key(`${if obj_only { "obj" } else { "exe" }} release=${release} target=${target_name()} name=${util::path_base(out.as_str())}`.to_string().as_str(), paths[0].as_str());
+    let key = crate::cache::key(`${if obj_only { "obj" } else { "exe" }} strip=${strip} target=${target_name()} name=${util::path_base(out.as_str())}`.to_string().as_str(), paths[0].as_str());
     if let Some(k) = key {
         if !force && crate::cache::lookup(k.as_str(), out.as_str()) {
             if !obj_only { chmod_x(out.as_str()); }
@@ -416,8 +421,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
             return 0;
         }
     }
-    let mut cfg = host_config();
-    cfg.debug = !release;
+    let cfg = host_config();
     let specs = match crate::deps::load_graph(paths[0].as_str(), false, false) {
         Ok(s) => s,
         Err(e) => { eprintln(e); return 1; }
@@ -431,7 +435,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
         None => { eprintln(`${paths[0]}: no main function`); return 1; }
     };
     if obj_only {
-        let r = match object(info, main_entry(main), !release) {
+        let r = match object(info, main_entry(main), !strip) {
             Ok(data) => match std::fs::write(out.as_str(), data.as_slice()) { Ok(_) => Ok(()), Err(e) => Err(`${e}`.to_string()) },
             Err(e) => Err(e),
         };
@@ -442,7 +446,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
         if let Some(k) = key { crate::cache::store(k.as_str(), out.as_str(), warnings.as_str()); }
         return 0;
     }
-    if let Err(e) = native(info, main_entry(main), out.as_str(), !release) {
+    if let Err(e) = native(info, main_entry(main), out.as_str(), !strip) {
         eprintln(e);
         return 1;
     }
@@ -462,15 +466,14 @@ fn chmod_x(path: &str) {
     let _ = std::process::Command::new("chmod").arg("755").arg(path).status();
 }
 
-/// navi test|bench [--release] [crate or file] [filter]: builds the
+/// navi test|bench [crate or file] [filter]: builds the
 /// #[test] (or #[bench]) functions of the crate with cfg(test) into a
 /// harness and runs the ones whose name contains filter.
 pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
-    let mut release = false;
     let mut rest: Vec<String> = Vec::new();
     for a in args.iter() {
         match a.as_str() {
-            "--release" => release = true,
+            "--release" => { eprintln(RELEASE_GONE); return 2; }
             "-timings" => TIMINGS = true,
             _ => rest.push(a.clone()),
         }
@@ -481,7 +484,6 @@ pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
         Err(e) => { eprintln(e); return 1; }
     };
     let mut cfg = host_config();
-    cfg.debug = !release;
     cfg.test = true;
     let specs = match crate::deps::load_graph(path.as_str(), false, false) {
         Ok(s) => s,
@@ -508,7 +510,7 @@ pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
     let ext = if target_os() == "windows" { ".exe" } else { "" };
     let exe = util::path_join(std::env::temp_dir().to_str().unwrap(), `navi-${attr}-${spec.name}${ext}`.to_string().as_str());
     let entry = &Entry { main: None, tests: fns, bench };
-    if let Err(e) = native(info, entry, exe.as_str(), !release) {
+    if let Err(e) = native(info, entry, exe.as_str(), true) {
         eprintln(e);
         return 1;
     }
