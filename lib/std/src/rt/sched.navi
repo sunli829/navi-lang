@@ -1998,7 +1998,7 @@ fn start_sysmon() {
 fn sysmon_loop(me: *mut M) -> ! {
     NOSLICE = crate::rt::native::env_set(b"NAVI_NOSLICE\0");
     let mut max_delay: u64 = 10000;
-    if let Some(v) = crate::rt::native::os_getenv("NAVI_SLICE_US") {
+    if let Some(v) = crate::rt::native::getenv_c(b"NAVI_SLICE_US\0") {
         let mut n = 0usize;
         for b in v.bytes() { if b >= b'0' && b <= b'9' { n = n * 10 + (b - b'0') as usize; } }
         if n > 0 {
@@ -2719,14 +2719,81 @@ pub fn stop_the_world() {
                 m = (*m).next;
             }
         }
-        if waiting == 0 { return; }
+        if waiting == 0 {
+            crate::rt::atomic_store(&mut STOPPED_ALL as *mut usize, 1);
+            return;
+        }
         unsafe { os_yield(); }
+    }
+}
+
+// Whether every G has stopped (stop_the_world returned); a stray allocation
+// was reported (see check_alloc_stopped).
+static mut STOPPED_ALL: usize = 0;
+static mut REPORTED: usize = 0;
+
+/// NAVI_GCVERIFY: a new span while the world is stopped for another G
+/// (something runs that should not) prints that G and its return
+/// addresses (tools/symbolize.py names them).
+pub fn check_alloc_stopped() {
+    // (Once the world has stopped: until then the others run on.)
+    if crate::rt::atomic_load(&mut STOPPED_ALL as *mut usize) == 0 { return; }
+    let g = current();
+    if g as usize == STW_OWNER { return; }
+    if !crate::rt::atomic_cas(&mut REPORTED as *mut usize, 0, 1) { return; }
+    crate::rt::native::put(2, "a span made while the world is stopped, by G ");
+    crate::rt::native::put_hex(2, g as u64);
+    if g as usize != 0 && unsafe { (*g).is_g0 } { crate::rt::native::put(2, " (an M's scheduler record)"); }
+    crate::rt::native::put(2, "; the collector is ");
+    crate::rt::native::put_hex(2, STW_OWNER as u64);
+    crate::rt::native::put(2, "\nreturn addresses:");
+    let mut fp = crate::rt::frame_address() as usize;
+    let mut k = 0;
+    while k < 12 && fp != 0 {
+        let ret = unsafe { *((fp + 8) as *const usize) };
+        crate::rt::native::put(2, " ");
+        crate::rt::native::put_hex(2, ret as u64);
+        let up = unsafe { *(fp as *const usize) };
+        if up <= fp { break; }
+        fp = up;
+        k += 1;
+    }
+    crate::rt::native::put(2, "\nmstart at ");
+    crate::rt::native::put_hex(2, crate::rt::mstart_address() as u64);
+    crate::rt::native::put(2, "\n");
+}
+
+/// Each M's current G, its status and state for the collector, and the
+/// running G (debugging a stopped world).
+pub fn dump_ms() {
+    let me = current();
+    let mut m = MS as *mut M;
+    while m as usize != 0 {
+        unsafe {
+            let g = (*m).cur;
+            crate::rt::native::put(2, "M ");
+            crate::rt::native::put_hex(2, m as u64);
+            crate::rt::native::put(2, " cur ");
+            crate::rt::native::put_hex(2, g as u64);
+            if g as usize != 0 {
+                crate::rt::native::put(2, " status ");
+                crate::rt::native::put_u64(2, (*g).status as u64);
+                crate::rt::native::put(2, " sys ");
+                crate::rt::native::put_u64(2, (*g).sys as u64);
+                crate::rt::native::put(2, " cb_prev ");
+                crate::rt::native::put_hex(2, (*g).cb_prev as u64);
+            }
+            if g as usize == me as usize { crate::rt::native::put(2, " (the collector)"); }
+            crate::rt::native::put(2, "\n");
+            m = (*m).next;
+        }
     }
 }
 
 /// Lets the stopped Gs run again.
 pub fn start_the_world() {
     if !MULTI { return; }
+    crate::rt::atomic_store(&mut STOPPED_ALL as *mut usize, 0);
     let me = current();
     let mut m = MS as *mut M;
     while m as usize != 0 {

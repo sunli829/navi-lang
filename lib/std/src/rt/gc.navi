@@ -485,6 +485,7 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
         st(PAGES + ((pg - ARENA) >> PAGE_SHIFT) * 8, s as usize);
         pg += PAGE;
     }
+    if VERIFY { crate::rt::sched::check_alloc_stopped(); }
     spin_lock(&mut HEAP_LK as *mut usize);
     unsafe { (*s).next_all = ALL as *mut Span; }
     ALL = s as usize;
@@ -1075,7 +1076,7 @@ fn concurrent_on() -> bool {
         MODE = if crate::rt::native::env_set(b"NAVI_GCSTW\0") { 2 } else { 1 };
         VERIFY = crate::rt::native::env_set(b"NAVI_GCVERIFY\0");
         // NAVI_GCMINHEAP=bytes: collect more often (testing).
-        if let Some(v) = crate::rt::native::os_getenv("NAVI_GCMINHEAP") {
+        if let Some(v) = crate::rt::native::getenv_c(b"NAVI_GCMINHEAP\0") {
             let mut n = 0usize;
             for b in v.bytes() { if b >= b'0' && b <= b'9' { n = n * 10 + (b - b'0') as usize; } }
             if n > 0 {
@@ -1237,19 +1238,33 @@ fn verify_marks() {
         }
     }
     if after != before {
+        // Spans made meanwhile mean something allocated while the world
+        // was stopped.
+        let mut now = 0usize;
+        s = ALL as *mut Span;
+        while s as usize != 0 { now += 1; s = unsafe { (*s).next_all }; }
+        crate::rt::native::put(2, "spans before ");
+        crate::rt::native::put_u64(2, nspans as u64);
+        crate::rt::native::put(2, " now ");
+        crate::rt::native::put_u64(2, now as u64);
+        crate::rt::native::put(2, "\n");
+        crate::rt::sched::dump_ms();
+        if now != nspans { crate::rt::native::fatal("concurrent mark missed reachable objects (the heap changed during the check)"); }
         report_missed(copies);
         crate::rt::native::fatal("concurrent mark missed reachable objects");
     }
 }
 
-// What verify_marks marked that the concurrent mark had not (up to 8
-// objects), and the marked objects that point at them (with their first
-// words).
+// What verify_marks marked that the concurrent mark had not (the first
+// 8), and the marked objects that point at any of them (the first 12, with
+// their first words): where a write barrier was missing.
 fn report_missed(copies: usize) {
     use crate::rt::native::{put, put_hex, put_u64};
-    let mut lo = [0usize; 8];
-    let mut hi = [0usize; 8];
-    let mut nm = 0;
+    // The newly marked objects, sorted by address (insertion: few).
+    let cap = 4096usize;
+    let los = unsafe { calloc(cap, 8) } as usize;
+    let his = unsafe { calloc(cap, 8) } as usize;
+    let mut nm = 0usize;
     let mut k = 0usize;
     let mut s = ALL as *mut Span;
     while s as usize != 0 {
@@ -1258,19 +1273,30 @@ fn report_missed(copies: usize) {
             let c = *((copies + 8 * k) as *const usize);
             let mut i = 0;
             while i < n {
-                if ldb((*s).bits as usize + n + i) != 0 && ldb(c + i) == 0 && nm < 8 {
-                    lo[nm] = (*s).start + i * (*s).elem;
-                    hi[nm] = lo[nm] + (*s).elem;
-                    put(2, "missed object ");
-                    put_hex(2, lo[nm] as u64);
-                    put(2, " size ");
-                    put_u64(2, (*s).elem as u64);
-                    put(2, if (*s).noscan { " noscan" } else { "" });
-                    put(2, " words");
-                    let mut w = 0;
-                    while w < 6 && w * 8 < (*s).elem { put(2, " "); put_hex(2, *((lo[nm] + 8 * w) as *const usize) as u64); w += 1; }
-                    put(2, "\n");
-                    nm += 1;
+                if ldb((*s).bits as usize + n + i) != 0 && ldb(c + i) == 0 {
+                    let lo = (*s).start + i * (*s).elem;
+                    if nm < 8 {
+                        put(2, "missed object ");
+                        put_hex(2, lo as u64);
+                        put(2, " size ");
+                        put_u64(2, (*s).elem as u64);
+                        put(2, if (*s).noscan { " noscan" } else { "" });
+                        put(2, " words");
+                        let mut w = 0;
+                        while w < 4 && w * 8 < (*s).elem { put(2, " "); put_hex(2, *((lo + 8 * w) as *const usize) as u64); w += 1; }
+                        put(2, "\n");
+                    }
+                    if nm < cap {
+                        let mut at = nm;
+                        while at > 0 && *((los + 8 * (at - 1)) as *const usize) > lo {
+                            *((los + 8 * at) as *mut usize) = *((los + 8 * (at - 1)) as *const usize);
+                            *((his + 8 * at) as *mut usize) = *((his + 8 * (at - 1)) as *const usize);
+                            at -= 1;
+                        }
+                        *((los + 8 * at) as *mut usize) = lo;
+                        *((his + 8 * at) as *mut usize) = lo + (*s).elem;
+                        nm += 1;
+                    }
                 }
                 i += 1;
             }
@@ -1278,34 +1304,44 @@ fn report_missed(copies: usize) {
         }
         k += 1;
     }
+    put(2, "newly marked: ");
+    put_u64(2, nm as u64);
+    put(2, "\n");
+    let mut shown = 0;
     k = 0;
     s = ALL as *mut Span;
-    while s as usize != 0 {
+    while s as usize != 0 && shown < 12 {
         unsafe {
             let n = (*s).nelems;
             let c = *((copies + 8 * k) as *const usize);
             let mut i = 0;
-            while i < n && !(*s).noscan {
+            while i < n && !(*s).noscan && shown < 12 {
                 if ldb(c + i) != 0 {
                     let o = (*s).start + i * (*s).elem;
                     let mut w = 0;
-                    while w * 8 < (*s).elem {
+                    while w * 8 < (*s).elem && shown < 12 {
                         let v = *((o + 8 * w) as *const usize);
-                        let mut j = 0;
-                        while j < nm {
-                            if v >= lo[j] && v < hi[j] {
-                                put(2, "  pointed at by ");
-                                put_hex(2, o as u64);
-                                put(2, " (size ");
-                                put_u64(2, (*s).elem as u64);
-                                put(2, ", word ");
-                                put_u64(2, w as u64);
-                                put(2, ") words");
-                                let mut x = 0;
-                                while x < 6 && x * 8 < (*s).elem { put(2, " "); put_hex(2, *((o + 8 * x) as *const usize) as u64); x += 1; }
-                                put(2, "\n");
-                            }
-                            j += 1;
+                        // The last newly marked object starting at or below v.
+                        let mut a = 0usize;
+                        let mut b = nm;
+                        while a < b {
+                            let mid = (a + b) / 2;
+                            if *((los + 8 * mid) as *const usize) <= v { a = mid + 1; } else { b = mid; }
+                        }
+                        if a > 0 && v < *((his + 8 * (a - 1)) as *const usize) {
+                            put(2, "  marked ");
+                            put_hex(2, o as u64);
+                            put(2, " (size ");
+                            put_u64(2, (*s).elem as u64);
+                            put(2, ") word ");
+                            put_u64(2, w as u64);
+                            put(2, " -> ");
+                            put_hex(2, v as u64);
+                            put(2, "; its words");
+                            let mut x = 0;
+                            while x < 6 && x * 8 < (*s).elem { put(2, " "); put_hex(2, *((o + 8 * x) as *const usize) as u64); x += 1; }
+                            put(2, "\n");
+                            shown += 1;
                         }
                         w += 1;
                     }
