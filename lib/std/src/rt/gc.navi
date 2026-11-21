@@ -8,8 +8,11 @@
 //! - Roots are the stack (from the collector's frame up to main's frame)
 //!   and the writable data section (statics). Roots and heap objects are
 //!   scanned word by word: any word that points into an allocated object,
-//!   including its interior, keeps it alive. Generated code keeps no values
-//!   in registers across calls, so every live pointer is in memory.
+//!   including its interior, keeps it alive.
+//! - A concurrent cycle (navi) marks with Go's hybrid write barrier: a store
+//!   into the heap or a static shades the value it overwrites and the one
+//!   it stores, so each stack is scanned once, when the cycle starts, and
+//!   the cycle ends without rescanning any.
 //! - Pacing (as Go's pacer): the heap may grow by what survived the last
 //!   collection (at least 32 MiB; std::gc::set_percent changes the ratio,
 //!   NAVI_GC=percent|off as GOGC) before the next one is done, at most to
@@ -461,6 +464,10 @@ fn assist_scan(debt: usize) {
         crate::rt::atomic_add(&mut ASSISTING as *mut usize, 1);
         while batch < 65536 && me != 0 {
             let mut obj = stack_pop(me);
+            if obj == 0 && !STACKS_DONE {
+                scan_stacks(2, me);
+                obj = stack_pop(me);
+            }
             if obj == 0 {
                 mark_lock();
                 if take_few(me) { obj = stack_pop(me); }
@@ -484,7 +491,7 @@ fn assist_scan(debt: usize) {
         if empty {
             mark_lock();
             // (This assist no longer counts.)
-            if !MARK_DONE && crate::rt::atomic_load(&mut ASSISTING as *mut usize) == 0 && no_grey() {
+            if !MARK_DONE && crate::rt::atomic_load(&mut ASSISTING as *mut usize) == 0 && STACKS_DONE && no_grey() {
                 MARK_DONE = true;
                 finish = true;
             }
@@ -883,6 +890,78 @@ fn take_shared() -> bool {
 /// Marks every object a word in [lo, hi) points into (by the collector).
 pub(crate) fn scan_range(lo: usize, hi: usize) { scan(lo, hi, MAIN); }
 
+/// The same, queuing what it marks on mark stack dst (0: the M's write
+/// barrier buffer).
+pub(crate) fn scan_into(lo: usize, hi: usize, dst: usize) { scan(lo, hi, dst); }
+
+/// The collector's mark stack (for sched's scans with the world stopped).
+pub(crate) fn main_dst() -> usize { MAIN }
+
+/// The current cycle's number.
+pub fn cycle_no() -> usize { CYCLE_NO }
+
+/// Scans the running G's own stack and registers (the world stopped).
+pub(crate) fn scan_own_stack() {
+    crate::rt::spill_registers(&mut SAVED_REGS as *mut [usize; 10] as *mut usize);
+    let lo = crate::rt::stack_pointer() as usize;
+    crate::rt::sched::scan_stack(lo, crate::rt::frame_address() as usize, crate::rt::sched::current_stack_hi());
+    scan_range(&SAVED_REGS as *const [usize; 10] as usize, &SAVED_REGS as *const [usize; 10] as usize + 80);
+}
+
+// --- Stacks, scanned while the program runs (as Go's markroot jobs) ------------
+//
+// The Gs of the ALL list as the cycle started (later ones have empty
+// stacks), from STK_CUR on, then those that were running when tried
+// (STK_PEND, C memory: asked to scan themselves, tried again).
+static mut STK_LK: usize = 0;
+static mut STK_CUR: usize = 0;
+static mut STK_PEND: usize = 0;
+static mut STK_N: usize = 0;
+static mut STK_CAP: usize = 0;
+static mut STK_BUSY: usize = 0;
+static mut STACKS_DONE: bool = true;
+// NAVI_GCCONCSTACKS=1 (being finished): the stacks are scanned while the
+// program runs; else when a cycle starts, the world stopped (1: on).
+static mut CONC_STACKS: usize = 0;
+
+// Scans up to budget stacks onto mark stack dst (the G may not stop);
+// whether every stack is scanned.
+fn scan_stacks(budget: usize, dst: usize) -> bool {
+    if STACKS_DONE { return true; }
+    let mut k = 0;
+    while k < budget {
+        spin_lock(&mut STK_LK as *mut usize);
+        let mut g = STK_CUR;
+        if g != 0 {
+            STK_CUR = crate::rt::sched::all_next(g);
+        } else if STK_N > 0 {
+            STK_N -= 1;
+            g = wget(STK_PEND + 8 * STK_N);
+        } else {
+            if STK_BUSY == 0 { STACKS_DONE = true; }
+            spin_unlock(&mut STK_LK as *mut usize);
+            return STACKS_DONE;
+        }
+        STK_BUSY += 1;
+        spin_unlock(&mut STK_LK as *mut usize);
+        let ok = crate::rt::sched::scan_g(g, CYCLE_NO, dst);
+        spin_lock(&mut STK_LK as *mut usize);
+        STK_BUSY -= 1;
+        if !ok {
+            if STK_N == STK_CAP {
+                STK_CAP = if STK_CAP == 0 { 256 } else { STK_CAP * 2 };
+                STK_PEND = unsafe { realloc(STK_PEND as *mut u8, STK_CAP * 8) } as usize;
+                if STK_PEND == 0 { out_of_memory(); }
+            }
+            wset(STK_PEND + 8 * STK_N, g);
+            STK_N += 1;
+        }
+        spin_unlock(&mut STK_LK as *mut usize);
+        k += 1;
+    }
+    false
+}
+
 
 // navi: the loop is the backend's leaf routine (generated navi code keeps
 // every value in memory; this loop runs over the whole live heap). It
@@ -1042,6 +1121,8 @@ fn mark_worker(k: usize, cyc: usize) {
             crate::rt::sched::preempt_on();
             return;
         }
+        // The stacks first (as Go's root jobs).
+        if !STACKS_DONE { scan_stacks(4, me); }
         let mut n = 0;
         let mut bytes = 0usize;
         while n < 256 {
@@ -1082,10 +1163,20 @@ fn mark_worker(k: usize, cyc: usize) {
                 crate::rt::sched::preempt_on();
                 return;
             }
+            if !STACKS_DONE {
+                scan_stacks(4, me);
+                if stack_len(me) > 0 {
+                    mark_lock();
+                    IDLE_MARKERS -= 1;
+                    mark_unlock();
+                    crate::rt::sched::preempt_on();
+                    break;
+                }
+            }
             // A look without the lock first (a hint): nothing to take and
-            // not everyone idle (or an assist runs), so keep waiting (the
-            // last marker waits for the assists).
-            if stack_len(POOL) == 0 && stack_len(SHARED) == 0 && (IDLE_MARKERS != MARKERS || ASSISTING != 0) && (spins < 100 || MARKERS == 1) {
+            // not everyone idle (or an assist runs, or a stack is left), so
+            // keep waiting (the last marker waits for the assists).
+            if stack_len(POOL) == 0 && stack_len(SHARED) == 0 && (IDLE_MARKERS != MARKERS || ASSISTING != 0 || !STACKS_DONE) && (spins < 100 || MARKERS == 1) {
                 crate::rt::sched::preempt_on();
                 continue;
             }
@@ -1094,7 +1185,7 @@ fn mark_worker(k: usize, cyc: usize) {
             if take_work(me) {
                 IDLE_MARKERS -= 1;
                 idle = false;
-            } else if IDLE_MARKERS == MARKERS && crate::rt::atomic_load(&mut ASSISTING as *mut usize) == 0 {
+            } else if IDLE_MARKERS == MARKERS && crate::rt::atomic_load(&mut ASSISTING as *mut usize) == 0 && STACKS_DONE {
                 MARK_DONE = true;
                 finish = true;
                 idle = false;
@@ -1563,10 +1654,12 @@ pub fn stats() -> (usize, usize, usize) { (COLLECTIONS, LIVE, ALLOCATED) }
 //
 // A cycle: (1) the world stops briefly while the roots (stacks, saved
 // registers, statics) are marked and the write barrier is switched on; (2)
-// a marker G drains the mark stack while the program runs: the barrier
-// marks every pointer stored into the heap, and objects allocated meanwhile
-// are born marked; (3) the world stops again: the stacks and statics are
-// rescanned (they have no barrier), the rest drained, the heap swept.
+// the marker Gs and the assists drain the grey objects while the program
+// runs: the barrier shades every pointer a store overwrites or stores (as
+// Go's hybrid barrier: a stack, scanned once, then needs none), and objects
+// allocated meanwhile are born marked; (3) the world stops again: what the
+// barriers left in the Ms' buffers is drained (the statics rescanned too:
+// the runtime writes some as integers) and sweeping begins.
 
 fn mark_lock() {
     while !crate::rt::atomic_cas(&mut MARK_LK as *mut usize, 0, 1) { mark_spin(); }
@@ -1617,16 +1710,6 @@ fn set_marking(on: bool) {
     crate::rt::atomic_store(crate::rt::gc_marking_flag() as *mut usize, if on { 1 } else { 0 });
 }
 
-// Marks the roots: the running G's registers and stack, the other Gs'
-// stacks and saved registers, the statics.
-fn mark_roots() {
-    crate::rt::spill_registers(&mut SAVED_REGS as *mut [usize; 10] as *mut usize);
-    let lo = crate::rt::stack_pointer() as usize;
-    crate::rt::sched::scan_stack(lo, crate::rt::frame_address() as usize, crate::rt::sched::current_stack_hi());
-    crate::rt::sched::scan_other_stacks();
-    scan_range(crate::rt::data_start() as usize, crate::rt::data_end() as usize);
-    scan_cleanups();
-}
 
 // How many mark workers a cycle has: a quarter of the threads (as Go's
 // dedicated workers), at least one.
@@ -1637,11 +1720,15 @@ fn workers() -> usize {
     n
 }
 
+// How long the world stopped to start the last cycle (NAVI_GCTRACE).
+static mut START_STW: u64 = 0;
+
 // (1), with the runtime lock held.
 fn start_cycle() {
     if COLLECTING { return; }
     finish_sweep();
     COLLECTING = true;
+    let t0 = crate::rt::native::monotonic_nanos();
     crate::rt::sched::stop_the_world();
     take_marked();
     SCAN_DONE = 0;
@@ -1651,7 +1738,15 @@ fn start_cycle() {
     CYCLE = true;
     LIMIT = ARENA_NEXT;
     set_marking(true);
-    mark_roots();
+    // The statics now; the stacks while the program runs (the barrier
+    // keeps what a G moves between its stack and the heap meanwhile).
+    scan_range(crate::rt::data_start() as usize, crate::rt::data_end() as usize);
+    scan_cleanups();
+    if CONC_STACKS == 0 { CONC_STACKS = if crate::rt::native::env_set(b"NAVI_GCCONCSTACKS\0") { 1 } else { 2 }; }
+    STK_CUR = crate::rt::sched::all_head();
+    STK_N = 0;
+    STK_BUSY = 0;
+    STACKS_DONE = false;
     // The cycle's state, all before the world starts again (assists start
     // taking grey objects at once; a marker of an earlier cycle not yet run
     // must see it is stale).
@@ -1661,6 +1756,12 @@ fn start_cycle() {
     NEXT_GC = if hard > ALLOCATED + MIN_HEAP / 4 { hard } else { ALLOCATED + MIN_HEAP / 4 };
     CYCLE_NO += 1;
     let cyc = CYCLE_NO;
+    if CONC_STACKS != 1 {
+        // Every stack now, the world stopped (each once: the barrier keeps
+        // them).
+        crate::rt::sched::scan_unscanned(cyc);
+        STACKS_DONE = true;
+    }
     move_all(MAIN, POOL);
     // (2): the marker Gs (a quarter of the threads, as Go's dedicated
     // workers), starting from the roots.
@@ -1669,6 +1770,7 @@ fn start_cycle() {
     MARK_DONE = false;
     crate::rt::sched::ask_yields(MARKERS);
     crate::rt::sched::start_the_world();
+    START_STW = crate::rt::native::monotonic_nanos() - t0;
     COLLECTING = false;
     let mut k = 0;
     while k < MARKERS {
@@ -1685,13 +1787,20 @@ fn finish_cycle() {
     COLLECTIONS += 1;
     let t0 = crate::rt::native::monotonic_nanos();
     crate::rt::sched::stop_the_world();
-    mark_roots();
+    // No stack again (the barrier kept them), only those no marker
+    // scanned.
+    crate::rt::sched::scan_unscanned(CYCLE_NO);
+    STACKS_DONE = true;
+    scan_range(crate::rt::data_start() as usize, crate::rt::data_end() as usize);
+    scan_cleanups();
     drain();
     if crate::rt::native::env_set(b"NAVI_GCTRACE\0") {
         crate::rt::native::put(2, "gc finish done=");
         crate::rt::native::put(2, if MARK_DONE { "1" } else { "0" });
-        crate::rt::native::put(2, " stw_ms=");
-        crate::rt::native::put_u64(2, (crate::rt::native::monotonic_nanos() - t0) / 1000000);
+        crate::rt::native::put(2, " start_stw_us=");
+        crate::rt::native::put_u64(2, START_STW / 1000);
+        crate::rt::native::put(2, " stw_us=");
+        crate::rt::native::put_u64(2, (crate::rt::native::monotonic_nanos() - t0) / 1000);
         crate::rt::native::put(2, " scan_mb=");
         crate::rt::native::put_u64(2, (SCAN_DONE >> 20) as u64);
         crate::rt::native::put(2, " assist_mb=");

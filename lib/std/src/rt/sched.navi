@@ -137,6 +137,11 @@ pub struct G {
     // stack: its next prologue's check moves it to one half as large (as
     // Go's shrinkstack; see morestack).
     shrink: usize,
+    // The cycle (gc's CYCLE_NO) whose mark has scanned its stack, and one
+    // whose marker asked it to scan its stack itself at its next check
+    // (it was running; see morestack).
+    scan_cyc: usize,
+    scan_req: usize,
 }
 
 // G.sys: running navi code; blocked in C (a system call or waiting for the
@@ -147,6 +152,10 @@ const SYS_RUNNING: usize = 0;
 const SYS_BLOCKED: usize = 1;
 const SYS_CLAIMED: usize = 2;
 const SYS_STOPPED: usize = 3;
+// Blocked, its stack being scanned by a marker (it waits as when claimed).
+const SYS_SCANNING: usize = 4;
+// G.running_on while a marker scans a G no M runs (an M waits to run it).
+const SCANNING: usize = 1;
 
 struct WaitNode { g: *mut G, gen: usize, key: usize, next: *mut WaitNode }
 
@@ -297,10 +306,14 @@ pub fn current_stack_hi() -> usize {
 /// the frames of user code by their stack maps (as Go's scanframe), the
 /// rest (the runtime, std, code without maps) conservatively, as are the
 /// registers the G saved when it stopped (below fp).
-pub fn scan_stack(sp: usize, fp0: usize, hi: usize) {
+pub fn scan_stack(sp: usize, fp0: usize, hi: usize) { scan_stack_into(sp, fp0, hi, crate::rt::gc::main_dst()); }
+
+// scan_stack, the objects found queued on mark stack dst (0: the M's
+// write barrier buffer).
+fn scan_stack_into(sp: usize, fp0: usize, hi: usize, dst: usize) {
     stack_mode();
     if STACKMAP != 1 || fp0 < sp || fp0 >= hi {
-        crate::rt::gc::scan_range(sp, hi);
+        crate::rt::gc::scan_into(sp, hi, dst);
         return;
     }
     let mut pend = [0usize; 9];
@@ -313,10 +326,10 @@ pub fn scan_stack(sp: usize, fp0: usize, hi: usize) {
         let (m, start) = if pc == 0 { (0, 0) } else { find_map(pc) };
         let flags = if m == 0 { 3 } else { unsafe { *((m + 8) as *const usize) } };
         if flags != 0 {
-            crate::rt::gc::scan_range(top, fp);
+            crate::rt::gc::scan_into(top, fp, dst);
             let mut k = 0;
             while k < 9 {
-                if pend[k] != 0 { crate::rt::gc::scan_range(pend[k], pend[k] + 8); }
+                if pend[k] != 0 { crate::rt::gc::scan_into(pend[k], pend[k] + 8, dst); }
                 pend[k] = 0;
                 k += 1;
             }
@@ -325,13 +338,13 @@ pub fn scan_stack(sp: usize, fp0: usize, hi: usize) {
             let any = unsafe { *((m + 16) as *const usize) };
             let nb = unsafe { *((m + 24) as *const usize) };
             let fsp = fp - frame;
-            if top < fsp { crate::rt::gc::scan_range(top, fsp); }
-            crate::rt::gc::scan_range(fsp, fsp + 8 * any);
+            if top < fsp { crate::rt::gc::scan_into(top, fsp, dst); }
+            crate::rt::gc::scan_into(fsp, fsp + 8 * any, dst);
             let mut w = any;
             while w < frame / 8 {
                 let i = w - any;
                 let bits = unsafe { *((m + 32 + 8 * (i / 64)) as *const usize) };
-                if (bits >> (i % 64) as u32) & 1 != 0 { crate::rt::gc::scan_range(fsp + 8 * w, fsp + 8 * w + 8); }
+                if (bits >> (i % 64) as u32) & 1 != 0 { crate::rt::gc::scan_into(fsp + 8 * w, fsp + 8 * w + 8, dst); }
                 w += 1;
             }
             let sv = m + 32 + 8 * nb;
@@ -342,7 +355,7 @@ pub fn scan_stack(sp: usize, fp0: usize, hi: usize) {
                 let e = unsafe { *((sv + 8 + 8 * j) as *const usize) };
                 let r = e >> 32;
                 let off = (e & 0xffffffff) as u32 as i32 as i64 as usize;
-                if pend[r] != 0 && (mask >> r as u32) & 1 != 0 { crate::rt::gc::scan_range(pend[r], pend[r] + 8); }
+                if pend[r] != 0 && (mask >> r as u32) & 1 != 0 { crate::rt::gc::scan_into(pend[r], pend[r] + 8, dst); }
                 pend[r] = fp.wrapping_add(off);
                 j += 1;
             }
@@ -351,11 +364,78 @@ pub fn scan_stack(sp: usize, fp0: usize, hi: usize) {
         fp = prev;
         pc = ret;
     }
-    crate::rt::gc::scan_range(top, hi);
+    crate::rt::gc::scan_into(top, hi, dst);
     let mut k = 0;
     while k < 9 {
-        if pend[k] != 0 { crate::rt::gc::scan_range(pend[k], pend[k] + 8); }
+        if pend[k] != 0 { crate::rt::gc::scan_into(pend[k], pend[k] + 8, dst); }
         k += 1;
+    }
+}
+
+// The stack and saved registers of g, not running (as the collector scans
+// one stopped).
+fn scan_saved(g: *mut G, dst: usize) {
+    unsafe {
+        scan_stack_into((*g).sp, if (*g).ms_fp != 0 { (*g).ms_fp } else { (*g).fp }, (*g).stack_hi, dst);
+        let r = &(*g).regs as *const [usize; 10] as usize;
+        crate::rt::gc::scan_into(r, r + 80, dst);
+    }
+}
+
+/// The first G of the ALL list (the stacks a mark scans: Gs made after
+/// start scanned), and the next.
+pub fn all_head() -> usize { ALL }
+pub fn all_next(g: usize) -> usize { unsafe { (*(g as *mut G)).all_next as usize } }
+
+/// A marker's scan of g's stack for cycle cyc while the program runs (as
+/// Go's scanstack with suspendG): a G no M runs is held (an M waits to run
+/// it), one blocked outside navi code too (it waits to go on); a running
+/// one is asked to scan its own at its next check (its limit poisoned).
+/// Whether it is scanned (or needs none).
+pub fn scan_g(gp: usize, cyc: usize, dst: usize) -> bool {
+    let g = gp as *mut G;
+    unsafe {
+        if (*g).status == DEAD || (*g).is_g0 || (*g).scan_cyc == cyc { return true; }
+        if crate::rt::atomic_cas(&mut (*g).running_on as *mut usize, 0, SCANNING) {
+            if (*g).status != DEAD && (*g).scan_cyc != cyc {
+                scan_saved(g, dst);
+                (*g).scan_cyc = cyc;
+            }
+            crate::rt::atomic_store(&mut (*g).running_on as *mut usize, 0);
+            return true;
+        }
+        if g as usize != current() as usize && crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_BLOCKED, SYS_SCANNING) {
+            if (*g).scan_cyc != cyc {
+                scan_saved(g, dst);
+                (*g).scan_cyc = cyc;
+            }
+            crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_BLOCKED);
+            return true;
+        }
+        (*g).scan_req = cyc;
+        crate::rt::atomic_store(&mut (*g).guard as *mut usize, POISON);
+        false
+    }
+}
+
+/// With the world stopped at the end of a mark: scans the stacks no
+/// marker did (the collector's own too), and drops the requests.
+pub fn scan_unscanned(cyc: usize) {
+    let me = current();
+    let mut g = ALL as *mut G;
+    while g as usize != 0 {
+        unsafe {
+            if (*g).status != DEAD && !(*g).is_g0 && (*g).scan_cyc != cyc {
+                if g as usize == me as usize {
+                    crate::rt::gc::scan_own_stack();
+                } else {
+                    scan_saved(g, crate::rt::gc::main_dst());
+                }
+                (*g).scan_cyc = cyc;
+            }
+            (*g).scan_req = 0;
+            g = (*g).all_next;
+        }
     }
 }
 
@@ -421,6 +501,9 @@ fn go_on(f: fn(), marker: bool) {
         (*g).poisoned = false;
         (*g).release_n = 0;
         (*g).shrink = 0;
+        // (Its stack is empty: scanned for a mark that runs.)
+        (*g).scan_cyc = crate::rt::gc::cycle_no();
+        (*g).scan_req = 0;
         NEXT_TID += 1;
         (*g).tid = NEXT_TID;
     }
@@ -742,8 +825,10 @@ fn push(c: *mut Chan, src: *const u8) {
         }
         let at = ((*c).head + (*c).len) % (*c).slots;
         let dst = crate::rt::ptr_offset((*c).buf as *const u8, at * (*c).elem) as *mut u8;
-        // The element may hold pointers (the copy is of bytes).
+        // The element may hold pointers (the copy is of bytes): shaded
+        // before (what it overwrites) and after, as a barrier does.
         preempt_off();
+        crate::rt::gc::shade_range(dst as usize, (*c).elem);
         copy_bytes(src, dst, (*c).elem);
         crate::rt::gc::shade_range(dst as usize, (*c).elem);
         preempt_on();
@@ -754,6 +839,7 @@ fn push(c: *mut Chan, src: *const u8) {
 fn pop(c: *mut Chan, dst: *mut u8) {
     unsafe {
         preempt_off();
+        crate::rt::gc::shade_range(dst as usize, (*c).elem);
         copy_bytes(crate::rt::ptr_offset((*c).buf as *const u8, (*c).head * (*c).elem), dst, (*c).elem);
         crate::rt::gc::shade_range(dst as usize, (*c).elem);
         preempt_on();
@@ -1210,6 +1296,7 @@ fn init_ms(main: *mut G) {
         (*m).g0 = g0;
         (*m).cur = main;
         (*main).m = m as usize;
+        (*main).running_on = m as usize;
         // The main G starts without a switch from g0: its C calls run
         // below g0's first frame.
         (*main).c_stack = ((*g0).sp - 256) & !15;
@@ -1300,9 +1387,11 @@ pub fn exit_blocked() {
             return;
         }
         while !crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_BLOCKED, SYS_RUNNING) {
-            // Only a collector's claim keeps it waiting: anything else is a
-            // lost state (it would wait forever, holding what it holds).
-            if crate::rt::atomic_load(&mut (*g).sys as *mut usize) != SYS_CLAIMED { crate::rt::native::fatal("exit_blocked: the G is not blocked"); }
+            // Only a collector's claim or a marker's scan keeps it waiting:
+            // anything else is a lost state (it would wait forever, holding
+            // what it holds).
+            let st = crate::rt::atomic_load(&mut (*g).sys as *mut usize);
+            if st != SYS_CLAIMED && st != SYS_SCANNING { crate::rt::native::fatal("exit_blocked: the G is not blocked"); }
             os_yield();
         }
         // Another M took over meanwhile: this one counts again (find_runnable
@@ -2077,6 +2166,8 @@ pub fn cb_enter(mp: usize) {
         let prev = (*m).cur;
         (*g).cb_prev = prev;
         (*g).m = mp;
+        // On the M from now (a marker may hold it a moment: idle, it was dead).
+        while !crate::rt::atomic_cas(&mut (*g).running_on as *mut usize, 0, mp) { os_yield(); }
         (*g).tid = (*prev).tid;
         (*g).catch = 0;
         (*g).sys = SYS_RUNNING;
@@ -2099,6 +2190,7 @@ pub fn cb_exit() {
         crate::rt::atomic_store(&mut (*m).cur as *mut *mut G as *mut usize, (*g).cb_prev as usize);
         (*g).cb_prev = 0 as *mut G;
         (*g).status = DEAD;
+        crate::rt::atomic_store(&mut (*g).running_on as *mut usize, 0);
         // Its stack may have moved.
         (*g).cb_stack = ((*g).stack_hi - 64) & !15;
     }
@@ -2389,6 +2481,8 @@ fn mloop() -> ! {
             continue;
         }
         crate::rt::atomic_add(unsafe { &mut (*m).run_seq as *mut usize }, 1);
+        // (A marker scanning its stack holds it a moment.)
+        while crate::rt::atomic_load(unsafe { &mut (*g).running_on as *mut usize }) == SCANNING { unsafe { os_yield(); } }
         if !crate::rt::atomic_cas(unsafe { &mut (*g).running_on as *mut usize }, 0, m as usize) {
             crate::rt::native::put(2, "G ");
             crate::rt::native::put_u64(2, g as u64);
@@ -2586,6 +2680,19 @@ pub fn morestack() -> usize {
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_STOPPED);
             while crate::rt::atomic_load(&mut STW as *mut usize) != 0 { os_yield(); }
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_RUNNING);
+        }
+        // A marker asked: the G scans its own stack (stopped here, as a
+        // collector would scan it: morestack's frames and the registers the
+        // stub saved conservatively, the rest by the maps). Not in
+        // preempt_off: the code it stopped may hold the mark lock (or another
+        // the scan takes); the marker asks again.
+        if (*g).scan_req != 0 && !(*g).is_g0 && (*g).nopreempt == 0 {
+            let cyc = (*g).scan_req;
+            (*g).scan_req = 0;
+            if crate::rt::gc::marking() && cyc == crate::rt::gc::cycle_no() && (*g).scan_cyc != cyc {
+                scan_stack_into(crate::rt::stack_pointer() as usize, (*g).entry_sp + 256 + 16, (*g).stack_hi, 0);
+                (*g).scan_cyc = cyc;
+            }
         }
         if (*g).old_size != 0 {
             release_os((*g).old_stack, (*g).old_size);
