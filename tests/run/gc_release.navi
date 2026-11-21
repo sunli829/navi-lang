@@ -1,0 +1,122 @@
+// Memory the heap no longer needs goes back to the system, and the spans
+// of one size class are reused by another (as Go's page heap and
+// scavenger).
+
+use std::gc;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getpid() -> i32;
+    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u8) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+extern "C" {
+    fn GetCurrentProcess() -> usize;
+    fn K32GetProcessMemoryInfo(process: usize, counters: *mut u8, size: u32) -> i32;
+}
+
+fn le64(b: &[u8], at: usize) -> usize {
+    let mut v = 0usize;
+    let mut i = 8;
+    while i > 0 {
+        i -= 1;
+        v = v * 256 + b[at + i] as usize;
+    }
+    v
+}
+
+// The resident memory now: rusage_info_v0's ri_phys_footprint (at 72).
+#[cfg(target_os = "macos")]
+fn rss_mb() -> usize {
+    let mut buf = [0u8; 256];
+    unsafe { proc_pid_rusage(getpid(), 0, &mut buf as *mut [u8; 256] as *mut u8); }
+    le64(&buf, 72) / 1048576
+}
+
+// PROCESS_MEMORY_COUNTERS' WorkingSetSize (at 16).
+#[cfg(target_os = "windows")]
+fn rss_mb() -> usize {
+    let mut buf = [0u8; 72];
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut buf as *mut [u8; 72] as *mut u8, 72); }
+    le64(&buf, 16) / 1048576
+}
+
+#[cfg(target_os = "linux")]
+fn rss_mb() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    for line in status.lines() {
+        if let Some(kb) = line.strip_prefix("VmRSS:") {
+            return kb.trim().trim_end_matches(" kB").parse::<usize>().unwrap() / 1024;
+        }
+    }
+    0
+}
+
+struct Small { a: i64, b: i64, c: Option<&Small> }
+
+// About 160 MiB in 32-byte objects, linked.
+fn small_objects() -> Option<&Small> {
+    let mut head: Option<&Small> = None;
+    let mut i = 0;
+    while i < 5000000 {
+        head = Some(&Small { a: i, b: i, c: head });
+        i += 1;
+    }
+    head
+}
+
+// About 150 MiB in 1 KiB buffers.
+fn buffers() -> Vec<Vec<u8>> {
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < 150000 {
+        let mut b: Vec<u8> = Vec::new();
+        b.resize(1000, 1);
+        v.push(b);
+        i += 1;
+    }
+    v
+}
+
+fn count(mut p: Option<&Small>) -> i64 {
+    let mut n = 0;
+    while let Some(s) = p {
+        n += 1;
+        p = s.c;
+    }
+    n
+}
+
+// The heap and resident memory while the list lives, on a thread of its
+// own (whose stack, with what may be left of the list on it, dies with
+// it: std's frames are scanned conservatively).
+fn with_list() -> (usize, usize) {
+    std::thread::spawn(|| {
+        let list = small_objects();
+        assert_eq(count(list), 5000000);
+        (gc::stats().heap_bytes, rss_mb())
+    }).join().unwrap()
+}
+
+#[test]
+fn unused_memory_returns_to_the_system() {
+    let (full, rss_full) = with_list();
+    assert_msg(full > 100 << 20, `heap ${full}`);
+
+    // The list died: its spans hold no object and go back.
+    gc::free_os_memory();
+    let s = gc::stats();
+    assert_msg(s.released_bytes > full / 2, `released ${s.released_bytes} of ${full}`);
+    assert_msg(s.heap_bytes < full / 2, `heap ${s.heap_bytes} of ${full}`);
+    let rss = rss_mb();
+    assert_msg(rss < rss_full / 2, `rss ${rss} MB, was ${rss_full} MB`);
+
+    // Another size class takes the dead spans: the heap does not grow by
+    // as much again.
+    let bufs = buffers();
+    assert_eq(bufs.len(), 150000);
+    let again = gc::stats().heap_bytes;
+    assert_msg(again < full + (full >> 2), `heap ${again}, the list's was ${full}`);
+    assert_eq(bufs[123456][999], 1);
+}

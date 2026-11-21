@@ -412,6 +412,51 @@ pub fn go(f: fn()) {
     start_sysmon();
     ready(g);
     unlock();
+    if !FGC_ON {
+        FGC_ON = true;
+        go(|| { forcegc_loop(); });
+    }
+}
+
+// --- Forced collections (as Go's forcegc) ---------------------------------------
+//
+// A G that waits until sysmon sees no collection for FORCE_GC (a program
+// that stopped allocating), then collects: what died is freed and its
+// memory returned to the system.
+const FORCE_GC: u64 = 120000000000;
+static mut FGC_ON: bool = false;
+static mut FGC_G: usize = 0;
+static mut FGC_LK: usize = 0;
+// Set (under FGC_LK) while it waits.
+static mut FGC_PARKED: bool = false;
+
+fn forcegc_loop() {
+    loop {
+        obj_lock(&mut FGC_LK as *mut usize);
+        FGC_G = current() as usize;
+        FGC_PARKED = true;
+        park_until(&mut FGC_LK as *mut usize, 0);
+        obj_unlock(&mut FGC_LK as *mut usize);
+        crate::rt::gc::collect();
+    }
+}
+
+// sysmon: readies the forced collection's G if no collection ran for
+// FORCE_GC (it runs no Gs itself: the global queue).
+fn force_gc(now: u64) {
+    let last = crate::rt::gc::LAST_GC;
+    if last == 0 || now < last + FORCE_GC || !FGC_PARKED { return; }
+    obj_lock(&mut FGC_LK as *mut usize);
+    if FGC_PARKED {
+        FGC_PARKED = false;
+        // Not again before it ran.
+        crate::rt::gc::LAST_GC = now;
+        let g = FGC_G as *mut G;
+        unsafe { (*g).status = RUNNABLE; }
+        gq_push(g);
+        wake_idle();
+    }
+    obj_unlock(&mut FGC_LK as *mut usize);
 }
 
 /// The first function of every spawned G (called by the start routine).
@@ -1686,7 +1731,7 @@ fn deadlock() -> ! {
     let mut g = ALL as *mut G;
     while g as usize != 0 {
         unsafe {
-            if (*g).status != DEAD && !(*g).is_g0 {
+            if (*g).status != DEAD && !(*g).is_g0 && g as usize != FGC_G {
                 crate::rt::native::put(2, "\ngoroutine ");
                 crate::rt::native::put_u64(2, (*g).tid);
                 crate::rt::native::put(2, if (*g).status == WAITING { " [waiting]:\n" } else { " [runnable]:\n" });
@@ -2055,6 +2100,7 @@ fn sysmon_loop(me: *mut M) -> ! {
                 m = (*m).next;
             }
         }
+        force_gc(crate::rt::native::monotonic_nanos());
         // (At most a time slice, 10 ms.)
         delay = if blocked { 20 } else if delay < max_delay { delay * 2 } else { max_delay };
     }

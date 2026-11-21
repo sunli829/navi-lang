@@ -23,10 +23,17 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
 }
 
+#[cfg(target_os = "linux")]
+#[nonblocking]
+extern "C" {
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+
 #[cfg(target_os = "windows")]
 #[nonblocking]
 extern "C" {
     fn VirtualAlloc(addr: *mut u8, size: usize, kind: u32, protect: u32) -> *mut u8;
+    fn VirtualFree(addr: *mut u8, size: usize, kind: u32) -> i32;
 }
 
 #[nonblocking]
@@ -34,6 +41,7 @@ extern "C" {
     fn memset(p: *mut u8, c: i32, n: usize) -> *mut u8;
     fn calloc(n: usize, size: usize) -> *mut u8;
     fn realloc(p: *mut u8, size: usize) -> *mut u8;
+    fn free(p: *mut u8);
 }
 
 #[cfg(target_os = "macos")]
@@ -76,6 +84,9 @@ struct Span {
     next_free: *mut Span,
     in_free: bool,
     list: usize, // index into FREE (small spans), or NCLASS * 2 for large spans
+    // Dead (no object allocated) with its pages returned to the system
+    // (see scavenge): zero when used again.
+    released: bool,
 }
 
 static mut ARENA: usize = 0;
@@ -83,7 +94,14 @@ static mut ARENA_NEXT: usize = 0;
 static mut ARENA_END: usize = 0;
 static mut PAGES: usize = 0; // *mut *mut Span, one entry per page of the arena
 static mut ALL: usize = 0; // *mut Span: every span
-static mut FREE: [usize; 65] = [0; 65]; // spans with free objects per class and noscan; [64]: dead large spans
+// Spans with free objects per class and noscan; [64]: dead spans (no
+// object allocated: large spans, and small ones of any class), which any
+// size class or large object may reuse (as Go's page heap); REL: dead
+// spans whose pages were returned to the system.
+static mut FREE: [usize; 65] = [0; 65];
+static mut REL: usize = 0;
+// The bytes of the arena returned to the system (in dead spans).
+static mut RELEASED: usize = 0;
 static mut ALLOCATED: usize = 0;
 static mut NEXT_GC: usize = 0;
 static mut LIVE: usize = 0;
@@ -125,6 +143,28 @@ fn commit(p: usize, size: usize) {
     let q = unsafe { VirtualAlloc(p as *mut u8, size, 0x1000, 4) } as usize; // MEM_COMMIT
     if q == 0 { out_of_memory(); }
 }
+
+// Returns the pages of [p, p + size) to the system (as Go's sysUnused):
+// they read as zero when used again, after reuse_pages.
+#[cfg(target_os = "linux")]
+fn release_pages(p: usize, size: usize) { unsafe { madvise(p as *mut u8, size, 4); } } // MADV_DONTNEED
+
+// A fresh anonymous mapping over the range (MADV_FREE would leave the
+// pages counted until the system needs them, and not zero).
+#[cfg(target_os = "macos")]
+fn release_pages(p: usize, size: usize) {
+    let q = unsafe { mmap(p as *mut u8, size, PROT_RW, MAP_FLAGS | 0x10, -1, 0) } as usize; // MAP_FIXED
+    if q != p { out_of_memory(); }
+}
+
+#[cfg(target_os = "windows")]
+fn release_pages(p: usize, size: usize) { unsafe { VirtualFree(p as *mut u8, size, 0x4000); } } // MEM_DECOMMIT
+
+#[cfg(not(target_os = "windows"))]
+fn reuse_pages(p: usize, size: usize) {}
+
+#[cfg(target_os = "windows")]
+fn reuse_pages(p: usize, size: usize) { commit(p, size); }
 
 fn init() {
     let base = reserve(ARENA_SIZE);
@@ -307,9 +347,85 @@ fn refill(c: usize, list: usize) -> *mut Span {
         }
         break;
     }
-    let s = new_span(CLASSES[c], SPAN_BYTES, list & 1 == 1, list);
+    let s = small_span(c, list);
     add_allocated(unsafe { (*s).nfree * (*s).elem });
     s
+}
+
+// A span for size class c (free list list): a dead one, else a new one.
+fn small_span(c: usize, list: usize) -> *mut Span {
+    let s = take_dead(SPAN_BYTES, SPAN_BYTES, list);
+    if s as usize == 0 { return new_span(CLASSES[c], SPAN_BYTES, list & 1 == 1, list); }
+    unsafe {
+        if (*s).released {
+            unrelease(s);
+        } else if (*s).list != list {
+            memset((*s).start as *mut u8, 0, (*s).bytes);
+        }
+        // (Of this class and not released: its free list links every object.)
+        if (*s).list != list || (*s).bump != 0 { relayout(s, CLASSES[c], list); }
+    }
+    s
+}
+
+// Takes a dead span of lo to hi bytes off its list: one whose pages are
+// still in use first. While a mark runs, only one of layout list (a
+// marker may be reading a span's layout).
+fn take_dead(lo: usize, hi: usize, list: usize) -> *mut Span {
+    let l = list_lk(64);
+    spin_lock(l);
+    let mut s = unlink_dead((&mut FREE as *mut [usize; 65] as usize + 64 * 8) as *mut usize, lo, hi, list);
+    if s == 0 { s = unlink_dead(&mut REL as *mut usize, lo, hi, list); }
+    spin_unlock(l);
+    s as *mut Span
+}
+
+fn unlink_dead(head: *mut usize, lo: usize, hi: usize, list: usize) -> usize {
+    let mut prev = 0usize;
+    let mut s = unsafe { *head };
+    while s != 0 {
+        let sp = s as *mut Span;
+        unsafe {
+            if (*sp).bytes >= lo && (*sp).bytes <= hi && ((*sp).list == list || !CYCLE) {
+                if prev == 0 { *head = (*sp).next_free as usize; } else { (*(prev as *mut Span)).next_free = (*sp).next_free; }
+                (*sp).in_free = false;
+                return s;
+            }
+            prev = s;
+            s = (*sp).next_free as usize;
+        }
+    }
+    0
+}
+
+// A released span's pages in use again (zero).
+fn unrelease(s: *mut Span) {
+    unsafe {
+        reuse_pages((*s).start, (*s).bytes);
+        (*s).released = false;
+        crate::rt::atomic_add(&mut RELEASED as *mut usize, 0usize.wrapping_sub((*s).bytes));
+    }
+}
+
+// Makes dead span s (its memory zero) one of objects of elem bytes on
+// free list list, all taken from the bump pointer.
+fn relayout(s: *mut Span, elem: usize, list: usize) {
+    unsafe {
+        let n = (*s).bytes / elem;
+        if n != (*s).nelems {
+            // (A dead span's allocation and mark bytes are all zero.)
+            free((*s).bits);
+            (*s).bits = calloc(2 * n, 1);
+        }
+        (*s).elem = elem;
+        (*s).div_mul = if elem >= 4294967296 { 0 } else { 4294967295 / elem + 1 };
+        (*s).nelems = n;
+        (*s).noscan = list & 1 == 1;
+        (*s).list = list;
+        (*s).freelist = 0;
+        (*s).bump = (*s).start;
+        (*s).nfree = n;
+    }
 }
 
 // The locks of the shared span lists and of the heap (new spans, the
@@ -372,7 +488,7 @@ fn alloc_small(c: usize, noscan: bool) -> usize {
         }
     }
     if UNSWEPT != 0 && sweep_for(list) { return alloc_small(c, noscan); }
-    let s = new_span(CLASSES[c], SPAN_BYTES, noscan, list);
+    let s = small_span(c, list);
     unsafe {
         (*s).next_free = FREE[list] as *mut Span;
         (*s).in_free = true;
@@ -406,32 +522,19 @@ fn alloc_large(size: usize, noscan: bool) -> usize { alloc_large_in(size, noscan
 // tries: how many more batches of spans may be swept for a fitting one.
 fn alloc_large_in(size: usize, noscan: bool, tries: usize) -> usize {
     let bytes = (size + PAGE - 1) / PAGE * PAGE;
-    // Reuse a dead large span that fits (first fit, at most twice the size).
-    let l = list_lk(64);
-    spin_lock(l);
-    let mut prev = 0usize;
-    let mut s = FREE[64] as *mut Span;
-    let mut found = 0usize;
-    while s as usize != 0 {
+    // Reuse a dead span that fits (first fit, at most twice the size).
+    let s = take_dead(bytes, 2 * bytes, NCLASS * 2);
+    if s as usize != 0 {
         unsafe {
-            if (*s).bytes >= bytes && (*s).bytes <= 2 * bytes {
-                if prev == 0 { FREE[64] = (*s).next_free as usize; } else { (*(prev as *mut Span)).next_free = (*s).next_free; }
-                (*s).in_free = false;
-                found = s as usize;
-                break;
+            if (*s).released { unrelease(s); } else { memset((*s).start as *mut u8, 0, (*s).bytes); }
+            if (*s).list != NCLASS * 2 {
+                relayout(s, (*s).bytes, NCLASS * 2);
+                (*s).bump = 0;
+                (*s).nfree = 0;
             }
-            prev = s as usize;
-            s = (*s).next_free;
-        }
-    }
-    spin_unlock(l);
-    if found != 0 {
-        let s = found as *mut Span;
-        unsafe {
             (*s).noscan = noscan;
             stb((*s).bits as usize, 1);
             if MARKING { stb((*s).bits as usize + 1, 1); }
-            memset((*s).start as *mut u8, 0, (*s).bytes);
             add_allocated((*s).bytes);
             return (*s).start;
         }
@@ -834,9 +937,16 @@ fn collect_locked() {
     sweep();
     crate::rt::sched::start_the_world();
     COLLECTING = false;
+    LAST_GC = crate::rt::native::monotonic_nanos();
+    scavenge(SCAV_GOAL);
 }
 
+/// When the last collection ended (monotonic nanoseconds; sysmon forces
+/// one when none ran for two minutes).
+pub static mut LAST_GC: u64 = 0;
+
 fn sweep() {
+    clear_lists();
     let mut live = 0usize;
     let mut s = ALL as *mut Span;
     while s as usize != 0 {
@@ -846,13 +956,15 @@ fn sweep() {
     LIVE = live;
     ALLOCATED = 0;
     NEXT_GC = goal(live);
+    SCAV_GOAL = heap_goal();
 }
 
 // Frees the unmarked objects of s, clears its marks and puts it on its
-// free list if it has room; returns its live bytes.
+// free list if it has room (the dead list if it has no object); returns
+// its live bytes.
 fn sweep_span(s: *mut Span) -> usize {
-    let (live, free) = sweep_bits(s);
-    if free { put_free(s); }
+    let (live, room) = sweep_bits(s);
+    if room == DEAD { put_dead(s); } else if room == ROOM { put_free(s); }
     live
 }
 
@@ -867,20 +979,63 @@ fn put_free(s: *mut Span) {
     }
 }
 
+// Puts dead span s on the dead list (released ones on theirs; its list's
+// lock held, or the world stopped).
+fn put_dead(s: *mut Span) {
+    unsafe {
+        if (*s).in_free { return; }
+        if (*s).released {
+            (*s).next_free = REL as *mut Span;
+            REL = s as usize;
+        } else {
+            (*s).next_free = FREE[NCLASS * 2] as *mut Span;
+            FREE[NCLASS * 2] = s as usize;
+        }
+        (*s).in_free = true;
+    }
+}
+
+// Empties every free list (the world is stopped): each span is put back
+// as it is swept.
+fn clear_lists() {
+    let mut i = 0;
+    while i <= NCLASS * 2 {
+        FREE[i] = 0;
+        i += 1;
+    }
+    REL = 0;
+    let mut s = ALL as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            (*s).in_free = false;
+            s = (*s).next_all;
+        }
+    }
+}
+
+// What a sweep leaves of a span: no free object, some, none allocated.
+const FULL: usize = 0;
+const ROOM: usize = 1;
+const DEAD: usize = 2;
+
 // Frees the unmarked objects of s and clears its marks (s is the caller's
-// alone); its live bytes, and whether it has room now.
-fn sweep_bits(s: *mut Span) -> (usize, bool) {
+// alone); its live bytes, and whether it has room now (FULL, ROOM, DEAD).
+fn sweep_bits(s: *mut Span) -> (usize, usize) {
     let mut live = 0usize;
-    let mut room = false;
+    let mut room = FULL;
     unsafe {
         let n = (*s).nelems;
         let bits = (*s).bits as usize;
+        // (Its pages are not touched: they stay released.)
+        if (*s).released { return (0, DEAD); }
         if (*s).list == NCLASS * 2 {
             if ldb(bits) != 0 && ldb(bits + 1) == 0 {
                 stb(bits, 0);
-                room = true;
+                room = DEAD;
             } else if ldb(bits) != 0 {
                 live += (*s).bytes;
+            } else {
+                room = DEAD;
             }
             stb(bits + 1, 0);
         } else {
@@ -909,7 +1064,7 @@ fn sweep_bits(s: *mut Span) -> (usize, bool) {
             (*s).bump = 0;
             (*s).nfree = nfree;
             live += (n - nfree) * (*s).elem;
-            room = nfree > 0;
+            room = if nfree == n { DEAD } else if nfree > 0 { ROOM } else { FULL };
         }
     }
     (live, room)
@@ -927,18 +1082,7 @@ static mut ALLOC_AT_START: usize = 0;
 
 // Lets every span be swept again (the world is stopped).
 fn begin_lazy_sweep() {
-    let mut i = 0;
-    while i <= NCLASS * 2 {
-        FREE[i] = 0;
-        i += 1;
-    }
-    let mut s = ALL as *mut Span;
-    while s as usize != 0 {
-        unsafe {
-            (*s).in_free = false;
-            s = (*s).next_all;
-        }
-    }
+    clear_lists();
     UNSWEPT = ALL;
 }
 
@@ -959,10 +1103,15 @@ fn sweep_some(n: usize) -> bool {
         // Swept unlocked (claimed: no one else has it); the list lock only
         // to put it on its free list.
         let (_, room) = sweep_bits(s);
-        if room {
+        if room == ROOM {
             let l = list_lk(unsafe { (*s).list });
             spin_lock(l);
             put_free(s);
+            spin_unlock(l);
+        } else if room == DEAD {
+            let l = list_lk(NCLASS * 2);
+            spin_lock(l);
+            put_dead(s);
             spin_unlock(l);
         }
         crate::rt::sched::preempt_on();
@@ -987,13 +1136,83 @@ fn sweep_for(list: usize) -> bool {
     false
 }
 
-// The sweeper G.
+// The sweeper G: then returns what the heap does not need to the system.
 fn sweeper() {
     loop {
-        if !sweep_some(64) { return; }
+        if !sweep_some(64) { break; }
         crate::rt::yield_now();
     }
+    scavenge(SCAV_GOAL);
 }
+
+// --- Returning memory to the system ------------------------------------------
+//
+// As Go's scavenger: once a cycle's sweep is done, the pages of dead spans
+// go back to the system until the heap's pages in use are at most the
+// heap goal (what survived plus what may be allocated before the next
+// cycle) and 10%. A program that stops allocating gets a collection every
+// two minutes (sched's sysmon), so its memory goes back too.
+
+// The pages to keep (set when a cycle ends).
+static mut SCAV_GOAL: usize = 0;
+
+// What survived the last cycle and may be allocated before the next.
+fn heap_goal() -> usize { (LIVE + NEXT_GC) / 10 * 11 }
+
+// The arena's bytes in use (made and not returned).
+fn heap_in_use() -> usize {
+    if ARENA == 0 { return 0; }
+    ARENA_NEXT - ARENA - crate::rt::atomic_load(&mut RELEASED as *mut usize)
+}
+
+// Releases dead spans until the heap's pages in use are at most goal.
+fn scavenge(goal: usize) {
+    loop {
+        if heap_in_use() <= goal { return; }
+        crate::rt::sched::preempt_off();
+        let l = list_lk(NCLASS * 2);
+        spin_lock(l);
+        let s = FREE[NCLASS * 2] as *mut Span;
+        if s as usize != 0 {
+            unsafe {
+                FREE[NCLASS * 2] = (*s).next_free as usize;
+                (*s).in_free = false;
+            }
+        }
+        spin_unlock(l);
+        if s as usize == 0 {
+            crate::rt::sched::preempt_on();
+            return;
+        }
+        unsafe {
+            release_pages((*s).start, (*s).bytes);
+            (*s).released = true;
+            // Zero when used again: its objects come from the bump pointer.
+            (*s).freelist = 0;
+            if (*s).list != NCLASS * 2 {
+                (*s).bump = (*s).start;
+                (*s).nfree = (*s).nelems;
+            }
+            crate::rt::atomic_add(&mut RELEASED as *mut usize, (*s).bytes);
+        }
+        spin_lock(l);
+        put_dead(s);
+        spin_unlock(l);
+        crate::rt::sched::preempt_on();
+    }
+}
+
+/// Runs a collection and returns every unused page to the system (as Go's
+/// debug.FreeOSMemory).
+pub fn free_os_memory() {
+    collect();
+    finish_sweep();
+    scavenge(0);
+}
+
+/// The heap's bytes in use (taken from the system and not returned) and
+/// returned (as Go's HeapSys - HeapReleased and HeapReleased).
+pub fn heap_bytes() -> (usize, usize) { (heap_in_use(), crate::rt::atomic_load(&mut RELEASED as *mut usize)) }
 
 // Bytes marked by write barriers (the markers count on their stacks).
 static mut MARKED_SHARED: usize = 0;
@@ -1094,9 +1313,12 @@ fn step_concurrent() -> bool {
     true
 }
 
+// A full cycle (as Go's runtime.GC: one running is finished first, its
+// roots marked before what died since).
 fn full_concurrent() -> bool {
     if !concurrent_on() { return false; }
-    if !CYCLE { start_cycle(); }
+    if CYCLE { finish_cycle(); }
+    start_cycle();
     finish_cycle();
     true
 }
@@ -1178,6 +1400,8 @@ fn finish_cycle() {
     LIVE = live;
     ALLOCATED = 0;
     NEXT_GC = goal(live);
+    SCAV_GOAL = heap_goal();
+    LAST_GC = crate::rt::native::monotonic_nanos();
     begin_lazy_sweep();
     crate::rt::sched::start_the_world();
     COLLECTING = false;
