@@ -120,6 +120,13 @@ pub struct G {
     // The M running it (0: none), taken atomically before an M switches
     // to it (debugging double scheduling).
     running_on: usize,
+    // Set by sysmon when the G has run for a time slice: it yields at its
+    // next check (a prologue's or a loop's; see morestack).
+    preempt: usize,
+    // While it yields inside morestack: the frame record above morestack's
+    // stub, where a collector's scan turns precise (as for a G stopped
+    // there; 0: not yielding there).
+    ms_fp: usize,
 }
 
 // G.sys: running navi code; blocked in C (a system call or waiting for the
@@ -301,7 +308,7 @@ pub fn scan_other_stacks() {
     while g as usize != 0 {
         unsafe {
             if (*g).status != DEAD && !(*g).is_g0 && g as usize != current() as usize {
-                scan_stack((*g).sp, (*g).fp, (*g).stack_hi);
+                scan_stack((*g).sp, if (*g).ms_fp != 0 { (*g).ms_fp } else { (*g).fp }, (*g).stack_hi);
                 let r = &(*g).regs as *const [usize; 10] as usize;
                 crate::rt::gc::scan_range(r, r + 80);
             }
@@ -932,7 +939,15 @@ struct M {
     retaken: usize,
     mon_g: usize,
     mon_seq: usize,
+    // Counts the Gs it starts running; what sysmon saw running last (the
+    // count and when).
+    run_seq: usize,
+    mon_run_seq: usize,
+    mon_run_t: usize,
 }
+
+// A G running this long is asked to yield (as Go's forcePreemptNS).
+const TIME_SLICE: usize = 10000000;
 
 // The runtime lock (pthread mutex) and the condition idle Ms wait on.
 static mut MU: usize = 0;
@@ -1948,10 +1963,26 @@ fn sysmon_loop(me: *mut M) -> ! {
                     }
                 } else {
                     (*m).mon_g = 0;
+                    // A G running for a time slice is asked to yield at its
+                    // next check: poisoning its limit takes it to morestack.
+                    let seq = crate::rt::atomic_load(&mut (*m).run_seq as *mut usize);
+                    let now = crate::rt::native::monotonic_nanos() as usize;
+                    if g as usize != 0 && (*m).mon_run_seq == seq {
+                        // (Again each look: start_the_world or morestack may
+                        // have restored the limit since.)
+                        if now - (*m).mon_run_t >= TIME_SLICE && !(*g).is_g0 && (*g).cb_prev as usize == 0 {
+                            (*g).preempt = 1;
+                            crate::rt::atomic_store(&mut (*g).guard as *mut usize, POISON);
+                        }
+                    } else {
+                        (*m).mon_run_seq = seq;
+                        (*m).mon_run_t = now;
+                    }
                 }
                 m = (*m).next;
             }
         }
+        // (At most 10 ms: a time slice.)
         delay = if blocked { 20 } else if delay < 10000 { delay * 2 } else { 10000 };
     }
 }
@@ -2012,6 +2043,7 @@ fn mloop() -> ! {
             gq_push(g);
             continue;
         }
+        crate::rt::atomic_add(unsafe { &mut (*m).run_seq as *mut usize }, 1);
         if !crate::rt::atomic_cas(unsafe { &mut (*g).running_on as *mut usize }, 0, m as usize) {
             crate::rt::native::put(2, "G ");
             crate::rt::native::put_u64(2, g as u64);
@@ -2238,12 +2270,38 @@ pub fn morestack() -> usize {
             (*g).sp = if bsp >= olo && bsp < ohi { bsp.wrapping_add(delta) } else { bsp };
             (*g).fp = if bfp >= olo && bfp < ohi { bfp.wrapping_add(delta) } else { bfp };
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_BLOCKED);
+        } else if (*g).preempt != 0 && !(*g).is_g0 && (*g).nopreempt == 0 && (*g).lock_depth == 0 && (*g).cb_prev as usize == 0 && !owner
+            && (*g).status == RUNNING && delta == 0 && preemptible(poll, (*g).entry_sp) {
+            // A time slice is over: other Gs run (as Go's preemption at a
+            // prologue). Parked here, the G is scanned as one stopped here:
+            // conservatively up to the record above the stub, then by the
+            // maps. (Not after moving the stack: morestack's frames are on
+            // the old one until the stub returns; a later check yields.)
+            (*g).preempt = 0;
+            (*g).ms_fp = (*g).entry_sp + 256 + 16;
+            yield_now();
+            (*g).ms_fp = 0;
+        } else {
+            (*g).preempt = 0;
         }
         delta
     }
 }
 
 const POISON: usize = 18446744073709551615;
+
+// Whether the check that entered morestack is in code that may yield: a
+// loop's (none in the runtime), or the prologue of a function outside the
+// runtime (as Go, which does not preempt runtime code: it may be between
+// registering a G as waiting and parking it). The stub's return address
+// (above the 256 bytes it saved) is in that function; one without a map
+// is the runtime's own.
+fn preemptible(poll: bool, entry_sp: usize) -> bool {
+    if poll { return true; }
+    let ret = unsafe { *((entry_sp + 256 + 8) as *const usize) };
+    let (m, _) = find_map(ret);
+    m != 0 && unsafe { *((m + 8) as *const usize) } & 1 == 0
+}
 
 /// Moves the running G's stack (from its stub's SP up) to a new one with
 /// room for what the function entering morestack needs; returns how far it
