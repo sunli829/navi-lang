@@ -1,5 +1,8 @@
 //! The garbage collector (navi addition; Rust has no GC). See spec/std-diff.md.
 
+use crate::fmt;
+use crate::marker::PhantomData;
+
 /// Collector statistics.
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
@@ -53,4 +56,68 @@ pub fn stats() -> Stats {
     let (heap_bytes, released_bytes) = crate::rt::gc::heap_bytes();
     let stack_bytes = crate::rt::sched::stack_bytes();
     Stats { collections, live_bytes, allocated_bytes, heap_bytes, released_bytes, stack_bytes }
+}
+
+// A weak handle: the address it was made from, cleared when that object
+// dies (the collector never scans it).
+struct Handle { addr: usize }
+
+/// A weak reference (as Go's `weak.Pointer`; Rust's `rc::Weak` without
+/// the `Rc`): it does not keep its object alive, and `upgrade` gives the
+/// object back while something else does. Weak references made from the
+/// same reference are equal.
+pub struct Weak<T> {
+    handle: &Handle,
+    t: PhantomData<T>,
+}
+
+impl<T> Weak<T> {
+    /// A weak reference to what `value` points to (an object of the heap;
+    /// one of a static never dies).
+    pub fn new(value: &T) -> Weak<T> {
+        let h = crate::rt::gc::weak_handle(value as *const T as usize);
+        Weak { handle: unsafe { &*(h as *const Handle) }, t: PhantomData }
+    }
+
+    /// The object, unless it died (it lives on from here).
+    pub fn upgrade(&self) -> Option<&T> {
+        let a = crate::rt::gc::weak_get(self.handle as *const Handle as usize);
+        if a == 0 { None } else { Some(unsafe { &*(a as *const T) }) }
+    }
+
+    // The same reference, its type erased (std::unique's table).
+    pub(crate) fn erase(&self) -> Weak<u8> { Weak { handle: self.handle, t: PhantomData } }
+
+    /// Whether two weak references were made from the same reference.
+    pub fn ptr_eq(&self, other: &Weak<T>) -> bool { crate::ptr::eq(self.handle, other.handle) }
+}
+
+impl<T> Clone for Weak<T> {
+    fn clone(&self) -> Weak<T> { Weak { handle: self.handle, t: PhantomData } }
+}
+
+impl<T> PartialEq for Weak<T> {
+    fn eq(&self, other: &Weak<T>) -> bool { self.ptr_eq(other) }
+}
+
+impl<T> fmt::Debug for Weak<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("(Weak)") }
+}
+
+/// A registered cleanup (`add_cleanup`).
+pub struct Cleanup { id: usize }
+
+impl Cleanup {
+    /// Cancels the cleanup if it has not been queued to run.
+    pub fn stop(&self) { crate::rt::gc::stop_cleanup(self.id); }
+}
+
+/// Calls `cleanup(arg)` some time after the object `value` points to has
+/// become unreachable (as Go's `runtime.AddCleanup`), on a thread that
+/// runs the cleanups one after another. `arg` and `cleanup` must not
+/// reach the object (it would never become unreachable). Not run if the
+/// program exits first.
+pub fn add_cleanup<T, A>(value: &T, cleanup: fn(A), arg: A) -> Cleanup {
+    let run: fn() = || cleanup(arg);
+    Cleanup { id: crate::rt::gc::add_cleanup(value as *const T as usize, run) }
 }

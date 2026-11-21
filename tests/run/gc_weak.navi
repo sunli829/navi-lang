@@ -1,0 +1,107 @@
+// Weak references (as Go's weak.Pointer), cleanups (runtime.AddCleanup)
+// and canonical values (the unique package).
+
+use std::gc::{self, Weak};
+use std::sync::mpmc::channel;
+use std::unique::Handle;
+
+struct Obj { v: i64, pad: [i64; 4] }
+
+// n objects made and dropped on a thread of their own, and weak
+// references to them. (Stacks are scanned conservatively in std's frames:
+// a stale copy of an address can keep an object a while, so the tests
+// count most, not all.)
+fn weaks_to_garbage(n: i64) -> Vec<Weak<Obj>> {
+    std::thread::spawn(|| {
+        let mut ws = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let o = &Obj { v: i, pad: [0; 4] };
+            ws.push(Weak::new(o));
+            i += 1;
+        }
+        assert_eq(ws[3].upgrade().unwrap().v, 3);
+        ws
+    }).join().unwrap()
+}
+
+fn alive(ws: &Vec<Weak<Obj>>) -> usize {
+    let mut n = 0;
+    for w in ws.iter() { if w.upgrade().is_some() { n += 1; } }
+    n
+}
+
+#[test]
+fn a_weak_reference_follows_its_object() {
+    let keep = &Obj { v: 42, pad: [1; 4] };
+    let w = Weak::new(keep);
+    gc::collect();
+    gc::collect();
+    assert_eq(w.upgrade().unwrap().v, 42);
+    assert(w == Weak::new(keep));
+    assert(w.ptr_eq(&w.clone()));
+    let dead = weaks_to_garbage(100);
+    gc::collect();
+    gc::collect();
+    assert_msg(alive(&dead) < 10, `${alive(&dead)} of 100 alive`);
+    assert_eq(keep.v, 42);
+}
+
+#[test]
+fn a_cleanup_runs_after_its_object_dies() {
+    let (tx, rx) = channel::<i64>();
+    let made = std::thread::spawn(|| {
+        let mut i = 0;
+        while i < 100 {
+            let o = &Obj { v: i, pad: [0; 4] };
+            let c = gc::add_cleanup(o, |t: std::sync::mpmc::Sender<i64>| { t.send(1).unwrap(); }, tx.clone());
+            // Every tenth is stopped: never runs.
+            if i % 10 == 0 { c.stop(); }
+            i += 1;
+        }
+        i
+    }).join().unwrap();
+    assert_eq(made, 100);
+    let mut ran = 0;
+    let mut tries = 0;
+    while ran < 85 && tries < 100 {
+        gc::collect();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        while let Ok(x) = rx.try_recv() { ran += x; }
+        tries += 1;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    while let Ok(x) = rx.try_recv() { ran += x; }
+    assert_msg(ran >= 85 && ran <= 90, `${ran} cleanups ran`);
+}
+
+#[test]
+fn equal_values_get_one_handle() {
+    let a = Handle::new("text/html".to_string());
+    let b = Handle::new(`text/${"html"}`.to_string());
+    let c = Handle::new("text/plain".to_string());
+    assert(a == b);
+    assert(a != c);
+    assert_eq(a.value().as_str(), "text/html");
+    assert_eq(`${a:?}`.to_string(), "Handle(\"text/html\")");
+    let n1 = Handle::new(5i64);
+    let n2 = Handle::new(5i64);
+    assert(n1 == n2);
+    // Handles from many threads at once.
+    let mut hs = Vec::new();
+    let mut t = 0;
+    while t < 8 {
+        hs.push(std::thread::spawn(|| {
+            let mut i = 0;
+            while i < 1000 {
+                let h = Handle::new(`k${i % 50}`.to_string());
+                assert_eq(h.value().len() >= 2, true);
+                i += 1;
+            }
+            Handle::new("k7".to_string())
+        }));
+        t += 1;
+    }
+    let first = Handle::new("k7".to_string());
+    for h in hs { assert(h.join().unwrap() == first); }
+}

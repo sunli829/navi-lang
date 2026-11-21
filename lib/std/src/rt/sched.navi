@@ -454,6 +454,50 @@ static mut FGC_LK: usize = 0;
 // Set (under FGC_LK) while it waits.
 static mut FGC_PARKED: bool = false;
 
+// The G that runs the cleanups (std::gc::add_cleanup), one after
+// another (as Go's cleanup goroutine), started with the first.
+static mut CL_ON: bool = false;
+static mut CL_G: usize = 0;
+static mut CL_LK: usize = 0;
+static mut CL_PARKED: bool = false;
+static mut CL_WAKE: bool = false;
+
+/// Starts the cleanup G (once).
+pub fn start_helpers() {
+    if CL_ON { return; }
+    lock();
+    if !CL_ON {
+        CL_ON = true;
+        go(|| { cleanup_loop(); });
+    }
+    unlock();
+}
+
+fn cleanup_loop() {
+    loop {
+        while let Some(f) = crate::rt::gc::next_cleanup() { f(); }
+        obj_lock(&mut CL_LK as *mut usize);
+        CL_G = current() as usize;
+        if !CL_WAKE {
+            CL_PARKED = true;
+            park_until(&mut CL_LK as *mut usize, 0);
+        }
+        CL_WAKE = false;
+        obj_unlock(&mut CL_LK as *mut usize);
+    }
+}
+
+/// After a mark queued cleanups (on a G): readies the cleanup G.
+pub fn wake_cleanups() {
+    obj_lock(&mut CL_LK as *mut usize);
+    CL_WAKE = true;
+    if CL_PARKED {
+        CL_PARKED = false;
+        ready(CL_G as *mut G);
+    }
+    obj_unlock(&mut CL_LK as *mut usize);
+}
+
 fn forcegc_loop() {
     loop {
         obj_lock(&mut FGC_LK as *mut usize);
@@ -1799,7 +1843,7 @@ fn deadlock() -> ! {
     let mut g = ALL as *mut G;
     while g as usize != 0 {
         unsafe {
-            if (*g).status != DEAD && !(*g).is_g0 && g as usize != FGC_G {
+            if (*g).status != DEAD && !(*g).is_g0 && g as usize != FGC_G && g as usize != CL_G {
                 crate::rt::native::put(2, "\ngoroutine ");
                 crate::rt::native::put_u64(2, (*g).tid);
                 crate::rt::native::put(2, if (*g).status == WAITING { " [waiting]:\n" } else { " [runnable]:\n" });
