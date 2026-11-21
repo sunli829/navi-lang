@@ -1,0 +1,71 @@
+// A thread's stack grows as it recurses and shrinks by half at each
+// collection that finds most of it unused (as Go's); the stacks of ended
+// threads go back to the system.
+
+use std::gc;
+use std::sync::mpmc::sync_channel;
+
+fn deep(n: i64) -> i64 {
+    let pad = [n; 16];
+    if n == 0 { 0 } else { deep(n - 1) + pad[(n % 16) as usize] - n + 1 }
+}
+
+#[test]
+fn a_thread_stack_shrinks_after_deep_recursion() {
+    let (to, from_main) = sync_channel::<i32>(0);
+    let (to_main, back) = sync_channel::<i64>(0);
+    let h = std::thread::spawn(|| {
+        // Grows the stack to some MiB, then waits shallow: each message is
+        // a call, whose check shrinks the stack if a collection asked.
+        to_main.send(deep(100000)).unwrap();
+        while let Ok(x) = from_main.recv() {
+            if x < 0 { break; }
+            to_main.send(deep(10)).unwrap();
+        }
+    });
+    assert_eq(back.recv().unwrap(), 100000);
+    let grown = gc::stats().stack_bytes;
+    assert_msg(grown > 8 << 20, `stacks ${grown}`);
+    let mut i = 0;
+    while i < 12 {
+        gc::collect();
+        to.send(1).unwrap();
+        assert_eq(back.recv().unwrap(), 10);
+        i += 1;
+    }
+    let shrunk = gc::stats().stack_bytes;
+    assert_msg(shrunk < 2 << 20, `stacks ${shrunk}, grown ${grown}`);
+    to.send(-1).unwrap();
+    h.join().unwrap();
+}
+
+#[test]
+fn ended_threads_return_their_stacks() {
+    // 500 threads alive at once, then ended: past the 64 kept for reuse,
+    // their stacks go back after a collection.
+    let (go, wait) = sync_channel::<i32>(500);
+    let mut hs = Vec::new();
+    let mut i = 0;
+    while i < 500 {
+        hs.push(std::thread::spawn(|| { wait.recv().unwrap(); deep(10) }));
+        i += 1;
+    }
+    let all = gc::stats().stack_bytes;
+    assert_msg(all >= 500 * 65536, `stacks ${all}`);
+    i = 0;
+    while i < 500 {
+        go.send(1).unwrap();
+        i += 1;
+    }
+    for h in hs { assert_eq(h.join().unwrap(), 10); }
+    gc::collect();
+    // (The sweeper G frees them after the cycle.)
+    let mut s = gc::stats().stack_bytes;
+    let mut tries = 0;
+    while s >= 100 * 65536 && tries < 100 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s = gc::stats().stack_bytes;
+        tries += 1;
+    }
+    assert_msg(s < 100 * 65536, `stacks ${s} of ${all}`);
+}

@@ -133,6 +133,10 @@ pub struct G {
     // How many object locks it holds (as Go's m.locks): it does not yield
     // for a time slice while it holds one.
     locks: usize,
+    // Set by a collection that found it using under a quarter of its
+    // stack: its next prologue's check moves it to one half as large (as
+    // Go's shrinkstack; see morestack).
+    shrink: usize,
 }
 
 // G.sys: running navi code; blocked in C (a system call or waiting for the
@@ -376,10 +380,13 @@ pub fn go(f: fn()) {
     let mut g = FREE_GS as *mut G;
     if g as usize != 0 {
         FREE_GS = unsafe { (*g).next } as usize;
+        NFREE_GS -= 1;
         unsafe {
-            if (*g).old_size != 0 {
-                release_os((*g).old_stack, (*g).old_size);
-                (*g).old_size = 0;
+            if (*g).stack_hi == 0 {
+                // (Its stack was returned: see exit_g and free_stacks.)
+                let stack = reserve(STACK);
+                (*g).stack_lo = stack;
+                (*g).stack_hi = stack + STACK;
             }
         }
     } else {
@@ -406,6 +413,7 @@ pub fn go(f: fn()) {
         (*g).sys = SYS_RUNNING;
         (*g).poisoned = false;
         (*g).release_n = 0;
+        (*g).shrink = 0;
         NEXT_TID += 1;
         (*g).tid = NEXT_TID;
     }
@@ -900,6 +908,7 @@ extern "C" {
 #[nonblocking]
 extern "C" {
     fn calloc(n: usize, size: usize) -> *mut u8;
+    fn realloc(p: *mut u8, size: usize) -> *mut u8;
     fn free(p: *mut u8);
 }
 
@@ -1756,6 +1765,104 @@ fn deadlock() -> ! {
     crate::rt::native::exit(2)
 }
 
+// A G that ended (on its M's scheduler record): its stack goes back to the
+// system unless it has the first size (as Go's gfput), then the G is kept
+// for go to reuse.
+fn exit_g(g: *mut G) {
+    unsafe {
+        if (*g).old_size != 0 {
+            release_os((*g).old_stack, (*g).old_size);
+            (*g).old_size = 0;
+        }
+        if (*g).stack_hi - (*g).stack_lo != STACK {
+            release_os((*g).stack_lo, (*g).stack_hi - (*g).stack_lo);
+            (*g).stack_lo = 0;
+            (*g).stack_hi = 0;
+        }
+    }
+    lock();
+    unsafe { (*g).next = FREE_GS as *mut G; }
+    FREE_GS = g as usize;
+    NFREE_GS += 1;
+    unlock();
+}
+
+// How many Gs are on FREE_GS; how many of them keep their stacks after a
+// collection (see free_stacks).
+static mut NFREE_GS: usize = 0;
+const KEEP_STACKS: usize = 64;
+
+/// After a collection (on a G): the stacks of the ended Gs past the first
+/// KEEP_STACKS go back to the system (as Go frees the stacks of its global
+/// list of dead goroutines at each cycle); go makes new ones as needed.
+pub fn free_stacks() {
+    let mut n = 0usize;
+    let mut a = 0usize;
+    lock();
+    let mut g = FREE_GS as *mut G;
+    let mut k = 0usize;
+    while g as usize != 0 {
+        unsafe {
+            if k >= KEEP_STACKS && (*g).stack_hi != 0 {
+                if n % 512 == 0 {
+                    a = realloc(a as *mut u8, (n + 512) * 16) as usize;
+                }
+                *((a + 16 * n) as *mut usize) = (*g).stack_lo;
+                *((a + 16 * n + 8) as *mut usize) = (*g).stack_hi - (*g).stack_lo;
+                (*g).stack_lo = 0;
+                (*g).stack_hi = 0;
+                n += 1;
+            }
+            g = (*g).next;
+        }
+        k += 1;
+    }
+    unlock();
+    let mut i = 0;
+    while i < n {
+        unsafe { release_os(*((a + 16 * i) as *const usize), *((a + 16 * i + 8) as *const usize)); }
+        i += 1;
+    }
+    if a != 0 { unsafe { free(a as *mut u8); } }
+}
+
+/// The bytes of the spawned Gs' stacks (those kept by ended Gs included;
+/// not the main G's, which is fixed).
+pub fn stack_bytes() -> usize {
+    let mut n = 0usize;
+    let mut g = ALL as *mut G;
+    while g as usize != 0 {
+        unsafe {
+            if !(*g).main { n += (*g).stack_hi - (*g).stack_lo + (*g).old_size; }
+            g = (*g).all_next;
+        }
+    }
+    n
+}
+
+/// With the world stopped at the end of a cycle: asks each spawned G
+/// using under a quarter of its grown stack to move to one half as large
+/// at its next prologue's check (its limit is poisoned; start_the_world
+/// keeps it so for the Gs on an M).
+pub fn mark_shrinks() {
+    let me = current();
+    let mut g = ALL as *mut G;
+    while g as usize != 0 {
+        unsafe {
+            if (*g).status != DEAD && !(*g).main && !(*g).is_g0 && (*g).cb_stack == 0 && g as usize != me as usize
+                && (*g).stack_hi != 0 && (*g).reserve_lo == 0 {
+                let size = (*g).stack_hi - (*g).stack_lo;
+                let sp = (*g).sp;
+                if size > STACK && sp >= (*g).stack_lo && sp < (*g).stack_hi && (*g).stack_hi - sp < size / 4 {
+                    (*g).shrink = 1;
+                    crate::rt::atomic_store(&mut (*g).guard as *mut usize, POISON);
+                }
+            }
+            g = (*g).all_next;
+        }
+    }
+}
+
 // What m's scheduler record does once the G that switched to it stopped.
 fn do_after(m: *mut M) {
     unsafe {
@@ -1763,12 +1870,7 @@ fn do_after(m: *mut M) {
         match (*m).after {
             AFTER_PARK => release_locks(g),
             AFTER_YIELD => gq_push(g),
-            AFTER_EXIT => {
-                lock();
-                (*g).next = FREE_GS as *mut G;
-                FREE_GS = g as usize;
-                unlock();
-            }
+            AFTER_EXIT => exit_g(g),
             _ => {}
         }
         (*m).after = AFTER_NONE;
@@ -2383,7 +2485,12 @@ pub fn morestack() -> usize {
             if (*g).main || (*g).is_g0 { crate::rt::native::fatal("stack overflow"); }
             if owner { crate::rt::native::fatal("the collector ran out of stack while the world was stopped"); }
             delta = grow(g);
+        } else if (*g).shrink != 0 && !poll && !was_blocked && !owner && !(*g).main && !(*g).is_g0 && (*g).cb_stack == 0 {
+            // A collection found most of the stack unused (a loop's check
+            // leaves it for a prologue's; the next collection asks again).
+            delta = shrink(g);
         }
+        if !poll { (*g).shrink = 0; }
         let mut limit = (*g).stack_lo + RED_ZONE;
         if stress {
             let near = (*g).entry_sp.wrapping_add(delta) - (*g).need - 256;
@@ -2480,6 +2587,8 @@ fn grow(g: *mut G) -> usize {
         }
         let used = hi - sp;
         let mut size = hi - lo;
+        // (NAVI_STACKMOVE: a move the collector asked for shrinks too.)
+        if STACKMOVE && (*g).shrink != 0 && size / 2 >= STACK && used + (*g).need + RED_ZONE + 4096 <= size / 4 { return move_stack(g, size / 2); }
         if !(STACKMOVE && size >= used + (*g).need + RED_ZONE + 4096) {
             loop {
                 size = size * 2;
@@ -2487,6 +2596,29 @@ fn grow(g: *mut G) -> usize {
                 if size >= used + (*g).need + RED_ZONE + 4096 { break; }
             }
         }
+        move_stack(g, size)
+    }
+}
+
+// Moves the running G's stack to one half as large if what it uses (and
+// what the entering function needs) takes at most half of that; how far.
+fn shrink(g: *mut G) -> usize {
+    unsafe {
+        let size = ((*g).stack_hi - (*g).stack_lo) / 2;
+        let used = (*g).stack_hi - (*g).entry_sp;
+        if size < STACK || (*g).entry_sp > (*g).stack_hi || used + (*g).need + RED_ZONE + 4096 > size / 2 { return 0; }
+        move_stack(g, size)
+    }
+}
+
+// Moves the running G's stack (from its stub's SP up) to a new one of size
+// bytes; how far it moved.
+fn move_stack(g: *mut G, size: usize) -> usize {
+    unsafe {
+        let lo = (*g).stack_lo;
+        let hi = (*g).stack_hi;
+        let sp = (*g).entry_sp;
+        let used = hi - sp;
         let nlo = reserve(size);
         let nhi = nlo + size;
         let delta = nhi.wrapping_sub(hi);
@@ -2848,7 +2980,7 @@ pub fn start_the_world() {
             if g as usize != 0 && g as usize != me as usize {
                 if (*g).poisoned {
                     (*g).poisoned = false;
-                    crate::rt::atomic_store(&mut (*g).guard as *mut usize, (*g).stack_lo + RED_ZONE);
+                    crate::rt::atomic_store(&mut (*g).guard as *mut usize, if (*g).shrink != 0 { POISON } else { (*g).stack_lo + RED_ZONE });
                 }
                 crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_CLAIMED, SYS_BLOCKED);
             }
