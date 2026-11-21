@@ -375,7 +375,14 @@ pub fn scan_other_stacks() {
 }
 
 /// Starts a new G running f.
-pub fn go(f: fn()) {
+pub fn go(f: fn()) { go_on(f, false); }
+
+/// Starts a mark worker G running f: Ms run it before any other G at their
+/// next scheduling point (as Go's dedicated mark workers; see
+/// find_runnable).
+pub fn go_marker(f: fn()) { go_on(f, true); }
+
+fn go_on(f: fn(), marker: bool) {
     lock();
     let mut g = FREE_GS as *mut G;
     if g as usize != 0 {
@@ -418,7 +425,16 @@ pub fn go(f: fn()) {
         (*g).tid = NEXT_TID;
     }
     start_sysmon();
-    ready(g);
+    if marker {
+        unsafe { (*g).status = RUNNABLE; }
+        obj_lock(&mut MQ_LK as *mut usize);
+        unsafe { (*g).next = MQ as *mut G; }
+        MQ = g as usize;
+        obj_unlock(&mut MQ_LK as *mut usize);
+        wakep();
+    } else {
+        ready(g);
+    }
     unlock();
     if !FGC_ON {
         FGC_ON = true;
@@ -934,20 +950,26 @@ unsafe fn os_cond_signal(c: *mut u8) { pthread_cond_signal(c); }
 #[cfg(not(target_os = "windows"))]
 unsafe fn os_yield() { sched_yield(); }
 // Waits on c (m held) for at most ns nanoseconds.
+// (The timespec in C memory: a local whose address C gets would be a heap
+// cell, and this runs on scheduler records, which must not allocate.)
 #[cfg(target_os = "macos")]
 unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
-    let ts = [(ns / 1000000000) as i64, (ns % 1000000000) as i64];
-    pthread_cond_timedwait_relative_np(c, m, &ts as *const [i64; 2] as *const i64);
+    let ts = calloc(2, 8) as *mut i64;
+    *ts = (ns / 1000000000) as i64;
+    *ts.add(1) = (ns % 1000000000) as i64;
+    pthread_cond_timedwait_relative_np(c, m, ts as *const i64);
+    free(ts as *mut u8);
 }
 #[cfg(target_os = "linux")]
 unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
     // An absolute CLOCK_REALTIME deadline.
-    let mut ts = [0i64; 2];
-    clock_gettime(0, &mut ts as *mut [i64; 2] as *mut i64);
-    let t = (ts[1] as u64) + ns % 1000000000;
-    ts[0] = ts[0] + (ns / 1000000000) as i64 + (t / 1000000000) as i64;
-    ts[1] = (t % 1000000000) as i64;
-    pthread_cond_timedwait(c, m, &ts as *const [i64; 2] as *const i64);
+    let ts = calloc(2, 8) as *mut i64;
+    clock_gettime(0, ts);
+    let t = (*ts.add(1) as u64) + ns % 1000000000;
+    *ts = *ts + (ns / 1000000000) as i64 + (t / 1000000000) as i64;
+    *ts.add(1) = (t % 1000000000) as i64;
+    pthread_cond_timedwait(c, m, ts as *const i64);
+    free(ts as *mut u8);
 }
 #[cfg(not(target_os = "windows"))]
 fn os_ncpu() -> i64 { unsafe { sysconf(SC_NPROCESSORS_ONLN) } }
@@ -1408,6 +1430,40 @@ pub fn wait_ns(w: *mut WaitList, lk: *mut usize, ns: u64) -> bool {
 // list. A readied G wakes an idle M unless one is already looking for work.
 // The runtime lock is not used on these paths.
 
+// The mark workers waiting to run (linked by next, under MQ_LK).
+static mut MQ: usize = 0;
+static mut MQ_LK: usize = 0;
+
+fn mq_pop() -> *mut G {
+    if crate::rt::atomic_load(&mut MQ as *mut usize) == 0 { return 0 as *mut G; }
+    obj_lock(&mut MQ_LK as *mut usize);
+    let g = MQ as *mut G;
+    if g as usize != 0 { MQ = unsafe { (*g).next } as usize; }
+    obj_unlock(&mut MQ_LK as *mut usize);
+    g
+}
+
+/// With the world stopped to start a cycle: asks the Gs running on up to
+/// n other Ms to yield when the world starts again (if they stopped in
+/// the program's own code; see morestack), so that their Ms run the mark
+/// workers (as Go's Ps schedule its dedicated workers then).
+pub fn ask_yields(n: usize) {
+    let me = current();
+    let mut k = 0;
+    let mut m = MS as *mut M;
+    while m as usize != 0 && k < n {
+        unsafe {
+            let g = (*m).cur;
+            if g as usize != 0 && g as usize != me as usize && !(*g).is_g0 && (*g).cb_prev as usize == 0
+                && crate::rt::atomic_load(&mut (*g).sys as *mut usize) == SYS_STOPPED {
+                (*g).preempt = 1;
+                k += 1;
+            }
+            m = (*m).next;
+        }
+    }
+}
+
 static mut GQ_LK: usize = 0;
 static mut GQ_HEAD: usize = 0;
 static mut GQ_TAIL: usize = 0;
@@ -1632,6 +1688,7 @@ fn steal(me: *mut M) -> *mut G {
 // Whether any G is runnable (a look without locks).
 fn work_exists() -> bool {
     if crate::rt::atomic_load(&mut GQ_HEAD as *mut usize) != 0 { return true; }
+    if crate::rt::atomic_load(&mut MQ as *mut usize) != 0 { return true; }
     let mut v = MS as *mut M;
     while v as usize != 0 {
         unsafe {
@@ -1690,7 +1747,9 @@ fn find_runnable(m: *mut M) -> *mut G {
             obj_unlock(&mut IDLE_LK as *mut usize);
         }
         run_timers();
-        let mut g = local_pop(m);
+        let mut g = mq_pop();
+        if g as usize != 0 { return g; }
+        g = local_pop(m);
         if g as usize != 0 { return g; }
         g = gq_pop();
         if g as usize != 0 { return g; }
@@ -1770,6 +1829,19 @@ fn deadlock() -> ! {
 // for go to reuse.
 fn exit_g(g: *mut G) {
     unsafe {
+        // What it held goes (as Go's goexit clears the g): its record is a
+        // heap object scanned as any other, and the registers it saved last
+        // would keep objects alive (exit_current dropped its entry, on the
+        // G: this runs on the scheduler record, which must not allocate).
+        let mut i = 0;
+        while i < 10 {
+            (*g).regs[i] = 0;
+            i += 1;
+        }
+        (*g).catch = 0;
+        (*g).release = 0;
+        (*g).sp = 0;
+        (*g).fp = 0;
         if (*g).old_size != 0 {
             release_os((*g).old_stack, (*g).old_size);
             (*g).old_size = 0;
@@ -1824,6 +1896,14 @@ pub fn free_stacks() {
         i += 1;
     }
     if a != 0 { unsafe { free(a as *mut u8); } }
+}
+
+/// Whether the running G may do a mark assist: not on a scheduler record,
+/// nor holding the runtime lock or in preempt_off (it would keep a
+/// collector waiting).
+pub fn may_assist() -> bool {
+    let g = current();
+    g as usize != 0 && unsafe { !(*g).is_g0 && (*g).lock_depth == 0 && (*g).nopreempt == 0 && (*g).m != 0 }
 }
 
 /// The bytes of the spawned Gs' stacks (those kept by ended Gs included;

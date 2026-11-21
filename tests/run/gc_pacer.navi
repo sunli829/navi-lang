@@ -1,0 +1,104 @@
+// Pacing (as Go's): a cycle ends near the heap goal (what survived and as
+// much again), under a memory limit if one is set, also with the ratio
+// off (NAVI_GC=off, NAVI_MEMLIMIT as GOGC and GOMEMLIMIT).
+
+use std::env;
+use std::gc;
+use std::process::Command;
+
+struct Node { v: i64, next: Option<&Node> }
+
+// A list of n nodes (16 bytes each).
+fn list(n: i64) -> Option<&Node> {
+    let mut head: Option<&Node> = None;
+    let mut i = 0;
+    while i < n {
+        head = Some(&Node { v: i, next: head });
+        i += 1;
+    }
+    head
+}
+
+fn sum(mut p: Option<&Node>) -> i64 {
+    let mut t = 0;
+    while let Some(n) = p {
+        t += n.v;
+        p = n.next;
+    }
+    t
+}
+
+// Allocates about mb MiB of short-lived lists; the most heap seen.
+fn churn(mb: i64) -> usize {
+    let mut most = 0usize;
+    let mut i = 0;
+    while i < mb {
+        let l = list(65536);
+        assert_eq(sum(l), 2147450880);
+        let h = gc::stats().heap_bytes;
+        if h > most { most = h; }
+        i += 1;
+    }
+    most
+}
+
+#[test]
+fn the_heap_stays_near_its_goal() {
+    let keep = list(3000000); // 48 MiB
+    let before = gc::stats().collections;
+    let most = churn(1024);
+    let s = gc::stats();
+    assert(s.collections > before + 3);
+    // The goal: what survived (48 MiB, and what was allocated during the
+    // mark, counted live as Go does) and as much again, and the 10% the
+    // scavenger keeps.
+    let live = s.live_bytes;
+    assert_msg(most < live * 5 / 2 && most < 256 << 20, `most heap ${most >> 20} MiB, live ${live >> 20} MiB`);
+    assert_eq(sum(keep), 4499998500000);
+}
+
+#[test]
+fn a_memory_limit_bounds_the_heap() {
+    let old_limit = gc::set_memory_limit(80 << 20);
+    let old_percent = gc::set_percent(usize::MAX);
+    let keep = list(1000000); // 16 MiB
+    let before = gc::stats().collections;
+    // (What the last test left goes back after the first cycles.)
+    churn(128);
+    let most = churn(512);
+    let after = gc::stats().collections;
+    gc::set_memory_limit(old_limit);
+    gc::set_percent(old_percent);
+    assert_msg(after > before + 3, `collections ${after - before}`);
+    assert_msg(most < 96 << 20, `most heap ${most >> 20} MiB`);
+    assert_eq(sum(keep), 499999500000);
+}
+
+// This test binary again, running only the test named name, with the
+// variables set.
+fn child(name: &str, vars: &[(&str, &str)]) -> bool {
+    let mut c = Command::new(env::current_exe().unwrap().as_str());
+    c.arg(name).env("NAVI_PACER_CHILD", "1");
+    for (k, v) in vars.iter() { c.env(*k, *v); }
+    c.status().unwrap().success()
+}
+
+#[test]
+fn off_collects_only_at_the_limit() {
+    if env::var("NAVI_PACER_CHILD").is_ok() {
+        let gc_off = env::var("NAVI_GC").is_ok();
+        let limited = env::var("NAVI_MEMLIMIT").is_ok();
+        let most = churn(256);
+        let n = gc::stats().collections;
+        if limited {
+            assert_msg(n > 2, `collections ${n}`);
+            assert_msg(most < 80 << 20, `most heap ${most >> 20} MiB`);
+        } else if gc_off {
+            assert_eq(n, 0);
+            assert(most > 200 << 20);
+        }
+        return;
+    }
+    assert(child("off_collects_only_at_the_limit", &[("NAVI_GC", "off")]));
+    assert(child("off_collects_only_at_the_limit", &[("NAVI_GC", "off"), ("NAVI_MEMLIMIT", "64MiB")]));
+}

@@ -10,9 +10,13 @@
 //!   scanned word by word: any word that points into an allocated object,
 //!   including its interior, keeps it alive. Generated code keeps no values
 //!   in registers across calls, so every live pointer is in memory.
-//! - A collection starts when the bytes allocated since the last one
-//!   reach the bytes that survived it (at least 32 MiB), like GOGC=100;
-//!   std::gc::set_percent changes the ratio.
+//! - Pacing (as Go's pacer): the heap may grow by what survived the last
+//!   collection (at least 32 MiB; std::gc::set_percent changes the ratio,
+//!   NAVI_GC=percent|off as GOGC) before the next one is done, at most to
+//!   a memory limit if one is set (std::gc::set_memory_limit,
+//!   NAVI_MEMLIMIT as GOMEMLIMIT). A cycle starts early enough to end
+//!   there: the markers take a quarter of the threads, and a G allocating
+//!   while they mark scans in proportion (a mark assist).
 //!
 //! Span metadata, mark bits and the mark stack live outside the arena
 //! (libc calloc), so the collector itself never allocates GC memory.
@@ -109,7 +113,30 @@ static mut REL: usize = 0;
 // The bytes of the arena returned to the system (in dead spans).
 static mut RELEASED: usize = 0;
 static mut ALLOCATED: usize = 0;
+// What ALLOCATED starts a cycle at (between cycles), or makes the
+// allocating G finish it (during one).
 static mut NEXT_GC: usize = 0;
+// What ALLOCATED should be when a cycle's mark ends (the heap goal less
+// what survived the last cycle; see set_goal).
+static mut GOAL: usize = 0;
+// Where in [0, GOAL) a cycle starts, in thousandths (adjusted to what was
+// allocated during the last mark).
+static mut TRIGGER: usize = 875;
+// Bytes of objects scanned this cycle (markers and assists add theirs in
+// batches) and in the last one: what is left to scan, for the assists.
+static mut SCAN_DONE: usize = 0;
+static mut SCAN_LAST: usize = 0;
+// How many assists hold grey objects (the markers do not end the mark
+// meanwhile).
+static mut ASSISTING: usize = 0;
+// What the markers scanned that no assist has counted yet (as Go's
+// bgScanCredit): an assist pays from it first.
+static mut BG_CREDIT: usize = 0;
+// The memory limit (bytes; NO_LIMIT: none) and the percent that turns the
+// ratio off (only the limit starts a cycle).
+static mut MEMLIMIT: usize = 18446744073709551615;
+const NO_LIMIT: usize = 18446744073709551615;
+const OFF: usize = 18446744073709551615;
 static mut LIVE: usize = 0;
 static mut COLLECTIONS: usize = 0;
 // NAVI_GCPOISON=1 (debugging, with NAVI_GCSTW): freed objects are filled
@@ -227,8 +254,34 @@ fn init() {
         CLASS_OF[k] = class_of(if k == 0 { 1 } else { k * 16 }) as u8;
         k += 1;
     }
-    NEXT_GC = MIN_HEAP;
+    read_env();
+    set_goal(0);
     span_offsets();
+}
+
+// NAVI_GC=percent|off and NAVI_MEMLIMIT=bytes (a suffix B, KiB, MiB, GiB or
+// TiB), as Go's GOGC and GOMEMLIMIT.
+fn read_env() {
+    if let Some(v) = crate::rt::native::getenv_c(b"NAVI_GC\0") {
+        if v == "off" { PERCENT = OFF; } else if let Some(n) = parse_size(v) { PERCENT = n; }
+    }
+    if let Some(v) = crate::rt::native::getenv_c(b"NAVI_MEMLIMIT\0") {
+        if let Some(n) = parse_size(v) { MEMLIMIT = n; }
+    }
+}
+
+fn parse_size(v: &str) -> Option<usize> {
+    let b = v.as_bytes();
+    let mut n = 0usize;
+    let mut i = 0;
+    while i < b.len() && b[i] >= b'0' && b[i] <= b'9' {
+        n = n * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    if i == 0 { return None; }
+    let unit = &v[i..];
+    let shift = if unit == "" || unit == "B" { 0 } else if unit == "KiB" { 10 } else if unit == "MiB" { 20 } else if unit == "GiB" { 30 } else if unit == "TiB" { 40 } else { return None; };
+    Some(n << shift)
 }
 
 /// The size class of each size up to MAX_SMALL in 16-byte steps.
@@ -324,6 +377,10 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
                 return p as *mut u8;
             }
         }
+        // An assist first (as Go's mallocgc): it may stop the G, and a
+        // cycle end and another start meanwhile; the object it returns must
+        // be the new cycle's (its initializing stores have no barrier).
+        if MARKING { assist(SPAN_BYTES); }
         // The shared lists have locks of their own (as Go's mcentral); the
         // runtime lock only for a collection.
         if ALLOCATED >= NEXT_GC {
@@ -340,6 +397,7 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
         crate::rt::sched::preempt_on();
         return p as *mut u8;
     }
+    if MARKING { assist(size); }
     if ALLOCATED >= NEXT_GC {
         crate::rt::sched::lock();
         if ALLOCATED >= NEXT_GC { collect_locked(); }
@@ -349,6 +407,112 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
     let p = alloc_large(size, noscan);
     crate::rt::sched::preempt_on();
     p as *mut u8
+}
+
+// --- Mark assists (as Go's gcAssistAlloc) ---------------------------------------
+//
+// While a mark runs, a G that took bytes from the heap scans grey objects
+// in proportion: what is left to scan (about what the last cycle scanned)
+// over what is left to allocate before the goal, so that the mark ends by
+// then (past the goal: until no grey object is left to take).
+// Bytes the assists scanned this cycle (NAVI_GCTRACE).
+static mut ASSISTED: usize = 0;
+
+fn assist(bytes: usize) {
+    if !crate::rt::sched::may_assist() { return; }
+    let alloc = ALLOCATED;
+    let left_heap = if GOAL > alloc { GOAL - alloc } else { 0 };
+    let done = crate::rt::atomic_load(&mut SCAN_DONE as *mut usize);
+    let expect = if SCAN_LAST != 0 { SCAN_LAST } else { LIVE };
+    // (Past what was expected: more is left than thought.)
+    let left_scan = if expect > done + expect / 16 { expect - done } else { expect / 16 };
+    if left_scan == 0 { return; }
+    let mut debt = if left_heap <= bytes { left_scan } else { ((bytes as u128) * (left_scan as u128) / (left_heap as u128)) as usize };
+    // What the markers did counts first.
+    loop {
+        let c = crate::rt::atomic_load(&mut BG_CREDIT as *mut usize);
+        if c == 0 { break; }
+        let take = if c < debt { c } else { debt };
+        if crate::rt::atomic_cas(&mut BG_CREDIT as *mut usize, c, c - take) {
+            debt -= take;
+            break;
+        }
+    }
+    if debt > 0 { assist_scan(debt); }
+}
+
+// Scans about debt bytes of grey objects (taken from the shared ones onto
+// the M's write barrier buffer, a stack the collector sees), in batches
+// during which the G does not stop; what it greys is shared. Finding no
+// grey object anywhere, it ends the mark itself (as Go's assists call
+// gcMarkDone: the markers may not get a thread soon).
+fn assist_scan(debt: usize) {
+    let mut done = 0usize;
+    let cyc = CYCLE_NO;
+    while done < debt {
+        crate::rt::sched::preempt_off();
+        if !MARKING || MARK_DONE {
+            crate::rt::sched::preempt_on();
+            return;
+        }
+        let me = crate::rt::sched::m_wbuf();
+        let mut batch = 0usize;
+        let mut empty = false;
+        crate::rt::atomic_add(&mut ASSISTING as *mut usize, 1);
+        while batch < 65536 && me != 0 {
+            let mut obj = stack_pop(me);
+            if obj == 0 {
+                mark_lock();
+                if take_few(me) { obj = stack_pop(me); }
+                mark_unlock();
+                if obj == 0 {
+                    empty = true;
+                    break;
+                }
+            }
+            batch += scan_object(obj, me);
+        }
+        if me != 0 && stack_len(me) > 0 {
+            mark_lock();
+            move_all(me, SHARED);
+            mark_unlock();
+        }
+        crate::rt::atomic_add(&mut ASSISTING as *mut usize, 18446744073709551615);
+        crate::rt::atomic_add(&mut SCAN_DONE as *mut usize, batch);
+        crate::rt::atomic_add(&mut ASSISTED as *mut usize, batch);
+        let mut finish = false;
+        if empty {
+            mark_lock();
+            // (This assist no longer counts.)
+            if !MARK_DONE && crate::rt::atomic_load(&mut ASSISTING as *mut usize) == 0 && no_grey() {
+                MARK_DONE = true;
+                finish = true;
+            }
+            mark_unlock();
+        }
+        crate::rt::sched::preempt_on();
+        if finish {
+            crate::rt::sched::lock();
+            if CYCLE_NO == cyc { finish_cycle(); }
+            crate::rt::sched::unlock();
+            return;
+        }
+        done += batch;
+        if empty || me == 0 { return; }
+    }
+}
+
+// Whether the pool, the shared objects and every marker's stack are empty
+// (mark_lock held; a marker in a batch may hold some still, and write
+// barriers' buffers: the final stop drains them).
+fn no_grey() -> bool {
+    if stack_len(POOL) != 0 || stack_len(SHARED) != 0 { return false; }
+    let mut k = 0;
+    while k < MAX_MARKERS {
+        if LOCAL != 0 && stack_len(LOCAL + k * 32) != 0 { return false; }
+        k += 1;
+    }
+    true
 }
 
 // A span of class c with free objects for an M's cache (the runtime lock
@@ -790,22 +954,26 @@ fn mark_found(s: *mut Span, i: usize, dst: usize) {
     }
 }
 
-fn scan_object(obj: usize, dst: usize) {
+// Scans obj; its size.
+fn scan_object(obj: usize, dst: usize) -> usize {
     let s = unsafe { *((PAGES + ((obj - ARENA) >> PAGE_SHIFT) * 8) as *const usize) } as *mut Span;
     let elem = unsafe { (*s).elem };
     scan(obj, obj + elem, dst);
+    elem
 }
 
 // Marks everything reachable from the mark stacks (the world is stopped).
 fn drain() {
+    let mut n = 0usize;
     loop {
         let obj = pop();
         if obj == 0 {
             if take_shared() { continue; }
-            return;
+            break;
         }
-        scan_object(obj, MAIN);
+        n += scan_object(obj, MAIN);
     }
+    SCAN_DONE += n;
 }
 
 /// The write barrier's work (and that of runtime copies): while a
@@ -852,6 +1020,20 @@ fn take_work(sk: usize) -> bool {
     move_all(SHARED, sk)
 }
 
+// Takes up to 64 grey objects from the pool, else the shared ones, onto
+// sk (an assist's batch; mark_lock held); false if both are empty.
+fn take_few(sk: usize) -> bool {
+    let from = if stack_len(POOL) > 0 { POOL } else { SHARED };
+    let mut k = 0;
+    while k < 64 {
+        let obj = stack_pop(from);
+        if obj == 0 { break; }
+        stack_push(sk, obj);
+        k += 1;
+    }
+    k > 0
+}
+
 fn mark_worker(k: usize, cyc: usize) {
     let me = LOCAL + k * 32;
     loop {
@@ -861,12 +1043,15 @@ fn mark_worker(k: usize, cyc: usize) {
             return;
         }
         let mut n = 0;
+        let mut bytes = 0usize;
         while n < 256 {
             let obj = stack_pop(me);
             if obj == 0 { break; }
-            scan_object(obj, me);
+            bytes += scan_object(obj, me);
             n += 1;
         }
+        crate::rt::atomic_add(&mut SCAN_DONE as *mut usize, bytes);
+        crate::rt::atomic_add(&mut BG_CREDIT as *mut usize, bytes);
         let mut idle = false;
         let mut finish = false;
         let len = stack_len(me);
@@ -898,8 +1083,9 @@ fn mark_worker(k: usize, cyc: usize) {
                 return;
             }
             // A look without the lock first (a hint): nothing to take and
-            // not everyone idle, so keep waiting.
-            if stack_len(POOL) == 0 && stack_len(SHARED) == 0 && IDLE_MARKERS != MARKERS && spins < 100 {
+            // not everyone idle (or an assist runs), so keep waiting (the
+            // last marker waits for the assists).
+            if stack_len(POOL) == 0 && stack_len(SHARED) == 0 && (IDLE_MARKERS != MARKERS || ASSISTING != 0) && (spins < 100 || MARKERS == 1) {
                 crate::rt::sched::preempt_on();
                 continue;
             }
@@ -908,11 +1094,11 @@ fn mark_worker(k: usize, cyc: usize) {
             if take_work(me) {
                 IDLE_MARKERS -= 1;
                 idle = false;
-            } else if IDLE_MARKERS == MARKERS {
+            } else if IDLE_MARKERS == MARKERS && crate::rt::atomic_load(&mut ASSISTING as *mut usize) == 0 {
                 MARK_DONE = true;
                 finish = true;
                 idle = false;
-            } else if spins >= 100 {
+            } else if spins >= 100 && MARKERS > 1 {
                 MARKERS -= 1;
                 IDLE_MARKERS -= 1;
                 leave = true;
@@ -996,8 +1182,7 @@ fn sweep() {
     }
     LIVE = live;
     ALLOCATED = 0;
-    NEXT_GC = goal(live);
-    SCAV_GOAL = heap_goal();
+    set_goal(live);
 }
 
 // Frees the unmarked objects of s, clears its marks and puts it on its
@@ -1198,8 +1383,12 @@ fn sweeper() {
 // The pages to keep (set when a cycle ends).
 static mut SCAV_GOAL: usize = 0;
 
-// What survived the last cycle and may be allocated before the next.
-fn heap_goal() -> usize { (LIVE + NEXT_GC) / 10 * 11 }
+// What survived the last cycle and may be allocated before the next, and
+// 10% (under a memory limit, at most 95% of it, as Go's scavenger).
+fn heap_goal() -> usize {
+    let g = if GOAL > NO_LIMIT / 11 * 10 - LIVE { NO_LIMIT } else { (LIVE + GOAL) / 10 * 11 };
+    if MEMLIMIT != NO_LIMIT && g > MEMLIMIT / 20 * 19 { MEMLIMIT / 20 * 19 } else { g }
+}
 
 // The arena's bytes in use (made and not returned).
 fn heap_in_use() -> usize {
@@ -1288,23 +1477,79 @@ fn take_marked() -> usize {
 
 /// Sets the heap size below which no collection starts.
 pub fn set_min_heap(bytes: usize) {
+    crate::rt::sched::lock();
     MIN_HEAP = bytes;
-    if NEXT_GC != 0 && NEXT_GC < bytes { NEXT_GC = bytes; }
+    repace();
+    crate::rt::sched::unlock();
 }
 
 static mut MIN_HEAP: usize = MIN_GC;
 static mut PERCENT: usize = 100;
 
+/// Sets the percent the heap may grow by (OFF: only the memory limit
+/// starts a collection); the previous one.
 pub fn set_percent(percent: usize) -> usize {
+    crate::rt::sched::lock();
+    if ARENA == 0 { init(); }
     let old = PERCENT;
     PERCENT = percent;
+    repace();
+    crate::rt::sched::unlock();
     old
 }
 
-// The bytes to allocate before the next collection.
+/// Sets the memory limit (NO_LIMIT: none); the previous one.
+pub fn set_memory_limit(bytes: usize) -> usize {
+    crate::rt::sched::lock();
+    if ARENA == 0 { init(); }
+    let old = MEMLIMIT;
+    MEMLIMIT = bytes;
+    repace();
+    crate::rt::sched::unlock();
+    old
+}
+
+// The goal again after a setting changed (not during a cycle: its start
+// set the point that finishes it).
+fn repace() {
+    if !CYCLE && ARENA != 0 { set_goal(LIVE); }
+}
+
+// The least the heap may grow by under a memory limit (as Go's minimum
+// heap: a limit below what survives does not collect continuously).
+const LIMIT_FLOOR: usize = 4194304;
+
+// The bytes the heap may grow by past what survived (live).
 fn goal(live: usize) -> usize {
-    let g = live / 100 * PERCENT;
-    if g > MIN_HEAP { g } else { MIN_HEAP }
+    let mut g = if PERCENT == OFF || PERCENT != 0 && live / 100 > NO_LIMIT / PERCENT { NO_LIMIT } else { live / 100 * PERCENT };
+    if g < MIN_HEAP { g = MIN_HEAP; }
+    if MEMLIMIT != NO_LIMIT {
+        // The limit counts the stacks too (not the collector's own
+        // metadata, outside the arena).
+        let other = crate::rt::sched::stack_bytes();
+        let room = if MEMLIMIT > live + other + LIMIT_FLOOR { MEMLIMIT - live - other } else { LIMIT_FLOOR };
+        if g > room { g = room; }
+    }
+    g
+}
+
+// Sets the next cycle's goal after one that left live bytes, and where it
+// starts.
+fn set_goal(live: usize) {
+    GOAL = goal(live);
+    NEXT_GC = if MODE == 2 { GOAL } else { ((GOAL as u128) * (TRIGGER as u128) / 1000) as usize };
+    SCAV_GOAL = heap_goal();
+}
+
+// After a concurrent cycle: the trigger moves so that the next mark,
+// allocating as much as this one did, ends at its goal (between 60% and
+// 95% of the way; halfway to the new estimate each time, as Go smooths).
+fn adjust_trigger(during_mark: usize) {
+    if GOAL == 0 || GOAL == NO_LIMIT { return; }
+    let used = ((during_mark as u128) * 1000 / (GOAL as u128)) as usize;
+    let mut want = if used >= 400 { 600 } else { 1000 - used };
+    if want > 950 { want = 950; }
+    TRIGGER = (TRIGGER + want) / 2;
 }
 
 /// Statistics for tests: (collections, live bytes after the last one,
@@ -1340,11 +1585,10 @@ fn concurrent_on() -> bool {
         if let Some(v) = crate::rt::native::getenv_c(b"NAVI_GCMINHEAP\0") {
             let mut n = 0usize;
             for b in v.bytes() { if b >= b'0' && b <= b'9' { n = n * 10 + (b - b'0') as usize; } }
-            if n > 0 {
-                MIN_HEAP = n;
-                if NEXT_GC > n { NEXT_GC = n; }
-            }
+            if n > 0 { MIN_HEAP = n; }
         }
+        // (Stop-the-world cycles start at the goal.)
+        set_goal(LIVE);
     }
     MODE == 1
 }
@@ -1380,6 +1624,15 @@ fn mark_roots() {
     scan_range(crate::rt::data_start() as usize, crate::rt::data_end() as usize);
 }
 
+// How many mark workers a cycle has: a quarter of the threads (as Go's
+// dedicated workers), at least one.
+fn workers() -> usize {
+    let mut n = (crate::rt::sched::procs() + 2) / 4;
+    if n < 1 { n = 1; }
+    if n > MAX_MARKERS { n = MAX_MARKERS; }
+    n
+}
+
 // (1), with the runtime lock held.
 fn start_cycle() {
     if COLLECTING { return; }
@@ -1387,29 +1640,36 @@ fn start_cycle() {
     COLLECTING = true;
     crate::rt::sched::stop_the_world();
     take_marked();
+    SCAN_DONE = 0;
+    BG_CREDIT = 0;
+    ASSISTED = 0;
     ALLOC_AT_START = ALLOCATED;
     CYCLE = true;
     LIMIT = ARENA_NEXT;
     set_marking(true);
     mark_roots();
-    crate::rt::sched::start_the_world();
-    // If the program allocates as much again before the marker is done,
-    // the allocating G finishes the cycle itself.
-    NEXT_GC = ALLOCATED + if NEXT_GC > MIN_HEAP { NEXT_GC } else { MIN_HEAP };
-    // (2): the marker Gs (half the threads), starting from the roots.
+    // The cycle's state, all before the world starts again (assists start
+    // taking grey objects at once; a marker of an earlier cycle not yet run
+    // must see it is stale).
+    // Past half again the goal the allocating G finishes the cycle itself
+    // (the assists should have ended it before).
+    let hard = if GOAL > NO_LIMIT / 2 { NO_LIMIT } else { GOAL + GOAL / 2 };
+    NEXT_GC = if hard > ALLOCATED + MIN_HEAP / 4 { hard } else { ALLOCATED + MIN_HEAP / 4 };
     CYCLE_NO += 1;
     let cyc = CYCLE_NO;
     move_all(MAIN, POOL);
-    MARKERS = crate::rt::sched::procs() / 2;
-    if MARKERS < 1 { MARKERS = 1; }
-    if MARKERS > MAX_MARKERS { MARKERS = MAX_MARKERS; }
+    // (2): the marker Gs (a quarter of the threads, as Go's dedicated
+    // workers), starting from the roots.
+    MARKERS = workers();
     IDLE_MARKERS = 0;
     MARK_DONE = false;
+    crate::rt::sched::ask_yields(MARKERS);
+    crate::rt::sched::start_the_world();
     COLLECTING = false;
     let mut k = 0;
     while k < MARKERS {
         let id = k;
-        crate::rt::sched::go(|| { mark_worker(id, cyc); });
+        crate::rt::sched::go_marker(|| { mark_worker(id, cyc); });
         k += 1;
     }
 }
@@ -1428,6 +1688,16 @@ fn finish_cycle() {
         crate::rt::native::put(2, if MARK_DONE { "1" } else { "0" });
         crate::rt::native::put(2, " stw_ms=");
         crate::rt::native::put_u64(2, (crate::rt::native::monotonic_nanos() - t0) / 1000000);
+        crate::rt::native::put(2, " scan_mb=");
+        crate::rt::native::put_u64(2, (SCAN_DONE >> 20) as u64);
+        crate::rt::native::put(2, " assist_mb=");
+        crate::rt::native::put_u64(2, (ASSISTED >> 20) as u64);
+        crate::rt::native::put(2, " goal_mb=");
+        crate::rt::native::put_u64(2, (GOAL >> 20) as u64);
+        crate::rt::native::put(2, " trigger=");
+        crate::rt::native::put_u64(2, TRIGGER as u64);
+        crate::rt::native::put(2, " start_mb=");
+        crate::rt::native::put_u64(2, (ALLOC_AT_START >> 20) as u64);
         crate::rt::native::put(2, " alloc_mb=");
         crate::rt::native::put_u64(2, (ALLOCATED >> 20) as u64);
         crate::rt::native::put(2, "\n");
@@ -1439,11 +1709,13 @@ fn finish_cycle() {
     crate::rt::sched::flush_caches();
     // The live heap: what was marked, and what was allocated meanwhile
     // (allocated black).
-    let live = take_marked() + (ALLOCATED - ALLOC_AT_START);
+    let during = ALLOCATED - ALLOC_AT_START;
+    let live = take_marked() + during;
     LIVE = live;
+    adjust_trigger(during);
+    SCAN_LAST = SCAN_DONE;
     ALLOCATED = 0;
-    NEXT_GC = goal(live);
-    SCAV_GOAL = heap_goal();
+    set_goal(live);
     LAST_GC = crate::rt::native::monotonic_nanos();
     begin_lazy_sweep();
     crate::rt::sched::start_the_world();
