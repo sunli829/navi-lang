@@ -1145,6 +1145,10 @@ impl Gen {
         self.emit_func("_navi_mstart", false);
 
         m.begin();
+        m.poll_stub();
+        self.emit_func("_navi_poll", false);
+
+        m.begin();
         m.swap_context();
         self.emit_func("_navi_swapctx", false);
 
@@ -1278,6 +1282,8 @@ fn collect_closures(f: &Func, todo: &mut Vec<&mut Func>) {
 enum Stub {
     /// The stack check's slow path (then the check again).
     Overflow(Label, Label, i64),
+    /// A loop's check's slow path (then back to the loop).
+    Poll(Label, Label),
     /// A panic with a message at a position.
     Panic { label: Label, msg: String, pos: Pos },
 }
@@ -3066,6 +3072,29 @@ impl FnGen {
             to[i] = t;
             i += 1;
         }
+        // Loop headers (a block that dominates a predecessor) check the G's
+        // stack limit as prologues do, so that a loop calling nothing
+        // still stops for a collector (as a JVM's safepoint polls; Go
+        // interrupts the thread instead). Not in the runtime, whose code
+        // relies on having no stopping point between some instructions.
+        let mut polls: Vec<bool> = Vec::new();
+        polls.resize(nb, false);
+        let rt = match self.f.def {
+            Some(d) => crate::mir::inline::in_runtime(d),
+            None => match self.f.owner { Some(d) => crate::mir::inline::in_runtime(d), None => true },
+        };
+        if !rt {
+            let d = crate::ssa::dom::dominators(sf);
+            for bb in sf.blocks.iter() {
+                let b = *bb;
+                if d.order[b.id as usize] < 0 { continue; }
+                for s in b.succs.iter() {
+                    let mut x = b.id as i32;
+                    while x >= 0 && x != s.id as i32 { x = d.idom[x as usize]; }
+                    if x == s.id as i32 { polls[to[s.id as usize]] = true; }
+                }
+            }
+        }
         let mut order: Vec<usize> = Vec::new();
         let mut cold: Vec<usize> = Vec::new();
         i = 0;
@@ -3084,6 +3113,13 @@ impl FnGen {
             let b = sf.blocks[bi];
             m.bind(labels[bi]);
             if bi == 0 { self.ssa_entry_args(sf, b); }
+            if polls[bi] {
+                let slow = m.new_label();
+                let back = m.new_label();
+                m.poll_check(slow);
+                m.bind(back);
+                self.stub_list.push(Stub::Poll(slow, back));
+            }
             for vv in b.values.iter() {
                 let v = *vv;
                 if self.g.dwarf && v.pos > 0 { self.note_line(v.pos); }
@@ -4021,6 +4057,14 @@ impl FnGen {
                     m.call_morestack();
                     self.ssa_spill_args(false);
                     m.jump(*resume);
+                }
+                Stub::Poll(l, back) => {
+                    m.bind(*l);
+                    // The loop's frame by its map, the saved registers
+                    // conservatively (tag -1).
+                    m.set_tag(-1);
+                    m.call_poll();
+                    m.jump(*back);
                 }
                 Stub::Panic { label, msg, pos } => {
                     m.bind(*label);
