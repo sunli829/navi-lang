@@ -130,6 +130,9 @@ pub struct G {
     // Windows' main G: where its stack's reservation starts (stack_lo is
     // where the committed part does; see commit_more). 0 otherwise.
     reserve_lo: usize,
+    // How many object locks it holds (as Go's m.locks): it does not yield
+    // for a time slice while it holds one.
+    locks: usize,
 }
 
 // G.sys: running navi code; blocked in C (a system call or waiting for the
@@ -996,8 +999,11 @@ struct M {
     mon_run_t: usize,
 }
 
-// A G running this long is asked to yield (as Go's forcePreemptNS).
-const TIME_SLICE: usize = 10000000;
+// A G running this long is asked to yield (as Go's forcePreemptNS;
+// NAVI_SLICE_US sets it in microseconds, for testing).
+static mut TIME_SLICE: usize = 10000000;
+// NAVI_NOSLICE=1: no time slices (debugging).
+static mut NOSLICE: bool = false;
 
 // The runtime lock (pthread mutex) and the condition idle Ms wait on.
 static mut MU: usize = 0;
@@ -1990,6 +1996,16 @@ fn start_sysmon() {
 // an M whose G has been blocked in the same call since the last look is
 // replaced if work waits.
 fn sysmon_loop(me: *mut M) -> ! {
+    NOSLICE = crate::rt::native::env_set(b"NAVI_NOSLICE\0");
+    let mut max_delay: u64 = 10000;
+    if let Some(v) = crate::rt::native::os_getenv("NAVI_SLICE_US") {
+        let mut n = 0usize;
+        for b in v.bytes() { if b >= b'0' && b <= b'9' { n = n * 10 + (b - b'0') as usize; } }
+        if n > 0 {
+            TIME_SLICE = n * 1000;
+            if (n as u64) < max_delay { max_delay = n as u64; }
+        }
+    }
     let mut delay: u64 = 20;
     loop {
         os_sleep_us(delay);
@@ -2003,9 +2019,16 @@ fn sysmon_loop(me: *mut M) -> ! {
                     blocked = true;
                     let seq = (*g).blk_seq;
                     if (*m).mon_g == g as usize && (*m).mon_seq == seq {
-                        if (*m).retaken == 0 && work_exists() && crate::rt::atomic_cas(&mut (*m).retaken as *mut usize, 0, 1) {
+                        // Counted first: once the flag is set, the G returning
+                        // from C takes the count back (it must never go below
+                        // zero, even for a moment: too_many adds it).
+                        if (*m).retaken == 0 && work_exists() {
                             crate::rt::atomic_add(&mut NRETAKEN as *mut usize, 1);
-                            wakep();
+                            if crate::rt::atomic_cas(&mut (*m).retaken as *mut usize, 0, 1) {
+                                wakep();
+                            } else {
+                                crate::rt::atomic_add(&mut NRETAKEN as *mut usize, 18446744073709551615);
+                            }
                         }
                     } else {
                         (*m).mon_g = g as usize;
@@ -2017,7 +2040,7 @@ fn sysmon_loop(me: *mut M) -> ! {
                     // next check: poisoning its limit takes it to morestack.
                     let seq = crate::rt::atomic_load(&mut (*m).run_seq as *mut usize);
                     let now = crate::rt::native::monotonic_nanos() as usize;
-                    if g as usize != 0 && (*m).mon_run_seq == seq {
+                    if g as usize != 0 && (*m).mon_run_seq == seq && !NOSLICE {
                         // (Again each look: start_the_world or morestack may
                         // have restored the limit since.)
                         if now - (*m).mon_run_t >= TIME_SLICE && !(*g).is_g0 && (*g).cb_prev as usize == 0 {
@@ -2032,8 +2055,8 @@ fn sysmon_loop(me: *mut M) -> ! {
                 m = (*m).next;
             }
         }
-        // (At most 10 ms: a time slice.)
-        delay = if blocked { 20 } else if delay < 10000 { delay * 2 } else { 10000 };
+        // (At most a time slice, 10 ms.)
+        delay = if blocked { 20 } else if delay < max_delay { delay * 2 } else { max_delay };
     }
 }
 
@@ -2113,9 +2136,15 @@ fn mloop() -> ! {
 // collector.
 pub fn obj_lock(lk: *mut usize) {
     while !crate::rt::atomic_cas(lk, 0, 1) { spin_wait(); }
+    let g = current();
+    if g as usize != 0 { unsafe { (*g).locks += 1; } }
 }
 
-pub fn obj_unlock(lk: *mut usize) { crate::rt::atomic_store(lk, 0); }
+pub fn obj_unlock(lk: *mut usize) {
+    crate::rt::atomic_store(lk, 0);
+    let g = current();
+    if g as usize != 0 { unsafe { if (*g).locks > 0 { (*g).locks -= 1; } } }
+}
 
 fn spin_wait() { unsafe { os_yield(); } }
 
@@ -2207,6 +2236,8 @@ fn release_locks(g: *mut G) {
         let n = (*g).release_n;
         let base = (*g).release;
         (*g).release_n = 0;
+        // Released for g (it takes them again when it runs).
+        (*g).locks = if (*g).locks > n { (*g).locks - n } else { 0 };
         // No GC memory here: this runs on the M's scheduler record, which a
         // collector neither stops nor scans.
         let mut few = [0usize; 64];
@@ -2322,7 +2353,7 @@ pub fn morestack() -> usize {
             (*g).sp = if bsp >= olo && bsp < ohi { bsp.wrapping_add(delta) } else { bsp };
             (*g).fp = if bfp >= olo && bfp < ohi { bfp.wrapping_add(delta) } else { bfp };
             crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_BLOCKED);
-        } else if (*g).preempt != 0 && !(*g).is_g0 && (*g).nopreempt == 0 && (*g).lock_depth == 0 && (*g).cb_prev as usize == 0 && !owner
+        } else if (*g).preempt != 0 && !(*g).is_g0 && (*g).nopreempt == 0 && (*g).lock_depth == 0 && (*g).locks == 0 && (*g).cb_prev as usize == 0 && !owner
             && (*g).status == RUNNING && delta == 0 && preemptible(poll, (*g).entry_sp) {
             // A time slice is over: other Gs run (as Go's preemption at a
             // prologue). Parked here, the G is scanned as one stopped here:
@@ -2333,6 +2364,13 @@ pub fn morestack() -> usize {
             (*g).ms_fp = (*g).entry_sp + 256 + 16;
             yield_now();
             (*g).ms_fp = 0;
+            // The limit again: a prologue on the way (a poisoned limit)
+            // entered a nested morestack, whose stub cleared it and which
+            // returned at once, the outer one having set it already.
+            crate::rt::atomic_store(&mut (*g).guard as *mut usize, limit);
+            if crate::rt::atomic_load(&mut STW as *mut usize) != 0 && STW_OWNER != g as usize {
+                crate::rt::atomic_store(&mut (*g).guard as *mut usize, POISON);
+            }
         } else {
             (*g).preempt = 0;
         }
@@ -2342,17 +2380,18 @@ pub fn morestack() -> usize {
 
 const POISON: usize = 18446744073709551615;
 
-// Whether the check that entered morestack is in code that may yield: a
-// loop's (none in the runtime), or the prologue of a function outside the
-// runtime (as Go, which does not preempt runtime code: it may be between
-// registering a G as waiting and parking it). The stub's return address
-// (above the 256 bytes it saved) is in that function; one without a map
-// is the runtime's own.
+// Whether the check that entered morestack is in code that may yield for
+// a time slice: the program's own (not std's, nor the runtime's: as Go
+// does not preempt runtime code, which may hold its M's state, be between
+// registering a G as waiting and parking it, or rely on not stopping
+// between two steps; std code may be called by the runtime). A loop's
+// check is in the function of the record _navi_poll pushed (above the
+// stub's 256 bytes and record), a prologue's in the function the stub
+// returns into; code without a map is the runtime's own.
 fn preemptible(poll: bool, entry_sp: usize) -> bool {
-    if poll { return true; }
-    let ret = unsafe { *((entry_sp + 256 + 8) as *const usize) };
+    let ret = if poll { unsafe { *((entry_sp + 256 + 16 + 8) as *const usize) } } else { unsafe { *((entry_sp + 256 + 8) as *const usize) } };
     let (m, _) = find_map(ret);
-    m != 0 && unsafe { *((m + 8) as *const usize) } & 1 == 0
+    m != 0 && unsafe { *((m + 8) as *const usize) } & 3 == 0
 }
 
 /// Moves the running G's stack (from its stub's SP up) to a new one with

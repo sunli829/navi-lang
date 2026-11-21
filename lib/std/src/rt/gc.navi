@@ -1074,6 +1074,15 @@ fn concurrent_on() -> bool {
     if MODE == 0 {
         MODE = if crate::rt::native::env_set(b"NAVI_GCSTW\0") { 2 } else { 1 };
         VERIFY = crate::rt::native::env_set(b"NAVI_GCVERIFY\0");
+        // NAVI_GCMINHEAP=bytes: collect more often (testing).
+        if let Some(v) = crate::rt::native::os_getenv("NAVI_GCMINHEAP") {
+            let mut n = 0usize;
+            for b in v.bytes() { if b >= b'0' && b <= b'9' { n = n * 10 + (b - b'0') as usize; } }
+            if n > 0 {
+                MIN_HEAP = n;
+                if NEXT_GC > n { NEXT_GC = n; }
+            }
+        }
     }
     MODE == 1
 }
@@ -1177,8 +1186,26 @@ fn finish_cycle() {
 // Rescans every marked object: if that marks anything more, the
 // concurrent mark missed a reachable object (a missing write barrier).
 fn verify_marks() {
-    let mut before = 0usize;
+    // The mark bytes before the rescan (to report what it marks).
+    let mut nspans = 0usize;
     let mut s = ALL as *mut Span;
+    while s as usize != 0 { nspans += 1; s = unsafe { (*s).next_all }; }
+    let copies = unsafe { calloc(nspans + 1, 8) } as usize;
+    let mut k = 0usize;
+    s = ALL as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            let n = (*s).nelems;
+            let c = calloc(n + 1, 1) as usize;
+            let mut i = 0;
+            while i < n { stb(c + i, ldb((*s).bits as usize + n + i)); i += 1; }
+            *((copies + 8 * k) as *mut usize) = c;
+            s = (*s).next_all;
+        }
+        k += 1;
+    }
+    let mut before = 0usize;
+    s = ALL as *mut Span;
     while s as usize != 0 {
         unsafe {
             let n = (*s).nelems;
@@ -1209,6 +1236,85 @@ fn verify_marks() {
             s = (*s).next_all;
         }
     }
-    if after != before { crate::rt::native::fatal("concurrent mark missed reachable objects"); }
+    if after != before {
+        report_missed(copies);
+        crate::rt::native::fatal("concurrent mark missed reachable objects");
+    }
+}
+
+// What verify_marks marked that the concurrent mark had not (up to 8
+// objects), and the marked objects that point at them (with their first
+// words).
+fn report_missed(copies: usize) {
+    use crate::rt::native::{put, put_hex, put_u64};
+    let mut lo = [0usize; 8];
+    let mut hi = [0usize; 8];
+    let mut nm = 0;
+    let mut k = 0usize;
+    let mut s = ALL as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            let n = (*s).nelems;
+            let c = *((copies + 8 * k) as *const usize);
+            let mut i = 0;
+            while i < n {
+                if ldb((*s).bits as usize + n + i) != 0 && ldb(c + i) == 0 && nm < 8 {
+                    lo[nm] = (*s).start + i * (*s).elem;
+                    hi[nm] = lo[nm] + (*s).elem;
+                    put(2, "missed object ");
+                    put_hex(2, lo[nm] as u64);
+                    put(2, " size ");
+                    put_u64(2, (*s).elem as u64);
+                    put(2, if (*s).noscan { " noscan" } else { "" });
+                    put(2, " words");
+                    let mut w = 0;
+                    while w < 6 && w * 8 < (*s).elem { put(2, " "); put_hex(2, *((lo[nm] + 8 * w) as *const usize) as u64); w += 1; }
+                    put(2, "\n");
+                    nm += 1;
+                }
+                i += 1;
+            }
+            s = (*s).next_all;
+        }
+        k += 1;
+    }
+    k = 0;
+    s = ALL as *mut Span;
+    while s as usize != 0 {
+        unsafe {
+            let n = (*s).nelems;
+            let c = *((copies + 8 * k) as *const usize);
+            let mut i = 0;
+            while i < n && !(*s).noscan {
+                if ldb(c + i) != 0 {
+                    let o = (*s).start + i * (*s).elem;
+                    let mut w = 0;
+                    while w * 8 < (*s).elem {
+                        let v = *((o + 8 * w) as *const usize);
+                        let mut j = 0;
+                        while j < nm {
+                            if v >= lo[j] && v < hi[j] {
+                                put(2, "  pointed at by ");
+                                put_hex(2, o as u64);
+                                put(2, " (size ");
+                                put_u64(2, (*s).elem as u64);
+                                put(2, ", word ");
+                                put_u64(2, w as u64);
+                                put(2, ") words");
+                                let mut x = 0;
+                                while x < 6 && x * 8 < (*s).elem { put(2, " "); put_hex(2, *((o + 8 * x) as *const usize) as u64); x += 1; }
+                                put(2, "\n");
+                            }
+                            j += 1;
+                        }
+                        w += 1;
+                    }
+                }
+                i += 1;
+            }
+            s = (*s).next_all;
+        }
+        k += 1;
+    }
 }
 
