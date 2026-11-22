@@ -100,6 +100,12 @@ struct Span {
     // Dead (no object allocated) with its pages returned to the system
     // (see scavenge): zero when used again.
     released: bool,
+    // Which words of each object hold pointers (C memory, made with the
+    // first typed object; 0: scan every word): an entry per object, a byte
+    // (objects up to 64 bytes) or a word (up to 512) of mask bits, word k
+    // a pointer if bit k is set; past 512 bytes two words: the mask and
+    // the words of the element type it repeats (0: scan every word).
+    pm: usize,
 }
 
 static mut ARENA: usize = 0;
@@ -294,10 +300,84 @@ static mut CLASS_OF: [u8; 513] = [0; 513];
 /// path (a free object in the first span of the size class) is written out
 /// in this one function.
 pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
+    // (Every word may be a pointer: the runtime's own allocations.)
+    alloc0(size, noscan, ALL_WORDS, 0)
+}
+
+const ALL_WORDS: usize = 18446744073709551615;
+
+/// Allocates size zeroed bytes for values of a type whose pointer words
+/// are mask's bits, tw words long (repeated: an array); mask 0: no
+/// pointers; tw 0: every word may be one (as Go's heap bitmap, written at
+/// allocation).
+pub fn alloc_typed(size: usize, mask: usize, tw: usize) -> *mut u8 {
+    let noscan = mask == 0 && tw != 0;
+    // (The common way straight to the threads' allocator.)
+    if MULTI && !POISON_FREE { return alloc_mt(size, noscan, mask, tw); }
+    alloc0(size, noscan, mask, tw)
+}
+
+/// The same for an array of such values (the mask repeated every tw words).
+pub fn alloc_array_typed(size: usize, mask: usize, tw: usize) -> *mut u8 {
+    if mask == 0 && tw != 0 { return alloc0(size, true, 0, 0); }
+    let p = alloc0(size, false, mask, tw);
+    set_info(p as usize, mask, tw, true);
+    p
+}
+
+// The bytes of an object's entry in its span's mask table.
+fn pm_width(elem: usize) -> usize { if elem <= 64 { 1 } else if elem <= 512 { 8 } else { 16 } }
+
+// Records the pointer words of the object at p (allocated, its span's):
+// mask (repeated every tw words for an array).
+fn set_info(p: usize, mask: usize, tw: usize, array: bool) {
+    let s = ld(PAGES + ((p - ARENA) >> PAGE_SHIFT) * 8) as *mut Span;
+    unsafe {
+        let elem = (*s).elem;
+        let w = pm_width(elem);
+        if (*s).pm == 0 {
+            let t = calloc((*s).nelems, w) as usize;
+            if t == 0 { out_of_memory(); }
+            (*s).pm = t;
+        }
+        let n = (*s).nelems;
+        let i = if n == 1 { 0 } else { ((p - (*s).start) * (*s).div_mul) >> 32 };
+        let e = (*s).pm + i * w;
+        if w == 16 {
+            wset(e, mask);
+            wset(e + 8, tw);
+            return;
+        }
+        // The object's words (up to 64), the type's mask repeated.
+        let words = elem >> 3;
+        let mut m = mask;
+        if tw == 0 || tw > 64 {
+            m = ALL_WORDS;
+        } else if array && tw < words {
+            let mut k = tw;
+            while k < words {
+                m = m | (mask << k as u32);
+                k += tw;
+            }
+        }
+        // (No bit past the object: its neighbour's words.)
+        if words < 64 { m = m & ((1usize << words as u32) - 1); }
+        if w == 1 { stb(e, (m & 255) as u8); } else { wset(e, m); }
+    }
+}
+
+fn alloc0(size: usize, noscan: bool, mask: usize, tw: usize) -> *mut u8 {
     if MULTI {
         if POISON_FREE && crate::rt::sched::on_g0() { crate::rt::native::fatal("GC allocation on a scheduler record"); }
-        return alloc_mt(size, noscan);
+        return alloc_mt(size, noscan, mask, tw);
     }
+    let p = alloc1(size, noscan);
+    if !noscan { set_info(p as usize, mask, tw, false); }
+    p
+}
+
+// The single-threaded allocator (before a second OS thread exists).
+fn alloc1(size: usize, noscan: bool) -> *mut u8 {
     if ALLOCATED >= NEXT_GC {
         if ARENA == 0 { init(); } else { collect_locked(); }
     }
@@ -343,7 +423,7 @@ pub static mut MULTI: bool = false;
 // keeps for itself (sched::m_cache), without the runtime lock; a span is
 // taken from the shared lists, and counted as allocated, under the lock
 // when the M's one is used up. Large objects are allocated under the lock.
-fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
+fn alloc_mt(size: usize, noscan: bool, mask: usize, tw: usize) -> *mut u8 {
     if size <= MAX_SMALL {
         let c = CLASS_OF[(size + 15) >> 4] as usize;
         let list = c * 2 + if noscan { 1 } else { 0 };
@@ -377,6 +457,17 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
                 let i = ((p - (*s).start) * (*s).div_mul) >> 32;
                 *(((*s).bits as usize + i) as *mut u8) = 1;
                 if MARKING { *(((*s).bits as usize + (*s).nelems + i) as *mut u8) = 1; }
+                if !noscan {
+                    // Its pointer words, in the entry of the span's table
+                    // (made, and wider entries, the slow way).
+                    let pm = (*s).pm;
+                    if pm != 0 && elem <= 512 {
+                        let m = if tw != 0 { mask } else if elem < 512 { (1usize << (elem >> 3) as u32) - 1 } else { ALL_WORDS };
+                        if elem <= 64 { *((pm + i) as *mut u8) = m as u8; } else { *((pm + 8 * i) as *mut usize) = m; }
+                    } else {
+                        set_info(p, mask, tw, false);
+                    }
+                }
                 return p as *mut u8;
             }
         }
@@ -398,6 +489,7 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
         st(crate::rt::sched::m_cache() + list * 8, ns as usize);
         let p = take_owned(ns);
         crate::rt::sched::preempt_on();
+        if !noscan { set_info(p, mask, tw, false); }
         return p as *mut u8;
     }
     if MARKING { assist(size); }
@@ -409,6 +501,7 @@ fn alloc_mt(size: usize, noscan: bool) -> *mut u8 {
     crate::rt::sched::preempt_off();
     let p = alloc_large(size, noscan);
     crate::rt::sched::preempt_on();
+    if !noscan { set_info(p, mask, tw, false); }
     p as *mut u8
 }
 
@@ -626,6 +719,11 @@ fn relayout(s: *mut Span, elem: usize, list: usize) {
             // (A dead span's allocation and mark bytes are all zero.)
             free((*s).bits);
             (*s).bits = calloc(2 * n, 1);
+        }
+        // (Its mask table is made again with the first typed object.)
+        if (*s).pm != 0 {
+            free((*s).pm as *mut u8);
+            (*s).pm = 0;
         }
         (*s).elem = elem;
         (*s).div_mul = if elem >= 4294967296 { 0 } else { 4294967295 / elem + 1 };
@@ -1033,12 +1131,77 @@ fn mark_found(s: *mut Span, i: usize, dst: usize) {
     }
 }
 
-// Scans obj; its size.
+// Scans obj (precisely: the words its entry in its span's mask table
+// says hold pointers); its size.
 fn scan_object(obj: usize, dst: usize) -> usize {
     let s = unsafe { *((PAGES + ((obj - ARENA) >> PAGE_SHIFT) * 8) as *const usize) } as *mut Span;
-    let elem = unsafe { (*s).elem };
-    scan(obj, obj + elem, dst);
+    let (elem, pm, n) = unsafe { ((*s).elem, (*s).pm, (*s).nelems) };
+    if pm == 0 {
+        scan(obj, obj + elem, dst);
+        return elem;
+    }
+    let i = if n == 1 { 0 } else { unsafe { ((obj - (*s).start) * (*s).div_mul) >> 32 } };
+    if elem <= 512 {
+        let m = if elem <= 64 { ldb(pm + i) as usize } else { wget(pm + 8 * i) };
+        // Every word a pointer: one range.
+        let words = elem >> 3;
+        if m == ALL_WORDS || words < 64 && m == (1usize << words as u32) - 1 {
+            scan(obj, obj + elem, dst);
+        } else {
+            scan_mask(obj, m, dst);
+        }
+    } else {
+        let e = pm + 16 * i;
+        let mask = unsafe { *(e as *const usize) };
+        let tw = unsafe { *((e + 8) as *const usize) };
+        // Every word (unknown, or an array of pointers): one range.
+        if tw == 0 || tw > 64 || (tw < 64 && mask == (1usize << tw as u32) - 1) || (tw == 64 && mask == ALL_WORDS) {
+            scan(obj, obj + elem, dst);
+        } else {
+            let step = tw * 8;
+            let mut b = obj;
+            while b + step <= obj + elem {
+                scan_mask(b, mask, dst);
+                b += step;
+            }
+        }
+    }
     elem
+}
+
+// Marks what the words at base whose bits in m are set point to (each
+// checked here, as scan_words does a range).
+fn scan_mask(base: usize, m0: usize, dst: usize) {
+    if m0 == ALL_WORDS {
+        scan(base, base + 512, dst);
+        return;
+    }
+    let arena = ARENA;
+    let next = if CYCLE { LIMIT } else { ARENA_NEXT };
+    let pages = PAGES;
+    let mut m = m0;
+    let mut p = base;
+    loop {
+        let q = crate::rt::scan_bits(p, m, arena, next, pages, SPAN_OFFS);
+        if q == 0 { return; }
+        // (Read again, as scan does: a mutator may have written it since.)
+        let w = ld(q - 8);
+        if w >= arena && w < next {
+            let s = ld(pages + ((w - arena) >> PAGE_SHIFT) * 8) as *mut Span;
+            if s as usize != 0 {
+                let n = unsafe { (*s).nelems };
+                let i = if n == 1 { 0 } else { unsafe { ((w - (*s).start) * (*s).div_mul) >> 32 } };
+                if i < n {
+                    let bits = unsafe { (*s).bits } as usize;
+                    if ldb(bits + i) != 0 && ldb(bits + n + i) == 0 { mark_found(s, i, dst); }
+                }
+            }
+        }
+        // The bits left past that word.
+        let k = (q - p) >> 3;
+        m = if k >= 64 { 0 } else { m >> k as u32 };
+        p = q;
+    }
 }
 
 // Marks everything reachable from the mark stacks (the world is stopped).
@@ -1869,7 +2032,7 @@ fn verify_marks() {
             while i < n {
                 if ldb(bits + n + i) != 0 {
                     before += 1;
-                    if !(*s).noscan { scan_range((*s).start + i * (*s).elem, (*s).start + (i + 1) * (*s).elem); }
+                    if !(*s).noscan { scan_object((*s).start + i * (*s).elem, MAIN); }
                 }
                 i += 1;
             }

@@ -1157,6 +1157,10 @@ impl Gen {
         self.emit_func("_navi_scanw", false);
 
         m.begin();
+        m.scan_bits();
+        self.emit_func("_navi_scanb", false);
+
+        m.begin();
         m.set_jmp();
         self.emit_func("_navi_setjmp", false);
 
@@ -1978,6 +1982,34 @@ impl FnGen {
 
     /// Calls std::rt::native::gc_alloc(size, noscan); the pointer is left in
     /// the result buffer.
+    /// The pointer words of a t for the collector: (mask, words), word k a
+    /// pointer if bit k of mask is set; (0, words): none; (all ones, 0):
+    /// unknown (over 63 words: every word is scanned).
+    pub fn ptr_mask(&mut self, t: &Type) -> (i64, i64) {
+        if t.kind == types::K_NEVER { return (0, 1); }
+        let l = self.g.lay_of(t);
+        let words = (l.size + 7) / 8;
+        if l.ptrs.len() == 0 { return (0, if words == 0 { 1 } else { words }); }
+        if words > 63 || l.unsized { return (-1, 0); }
+        let mut mask = 0i64;
+        for o in l.ptrs.iter() { mask = mask | (1i64 << (*o / 8) as u32); }
+        (mask, words)
+    }
+
+    /// Calls gc_alloc_typed(size in V1, mask, words): an object whose
+    /// pointer words the collector knows.
+    fn call_alloc_typed(&mut self, mask: i64, words: i64) { self.call_alloc_with("gc_alloc_typed", mask, words); }
+
+    fn call_alloc_with(&mut self, entry: &str, mask: i64, words: i64) {
+        let m = self.m;
+        m.store(8, V1, SP, 0);
+        m.mov_imm(V1, mask);
+        m.store(8, V1, SP, 8);
+        m.mov_imm(V1, words);
+        m.store(8, V1, SP, 16);
+        self.call_runtime(entry);
+    }
+
     fn call_alloc(&mut self, size: i64, noscan: bool) {
         let m = self.m;
         m.mov_imm(V1, size);
@@ -2083,7 +2115,13 @@ impl FnGen {
     fn closure(&mut self, ops: &Vec<Operand>, cf: &Func) {
         let m = self.m;
         let size = (8 + 8 * ops.len()) as i64;
-        self.call_alloc(size, false);
+        // (The context and the captures: pointers.)
+        if ops.len() + 1 <= 63 {
+            m.mov_imm(V1, size);
+            self.call_alloc_typed((1i64 << (ops.len() + 1) as u32) - 1, (ops.len() + 1) as i64);
+        } else {
+            self.call_alloc(size, false);
+        }
         m.load(8, BASE, FP, self.res_off);
         m.load(8, T1, FP, SLOT_CTX);
         m.store(8, T1, BASE, 0);
@@ -2277,6 +2315,28 @@ impl FnGen {
                 let ns = self.noscan(targ0.unwrap());
                 m.mov_imm(V1, if ns { 0 } else { 1 });
             }
+            "alloc_array" => {
+                // n elements of T, the collector told T's pointer words.
+                let t = targ0.unwrap();
+                let es = self.size(t);
+                let n = self.opreg(&args[0], V1);
+                m.mov_imm(V2, if es == 0 { 1 } else { es });
+                m.arith(MUL, V1, n, V2);
+                let (mask, words) = self.ptr_mask(t);
+                if mask == 0 && words != 0 {
+                    m.store(8, V1, SP, 0);
+                    m.mov_imm(V1, 1);
+                    m.store(1, V1, SP, 8);
+                    self.call_runtime("gc_alloc");
+                } else if words == 0 {
+                    m.store(8, V1, SP, 0);
+                    m.store_zero(1, SP, 8);
+                    self.call_runtime("gc_alloc");
+                } else {
+                    self.call_alloc_with("gc_alloc_array", mask, words);
+                }
+                m.load(8, V1, FP, self.res_off);
+            }
             "is_copy_clone" => {
                 m.mov_imm(V1, if copy_clone(targ0.unwrap()) { 1 } else { 0 });
             }
@@ -2317,7 +2377,7 @@ impl FnGen {
             "func_table" => {
                 m.adr_sym(V1, &"_navi_ftab".to_string());
             }
-            "scan_words" => {
+            "scan_words" | "scan_bits" => {
                 let mut ca = Vec::new();
                 let mut k = 0;
                 while k < 6 {
@@ -2326,7 +2386,7 @@ impl FnGen {
                     ca.push(int_arg());
                     k += 1;
                 }
-                m.call_c("_navi_scanw", 0, &ca, false, false, false);
+                m.call_c(if name == "scan_words" { "_navi_scanw" } else { "_navi_scanb" }, 0, &ca, false, false, false);
             }
             "resume_context" => {
                 self.load_scalar(&args[0], V1);
@@ -3658,8 +3718,13 @@ impl FnGen {
             }
             crate::ssa::OP_ALLOC => {
                 let t = match &v.aux { crate::ssa::Aux::Ty(t) => *t, _ => return };
-                let ns = self.noscan(t);
-                self.call_alloc(v.aux_int, ns);
+                let (mask, words) = self.ptr_mask(t);
+                if mask == 0 || words == 0 {
+                    self.call_alloc(v.aux_int, mask == 0);
+                } else {
+                    m.mov_imm(V1, v.aux_int);
+                    self.call_alloc_typed(mask, words);
+                }
             }
             crate::ssa::OP_SELECT => {
                 let t = v.args[0];
