@@ -396,6 +396,16 @@ pub fn scan_g(gp: usize, cyc: usize, dst: usize) -> bool {
     let g = gp as *mut G;
     unsafe {
         if (*g).status == DEAD || (*g).is_g0 || (*g).scan_cyc == cyc { return true; }
+        if g as usize == current() as usize {
+            // Its own (an assist): now, from here up, its registers too.
+            let r = calloc(10, 8) as usize;
+            crate::rt::spill_registers(r as *mut usize);
+            scan_stack_into(crate::rt::stack_pointer() as usize, crate::rt::frame_address() as usize, (*g).stack_hi, dst);
+            crate::rt::gc::scan_into(r, r + 80, dst);
+            free(r as *mut u8);
+            (*g).scan_cyc = cyc;
+            return true;
+        }
         if crate::rt::atomic_cas(&mut (*g).running_on as *mut usize, 0, SCANNING) {
             if (*g).status != DEAD && (*g).scan_cyc != cyc {
                 scan_saved(g, dst);
@@ -409,7 +419,7 @@ pub fn scan_g(gp: usize, cyc: usize, dst: usize) -> bool {
                 scan_saved(g, dst);
                 (*g).scan_cyc = cyc;
             }
-            crate::rt::atomic_store(&mut (*g).sys as *mut usize, SYS_BLOCKED);
+            if !crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_SCANNING, SYS_BLOCKED) { crate::rt::native::fatal("scan_g: a scanned G's state changed"); }
             return true;
         }
         (*g).scan_req = cyc;
@@ -1391,7 +1401,27 @@ pub fn exit_blocked() {
             // anything else is a lost state (it would wait forever, holding
             // what it holds).
             let st = crate::rt::atomic_load(&mut (*g).sys as *mut usize);
-            if st != SYS_CLAIMED && st != SYS_SCANNING { crate::rt::native::fatal("exit_blocked: the G is not blocked"); }
+            // (Blocked again: a marker's scan ended meanwhile; try again.)
+            if st != SYS_CLAIMED && st != SYS_SCANNING && st != SYS_BLOCKED {
+                crate::rt::native::put(2, "exit_blocked: sys ");
+                crate::rt::native::put_u64(2, st as u64);
+                crate::rt::native::put(2, " g ");
+                crate::rt::native::put_hex(2, g as u64);
+                crate::rt::native::put(2, " running_on ");
+                crate::rt::native::put_hex(2, (*g).running_on as u64);
+                crate::rt::native::put(2, " m ");
+                crate::rt::native::put_hex(2, (*g).m as u64);
+                crate::rt::native::put(2, " cb_prev ");
+                crate::rt::native::put_hex(2, (*g).cb_prev as u64);
+                crate::rt::native::put(2, " status ");
+                crate::rt::native::put_u64(2, (*g).status as u64);
+                crate::rt::native::put(2, " stw ");
+                crate::rt::native::put_u64(2, STW as u64);
+                crate::rt::native::put(2, " owner ");
+                crate::rt::native::put_hex(2, STW_OWNER as u64);
+                crate::rt::native::put(2, "\n");
+                crate::rt::native::fatal("exit_blocked: the G is not blocked");
+            }
             os_yield();
         }
         // Another M took over meanwhile: this one counts again (find_runnable
@@ -3119,7 +3149,10 @@ pub fn stop_the_world() {
                 let g = (*m).cur;
                 if g as usize != 0 && g as usize != me as usize {
                     let st = crate::rt::atomic_load(&mut (*g).sys as *mut usize);
-                    if st == SYS_RUNNING {
+                    // (One a marker is scanning goes back to blocked, then is
+                    // claimed: else it could go on running once the marker
+                    // lets it go.)
+                    if st == SYS_RUNNING || st == SYS_SCANNING {
                         waiting += 1;
                     } else if st == SYS_BLOCKED {
                         if !crate::rt::atomic_cas(&mut (*g).sys as *mut usize, SYS_BLOCKED, SYS_CLAIMED) { waiting += 1; }
