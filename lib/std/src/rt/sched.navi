@@ -142,6 +142,10 @@ pub struct G {
     // (it was running; see morestack).
     scan_cyc: usize,
     scan_req: usize,
+    // Where its print output and panic messages go: a test's captured
+    // output (see native::capture_new; 0: the standard streams). A G it
+    // starts inherits it.
+    capture: usize,
 }
 
 // G.sys: running navi code; blocked in C (a system call or waiting for the
@@ -473,6 +477,7 @@ pub fn go(f: fn()) { go_on(f, false); }
 pub fn go_marker(f: fn()) { go_on(f, true); }
 
 fn go_on(f: fn(), marker: bool) {
+    let capture = if marker { 0 } else { output_capture() };
     lock();
     let mut g = FREE_GS as *mut G;
     if g as usize != 0 {
@@ -514,6 +519,7 @@ fn go_on(f: fn(), marker: bool) {
         // (Its stack is empty: scanned for a mark that runs.)
         (*g).scan_cyc = crate::rt::gc::cycle_no();
         (*g).scan_req = 0;
+        (*g).capture = capture;
         NEXT_TID += 1;
         (*g).tid = NEXT_TID;
     }
@@ -2076,7 +2082,9 @@ pub fn stack_bytes() -> usize {
     let mut g = ALL as *mut G;
     while g as usize != 0 {
         unsafe {
-            if !(*g).main { n += (*g).stack_hi - (*g).stack_lo + (*g).old_size; }
+            // (Read without the lock: a G may be moving its stack.)
+            let (lo, hi) = ((*g).stack_lo, (*g).stack_hi);
+            if !(*g).main && hi > lo { n += hi - lo + (*g).old_size; }
             g = (*g).all_next;
         }
     }
@@ -2203,6 +2211,7 @@ pub fn cb_enter(mp: usize) {
             while !crate::rt::atomic_cas(&mut (*g).running_on as *mut usize, 0, mp) { os_yield(); }
         }
         (*g).tid = (*prev).tid;
+        (*g).capture = (*prev).capture;
         (*g).catch = 0;
         (*g).sys = SYS_RUNNING;
         (*g).status = RUNNING;
@@ -2269,6 +2278,7 @@ fn exit_current() -> ! {
         // cache as the collector emptied it (the object was handed out
         // twice).
         (*g).entry = || {};
+        (*g).capture = 0;
         (*g).status = DEAD;
     }
     stop_current(AFTER_EXIT);
@@ -2560,6 +2570,16 @@ pub fn preempt_on() { unsafe { (*current()).nopreempt -= 1; } }
 static mut NEXT_TID: u64 = 1;
 
 /// The running G's std::thread::ThreadId.
+/// The running G's output capture (0: none; see G.capture).
+pub fn output_capture() -> usize {
+    let g = current();
+    if g as usize == 0 { return 0; }
+    unsafe { if (*g).is_g0 { 0 } else { (*g).capture } }
+}
+
+/// Sets the running G's output capture (0: none).
+pub fn set_output_capture(c: usize) { unsafe { (*current()).capture = c; } }
+
 pub fn current_id() -> u64 {
     let g = current();
     if g as usize == 0 { return 1; } // before the scheduler starts
@@ -2673,8 +2693,14 @@ pub fn morestack() -> usize {
     unsafe {
         if (*g).stack_hi == 0 { return 0; } // a thread's scheduler record: no limit
         // Entered from inside morestack (the collector poisoned the limit):
-        // the outer one stops the G at the next prologue if need be.
-        if (*g).ms_depth > 1 { return 0; }
+        // the outer one stops the G at the next prologue if need be. The
+        // stub cleared the limit, which the outer one may have set already:
+        // poisoned, the next prologue comes here again and sets it (else the
+        // G ran on without a limit, and a large frame went past its stack).
+        if (*g).ms_depth > 1 {
+            crate::rt::atomic_store(&mut (*g).guard as *mut usize, POISON);
+            return 0;
+        }
         // Between enter_blocked and the call that blocks (a function's
         // prologue): the G runs navi code again until morestack is done (a
         // collector waits for it rather than scanning a stack that may move)
@@ -2753,7 +2779,7 @@ pub fn morestack() -> usize {
         } else if !poll && (*g).entry_sp < (*g).stack_lo + RED_ZONE + (*g).need || stress {
             if (*g).main || (*g).is_g0 { crate::rt::native::fatal("stack overflow"); }
             if owner { crate::rt::native::fatal("the collector ran out of stack while the world was stopped"); }
-            delta = grow(g);
+            delta = grow(g, !was_blocked && (*g).cb_stack == 0);
         } else if (*g).shrink != 0 && !poll && !was_blocked && !owner && !(*g).main && !(*g).is_g0 && (*g).cb_stack == 0 {
             // A collection found most of the stack unused (a loop's check
             // leaves it for a prologue's; the next collection asks again).
@@ -2822,7 +2848,7 @@ fn preemptible(poll: bool, entry_sp: usize) -> bool {
 /// FPs, addresses of locals, the registers the stub saved) is moved as
 /// much, as are the catch_unwind records (on the heap). Nothing else
 /// points into a stack: escape analysis keeps such locals on the heap.
-fn grow(g: *mut G) -> usize {
+fn grow(g: *mut G, may_shrink: bool) -> usize {
     unsafe {
         let lo = (*g).stack_lo;
         let hi = (*g).stack_hi;
@@ -2856,8 +2882,9 @@ fn grow(g: *mut G) -> usize {
         }
         let used = hi - sp;
         let mut size = hi - lo;
-        // (NAVI_STACKMOVE: a move the collector asked for shrinks too.)
-        if STACKMOVE && (*g).shrink != 0 && size / 2 >= STACK && used + (*g).need + RED_ZONE + 4096 <= size / 4 { return move_stack(g, size / 2); }
+        // (NAVI_STACKMOVE: a move the collector asked for shrinks too, where
+        // shrink would: not in a blocked window nor on a callback's stack.)
+        if STACKMOVE && may_shrink && (*g).shrink != 0 && size / 2 >= STACK && used + (*g).need + RED_ZONE + 4096 <= size / 4 { return move_stack(g, size / 2); }
         if !(STACKMOVE && size >= used + (*g).need + RED_ZONE + 4096) {
             loop {
                 size = size * 2;

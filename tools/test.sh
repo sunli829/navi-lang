@@ -83,8 +83,10 @@ for f in tests/ui/*.navi; do
 done
 # navi test and navi bench on a crate with passing and failing tests.
 set +e
-got_out=$("$navi" test tests/harness 2>/dev/null)
+"$navi" test tests/harness > "$tmp/harness.out" 2>/dev/null
 code=$?
+# (A failed test's panic message names its file by its full path.)
+got_out=$(grep -v ' panicked at ' "$tmp/harness.out")
 set -e
 if [ "$got_out" = "$(cat tests/harness/expected.out)" ] && [ "$code" = 1 ]; then
 	echo "ok   navi test tests/harness"

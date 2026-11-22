@@ -1,58 +1,142 @@
 //! The harnesses of navi test and navi bench: the compiler generates an
 //! entry function that passes the #[test] or #[bench] functions here. The
-//! first command line argument, if any, selects the names containing it.
+//! first command line argument that is not an option, if any, selects the
+//! names containing it.
+//!
+//! Tests run in parallel as Rust's harness runs them: on
+//! --test-threads=N threads (NAVI_TEST_THREADS, else as many as the
+//! scheduler's), each test's print output and panic messages captured
+//! (and threads it starts) and shown only if it fails; --nocapture
+//! (NAVI_TEST_NOCAPTURE) prints them as they come. The results are printed
+//! in the tests' order.
 
 use crate::bench::Bencher;
 
-fn selected(name: &str) -> bool {
-    match crate::env::args().nth(1) {
+// The harness's options: the name filter, the threads, whether output is
+// captured.
+struct Options {
+    filter: Option<String>,
+    threads: usize,
+    capture: bool,
+}
+
+fn options() -> Options {
+    let mut o = Options { filter: None, threads: 0, capture: crate::env::var("NAVI_TEST_NOCAPTURE").is_err() };
+    if let Ok(v) = crate::env::var("NAVI_TEST_THREADS") {
+        if let Ok(n) = v.parse::<usize>() { o.threads = n; }
+    }
+    for a in crate::env::args().skip(1) {
+        if let Some(v) = a.strip_prefix("--test-threads=") {
+            match v.parse::<usize>() {
+                Ok(n) if n > 0 => o.threads = n,
+                _ => {
+                    eprintln(`--test-threads: not a positive number: ${v}`);
+                    crate::process::exit(2);
+                }
+            }
+        } else if a == "--nocapture" || a == "--no-capture" {
+            o.capture = false;
+        } else if o.filter.is_none() {
+            o.filter = Some(a.clone());
+        }
+    }
+    if o.threads == 0 {
+        o.threads = match crate::thread::available_parallelism() { Ok(n) => n, Err(_) => 1 };
+    }
+    o
+}
+
+fn selected(o: &Options, name: &str) -> bool {
+    match &o.filter {
         Some(f) => name.contains(f.as_str()),
         None => true,
     }
 }
 
-/// Runs each test, catching panics; exits with 1 if any failed. panics[i]
-/// is what test i must do (as Rust's #[should_panic]): "" return, "panic:"
-/// panic, "panic:text" panic with a message containing text.
+// Runs test i; None if it passed, else why not ("" if it panicked).
+fn run_one(test: fn(), panics: &str) -> Option<String> {
+    match (crate::panic::catch_unwind(test), panics.strip_prefix("panic:")) {
+        (Ok(_), None) => None,
+        (Err(_), None) => Some(String::new()),
+        (Ok(_), Some(_)) => Some("test did not panic as expected".to_string()),
+        (Err(p), Some(want)) => {
+            if p.message().contains(want) { None } else {
+                Some(`panic did not contain expected string\n      panic message: ${p.message():?}\n expected substring: ${want:?}`.to_string())
+            }
+        }
+    }
+}
+
+/// Runs the tests (see the module's comment), catching panics; exits with
+/// 1 if any failed. panics[i] is what test i must do (as Rust's
+/// #[should_panic]): "" return, "panic:" panic, "panic:text" panic with a
+/// message containing text.
 pub fn run_tests(names: &[&str], tests: &[fn()], panics: &[&str]) {
+    let o = options();
+    let mut sel: Vec<usize> = Vec::new();
+    for i in 0..tests.len() {
+        if selected(&o, names[i]) { sel.push(i); }
+    }
+    let (work_tx, work_rx) = crate::sync::mpmc::channel::<usize>();
+    for k in 0..sel.len() { let _ = work_tx.send(k); }
+    work_tx.close();
+    let (done_tx, done_rx) = crate::sync::mpmc::channel::<(usize, Option<String>, String)>();
+    let n = if o.threads < sel.len() { o.threads } else { sel.len() };
+    let capture = o.capture;
+    let mut workers = Vec::new();
+    for _ in 0..n {
+        workers.push(crate::thread::spawn(|| {
+            for k in work_rx.iter() {
+                let i = sel[k];
+                let c = if capture { crate::rt::native::capture_new() } else { 0 };
+                crate::rt::sched::set_output_capture(c);
+                let why = run_one(tests[i], panics[i]);
+                crate::rt::sched::set_output_capture(0);
+                let out = if c != 0 { crate::rt::native::capture_take(c) } else { String::new() };
+                let _ = done_tx.send((k, why, out));
+            }
+        }));
+    }
+    // The results in the tests' order, each once it and those before it
+    // have ended.
+    let mut results: Vec<Option<(Option<String>, String)>> = Vec::new();
+    for _ in 0..sel.len() { results.push(None); }
+    let mut shown = 0;
     let mut passed = 0;
     let mut failed = 0;
-    let mut i = 0;
-    while i < tests.len() {
-        if selected(names[i]) {
-            let why = match (crate::panic::catch_unwind(tests[i]), panics[i].strip_prefix("panic:")) {
-                (Ok(_), None) => None,
-                (Err(_), None) => Some(String::new()),
-                (Ok(_), Some(_)) => Some("test did not panic as expected".to_string()),
-                (Err(p), Some(want)) => {
-                    if p.message().contains(want) { None } else {
-                        Some(`panic did not contain expected string\n      panic message: ${p.message():?}\n expected substring: ${want:?}`.to_string())
-                    }
-                }
-            };
+    for _ in 0..sel.len() {
+        let (k, why, out) = match done_rx.recv() { Ok(r) => r, Err(_) => break };
+        results[k] = Some((why, out));
+        while shown < sel.len() {
+            let (why, out) = match &results[shown] { Some(r) => r.clone(), None => break };
+            let name = names[sel[shown]];
             match why {
                 None => {
-                    println(`ok   ${names[i]}`);
+                    println(`ok   ${name}`);
                     passed += 1;
                 }
                 Some(w) => {
-                    if w.len() > 0 { println(`note: ${w}`); }
-                    println(`--- FAIL: ${names[i]}`);
+                    // (Its output indented, as go test prints a failed test's log.)
+                    println(`--- FAIL: ${name}`);
+                    for line in out.lines() { println(`    ${line}`); }
+                    if w.len() > 0 { println(`    note: ${w}`); }
                     failed += 1;
                 }
             }
+            shown += 1;
         }
-        i += 1;
     }
+    for w in workers.iter() { let _ = w.join(); }
     println(`${passed} passed, ${failed} failed`);
     if failed > 0 { crate::process::exit(1); }
 }
 
 /// Runs each benchmark and prints the time per iteration.
 pub fn run_benches(names: &[&str], plain: &[fn()], bnames: &[&str], with_b: &[fn(&mut Bencher)]) {
+    let o = options();
     let mut i = 0;
     while i < plain.len() {
-        if selected(names[i]) {
+        if selected(&o, names[i]) {
             let f = plain[i];
             let mut b = Bencher::new();
             b.iter(|| f());
@@ -62,7 +146,7 @@ pub fn run_benches(names: &[&str], plain: &[fn()], bnames: &[&str], with_b: &[fn
     }
     i = 0;
     while i < with_b.len() {
-        if selected(bnames[i]) {
+        if selected(&o, bnames[i]) {
             let mut b = Bencher::new();
             with_b[i](&mut b);
             report(bnames[i], &b);
