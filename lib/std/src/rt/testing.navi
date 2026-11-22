@@ -8,7 +8,9 @@
 //! scheduler's), each test's print output and panic messages captured
 //! (and threads it starts) and shown only if it fails; --nocapture
 //! (NAVI_TEST_NOCAPTURE) prints them as they come. The results are printed
-//! in the tests' order.
+//! in the tests' order. With NAVI_TEST_TIMEOUT=ns (navi test's -timeout)
+//! a program still running then prints the tests that run, their output so
+//! far and the goroutines, and exits (as go test's -timeout panics).
 
 use crate::bench::Bencher;
 
@@ -83,15 +85,25 @@ pub fn run_tests(names: &[&str], tests: &[fn()], panics: &[&str]) {
     let (done_tx, done_rx) = crate::sync::mpmc::channel::<(usize, Option<String>, String)>();
     let n = if o.threads < sel.len() { o.threads } else { sel.len() };
     let capture = o.capture;
+    // Each test's capture while it runs (1 if not captured; for the timeout).
+    let mut running: Vec<usize> = Vec::new();
+    for _ in 0..sel.len() { running.push(0); }
+    if let Ok(v) = crate::env::var("NAVI_TEST_TIMEOUT") {
+        if let Ok(ns) = v.parse::<u64>() {
+            if ns > 0 { watchdog(ns, names, &sel, &running); }
+        }
+    }
     let mut workers = Vec::new();
     for _ in 0..n {
         workers.push(crate::thread::spawn(|| {
             for k in work_rx.iter() {
                 let i = sel[k];
                 let c = if capture { crate::rt::native::capture_new() } else { 0 };
+                running[k] = if c != 0 { c } else { 1 };
                 crate::rt::sched::set_output_capture(c);
                 let why = run_one(tests[i], panics[i]);
                 crate::rt::sched::set_output_capture(0);
+                running[k] = 0;
                 let out = if c != 0 { crate::rt::native::capture_take(c) } else { String::new() };
                 let _ = done_tx.send((k, why, out));
             }
@@ -129,6 +141,31 @@ pub fn run_tests(names: &[&str], tests: &[fn()], panics: &[&str]) {
     for w in workers.iter() { let _ = w.join(); }
     println(`${passed} passed, ${failed} failed`);
     if failed > 0 { crate::process::exit(1); }
+}
+
+// After ns: the tests running (their output so far), the goroutines, exit.
+fn watchdog(ns: u64, names: &[&str], sel: &Vec<usize>, running: &Vec<usize>) {
+    let _ = crate::thread::spawn(|| {
+        crate::thread::sleep(crate::time::Duration::from_nanos(ns));
+        timed_out(ns, names, sel, running);
+    });
+}
+
+fn timed_out(ns: u64, names: &[&str], sel: &Vec<usize>, running: &Vec<usize>) {
+    let mut text = `panic: test timed out after ${ns / 1000000000}s\nrunning tests:\n`.to_string();
+    for k in 0..sel.len() {
+        if running[k] != 0 { text.push_str(`\t${names[sel[k]]}\n`.to_string().as_str()); }
+    }
+    for k in 0..sel.len() {
+        let c = running[k];
+        if c > 1 {
+            text.push_str(`--- output of ${names[sel[k]]}:\n`.to_string().as_str());
+            for line in crate::rt::native::capture_peek(c).lines() { text.push_str(`    ${line}\n`.to_string().as_str()); }
+        }
+    }
+    eprint(text);
+    crate::rt::sched::dump_goroutines();
+    crate::process::exit(2);
 }
 
 /// Runs each benchmark and prints the time per iteration.
