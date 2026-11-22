@@ -56,16 +56,10 @@ match_diags() {
 		END { for (i = 1; i <= n; i++) if (!used[i]) { print "missing: " line[i] ": " kind[i] " " text[i]; bad = 1 } exit bad }' \
 		"$tmp/diag.want" "$tmp/diag.got" > "$tmp/diag.diff"
 }
-# tests/run: files of #[test] functions; navi test runs them, all must pass.
-for f in tests/run/*.navi; do
-	set +e
-	# A hung test fails after 5 minutes (perl's alarm: macOS has no timeout
-	# command).
-	got=$(perl -e 'alarm(300); exec(@ARGV)' "$navi" test "$f" 2>&1)
-	code=$?
-	set -e
-	if [ "$code" = 0 ]; then echo "ok   $f ($(echo "$got" | tail -1))"; else echo "FAIL $f (navi test, exit $code)"; echo "$got" | grep -v '^ok ' | head -30; fail=1; fi
-done
+# tests/run: files of #[test] functions; navi test runs them (in parallel,
+# each file's output printed when it ends), all must pass. A hung test
+# fails after 5 minutes.
+"$navi" test -timeout 5m tests/run/*.navi || fail=1
 # tests/ui: navi build reports exactly the annotated errors and warnings;
 # a file without ERROR annotations builds.
 for f in tests/ui/*.navi; do

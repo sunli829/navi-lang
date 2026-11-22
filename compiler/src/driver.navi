@@ -138,6 +138,9 @@ pub fn load_crate(path: &str) -> Result<&mut CrateSpec, String> {
 }
 
 static mut TIMINGS: bool = false;
+// navi test's -timeout: a test program running longer is killed (0: none).
+static mut TIMEOUT_NS: u64 = 600000000000;
+static mut TIMEOUT_TEXT: String = "10m".to_string();
 static mut PHASE_START: u64 = 0;
 static mut PHASE_CPU: u64 = 0;
 
@@ -592,35 +595,186 @@ fn chmod_x(path: &str) {
     let _ = std::process::Command::new("chmod").arg("755").arg(path).status();
 }
 
-/// navi test|bench [-p name] [--no-run] [dir or file] [filter]: builds the #[test]
-/// (or #[bench]) functions of each crate (as navi build chooses them) with
-/// cfg(test) into a harness and runs the ones whose name contains filter;
-/// then (navi test) each file of the crate's tests/ directory as a crate of
-/// its own (as Cargo's integration tests), using the crate if it is a
-/// library, with NAVI_BIN_EXE_name naming its program if it is one.
+/// navi test|bench [-p name] [--no-run] [-j N] [-timeout d] [dir or file ...] [filter]:
+/// builds the #[test] (or #[bench]) functions of each crate (as navi build
+/// chooses them) with cfg(test) into a harness and runs the ones whose name
+/// contains filter; then (navi test) each file of the crate's tests/
+/// directory as a crate of its own (as Cargo's integration tests), using
+/// the crate if it is a library, with NAVI_BIN_EXE_name naming its program
+/// if it is one. The harnesses are cached as navi build's programs.
 /// --no-run builds the test programs and prints where they are (as cargo
 /// test --no-run), for running them elsewhere.
+///
+/// With more than one path (the last argument is the filter if it is not a
+/// file or directory), navi test tests them in processes of their own, N at
+/// a time (-j; the number of CPUs by default), printing each one's output
+/// when it ends, in the paths' order, as go test does with packages: "ok"
+/// and the summary if it passed, all of it and "FAIL" if not. A test
+/// program running longer than -timeout (10m by default, as go test's; 0
+/// for none) is killed.
 pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
     let mut rest: Vec<String> = Vec::new();
     let mut package = String::new();
     let mut no_run = false;
+    let mut jobs = match std::thread::available_parallelism() { Ok(n) => n, Err(_) => 1 };
+    // Passed on to the processes testing one path each.
+    let mut pass: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--release" => { eprintln(RELEASE_GONE); return 2; }
             "-timings" => TIMINGS = true,
-            "--no-run" => no_run = true,
+            "--no-run" => {
+                no_run = true;
+                pass.push(args[i].clone());
+            }
             "-p" if i + 1 < args.len() => {
                 package = args[i + 1].clone();
+                pass.push(args[i].clone());
+                pass.push(args[i + 1].clone());
+                i += 1;
+            }
+            "-j" | "--jobs" if i + 1 < args.len() => {
+                jobs = match args[i + 1].parse::<usize>() {
+                    Ok(n) if n > 0 => n,
+                    _ => { eprintln(`${args[i]}: not a positive number: ${args[i + 1]}`); return 2; }
+                };
+                i += 1;
+            }
+            "-timeout" if i + 1 < args.len() => {
+                TIMEOUT_NS = match parse_duration(args[i + 1].as_str()) {
+                    Some(n) => n,
+                    None => { eprintln(`-timeout: not a duration (as 90s, 10m or 1h30m): ${args[i + 1]}`); return 2; }
+                };
+                TIMEOUT_TEXT = args[i + 1].clone();
+                pass.push(args[i].clone());
+                pass.push(args[i + 1].clone());
                 i += 1;
             }
             _ => rest.push(args[i].clone()),
         }
         i += 1;
     }
-    let path = if rest.len() > 0 { rest[0].clone() } else { ".".to_string() };
-    let filter = if rest.len() > 1 { rest[1].clone() } else { String::new() };
-    let us = match units(path.as_str(), package.as_str()) {
+    let mut paths: Vec<String> = Vec::new();
+    let mut filter = String::new();
+    for (k, a) in rest.iter().enumerate() {
+        if k > 0 && k + 1 == rest.len() && !Path::new(a.as_str()).exists() { filter = a.clone(); } else { paths.push(a.clone()); }
+    }
+    if paths.len() == 0 { paths.push(".".to_string()); }
+    if filter.len() > 0 { pass.push(filter.clone()); }
+    if paths.len() > 1 && jobs > 1 && !bench { return test_parallel(&paths, &pass, jobs); }
+    let mut code = 0;
+    for path in paths.iter() {
+        let c = test_path(path.as_str(), package.as_str(), filter.as_str(), bench, no_run);
+        if c != 0 { code = c; }
+    }
+    code
+}
+
+// The nanoseconds of a duration as go test's -timeout takes it: numbers
+// each with a unit (ms, s, m or h), as 90s or 1h30m.
+fn parse_duration(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    let mut total: u64 = 0;
+    let mut i = 0;
+    if b.len() == 0 { return None; }
+    if s == "0" { return Some(0); }
+    while i < b.len() {
+        let start = i;
+        while i < b.len() && b[i] >= b'0' && b[i] <= b'9' { i += 1; }
+        if i == start { return None; }
+        let n = match s[start..i].parse::<u64>() { Ok(n) => n, Err(_) => return None };
+        let u = i;
+        while i < b.len() && (b[i] < b'0' || b[i] > b'9') { i += 1; }
+        let unit: u64 = match &s[u..i] {
+            "ms" => 1000000,
+            "s" => 1000000000,
+            "m" => 60000000000,
+            "h" => 3600000000000,
+            _ => return None,
+        };
+        total += n * unit;
+    }
+    Some(total)
+}
+
+// Tests each of paths with "navi test path pass..." in a process of its
+// own, jobs at a time; prints each one's output (stdout and stderr in one
+// file, in the order written) when it and those before it have ended.
+fn test_parallel(paths: &Vec<String>, pass: &Vec<String>, jobs: usize) -> i32 {
+    let me = match exe_path() {
+        Some(p) => p,
+        None => { eprintln("navi test: cannot find navi's own path"); return 1; }
+    };
+    let dir = util::path_join(std::env::temp_dir().to_str().unwrap(), `navi-tests-${std::process::id()}`.to_string().as_str());
+    if let Err(e) = std::fs::create_dir_all(dir.as_str()) {
+        eprintln(`${dir}: ${e}`);
+        return 1;
+    }
+    let (work_tx, work_rx) = std::sync::mpmc::channel::<usize>();
+    for i in 0..paths.len() { let _ = work_tx.send(i); }
+    work_tx.close();
+    let (done_tx, done_rx) = std::sync::mpmc::channel::<(usize, i32, String, f64)>();
+    let n = if jobs < paths.len() { jobs } else { paths.len() };
+    for _ in 0..n {
+        std::thread::spawn(|| {
+            for i in work_rx.iter() {
+                let out = util::path_join(dir.as_str(), `${i}.out`.to_string().as_str());
+                let start = std::time::Instant::now();
+                let code = match std::fs::File::create(out.as_str()) {
+                    Ok(f) => {
+                        let mut cmd = std::process::Command::new(me.as_str());
+                        cmd.arg("test").arg(paths[i].as_str());
+                        for a in pass.iter() { cmd.arg(a.as_str()); }
+                        cmd.stdin(std::process::Stdio::null());
+                        cmd.stdout(f);
+                        cmd.stderr(f);
+                        let c = match cmd.status() {
+                            Ok(s) => match s.code() { Some(c) => c, None => 1 },
+                            Err(e) => { eprintln(`${me}: ${e}`); 1 }
+                        };
+                        let mut f2 = f;
+                        f2.close();
+                        c
+                    }
+                    Err(e) => { eprintln(`${out}: ${e}`); 1 }
+                };
+                let text = match std::fs::read_to_string(out.as_str()) { Ok(t) => t, Err(_) => String::new() };
+                let _ = std::fs::remove_file(out.as_str());
+                let _ = done_tx.send((i, code, text, start.elapsed().as_secs_f64()));
+            }
+        });
+    }
+    let mut results: Vec<Option<(i32, String, f64)>> = Vec::new();
+    for _ in 0..paths.len() { results.push(None); }
+    let mut shown = 0;
+    let mut code = 0;
+    for _ in 0..paths.len() {
+        let (i, c, text, secs) = match done_rx.recv() { Ok(r) => r, Err(_) => break };
+        results[i] = Some((c, text, secs));
+        while shown < paths.len() {
+            let (c, text, secs) = match &results[shown] { Some(r) => r.clone(), None => break };
+            let t = text.trim_end();
+            if c == 0 {
+                let last = match t.rfind('\n') { Some(k) => &t[k + 1..], None => t };
+                println(`ok   ${paths[shown]} (${last}; ${secs:.2}s)`);
+            } else {
+                if t.len() > 0 { println(t); }
+                println(`FAIL ${paths[shown]} (exit ${c}; ${secs:.2}s)`);
+                code = 1;
+            }
+            shown += 1;
+        }
+    }
+    let _ = std::fs::remove_dir(dir.as_str());
+    code
+}
+
+// navi test on one path (a file or a project's directory).
+fn test_path(path_s: &str, package: &str, filter_s: &str, bench: bool, no_run: bool) -> i32 {
+    let path = path_s.to_string();
+    let filter = filter_s.to_string();
+    let us = match units(path.as_str(), package) {
         Ok(u) => u,
         Err(e) => { eprintln(e); return 1; }
     };
@@ -691,10 +845,93 @@ fn test_files(dir: &str) -> Vec<String> {
 // as Cargo's), printed for a project's crates. no_run: only built, its
 // path printed ("Executable label (path)").
 fn run_harness(specs: Vec<&CrateSpec>, name: &str, label: &str, filter: &str, bench: bool, env: &Vec<(String, String)>, announce: bool, no_run: bool) -> i32 {
+    let attr = if bench { "bench" } else { "test" };
+    let ext = if target_os() == "windows" { ".exe" } else { "" };
+    // The executable's name is the same every time (a Mach-O executable's
+    // code signature names it, and a cached one is reused as it is); a
+    // directory of the process's own keeps runs apart.
+    let tmp = std::env::temp_dir().to_str().unwrap().to_string();
+    let dir = if no_run { tmp.clone() } else { util::path_join(tmp.as_str(), `navi-${attr}-${std::process::id()}`.to_string().as_str()) };
+    if let Err(e) = std::fs::create_dir_all(dir.as_str()) {
+        eprintln(`${dir}: ${e}`);
+        return 1;
+    }
+    let exe = util::path_join(dir.as_str(), `navi-${attr}-${name}${ext}`.to_string().as_str());
+    let mut opts = `harness ${attr} target=${target_name()} name=${util::path_base(exe.as_str())}`.to_string();
+    for s in specs.iter() { opts.push_str(`\n${s.name} ${s.fs_root} ${s.root} ${s.deps:?}`.to_string().as_str()); }
+    let last = specs[specs.len() - 1];
+    let key = crate::cache::key(opts.as_str(), util::path_join(last.fs_root.as_str(), last.root.as_str()).as_str());
+    let cached = match &key {
+        Some(k) => crate::cache::lookup(k.as_str(), exe.as_str()),
+        None => false,
+    };
+    if cached {
+        chmod_x(exe.as_str());
+        phase("cached");
+    } else {
+        let c = build_harness(specs, name, bench, exe.as_str(), key);
+        if c != 0 { return c; }
+    }
+    if no_run {
+        eprintln(`  Executable ${label} (${exe})`);
+        return 0;
+    }
+    if announce { eprintln(`     Running ${label}`); }
+    let mut cmd = std::process::Command::new(exe.as_str());
+    if filter.len() > 0 { cmd.arg(filter); }
+    // The tests can build programs with navi (as Cargo sets CARGO).
+    for (k, v) in env.iter() { cmd.env(k.as_str(), v.as_str()); }
+    let code = run_timed(&mut cmd, label);
+    let _ = std::fs::remove_file(exe.as_str());
+    let _ = std::fs::remove_dir(dir.as_str());
+    code
+}
+
+// Runs cmd to its end, killing it after TIMEOUT_NS (as go test's -timeout);
+// its exit code.
+fn run_timed(cmd: &mut std::process::Command, label: &str) -> i32 {
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln(`${label}: ${e}`);
+            return 1;
+        }
+    };
+    let mut done = false;
+    let mut timed_out = false;
+    let ns = TIMEOUT_NS;
+    if ns > 0 {
+        let victim = child;
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_nanos(ns));
+            if !done {
+                timed_out = true;
+                let mut c = victim;
+                let _ = c.kill();
+            }
+        });
+    }
+    let st = child.wait();
+    done = true;
+    if timed_out {
+        eprintln(`${label}: timed out after ${TIMEOUT_TEXT}`);
+        return 1;
+    }
+    match st {
+        Ok(s) => match s.code() { Some(c) => c, None => 1 },
+        Err(e) => { eprintln(`${label}: ${e}`); 1 }
+    }
+}
+
+// Checks specs with cfg(test) and builds the harness of crate name's
+// #[test] (or #[bench]) functions into exe, cached under key; 0 if built.
+fn build_harness(specs: Vec<&CrateSpec>, name: &str, bench: bool, exe: &str, key: Option<String>) -> i32 {
     let mut cfg = host_config();
     cfg.test = true;
     let (info, errs) = check_specs(cfg, &specs);
-    if report(&errs) { return 1; }
+    let (warnings, failed) = diagnostics(&errs);
+    if warnings.len() > 0 { eprintln(warnings); }
+    if failed { return 1; }
     let attr = if bench { "bench" } else { "test" };
     let mut fns: Vec<&mut resolve::Def> = Vec::new();
     for d in info.res.defs.iter() {
@@ -715,32 +952,13 @@ fn run_harness(specs: Vec<&CrateSpec>, name: &str, label: &str, filter: &str, be
             fns.push(*d);
         }
     }
-    let ext = if target_os() == "windows" { ".exe" } else { "" };
-    let exe = if no_run {
-        util::path_join(std::env::temp_dir().to_str().unwrap(), `navi-${attr}-${name}${ext}`.to_string().as_str())
-    } else {
-        util::path_join(std::env::temp_dir().to_str().unwrap(), `navi-${attr}-${name}-${std::process::id()}${ext}`.to_string().as_str())
-    };
     let entry = &Entry { main: None, tests: fns, bench };
-    if let Err(e) = native(info, entry, exe.as_str(), true) {
+    if let Err(e) = native(info, entry, exe, true) {
         eprintln(e);
         return 1;
     }
-    if no_run {
-        eprintln(`  Executable ${label} (${exe})`);
-        return 0;
-    }
-    if announce { eprintln(`     Running ${label}`); }
-    let mut cmd = std::process::Command::new(exe.as_str());
-    if filter.len() > 0 { cmd.arg(filter); }
-    // The tests can build programs with navi (as Cargo sets CARGO).
-    for (k, v) in env.iter() { cmd.env(k.as_str(), v.as_str()); }
-    let st = cmd.status();
-    let _ = std::fs::remove_file(exe.as_str());
-    match st {
-        Ok(s) => match s.code() { Some(c) => c, None => 1 },
-        Err(e) => { eprintln(`${exe}: ${e}`); 1 }
-    }
+    if let Some(k) = key { crate::cache::store(k.as_str(), exe, warnings.as_str()); }
+    0
 }
 
 /// navi update [dir]: resolves the git dependencies' tags again (and

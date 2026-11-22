@@ -339,7 +339,7 @@ pub use crate::parser::Ast;                 // 重新导出
   - 一个 crate 就是一个带 `navi.toml` 的目录，`[package]` 的 `name` 必填（字母、数字、`_`、`-`，不以数字开头；代码里 `-` 写成 `_`）。navi 从当前目录（或命令给的目录）往上找最近的 `navi.toml`
   - 单个 `.navi` 文件不需要 `navi.toml`，可以直接 `navi build x.navi` / `navi run x.navi` / `navi test x.navi`（同 `go run x.go`），但不能有依赖
   - `navi new 名字` / `navi init`（`--lib` 建库，`--vcs none` 不建 git 仓库）创建 crate：`navi.toml`、`src/main.navi`（或 `src/lib.navi`）、`.gitignore`，不在 git 仓库里时 `git init`
-  - `navi build` 把程序写到项目根目录的 `target/名字`（`-o` 另指），库只做检查；`navi run [-- 参数]` 构建并运行；`navi test` 运行单元测试（`#[test]`）和 `tests/*.navi` 集成测试：集成测试每个文件是一个单独的 crate，能用本 crate 的依赖，本 crate 是库时还能 `use` 它，是程序时环境变量 `NAVI_BIN_EXE_名字` 是它的路径（同 Cargo 的 `CARGO_BIN_EXE_`）
+  - `navi build` 把程序写到项目根目录的 `target/名字`（`-o` 另指），库只做检查；`navi run [-- 参数]` 构建并运行；`navi test` 运行单元测试（`#[test]`）和 `tests/*.navi` 集成测试：集成测试每个文件是一个单独的 crate，能用本 crate 的依赖，本 crate 是库时还能 `use` 它，是程序时环境变量 `NAVI_BIN_EXE_名字` 是它的路径（同 Cargo 的 `CARGO_BIN_EXE_`）。`navi test a.navi b.navi dir ...` 可以给多个路径（最后一个参数不是文件或目录时是过滤串），照 `go test` 每个路径一个进程并行（`-j N`，默认 CPU 数），按路径顺序打印结果；`-timeout 时长`（默认 10m，`0` 不限）超时的测试程序被杀掉；测试程序和 `navi build` 一样走构建缓存
 - **workspace**（同 Cargo）：根目录的 `navi.toml` 写 `[workspace]`：
 
   ```toml
