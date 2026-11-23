@@ -1,0 +1,195 @@
+//! Several objects as one (docs/crates.md): each crate's code is an object
+//! of its own; before linking they become one object, which the linkers
+//! (Mach-O, ELF, PE) take as before.
+//!
+//! - Sections are concatenated (each part's aligned), symbols and
+//!   relocations moved with them.
+//! - A part's numbered symbols (strings, locations: their names say
+//!   nothing about what they are) are its own: renamed with the part's
+//!   number. Every other name means the same thing in every part (stable
+//!   names, crate::symbols): defined in several (a generic instance, a type
+//!   descriptor or vtable each part needed), the first part's stays.
+//! - The program-wide tables are made again for the whole: the stack map
+//!   table (_navi_ftab: its entries are offsets from _navi_text0, the start
+//!   of the text, and from the start of the maps) and the range of
+//!   writable data the collector scans (_navi_data_start to
+//!   _navi_data_end).
+
+use std::collections::HashMap;
+use crate::obj::{self, Object};
+
+// Names each part defines for itself that the merged object defines once.
+fn program_wide(name: &str) -> bool {
+    name == "_navi_ftab" || name == "_navi_text0" || name == "_navi_data_start" || name == "_navi_data_end"
+}
+
+// A name numbered by the object that made it (its own, not shared).
+fn part_local(name: &str) -> bool {
+    name.starts_with("_navi_str") || name.starts_with("_navi_loc")
+}
+
+fn rd(b: &Vec<u8>, at: usize, n: usize) -> u64 {
+    let mut v = 0u64;
+    let mut i = 0;
+    while i < n {
+        v = v | (b[at + i] as u64) << (8 * i) as u32;
+        i += 1;
+    }
+    v
+}
+
+fn put(b: &mut Vec<u8>, v: u64, n: usize) {
+    let mut i = 0;
+    while i < n {
+        b.push((v >> (8 * i) as u32) as u8);
+        i += 1;
+    }
+}
+
+fn align_to(s: &mut Vec<u8>, a: usize) {
+    while s.len() % a != 0 { s.push(0); }
+}
+
+// The offset of symbol name in part p (its first definition), if defined.
+fn sym_off(p: &Object, name: &str) -> Option<u64> {
+    for s in p.syms.iter() {
+        if s.name == name { return Some(s.off); }
+    }
+    None
+}
+
+/// The parts as one object.
+pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
+    if parts.len() == 0 { return Err("merge: no objects".to_string()); }
+    let arch = parts[0].arch.clone();
+    let o = obj::new_object(arch.as_str());
+    let mut k = 0;
+    while k < obj::NUM_SECTIONS {
+        let mut a = o.align[k];
+        for p in parts.iter() { if p.align[k] > a { a = p.align[k]; } }
+        o.align[k] = a;
+        k += 1;
+    }
+    // The merged stack map table first in DATA_CONST (its entries point
+    // forward into the parts' maps). Its size: the header and every
+    // part's entries.
+    let mut nentries = 0usize;
+    let mut tables: Vec<(u64, u64, u64)> = Vec::new(); // (table offset, count, maps offset) per part
+    for p in parts.iter() {
+        match sym_off(*p, "_navi_ftab") {
+            Some(off) => {
+                let dc = p.sects[obj::DATA_CONST];
+                let n = rd(&dc, off as usize, 8);
+                let moff = rd(&dc, off as usize + 16, 8);
+                tables.push((off, n, moff));
+                nentries += n as usize;
+            }
+            None => tables.push((0, 0, 0)),
+        }
+    }
+    let mut head_len = 24 + 12 * nentries;
+    while head_len % 8 != 0 { head_len += 1; }
+    o.define("_navi_ftab", obj::DATA_CONST, 8, false);
+    o.zeros(obj::DATA_CONST, head_len as i64);
+    o.define("_navi_text0", obj::TEXT, 4, false);
+    o.define("_navi_data_start", obj::DATA, 8, false);
+    // Each part's sections, aligned; base[p][sec].
+    let mut base: Vec<Vec<u64>> = Vec::new();
+    for p in parts.iter() {
+        let mut b: Vec<u64> = Vec::new();
+        let mut s = 0;
+        while s < obj::NUM_SECTIONS {
+            let mut sect = o.sects[s];
+            align_to(&mut sect, 1usize << o.align[s]);
+            b.push(sect.len() as u64);
+            sect.extend_from_slice(p.sects[s].as_slice());
+            s += 1;
+        }
+        base.push(b);
+    }
+    o.define("_navi_data_end", obj::DATA, 8, false);
+    o.zeros(obj::DATA, 8);
+    // The merged table: [count, text start (relocated), maps offset from
+    // the table], the entries (each part's moved), the maps stay where the
+    // parts put them.
+    {
+        let mut t: Vec<u8> = Vec::new();
+        put(&mut t, nentries as u64, 8);
+        put(&mut t, 0, 8);
+        put(&mut t, head_len as u64, 8);
+        let mut pi = 0;
+        while pi < parts.len() {
+            let (toff, n, moff) = tables[pi];
+            let dc = parts[pi].sects[obj::DATA_CONST];
+            // A part's maps, from the merged table's maps base (where its
+            // header ends, which is where part 0's DATA_CONST starts).
+            let maps_at = base[pi][obj::DATA_CONST] + toff + moff - head_len as u64;
+            let mut e = 0;
+            while e < n as usize {
+                let at = toff as usize + 24 + 12 * e;
+                let fo = rd(&dc, at, 4) + base[pi][obj::TEXT];
+                let size = rd(&dc, at + 4, 4);
+                let mo = rd(&dc, at + 8, 4) + maps_at;
+                if fo > 0xffffffff || mo > 0xffffffff { return Err("merge: the text or the stack maps exceed 4 GiB".to_string()); }
+                put(&mut t, fo, 4);
+                put(&mut t, size, 4);
+                put(&mut t, mo, 4);
+                e += 1;
+            }
+            pi += 1;
+        }
+        while t.len() % 8 != 0 { t.push(0); }
+        let mut dc = o.sects[obj::DATA_CONST];
+        let mut i = 0;
+        while i < t.len() {
+            dc[i] = t[i];
+            i += 1;
+        }
+        o.reloc(obj::DATA_CONST, 8, obj::ABS64, "_navi_text0");
+    }
+    // Symbols: a part's own renamed, shared ones once (the first part's).
+    let mut defined: HashMap<String, bool> = HashMap::new();
+    for s in o.syms.iter() { defined.insert(s.name.clone(), true); }
+    let mut pi = 0;
+    while pi < parts.len() {
+        let p = parts[pi];
+        // The merged name of each of the part's names.
+        let mut names: Vec<String> = Vec::new();
+        for n in p.names.iter() {
+            if part_local(n.as_str()) { names.push(`${n}.p${pi}`.to_string()); } else { names.push(n.clone()); }
+        }
+        for s in p.syms.iter() {
+            let name = names[s.id as usize].clone();
+            if program_wide(s.name.as_str()) { continue; }
+            if defined.contains_key(&name) { continue; }
+            defined.insert(name.clone(), true);
+            o.define_at(name.as_str(), s.sec, s.off + base[pi][s.sec], s.global);
+        }
+        for r in p.relocs.iter() {
+            let id = o.id_s(&names[r.sym as usize]);
+            let off = r.off as u64 + base[pi][r.sec];
+            if off > 0xffffffff { return Err("merge: a section exceeds 4 GiB".to_string()); }
+            o.reloc_id(r.sec, off as u32, r.kind, id);
+        }
+        for (n, _) in p.undef.iter() { o.undefined(n.as_str()); }
+        for (n, l) in p.libs.iter() { o.import_from(n.as_str(), l.as_str()); }
+        // Debug information.
+        let mut fmap: Vec<u32> = Vec::new();
+        for f in p.files.iter() { fmap.push(o.file_id(f)); }
+        for l in p.lines.iter() {
+            o.lines.push(obj::Line { off: l.off + base[pi][obj::TEXT], file: fmap[l.file as usize], line: l.line });
+        }
+        for f in p.funcs.iter() {
+            o.funcs.push(obj::FuncRange { name: f.name.clone(), off: f.off + base[pi][obj::TEXT], size: f.size });
+        }
+        for (off, size, push) in p.frames.iter() {
+            o.frames.push((*off + base[pi][obj::TEXT], *size, *push));
+        }
+        pi += 1;
+    }
+    // Symbols defined by some part are not undefined.
+    let mut gone: Vec<String> = Vec::new();
+    for (n, _) in o.undef.iter() { if defined.contains_key(n) { gone.push(n.clone()); } }
+    for n in gone.iter() { o.undef.remove(n); }
+    Ok(o)
+}
