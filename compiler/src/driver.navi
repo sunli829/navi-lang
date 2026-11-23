@@ -329,37 +329,55 @@ pub fn crate_roots(info: &mut types::collect::Info, name: &str) -> Vec<&mut reso
     out
 }
 
-// NAVI_SPLIT=1: std compiled alone (every non-generic function and static,
-// with its functions' escape summaries), then the program with std's
-// non-generic functions external, the objects merged.
-// std comes from the build cache when a build (of any program) compiled
-// the same std the same way (crate::libcache).
+// NAVI_SPLIT=1: each crate the program depends on compiled alone (every
+// non-generic function and static, with its functions' escape summaries),
+// its dependencies' non-generic functions external, dependencies first;
+// then the program's crate so, its main running the crates' initializers
+// in that order; the objects merged. A crate comes from the build cache
+// when a build (of any program) compiled the same crate the same way, on
+// the same dependencies (crate::libcache).
 fn code_split(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Result<&mut crate::obj::Object, String> {
-    let root = `${util::path_clean(std_crate().fs_root.as_str())}/`.to_string();
-    let key = crate::libcache::key("std", root.as_str(), target_name().as_str(), dwarf);
-    let cached = match key { Some(k) => crate::libcache::load(k.as_str()), None => None };
-    let (lib_obj, lib_sums) = match cached {
-        Some(c) => c,
-        None => {
-            let lib_roots = crate_roots(info, "std");
-            let lib = crate::mir::build::build_program(info, Some(lib_roots.clone()), None);
-            lazy_errors(info)?;
-            let sums = lib.summaries;
-            let lib_plan = crate::codegen::build_library_plan(lib, "std", &lib_roots);
-            let o = backend(lib_plan, dwarf)?;
-            if let Some(k) = key { crate::libcache::store(k.as_str(), o, &sums); }
-            (o, sums)
+    let target = target_name();
+    let mut done: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut sums: std::collections::HashMap<String, crate::mir::escape::Summary> = std::collections::HashMap::new();
+    let mut keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut libs: Vec<&mut crate::obj::Object> = Vec::new();
+    let order = split_order(info);
+    for c in order.iter() {
+        let mut dep_keys: Vec<String> = Vec::new();
+        for (_, d) in c.deps.iter() {
+            match keys.get(&d.name) { Some(k) => dep_keys.push(`${d.name} ${k}`.to_string()), None => dep_keys.push(`${d.name} -`.to_string()) }
         }
-    };
-    phase("std");
+        dep_keys.sort();
+        let root = `${util::path_clean(c.fs_root.as_str())}/`.to_string();
+        let key = crate::libcache::key(c.name.as_str(), root.as_str(), target.as_str(), dwarf, &dep_keys);
+        let cached = match key { Some(k) => crate::libcache::load(k.as_str()), None => None };
+        let (o, s) = match cached {
+            Some(x) => x,
+            None => {
+                let roots = crate_roots(info, c.name.as_str());
+                let ext = &mut crate::mir::build::Ext { crates: done.clone(), summaries: sums.clone() };
+                let lib = crate::mir::build::build_program(info, Some(roots.clone()), if done.len() > 0 { Some(ext) } else { None });
+                lazy_errors(info)?;
+                let s = lib.summaries;
+                let plan = crate::codegen::build_library_plan(lib, c.name.as_str(), &roots);
+                let o = backend(plan, dwarf)?;
+                if let Some(k) = key { crate::libcache::store(k.as_str(), o, &s); }
+                (o, s)
+            }
+        };
+        for (d, sm) in s.iter() { sums.insert(d.clone(), sm.clone()); }
+        done.insert(c.name.clone(), true);
+        keys.insert(c.name.clone(), match key { Some(k) => k, None => "-".to_string() });
+        libs.push(o);
+        phase(c.name.as_str());
+    }
     let mut roots: Vec<&mut resolve::Def> = Vec::new();
     match entry.main {
         Some(m) => roots.push(m),
         None => { for t in entry.tests.iter() { roots.push(*t); } }
     }
-    let mut crates: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    crates.insert("std".to_string(), true);
-    let ext = &mut crate::mir::build::Ext { crates, summaries: lib_sums };
+    let ext = &mut crate::mir::build::Ext { crates: done, summaries: sums };
     let prog = crate::mir::build::build_program(info, Some(roots), Some(ext));
     lazy_errors(info)?;
     let mf = match entry.main {
@@ -368,14 +386,42 @@ fn code_split(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Re
     };
     phase("mir");
     let plan = crate::codegen::build_plan(prog, entry.main, mf);
-    plan.ext_inits.push("std".to_string());
+    for c in order.iter() { plan.ext_inits.push(c.name.clone()); }
     phase("plan");
     let o = backend(plan, dwarf)?;
     phase("codegen");
     let mut parts: Vec<&mut crate::obj::Object> = Vec::new();
     parts.push(o);
-    parts.push(lib_obj);
+    for l in libs.iter() { parts.push(*l); }
     crate::merge::merge(&parts)
+}
+
+// The crates compiled alone (every one but the program's, the last
+// loaded), each after its dependencies.
+fn split_order(info: &mut types::collect::Info) -> Vec<&mut resolve::Crate> {
+    let all = info.res.crates;
+    let mut out: Vec<&mut resolve::Crate> = Vec::new();
+    if all.len() == 0 { return out; }
+    let top = all[all.len() - 1];
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    // Depth first, dependencies by name (the same order every time); a
+    // crate after all of its dependencies.
+    let mut stack: Vec<(&mut resolve::Crate, bool)> = Vec::new();
+    stack.push((top, false));
+    while let Some((c, after)) = stack.pop() {
+        if after {
+            if c.name != top.name { out.push(c); }
+            continue;
+        }
+        if seen.contains_key(&c.name) { continue; }
+        seen.insert(c.name.clone(), true);
+        stack.push((c, true));
+        let mut ds: Vec<&mut resolve::Crate> = Vec::new();
+        for (_, d) in c.deps.iter() { ds.push(*d); }
+        ds.sort_by(|a, b| b.name.cmp(&a.name));
+        for d in ds.iter() { if !seen.contains_key(&d.name) { stack.push((*d, false)); } }
+    }
+    out
 }
 
 /// Compiles a checked program into an object file for the target.
