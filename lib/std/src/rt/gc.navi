@@ -69,10 +69,14 @@ const PROT_RW: i32 = 3;
 const PAGE_SHIFT: usize = 13;
 const PAGE: usize = 8192;
 const SPAN_BYTES: usize = 65536;
-const ARENA_SIZE: usize = 34359738368; // 32 GiB of address space
-// The address space is reserved 64 MiB at a time as the heap grows (as Go's
-// heap arenas), right after the part reserved before (see init).
-const ARENA_CHUNK: usize = 67108864;
+// The heap is made of 64 MiB arenas (as Go's heapArena), wherever the system
+// gives the address space, found through the arena index: its entry
+// p >> ARENA_SHIFT is the span table of the arena holding p (a span or 0
+// per page) or 0. INDEX_LEN entries cover a 48-bit address space.
+const ARENA_SHIFT: usize = 26;
+const ARENA_BYTES: usize = 67108864;
+const ARENA_PAGES: usize = 8192;
+const INDEX_LEN: usize = 4194304;
 const MIN_GC: usize = 33554432; // 32 MiB
 const NCLASS: usize = 32;
 const MAX_SMALL: usize = 8192;
@@ -82,6 +86,10 @@ static CLASSES: [usize; 32] = [16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 
     7168, 8192];
 
 struct Span {
+    // How many spans were made before it: a concurrent mark reads only
+    // those made before it started (LIMIT). The first word: the backend's
+    // scan_heap reads it at offset 0.
+    seq: usize,
     start: usize,
     bytes: usize,
     elem: usize,
@@ -112,12 +120,15 @@ struct Span {
     pm: usize,
 }
 
-static mut ARENA: usize = 0;
-static mut ARENA_NEXT: usize = 0;
-static mut ARENA_END: usize = 0;
-// Where the address space reserved so far ends (ARENA_NEXT <= it <= ARENA_END).
-static mut ARENA_MAPPED: usize = 0;
-static mut PAGES: usize = 0; // *mut *mut Span, one entry per page of the arena
+static mut INDEX: usize = 0; // the arena index (0: before init)
+// The address space spans are cut from next: [HEAP_NEXT, HEAP_END).
+static mut HEAP_NEXT: usize = 0;
+static mut HEAP_END: usize = 0;
+// The next of Go's arena hints to try (see grow).
+static mut HINT: usize = 0;
+// Bytes cut off for spans, and how many spans were made.
+static mut HEAP_CUT: usize = 0;
+static mut SPAN_SEQ: usize = 0;
 static mut ALL: usize = 0; // *mut Span: every span
 // Spans with free objects per class and noscan; [64]: dead spans (no
 // object allocated: large spans, and small ones of any class), which any
@@ -286,39 +297,13 @@ fn reuse_pages(p: usize, size: usize) {
 }
 
 fn init() {
-    // As Go's arena hints: the first 64 MiB at an address where nothing else
-    // goes (the C library's heap and the stacks grow from elsewhere), and
-    // each next part right after (new_span), so that the heap stays one
-    // range, which the page table and the generated scans index from ARENA,
-    // and the address space reserved follows the heap instead of being all
-    // of ARENA_SIZE from the start. Where no hint is free (a smaller address
-    // space), all of it at once wherever the system puts it, as before.
-    let mut i = 0usize;
-    while i < 128 && ARENA == 0 {
-        let h = i << 40 | 0x00c0 << 32;
-        if reserve_at(h, ARENA_CHUNK) {
-            ARENA = h;
-            ARENA_NEXT = h;
-            ARENA_MAPPED = h + ARENA_CHUNK;
-            ARENA_END = h + ARENA_SIZE;
-        }
-        i += 1;
-    }
-    if ARENA == 0 {
-        let base = reserve(ARENA_SIZE);
-        if base == 0 { out_of_memory(); }
-        // Align the arena to a page.
-        let aligned = (base + PAGE - 1) / PAGE * PAGE;
-        ARENA = aligned;
-        ARENA_NEXT = aligned;
-        ARENA_END = base + ARENA_SIZE;
-        ARENA_MAPPED = ARENA_END;
-    }
-    let table_size = (ARENA_SIZE >> PAGE_SHIFT) * 8;
-    let table = reserve(table_size);
-    if table == 0 { out_of_memory(); }
-    commit(table, table_size);
-    PAGES = table;
+    // The index (its pages are touched where arenas are); the arenas come
+    // as spans need them (grow).
+    let size = INDEX_LEN * 8;
+    let index = reserve(size);
+    if index == 0 { out_of_memory(); }
+    commit(index, size);
+    INDEX = index;
     MAIN = new_stack();
     POOL = new_stack();
     SHARED = new_stack();
@@ -396,7 +381,7 @@ fn pm_width(elem: usize) -> usize { if elem <= 64 { 1 } else if elem <= 512 { 8 
 // Records the pointer words of the object at p (allocated, its span's):
 // mask (repeated every tw words for an array).
 fn set_info(p: usize, mask: usize, tw: usize, array: bool) {
-    let s = ld(PAGES + ((p - ARENA) >> PAGE_SHIFT) * 8) as *mut Span;
+    let s = span_of(p);
     unsafe {
         let elem = (*s).elem;
         let w = pm_width(elem);
@@ -444,7 +429,7 @@ fn alloc0(size: usize, noscan: bool, mask: usize, tw: usize) -> *mut u8 {
 // The single-threaded allocator (before a second OS thread exists).
 fn alloc1(size: usize, noscan: bool) -> *mut u8 {
     if ALLOCATED >= NEXT_GC {
-        if ARENA == 0 { init(); } else { collect_locked(); }
+        if INDEX == 0 { init(); } else { collect_locked(); }
     }
     if size > MAX_SMALL { return alloc_large(size, noscan) as *mut u8; }
     let c = CLASS_OF[(size + 15) >> 4] as usize;
@@ -931,24 +916,21 @@ fn alloc_large_in(size: usize, noscan: bool, tries: usize) -> usize {
 
 // A new span: the heap lock only to cut its pages off the arena and to put
 // it on the span list (it is set up in between: no other thread sees it
-// before; a concurrent mark ignores pages past its LIMIT).
+// before, and a concurrent mark reads no span made since it started).
 fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
     spin_lock(&mut HEAP_LK as *mut usize);
-    let start = ARENA_NEXT;
-    if start + bytes > ARENA_END { out_of_memory(); }
-    if start + bytes > ARENA_MAPPED {
-        // The next part of the address space, right after the last.
-        let mut n = (start + bytes - ARENA_MAPPED + ARENA_CHUNK - 1) / ARENA_CHUNK * ARENA_CHUNK;
-        if n > ARENA_END - ARENA_MAPPED { n = ARENA_END - ARENA_MAPPED; }
-        if !reserve_at(ARENA_MAPPED, n) { crate::rt::native::fatal("out of memory: the address space after the heap is taken"); }
-        ARENA_MAPPED += n;
-    }
-    ARENA_NEXT = start + bytes;
+    if HEAP_NEXT + bytes > HEAP_END { grow(bytes); }
+    let start = HEAP_NEXT;
+    HEAP_NEXT = start + bytes;
+    HEAP_CUT += bytes;
+    let seq = SPAN_SEQ;
+    SPAN_SEQ += 1;
     spin_unlock(&mut HEAP_LK as *mut usize);
     commit(start, bytes);
     let s = unsafe { calloc(1, crate::intrinsics::size_of::<Span>()) } as *mut Span;
     let nelems = bytes / elem;
     unsafe {
+        (*s).seq = seq;
         (*s).start = start;
         (*s).bytes = bytes;
         (*s).elem = elem;
@@ -965,7 +947,7 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
     }
     let mut pg = start;
     while pg < start + bytes {
-        st(PAGES + ((pg - ARENA) >> PAGE_SHIFT) * 8, s as usize);
+        set_span(pg, s);
         pg += PAGE;
     }
     if VERIFY { crate::rt::sched::check_alloc_stopped(); }
@@ -1144,32 +1126,114 @@ fn scan_stacks(budget: usize, dst: usize) -> bool {
 // every value in memory; this loop runs over the whole live heap). It
 // stops at the words to mark.
 fn scan(lo: usize, hi: usize, dst: usize) {
-    let arena = ARENA;
     // During a concurrent mark, spans made since it started hold only
     // objects allocated black (or free ones): not read.
-    let next = if CYCLE { LIMIT } else { ARENA_NEXT };
-    let pages = PAGES;
+    let limit = if CYCLE { LIMIT } else { NO_LIMIT };
     let mut p = (lo + 7) / 8 * 8;
     loop {
-        p = crate::rt::scan_words(p, hi, arena, next, pages, SPAN_OFFS);
+        p = crate::rt::scan_heap(p, hi, INDEX, INDEX_LEN, limit, SPAN_OFFS);
         if p == 0 { return; }
         // Read again: a running mutator may have changed the word since
         // (its write barrier shaded the new value; either may be marked).
         let w = ld(p - 8);
-        if w < arena || w >= next { continue; }
-        let s = ld(pages + ((w - arena) >> PAGE_SHIFT) * 8) as *mut Span;
-        if s as usize == 0 { continue; }
-        let n = unsafe { (*s).nelems };
-        let i = if n == 1 { 0 } else { unsafe { ((w - (*s).start) * (*s).div_mul) >> 32 } };
-        if i >= n { continue; }
-        let bits = unsafe { (*s).bits } as usize;
-        if ldb(bits + i) == 0 || ldb(bits + n + i) != 0 { continue; }
-        mark_found(s, i, dst);
+        let a = w >> ARENA_SHIFT;
+        if a < INDEX_LEN {
+            let t = ld(INDEX + 8 * a);
+            if t != 0 {
+                let s = ld(t + 8 * ((w >> PAGE_SHIFT) & (ARENA_PAGES - 1))) as *mut Span;
+                if s as usize != 0 && unsafe { (*s).seq } < limit {
+                    let n = unsafe { (*s).nelems };
+                    let i = if n == 1 { 0 } else { unsafe { ((w - (*s).start) * (*s).div_mul) >> 32 } };
+                    if i < n {
+                        let bits = unsafe { (*s).bits } as usize;
+                        if ldb(bits + i) != 0 && ldb(bits + n + i) == 0 { mark_found(s, i, dst); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The span of address p (0: none, not the heap's), as Go's spanOf.
+fn span_of(p: usize) -> *mut Span {
+    let a = p >> ARENA_SHIFT;
+    if a >= INDEX_LEN || INDEX == 0 { return 0 as *mut Span; }
+    let t = ld(INDEX + 8 * a);
+    if t == 0 { return 0 as *mut Span; }
+    ld(t + 8 * ((p >> PAGE_SHIFT) & (ARENA_PAGES - 1))) as *mut Span
+}
+
+// Makes s the span of page p (its arena's table exists): published whole,
+// as a concurrent marker may look it up at once.
+fn set_span(p: usize, s: *mut Span) {
+    let t = ld(INDEX + 8 * (p >> ARENA_SHIFT));
+    crate::rt::atomic_store((t + 8 * ((p >> PAGE_SHIFT) & (ARENA_PAGES - 1))) as *mut usize, s as usize);
+}
+
+// The span and index of the allocated, unmarked object w points to, of a
+// span made before limit ((0, 0): none), as scan_heap finds them.
+fn unmarked(w: usize, limit: usize) -> (*mut Span, usize) {
+    let s = span_of(w);
+    if s as usize == 0 { return (s, 0); }
+    unsafe {
+        if (*s).seq >= limit { return (0 as *mut Span, 0); }
+        let n = (*s).nelems;
+        let i = if n == 1 { 0 } else { ((w - (*s).start) * (*s).div_mul) >> 32 };
+        if i >= n { return (0 as *mut Span, 0); }
+        let bits = (*s).bits as usize;
+        if ldb(bits + i) == 0 || ldb(bits + n + i) != 0 { return (0 as *mut Span, 0); }
+        (s, i)
+    }
+}
+
+/// Whether w points to an allocated, unmarked object of a span made before
+/// limit (native's scan_heap, for a compiler that does not generate it).
+pub(crate) fn unmarked_at(w: usize, limit: usize) -> bool { unmarked(w, limit).0 as usize != 0 }
+
+// More address space for spans, at least n bytes (with HEAP_LK), as Go's
+// sysAlloc: right after the part spans are cut from, which then goes on;
+// else at the next of Go's arena hints (0x00c0 << 32, then 1 << 40 above
+// each), where nothing else goes (the C library's heap and the stacks grow
+// from elsewhere); else wherever the system puts it. What is left of the
+// part before stays unused.
+fn grow(n: usize) {
+    let size = (n + ARENA_BYTES - 1) / ARENA_BYTES * ARENA_BYTES;
+    let top = INDEX_LEN << ARENA_SHIFT;
+    if HEAP_END != 0 && HEAP_END + size <= top && reserve_at(HEAP_END, size) {
+        map_arenas(HEAP_END, size);
+        HEAP_END += size;
+        return;
+    }
+    let mut base = 0usize;
+    while HINT < 128 && base == 0 {
+        let h = HINT << 40 | 0x00c0 << 32;
+        HINT += 1;
+        if reserve_at(h, size) { base = h; }
+    }
+    if base == 0 {
+        base = reserve(size);
+        if base == 0 || base + size > top { out_of_memory(); }
+    }
+    map_arenas(base, size);
+    HEAP_NEXT = base;
+    HEAP_END = base + size;
+}
+
+// Span tables for the arenas [p, p + n) has a part of.
+fn map_arenas(p: usize, n: usize) {
+    let mut a = p >> ARENA_SHIFT;
+    while a <= (p + n - 1) >> ARENA_SHIFT {
+        if ld(INDEX + 8 * a) == 0 {
+            let t = unsafe { calloc(ARENA_PAGES, 8) } as usize;
+            if t == 0 { out_of_memory(); }
+            crate::rt::atomic_store((INDEX + 8 * a) as *mut usize, t);
+        }
+        a += 1;
     }
 }
 
 /// The offsets of Span's start, nelems, div_mul and bits, a byte each (for
-/// scan_words).
+/// scan_heap).
 static mut SPAN_OFFS: usize = 0;
 
 fn span_offsets() {
@@ -1180,6 +1244,7 @@ fn span_offsets() {
         let div_mul = &mut (*s).div_mul as *mut usize as usize - s as usize;
         let bits = &mut (*s).bits as *mut *mut u8 as usize - s as usize;
         SPAN_OFFS = start | nelems << 8 | div_mul << 16 | bits << 24;
+        if &mut (*s).seq as *mut usize as usize != s as usize { crate::rt::native::fatal("Span.seq is not its first word"); }
     }
 }
 
@@ -1213,7 +1278,7 @@ fn mark_found(s: *mut Span, i: usize, dst: usize) {
 // Scans obj (precisely: the words its entry in its span's mask table
 // says hold pointers); its size.
 fn scan_object(obj: usize, dst: usize) -> usize {
-    let s = unsafe { *((PAGES + ((obj - ARENA) >> PAGE_SHIFT) * 8) as *const usize) } as *mut Span;
+    let s = ld(ld(INDEX + 8 * (obj >> ARENA_SHIFT)) + 8 * ((obj >> PAGE_SHIFT) & (ARENA_PAGES - 1))) as *mut Span;
     let (elem, pm, n) = unsafe { ((*s).elem, (*s).pm, (*s).nelems) };
     if pm == 0 {
         scan(obj, obj + elem, dst);
@@ -1249,30 +1314,33 @@ fn scan_object(obj: usize, dst: usize) -> usize {
 }
 
 // Marks what the words at base whose bits in m are set point to (each
-// checked here, as scan_words does a range).
+// checked here, as scan_heap does a range).
 fn scan_mask(base: usize, m0: usize, dst: usize) {
     if m0 == ALL_WORDS {
         scan(base, base + 512, dst);
         return;
     }
-    let arena = ARENA;
-    let next = if CYCLE { LIMIT } else { ARENA_NEXT };
-    let pages = PAGES;
+    let limit = if CYCLE { LIMIT } else { NO_LIMIT };
     let mut m = m0;
     let mut p = base;
     loop {
-        let q = crate::rt::scan_bits(p, m, arena, next, pages, SPAN_OFFS);
+        let q = crate::rt::scan_heap_bits(p, m, INDEX, INDEX_LEN, limit, SPAN_OFFS);
         if q == 0 { return; }
-        // (Read again, as scan does: a mutator may have written it since.)
+        // (Read again, as scan does: a mutator may have written it since;
+        // the lookup written out, as this runs for every pointer found.)
         let w = ld(q - 8);
-        if w >= arena && w < next {
-            let s = ld(pages + ((w - arena) >> PAGE_SHIFT) * 8) as *mut Span;
-            if s as usize != 0 {
-                let n = unsafe { (*s).nelems };
-                let i = if n == 1 { 0 } else { unsafe { ((w - (*s).start) * (*s).div_mul) >> 32 } };
-                if i < n {
-                    let bits = unsafe { (*s).bits } as usize;
-                    if ldb(bits + i) != 0 && ldb(bits + n + i) == 0 { mark_found(s, i, dst); }
+        let a = w >> ARENA_SHIFT;
+        if a < INDEX_LEN {
+            let t = ld(INDEX + 8 * a);
+            if t != 0 {
+                let s = ld(t + 8 * ((w >> PAGE_SHIFT) & (ARENA_PAGES - 1))) as *mut Span;
+                if s as usize != 0 && unsafe { (*s).seq } < limit {
+                    let n = unsafe { (*s).nelems };
+                    let i = if n == 1 { 0 } else { unsafe { ((w - (*s).start) * (*s).div_mul) >> 32 } };
+                    if i < n {
+                        let bits = unsafe { (*s).bits } as usize;
+                        if ldb(bits + i) != 0 && ldb(bits + n + i) == 0 { mark_found(s, i, dst); }
+                    }
                 }
             }
         }
@@ -1453,7 +1521,7 @@ fn mark_worker(k: usize, cyc: usize) {
 pub fn marking() -> bool { MARKING }
 
 // Whether a concurrent mark runs (mirrors the word the generated write
-// barriers test), when it started, and the end of the arena then.
+// barriers test), when it started, and how many spans were made then.
 static mut MARKING: bool = false;
 static mut CYCLE: bool = false;
 static mut LIMIT: usize = 0;
@@ -1728,8 +1796,8 @@ fn heap_goal() -> usize {
 
 // The arena's bytes in use (made and not returned).
 fn heap_in_use() -> usize {
-    if ARENA == 0 { return 0; }
-    ARENA_NEXT - ARENA - crate::rt::atomic_load(&mut RELEASED as *mut usize)
+    if INDEX == 0 { return 0; }
+    HEAP_CUT - crate::rt::atomic_load(&mut RELEASED as *mut usize)
 }
 
 // Releases dead spans until the heap's pages in use are at most goal.
@@ -1826,7 +1894,7 @@ static mut PERCENT: usize = 100;
 /// starts a collection); the previous one.
 pub fn set_percent(percent: usize) -> usize {
     crate::rt::sched::lock();
-    if ARENA == 0 { init(); }
+    if INDEX == 0 { init(); }
     let old = PERCENT;
     PERCENT = percent;
     repace();
@@ -1837,7 +1905,7 @@ pub fn set_percent(percent: usize) -> usize {
 /// Sets the memory limit (NO_LIMIT: none); the previous one.
 pub fn set_memory_limit(bytes: usize) -> usize {
     crate::rt::sched::lock();
-    if ARENA == 0 { init(); }
+    if INDEX == 0 { init(); }
     let old = MEMLIMIT;
     MEMLIMIT = bytes;
     repace();
@@ -1848,7 +1916,7 @@ pub fn set_memory_limit(bytes: usize) -> usize {
 // The goal again after a setting changed (not during a cycle: its start
 // set the point that finishes it).
 fn repace() {
-    if !CYCLE && ARENA != 0 { set_goal(LIVE); }
+    if !CYCLE && INDEX != 0 { set_goal(LIVE); }
 }
 
 // The least the heap may grow by under a memory limit (as Go's minimum
@@ -1978,7 +2046,7 @@ fn start_cycle() {
     ASSISTED = 0;
     ALLOC_AT_START = ALLOCATED;
     CYCLE = true;
-    LIMIT = ARENA_NEXT;
+    LIMIT = SPAN_SEQ;
     set_marking(true);
     // The statics now; the stacks while the program runs (the barrier
     // keeps what a G moves between its stack and the heap meanwhile).
@@ -2358,8 +2426,7 @@ pub fn weak_get(h: usize) -> usize {
 // Whether the object containing addr is marked (an address outside the
 // heap's objects is: a static's).
 fn is_marked(addr: usize) -> bool {
-    if addr < ARENA || addr >= ARENA_NEXT { return true; }
-    let s = ld(PAGES + ((addr - ARENA) >> PAGE_SHIFT) * 8) as *mut Span;
+    let s = span_of(addr);
     if s as usize == 0 { return true; }
     unsafe {
         let n = (*s).nelems;
