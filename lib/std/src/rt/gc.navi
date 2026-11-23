@@ -28,6 +28,7 @@
 #[nonblocking]
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
 #[cfg(target_os = "linux")]
@@ -69,6 +70,9 @@ const PAGE_SHIFT: usize = 13;
 const PAGE: usize = 8192;
 const SPAN_BYTES: usize = 65536;
 const ARENA_SIZE: usize = 34359738368; // 32 GiB of address space
+// The address space is reserved 64 MiB at a time as the heap grows (as Go's
+// heap arenas), right after the part reserved before (see init).
+const ARENA_CHUNK: usize = 67108864;
 const MIN_GC: usize = 33554432; // 32 MiB
 const NCLASS: usize = 32;
 const MAX_SMALL: usize = 8192;
@@ -111,6 +115,8 @@ struct Span {
 static mut ARENA: usize = 0;
 static mut ARENA_NEXT: usize = 0;
 static mut ARENA_END: usize = 0;
+// Where the address space reserved so far ends (ARENA_NEXT <= it <= ARENA_END).
+static mut ARENA_MAPPED: usize = 0;
 static mut PAGES: usize = 0; // *mut *mut Span, one entry per page of the arena
 static mut ALL: usize = 0; // *mut Span: every span
 // Spans with free objects per class and noscan; [64]: dead spans (no
@@ -174,6 +180,21 @@ fn reserve(size: usize) -> usize {
 
 #[cfg(not(target_os = "windows"))]
 fn commit(p: usize, size: usize) {}
+
+// Reserves size bytes of address space at p, or nothing (false: something is
+// there; the address is a hint, as Go's sysReserve takes it).
+#[cfg(not(target_os = "windows"))]
+fn reserve_at(p: usize, size: usize) -> bool {
+    let q = unsafe { mmap(p as *mut u8, size, PROT_RW, MAP_FLAGS, -1, 0) } as usize;
+    if q == p { return true; }
+    if q != 18446744073709551615 { unsafe { munmap(q as *mut u8, size); } }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn reserve_at(p: usize, size: usize) -> bool {
+    unsafe { VirtualAlloc(p as *mut u8, size, 0x2000, 4) as usize == p } // MEM_RESERVE
+}
 
 #[cfg(target_os = "windows")]
 fn reserve(size: usize) -> usize {
@@ -242,13 +263,34 @@ fn reuse_pages(p: usize, size: usize) {
 }
 
 fn init() {
-    let base = reserve(ARENA_SIZE);
-    if base == 0 { out_of_memory(); }
-    // Align the arena to a page.
-    let aligned = (base + PAGE - 1) / PAGE * PAGE;
-    ARENA = aligned;
-    ARENA_NEXT = aligned;
-    ARENA_END = base + ARENA_SIZE;
+    // As Go's arena hints: the first 64 MiB at an address where nothing else
+    // goes (the C library's heap and the stacks grow from elsewhere), and
+    // each next part right after (new_span), so that the heap stays one
+    // range, which the page table and the generated scans index from ARENA,
+    // and the address space reserved follows the heap instead of being all
+    // of ARENA_SIZE from the start. Where no hint is free (a smaller address
+    // space), all of it at once wherever the system puts it, as before.
+    let mut i = 0usize;
+    while i < 128 && ARENA == 0 {
+        let h = i << 40 | 0x00c0 << 32;
+        if reserve_at(h, ARENA_CHUNK) {
+            ARENA = h;
+            ARENA_NEXT = h;
+            ARENA_MAPPED = h + ARENA_CHUNK;
+            ARENA_END = h + ARENA_SIZE;
+        }
+        i += 1;
+    }
+    if ARENA == 0 {
+        let base = reserve(ARENA_SIZE);
+        if base == 0 { out_of_memory(); }
+        // Align the arena to a page.
+        let aligned = (base + PAGE - 1) / PAGE * PAGE;
+        ARENA = aligned;
+        ARENA_NEXT = aligned;
+        ARENA_END = base + ARENA_SIZE;
+        ARENA_MAPPED = ARENA_END;
+    }
     let table_size = (ARENA_SIZE >> PAGE_SHIFT) * 8;
     let table = reserve(table_size);
     if table == 0 { out_of_memory(); }
@@ -871,6 +913,13 @@ fn new_span(elem: usize, bytes: usize, noscan: bool, list: usize) -> *mut Span {
     spin_lock(&mut HEAP_LK as *mut usize);
     let start = ARENA_NEXT;
     if start + bytes > ARENA_END { out_of_memory(); }
+    if start + bytes > ARENA_MAPPED {
+        // The next part of the address space, right after the last.
+        let mut n = (start + bytes - ARENA_MAPPED + ARENA_CHUNK - 1) / ARENA_CHUNK * ARENA_CHUNK;
+        if n > ARENA_END - ARENA_MAPPED { n = ARENA_END - ARENA_MAPPED; }
+        if !reserve_at(ARENA_MAPPED, n) { crate::rt::native::fatal("out of memory: the address space after the heap is taken"); }
+        ARENA_MAPPED += n;
+    }
     ARENA_NEXT = start + bytes;
     spin_unlock(&mut HEAP_LK as *mut usize);
     commit(start, bytes);
