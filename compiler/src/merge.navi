@@ -2,8 +2,13 @@
 //! of its own; before linking they become one object, which the linkers
 //! (Mach-O, ELF, PE) take as before.
 //!
-//! - Sections are concatenated (each part's aligned), symbols and
-//!   relocations moved with them.
+//! - Each part's sections are cut into atoms, one per symbol (a function
+//!   with its inner labels, a string, a static, a table); the atoms nothing
+//!   reaches from the program's entry point are left out (a crate compiled
+//!   alone has every function a program might call). NAVI_NOSTRIP=1 keeps
+//!   them all.
+//!   A static's initialization in a crate's initializer counts as reached
+//!   only if the static is.
 //! - A part's numbered symbols (strings, locations: their names say
 //!   nothing about what they are) are its own: renamed with the part's
 //!   number. Every other name means the same thing in every part (stable
@@ -17,6 +22,7 @@
 
 use std::collections::HashMap;
 use crate::obj::{self, Object};
+use crate::backend::lower::INIT_NOP;
 
 // Names each part defines for itself that the merged object defines once.
 fn program_wide(name: &str) -> bool {
@@ -35,6 +41,12 @@ fn numbered(name: &str, prefix: &str) -> bool {
         if c < b'0' || c > b'9' { return false; }
     }
     true
+}
+
+// A label inside a function (where it saves its registers, its C call),
+// not the start of an atom.
+fn inner_label(name: &str, sec: obj::Section) -> bool {
+    sec == obj::TEXT && (name.ends_with(".r") || name.ends_with(".c"))
 }
 
 fn rd(b: &Vec<u8>, at: usize, n: usize) -> u64 {
@@ -59,12 +71,162 @@ fn align_to(s: &mut Vec<u8>, a: usize) {
     while s.len() % a != 0 { s.push(0); }
 }
 
-// The offset of symbol name in part p (its first definition), if defined.
-fn sym_off(p: &Object, name: &str) -> Option<u64> {
-    for s in p.syms.iter() {
-        if s.name == name { return Some(s.off); }
+// The index of the last of the sorted starts at or before off.
+fn find(starts: &Vec<u64>, off: u64) -> usize {
+    let mut lo = 0usize;
+    let mut hi = starts.len();
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if starts[mid] <= off { lo = mid; } else { hi = mid; }
     }
-    None
+    lo
+}
+
+// A part cut into atoms: per section, the atoms' starts (sorted; the first
+// at 0), whether each is reached and where it went.
+struct Part {
+    starts: Vec<Vec<u64>>,
+    live: Vec<Vec<bool>>,
+    to: Vec<Vec<u64>>,
+    // The relocations of each atom: rels[sec][first[sec][a]..first[sec][a + 1]].
+    first: Vec<Vec<u32>>,
+    rels: Vec<Vec<u32>>,
+    // The merged name of each of the part's names.
+    names: Vec<String>,
+    // The atom of the stack map table (DATA_CONST; -1: none): never
+    // copied, its entries and maps are taken one function at a time.
+    ftab: i64,
+    // The table's entries (text offset, size, map offset from the maps).
+    entries: Vec<(u64, u64, u64)>,
+    // Where the maps start in DATA_CONST and end.
+    maps: u64,
+    maps_end: u64,
+    // Whether no symbol starts a section (its first atom has none).
+    bare: Vec<bool>,
+}
+
+impl Part {
+    fn end(&self, p: &Object, s: usize, a: usize) -> u64 {
+        if a + 1 < self.starts[s].len() { self.starts[s][a + 1] } else { p.sects[s].len() as u64 }
+    }
+
+    // Where offset off of section s went (its atom reached).
+    fn at(&self, s: usize, off: u64) -> u64 {
+        let a = find(&self.starts[s], off);
+        self.to[s][a] + off - self.starts[s][a]
+    }
+
+    fn reached(&self, s: usize, off: u64) -> bool { self.live[s][find(&self.starts[s], off)] }
+}
+
+fn cut(p: &Object, pi: usize) -> &mut Part {
+    let mut starts: Vec<Vec<u64>> = Vec::new();
+    let mut s = 0;
+    while s < obj::NUM_SECTIONS {
+        starts.push(Vec::new());
+        s += 1;
+    }
+    let mut ftab_off = -1i64;
+    for sy in p.syms.iter() {
+        if sy.name == "_navi_ftab" { ftab_off = sy.off as i64; }
+        if (program_wide(sy.name.as_str()) && sy.name != "_navi_ftab") || inner_label(sy.name.as_str(), sy.sec) { continue; }
+        let mut v = starts[sy.sec];
+        v.push(sy.off);
+    }
+    let mut live: Vec<Vec<bool>> = Vec::new();
+    let mut to: Vec<Vec<u64>> = Vec::new();
+    let mut bare: Vec<bool> = Vec::new();
+    s = 0;
+    while s < obj::NUM_SECTIONS {
+        let mut v = starts[s];
+        bare.push(!v.contains(&0));
+        v.push(0);
+        v.sort();
+        v.dedup();
+        let mut l: Vec<bool> = Vec::new();
+        let mut t: Vec<u64> = Vec::new();
+        for _ in v.iter() {
+            l.push(false);
+            t.push(0);
+        }
+        live.push(l);
+        to.push(t);
+        s += 1;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for n in p.names.iter() {
+        if part_local(n.as_str()) { names.push(`${n}.p${pi}`.to_string()); } else { names.push(n.clone()); }
+    }
+    let part = &mut Part { starts, live, to, first: Vec::new(), rels: Vec::new(), names, ftab: -1, entries: Vec::new(), maps: 0, maps_end: 0, bare };
+    // Each atom's relocations (counted, then placed).
+    let mut ra: Vec<u32> = Vec::with_capacity(p.relocs.len());
+    s = 0;
+    while s < obj::NUM_SECTIONS {
+        let mut first: Vec<u32> = Vec::new();
+        let mut k = 0;
+        while k <= part.starts[s].len() {
+            first.push(0);
+            k += 1;
+        }
+        part.first.push(first);
+        part.rels.push(Vec::new());
+        s += 1;
+    }
+    for r in p.relocs.iter() {
+        let a = find(&part.starts[r.sec], r.off as u64);
+        ra.push(a as u32);
+        let mut f = part.first[r.sec];
+        f[a + 1] += 1;
+    }
+    s = 0;
+    while s < obj::NUM_SECTIONS {
+        let mut f = part.first[s];
+        let mut k = 1;
+        while k < f.len() {
+            f[k] += f[k - 1];
+            k += 1;
+        }
+        let mut rl = part.rels[s];
+        let mut k2 = 0;
+        while k2 < f[f.len() - 1] {
+            rl.push(0);
+            k2 += 1;
+        }
+        s += 1;
+    }
+    let mut fill: Vec<Vec<u32>> = Vec::new();
+    for f in part.first.iter() { fill.push(f.clone()); }
+    let mut i = 0;
+    while i < p.relocs.len() {
+        let sec = p.relocs[i].sec;
+        let a = ra[i] as usize;
+        let mut fl = fill[sec];
+        let mut rl = part.rels[sec];
+        rl[fl[a] as usize] = i as u32;
+        fl[a] += 1;
+        i += 1;
+    }
+    // The stack map table.
+    if ftab_off >= 0 {
+        let dc = p.sects[obj::DATA_CONST];
+        let off = ftab_off as u64;
+        let a = find(&part.starts[obj::DATA_CONST], off);
+        part.ftab = a as i64;
+        let n = rd(&dc, off as usize, 8);
+        part.maps = off + rd(&dc, off as usize + 16, 8);
+        part.maps_end = part.end(p, obj::DATA_CONST, a);
+        let mut e = 0;
+        while e < n as usize {
+            let at = off as usize + 24 + 12 * e;
+            part.entries.push((rd(&dc, at, 4), rd(&dc, at + 4, 4), rd(&dc, at + 8, 4)));
+            e += 1;
+        }
+    }
+    part
+}
+
+fn reached(cuts: &Vec<&mut Part>, defs: &HashMap<String, (usize, usize, usize)>, name: &String) -> bool {
+    match defs.get(name) { Some(d) => cuts[d.0].live[d.1][d.2], None => false }
 }
 
 /// The parts as one object.
@@ -79,75 +241,169 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
         o.align[k] = a;
         k += 1;
     }
-    // The merged stack map table first in DATA_CONST (its entries point
-    // forward into the parts' maps). Its size: the header and every
-    // part's entries.
-    let mut nentries = 0usize;
-    let mut tables: Vec<(u64, u64, u64)> = Vec::new(); // (table offset, count, maps offset) per part
-    for p in parts.iter() {
-        match sym_off(*p, "_navi_ftab") {
-            Some(off) => {
-                let dc = p.sects[obj::DATA_CONST];
-                let n = rd(&dc, off as usize, 8);
-                let moff = rd(&dc, off as usize + 16, 8);
-                tables.push((off, n, moff));
-                nentries += n as usize;
-            }
-            None => tables.push((0, 0, 0)),
+    let mut cuts: Vec<&mut Part> = Vec::new();
+    let mut pi = 0;
+    while pi < parts.len() {
+        cuts.push(cut(parts[pi], pi));
+        pi += 1;
+    }
+    // Each name's definition (part, section, atom): the first part's.
+    let mut defs: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    pi = 0;
+    while pi < parts.len() {
+        let c = cuts[pi];
+        for sy in parts[pi].syms.iter() {
+            if program_wide(sy.name.as_str()) { continue; }
+            let name = c.names[sy.id as usize];
+            if defs.contains_key(&name) { continue; }
+            defs.insert(name, (pi, sy.sec, find(&c.starts[sy.sec], sy.off)));
         }
+        pi += 1;
+    }
+    // The atoms reached: from the global symbols (the entry point) and any
+    // bytes before a section's first symbol, through relocations.
+    let all = std::env::var("NAVI_NOSTRIP").is_ok();
+    let mut work: Vec<(usize, usize, usize)> = Vec::new();
+    pi = 0;
+    while pi < parts.len() {
+        let p = parts[pi];
+        let c = cuts[pi];
+        for sy in p.syms.iter() {
+            if sy.global { work.push(defs[&c.names[sy.id as usize]]); }
+        }
+        let mut s = 0;
+        while s < obj::NUM_SECTIONS {
+            let mut a = 0;
+            while a < c.starts[s].len() {
+                let skip = s == obj::DATA_CONST && a as i64 == c.ftab;
+                let bare = a == 0 && c.bare[s] && p.sects[s].len() > 0;
+                if !skip && (all || bare) { work.push((pi, s, a)); }
+                a += 1;
+            }
+            s += 1;
+        }
+        pi += 1;
+    }
+    // A static's initialization (lower::static_init_sym) counts only if
+    // the static is reached: the crate's initializer calls
+    // lower::INIT_NOP instead.
+    if let Some(d) = defs.get(&INIT_NOP.to_string()) { work.push(*d); }
+    let mut weak: Vec<String> = Vec::new();
+    loop {
+        while work.len() > 0 {
+            let (wp, ws, wa) = work.pop().unwrap();
+            let c = cuts[wp];
+            let mut lv = c.live[ws];
+            if lv[wa] { continue; }
+            lv[wa] = true;
+            let p = parts[wp];
+            let f = c.first[ws];
+            let rl = c.rels[ws];
+            let mut i = f[wa];
+            while i < f[wa + 1] {
+                let r = p.relocs[rl[i as usize] as usize];
+                let name = c.names[r.sym as usize];
+                if let Some(d) = defs.get(&name) {
+                    if name.ends_with(".i") { weak.push(name); } else { work.push(*d); }
+                }
+                i += 1;
+            }
+        }
+        // (Those whose static is not reached yet wait for the next round.)
+        let mut wait: Vec<String> = Vec::new();
+        for si in weak.iter() {
+            if reached(&cuts, &defs, &si[..si.len() - 2].to_string()) { work.push(defs[si]); } else { wait.push(si.clone()); }
+        }
+        weak = wait;
+        if work.len() == 0 { break; }
+    }
+    // Stack map entries of the functions reached; the merged table first
+    // in DATA_CONST, then their maps, then the parts' data.
+    let mut nentries = 0usize;
+    for c in cuts.iter() {
+        for e in c.entries.iter() { if c.reached(obj::TEXT, e.0) { nentries += 1; } }
     }
     let mut head_len = 24 + 12 * nentries;
     while head_len % 8 != 0 { head_len += 1; }
     o.define("_navi_ftab", obj::DATA_CONST, 8, false);
     o.zeros(obj::DATA_CONST, head_len as i64);
+    // The maps: per part, each reached function's (until the next map).
+    let mut map_at: Vec<HashMap<u64, u64>> = Vec::new();
+    pi = 0;
+    while pi < parts.len() {
+        let c = cuts[pi];
+        let dc = parts[pi].sects[obj::DATA_CONST];
+        let mut mos: Vec<u64> = Vec::new();
+        for e in c.entries.iter() { mos.push(e.2); }
+        mos.sort();
+        mos.dedup();
+        let mut at: HashMap<u64, u64> = HashMap::new();
+        for e in c.entries.iter() {
+            if !c.reached(obj::TEXT, e.0) || at.contains_key(&e.2) { continue; }
+            let i = find(&mos, e.2);
+            let from = c.maps + e.2;
+            let to = if i + 1 < mos.len() { c.maps + mos[i + 1] } else { c.maps_end };
+            let mut sect = o.sects[obj::DATA_CONST];
+            at.insert(e.2, sect.len() as u64 - head_len as u64);
+            sect.extend_from_slice(&dc[from as usize..to as usize]);
+            align_to(&mut sect, 8);
+        }
+        map_at.push(at);
+        pi += 1;
+    }
     o.define("_navi_text0", obj::TEXT, 4, false);
     o.define("_navi_data_start", obj::DATA, 8, false);
-    // Each part's sections, aligned; base[p][sec].
-    let mut base: Vec<Vec<u64>> = Vec::new();
-    for p in parts.iter() {
-        let mut b: Vec<u64> = Vec::new();
+    // The atoms reached, in order, each as aligned as it was.
+    pi = 0;
+    while pi < parts.len() {
+        let p = parts[pi];
+        let c = cuts[pi];
         let mut s = 0;
         while s < obj::NUM_SECTIONS {
+            let src = p.sects[s];
             let mut sect = o.sects[s];
-            align_to(&mut sect, 1usize << o.align[s]);
-            b.push(sect.len() as u64);
-            sect.extend_from_slice(p.sects[s].as_slice());
+            let cap = 1u64 << o.align[s];
+            let mut to = c.to[s];
+            let mut a = 0;
+            while a < c.starts[s].len() {
+                if c.live[s][a] {
+                    let st = c.starts[s][a];
+                    let mut al = 1u64;
+                    while al < cap && st % (al * 2) == 0 { al = al * 2; }
+                    align_to(&mut sect, al as usize);
+                    to[a] = sect.len() as u64;
+                    let en = c.end(p, s, a);
+                    sect.extend_from_slice(&src[st as usize..en as usize]);
+                }
+                a += 1;
+            }
             s += 1;
         }
-        base.push(b);
+        pi += 1;
     }
     o.define("_navi_data_end", obj::DATA, 8, false);
     o.zeros(obj::DATA, 8);
     // The merged table: [count, text start (relocated), maps offset from
-    // the table], the entries (each part's moved), the maps stay where the
-    // parts put them.
+    // the table], the entries.
     {
         let mut t: Vec<u8> = Vec::new();
         put(&mut t, nentries as u64, 8);
         put(&mut t, 0, 8);
         put(&mut t, head_len as u64, 8);
-        let mut pi = 0;
+        pi = 0;
         while pi < parts.len() {
-            let (toff, n, moff) = tables[pi];
-            let dc = parts[pi].sects[obj::DATA_CONST];
-            // A part's maps, from the merged table's maps base (where its
-            // header ends, which is where part 0's DATA_CONST starts).
-            let maps_at = base[pi][obj::DATA_CONST] + toff + moff - head_len as u64;
-            let mut e = 0;
-            while e < n as usize {
-                let at = toff as usize + 24 + 12 * e;
-                let fo = rd(&dc, at, 4) + base[pi][obj::TEXT];
-                let size = rd(&dc, at + 4, 4);
-                let mo = rd(&dc, at + 8, 4) + maps_at;
+            let c = cuts[pi];
+            for e in c.entries.iter() {
+                if !c.reached(obj::TEXT, e.0) { continue; }
+                let fo = c.at(obj::TEXT, e.0);
+                let mo = map_at[pi][&e.2];
                 if fo > 0xffffffff || mo > 0xffffffff { return Err("merge: the text or the stack maps exceed 4 GiB".to_string()); }
                 put(&mut t, fo, 4);
-                put(&mut t, size, 4);
+                put(&mut t, e.1, 4);
                 put(&mut t, mo, 4);
-                e += 1;
             }
             pi += 1;
         }
-        while t.len() % 8 != 0 { t.push(0); }
         let mut dc = o.sects[obj::DATA_CONST];
         let mut i = 0;
         while i < t.len() {
@@ -156,43 +412,53 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
         }
         o.reloc(obj::DATA_CONST, 8, obj::ABS64, "_navi_text0");
     }
-    // Symbols: a part's own renamed, shared ones once (the first part's).
+    // Symbols (each name once), relocations and debug information of the
+    // atoms reached.
     let mut defined: HashMap<String, bool> = HashMap::new();
     for s in o.syms.iter() { defined.insert(s.name.clone(), true); }
-    let mut pi = 0;
+    let mut used: HashMap<String, bool> = HashMap::new();
+    pi = 0;
     while pi < parts.len() {
         let p = parts[pi];
-        // The merged name of each of the part's names.
-        let mut names: Vec<String> = Vec::new();
-        for n in p.names.iter() {
-            if part_local(n.as_str()) { names.push(`${n}.p${pi}`.to_string()); } else { names.push(n.clone()); }
-        }
+        let c = cuts[pi];
         for s in p.syms.iter() {
-            let name = names[s.id as usize].clone();
-            if program_wide(s.name.as_str()) { continue; }
-            if defined.contains_key(&name) { continue; }
+            let name = c.names[s.id as usize];
+            if program_wide(s.name.as_str()) || defined.contains_key(&name) || !c.reached(s.sec, s.off) { continue; }
             defined.insert(name.clone(), true);
-            o.define_at(name.as_str(), s.sec, s.off + base[pi][s.sec], s.global);
+            o.define_at(name.as_str(), s.sec, c.at(s.sec, s.off), s.global);
         }
         for r in p.relocs.iter() {
-            let id = o.id_s(&names[r.sym as usize]);
-            let off = r.off as u64 + base[pi][r.sec];
+            if !c.reached(r.sec, r.off as u64) { continue; }
+            let mut name = c.names[r.sym as usize];
+            if name.ends_with(".i") && !reached(&cuts, &defs, &name) { name = INIT_NOP.to_string(); }
+            used.insert(name.clone(), true);
+            let id = o.id_s(&name);
+            let off = c.at(r.sec, r.off as u64);
             if off > 0xffffffff { return Err("merge: a section exceeds 4 GiB".to_string()); }
             o.reloc_id(r.sec, off as u32, r.kind, id);
         }
-        for (n, _) in p.undef.iter() { o.undefined(n.as_str()); }
-        for (n, l) in p.libs.iter() { o.import_from(n.as_str(), l.as_str()); }
-        // Debug information.
-        let mut fmap: Vec<u32> = Vec::new();
-        for f in p.files.iter() { fmap.push(o.file_id(f)); }
+        for (n, _) in p.undef.iter() { if used.contains_key(n) { o.undefined(n.as_str()); } }
+        for (n, l) in p.libs.iter() { if used.contains_key(n) { o.import_from(n.as_str(), l.as_str()); } }
+        let mut fmap: HashMap<u32, u32> = HashMap::new();
         for l in p.lines.iter() {
-            o.lines.push(obj::Line { off: l.off + base[pi][obj::TEXT], file: fmap[l.file as usize], line: l.line });
+            if !c.reached(obj::TEXT, l.off) { continue; }
+            let fi = match fmap.get(&l.file) {
+                Some(f) => *f,
+                None => {
+                    let f = o.file_id(&p.files[l.file as usize]);
+                    fmap.insert(l.file, f);
+                    f
+                }
+            };
+            o.lines.push(obj::Line { off: c.at(obj::TEXT, l.off), file: fi, line: l.line });
         }
         for f in p.funcs.iter() {
-            o.funcs.push(obj::FuncRange { name: f.name.clone(), off: f.off + base[pi][obj::TEXT], size: f.size });
+            if !c.reached(obj::TEXT, f.off) { continue; }
+            o.funcs.push(obj::FuncRange { name: f.name.clone(), off: c.at(obj::TEXT, f.off), size: f.size });
         }
         for (off, size, push) in p.frames.iter() {
-            o.frames.push((*off + base[pi][obj::TEXT], *size, *push));
+            if !c.reached(obj::TEXT, *off) { continue; }
+            o.frames.push((c.at(obj::TEXT, *off), *size, *push));
         }
         pi += 1;
     }
