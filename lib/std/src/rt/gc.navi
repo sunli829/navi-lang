@@ -633,8 +633,11 @@ fn assist_scan(debt: usize) {
         let mut finish = false;
         if empty {
             mark_lock();
-            // (This assist no longer counts.)
-            if !MARK_DONE && crate::rt::atomic_load(&mut ASSISTING as *mut usize) == 0 && STACKS_DONE && no_grey() {
+            // (This assist no longer counts.) Every marker idle too: a busy
+            // one holds the object it scans in no stack (a list's next one
+            // appears only after; the mark ended without the rest of the
+            // list, which the final stop then marked, the world stopped).
+            if !MARK_DONE && crate::rt::atomic_load(&mut ASSISTING as *mut usize) == 0 && STACKS_DONE && IDLE_MARKERS == MARKERS && no_grey() {
                 MARK_DONE = true;
                 finish = true;
             }
@@ -648,7 +651,21 @@ fn assist_scan(debt: usize) {
             return;
         }
         done += batch;
-        if empty || me == 0 { return; }
+        if me == 0 { return; }
+        if empty && done < debt {
+            // No grey object to take: the markers hold the rest (a long
+            // list is marked one object after another). As Go's
+            // gcParkAssist, the G pays the rest of its debt from the
+            // markers' credit, waiting for them, rather than allocate on (a
+            // marker short of CPU let the heap grow far past the goal).
+            let c = crate::rt::atomic_load(&mut BG_CREDIT as *mut usize);
+            if c > 0 {
+                let take = if c < debt - done { c } else { debt - done };
+                if crate::rt::atomic_cas(&mut BG_CREDIT as *mut usize, c, c - take) { done += take; }
+            } else {
+                crate::rt::sched::yield_now();
+            }
+        }
     }
 }
 
@@ -1276,6 +1293,18 @@ fn mark_found(s: *mut Span, i: usize, dst: usize) {
             }
         }
     }
+}
+
+/// Gives the markers what the running M's write barrier buffer holds (a
+/// stack a G scanned itself: its roots wait there for no 256 more, and a
+/// mark the markers took for done then marked them, the whole heap behind
+/// them, with the world stopped).
+pub fn flush_wbuf() {
+    let b = crate::rt::sched::m_wbuf();
+    if b == 0 || stack_len(b) == 0 { return; }
+    mark_lock();
+    move_all(b, SHARED);
+    mark_unlock();
 }
 
 // Scans obj (precisely: the words its entry in its span's mask table
@@ -2094,19 +2123,26 @@ fn start_cycle() {
 }
 
 // (3), with the runtime lock held.
+// What the final stop marked (MiB; NAVI_GCTRACE).
+static mut FINISH_MB: usize = 0;
 fn finish_cycle() {
     if !CYCLE || COLLECTING { return; }
     COLLECTING = true;
     COLLECTIONS += 1;
     let t0 = crate::rt::native::monotonic_nanos();
     crate::rt::sched::stop_the_world();
+    let t1 = crate::rt::native::monotonic_nanos();
     // No stack again (the barrier kept them), only those no marker
     // scanned.
     crate::rt::sched::scan_unscanned(CYCLE_NO);
     STACKS_DONE = true;
+    let t2 = crate::rt::native::monotonic_nanos();
     scan_range(crate::rt::data_start() as usize, crate::rt::data_end() as usize);
     scan_cleanups();
+    let s0 = SCAN_DONE;
     drain();
+    let t3 = crate::rt::native::monotonic_nanos();
+    FINISH_MB = (SCAN_DONE - s0) >> 20;
     if crate::rt::native::env_set(b"NAVI_GCTRACE\0") {
         crate::rt::native::put(2, "gc finish done=");
         crate::rt::native::put(2, if MARK_DONE { "1" } else { "0" });
@@ -2114,6 +2150,14 @@ fn finish_cycle() {
         crate::rt::native::put_u64(2, START_STW / 1000);
         crate::rt::native::put(2, " stw_us=");
         crate::rt::native::put_u64(2, (crate::rt::native::monotonic_nanos() - t0) / 1000);
+        crate::rt::native::put(2, " stop_us=");
+        crate::rt::native::put_u64(2, (t1 - t0) / 1000);
+        crate::rt::native::put(2, " stacks_us=");
+        crate::rt::native::put_u64(2, (t2 - t1) / 1000);
+        crate::rt::native::put(2, " drain_us=");
+        crate::rt::native::put_u64(2, (t3 - t2) / 1000);
+        crate::rt::native::put(2, " drain_mb=");
+        crate::rt::native::put_u64(2, FINISH_MB as u64);
         crate::rt::native::put(2, " scan_mb=");
         crate::rt::native::put_u64(2, (SCAN_DONE >> 20) as u64);
         crate::rt::native::put(2, " assist_mb=");
