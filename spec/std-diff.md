@@ -41,6 +41,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | channel 模块 | 常用 `std::sync::mpsc`（单消费者） | `std::sync::mpmc`（`Receiver` 可以被多个线程共享） |
 | `thread::spawn` | 操作系统线程 | 绿色线程（M:N 调度） |
 | `thread::available_parallelism` | `io::Result<NonZero<usize>>` | `io::Result<usize>`（调度器同时使用的 OS 线程数：`NAVI_MAXPROCS`，否则 CPU 数） |
+| —（navi 新增） | — | `thread::cpu_count() -> usize`：CPU 数，不受 `NAVI_MAXPROCS` 影响（同 Go 的 `runtime.NumCPU`） |
 | `thread::current()` | `Thread` 有 name、unpark 等 | 只有 `id() -> ThreadId` |
 | `ThreadId::as_u64` | 不稳定，返回 `NonZero<u64>` | 稳定，返回 `u64`（不为 0） |
 | `sync::atomic` | 各种整数宽度和 `AtomicBool`/`AtomicPtr`；Ordering 按指定的语义 | 只有 `AtomicUsize`（load/store/fetch_add/compare_exchange）；所有操作都是顺序一致的 |
