@@ -348,7 +348,7 @@ fn scan_stack_into(sp: usize, fp0: usize, hi: usize, dst: usize) {
         let ret = unsafe { *((fp + 8) as *const usize) };
         let (m, start) = if pc == 0 { (0, 0) } else { find_map(pc) };
         let flags = if m == 0 { 3 } else { unsafe { *((m + 8) as *const usize) } };
-        if flags != 0 {
+        if flags & 3 != 0 {
             crate::rt::gc::scan_into(top, fp, dst);
             let mut k = 0;
             while k < 9 {
@@ -2997,6 +2997,46 @@ fn stack_mode() {
 // The word at old address a, in the copy.
 fn mv_rd(a: usize, delta: usize) -> usize { unsafe { *(a.wrapping_add(delta) as *const usize) } }
 
+// How many words of its caller's outgoing area the function containing
+// return address pc takes its parameters in, and which of them hold
+// pointers (all of them past 64 words; ARGS_UNKNOWN: code without such a
+// map, and the caller's area is taken conservatively).
+fn arg_map(pc: usize) -> (usize, usize) {
+    let a = ext_map(find_map(pc).0);
+    if a == 0 { return (ARGS_UNKNOWN, 0); }
+    unsafe { (*(a as *const usize), *((a + 8) as *const usize)) }
+}
+
+const ARGS_UNKNOWN: usize = 18446744073709551615;
+
+// Where map m's words past its calls are (flag 4): the parameters' words and
+// mask, then the result's (0: an older compiler's map, or none).
+fn ext_map(m: usize) -> usize {
+    if m == 0 { return 0; }
+    unsafe {
+        if *((m + 8) as *const usize) & 4 == 0 { return 0; }
+        let nb = *((m + 24) as *const usize);
+        let sv = m + 32 + 8 * nb;
+        let ns = *(sv as *const usize);
+        let calls = sv + 8 + 8 * ns;
+        let n = *(calls as *const usize);
+        calls + 8 + 8 * ((n + 1) / 2)
+    }
+}
+
+// Moves the pointer words of a result being made at old address ret (in the
+// old stack) by map m's result mask.
+fn mv_result(m: usize, ret: usize, sp: usize, lo: usize, hi: usize, delta: usize) {
+    let a = ext_map(m);
+    if a == 0 || ret < sp || ret >= hi { return; }
+    let (rw, rm) = unsafe { (*((a + 16) as *const usize), *((a + 24) as *const usize)) };
+    let mut k = 0;
+    while k < rw && ret + 8 * k < hi {
+        if rw > 64 || (rm >> k as u32) & 1 != 0 { mv_adj(ret + 8 * k, lo, hi, delta); }
+        k += 1;
+    }
+}
+
 // Moves the word at old address a (in the copy) if it points into the old stack.
 fn mv_adj(a: usize, lo: usize, hi: usize, delta: usize) {
     let p = a.wrapping_add(delta) as *mut usize;
@@ -3056,9 +3096,16 @@ fn call_mask(calls: usize, ret: usize) -> usize {
 // (delta away), frame by frame from the morestack stub's (sp) outward: the
 // words each function's map marks, its saved registers as the caller's
 // mask at the call says (the value of x19 + k a frame saved belongs to the
-// next frame out that uses the register), the saved frame pointers. Code
-// without a map (the runtime's routines): every word of its frame.
+// next frame out that uses the register), the saved frame pointers, the
+// arguments of the call in progress and the result it is making by the
+// called function's map (as Go's adjustframe goes by the locals' and the
+// arguments' maps). No word moves only because it looks like an address in
+// the stack: one that is not a pointer would change. Code without a map
+// (the runtime's hand-written routines): every word of its frame.
 fn move_frames(sp: usize, lo: usize, hi: usize, delta: usize) {
+    // The function that entered morestack: its result buffer (RET, saved by
+    // the stub at sp + 64, before it is moved itself).
+    mv_result(find_map(mv_rd(sp + 256 + 8, delta)).0, mv_rd(sp + 64, delta), sp, lo, hi, delta);
     // The stub saved x0-x15 at sp, x19-x28 at sp + 128, x16-x17 at sp + 208;
     // at a function's entry only CTX (x0), RET (x8), LOC (x9) and the
     // saved registers hold values.
@@ -3075,6 +3122,9 @@ fn move_frames(sp: usize, lo: usize, hi: usize, delta: usize) {
     // pushed: its caller's frame pointer and return address.
     let s = sp + 256;
     mv_adj(s, lo, hi, delta);
+    // The function that entered morestack (the stub returns into it): its
+    // map says which words of its caller's outgoing area hold pointers.
+    let (mut argw, mut argmask) = arg_map(mv_rd(s + 8, delta));
     let t = s + 16;
     let mut fp = mv_rd(t, delta);
     let mut pc = mv_rd(t + 8, delta);
@@ -3090,6 +3140,8 @@ fn move_frames(sp: usize, lo: usize, hi: usize, delta: usize) {
                 mv_adj(a, lo, hi, delta);
                 a += 8;
             }
+            argw = ARGS_UNKNOWN;
+            argmask = 0;
             k = 0;
             while k < 9 {
                 if pend[k] != 0 { mv_adj(pend[k], lo, hi, delta); }
@@ -3099,23 +3151,47 @@ fn move_frames(sp: usize, lo: usize, hi: usize, delta: usize) {
         } else {
             let frame = unsafe { *(m as *const usize) };
             let flags = unsafe { *((m + 8) as *const usize) };
+            // Its result buffer, by the RET its prologue saved (read before
+            // the slot itself moves).
+            mv_result(m, mv_rd(fp - 16, delta), sp, lo, hi, delta);
             let any = unsafe { *((m + 16) as *const usize) };
             let nb = unsafe { *((m + 24) as *const usize) };
             let fsp = fp - frame;
+            // The bottom of the frame (the outgoing area and the buffers):
+            // the arguments of the call in progress by the called function's
+            // map. The rest holds nothing live across the call that the maps
+            // do not describe: the result being made in the buffer is moved
+            // by the called function's map (mv_result). A map an older
+            // compiler made (no flag 4; the runtime's frames all bottom), or
+            // a call into code without such a map: every word there that
+            // looks like an address, as before.
+            let exact = flags & 4 != 0;
             let mut w = 0;
-            while w < any {
-                mv_adj(fsp + 8 * w, lo, hi, delta);
-                w += 1;
+            if exact && argw != ARGS_UNKNOWN {
+                while w < argw && w < any {
+                    if argw > 64 || (argmask >> w as u32) & 1 != 0 { mv_adj(fsp + 8 * w, lo, hi, delta); }
+                    w += 1;
+                }
+            } else {
+                while w < any {
+                    mv_adj(fsp + 8 * w, lo, hi, delta);
+                    w += 1;
+                }
             }
+            w = any;
             while w < frame / 8 {
                 let i = w - any;
                 let bits = unsafe { *((m + 32 + 8 * (i / 64)) as *const usize) };
                 if (bits >> (i % 64) as u32) & 1 != 0 { mv_adj(fsp + 8 * w, lo, hi, delta); }
                 w += 1;
             }
+            // This frame is the next one out's callee.
+            let (naw, nam) = arg_map(pc);
+            argw = naw;
+            argmask = nam;
             let sv = m + 32 + 8 * nb;
             let ns = unsafe { *(sv as *const usize) };
-            let mask = if flags & 1 != 0 { 0x1ff } else { call_mask(sv + 8 + 8 * ns, pc - start) };
+            let mask = if !exact && flags & 1 != 0 { 0x1ff } else { call_mask(sv + 8 + 8 * ns, pc - start) };
             let mut j = 0;
             while j < ns {
                 let e = unsafe { *((sv + 8 + 8 * j) as *const usize) };

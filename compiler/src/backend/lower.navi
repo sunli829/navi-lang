@@ -122,6 +122,15 @@ pub struct Gen {
     cur_meta: Vec<u64>,
     cur_masks: Vec<u16>,
     cur_all: u64,
+    /// How many words of its caller's outgoing area the function just made
+    /// takes its parameters in, and which of them hold pointers (all of them
+    /// past 64 words).
+    cur_argw: u64,
+    cur_argmask: u64,
+    /// The words of its result, in memory at RET (0: in registers), and
+    /// which of them hold pointers (all of them past 64 words).
+    cur_retw: u64,
+    cur_retmask: u64,
     /// The functions placed with stack maps: (symbol, text offset, size,
     /// map symbol), in text order.
     ftab: Vec<(u64, u64, u64)>,
@@ -272,7 +281,7 @@ fn new_gen(p: &mut Plan, arch: &str, m: &mut dyn Machine, tgt: TargetConv, dwarf
         loc_ids: HashMap::new(), str_ids: HashMap::new(),
         closure: HashMap::new(), statics: HashMap::new(), errs: Vec::new(), cur_lines: Vec::new(), cur_file: None, cur_name: String::new(),
         lock, lays: HashMap::new(), ftypes: HashMap::new(), loc_ty, worker: false, outs: Vec::new(), fstrs: Vec::new(), fstr_ix: HashMap::new(),
-        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), flibs: Vec::new(), main_ids: HashMap::new(), cur_meta: Vec::new(), cur_masks: Vec::new(), cur_all: 0, ftab: Vec::new(), fmeta: Vec::new(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
+        flocs: Vec::new(), floc_ix: HashMap::new(), fundef: Vec::new(), flibs: Vec::new(), main_ids: HashMap::new(), cur_meta: Vec::new(), cur_masks: Vec::new(), cur_all: 0, cur_argw: 0, cur_argmask: 0, cur_retw: 0, cur_retmask: 0, ftab: Vec::new(), fmeta: Vec::new(), ph_s: Vec::new(), ph_l: Vec::new(), file_no: HashMap::new(),
         file_sym: HashMap::new(), floc_pos: HashMap::new(),
         sym_marking: "_navi_gc_marking".to_string(), sym_rundefers: "_navi_rundefers".to_string(),
         ssa_check: match std::env::var("NAVI_SSACHECK") { Ok(v) => if v == "2" { 2 } else if v == "3" { 3 } else { 1 }, Err(_) => 0 },
@@ -743,7 +752,6 @@ impl Gen {
         let mut fm = self.cur_meta;
         self.cur_meta = Vec::new();
         if fm.len() == 0 { return fm; }
-        let conservative = fm[1] & 1 != 0;
         // Each call: (return offset / code unit) << 9 | mask, two in a word.
         fm.push(calls.len() as u64);
         let mut half = 0u64;
@@ -752,12 +760,21 @@ impl Gen {
             let c = calls[ci];
             let ret = c >> 32;
             let tag = (c & 0xffffffff) as i64 - 1;
-            let mask = if conservative || tag < 0 || tag as usize >= self.cur_masks.len() { self.cur_all } else { self.cur_masks[tag as usize] as u64 };
+            let mask = if tag < 0 || tag as usize >= self.cur_masks.len() { self.cur_all } else { self.cur_masks[tag as usize] as u64 };
             let e = (ret / self.tgt.code_unit) << 9 | mask;
             if ci % 2 == 0 { half = e; } else { fm.push(half | e << 32); }
             ci += 1;
         }
         if calls.len() % 2 == 1 { fm.push(half); }
+        // Flag 4: the four words after the calls say where this function's
+        // parameters are in its caller's outgoing area and its result in the
+        // caller's buffer, with their pointer words (a map an older compiler
+        // made has none).
+        fm[1] = fm[1] | 4;
+        fm.push(self.cur_argw);
+        fm.push(self.cur_argmask);
+        fm.push(self.cur_retw);
+        fm.push(self.cur_retmask);
         fm
     }
 
@@ -1462,14 +1479,18 @@ impl FnGen {
             Some(d) => crate::mir::inline::in_runtime(d),
             None => match self.f.owner { Some(d) => crate::mir::inline::in_runtime(d), None => false },
         };
-        let any = if rt { nw } else { (frame + self.buf_top) / 8 };
+        // The runtime's frames get the same map as others: the collector
+        // still scans them whole (flag 1: their integers may hold the only
+        // address of an object), but a stack move goes by the map, as Go's
+        // treats a uintptr as no pointer.
+        let any = (frame + self.buf_top) / 8;
         let mut bits: Vec<u64> = Vec::new();
         let mut k = 0;
         while k < (nw - any + 63) / 64 {
             bits.push(0);
             k += 1;
         }
-        if !rt {
+        {
             let mut set = |off: i64| {
                 let w = frame + off;
                 if w >= 0 && w < frame && w % 8 == 0 && w / 8 >= any {
@@ -1495,6 +1516,58 @@ impl FnGen {
             }
             for o in self.ptr_slots.iter() { set(*o); }
         }
+        // The parameters are in the caller's outgoing area, which starts at
+        // its SP, this frame's FP + 16 (the frame record): their pointer
+        // words by this frame's own layout, for a stack move to take those
+        // words by (as Go's argument maps) instead of every word there that
+        // looks like an address in the stack.
+        let mut argw = 0i64;
+        let mut argmask = 0u64;
+        let mut ai = self.first_arg();
+        while ai <= self.f.nargs {
+            let at = self.ltypes[ai];
+            if at.kind != types::K_NEVER {
+                let al = self.g.lay_of(at);
+                let base = self.loff[ai] - 16;
+                let end = (base + al.size + 7) / 8;
+                if end > argw { argw = end; }
+                for q in al.ptrs.iter() {
+                    let aw = (base + *q) / 8;
+                    if aw >= 0 && aw < 64 { argmask = argmask | 1u64 << aw as u32; }
+                }
+            }
+            ai += 1;
+        }
+        // More than a word mask describes: those words taken conservatively.
+        if argw > 64 { argmask = 18446744073709551615; }
+        self.g.cur_argw = argw as u64;
+        self.g.cur_argmask = argmask;
+        // The result, when it is in memory: every call passes RET, the
+        // address of the caller's result buffer, and the result is made
+        // there while this function runs (and calls others). A move adjusts
+        // its pointer words by this mask, as Go's argument maps cover the
+        // results, instead of every word of the caller's buffer that looks
+        // like an address: the buffer holds what earlier calls returned, and
+        // the padding of a result made over it keeps their bytes.
+        let mut retw = 0u64;
+        let mut retmask = 0u64;
+        if !self.ssa_var0 {
+            let rt0 = self.ltypes[0];
+            if rt0.kind != types::K_NEVER {
+                let rl = self.g.lay_of(rt0);
+                retw = ((rl.size + 7) / 8) as u64;
+                if retw > 64 {
+                    retmask = 18446744073709551615;
+                } else {
+                    for q in rl.ptrs.iter() {
+                        let rw = *q / 8;
+                        if rw >= 0 && rw < 64 { retmask = retmask | 1u64 << rw as u32; }
+                    }
+                }
+            }
+        }
+        self.g.cur_retw = retw;
+        self.g.cur_retmask = retmask;
         let mut meta = self.g.cur_meta;
         meta.clear();
         // Flag 2: std code, whose integers may hold the only address of a
