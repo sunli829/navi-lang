@@ -91,8 +91,8 @@ struct Part {
     // The relocations of each atom: rels[sec][first[sec][a]..first[sec][a + 1]].
     first: Vec<Vec<u32>>,
     rels: Vec<Vec<u32>>,
-    // The merged name of each of the part's names.
-    names: Vec<String>,
+    // The merged name (Names) of each of the part's names.
+    gid: Vec<u32>,
     // The atom of the stack map table (DATA_CONST; -1: none): never
     // copied, its entries and maps are taken one function at a time.
     ftab: i64,
@@ -119,7 +119,29 @@ impl Part {
     fn reached(&self, s: usize, off: u64) -> bool { self.live[s][find(&self.starts[s], off)] }
 }
 
-fn cut(p: &Object, pi: usize) -> &mut Part {
+// The merged object's names, numbered (the parts' names map to them once,
+// so the rest looks nothing up by name).
+struct Names {
+    ids: HashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl Names {
+    fn id_of(&mut self, n: &String) -> u32 {
+        if let Some(i) = self.ids.get(n) { return *i; }
+        self.id(n.clone())
+    }
+
+    fn id(&mut self, n: String) -> u32 {
+        if let Some(i) = self.ids.get(&n) { return *i; }
+        let i = self.names.len() as u32;
+        self.ids.insert(n.clone(), i);
+        self.names.push(n);
+        i
+    }
+}
+
+fn cut(p: &Object, pi: usize, g: &mut Names) -> &mut Part {
     let mut starts: Vec<Vec<u64>> = Vec::new();
     let mut s = 0;
     while s < obj::NUM_SECTIONS {
@@ -153,11 +175,11 @@ fn cut(p: &Object, pi: usize) -> &mut Part {
         to.push(t);
         s += 1;
     }
-    let mut names: Vec<String> = Vec::new();
+    let mut gid: Vec<u32> = Vec::with_capacity(p.names.len());
     for n in p.names.iter() {
-        if part_local(n.as_str()) { names.push(`${n}.p${pi}`.to_string()); } else { names.push(n.clone()); }
+        if part_local(n.as_str()) { gid.push(g.id(`${n}.p${pi}`.to_string())); } else { gid.push(g.id_of(n)); }
     }
-    let part = &mut Part { starts, live, to, first: Vec::new(), rels: Vec::new(), names, ftab: -1, entries: Vec::new(), maps: 0, maps_end: 0, bare };
+    let part = &mut Part { starts, live, to, first: Vec::new(), rels: Vec::new(), gid, ftab: -1, entries: Vec::new(), maps: 0, maps_end: 0, bare };
     // Each atom's relocations (counted, then placed).
     let mut ra: Vec<u32> = Vec::with_capacity(p.relocs.len());
     s = 0;
@@ -225,8 +247,14 @@ fn cut(p: &Object, pi: usize) -> &mut Part {
     part
 }
 
-fn reached(cuts: &Vec<&mut Part>, defs: &HashMap<String, (usize, usize, usize)>, name: &String) -> bool {
-    match defs.get(name) { Some(d) => cuts[d.0].live[d.1][d.2], None => false }
+fn reached(cuts: &Vec<&mut Part>, defs: &Vec<(i64, usize, usize)>, id: usize) -> bool {
+    let d = defs[id];
+    d.0 >= 0 && cuts[d.0 as usize].live[d.1][d.2]
+}
+
+// Whether a relocation kept refers to name.
+fn is_used(g: &Names, used: &Vec<bool>, n: &String) -> bool {
+    match g.ids.get(n) { Some(i) => used[*i as usize], None => false }
 }
 
 /// The parts as one object.
@@ -241,35 +269,48 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
         o.align[k] = a;
         k += 1;
     }
+    let g = &mut Names { ids: HashMap::new(), names: Vec::new() };
     let mut cuts: Vec<&mut Part> = Vec::new();
     let mut pi = 0;
     while pi < parts.len() {
-        cuts.push(cut(parts[pi], pi));
+        cuts.push(cut(parts[pi], pi, g));
         pi += 1;
     }
-    // Each name's definition (part, section, atom): the first part's.
-    let mut defs: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    let ng = g.names.len();
+    // Each name's definition (part, section, atom; part -1: none): the
+    // first part's.
+    let mut defs: Vec<(i64, usize, usize)> = Vec::with_capacity(ng);
+    // The static a name initializes (lower::static_init_sym; -1: none).
+    let mut init_of: Vec<i64> = Vec::with_capacity(ng);
+    let mut k2 = 0;
+    while k2 < ng {
+        defs.push((-1, 0, 0));
+        let n = g.names[k2];
+        let st = if n.ends_with(".i") { match g.ids.get(&n[..n.len() - 2].to_string()) { Some(i) => *i as i64, None => -1 } } else { -1 };
+        init_of.push(st);
+        k2 += 1;
+    }
     pi = 0;
     while pi < parts.len() {
         let c = cuts[pi];
         for sy in parts[pi].syms.iter() {
             if program_wide(sy.name.as_str()) { continue; }
-            let name = c.names[sy.id as usize];
-            if defs.contains_key(&name) { continue; }
-            defs.insert(name, (pi, sy.sec, find(&c.starts[sy.sec], sy.off)));
+            let id = c.gid[sy.id as usize] as usize;
+            if defs[id].0 >= 0 { continue; }
+            defs[id] = (pi as i64, sy.sec, find(&c.starts[sy.sec], sy.off));
         }
         pi += 1;
     }
     // The atoms reached: from the global symbols (the entry point) and any
     // bytes before a section's first symbol, through relocations.
     let all = std::env::var("NAVI_NOSTRIP").is_ok();
-    let mut work: Vec<(usize, usize, usize)> = Vec::new();
+    let mut work: Vec<(i64, usize, usize)> = Vec::new();
     pi = 0;
     while pi < parts.len() {
         let p = parts[pi];
         let c = cuts[pi];
         for sy in p.syms.iter() {
-            if sy.global { work.push(defs[&c.names[sy.id as usize]]); }
+            if sy.global { work.push(defs[c.gid[sy.id as usize] as usize]); }
         }
         let mut s = 0;
         while s < obj::NUM_SECTIONS {
@@ -277,7 +318,7 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
             while a < c.starts[s].len() {
                 let skip = s == obj::DATA_CONST && a as i64 == c.ftab;
                 let bare = a == 0 && c.bare[s] && p.sects[s].len() > 0;
-                if !skip && (all || bare) { work.push((pi, s, a)); }
+                if !skip && (all || bare) { work.push((pi as i64, s, a)); }
                 a += 1;
             }
             s += 1;
@@ -287,32 +328,30 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
     // A static's initialization (lower::static_init_sym) counts only if
     // the static is reached: the crate's initializer calls
     // lower::INIT_NOP instead.
-    if let Some(d) = defs.get(&INIT_NOP.to_string()) { work.push(*d); }
-    let mut weak: Vec<String> = Vec::new();
+    let nop = match g.ids.get(&INIT_NOP.to_string()) { Some(i) => *i as i64, None => -1 };
+    if nop >= 0 { work.push(defs[nop as usize]); }
+    let mut weak: Vec<u32> = Vec::new();
     loop {
-        while work.len() > 0 {
-            let (wp, ws, wa) = work.pop().unwrap();
-            let c = cuts[wp];
+        while let Some((wp, ws, wa)) = work.pop() {
+            if wp < 0 { continue; }
+            let c = cuts[wp as usize];
             let mut lv = c.live[ws];
             if lv[wa] { continue; }
             lv[wa] = true;
-            let p = parts[wp];
+            let p = parts[wp as usize];
             let f = c.first[ws];
             let rl = c.rels[ws];
             let mut i = f[wa];
             while i < f[wa + 1] {
-                let r = p.relocs[rl[i as usize] as usize];
-                let name = c.names[r.sym as usize];
-                if let Some(d) = defs.get(&name) {
-                    if name.ends_with(".i") { weak.push(name); } else { work.push(*d); }
-                }
+                let id = c.gid[p.relocs[rl[i as usize] as usize].sym as usize];
+                if init_of[id as usize] >= 0 { weak.push(id); } else { work.push(defs[id as usize]); }
                 i += 1;
             }
         }
         // (Those whose static is not reached yet wait for the next round.)
-        let mut wait: Vec<String> = Vec::new();
+        let mut wait: Vec<u32> = Vec::new();
         for si in weak.iter() {
-            if reached(&cuts, &defs, &si[..si.len() - 2].to_string()) { work.push(defs[si]); } else { wait.push(si.clone()); }
+            if reached(&cuts, &defs, init_of[*si as usize] as usize) { work.push(defs[*si as usize]); } else { wait.push(*si); }
         }
         weak = wait;
         if work.len() == 0 { break; }
@@ -414,34 +453,61 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
     }
     // Symbols (each name once), relocations and debug information of the
     // atoms reached.
-    let mut defined: HashMap<String, bool> = HashMap::new();
-    for s in o.syms.iter() { defined.insert(s.name.clone(), true); }
-    let mut used: HashMap<String, bool> = HashMap::new();
+    let mut defined: Vec<bool> = Vec::with_capacity(ng);
+    let mut used: Vec<bool> = Vec::with_capacity(ng);
+    let mut oid: Vec<i64> = Vec::with_capacity(ng);
+    k2 = 0;
+    while k2 < ng {
+        defined.push(false);
+        used.push(false);
+        oid.push(-1);
+        k2 += 1;
+    }
     pi = 0;
     while pi < parts.len() {
         let p = parts[pi];
         let c = cuts[pi];
-        for s in p.syms.iter() {
-            let name = c.names[s.id as usize];
-            if program_wide(s.name.as_str()) || defined.contains_key(&name) || !c.reached(s.sec, s.off) { continue; }
-            defined.insert(name.clone(), true);
-            o.define_at(name.as_str(), s.sec, c.at(s.sec, s.off), s.global);
+        for sy in p.syms.iter() {
+            let id = c.gid[sy.id as usize] as usize;
+            if program_wide(sy.name.as_str()) || defined[id] || !c.reached(sy.sec, sy.off) { continue; }
+            defined[id] = true;
+            o.define_at(g.names[id].as_str(), sy.sec, c.at(sy.sec, sy.off), sy.global);
         }
-        for r in p.relocs.iter() {
-            if !c.reached(r.sec, r.off as u64) { continue; }
-            let mut name = c.names[r.sym as usize];
-            if name.ends_with(".i") && !reached(&cuts, &defs, &name) { name = INIT_NOP.to_string(); }
-            used.insert(name.clone(), true);
-            let id = o.id_s(&name);
-            let off = c.at(r.sec, r.off as u64);
-            if off > 0xffffffff { return Err("merge: a section exceeds 4 GiB".to_string()); }
-            o.reloc_id(r.sec, off as u32, r.kind, id);
+        // Each atom's relocations, moved with it.
+        let mut s = 0;
+        while s < obj::NUM_SECTIONS {
+            let f = c.first[s];
+            let rl = c.rels[s];
+            let mut a = 0;
+            while a < c.starts[s].len() {
+                if c.live[s][a] {
+                    let delta = c.to[s][a] as i64 - c.starts[s][a] as i64;
+                    let mut i = f[a];
+                    while i < f[a + 1] {
+                        let r = p.relocs[rl[i as usize] as usize];
+                        let mut id = c.gid[r.sym as usize] as usize;
+                        if init_of[id] >= 0 && !reached(&cuts, &defs, id) { id = nop as usize; }
+                        used[id] = true;
+                        if oid[id] < 0 { oid[id] = o.id_s(&g.names[id]) as i64; }
+                        let off = r.off as i64 + delta;
+                        if off > 0xffffffff { return Err("merge: a section exceeds 4 GiB".to_string()); }
+                        o.reloc_id(r.sec, off as u32, r.kind, oid[id] as u32);
+                        i += 1;
+                    }
+                }
+                a += 1;
+            }
+            s += 1;
         }
-        for (n, _) in p.undef.iter() { if used.contains_key(n) { o.undefined(n.as_str()); } }
-        for (n, l) in p.libs.iter() { if used.contains_key(n) { o.import_from(n.as_str(), l.as_str()); } }
+        for (n, _) in p.undef.iter() { if is_used(g, &used, n) { o.undefined(n.as_str()); } }
+        for (n, l) in p.libs.iter() { if is_used(g, &used, n) { o.import_from(n.as_str(), l.as_str()); } }
         let mut fmap: HashMap<u32, u32> = HashMap::new();
+        // (Lines come by address: the atom found once for each run.)
+        let ts = c.starts[obj::TEXT];
+        let mut a = 0usize;
         for l in p.lines.iter() {
-            if !c.reached(obj::TEXT, l.off) { continue; }
+            if l.off < ts[a] || a + 1 < ts.len() && l.off >= ts[a + 1] { a = find(&ts, l.off); }
+            if !c.live[obj::TEXT][a] { continue; }
             let fi = match fmap.get(&l.file) {
                 Some(f) => *f,
                 None => {
@@ -450,7 +516,7 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
                     f
                 }
             };
-            o.lines.push(obj::Line { off: c.at(obj::TEXT, l.off), file: fi, line: l.line });
+            o.lines.push(obj::Line { off: c.to[obj::TEXT][a] + l.off - ts[a], file: fi, line: l.line });
         }
         for f in p.funcs.iter() {
             if !c.reached(obj::TEXT, f.off) { continue; }
@@ -464,7 +530,9 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
     }
     // Symbols defined by some part are not undefined.
     let mut gone: Vec<String> = Vec::new();
-    for (n, _) in o.undef.iter() { if defined.contains_key(n) { gone.push(n.clone()); } }
+    for (n, _) in o.undef.iter() {
+        if let Some(i) = g.ids.get(n) { if defined[*i as usize] { gone.push(n.clone()); } }
+    }
     for n in gone.iter() { o.undef.remove(n); }
     Ok(o)
 }
