@@ -170,7 +170,79 @@ pub struct WaitList { head: *mut WaitNode, tail: *mut WaitNode }
 static mut ALL: usize = 0;
 static mut FREE_GS: usize = 0; // dead Gs whose records and stacks are reused (linked by next)
 
-fn reserve(size: usize) -> usize { reserve_os(size) }
+// Stacks no G uses any more, kept for reuse (as Go's stack pool): a list
+// per size (STACK << k), linked through each stack's lowest word, under
+// SPOOL_LK; they go back to the system after each collection (free_stacks).
+// With NAVI_STACKMOVE a stack is freed at nearly every call: an munmap
+// each, which a virtual machine makes slow (CI's macOS ones ran the mode
+// 50 times slower), since it must stop every CPU running the process.
+const SPOOL_CLASSES: usize = 12;
+static mut SPOOL: [usize; 12] = [0; 12];
+static mut SPOOL_LK: usize = 0;
+
+// Takes SPOOL_LK. Held, a G makes no call until it lets go with an inline
+// store: a call's prologue could stop it for a collector, which may need a
+// stack itself (stack_headroom).
+fn spool_lock() {
+    while !crate::rt::atomic_cas(&mut SPOOL_LK as *mut usize, 0, 1) { unsafe { os_yield(); } }
+}
+
+// The pool's list for stacks of size bytes (SPOOL_CLASSES: none).
+fn spool_class(size: usize) -> usize {
+    let mut k = 0;
+    let mut s = STACK;
+    while k < SPOOL_CLASSES {
+        if s == size { return k; }
+        s = s * 2;
+        k += 1;
+    }
+    SPOOL_CLASSES
+}
+
+// A stack of size bytes: one from the pool, else from the system.
+fn reserve(size: usize) -> usize {
+    let k = spool_class(size);
+    if k < SPOOL_CLASSES {
+        spool_lock();
+        let p = SPOOL[k];
+        if p != 0 { SPOOL[k] = unsafe { *(p as *const usize) }; }
+        crate::rt::atomic_store(&mut SPOOL_LK as *mut usize, 0);
+        if p != 0 { return p; }
+    }
+    reserve_os(size)
+}
+
+// A stack no G uses any more: into the pool (unless NAVI_STACKPROT keeps
+// it to fault on).
+fn release(p: usize, size: usize) {
+    if size == 0 { return; }
+    let k = spool_class(size);
+    if k >= SPOOL_CLASSES || stack_prot() {
+        release_os(p, size);
+        return;
+    }
+    spool_lock();
+    unsafe { *(p as *mut usize) = SPOOL[k]; }
+    SPOOL[k] = p;
+    crate::rt::atomic_store(&mut SPOOL_LK as *mut usize, 0);
+}
+
+// The pool's stacks back to the system.
+fn drain_spool() {
+    let mut k = 0;
+    while k < SPOOL_CLASSES {
+        spool_lock();
+        let mut p = SPOOL[k];
+        SPOOL[k] = 0;
+        crate::rt::atomic_store(&mut SPOOL_LK as *mut usize, 0);
+        while p != 0 {
+            let next = unsafe { *(p as *const usize) };
+            release_os(p, STACK << k as u32);
+            p = next;
+        }
+        k += 1;
+    }
+}
 
 #[cfg(not(target_os = "windows"))]
 fn reserve_os(size: usize) -> usize {
@@ -183,8 +255,7 @@ fn reserve_os(size: usize) -> usize {
 fn release_os(p: usize, size: usize) {
     // NAVI_STACKPROT=1 (debugging): the stack stays mapped, inaccessible, so
     // that a pointer left into it faults where it is used.
-    if STACKPROT == 0 { STACKPROT = if crate::rt::native::env_set(b"NAVI_STACKPROT\0") { 1 } else { 2 }; }
-    if STACKPROT == 1 {
+    if stack_prot() {
         unsafe { mprotect(p as *mut u8, size, 0); }
         return;
     }
@@ -192,6 +263,13 @@ fn release_os(p: usize, size: usize) {
 }
 #[cfg(not(target_os = "windows"))]
 static mut STACKPROT: usize = 0;
+#[cfg(not(target_os = "windows"))]
+fn stack_prot() -> bool {
+    if STACKPROT == 0 { STACKPROT = if crate::rt::native::env_set(b"NAVI_STACKPROT\0") { 1 } else { 2 }; }
+    STACKPROT == 1
+}
+#[cfg(target_os = "windows")]
+fn stack_prot() -> bool { false }
 
 #[cfg(target_os = "windows")]
 fn release_os(p: usize, size: usize) { unsafe { VirtualFree(p as *mut u8, 0, 0x8000); } }
@@ -2044,11 +2122,11 @@ fn exit_g(g: *mut G) {
         (*g).sp = 0;
         (*g).fp = 0;
         if (*g).old_size != 0 {
-            release_os((*g).old_stack, (*g).old_size);
+            release((*g).old_stack, (*g).old_size);
             (*g).old_size = 0;
         }
         if (*g).stack_hi - (*g).stack_lo != STACK {
-            release_os((*g).stack_lo, (*g).stack_hi - (*g).stack_lo);
+            release((*g).stack_lo, (*g).stack_hi - (*g).stack_lo);
             (*g).stack_lo = 0;
             (*g).stack_hi = 0;
         }
@@ -2066,9 +2144,11 @@ static mut NFREE_GS: usize = 0;
 const KEEP_STACKS: usize = 64;
 
 /// After a collection (on a G): the stacks of the ended Gs past the first
-/// KEEP_STACKS go back to the system (as Go frees the stacks of its global
-/// list of dead goroutines at each cycle); go makes new ones as needed.
+/// KEEP_STACKS, and the pool's, go back to the system (as Go frees the
+/// stacks of its global list of dead goroutines and its stack spans at each
+/// cycle); go makes new ones as needed.
 pub fn free_stacks() {
+    drain_spool();
     let mut n = 0usize;
     let mut a = 0usize;
     lock();
@@ -2795,7 +2875,7 @@ pub fn morestack() -> usize {
             }
         }
         if (*g).old_size != 0 {
-            release_os((*g).old_stack, (*g).old_size);
+            release((*g).old_stack, (*g).old_size);
             (*g).old_size = 0;
         }
         let mut delta = 0usize;
