@@ -198,6 +198,10 @@ pub struct Plan {
     dyn_seen: HashMap<String, bool>,
     /// Instances created but not walked yet (see walk_pending).
     pending: Vec<&mut Inst>,
+    /// Stable descriptions of types and shapes, for symbol names
+    /// (crate::symbols).
+    canon: &mut crate::symbols::Canon,
+    canon_shapes: HashMap<u64, String>,
 }
 
 /// GC shapes by number, shared by the warming threads. A shape is
@@ -268,7 +272,7 @@ pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> 
         main: None, statics: Vec::new(), static_ok: HashMap::new(), vtables: HashMap::new(), vtable_list: Vec::new(),
         descs: HashMap::new(), desc_list: Vec::new(), strings: HashMap::new(), string_list: Vec::new(), errors: Vec::new(), static_init: HashMap::new(), runtime: HashMap::new(),
         groups_by_key: HashMap::new(), native: None, shapes: new_shapes(), shape_cache: HashMap::new(), copies: Vec::new(), drafting: false, bail: false,
-        evs: Vec::new(), dyn_seen: HashMap::new(), pending: Vec::new() };
+        evs: Vec::new(), dyn_seen: HashMap::new(), pending: Vec::new(), canon: crate::symbols::new_canon(), canon_shapes: HashMap::new() };
     p.find_native();
     for name in ["panic_raw", "panic_bounds", "gc_alloc", "gc_alloc_typed", "gc_alloc_array", "sched_init", "gmain", "set_args", "morestack", "mstart", "gc_wb", "cb_enter", "cb_exit"].iter() {
         match p.native_fn(*name) {
@@ -471,7 +475,7 @@ impl Plan {
             descs: self.descs, desc_list: Vec::new(), strings: self.strings, string_list: Vec::new(), errors: Vec::new(), static_init: self.static_init,
             runtime: self.runtime, groups_by_key: self.groups_by_key, native: self.native, shapes: self.shapes, shape_cache: HashMap::new(), copies: Vec::new(), drafting: true,
             bail: false, evs: Vec::new(), dyn_seen: HashMap::new(),
-            pending: Vec::new() }
+            pending: Vec::new(), canon: crate::symbols::new_canon(), canon_shapes: HashMap::new() }
     }
 
     fn visit_op(&mut self, inst: &mut Inst, op: &Operand) {
@@ -750,7 +754,8 @@ impl Plan {
     /// time.
     pub fn desc(&mut self, t: &Type) -> &mut Desc {
         if let Some(d) = self.descs.get(&t.id) { return *d; }
-        let d = &mut Desc { sym: `_navi_ty${self.desc_list.len()}`.to_string(), ty: t, map_vt: None };
+        let what = self.canon.ty(t);
+        let d = &mut Desc { sym: crate::symbols::symbol("_navi_ty_", "", what.as_str()), ty: t, map_vt: None };
         self.descs.insert(t.id, d);
         self.desc_list.push(d);
         for p in self.desc_parts(t).iter() { self.desc(*p); }
@@ -804,7 +809,8 @@ impl Plan {
     fn vtable(&mut self, concrete: &Type, dyn_ty: &Type) -> &mut Vtable {
         let key = `${concrete.id}/${dyn_ty.id}`.to_string();
         if let Some(v) = self.vtables.get(&key) { return *v; }
-        let v = &mut Vtable { sym: `_navi_vt${self.vtables.len()}`.to_string(), concrete, dyn_ty, methods: Vec::new() };
+        let what = `${self.canon.ty(concrete)}|${self.canon.ty(dyn_ty)}`.to_string();
+        let v = &mut Vtable { sym: crate::symbols::symbol("_navi_vt_", "", what.as_str()), concrete, dyn_ty, methods: Vec::new() };
         self.vtables.insert(key, v);
         self.vtable_list.push(v);
         for m in self.dyn_methods(dyn_ty).iter() {
@@ -921,7 +927,9 @@ impl Plan {
             Some(g) => *g,
             None => {
                 let name = match inst.def { Some(d) => d.name.clone(), None => if inst.func.name.len() > 0 { inst.func.name.clone() } else { "anon".to_string() } };
-                let g = &mut Group { key: key.clone(), sym: `_navi_${self.groups.len()}_${sanitize(name.as_str())}`.to_string(), rep: inst,
+                let what = self.canon_group_key(inst);
+                let sym = crate::symbols::symbol("_navi_", name.as_str(), what.as_str());
+                let g = &mut Group { key: key.clone(), sym, rep: inst,
                     insts: Vec::new(), slots: HashMap::new(), nslots: 0, closure_syms: HashMap::new() };
                 self.groups_by_key.insert(key, g);
                 self.groups.push(g);
@@ -930,7 +938,127 @@ impl Plan {
         };
         g.insts.push(inst);
         inst.group = Some(g);
-        inst.dict = `${g.sym}_dict${g.insts.len() - 1}`.to_string();
+        let what = self.canon_inst(inst);
+        inst.dict = `${g.sym}_d${crate::symbols::hash64(what.as_str())}`.to_string();
+    }
+
+    // The function inst runs, described stably: its definition, or a
+    // closure's or shim's owner, name and signature (shims of one name
+    // differ by their types: <str as Index>::index for each index type).
+    fn canon_func(&mut self, inst: &Inst) -> String {
+        match inst.def {
+            Some(d) => crate::symbols::def_id(d),
+            None => {
+                let f = inst.func;
+                let mut b = `${crate::symbols::def_id_opt(f.owner)}/${f.name}(`.to_string();
+                let mut i = 0;
+                while i <= f.nargs && i < f.locals.len() {
+                    b.push_str(self.canon.ty(f.locals[i].ty).as_str());
+                    b.push(',');
+                    i += 1;
+                }
+                b.push(')');
+                b
+            }
+        }
+    }
+
+    // An instance described stably: its function and concrete type
+    // arguments.
+    fn canon_inst(&mut self, inst: &Inst) -> String {
+        let mut b = self.canon_func(inst);
+        for a in inst.args.iter() {
+            b.push('<');
+            b.push_str(self.canon.ty(*a).as_str());
+        }
+        if let Some(st) = inst.self_ty {
+            b.push_str("<self ");
+            b.push_str(self.canon.ty(st).as_str());
+        }
+        b
+    }
+
+    // shape_key described stably (the shapes by structure, not number).
+    fn canon_group_key(&mut self, inst: &Inst) -> String {
+        let mut b = self.canon_func(inst);
+        if inst.args.len() == 0 && inst.self_ty.is_none() { return b; }
+        for a in inst.args.iter() {
+            b.push('<');
+            b.push_str(self.canon_shape(*a, 0).as_str());
+        }
+        if let Some(st) = inst.self_ty {
+            b.push_str("<self ");
+            b.push_str(self.canon_shape(st, 0).as_str());
+        }
+        self.canon_shape_walk(inst, inst.func, &mut b);
+        b
+    }
+
+    fn canon_shape_walk(&mut self, inst: &Inst, f: &Func, b: &mut String) {
+        for l in f.locals.iter() {
+            b.push('|');
+            let t = inst.concrete(self.info, l.ty);
+            b.push_str(self.canon_shape(t, 0).as_str());
+        }
+        for blk in f.blocks.iter() {
+            for st in blk.stmts.iter() {
+                if let Stmt::Assign { rv, .. } = st {
+                    if let Rvalue::Aggregate { closure, .. } = rv {
+                        if let Some(cf) = closure {
+                            b.push('{');
+                            self.canon_shape_walk(inst, *cf, b);
+                            b.push('}');
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // shape_uncached described stably (hashed when long).
+    fn canon_shape(&mut self, t: &Type, depth: i32) -> String {
+        let key = (t.id as u64) << 8 | depth as u64;
+        if let Some(s) = self.canon_shapes.get(&key) { return s.clone(); }
+        let mut b = String::new();
+        match t.kind {
+            types::K_REF | types::K_PTR | types::K_FN => b = shape_of(t),
+            types::K_TUPLE => {
+                b.push('(');
+                for e in t.elems.iter() {
+                    b.push_str(self.canon_shape(*e, depth + 1).as_str());
+                    b.push(',');
+                }
+                b.push(')');
+            }
+            types::K_ARRAY => b = `[${self.canon_shape(t.el(), depth + 1)};${t.len}]`.to_string(),
+            types::K_ADT if depth <= 8 => {
+                let ai = self.info.adts[&t.d().id];
+                b.push('d');
+                b.push_str(crate::symbols::def_id(t.d()).as_str());
+                b.push('{');
+                if ai.is_enum {
+                    let mut v = 0;
+                    while v < ai.variants.len() {
+                        for ft in self.lay.field_types(t, v as i64).iter() {
+                            b.push_str(self.canon_shape(*ft, depth + 1).as_str());
+                            b.push(',');
+                        }
+                        b.push('|');
+                        v += 1;
+                    }
+                } else {
+                    for ft in self.lay.field_types(t, -1).iter() {
+                        b.push_str(self.canon_shape(*ft, depth + 1).as_str());
+                        b.push(',');
+                    }
+                }
+                b.push('}');
+            }
+            _ => b = self.canon.ty(t),
+        }
+        if b.len() > 48 { b = `#${crate::symbols::hash64(b.as_str())}`.to_string(); }
+        self.canon_shapes.insert(key, b.clone());
+        b
     }
 
     /// Sorts the statics so that each is initialized after the statics its

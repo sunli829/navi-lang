@@ -1,0 +1,224 @@
+//! Stable symbol names (docs/crates.md): what a symbol stands for is
+//! described by its definitions' identities (crate, file relative to the
+//! crate's root, position there, kind and name), never by the numbers a
+//! compilation hands out, so that the same thing gets the same name in
+//! every compilation of the same sources: a crate compiled alone and the
+//! programs using it agree on its symbols.
+
+use std::collections::HashMap;
+use crate::resolve::Def;
+use crate::types::{self, Type, TraitRef};
+
+/// A definition's identity: its crate, its file relative to the crate's
+/// root and its position there, its kind and name. A definition without a
+/// file (derived and generated items) is its parent's identity and its
+/// own kind and name.
+pub fn def_id(d: &Def) -> String {
+    let mut b = String::new();
+    match d.file {
+        Some(f) => {
+            b.push_str(d.krate.name.as_str());
+            b.push(':');
+            let root = d.krate.fs_root.as_str();
+            let name = f.name.as_str();
+            if root.len() > 0 && name.starts_with(root) {
+                let rest = &name[root.len()..];
+                b.push_str(rest.trim_start_matches('/'));
+            } else {
+                b.push_str(name);
+            }
+            b.push('@');
+            b.push_str(`${d.pos}`.to_string().as_str());
+        }
+        None => match d.parent {
+            Some(p) => b.push_str(def_id(p).as_str()),
+            None => b.push_str(d.krate.name.as_str()),
+        },
+    }
+    b.push('#');
+    b.push_str(`${d.kind}`.to_string().as_str());
+    if d.ctor { b.push('c'); }
+    b.push('/');
+    b.push_str(d.name.as_str());
+    b
+}
+
+/// The first 64 bits of the SHA-256 of s, in hex.
+pub fn hash64(s: &str) -> String {
+    let d = crate::sha256::sum(s.as_bytes());
+    let digits = b"0123456789abcdef";
+    let mut b = String::new();
+    let mut i = 0;
+    while i < 8 {
+        b.push(digits[(d[i] >> 4) as usize] as char);
+        b.push(digits[(d[i] & 15) as usize] as char);
+        i += 1;
+    }
+    b
+}
+
+// A description longer than this is replaced by its hash (descriptions
+// nest: a type's names its parts' by their own).
+const LONG: usize = 48;
+
+fn short(s: String) -> String {
+    if s.len() <= LONG { return s; }
+    let h = hash64(s.as_str());
+    `#${h}`.to_string()
+}
+
+/// Stable descriptions of types, cached by type (a compilation's types are
+/// interned: one object, one id, per type).
+pub struct Canon {
+    cache: HashMap<u32, String>,
+}
+
+pub fn new_canon() -> &mut Canon { &mut Canon { cache: HashMap::new() } }
+
+impl Canon {
+    /// A stable description of t (two types get the same one iff they are
+    /// the same type).
+    pub fn ty(&mut self, t: &Type) -> String {
+        if let Some(s) = self.cache.get(&t.id) { return s.clone(); }
+        let s = short(self.ty_uncached(t));
+        self.cache.insert(t.id, s.clone());
+        s
+    }
+
+    fn list(&mut self, b: &mut String, ts: &Vec<&Type>) {
+        b.push('<');
+        for t in ts.iter() {
+            b.push_str(self.ty(*t).as_str());
+            b.push(',');
+        }
+        b.push('>');
+    }
+
+    fn opt(&mut self, b: &mut String, t: Option<&Type>) {
+        match t {
+            Some(x) => b.push_str(self.ty(x).as_str()),
+            None => b.push('-'),
+        }
+    }
+
+    /// A stable description of a trait reference.
+    pub fn trait_ref(&mut self, r: &TraitRef) -> String {
+        let mut b = String::new();
+        b.push('T');
+        match r.tdef {
+            Some(d) => b.push_str(def_id(d).as_str()),
+            None => b.push('-'),
+        }
+        b.push('[');
+        self.opt(&mut b, r.self_ty);
+        b.push(']');
+        self.list(&mut b, &r.args);
+        for bd in r.bindings.iter() {
+            b.push_str(bd.name.as_str());
+            b.push('=');
+            b.push_str(self.ty(bd.ty).as_str());
+            b.push(';');
+        }
+        short(b)
+    }
+
+    fn ty_uncached(&mut self, t: &Type) -> String {
+        let mut b = String::new();
+        match t.kind {
+            types::K_BOOL => b.push_str("bool"),
+            types::K_CHAR => b.push_str("char"),
+            types::K_STR => b.push_str("str"),
+            types::K_INT => b.push_str(types::int_name(t.int)),
+            types::K_FLOAT => b.push_str(if t.f64 { "f64" } else { "f32" }),
+            types::K_NEVER => b.push('!'),
+            types::K_TUPLE => {
+                b.push('(');
+                for e in t.elems.iter() {
+                    b.push_str(self.ty(*e).as_str());
+                    b.push(',');
+                }
+                b.push(')');
+            }
+            types::K_REF | types::K_PTR => {
+                b.push(if t.kind == types::K_REF { '&' } else { '*' });
+                if t.is_mut { b.push_str("mut "); }
+                b.push_str(self.ty(t.el()).as_str());
+            }
+            types::K_SLICE => {
+                b.push('[');
+                b.push_str(self.ty(t.el()).as_str());
+                b.push(']');
+            }
+            types::K_ARRAY => {
+                b.push('[');
+                b.push_str(self.ty(t.el()).as_str());
+                b.push_str(`;${t.len}]`.to_string().as_str());
+            }
+            types::K_FN => {
+                b.push_str("fn");
+                b.push_str(t.abi.as_str());
+                self.list(&mut b, &t.elems);
+                b.push_str("->");
+                self.opt(&mut b, t.ret);
+            }
+            types::K_ADT | types::K_OPAQUE => {
+                b.push(if t.kind == types::K_ADT { 'A' } else { 'O' });
+                match t.def {
+                    Some(d) => b.push_str(def_id(d).as_str()),
+                    None => b.push('-'),
+                }
+                self.list(&mut b, &t.args);
+            }
+            types::K_DYN => {
+                b.push_str("dyn");
+                for r in t.bounds.iter() {
+                    b.push_str(self.trait_ref(*r).as_str());
+                    b.push('+');
+                }
+            }
+            types::K_PROJ => {
+                b.push_str("proj");
+                match t.def {
+                    Some(d) => b.push_str(def_id(d).as_str()),
+                    None => b.push('-'),
+                }
+                match t.trait_ref {
+                    Some(r) => b.push_str(self.trait_ref(r).as_str()),
+                    None => b.push('-'),
+                }
+            }
+            types::K_PARAM => {
+                b.push_str(`P${t.index}`.to_string().as_str());
+                if t.is_self { b.push_str("self"); }
+                match t.def {
+                    Some(d) => b.push_str(def_id(d).as_str()),
+                    None => {}
+                }
+            }
+            types::K_CONST => b.push_str(`C${t.len}`.to_string().as_str()),
+            _ => b.push_str(types::type_string(t).as_str()),
+        }
+        b
+    }
+}
+
+/// A symbol: a readable part (sanitized) and the hash of what it stands
+/// for.
+pub fn symbol(prefix: &str, name: &str, what: &str) -> String {
+    let mut b = String::new();
+    b.push_str(prefix);
+    for c in name.chars() {
+        if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' { b.push(c); } else { b.push('_'); }
+    }
+    b.push('_');
+    b.push_str(hash64(what).as_str());
+    b
+}
+
+/// Whether d is a definition (for def_id's users that hold an Option).
+pub fn def_id_opt(d: Option<&mut Def>) -> String {
+    match d {
+        Some(x) => def_id(x),
+        None => "-".to_string(),
+    }
+}
