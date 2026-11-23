@@ -234,12 +234,15 @@ pub fn main_entry(main: &mut resolve::Def) -> &Entry { &Entry { main: Some(main)
 
 /// Compiles a checked program into the object model for the target.
 pub fn code(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Result<&mut crate::obj::Object, String> {
+    // NAVI_SPLIT=1 (docs/crates.md, being built): std compiled alone, then
+    // the program using it, the two objects merged.
+    if std::env::var("NAVI_SPLIT").is_ok() { return code_split(info, entry, dwarf); }
     let mut roots: Vec<&mut resolve::Def> = Vec::new();
     match entry.main {
         Some(m) => roots.push(m),
         None => { for t in entry.tests.iter() { roots.push(*t); } }
     }
-    let prog = crate::mir::build::build_program(info, Some(roots));
+    let prog = crate::mir::build::build_program(info, Some(roots), None);
     // Errors in std bodies checked on first use (while building the MIR):
     // the program had none before.
     if let Some(c) = info.c {
@@ -256,27 +259,7 @@ pub fn code(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Resu
     phase("mir");
     let plan = crate::codegen::build_plan(prog, entry.main, mf);
     phase("plan");
-    let os = target_os();
-    let arm = target_arch() == "arm64";
-    let tgt = crate::backend::lower::TargetConv {
-        c_prefix: if os == "macos" { "_".to_string() } else { String::new() },
-        write: if os == "windows" { "_write".to_string() } else { "write".to_string() },
-        os: os.clone(),
-        num_saved: if arm { 9 } else { 2 },
-        code_unit: if arm { 4 } else { 1 },
-    };
-    let o = if arm {
-        // NAVI_LLSC=1 tests linux-arm64's atomics on macOS.
-        if os == "macos" && std::env::var("NAVI_LLSC").is_err() {
-            crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(true, os == "macos") }, tgt, dwarf)
-        } else {
-            crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(false, os == "macos") }, tgt, dwarf)
-        }
-    } else if os == "windows" {
-        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(true) }, tgt, dwarf)
-    } else {
-        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(false) }, tgt, dwarf)
-    };
+    let o = backend(plan, dwarf);
     phase("codegen");
     // (NAVI_MERGETEST=1: the object passed through the merging of several,
     // as one part: testing crate::merge.)
@@ -287,6 +270,99 @@ pub fn code(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Resu
         return crate::merge::merge(&parts);
     }
     o
+}
+
+// The plan's code for the target as an object.
+fn backend(plan: &mut crate::codegen::Plan, dwarf: bool) -> Result<&mut crate::obj::Object, String> {
+    let os = target_os();
+    let arm = target_arch() == "arm64";
+    let tgt = crate::backend::lower::TargetConv {
+        c_prefix: if os == "macos" { "_".to_string() } else { String::new() },
+        write: if os == "windows" { "_write".to_string() } else { "write".to_string() },
+        os: os.clone(),
+        num_saved: if arm { 9 } else { 2 },
+        code_unit: if arm { 4 } else { 1 },
+    };
+    if arm {
+        // NAVI_LLSC=1 tests linux-arm64's atomics on macOS.
+        if os == "macos" && std::env::var("NAVI_LLSC").is_err() {
+            crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(true, os == "macos") }, tgt, dwarf)
+        } else {
+            crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(false, os == "macos") }, tgt, dwarf)
+        }
+    } else if os == "windows" {
+        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(true) }, tgt, dwarf)
+    } else {
+        crate::backend::lower::generate(plan, "amd64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::amd64::new_machine(false) }, tgt, dwarf)
+    }
+}
+
+// The errors in std bodies checked on first use (while building MIR).
+fn lazy_errors(info: &mut types::collect::Info) -> Result<(), String> {
+    if let Some(c) = info.c {
+        let mut lines: Vec<String> = Vec::new();
+        for e in c.errs.sorted().iter() {
+            if !e.warning { lines.push(`${e}`.to_string()); }
+        }
+        if lines.len() > 0 { return Err(lines.join("\n")); }
+    }
+    Ok(())
+}
+
+/// The definitions a crate compiled alone starts from: its non-generic
+/// functions with bodies (outside traits) and its statics.
+pub fn crate_roots(info: &mut types::collect::Info, name: &str) -> Vec<&mut resolve::Def> {
+    let mut out: Vec<&mut resolve::Def> = Vec::new();
+    for d in info.res.defs.iter() {
+        if d.krate.name != name { continue; }
+        if d.kind == resolve::DEF_STATIC {
+            if let resolve::Node::Item(crate::syntax::ast::Item::Static(n)) = &d.node { if n.value.is_some() { out.push(*d); } }
+            continue;
+        }
+        if d.kind != resolve::DEF_FN && d.kind != resolve::DEF_ASSOC_FN { continue; }
+        let f = match &d.node { resolve::Node::Item(crate::syntax::ast::Item::Fn(f)) => f, _ => continue };
+        if f.body.is_none() || types::collect::has_attr(&f.base.attrs, "intrinsic") || types::collect::has_attr(&f.base.attrs, "test") || types::collect::has_attr(&f.base.attrs, "bench") { continue; }
+        if let Some(p) = d.parent { if p.kind == resolve::DEF_TRAIT { continue; } }
+        if info.generics_of(*d).all().len() > 0 { continue; }
+        out.push(*d);
+    }
+    out
+}
+
+// NAVI_SPLIT=1: std compiled alone (every non-generic function and static,
+// with its functions' escape summaries), then the program with std's
+// non-generic functions external, the objects merged.
+fn code_split(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Result<&mut crate::obj::Object, String> {
+    let lib_roots = crate_roots(info, "std");
+    let lib = crate::mir::build::build_program(info, Some(lib_roots.clone()), None);
+    lazy_errors(info)?;
+    let lib_plan = crate::codegen::build_library_plan(lib, "std", &lib_roots);
+    let lib_obj = backend(lib_plan, dwarf)?;
+    phase("std");
+    let mut roots: Vec<&mut resolve::Def> = Vec::new();
+    match entry.main {
+        Some(m) => roots.push(m),
+        None => { for t in entry.tests.iter() { roots.push(*t); } }
+    }
+    let mut crates: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    crates.insert("std".to_string(), true);
+    let ext = &mut crate::mir::build::Ext { crates, summaries: lib.summaries };
+    let prog = crate::mir::build::build_program(info, Some(roots), Some(ext));
+    lazy_errors(info)?;
+    let mf = match entry.main {
+        Some(m) => prog.func(m).unwrap(),
+        None => crate::mir::harness::harness(prog, &entry.tests, entry.bench),
+    };
+    phase("mir");
+    let plan = crate::codegen::build_plan(prog, entry.main, mf);
+    plan.ext_inits.push("std".to_string());
+    phase("plan");
+    let o = backend(plan, dwarf)?;
+    phase("codegen");
+    let mut parts: Vec<&mut crate::obj::Object> = Vec::new();
+    parts.push(o);
+    parts.push(lib_obj);
+    crate::merge::merge(&parts)
 }
 
 /// Compiles a checked program into an object file for the target.

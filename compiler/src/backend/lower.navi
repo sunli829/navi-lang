@@ -307,11 +307,16 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
         g.statics.insert(d.id, crate::symbols::symbol("_navi_s_", d.name.as_str(), crate::symbols::def_id(d).as_str()));
         i += 1;
     }
+    for d in p.ext_statics.iter() {
+        g.statics.insert(d.id, crate::symbols::symbol("_navi_s_", d.name.as_str(), crate::symbols::def_id(*d).as_str()));
+    }
     // Every function with its symbol (a group's closures are numbered
     // within the group).
     let mut jobs: Vec<Job> = Vec::new();
     for gp in p.groups.iter() {
         let grp = *gp;
+        // (A separately compiled crate's: in its object.)
+        if grp.external { continue; }
         let mut todo: Vec<&mut Func> = Vec::new();
         collect_closures(grp.rep.func, &mut todo);
         jobs.push(Job { grp, f: grp.rep.func, sym: grp.sym.clone() });
@@ -378,9 +383,13 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
     }
     for h in hs.iter() { h.join().unwrap(); }
     p.info.ctx.par = false;
-    g.gen_main();
-    g.gen_run_defers();
-    g.gen_sched();
+    if p.library.len() == 0 {
+        g.gen_main();
+        g.gen_run_defers();
+        g.gen_sched();
+    } else {
+        g.gen_crate_init();
+    }
     g.gen_data();
     if g.errs.len() > 0 { return Err(g.errs.join("\n")); }
     if g.ssa_check > 0 {
@@ -394,6 +403,10 @@ pub fn generate(p: &mut Plan, arch: &str, new_m: fn() -> &mut dyn Machine, tgt: 
     Ok(g.o)
 }
 
+/// The symbol of the initializer of crate name's statics (a crate compiled
+/// alone, docs/crates.md).
+pub fn crate_init_sym(name: &str) -> String { `_navi_init_${name}`.to_string() }
+
 // The stable names (crate::symbols) of distinct things must differ: a
 // clash would bind references to the wrong definition.
 fn check_symbols(p: &Plan) -> Result<(), String> {
@@ -404,6 +417,7 @@ fn check_symbols(p: &Plan) -> Result<(), String> {
         Ok(())
     };
     for g in p.groups.iter() {
+        if g.external { continue; }
         add(&g.sym)?;
         for i in g.insts.iter() { add(&i.dict)?; }
     }
@@ -850,6 +864,7 @@ impl Gen {
         }
         // Dictionaries: [code, ctx] per slot (vtables: [vtable, 0]).
         for grp in self.p.groups.iter() {
+            if grp.external { continue; }
             for inst in grp.insts.iter() {
                 let off = self.o.define(inst.dict.as_str(), obj::DATA_CONST, 8, false);
                 let n = grp.nslots as i64;
@@ -887,13 +902,17 @@ impl Gen {
         // the entry point runs their initializers). The collector scans from
         // _navi_data_start to _navi_data_end.
         self.o.define("_navi_data_start", obj::DATA, 8, false);
-        for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv", "_navi_saved_greg", "_navi_gc_marking", "_navi_tls_key"].iter() {
-            self.o.define(*sym, obj::DATA, 8, false);
-            self.o.zeros(obj::DATA, 8);
+        // (A crate compiled alone has statics only: the program's object
+        // has the runtime's words.)
+        if self.p.library.len() == 0 {
+            for sym in ["_navi_stack_top", "_navi_stack_lo", "_navi_os_sp", "_navi_argc", "_navi_argv", "_navi_saved_greg", "_navi_gc_marking", "_navi_tls_key"].iter() {
+                self.o.define(*sym, obj::DATA, 8, false);
+                self.o.zeros(obj::DATA, 8);
+            }
+            // The G record in use before the scheduler starts (no stack limit).
+            self.o.define("_navi_g0boot", obj::DATA, 16, false);
+            self.o.zeros(obj::DATA, 512);
         }
-        // The G record in use before the scheduler starts (no stack limit).
-        self.o.define("_navi_g0boot", obj::DATA, 16, false);
-        self.o.zeros(obj::DATA, 512);
         for d in self.p.statics.iter() {
             let ty = self.p.info.consts[&d.id].ty;
             let l = self.lay.of(ty);
@@ -1119,6 +1138,12 @@ impl Gen {
         m.load(8, V1, SP, 8);
         m.adr_sym(I1, &"_navi_argv".to_string());
         m.store(8, V1, I1, 0);
+        // The statics of crates compiled separately first (they come before
+        // this one: std's runtime among them), then this one's.
+        for name in self.p.ext_inits.iter() {
+            m.adr_sym(LOC, &main_loc);
+            m.call(&crate_init_sym(name.as_str()));
+        }
         for d in self.p.statics.iter() {
             let inst = match self.p.static_init.get(&d.id) { Some(i) => *i, None => continue };
             m.adr_sym(RET, &self.statics[&d.id]);
@@ -1247,6 +1272,25 @@ impl Gen {
         self.m.begin();
         self.m.run_defers();
         self.emit_func("_navi_rundefers", false);
+    }
+
+    /// A crate compiled alone: the function that initializes its statics
+    /// (in order), which the program's entry point calls.
+    fn gen_crate_init(&mut self) {
+        let m = self.m;
+        m.begin();
+        m.prologue(32);
+        let loc = self.loc_at("<init>", 0, 0);
+        for d in self.p.statics.iter() {
+            let inst = match self.p.static_init.get(&d.id) { Some(i) => *i, None => continue };
+            m.adr_sym(RET, &self.statics[&d.id]);
+            m.adr_sym(LOC, &loc);
+            m.adr_sym(CTX, &inst.dict);
+            m.call(&inst.grp().sym);
+        }
+        m.ret();
+        let sym = crate_init_sym(self.p.library.as_str());
+        self.emit_func(sym.as_str(), true);
     }
 
     fn size_of(&mut self, t: Option<&Type>) -> i64 {
@@ -2637,7 +2681,10 @@ impl FnGen {
                 }
                 codegen::T_INST => {
                     let i = t.inst.unwrap();
-                    ret_ty = Some(self.g.concrete(i, i.func.locals[0].ty));
+                    // (A separately compiled crate's function has no body
+                    // here: its signature's.)
+                    let rt = if i.func.locals.len() > 0 { i.func.locals[0].ty } else { self.g.fn_sig_of(t.def).ret };
+                    ret_ty = Some(self.g.concrete(i, rt));
                 }
                 _ => {
                     self.g.errorf(`${self.f.name}: cannot defer intrinsic ${t.intrinsic}`.to_string());

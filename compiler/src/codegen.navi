@@ -117,6 +117,9 @@ impl Inst {
 /// A shape instance: one piece of machine code shared by the
 /// instantiations in insts. rep provides the (layout-identical) types.
 pub struct Group {
+    /// A function of a crate compiled separately: its code and dictionary
+    /// are in that crate's object (docs/crates.md).
+    pub external: bool,
     pub key: String,
     pub sym: String,
     pub rep: &mut Inst,
@@ -155,6 +158,13 @@ pub enum DictEntry {
 
 /// The set of functions and data to generate.
 pub struct Plan {
+    /// The statics of crates compiled separately this code uses.
+    pub ext_statics: Vec<&mut Def>,
+    /// The crates compiled separately whose initializers main runs first
+    /// (their statics), in order.
+    pub ext_inits: Vec<String>,
+    /// Compiling a crate alone (docs/crates.md): its name (no main).
+    pub library: String,
     pub mir: &mut Program,
     pub info: &mut Info,
     pub lay: &mut Computer,
@@ -267,9 +277,10 @@ fn args_key(ts: &Vec<&Type>) -> String {
 fn opt_id(t: Option<&Type>) -> u32 { match t { Some(x) => x.id, None => 0 } }
 
 /// Plans code generation for the program rooted at main.
-pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> &mut Plan {
+// A plan with the runtime functions generated code calls by name.
+fn new_plan(prog: &mut Program) -> &mut Plan {
     let p = &mut Plan { mir: prog, info: prog.info, lay: layout::new_computer(prog.info), groups: Vec::new(), insts: HashMap::new(),
-        main: None, statics: Vec::new(), static_ok: HashMap::new(), vtables: HashMap::new(), vtable_list: Vec::new(),
+        main: None, statics: Vec::new(), ext_statics: Vec::new(), ext_inits: Vec::new(), library: String::new(), static_ok: HashMap::new(), vtables: HashMap::new(), vtable_list: Vec::new(),
         descs: HashMap::new(), desc_list: Vec::new(), strings: HashMap::new(), string_list: Vec::new(), errors: Vec::new(), static_init: HashMap::new(), runtime: HashMap::new(),
         groups_by_key: HashMap::new(), native: None, shapes: new_shapes(), shape_cache: HashMap::new(), copies: Vec::new(), drafting: false, bail: false,
         evs: Vec::new(), dyn_seen: HashMap::new(), pending: Vec::new(), canon: crate::symbols::new_canon(), canon_shapes: HashMap::new() };
@@ -288,12 +299,40 @@ pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> 
     // before main's (whose initializers allocate through the runtime, which
     // the instance graph does not show).
     p.walk_pending();
-    p.main = Some(p.inst(main, Vec::new(), None, mf));
-    p.walk_pending();
-    p.order_statics();
-    p.assign_slots();
-    p.groups.sort_by(|a, b| a.sym.cmp(&b.sym));
     p
+}
+
+pub fn build_plan(prog: &mut Program, main: Option<&mut Def>, mf: &mut Func) -> &mut Plan {
+    let p = new_plan(prog);
+    p.main = Some(p.inst(main, Vec::new(), None, mf));
+    p.finish_plan();
+    p
+}
+
+/// The plan of crate name compiled alone (docs/crates.md): roots, its
+/// non-generic functions and its statics; no main (generate makes the
+/// crate's initializer instead).
+pub fn build_library_plan(prog: &mut Program, name: &str, roots: &Vec<&mut Def>) -> &mut Plan {
+    let p = new_plan(prog);
+    p.library = name.to_string();
+    for d in roots.iter() {
+        if d.kind == resolve::DEF_STATIC {
+            p.static_def(*d);
+            continue;
+        }
+        if let Some(f) = p.func_of(*d) { p.inst(Some(*d), Vec::new(), None, f); }
+    }
+    p.finish_plan();
+    p
+}
+
+impl Plan {
+    fn finish_plan(&mut self) {
+        self.walk_pending();
+        self.order_statics();
+        self.assign_slots();
+        self.groups.sort_by(|a, b| a.sym.cmp(&b.sym));
+    }
 }
 
 fn sanitize(s: &str) -> String {
@@ -471,7 +510,7 @@ impl Plan {
     // and the rest is only read.
     fn warm_copy(&mut self) -> &mut Plan {
         &mut Plan { mir: self.mir, info: self.info, lay: layout::new_computer(self.info), groups: Vec::new(), insts: self.insts,
-            main: None, statics: Vec::new(), static_ok: self.static_ok, vtables: self.vtables, vtable_list: Vec::new(),
+            main: None, statics: Vec::new(), ext_statics: Vec::new(), ext_inits: Vec::new(), library: String::new(), static_ok: self.static_ok, vtables: self.vtables, vtable_list: Vec::new(),
             descs: self.descs, desc_list: Vec::new(), strings: self.strings, string_list: Vec::new(), errors: Vec::new(), static_init: self.static_init,
             runtime: self.runtime, groups_by_key: self.groups_by_key, native: self.native, shapes: self.shapes, shape_cache: HashMap::new(), copies: Vec::new(), drafting: true,
             bail: false, evs: Vec::new(), dyn_seen: HashMap::new(),
@@ -567,6 +606,15 @@ impl Plan {
     fn static_def(&mut self, d: &mut Def) {
         if self.static_ok.contains_key(&d.id) { return; }
         self.static_ok.insert(d.id, true);
+        // A separately compiled crate's static: defined and initialized
+        // there (a constant is made where it is used: its value is the
+        // same everywhere, one copy kept).
+        if let Some(x) = self.mir.ext {
+            if d.kind == resolve::DEF_STATIC && x.crates.contains_key(&d.krate.name) {
+                self.ext_statics.push(d);
+                return;
+            }
+        }
         self.statics.push(d);
         if let Some(f) = self.mir.func(d) {
             let i = self.inst(Some(d), Vec::new(), None, f);
@@ -617,6 +665,7 @@ impl Plan {
 
     // The function of def; while drafting only one already built.
     fn func_of(&mut self, d: &mut Def) -> Option<&mut Func> {
+        if self.mir.is_external(d) { return Some(self.mir.stub(d)); }
         if !self.drafting { return self.mir.func(d); }
         match self.mir.funcs.get(&d.id) {
             Some(f) => Some(*f),
@@ -929,7 +978,8 @@ impl Plan {
                 let name = match inst.def { Some(d) => d.name.clone(), None => if inst.func.name.len() > 0 { inst.func.name.clone() } else { "anon".to_string() } };
                 let what = self.canon_group_key(inst);
                 let sym = crate::symbols::symbol("_navi_", name.as_str(), what.as_str());
-                let g = &mut Group { key: key.clone(), sym, rep: inst,
+                let external = match inst.def { Some(d) => self.mir.is_external(d) && inst.args.len() == 0 && inst.self_ty.is_none(), None => false };
+                let g = &mut Group { external, key: key.clone(), sym, rep: inst,
                     insts: Vec::new(), slots: HashMap::new(), nslots: 0, closure_syms: HashMap::new() };
                 self.groups_by_key.insert(key, g);
                 self.groups.push(g);

@@ -13,8 +13,23 @@ use crate::mir::*;
 use crate::mir::boxing::box_address_taken;
 
 /// The MIR of all crates.
+/// Crates compiled separately (docs/crates.md): their non-generic
+/// functions are not built here but called by their stable symbols, with
+/// the escape summaries their own compilation found (by symbols::def_id).
+pub struct Ext {
+    pub crates: HashMap<String, bool>,
+    pub summaries: HashMap<String, crate::mir::escape::Summary>,
+}
+
 pub struct Program {
     pub info: &mut Info,
+    /// Crates compiled separately (none: everything is built here).
+    pub ext: Option<&mut Ext>,
+    /// Bodiless stand-ins of their functions, by definition id.
+    stubs: HashMap<u32, &mut Func>,
+    /// After build_program: each function's escape summary, by symbols::def_id
+    /// of its definition (what a crate compiled alone gives its users).
+    pub summaries: HashMap<String, crate::mir::escape::Summary>,
     /// Functions, methods, consts and statics by definition id.
     pub funcs: HashMap<u32, &mut Func>,
     /// Lang functions used by lowering, found by std path.
@@ -36,9 +51,9 @@ pub struct Program {
 /// Builds the MIR of every body, or given roots (main, or the tests) only
 /// of the bodies they can reach (others are still built on first use,
 /// without escape analysis).
-pub fn build_program(info: &mut Info, roots: Option<Vec<&mut Def>>) -> &mut Program {
+pub fn build_program(info: &mut Info, roots: Option<Vec<&mut Def>>, ext: Option<&mut Ext>) -> &mut Program {
     let escape = std::env::var("NAVI_NOESCAPE").is_err();
-    let p = &mut Program { info, funcs: HashMap::new(), lang_fns: HashMap::new(), closures: Vec::new(), closure_base: 0, shims: HashMap::new(), escape, direct_templates: escape };
+    let p = &mut Program { info, ext, stubs: HashMap::new(), summaries: HashMap::new(), funcs: HashMap::new(), lang_fns: HashMap::new(), closures: Vec::new(), closure_base: 0, shims: HashMap::new(), escape, direct_templates: escape };
     p.find_lang_fns();
     let defs = info.res.defs.clone();
     match roots {
@@ -56,7 +71,20 @@ pub fn build_program(info: &mut Info, roots: Option<Vec<&mut Def>>) -> &mut Prog
         }
         for c in p.closures.iter() { all.push(*c); }
         info.ctx.par = true;
-        let keep = crate::mir::escape::analyze_program(info, &all);
+        // The functions of crates compiled separately, with their summaries.
+        let mut ext_fns: Vec<(&mut Func, crate::mir::escape::Summary)> = Vec::new();
+        if let Some(x) = p.ext {
+            for d in defs.iter() {
+                if !p.is_external(*d) { continue; }
+                if let Some(sm) = x.summaries.get(&crate::symbols::def_id(*d)) { ext_fns.push((p.stub(*d), sm.clone())); }
+            }
+        }
+        let (keep, sums) = crate::mir::escape::analyze_program(info, &all, &ext_fns);
+        for f in all.iter() {
+            if let Some(d) = f.def {
+                if let Some(sm) = sums.get(&f.id) { p.summaries.insert(crate::symbols::def_id(d), sm.clone()); }
+            }
+        }
         crate::util::par_for(all.len(), 16, |i| { crate::mir::boxing::box_locals(info.ctx, all[i], Some(&keep[&all[i].id])); });
         info.ctx.par = false;
         if std::env::var("NAVI_NOINLINE").is_err() {
@@ -171,6 +199,8 @@ impl Program {
             for d in work.iter() {
                 if seen.contains_key(&d.id) { continue; }
                 seen.insert(d.id, true);
+                // (A separately compiled crate's: called, not built.)
+                if self.is_external(*d) { continue; }
                 if !self.funcs.contains_key(&d.id) { level.push(*d); }
             }
             work = Vec::new();
@@ -199,10 +229,35 @@ impl Program {
         }
     }
 
+    /// Whether d is a function of a crate compiled separately that is not
+    /// built here: not generic (no instance of it depends on this program),
+    /// with a body, outside a trait.
+    pub fn is_external(&mut self, d: &mut Def) -> bool {
+        let x = match self.ext { Some(x) => x, None => return false };
+        if !x.crates.contains_key(&d.krate.name) { return false; }
+        if d.kind != resolve::DEF_FN && d.kind != resolve::DEF_ASSOC_FN { return false; }
+        if !has_body(d) { return false; }
+        if let Some(p) = d.parent { if p.kind == resolve::DEF_TRAIT { return false; } }
+        if let Node::Item(Item::Fn(fd)) = &d.node {
+            if crate::types::collect::has_attr(&fd.base.attrs, "intrinsic") { return false; }
+        }
+        self.info.generics_of(d).all().len() == 0
+    }
+
+    /// A bodiless stand-in for external function d (its signature's
+    /// parameter count; nothing else is read).
+    pub fn stub(&mut self, d: &mut Def) -> &mut Func {
+        if let Some(f) = self.stubs.get(&d.id) { return *f; }
+        let f = new_func(d.name.clone(), Some(d), Some(d), d.file);
+        f.nargs = self.info.fn_sig_of(d).params.len();
+        self.stubs.insert(d.id, f);
+        f
+    }
+
     // A copy for building one function on a thread: its closures are its
     // own (numbered within the function); the rest is shared, read only.
     fn worker(&mut self) -> &mut Program {
-        &mut Program { info: self.info, funcs: self.funcs, lang_fns: self.lang_fns, closures: Vec::new(), closure_base: 0,
+        &mut Program { info: self.info, ext: self.ext, stubs: self.stubs, summaries: HashMap::new(), funcs: self.funcs, lang_fns: self.lang_fns, closures: Vec::new(), closure_base: 0,
             shims: self.shims, escape: self.escape, direct_templates: self.direct_templates }
     }
 
@@ -311,6 +366,7 @@ impl Program {
     /// The MIR of a body, building it on first use.
     pub fn func(&mut self, def: &mut Def) -> Option<&mut Func> {
         if let Some(f) = self.funcs.get(&def.id) { return Some(*f); }
+        if self.is_external(def) { return Some(self.stub(def)); }
         let w = self.worker();
         let f = w.build(def)?;
         for c in w.closures.iter() { self.closures.push(*c); }
