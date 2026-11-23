@@ -1,0 +1,333 @@
+//! The compiled crates in the build cache (docs/crates.md): a crate compiled
+//! alone (its object and its functions' escape summaries) is stored under
+//! a key made of the compiler, the target, the options and the contents of
+//! the crate's source files, and taken from there by any later build, of
+//! any program, that has the same key.
+
+use std::collections::HashMap;
+use crate::cache;
+use crate::mir::escape::{self, Summary};
+use crate::obj::{self, Object};
+use crate::sha256;
+use crate::util;
+
+// The format of an entry (a different one is a miss).
+const MAGIC: &str = "navilib1";
+
+// The compiler's switches that change the code it makes.
+const ENV: [&str; 9] = ["NAVI_NOESCAPE", "NAVI_LLSC", "NAVI_NOPOLL", "NAVI_NOCOPYPROP", "NAVI_NOINLINE", "NAVI_NOINLINE2", "NAVI_NOSSAOPT", "NAVI_ELF_LIBC", "NAVI_CHECK_STD"];
+
+/// The key of crate name, whose files are under root (read by this build:
+/// cache::READ), compiled for target with debug information or not.
+pub fn key(name: &str, root: &str, target: &str, dwarf: bool) -> Option<String> {
+    let id = cache::compiler_id()?;
+    let mut files: Vec<(String, String)> = Vec::new();
+    for (path, src) in cache::READ.iter() {
+        if !path.starts_with(root) { continue; }
+        files.push((path[root.len()..].to_string(), cache::hex(&sha256::sum(src.as_bytes()))));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut text = `${MAGIC} ${id}\ncrate ${name}\ntarget ${target}\ndwarf ${dwarf}\n`.to_string();
+    for v in ENV.iter() {
+        let x = match std::env::var(*v) { Ok(x) => x, Err(_) => "-".to_string() };
+        text.push_str(`${*v}=${x}\n`.to_string().as_str());
+    }
+    for (p, h) in files.iter() { text.push_str(`${h} ${p}\n`.to_string().as_str()); }
+    Some(cache::hex(&sha256::sum(text.as_bytes())))
+}
+
+fn path(key: &str) -> Option<String> {
+    let d = cache::dir()?;
+    Some(util::path_join(d.as_str(), `${key}.lib`.to_string().as_str()))
+}
+
+/// The crate stored under key.
+pub fn load(key: &str) -> Option<(&mut Object, HashMap<String, Summary>)> {
+    let p = path(key)?;
+    let data = std::fs::read(p.as_str()).ok()?;
+    let r = &mut Reader { b: data, at: 0, bad: false };
+    let out = decode(r)?;
+    if r.bad || r.at != r.b.len() { return None; }
+    cache::mark_used(p.as_str());
+    Some(out)
+}
+
+/// Stores a crate under key.
+pub fn store(key: &str, o: &Object, sums: &HashMap<String, Summary>) {
+    let p = match path(key) { Some(p) => p, None => return };
+    let mut w: Vec<u8> = Vec::new();
+    encode(&mut w, o, sums);
+    // Written whole, then renamed: a reader sees the old entry or the new.
+    let tmp = `${p}.${std::process::id()}`.to_string();
+    if std::fs::write(tmp.as_str(), w.as_slice()).is_err() { return; }
+    if std::fs::rename(tmp.as_str(), p.as_str()).is_err() { let _ = std::fs::remove_file(tmp.as_str()); }
+    if let Some(d) = cache::dir() { cache::trim(d.as_str()); }
+}
+
+fn u32w(w: &mut Vec<u8>, v: u32) {
+    let mut i = 0;
+    while i < 4 {
+        w.push((v >> (8 * i) as u32) as u8);
+        i += 1;
+    }
+}
+
+fn u64w(w: &mut Vec<u8>, v: u64) {
+    u32w(w, v as u32);
+    u32w(w, (v >> 32) as u32);
+}
+
+fn bytesw(w: &mut Vec<u8>, b: &[u8]) {
+    u64w(w, b.len() as u64);
+    w.extend_from_slice(b);
+}
+
+fn strw(w: &mut Vec<u8>, s: &str) { bytesw(w, s.as_bytes()); }
+
+fn encode(w: &mut Vec<u8>, o: &Object, sums: &HashMap<String, Summary>) {
+    strw(w, MAGIC);
+    strw(w, o.arch.as_str());
+    let mut s = 0;
+    while s < obj::NUM_SECTIONS {
+        bytesw(w, o.sects[s].as_slice());
+        u32w(w, o.align[s]);
+        s += 1;
+    }
+    u64w(w, o.names.len() as u64);
+    for n in o.names.iter() { strw(w, n.as_str()); }
+    u64w(w, o.syms.len() as u64);
+    for sy in o.syms.iter() {
+        u32w(w, sy.id);
+        u32w(w, sy.sec as u32);
+        u64w(w, sy.off);
+        u32w(w, if sy.global { 1 } else { 0 });
+    }
+    u64w(w, o.relocs.len() as u64);
+    for r in o.relocs.iter() {
+        u32w(w, r.sec as u32);
+        u32w(w, r.off);
+        u32w(w, r.kind as u32);
+        u32w(w, r.sym);
+    }
+    // (Sorted: the maps' order is not the same from one run to the next.)
+    let mut undef: Vec<String> = Vec::new();
+    for (n, _) in o.undef.iter() { undef.push(n.clone()); }
+    undef.sort();
+    u64w(w, undef.len() as u64);
+    for n in undef.iter() { strw(w, n.as_str()); }
+    let mut libs: Vec<(String, String)> = Vec::new();
+    for (n, l) in o.libs.iter() { libs.push((n.clone(), l.clone())); }
+    libs.sort_by(|a, b| a.0.cmp(&b.0));
+    u64w(w, libs.len() as u64);
+    for (n, l) in libs.iter() {
+        strw(w, n.as_str());
+        strw(w, l.as_str());
+    }
+    u64w(w, o.files.len() as u64);
+    for f in o.files.iter() { strw(w, f.as_str()); }
+    u64w(w, o.lines.len() as u64);
+    for l in o.lines.iter() {
+        u64w(w, l.off);
+        u32w(w, l.file);
+        u32w(w, l.line);
+    }
+    u64w(w, o.funcs.len() as u64);
+    for f in o.funcs.iter() {
+        strw(w, f.name.as_str());
+        u64w(w, f.off);
+        u64w(w, f.size);
+    }
+    u64w(w, o.frames.len() as u64);
+    for (off, size, push) in o.frames.iter() {
+        u64w(w, *off);
+        u64w(w, *size);
+        u64w(w, *push);
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for (d, _) in sums.iter() { ids.push(d.clone()); }
+    ids.sort();
+    u64w(w, ids.len() as u64);
+    for d in ids.iter() {
+        strw(w, d.as_str());
+        let (esc, pairs) = escape::summary_parts(&sums[d]);
+        bytesw(w, esc.as_slice());
+        u64w(w, pairs.len() as u64);
+        for (a, b, c, e) in pairs.iter() {
+            w.push(*a);
+            w.push(*b);
+            w.push(*c);
+            w.push(*e);
+        }
+    }
+}
+
+struct Reader {
+    b: Vec<u8>,
+    at: usize,
+    bad: bool,
+}
+
+impl Reader {
+    fn has(&mut self, n: u64) -> bool {
+        if self.bad || n > (self.b.len() - self.at) as u64 { self.bad = true; return false; }
+        true
+    }
+
+    fn u8(&mut self) -> u8 {
+        if !self.has(1) { return 0; }
+        self.at += 1;
+        self.b[self.at - 1]
+    }
+
+    fn u32(&mut self) -> u32 {
+        if !self.has(4) { return 0; }
+        let mut v = 0u32;
+        let mut i = 0;
+        while i < 4 {
+            v = v | (self.b[self.at + i] as u32) << (8 * i) as u32;
+            i += 1;
+        }
+        self.at += 4;
+        v
+    }
+
+    fn u64(&mut self) -> u64 {
+        let lo = self.u32() as u64;
+        lo | (self.u32() as u64) << 32
+    }
+
+    // A count of items of at least min bytes each (bounded by what is
+    // left, so a damaged entry allocates nothing large).
+    fn count(&mut self, min: u64) -> usize {
+        let n = self.u64();
+        if !self.has(n * min) { return 0; }
+        n as usize
+    }
+
+    fn bytes(&mut self) -> Vec<u8> {
+        let n = self.u64();
+        if !self.has(n) { return Vec::new(); }
+        let v = self.b[self.at..self.at + n as usize].to_vec();
+        self.at += n as usize;
+        v
+    }
+
+    fn str(&mut self) -> String {
+        match String::from_utf8(self.bytes()) {
+            Ok(s) => s,
+            Err(_) => {
+                self.bad = true;
+                String::new()
+            }
+        }
+    }
+}
+
+fn decode(r: &mut Reader) -> Option<(&mut Object, HashMap<String, Summary>)> {
+    if r.str() != MAGIC { return None; }
+    let arch = r.str();
+    let o = obj::new_object(arch.as_str());
+    let mut s = 0;
+    while s < obj::NUM_SECTIONS {
+        o.sects[s] = r.bytes();
+        o.align[s] = r.u32();
+        s += 1;
+    }
+    let nn = r.count(8);
+    let mut i = 0;
+    while i < nn {
+        let n = r.str();
+        o.id_s(&n);
+        i += 1;
+    }
+    let ns = r.count(20);
+    i = 0;
+    while i < ns {
+        let id = r.u32();
+        let sec = r.u32() as usize;
+        let off = r.u64();
+        let global = r.u32() == 1;
+        if id as usize >= o.names.len() || sec >= obj::NUM_SECTIONS { return None; }
+        o.syms.push(obj::Symbol { name: o.names[id as usize].clone(), id, sec, off, global });
+        i += 1;
+    }
+    let nr = r.count(16);
+    i = 0;
+    while i < nr {
+        let sec = r.u32() as usize;
+        let off = r.u32();
+        let kind = r.u32() as u8;
+        let sym = r.u32();
+        if sym as usize >= o.names.len() || sec >= obj::NUM_SECTIONS { return None; }
+        o.relocs.push(obj::SymReloc { sec, off, kind, sym });
+        i += 1;
+    }
+    let nu = r.count(8);
+    i = 0;
+    while i < nu {
+        let n = r.str();
+        o.undefined(n.as_str());
+        i += 1;
+    }
+    let nl = r.count(16);
+    i = 0;
+    while i < nl {
+        let n = r.str();
+        let l = r.str();
+        o.import_from(n.as_str(), l.as_str());
+        i += 1;
+    }
+    let nf = r.count(8);
+    i = 0;
+    while i < nf {
+        let f = r.str();
+        o.file_id(&f);
+        i += 1;
+    }
+    let nli = r.count(16);
+    i = 0;
+    while i < nli {
+        let off = r.u64();
+        let file = r.u32();
+        let line = r.u32();
+        if file as usize >= o.files.len() { return None; }
+        o.lines.push(obj::Line { off, file, line });
+        i += 1;
+    }
+    let nfu = r.count(24);
+    i = 0;
+    while i < nfu {
+        let name = r.str();
+        let off = r.u64();
+        let size = r.u64();
+        o.funcs.push(obj::FuncRange { name, off, size });
+        i += 1;
+    }
+    let nfr = r.count(24);
+    i = 0;
+    while i < nfr {
+        let off = r.u64();
+        let size = r.u64();
+        let push = r.u64();
+        o.frames.push((off, size, push));
+        i += 1;
+    }
+    let mut sums: HashMap<String, Summary> = HashMap::new();
+    let nsum = r.count(24);
+    i = 0;
+    while i < nsum {
+        let d = r.str();
+        let esc = r.bytes();
+        let np = r.count(4);
+        let mut pairs: Vec<(u8, u8, u8, u8)> = Vec::new();
+        let mut k = 0;
+        while k < np {
+            pairs.push((r.u8(), r.u8(), r.u8(), r.u8()));
+            k += 1;
+        }
+        sums.insert(d, escape::summary_from(esc, pairs));
+        i += 1;
+    }
+    if r.bad { return None; }
+    Some((o, sums))
+}
