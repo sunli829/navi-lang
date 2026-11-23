@@ -67,17 +67,20 @@ impl Analysis {
         None
     }
 
-    fn add_module_names(&self, m: &Module, items: &mut Items) {
+    // (from: the module the completion is in; only what it can use is
+    // offered, as the checker allows.)
+    fn add_module_names(&self, m: &Module, from: Option<&Module>, items: &mut Items) {
         let mut ns = 0;
         while ns < m.bindings.len() {
             for (name, b) in m.bindings[ns].iter() {
+                if !can_see(&b.vis, from) { continue; }
                 match b.res.def {
                     Some(d) => items.add(name.as_str(), item_kind(d.kind), self.def_detail(d)),
                     None => items.add(name.as_str(), 9, String::new()),
                 }
             }
             for (name, bs) in m.globs[ns].iter() {
-                if bs.len() == 0 { continue; }
+                if bs.len() == 0 || !can_see(&bs[0].vis, from) { continue; }
                 match bs[0].res.def {
                     Some(d) => items.add(name.as_str(), item_kind(d.kind), self.def_detail(d)),
                     None => items.add(name.as_str(), 9, String::new()),
@@ -88,10 +91,10 @@ impl Analysis {
     }
 
     // The names in a module, type or trait (after Path::).
-    fn add_members(&self, d: &Def, items: &mut Items) {
+    fn add_members(&self, d: &Def, from: Option<&Module>, items: &mut Items) {
         let info = match self.info { Some(i) => i, None => return };
         if let Some(m) = d.module {
-            self.add_module_names(m, items);
+            self.add_module_names(m, from, items);
             if d.kind == DEF_MOD { return; }
         }
         if d.kind == DEF_ENUM {
@@ -110,12 +113,12 @@ impl Analysis {
             let st = im.self_ty;
             let ok = match st.def { Some(sd) => sd.id == d.id, None => false };
             if !ok { continue; }
-            for (name, it) in im.items.iter() { items.add(name.as_str(), item_kind(it.kind), self.def_detail(*it)); }
+            for (name, it) in im.items.iter() { if can_see(&it.vis, from) { items.add(name.as_str(), item_kind(it.kind), self.def_detail(*it)); } }
         }
     }
 
     // The fields and methods of a value of type t (after value.).
-    fn add_methods(&self, t0: &Type, items: &mut Items) {
+    fn add_methods(&self, t0: &Type, from: Option<&Module>, items: &mut Items) {
         let info = match self.info { Some(i) => i, None => return };
         let mut t = t0;
         loop {
@@ -129,6 +132,7 @@ impl Analysis {
             if let Some(d) = t.def {
                 if let Some(adt) = info.adts.get(&d.id) {
                     for f in adt.fields.iter() {
+                        if !can_see(&f.vis, from) { continue; }
                         items.add(f.name.as_str(), 5, `${f.name}: ${crate::types::type_string(f.ty)}`.to_string());
                     }
                 }
@@ -145,7 +149,7 @@ impl Analysis {
         for (_, im) in info.impls.iter() {
             if !same_head(im.self_ty, t) { continue; }
             for (name, it) in im.items.iter() {
-                if it.kind == DEF_ASSOC_FN { items.add(name.as_str(), 2, self.def_detail(*it)); }
+                if it.kind == DEF_ASSOC_FN && (im.trait_ref.is_some() || can_see(&it.vis, from)) { items.add(name.as_str(), 2, self.def_detail(*it)); }
             }
             // A trait's provided methods.
             if let Some(tr) = im.trait_ref {
@@ -158,6 +162,12 @@ impl Analysis {
             }
         }
     }
+}
+
+// Whether code in module from may use an item of visibility v (None: no
+// module known, everything).
+fn can_see(v: &Visibility, from: Option<&Module>) -> bool {
+    match from { Some(m) => v.accessible_from(m), None => true }
 }
 
 // Whether an impl's self type is of the same kind as t (the same struct,
@@ -191,15 +201,16 @@ impl Server {
         let mut start = off;
         while start > 0 && is_word(b[start - 1]) { start -= 1; }
         let items = &mut Items { out: arr(), seen: HashMap::new() };
+        let from: Option<&Module> = match at.a.module_of_file(at.fd) { Some(m) => Some(m), None => None };
         // value.
         if start > 0 && b[start - 1] == b'.' && !(start > 1 && b[start - 2] == b'.') {
-            if let Some(t) = receiver_type(at.idx, src, start - 1) { at.a.add_methods(t, items); }
+            if let Some(t) = receiver_type(at.idx, src, start - 1) { at.a.add_methods(t, from, items); }
             return Ok(obj().set("isIncomplete", Json::Bool(false)).set("items", items.out.clone()));
         }
         // a::b::
         if start > 1 && b[start - 1] == b':' && b[start - 2] == b':' {
             let segs = path_before(src, start - 2);
-            if let Some(d) = resolve_path(at.a, at.fd, at.idx, &segs, start - 2) { at.a.add_members(d, items); }
+            if let Some(d) = resolve_path(at.a, at.fd, at.idx, &segs, start - 2) { at.a.add_members(d, from, items); }
             return Ok(obj().set("isIncomplete", Json::Bool(false)).set("items", items.out.clone()));
         }
         // A name: locals of the function, the module's names, the prelude.
@@ -213,14 +224,14 @@ impl Server {
                 items.add(l.name.as_str(), 6, detail);
             }
         }
-        if let Some(m) = at.a.module_of_file(at.fd) {
-            at.a.add_module_names(m, items);
-            if let Some(pm) = m.krate.prelude { at.a.add_module_names(pm, items); }
+        if let Some(m) = from {
+            at.a.add_module_names(m, from, items);
+            if let Some(pm) = m.krate.prelude { at.a.add_module_names(pm, from, items); }
             // std's prelude for other crates.
             if let Some(info) = at.a.info {
                 for c in info.res.crates.iter() {
                     if c.is_std {
-                        if let Some(pm) = c.prelude { at.a.add_module_names(pm, items); }
+                        if let Some(pm) = c.prelude { at.a.add_module_names(pm, from, items); }
                     }
                 }
             }
