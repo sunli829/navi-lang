@@ -351,7 +351,110 @@ static mut CLASS_OF: [u8; 513] = [0; 513];
 /// in this one function.
 pub fn alloc(size: usize, noscan: bool) -> *mut u8 {
     // (Every word may be a pointer: the runtime's own allocations.)
-    alloc0(size, noscan, ALL_WORDS, 0)
+    let p = alloc0(size, noscan, ALL_WORDS, 0);
+    if PROF != 2 { prof_alloc(p as usize, size); }
+    p
+}
+
+// --- Live heap profile (NAVI_MEMPROF=1, debugging; as Go's inuse_space) ----------
+//
+// An allocation about every PROF_RATE bytes is sampled: its address, size
+// and the return addresses of its caller's frames. At the end of each mark
+// the samples still marked are printed ("MEMPROF" lines), the others
+// dropped; tools/memprof.py symbolizes and sums them.
+static mut PROF: usize = 0; // 0: not read yet, 1: on, 2: off
+static mut PROF_ACC: usize = 0;
+const PROF_RATE: usize = 262144;
+const PROF_REC: usize = 10; // words: address, size, 8 return addresses
+static mut PROF_LK: usize = 0;
+static mut PROF_BUF: usize = 0;
+static mut PROF_N: usize = 0;
+static mut PROF_CAP: usize = 0;
+
+#[inline(never)]
+fn prof_alloc(p: usize, size: usize) {
+    if PROF == 0 { PROF = if crate::rt::native::env_set(b"NAVI_MEMPROF\0") { 1 } else { 2 }; }
+    if PROF != 1 { return; }
+    // (Racy: a sample more or less.)
+    PROF_ACC += size;
+    if PROF_ACC < PROF_RATE { return; }
+    PROF_ACC = 0;
+    let mut pcs = [0usize; 8];
+    let mut fp = crate::rt::frame_address() as usize;
+    let mut k = 0;
+    while k < 8 && fp != 0 {
+        let up = unsafe { *(fp as *const usize) };
+        pcs[k] = unsafe { *((fp + 8) as *const usize) };
+        k += 1;
+        if up <= fp || up - fp > 1048576 { break; }
+        fp = up;
+    }
+    crate::rt::sched::preempt_off();
+    spin_lock(&mut PROF_LK as *mut usize);
+    if PROF_N == PROF_CAP {
+        PROF_CAP = if PROF_CAP == 0 { 4096 } else { PROF_CAP * 2 };
+        PROF_BUF = unsafe { realloc(PROF_BUF as *mut u8, PROF_CAP * PROF_REC * 8) } as usize;
+    }
+    let r = PROF_BUF + PROF_N * PROF_REC * 8;
+    wset(r, p);
+    wset(r + 8, size);
+    let mut j = 0;
+    while j < 8 {
+        wset(r + 16 + 8 * j, pcs[j]);
+        j += 1;
+    }
+    PROF_N += 1;
+    spin_unlock(&mut PROF_LK as *mut usize);
+    crate::rt::sched::preempt_on();
+}
+
+// At the end of a mark (the world stopped): prints the live samples, drops
+// the dead.
+fn prof_mark_end() {
+    if PROF != 1 { return; }
+    crate::rt::native::put(2, "MEMPROF cycle ");
+    crate::rt::native::put_u64(2, CYCLE_NO as u64);
+    crate::rt::native::put(2, " mstart ");
+    crate::rt::native::put_hex(2, crate::rt::mstart_address() as u64);
+    crate::rt::native::put(2, "\n");
+    let mut i = 0;
+    let mut k = 0;
+    while i < PROF_N {
+        let r = PROF_BUF + i * PROF_REC * 8;
+        let a = wget(r);
+        let s = span_of(a);
+        let mut live = false;
+        if s as usize != 0 {
+            unsafe {
+                let n = (*s).nelems;
+                let ix = if n == 1 { 0 } else { ((a - (*s).start) * (*s).div_mul) >> 32 };
+                let bits = (*s).bits as usize;
+                live = ix < n && ldb(bits + ix) != 0 && ldb(bits + n + ix) != 0;
+            }
+        }
+        if live {
+            crate::rt::native::put(2, "M ");
+            crate::rt::native::put_u64(2, wget(r + 8) as u64);
+            let mut j = 0;
+            while j < 8 {
+                crate::rt::native::put(2, " ");
+                crate::rt::native::put_hex(2, wget(r + 16 + 8 * j) as u64);
+                j += 1;
+            }
+            crate::rt::native::put(2, "\n");
+            if k != i {
+                let d = PROF_BUF + k * PROF_REC * 8;
+                let mut w = 0;
+                while w < PROF_REC {
+                    wset(d + 8 * w, wget(r + 8 * w));
+                    w += 1;
+                }
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+    PROF_N = k;
 }
 
 const ALL_WORDS: usize = 18446744073709551615;
@@ -363,15 +466,19 @@ const ALL_WORDS: usize = 18446744073709551615;
 pub fn alloc_typed(size: usize, mask: usize, tw: usize) -> *mut u8 {
     let noscan = mask == 0 && tw != 0;
     // (The common way straight to the threads' allocator.)
-    if MULTI && !POISON_FREE { return alloc_mt(size, noscan, mask, tw); }
-    alloc0(size, noscan, mask, tw)
+    let p = if MULTI && !POISON_FREE { alloc_mt(size, noscan, mask, tw) } else { alloc0(size, noscan, mask, tw) };
+    if PROF != 2 { prof_alloc(p as usize, size); }
+    p
 }
 
 /// The same for an array of such values (the mask repeated every tw words).
 pub fn alloc_array_typed(size: usize, mask: usize, tw: usize) -> *mut u8 {
-    if mask == 0 && tw != 0 { return alloc0(size, true, 0, 0); }
-    let p = alloc0(size, false, mask, tw);
-    set_info(p as usize, mask, tw, true);
+    let p = if mask == 0 && tw != 0 { alloc0(size, true, 0, 0) } else {
+        let q = alloc0(size, false, mask, tw);
+        set_info(q as usize, mask, tw, true);
+        q
+    };
+    if PROF != 2 { prof_alloc(p as usize, size); }
     p
 }
 
@@ -2141,6 +2248,7 @@ fn finish_cycle() {
     scan_cleanups();
     let s0 = SCAN_DONE;
     drain();
+    prof_mark_end();
     let t3 = crate::rt::native::monotonic_nanos();
     FINISH_MB = (SCAN_DONE - s0) >> 20;
     if crate::rt::native::env_set(b"NAVI_GCTRACE\0") {
