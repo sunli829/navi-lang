@@ -244,6 +244,18 @@ if [ "$r1" = "42 110 100" ] && [ "$locked" = 2 ] && [ "$r2" = "42 110 100" ] && 
 else
 	echo "FAIL dependencies"; printf '%s\n' "$r1" "$locked" "$r2" "$r3" "$r4"; fail=1
 fi
+# Generic code instantiated by two crates for element types of different
+# sizes: the group of either has one instance, so its calls are static and
+# differ; each crate's copy must keep its own symbol (it shared one, and
+# the linker kept one copy: lib's numbers came out as "1,49,49").
+d=$tmp/split
+mkdir -p "$d/lib/src" "$d/app/src"
+printf '[package]\nname = "lib"\n' > "$d/lib/navi.toml"
+printf 'pub fn texts(v: &Vec<u16>) -> String {\n    let s: Vec<String> = v.iter().map(|a: &u16| -> String { a.to_string() }).collect();\n    s.join(",")\n}\n' > "$d/lib/src/lib.navi"
+printf '[package]\nname = "app"\n\n[dependencies]\nlib = { path = "../lib" }\n' > "$d/app/navi.toml"
+printf 'fn main() {\n    let mut big: Vec<[u64; 4]> = Vec::new();\n    big.push([7, 0, 0, 0]);\n    big.push([8, 0, 0, 0]);\n    let s: Vec<String> = big.iter().map(|b: &[u64; 4]| -> String { b[0].to_string() }).collect();\n    let mut v: Vec<u16> = Vec::new();\n    v.push(1);\n    v.push(2);\n    v.push(3);\n    println(`${s.join(",")} ${lib::texts(&v)}`);\n}\n' > "$d/app/src/main.navi"
+r=$(cd "$d/app" && "$navi" run 2>&1 | tail -1) || true
+if [ "$r" = "7,8 1,2,3" ]; then echo "ok   generic code in two crates"; else echo "FAIL generic code in two crates: $r"; fail=1; fi
 for f in tests/types/*/*.navi tests/check/*/*.navi; do front types-dump "$f"; done
 # The compiler's own unit tests (#[cfg(test)] modules).
 set +e
