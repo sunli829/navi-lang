@@ -101,6 +101,17 @@ if [ "$bad" != 0 ] && match_diags; then
 else
 	echo "FAIL derive macro errors (tests/derive/bad)"; head -20 "$tmp/diag.diff"; fail=1
 fi
+# The assembler (compiler/src/asm) against clang's, where there is one
+# that targets both (macOS).
+if [ "$(uname -s)" = Darwin ] && command -v clang > /dev/null && command -v objdump > /dev/null && command -v python3 > /dev/null; then
+	for arch in arm64 amd64; do
+		if python3 tools/asmcheck.py $arch "$navi" tests/asm/$arch.txt "$tmp/asm-$arch" > "$tmp/asm.out" 2>&1; then
+			echo "ok   assembler $arch (tests/asm/$arch.txt)"
+		else
+			echo "FAIL assembler $arch"; head -20 "$tmp/asm.out"; fail=1
+		fi
+	done
+fi
 # navi test and navi bench on a crate with passing and failing tests.
 set +e
 "$navi" test tests/harness > "$tmp/harness.out" 2>/dev/null

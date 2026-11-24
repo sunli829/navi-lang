@@ -904,6 +904,7 @@ impl Gen {
             }
         }
         self.gen_descs();
+        self.gen_asm();
         // Writable data: the stack top, then the statics (zero-initialized;
         // the entry point runs their initializers). The collector scans from
         // _navi_data_start to _navi_data_end.
@@ -937,6 +938,73 @@ impl Gen {
             self.o.define(s.0.as_str(), obj::RO_DATA, 1, false);
             self.o.append(obj::RO_DATA, s.1.as_slice());
             self.o.zeros(obj::RO_DATA, 1);
+        }
+    }
+
+    /// The #[asm] functions of the crate compiled (crate::asm): each
+    /// module's <file>_<arch>.s assembled, its functions defined by their
+    /// symbols (asm_sym). (Every one: merging drops those not called.)
+    fn gen_asm(&mut self) {
+        let mut names: Vec<String> = Vec::new();
+        let mut decls: HashMap<String, Vec<&mut Def>> = HashMap::new();
+        for d in self.p.info.res.defs.iter() {
+            if d.kind != crate::resolve::DEF_FN && d.kind != crate::resolve::DEF_ASSOC_FN { continue; }
+            if !codegen::fn_has_attr(*d, "asm") { continue; }
+            if self.p.library.len() > 0 && d.krate.name != self.p.library { continue; }
+            if let Some(x) = self.p.mir.ext { if x.crates.contains_key(&d.krate.name) { continue; } }
+            let f = match d.file { Some(f) => f, None => continue };
+            if !decls.contains_key(&f.name) {
+                names.push(f.name.clone());
+                decls.insert(f.name.clone(), Vec::new());
+            }
+            decls.get_mut(&f.name).unwrap().push(*d);
+        }
+        names.sort();
+        for name in names.iter() {
+            let ds = decls[name].clone();
+            let c = ds[0].krate;
+            // The file's path (its name is the crate's directory and the path
+            // in the crate).
+            let prefix = `${c.dir}/`.to_string();
+            let path = if name.starts_with("/") || c.fs_root.len() == 0 { name.clone() } else if name.starts_with(prefix.as_str()) { crate::util::path_join(c.fs_root.as_str(), &name[prefix.len()..]) } else { name.clone() };
+            let stem = if path.ends_with(".navi") { path[..path.len() - 5].to_string() } else { path.clone() };
+            let spath = `${stem}_${self.o.arch}.s`.to_string();
+            let src = match crate::cache::read_source(spath.as_str()) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.errorf(`${name}: #[asm] fn ${ds[0].name}: ${spath}: ${e}`.to_string());
+                    continue;
+                }
+            };
+            crate::cache::note(spath.as_str(), &src);
+            let funcs = match crate::asm::assemble(self.o.arch.as_str(), src.as_str()) {
+                Ok(f) => f,
+                Err(errs) => {
+                    for e in errs.iter() { self.errorf(`${spath}:${e.line}: ${e.msg}`.to_string()); }
+                    continue;
+                }
+            };
+            for f in funcs.iter() {
+                let mut decl: Option<&mut Def> = None;
+                for d in ds.iter() { if d.name == f.name { decl = Some(*d); } }
+                let d = match decl {
+                    Some(d) => d,
+                    None => {
+                        self.errorf(`${spath}:${f.line}: ${f.name} is not an #[asm] fn of ${name}`.to_string());
+                        continue;
+                    }
+                };
+                let sym = asm_sym(d);
+                let off = self.o.define(sym.as_str(), obj::TEXT, 16, false);
+                self.o.append(obj::TEXT, f.code.as_slice());
+                if self.dwarf { self.o.funcs.push(obj::FuncRange { name: d.name.clone(), off, size: f.code.len() as u64 }); }
+                for r in f.relocs.iter() { self.o.reloc(obj::TEXT, off as u32 + r.off, r.kind, r.sym.as_str()); }
+            }
+            for d in ds.iter() {
+                let mut found = false;
+                for f in funcs.iter() { if f.name == d.name { found = true; } }
+                if !found { self.errorf(`${name}: #[asm] fn ${d.name} is not in ${spath}`.to_string()); }
+            }
         }
     }
 
@@ -2354,6 +2422,27 @@ impl FnGen {
         let name = t.intrinsic.as_str();
         let targ0: Option<&Type> = if t.type_args.len() > 0 { Some(t.type_args[0]) } else { None };
         match name {
+            "asm" => {
+                // navi's convention: the arguments at sp, 8 bytes each,
+                // the result to the result buffer (RET).
+                let mut off = 0i64;
+                for a in args.iter() {
+                    let at = self.operand_type(a);
+                    let sz = self.size(at);
+                    self.store_operand(a, SP, off);
+                    off += (sz + 7) / 8 * 8;
+                }
+                m.addr_of(RET, FP, self.res_off);
+                m.call(&asm_sym(t.def));
+                if size == 1 || size == 2 || size == 4 || size == 8 {
+                    m.load(size, V1, FP, self.res_off);
+                    if size < 8 && dt.kind == types::K_INT && is_signed(dt) { m.sign_ext(V1, V1, size); }
+                } else if size == 16 {
+                    m.load(8, V1, FP, self.res_off);
+                    m.load(8, V2, FP, self.res_off + 8);
+                }
+                return true;
+            }
             "extern" => {
                 let s = self.g.extern_def_sym(t.def);
                 let fo = mir::copy(mir::local_place(0));
@@ -4237,3 +4326,6 @@ impl FnGen {
 fn same_loc(a: &Loc, b: &Loc) -> bool {
     a.kind == b.kind && a.fp == b.fp && ((a.kind == 0 && a.reg == b.reg) || (a.kind == 1 && a.off == b.off))
 }
+
+/// The symbol of an #[asm] function.
+pub fn asm_sym(d: &Def) -> String { crate::symbols::symbol("_navi_asm_", d.name.as_str(), crate::symbols::def_id(d).as_str()) }

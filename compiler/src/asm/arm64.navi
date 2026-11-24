@@ -1,0 +1,849 @@
+//! The arm64 assembler (GNU syntax): the general purpose instructions a
+//! leaf function needs, loads and stores in every addressing mode, branches
+//! to local labels, and the SIMD and cryptography instructions (ld1/st1,
+//! aese/aesmc, pmull, ext, eor...). Every instruction is 4 bytes.
+
+use std::collections::HashMap;
+use crate::asm::{Stmt, Func, Error, is_local, int, data, functions};
+use crate::obj::Reloc;
+
+// A register operand: kind x (64-bit), w (32-bit), v (vector, with an
+// arrangement), q/d/s/h/b (SIMD scalars); 31 is sp or zr.
+#[derive(Clone)]
+struct R {
+    kind: u8,
+    n: u32,
+    // A vector's arrangement (16b, 2d...) or "".
+    arr: String,
+    // An element index (v0.d[1]), -1 if none.
+    idx: i64,
+    sp: bool,
+}
+
+const X: u8 = 1;
+const W: u8 = 2;
+const V: u8 = 3;
+const Q: u8 = 4;
+const D: u8 = 5;
+const S: u8 = 6;
+const H: u8 = 7;
+const B: u8 = 8;
+
+fn reg(s: &str) -> Option<R> {
+    let t = s.trim().to_lowercase();
+    let t = t.as_str();
+    match t {
+        "sp" => return Some(R { kind: X, n: 31, arr: String::new(), idx: -1, sp: true }),
+        "wsp" => return Some(R { kind: W, n: 31, arr: String::new(), idx: -1, sp: true }),
+        "xzr" => return Some(R { kind: X, n: 31, arr: String::new(), idx: -1, sp: false }),
+        "wzr" => return Some(R { kind: W, n: 31, arr: String::new(), idx: -1, sp: false }),
+        "lr" => return Some(R { kind: X, n: 30, arr: String::new(), idx: -1, sp: false }),
+        "fp" => return Some(R { kind: X, n: 29, arr: String::new(), idx: -1, sp: false }),
+        _ => {}
+    }
+    if t.len() < 2 { return None; }
+    let kind = match t.as_bytes()[0] {
+        b'x' => X,
+        b'w' => W,
+        b'v' => V,
+        b'q' => Q,
+        b'd' => D,
+        b's' => S,
+        b'h' => H,
+        b'b' => B,
+        _ => return None,
+    };
+    let rest = &t[1..];
+    let mut end = 0;
+    let rb = rest.as_bytes();
+    while end < rb.len() && rb[end].is_ascii_digit() { end += 1; }
+    if end == 0 { return None; }
+    let n = rest[..end].parse::<u32>().ok()?;
+    if n > 31 || (n == 31 && (kind == X || kind == W)) { return None; }
+    let mut arr = String::new();
+    let mut idx: i64 = -1;
+    let tail = &rest[end..];
+    if tail.len() > 0 {
+        if kind != V || !tail.starts_with(".") { return None; }
+        let a = &tail[1..];
+        match a.find('[') {
+            Some(i) => {
+                arr = a[..i].to_string();
+                if !a.ends_with("]") { return None; }
+                idx = a[i + 1..a.len() - 1].parse::<i64>().ok()?;
+            }
+            None => arr = a.to_string(),
+        }
+    }
+    Some(R { kind, n, arr, idx, sp: false })
+}
+
+// An immediate (#n or n).
+fn imm(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if t.starts_with("#") { int(&t[1..]) } else { int(t) }
+}
+
+// A memory operand: [base], [base, #off], [base, index{, lsl #s}]; pre:
+// written back first (!).
+struct Mem {
+    base: u32,
+    off: i64,
+    index: i64,
+    shift: i64,
+    pre: bool,
+}
+
+fn mem(s: &str) -> Option<Mem> {
+    let mut t = s.trim();
+    let mut pre = false;
+    if t.ends_with("!") {
+        pre = true;
+        t = t[..t.len() - 1].trim();
+    }
+    if !t.starts_with("[") || !t.ends_with("]") { return None; }
+    let inner = &t[1..t.len() - 1];
+    let parts: Vec<&str> = inner.split(',').collect();
+    let b = reg(parts[0])?;
+    if b.kind != X { return None; }
+    let mut m = Mem { base: b.n, off: 0, index: -1, shift: 0, pre };
+    if parts.len() >= 2 {
+        let p = parts[1].trim();
+        if p.starts_with("#") || p.starts_with("-") || p.as_bytes()[0].is_ascii_digit() {
+            m.off = imm(p)?;
+        } else {
+            let r = reg(p)?;
+            if r.kind != X { return None; }
+            m.index = r.n as i64;
+            if parts.len() >= 3 {
+                let sh = parts[2].trim();
+                if !sh.starts_with("lsl") { return None; }
+                m.shift = imm(sh[3..].trim())?;
+            }
+        }
+    }
+    Some(m)
+}
+
+// A vector register list {v0.16b, v1.16b} or {v0.16b-v3.16b}: the first,
+// the count, the arrangement.
+fn vlist(s: &str) -> Option<(u32, u32, String)> {
+    let t = s.trim();
+    if !t.starts_with("{") || !t.ends_with("}") { return None; }
+    let inner = &t[1..t.len() - 1];
+    if let Some(i) = inner.find('-') {
+        let a = reg(&inner[..i])?;
+        let b = reg(&inner[i + 1..])?;
+        if a.kind != V || b.kind != V { return None; }
+        let n = (b.n + 32 - a.n) % 32 + 1;
+        return Some((a.n, n, a.arr));
+    }
+    let parts: Vec<&str> = inner.split(',').collect();
+    let first = reg(parts[0])?;
+    let mut k = 1;
+    while k < parts.len() {
+        let r = reg(parts[k])?;
+        if r.n != (first.n + k as u32) % 32 { return None; }
+        k += 1;
+    }
+    Some((first.n, parts.len() as u32, first.arr))
+}
+
+// A vector arrangement's size field and Q bit.
+fn arr_bits(a: &str) -> Option<(u32, u32)> {
+    match a {
+        "8b" => Some((0, 0)),
+        "16b" => Some((0, 1)),
+        "4h" => Some((1, 0)),
+        "8h" => Some((1, 1)),
+        "2s" => Some((2, 0)),
+        "4s" => Some((2, 1)),
+        "1d" => Some((3, 0)),
+        "2d" => Some((3, 1)),
+        _ => None,
+    }
+}
+
+fn cond(s: &str) -> Option<u32> {
+    match s {
+        "eq" => Some(0),
+        "ne" => Some(1),
+        "cs" | "hs" => Some(2),
+        "cc" | "lo" => Some(3),
+        "mi" => Some(4),
+        "pl" => Some(5),
+        "vs" => Some(6),
+        "vc" => Some(7),
+        "hi" => Some(8),
+        "ls" => Some(9),
+        "ge" => Some(10),
+        "lt" => Some(11),
+        "gt" => Some(12),
+        "le" => Some(13),
+        "al" => Some(14),
+        _ => None,
+    }
+}
+
+// The N:immr:imms of a logical immediate (a repeated rotated run of ones),
+// for a register of width bits.
+fn bitmask(v: u64, width: u32) -> Option<u32> {
+    let mut x = v;
+    if width == 32 {
+        x = x & 0xffffffff;
+        x = x | (x << 32);
+    }
+    if x == 0 || x == 0xffffffffffffffff { return None; }
+    // The element size: the smallest that repeats.
+    let mut size = 64u32;
+    while size > 2 {
+        let half = size / 2;
+        let mask = if half == 64 { 0xffffffffffffffff } else { (1u64 << half) - 1 };
+        if (x & mask) != ((x >> half) & mask) { break; }
+        size = half;
+    }
+    let emask = if size == 64 { 0xffffffffffffffff } else { (1u64 << size) - 1 };
+    let e = x & emask;
+    // Rotate e right until its ones are at the bottom, contiguous.
+    let mut r = 0u32;
+    while r < size {
+        let rot = if r == 0 { e } else { ((e >> r) | (e << (size - r))) & emask };
+        // rot is 0..01..1?
+        if rot != 0 && (rot & (rot + 1)) == 0 {
+            let ones = (rot.count_ones()) as u32;
+            let immr = (size - r) % size;
+            let nbit = if size == 64 { 1u32 } else { 0u32 };
+            let imms = ((!(size * 2 - 1)) & 0x3f) | (ones - 1);
+            return Some((nbit << 12) | (immr << 6) | (imms & 0x3f));
+        }
+        r += 1;
+    }
+    None
+}
+
+// The assembler's state: label offsets (local ones keyed by their
+// function), the code.
+struct Asm {
+    labels: HashMap<String, i64>,
+    func: String,
+    errs: Vec<Error>,
+}
+
+impl Asm {
+    fn key(&self, l: &str) -> String { if is_local(l) { `${self.func}${l}`.to_string() } else { l.to_string() } }
+
+    // The offset from pc to label l (within the current function).
+    fn target(&mut self, line: u32, l: &str, pc: i64) -> i64 {
+        let k = self.key(l.trim());
+        if !is_local(l.trim()) && l.trim() != self.func {
+            self.errs.push(Error { line, msg: `${l}: branches go to local labels (.name) of the same function`.to_string() });
+            return 0;
+        }
+        match self.labels.get(&k) {
+            Some(o) => *o - pc,
+            None => {
+                self.errs.push(Error { line, msg: `no label ${l}`.to_string() });
+                0
+            }
+        }
+    }
+}
+
+pub fn assemble(stmts: &Vec<Stmt>) -> Result<Vec<Func>, Vec<Error>> {
+    let a = &mut Asm { labels: HashMap::new(), func: String::new(), errs: Vec::new() };
+    // Pass 1: offsets.
+    let mut offs: Vec<i64> = Vec::new();
+    let mut pc = 0i64;
+    for s in stmts.iter() {
+        if s.label.len() > 0 {
+            if !is_local(s.label.as_str()) {
+                a.func = s.label.clone();
+                pc = 0;
+            }
+            let k = a.key(s.label.as_str());
+            if a.labels.contains_key(&k) { a.errs.push(Error { line: s.line, msg: `label ${s.label} defined twice`.to_string() }); }
+            a.labels.insert(k, pc);
+            offs.push(pc);
+            continue;
+        }
+        offs.push(pc);
+        pc += size_of(s, pc);
+    }
+    // Pass 2: the bytes.
+    let mut code: Vec<Vec<u8>> = Vec::new();
+    let mut relocs: Vec<Vec<Reloc>> = Vec::new();
+    let mut i = 0;
+    while i < stmts.len() {
+        let s = &stmts[i];
+        relocs.push(Vec::new());
+        if s.label.len() > 0 {
+            if !is_local(s.label.as_str()) { a.func = s.label.clone(); }
+            code.push(Vec::new());
+            i += 1;
+            continue;
+        }
+        code.push(encode(a, s, offs[i]));
+        i += 1;
+    }
+    if a.errs.len() > 0 { return Err(a.errs); }
+    functions(stmts, &code, &relocs)
+}
+
+// The size of a statement at pc.
+fn size_of(s: &Stmt, pc: i64) -> i64 {
+    if let Some(d) = data(s.op.as_str(), &s.args) {
+        return match d { Ok(b) => b.len() as i64, Err(_) => 0 };
+    }
+    if s.op == ".balign" || s.op == ".p2align" || s.op == ".align" {
+        let n = align_of(s);
+        if n <= 1 { return 0; }
+        return (n - pc % n) % n;
+    }
+    if s.op == ".text" || s.op == ".globl" || s.op == ".global" { return 0; }
+    4
+}
+
+fn align_of(s: &Stmt) -> i64 {
+    let v = if s.args.len() > 0 { int(s.args[0].as_str()).unwrap_or(1) } else { 1 };
+    if s.op == ".balign" { v } else { 1i64 << v }
+}
+
+fn word(w: u32) -> Vec<u8> {
+    let mut b: Vec<u8> = Vec::new();
+    b.push(w as u8);
+    b.push((w >> 8) as u8);
+    b.push((w >> 16) as u8);
+    b.push((w >> 24) as u8);
+    b
+}
+
+fn encode(a: &mut Asm, s: &Stmt, pc: i64) -> Vec<u8> {
+    if let Some(d) = data(s.op.as_str(), &s.args) {
+        return match d {
+            Ok(b) => b,
+            Err(m) => {
+                a.errs.push(Error { line: s.line, msg: m });
+                Vec::new()
+            }
+        };
+    }
+    if s.op == ".balign" || s.op == ".p2align" || s.op == ".align" {
+        let n = align_of(s);
+        let mut out: Vec<u8> = Vec::new();
+        if n > 1 {
+            let mut pad = (n - pc % n) % n;
+            // nop between instructions, zeros otherwise.
+            while pad >= 4 && pc % 4 == 0 {
+                out.extend_from_slice(word(0xd503201f).as_slice());
+                pad -= 4;
+            }
+            while pad > 0 {
+                out.push(0);
+                pad -= 1;
+            }
+        }
+        return out;
+    }
+    if s.op == ".text" || s.op == ".globl" || s.op == ".global" { return Vec::new(); }
+    match inst(a, s, pc) {
+        Ok(w) => word(w),
+        Err(m) => {
+            a.errs.push(Error { line: s.line, msg: `${s.op}: ${m}`.to_string() });
+            word(0)
+        }
+    }
+}
+
+fn want(args: &Vec<String>, n: usize) -> Result<(), String> {
+    if args.len() != n { return Err(`expected ${n} operands, found ${args.len()}`.to_string()); }
+    Ok(())
+}
+
+fn r_of(s: &str) -> Result<R, String> {
+    match reg(s) {
+        Some(r) => Ok(r),
+        None => Err(`bad register ${s}`.to_string()),
+    }
+}
+
+fn gp(s: &str) -> Result<R, String> {
+    let r = r_of(s)?;
+    if r.kind != X && r.kind != W { return Err(`${s} is not a general purpose register`.to_string()); }
+    Ok(r)
+}
+
+fn vec(s: &str) -> Result<R, String> {
+    let r = r_of(s)?;
+    if r.kind != V { return Err(`${s} is not a vector register`.to_string()); }
+    Ok(r)
+}
+
+fn sf(r: &R) -> u32 { if r.kind == X { 1u32 << 31 } else { 0 } }
+
+fn imm_of(s: &str) -> Result<i64, String> {
+    match imm(s) {
+        Some(v) => Ok(v),
+        None => Err(`bad immediate ${s}`.to_string()),
+    }
+}
+
+// A shift operand "lsl #n" (or "asr", "lsr"): the type and amount.
+fn shift(s: &str) -> Result<(u32, u32), String> {
+    let t = s.trim().to_lowercase();
+    let (k, rest) = if t.starts_with("lsl") { (0u32, &t[3..]) } else if t.starts_with("lsr") { (1u32, &t[3..]) } else if t.starts_with("asr") { (2u32, &t[3..]) } else { return Err(`bad shift ${s}`.to_string()) };
+    Ok((k, imm_of(rest)? as u32))
+}
+
+fn inst(a: &mut Asm, s: &Stmt, pc: i64) -> Result<u32, String> {
+    let args = &s.args;
+    let op = s.op.as_str();
+    if op.starts_with("b.") {
+        let c = match cond(&op[2..]) { Some(c) => c, None => return Err("bad condition".to_string()) };
+        want(args, 1)?;
+        let off = a.target(s.line, args[0].as_str(), pc);
+        return Ok(0x54000000 | ((((off >> 2) as u32) & 0x7ffff) << 5) | c);
+    }
+    match op {
+        "nop" => Ok(0xd503201f),
+        "ret" => {
+            if args.len() == 0 { return Ok(0xd65f03c0); }
+            Ok(0xd65f0000 | (gp(args[0].as_str())?.n << 5))
+        }
+        "b" => {
+            want(args, 1)?;
+            let off = a.target(s.line, args[0].as_str(), pc);
+            Ok(0x14000000 | (((off >> 2) as u32) & 0x3ffffff))
+        }
+        "cbz" | "cbnz" => {
+            want(args, 2)?;
+            let r = gp(args[0].as_str())?;
+            let off = a.target(s.line, args[1].as_str(), pc);
+            let base: u32 = if op == "cbz" { 0x34000000 } else { 0x35000000 };
+            Ok(base | sf(&r) | ((((off >> 2) as u32) & 0x7ffff) << 5) | r.n)
+        }
+        "tbz" | "tbnz" => {
+            want(args, 3)?;
+            let r = gp(args[0].as_str())?;
+            let bit = imm_of(args[1].as_str())? as u32;
+            let off = a.target(s.line, args[2].as_str(), pc);
+            let base: u32 = if op == "tbz" { 0x36000000 } else { 0x37000000 };
+            Ok(base | ((bit >> 5) << 31) | ((bit & 31) << 19) | ((((off >> 2) as u32) & 0x3fff) << 5) | r.n)
+        }
+        "adr" => {
+            want(args, 2)?;
+            let r = gp(args[0].as_str())?;
+            let off = a.target(s.line, args[1].as_str(), pc);
+            let v = off as u32;
+            Ok(0x10000000 | ((v & 3) << 29) | (((v >> 2) & 0x7ffff) << 5) | r.n)
+        }
+        "mov" => mov(args),
+        "movz" | "movk" | "movn" => {
+            if args.len() < 2 { return Err("expected 2 or 3 operands".to_string()); }
+            let r = gp(args[0].as_str())?;
+            let v = imm_of(args[1].as_str())? as u32;
+            let mut hw = 0u32;
+            if args.len() == 3 { hw = shift(args[2].as_str())?.1 / 16; }
+            let base: u32 = if op == "movz" { 0x52800000 } else if op == "movk" { 0x72800000 } else { 0x12800000 };
+            Ok(base | sf(&r) | (hw << 21) | ((v & 0xffff) << 5) | r.n)
+        }
+        "add" | "sub" | "adds" | "subs" => {
+            if args.len() > 0 && reg(args[0].as_str()).map(|r| r.kind == V).unwrap_or(false) { return vec3(op, args); }
+            addsub(op, args)
+        }
+        "cmp" | "cmn" => {
+            if args.len() < 2 { return Err("expected 2 operands".to_string()); }
+            let r = gp(args[0].as_str())?;
+            let mut a2: Vec<String> = Vec::new();
+            a2.push(if r.kind == X { "xzr".to_string() } else { "wzr".to_string() });
+            for x in args.iter() { a2.push(x.clone()); }
+            addsub(if op == "cmp" { "subs" } else { "adds" }, &a2)
+        }
+        "neg" => {
+            want(args, 2)?;
+            let r = gp(args[0].as_str())?;
+            let mut a2: Vec<String> = Vec::new();
+            a2.push(args[0].clone());
+            a2.push(if r.kind == X { "xzr".to_string() } else { "wzr".to_string() });
+            a2.push(args[1].clone());
+            addsub("sub", &a2)
+        }
+        "and" | "orr" | "eor" | "ands" | "bic" | "orn" => {
+            if args.len() > 0 && reg(args[0].as_str()).map(|r| r.kind == V).unwrap_or(false) { return vec3(op, args); }
+            logical(op, args)
+        }
+        "tst" => {
+            if args.len() < 2 { return Err("expected 2 operands".to_string()); }
+            let r = gp(args[0].as_str())?;
+            let mut a2: Vec<String> = Vec::new();
+            a2.push(if r.kind == X { "xzr".to_string() } else { "wzr".to_string() });
+            for x in args.iter() { a2.push(x.clone()); }
+            logical("ands", &a2)
+        }
+        "mvn" => {
+            want(args, 2)?;
+            let r = gp(args[0].as_str())?;
+            let mut a2: Vec<String> = Vec::new();
+            a2.push(args[0].clone());
+            a2.push(if r.kind == X { "xzr".to_string() } else { "wzr".to_string() });
+            a2.push(args[1].clone());
+            logical("orn", &a2)
+        }
+        "lsl" | "lsr" | "asr" | "ror" => {
+            want(args, 3)?;
+            let d = gp(args[0].as_str())?;
+            let n = gp(args[1].as_str())?;
+            if let Some(m) = reg(args[2].as_str()) {
+                let k: u32 = match op { "lsl" => 0, "lsr" => 1, "asr" => 2, _ => 3 };
+                return Ok(0x1ac02000 | sf(&d) | (m.n << 16) | (k << 10) | (n.n << 5) | d.n);
+            }
+            let sh = imm_of(args[2].as_str())? as u32;
+            let width: u32 = if d.kind == X { 64 } else { 32 };
+            if sh >= width { return Err("shift too large".to_string()); }
+            let nbit: u32 = if d.kind == X { 1 << 22 } else { 0 };
+            match op {
+                "lsl" => Ok(0x53000000 | sf(&d) | nbit | (((width - sh) % width) << 16) | ((width - 1 - sh) << 10) | (n.n << 5) | d.n),
+                "lsr" => Ok(0x53000000 | sf(&d) | nbit | (sh << 16) | ((width - 1) << 10) | (n.n << 5) | d.n),
+                "asr" => Ok(0x13000000 | sf(&d) | nbit | (sh << 16) | ((width - 1) << 10) | (n.n << 5) | d.n),
+                // ror: extr d, n, n, #sh
+                _ => Ok(0x13800000 | sf(&d) | nbit | (n.n << 16) | (sh << 10) | (n.n << 5) | d.n),
+            }
+        }
+        "mul" | "udiv" | "sdiv" => {
+            want(args, 3)?;
+            let d = gp(args[0].as_str())?;
+            let n = gp(args[1].as_str())?;
+            let m = gp(args[2].as_str())?;
+            let base: u32 = match op { "mul" => 0x1b007c00, "udiv" => 0x1ac00800, _ => 0x1ac00c00 };
+            Ok(base | sf(&d) | (m.n << 16) | (n.n << 5) | d.n)
+        }
+        "madd" | "msub" => {
+            want(args, 4)?;
+            let d = gp(args[0].as_str())?;
+            let n = gp(args[1].as_str())?;
+            let m = gp(args[2].as_str())?;
+            let ac = gp(args[3].as_str())?;
+            let base: u32 = if op == "madd" { 0x1b000000 } else { 0x1b008000 };
+            Ok(base | sf(&d) | (m.n << 16) | (ac.n << 10) | (n.n << 5) | d.n)
+        }
+        "csel" | "csinc" => {
+            want(args, 4)?;
+            let d = gp(args[0].as_str())?;
+            let n = gp(args[1].as_str())?;
+            let m = gp(args[2].as_str())?;
+            let c = match cond(args[3].trim()) { Some(c) => c, None => return Err("bad condition".to_string()) };
+            let base: u32 = if op == "csel" { 0x1a800000 } else { 0x1a800400 };
+            Ok(base | sf(&d) | (m.n << 16) | (c << 12) | (n.n << 5) | d.n)
+        }
+        "clz" | "rbit" | "rev" => {
+            want(args, 2)?;
+            let d = gp(args[0].as_str())?;
+            let n = gp(args[1].as_str())?;
+            let w: u32 = match op {
+                "clz" => 0x5ac01000,
+                "rbit" => 0x5ac00000,
+                _ => if d.kind == X { 0x5ac00c00 } else { 0x5ac00800 },
+            };
+            Ok(w | sf(&d) | (n.n << 5) | d.n)
+        }
+        "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldur" | "stur" => ldst(op, args),
+        "ldp" | "stp" => ldstp(op, args),
+        "ld1" | "st1" => ld1(op, args),
+        "aese" | "aesd" | "aesmc" | "aesimc" => {
+            want(args, 2)?;
+            let d = vec(args[0].as_str())?;
+            let n = vec(args[1].as_str())?;
+            let w: u32 = match op { "aese" => 0x4e284800, "aesd" => 0x4e285800, "aesmc" => 0x4e286800, _ => 0x4e287800 };
+            Ok(w | (n.n << 5) | d.n)
+        }
+        "pmull" | "pmull2" => {
+            want(args, 3)?;
+            let d = vec(args[0].as_str())?;
+            let n = vec(args[1].as_str())?;
+            let m = vec(args[2].as_str())?;
+            if d.arr != "1q" { return Err("pmull makes a 1q".to_string()); }
+            let base: u32 = if op == "pmull" { 0x0ee0e000 } else { 0x4ee0e000 };
+            Ok(base | (m.n << 16) | (n.n << 5) | d.n)
+        }
+        "ext" => {
+            want(args, 4)?;
+            let d = vec(args[0].as_str())?;
+            let n = vec(args[1].as_str())?;
+            let m = vec(args[2].as_str())?;
+            let k = imm_of(args[3].as_str())? as u32;
+            let q: u32 = if d.arr == "16b" { 1 << 30 } else { 0 };
+            Ok(0x2e000000 | q | (m.n << 16) | ((k & 15) << 11) | (n.n << 5) | d.n)
+        }
+        "rev64" | "rev32" | "rev16" => {
+            want(args, 2)?;
+            let d = vec(args[0].as_str())?;
+            let n = vec(args[1].as_str())?;
+            let (size, q) = match arr_bits(d.arr.as_str()) { Some(x) => x, None => return Err("bad arrangement".to_string()) };
+            let base: u32 = match op { "rev64" => 0x0e200800, "rev32" => 0x2e200800, _ => 0x0e201800 };
+            Ok(base | (q << 30) | (size << 22) | (n.n << 5) | d.n)
+        }
+        "ushr" | "sshr" | "shl" | "sri" | "sli" => {
+            want(args, 3)?;
+            let d = vec(args[0].as_str())?;
+            let n = vec(args[1].as_str())?;
+            let sh = imm_of(args[2].as_str())? as u32;
+            let (size, q) = match arr_bits(d.arr.as_str()) { Some(x) => x, None => return Err("bad arrangement".to_string()) };
+            let esize = 8u32 << size;
+            if sh >= esize && op != "ushr" && op != "sshr" && op != "sri" { return Err("shift too large".to_string()); }
+            // immh:immb: esize + sh for left shifts, 2*esize - sh for right.
+            let left = op == "shl" || op == "sli";
+            let ib = if left { esize + sh } else { 2 * esize - sh };
+            let base: u32 = match op { "ushr" => 0x2f000400, "sshr" => 0x0f000400, "shl" => 0x0f005400, "sri" => 0x2f004400, _ => 0x2f005400 };
+            Ok(base | (q << 30) | ((ib & 0x7f) << 16) | (n.n << 5) | d.n)
+        }
+        "movi" => {
+            want(args, 2)?;
+            let d = vec(args[0].as_str())?;
+            let v = imm_of(args[1].as_str())? as u32;
+            if d.arr != "16b" && d.arr != "8b" { return Err("movi takes 8b or 16b".to_string()); }
+            let q: u32 = if d.arr == "16b" { 1 << 30 } else { 0 };
+            Ok(0x0f00e400 | q | (((v >> 5) & 7) << 16) | ((v & 31) << 5) | d.n)
+        }
+        "dup" => {
+            want(args, 2)?;
+            let d = vec(args[0].as_str())?;
+            let (size, q) = match arr_bits(d.arr.as_str()) { Some(x) => x, None => return Err("bad arrangement".to_string()) };
+            let imm5 = 1u32 << size;
+            let src = r_of(args[1].as_str())?;
+            if src.kind == V {
+                if src.idx < 0 { return Err("dup takes an element".to_string()); }
+                let i5 = imm5 | ((src.idx as u32) << (size + 1));
+                return Ok(0x0e000400 | (q << 30) | (i5 << 16) | (src.n << 5) | d.n);
+            }
+            Ok(0x0e000c00 | (q << 30) | (imm5 << 16) | (src.n << 5) | d.n)
+        }
+        "umov" | "ins" => mov(args),
+        "fmov" => {
+            want(args, 2)?;
+            let d = r_of(args[0].as_str())?;
+            let n = r_of(args[1].as_str())?;
+            if d.kind == D && n.kind == X { return Ok(0x9e670000 | (n.n << 5) | d.n); }
+            if d.kind == X && n.kind == D { return Ok(0x9e660000 | (n.n << 5) | d.n); }
+            Err("fmov moves between an x and a d register".to_string())
+        }
+        _ => Err("unknown instruction".to_string()),
+    }
+}
+
+// mov: registers (general, to or from sp, vectors and their elements) or
+// an immediate movz/movn can make.
+fn mov(args: &Vec<String>) -> Result<u32, String> {
+    want(args, 2)?;
+    let d = r_of(args[0].as_str())?;
+    if let Some(n) = reg(args[1].as_str()) {
+        if d.kind == V && n.kind == V {
+            if d.idx >= 0 || n.idx >= 0 { return Err("element moves between vectors are not supported".to_string()); }
+            let q: u32 = if d.arr == "16b" || d.arr.len() == 0 { 1 << 30 } else { 0 };
+            return Ok(0x0ea01c00 | q | (n.n << 16) | (n.n << 5) | d.n);
+        }
+        if d.kind == V && (n.kind == X || n.kind == W) {
+            // ins vd.T[i], rn
+            let (size, _) = match arr_bits(`${if d.arr == "d" { "2d" } else if d.arr == "s" { "4s" } else if d.arr == "h" { "8h" } else { "16b" }}`.to_string().as_str()) { Some(x) => x, None => return Err("bad element".to_string()) };
+            if d.idx < 0 { return Err("mov to a vector takes an element".to_string()); }
+            let imm5 = (1u32 << size) | ((d.idx as u32) << (size + 1));
+            return Ok(0x4e001c00 | (imm5 << 16) | (n.n << 5) | d.n);
+        }
+        if (d.kind == X || d.kind == W) && n.kind == V {
+            // umov rd, vn.T[i]
+            let (size, _) = match arr_bits(`${if n.arr == "d" { "2d" } else if n.arr == "s" { "4s" } else if n.arr == "h" { "8h" } else { "16b" }}`.to_string().as_str()) { Some(x) => x, None => return Err("bad element".to_string()) };
+            if n.idx < 0 { return Err("mov from a vector takes an element".to_string()); }
+            let imm5 = (1u32 << size) | ((n.idx as u32) << (size + 1));
+            let q: u32 = if size == 3 { 1 << 30 } else { 0 };
+            return Ok(0x0e003c00 | q | (imm5 << 16) | (n.n << 5) | d.n);
+        }
+        if d.kind != X && d.kind != W { return Err("bad mov".to_string()); }
+        if d.sp || n.sp {
+            return Ok(0x11000000 | sf(&d) | (n.n << 5) | d.n);
+        }
+        return Ok(0x2a0003e0 | sf(&d) | (n.n << 16) | d.n);
+    }
+    let v = imm_of(args[1].as_str())?;
+    if d.kind != X && d.kind != W { return Err("bad mov".to_string()); }
+    let width = if d.kind == X { 64 } else { 32 };
+    let u = if width == 32 { (v as u64) & 0xffffffff } else { v as u64 };
+    let mut hw = 0u32;
+    while hw < (width / 16) as u32 {
+        if (u & !(0xffffu64 << (16 * hw))) == 0 { return Ok(0x52800000 | sf(&d) | (hw << 21) | ((((u >> (16 * hw)) & 0xffff) as u32) << 5) | d.n); }
+        let nu = if width == 32 { (!u) & 0xffffffff } else { !u };
+        if (nu & !(0xffffu64 << (16 * hw))) == 0 { return Ok(0x12800000 | sf(&d) | (hw << 21) | ((((nu >> (16 * hw)) & 0xffff) as u32) << 5) | d.n); }
+        hw += 1;
+    }
+    if let Some(bm) = bitmask(u, width as u32) { return Ok(0x32000000 | sf(&d) | (bm << 10) | (31 << 5) | d.n); }
+    Err("the immediate needs movz and movk".to_string())
+}
+
+// add/sub/adds/subs: an immediate (12 bits, maybe lsl #12) or a register
+// (maybe shifted).
+fn addsub(op: &str, args: &Vec<String>) -> Result<u32, String> {
+    if args.len() < 3 { return Err("expected 3 operands".to_string()); }
+    let d = gp(args[0].as_str())?;
+    let n = gp(args[1].as_str())?;
+    let (opb, setf) = match op { "add" => (0u32, 0u32), "sub" => (1, 0), "adds" => (0, 1), _ => (1, 1) };
+    if let Some(m) = reg(args[2].as_str()) {
+        if d.sp || n.sp {
+            // Extended register form (uxtx), which takes sp.
+            return Ok(0x0b206000 | sf(&d) | (opb << 30) | (setf << 29) | (m.n << 16) | (n.n << 5) | d.n);
+        }
+        let mut sh = (0u32, 0u32);
+        if args.len() == 4 { sh = shift(args[3].as_str())?; }
+        return Ok(0x0b000000 | sf(&d) | (opb << 30) | (setf << 29) | (sh.0 << 22) | (m.n << 16) | (sh.1 << 10) | (n.n << 5) | d.n);
+    }
+    let mut v = imm_of(args[2].as_str())?;
+    let mut opb = opb;
+    if v < 0 {
+        v = 0 - v;
+        opb = 1 - opb;
+    }
+    let mut hi = 0u32;
+    if args.len() == 4 {
+        if shift(args[3].as_str())? != (0, 12) { return Err("an immediate shifts by lsl #12 only".to_string()); }
+        hi = 1;
+    } else if v > 4095 && (v & 0xfff) == 0 && v < (1 << 24) {
+        v = v >> 12;
+        hi = 1;
+    }
+    if v > 4095 { return Err("immediate out of range".to_string()); }
+    Ok(0x11000000 | sf(&d) | (opb << 30) | (setf << 29) | (hi << 22) | ((v as u32) << 10) | (n.n << 5) | d.n)
+}
+
+// and/orr/eor/ands/bic/orn: a register (maybe shifted) or a bitmask
+// immediate.
+fn logical(op: &str, args: &Vec<String>) -> Result<u32, String> {
+    if args.len() < 3 { return Err("expected 3 operands".to_string()); }
+    let d = gp(args[0].as_str())?;
+    let n = gp(args[1].as_str())?;
+    let (opc, neg) = match op { "and" => (0u32, 0u32), "orr" => (1, 0), "eor" => (2, 0), "ands" => (3, 0), "bic" => (0, 1), _ => (1, 1) };
+    if let Some(m) = reg(args[2].as_str()) {
+        let mut sh = (0u32, 0u32);
+        if args.len() == 4 { sh = shift(args[3].as_str())?; }
+        return Ok(0x0a000000 | sf(&d) | (opc << 29) | (sh.0 << 22) | (neg << 21) | (m.n << 16) | (sh.1 << 10) | (n.n << 5) | d.n);
+    }
+    if neg == 1 { return Err("bic and orn take a register".to_string()); }
+    let v = imm_of(args[2].as_str())? as u64;
+    let width: u32 = if d.kind == X { 64 } else { 32 };
+    match bitmask(v, width) {
+        Some(bm) => Ok(0x12000000 | sf(&d) | (opc << 29) | (bm << 10) | (n.n << 5) | d.n),
+        None => Err("the immediate is not a bitmask".to_string()),
+    }
+}
+
+// A vector instruction with three registers (eor/and/orr/bic/add/sub).
+fn vec3(op: &str, args: &Vec<String>) -> Result<u32, String> {
+    want(args, 3)?;
+    let d = vec(args[0].as_str())?;
+    let n = vec(args[1].as_str())?;
+    let m = vec(args[2].as_str())?;
+    let (size, q) = match arr_bits(d.arr.as_str()) { Some(x) => x, None => return Err("bad arrangement".to_string()) };
+    let w: u32 = match op {
+        "eor" => 0x2e201c00,
+        "and" => 0x0e201c00,
+        "orr" => 0x0ea01c00,
+        "bic" => 0x0e601c00,
+        "add" => 0x0e208400 | (size << 22),
+        "sub" => 0x2e208400 | (size << 22),
+        _ => return Err("unknown vector instruction".to_string()),
+    };
+    Ok(w | (q << 30) | (m.n << 16) | (n.n << 5) | d.n)
+}
+
+// The size (log2 of bytes) and the vector bit of a load or store's
+// register.
+fn ls_size(op: &str, r: &R) -> Result<(u32, bool), String> {
+    if op == "ldrb" || op == "strb" { return Ok((0, false)); }
+    if op == "ldrh" || op == "strh" { return Ok((1, false)); }
+    match r.kind {
+        X => Ok((3, false)),
+        W => Ok((2, false)),
+        Q => Ok((4, true)),
+        D => Ok((3, true)),
+        S => Ok((2, true)),
+        H => Ok((1, true)),
+        B => Ok((0, true)),
+        _ => Err("bad register for a load or store".to_string()),
+    }
+}
+
+// The size and opc fields of a load or store of 1 << size bytes.
+fn ls_fields(size: u32, simd: bool, load: bool) -> (u32, u32) {
+    if simd && size == 4 { return (0, if load { 3 } else { 2 }); }
+    (size, if load { 1 } else { 0 })
+}
+
+fn ldst(op: &str, args: &Vec<String>) -> Result<u32, String> {
+    if args.len() < 2 || args.len() > 3 { return Err("expected 2 or 3 operands".to_string()); }
+    let t = r_of(args[0].as_str())?;
+    let (size, simd) = ls_size(op, &t)?;
+    let load = op.starts_with("ld");
+    let (sz, opc) = ls_fields(size, simd, load);
+    let v: u32 = if simd { 1 << 26 } else { 0 };
+    let m = match mem(args[1].as_str()) { Some(m) => m, None => return Err(`bad address ${args[1]}`.to_string()) };
+    let base = 0x38000000 | (sz << 30) | v | (opc << 22) | (m.base << 5) | t.n;
+    if args.len() == 3 {
+        // Post-index: [base], #off.
+        let off = imm_of(args[2].as_str())?;
+        if off < -256 || off > 255 { return Err("offset out of range".to_string()); }
+        return Ok(base | (((off as u32) & 0x1ff) << 12) | 0x400);
+    }
+    if m.index >= 0 {
+        let s: u32 = if m.shift == 0 { 0 } else if m.shift == size as i64 { 1 } else { return Err("the index shifts by the access size".to_string()) };
+        return Ok(base | 0x00200800 | ((m.index as u32) << 16) | (3 << 13) | (s << 12));
+    }
+    if m.pre {
+        if m.off < -256 || m.off > 255 { return Err("offset out of range".to_string()); }
+        return Ok(base | (((m.off as u32) & 0x1ff) << 12) | 0xc00);
+    }
+    let scale = 1i64 << size;
+    if op != "ldur" && op != "stur" && m.off >= 0 && m.off % scale == 0 && m.off / scale < 4096 {
+        return Ok(base | 0x01000000 | (((m.off / scale) as u32) << 10));
+    }
+    if m.off < -256 || m.off > 255 { return Err("offset out of range".to_string()); }
+    Ok(base | (((m.off as u32) & 0x1ff) << 12))
+}
+
+fn ldstp(op: &str, args: &Vec<String>) -> Result<u32, String> {
+    if args.len() < 3 || args.len() > 4 { return Err("expected 3 or 4 operands".to_string()); }
+    let t = r_of(args[0].as_str())?;
+    let t2 = r_of(args[1].as_str())?;
+    let load = op == "ldp";
+    let (opc, v, scale): (u32, u32, i64) = match t.kind {
+        X => (2, 0, 8),
+        W => (0, 0, 4),
+        Q => (2, 1, 16),
+        D => (1, 1, 8),
+        S => (0, 1, 4),
+        _ => return Err("bad register for a pair".to_string()),
+    };
+    let m = match mem(args[2].as_str()) { Some(m) => m, None => return Err(`bad address ${args[2]}`.to_string()) };
+    let (mode, off) = if args.len() == 4 { (1u32, imm_of(args[3].as_str())?) } else if m.pre { (3u32, m.off) } else { (2u32, m.off) };
+    if off % scale != 0 || off / scale < -64 || off / scale > 63 { return Err("offset out of range".to_string()); }
+    let l: u32 = if load { 1 } else { 0 };
+    Ok(0x28000000 | (opc << 30) | (v << 26) | (mode << 23) | (l << 22) | ((((off / scale) as u32) & 0x7f) << 15) | (t2.n << 10) | (m.base << 5) | t.n)
+}
+
+// ld1/st1 {list}, [base]{, #size or xm}.
+fn ld1(op: &str, args: &Vec<String>) -> Result<u32, String> {
+    if args.len() < 2 || args.len() > 3 { return Err("expected 2 or 3 operands".to_string()); }
+    let (first, count, arr) = match vlist(args[0].as_str()) { Some(x) => x, None => return Err(`bad register list ${args[0]}`.to_string()) };
+    let (size, q) = match arr_bits(arr.as_str()) { Some(x) => x, None => return Err("bad arrangement".to_string()) };
+    let m = match mem(args[1].as_str()) { Some(m) => m, None => return Err(`bad address ${args[1]}`.to_string()) };
+    let opcode: u32 = match count { 1 => 7, 2 => 10, 3 => 6, 4 => 2, _ => return Err("1 to 4 registers".to_string()) };
+    let l: u32 = if op == "ld1" { 1 << 22 } else { 0 };
+    let mut w = 0x0c000000 | (q << 30) | l | (opcode << 12) | (size << 10) | (m.base << 5) | first;
+    if args.len() == 3 {
+        w = w | (1 << 23);
+        match reg(args[2].as_str()) {
+            Some(r) => w = w | (r.n << 16),
+            None => {
+                let off = imm_of(args[2].as_str())?;
+                let want = (count as i64) * (if q == 1 { 16 } else { 8 });
+                if off != want { return Err(`the post-increment is the size, ${want}`.to_string()); }
+                w = w | (31 << 16);
+            }
+        }
+    }
+    Ok(w)
+}

@@ -1,0 +1,760 @@
+//! The amd64 assembler (Intel syntax: `mov rax, qword ptr [rsp + 8]`,
+//! `movdqu xmm0, xmmword ptr [rdi]`): the general purpose instructions a
+//! leaf function needs, jumps to local labels (always rel32), rip-relative
+//! addresses of local labels, and the SSE, AES-NI and PCLMULQDQ
+//! instructions.
+
+use std::collections::HashMap;
+use crate::asm::{Stmt, Func, Error, is_local, int, data, functions};
+use crate::obj::Reloc;
+
+// A register: its number (0-15), its size in bytes (16: xmm), whether a
+// byte register needs a REX prefix (spl, bpl, sil, dil).
+#[derive(Clone)]
+struct R {
+    n: u32,
+    size: u32,
+    rex8: bool,
+}
+
+const GP64: [&str; 16] = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+const GP32: [&str; 16] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"];
+const GP16: [&str; 16] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"];
+const GP8: [&str; 16] = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"];
+
+fn reg(s: &str) -> Option<R> {
+    let t = s.trim().to_lowercase();
+    let mut i = 0;
+    while i < 16 {
+        if t == GP64[i] { return Some(R { n: i as u32, size: 8, rex8: false }); }
+        if t == GP32[i] { return Some(R { n: i as u32, size: 4, rex8: false }); }
+        if t == GP16[i] { return Some(R { n: i as u32, size: 2, rex8: false }); }
+        if t == GP8[i] { return Some(R { n: i as u32, size: 1, rex8: i >= 4 && i < 8 }); }
+        i += 1;
+    }
+    if t.starts_with("xmm") {
+        let n = t[3..].parse::<u32>().ok()?;
+        if n < 16 { return Some(R { n, size: 16, rex8: false }); }
+    }
+    None
+}
+
+// A memory operand: [base + index*scale + disp] or [rip + label]; its
+// size from "byte/word/dword/qword/xmmword ptr" (0 if not given).
+#[derive(Clone)]
+struct Mem {
+    base: i64,
+    index: i64,
+    scale: u32,
+    disp: i64,
+    rip: bool,
+    label: String,
+    size: u32,
+}
+
+fn mem(s: &str) -> Option<Mem> {
+    let mut t = s.trim().to_lowercase();
+    let mut size = 0u32;
+    for (p, n) in [("byte ptr", 1u32), ("word ptr", 2u32), ("dword ptr", 4u32), ("qword ptr", 8u32), ("xmmword ptr", 16u32), ("oword ptr", 16u32)].iter() {
+        if t.starts_with(*p) {
+            size = *n;
+            t = t[p.len()..].trim().to_string();
+        }
+    }
+    if !t.starts_with("[") || !t.ends_with("]") { return None; }
+    let inner = t[1..t.len() - 1].replace(" ", "");
+    let mut m = Mem { base: -1, index: -1, scale: 1, disp: 0, rip: false, label: String::new(), size };
+    // Terms separated by + and - (a - starts a negative displacement).
+    let mut terms: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in inner.chars() {
+        if (c == '+' || c == '-') && cur.len() > 0 {
+            terms.push(cur);
+            cur = String::new();
+            if c == '-' { cur.push('-'); }
+            continue;
+        }
+        cur.push(c);
+    }
+    if cur.len() > 0 { terms.push(cur); }
+    for x in terms.iter() {
+        let tx = x.as_str();
+        if tx == "rip" {
+            m.rip = true;
+            continue;
+        }
+        if let Some(i) = tx.find('*') {
+            let r = reg(&tx[..i])?;
+            m.index = r.n as i64;
+            m.scale = int(&tx[i + 1..])? as u32;
+            continue;
+        }
+        if let Some(r) = reg(tx) {
+            if r.size != 8 { return None; }
+            if m.base < 0 { m.base = r.n as i64; } else { m.index = r.n as i64; }
+            continue;
+        }
+        if let Some(v) = int(tx) {
+            m.disp += v;
+            continue;
+        }
+        if m.rip && m.label.len() == 0 && (tx.starts_with(".") || tx.as_bytes()[0].is_ascii_alphabetic() || tx.starts_with("_")) {
+            m.label = tx.to_string();
+            continue;
+        }
+        return None;
+    }
+    if m.rip && (m.base >= 0 || m.index >= 0) { return None; }
+    Some(m)
+}
+
+// An operand: a register, a memory reference, an immediate or a label.
+#[derive(Clone)]
+enum Opnd {
+    Reg(R),
+    Mem(Mem),
+    Imm(i64),
+    Label(String),
+}
+
+fn opnd(s: &str) -> Option<Opnd> {
+    if let Some(r) = reg(s) { return Some(Opnd::Reg(r)); }
+    if s.contains("[") { return Some(Opnd::Mem(mem(s)?)); }
+    if let Some(v) = int(s) { return Some(Opnd::Imm(v)); }
+    let t = s.trim();
+    if t.len() > 0 && (t.starts_with(".") || t.starts_with("_") || t.as_bytes()[0].is_ascii_alphabetic()) { return Some(Opnd::Label(t.to_string())); }
+    None
+}
+
+// An instruction being encoded: prefixes, REX bits, opcode, ModRM/SIB and
+// displacement, immediate; a rip-relative target fixed up at the end.
+struct Enc {
+    pre: Vec<u8>,
+    w: bool,
+    rr: u32,
+    rx: u32,
+    rb: u32,
+    rex: bool,
+    op: Vec<u8>,
+    modrm: Vec<u8>,
+    disp: Vec<u8>,
+    // The rip-relative target (offset in the function), or -1.
+    rip_to: i64,
+    imm: Vec<u8>,
+}
+
+fn enc() -> Enc { Enc { pre: Vec::new(), w: false, rr: 0, rx: 0, rb: 0, rex: false, op: Vec::new(), modrm: Vec::new(), disp: Vec::new(), rip_to: -1, imm: Vec::new() } }
+
+fn le(v: i64, n: usize) -> Vec<u8> {
+    let mut b: Vec<u8> = Vec::new();
+    let mut k = 0;
+    while k < n {
+        b.push((v >> (8 * k)) as u8);
+        k += 1;
+    }
+    b
+}
+
+impl Enc {
+    // The bytes, at pc.
+    fn bytes(&self, pc: i64) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(self.pre.as_slice());
+        let rexb = (if self.w { 8 } else { 0 }) | (self.rr << 2) | (self.rx << 1) | self.rb;
+        if rexb != 0 || self.rex { out.push(0x40 | rexb as u8); }
+        out.extend_from_slice(self.op.as_slice());
+        out.extend_from_slice(self.modrm.as_slice());
+        let disp_at = out.len();
+        out.extend_from_slice(self.disp.as_slice());
+        out.extend_from_slice(self.imm.as_slice());
+        if self.rip_to >= 0 {
+            let d = self.rip_to - (pc + out.len() as i64);
+            let b = le(d, 4);
+            let mut k = 0;
+            while k < 4 {
+                out[disp_at + k] = b[k];
+                k += 1;
+            }
+        }
+        out
+    }
+
+    // ModRM (and SIB, displacement) for register field reg and operand
+    // rm.
+    fn rm(&mut self, a: &mut Asm, reg: u32, x: &Opnd) -> Result<(), String> {
+        self.rr = (reg >> 3) & 1;
+        match x {
+            Opnd::Reg(r) => {
+                self.rb = (r.n >> 3) & 1;
+                if r.rex8 { self.rex = true; }
+                self.modrm.push((0xc0 | ((reg & 7) << 3) | (r.n & 7)) as u8);
+                Ok(())
+            }
+            Opnd::Mem(m) => {
+                if m.rip {
+                    self.modrm.push((((reg & 7) << 3) | 5) as u8);
+                    self.disp = le(0, 4);
+                    if m.label.len() > 0 {
+                        self.rip_to = a.label(m.label.as_str())? + m.disp;
+                    } else {
+                        return Err("rip-relative addresses name a label".to_string());
+                    }
+                    return Ok(());
+                }
+                if m.base < 0 {
+                    // [index*scale + disp32] or [disp32].
+                    let idx: u32 = if m.index >= 0 { m.index as u32 } else { 4 };
+                    self.rx = (idx >> 3) & 1;
+                    self.modrm.push((((reg & 7) << 3) | 4) as u8);
+                    self.modrm.push(((ss(m.scale)? << 6) | ((idx & 7) << 3) | 5) as u8);
+                    self.disp = le(m.disp, 4);
+                    return Ok(());
+                }
+                let base = m.base as u32;
+                self.rb = (base >> 3) & 1;
+                let md: u32 = if m.disp == 0 && (base & 7) != 5 { 0 } else if m.disp >= -128 && m.disp <= 127 { 1 } else { 2 };
+                if m.index >= 0 || (base & 7) == 4 {
+                    let idx: u32 = if m.index >= 0 { m.index as u32 } else { 4 };
+                    if m.index == 4 { return Err("rsp cannot be an index".to_string()); }
+                    self.rx = (idx >> 3) & 1;
+                    self.modrm.push(((md << 6) | ((reg & 7) << 3) | 4) as u8);
+                    self.modrm.push(((ss(m.scale)? << 6) | ((idx & 7) << 3) | (base & 7)) as u8);
+                } else {
+                    self.modrm.push(((md << 6) | ((reg & 7) << 3) | (base & 7)) as u8);
+                }
+                if md == 1 { self.disp = le(m.disp, 1); }
+                if md == 2 { self.disp = le(m.disp, 4); }
+                Ok(())
+            }
+            _ => Err("expected a register or memory".to_string()),
+        }
+    }
+}
+
+fn ss(scale: u32) -> Result<u32, String> {
+    match scale {
+        1 => Ok(0),
+        2 => Ok(1),
+        4 => Ok(2),
+        8 => Ok(3),
+        _ => Err("the scale is 1, 2, 4 or 8".to_string()),
+    }
+}
+
+struct Asm {
+    labels: HashMap<String, i64>,
+    func: String,
+    // Pass 1: labels not known yet (0).
+    sizing: bool,
+}
+
+impl Asm {
+    fn key(&self, l: &str) -> String { if is_local(l) { `${self.func}${l}`.to_string() } else { l.to_string() } }
+
+    fn label(&self, l: &str) -> Result<i64, String> {
+        if self.sizing { return Ok(0); }
+        if !is_local(l) && l != self.func { return Err(`${l}: labels are local (.name) to the function`.to_string()); }
+        match self.labels.get(&self.key(l)) {
+            Some(o) => Ok(*o),
+            None => Err(`no label ${l}`.to_string()),
+        }
+    }
+}
+
+pub fn assemble(stmts: &Vec<Stmt>) -> Result<Vec<Func>, Vec<Error>> {
+    let a = &mut Asm { labels: HashMap::new(), func: String::new(), sizing: true };
+    let mut errs: Vec<Error> = Vec::new();
+    // Pass 1: sizes (an instruction's size does not depend on labels).
+    let mut offs: Vec<i64> = Vec::new();
+    let mut pc = 0i64;
+    for s in stmts.iter() {
+        offs.push(pc);
+        if s.label.len() > 0 {
+            if !is_local(s.label.as_str()) {
+                a.func = s.label.clone();
+                pc = 0;
+                offs.pop();
+                offs.push(0);
+            }
+            let k = a.key(s.label.as_str());
+            if a.labels.contains_key(&k) { errs.push(Error { line: s.line, msg: `label ${s.label} defined twice`.to_string() }); }
+            a.labels.insert(k, pc);
+            continue;
+        }
+        match stmt_bytes(a, s, pc) {
+            Ok(b) => pc += b.len() as i64,
+            Err(m) => errs.push(Error { line: s.line, msg: `${s.op}: ${m}`.to_string() }),
+        }
+    }
+    if errs.len() > 0 { return Err(errs); }
+    // Pass 2.
+    a.sizing = false;
+    let mut code: Vec<Vec<u8>> = Vec::new();
+    let mut relocs: Vec<Vec<Reloc>> = Vec::new();
+    let mut i = 0;
+    while i < stmts.len() {
+        let s = &stmts[i];
+        relocs.push(Vec::new());
+        if s.label.len() > 0 {
+            if !is_local(s.label.as_str()) { a.func = s.label.clone(); }
+            code.push(Vec::new());
+            i += 1;
+            continue;
+        }
+        match stmt_bytes(a, s, offs[i]) {
+            Ok(b) => code.push(b),
+            Err(m) => {
+                errs.push(Error { line: s.line, msg: `${s.op}: ${m}`.to_string() });
+                code.push(Vec::new());
+            }
+        }
+        i += 1;
+    }
+    if errs.len() > 0 { return Err(errs); }
+    functions(stmts, &code, &relocs)
+}
+
+fn stmt_bytes(a: &mut Asm, s: &Stmt, pc: i64) -> Result<Vec<u8>, String> {
+    if let Some(d) = data(s.op.as_str(), &s.args) { return d; }
+    if s.op == ".balign" || s.op == ".p2align" || s.op == ".align" {
+        let v = if s.args.len() > 0 { int(s.args[0].as_str()).unwrap_or(1) } else { 1 };
+        let n = if s.op == ".p2align" { 1i64 << v } else { v };
+        let mut out: Vec<u8> = Vec::new();
+        if n > 1 {
+            let mut pad = (n - pc % n) % n;
+            while pad > 0 {
+                // int3 between functions' code and data.
+                out.push(0xcc);
+                pad -= 1;
+            }
+        }
+        return Ok(out);
+    }
+    if s.op == ".text" || s.op == ".globl" || s.op == ".global" || s.op == ".intel_syntax" { return Ok(Vec::new()); }
+    let mut ops: Vec<Opnd> = Vec::new();
+    for x in s.args.iter() {
+        match opnd(x.as_str()) {
+            Some(o) => ops.push(o),
+            None => return Err(`bad operand ${x}`.to_string()),
+        }
+    }
+    let e = inst(a, s.op.as_str(), &ops, pc)?;
+    Ok(e.bytes(pc))
+}
+
+fn want(ops: &Vec<Opnd>, n: usize) -> Result<(), String> {
+    if ops.len() != n { return Err(`expected ${n} operands, found ${ops.len()}`.to_string()); }
+    Ok(())
+}
+
+// The size of an operand (registers, memory with a size).
+fn osize(x: &Opnd) -> u32 {
+    match x {
+        Opnd::Reg(r) => r.size,
+        Opnd::Mem(m) => m.size,
+        _ => 0,
+    }
+}
+
+fn is_xmm(x: &Opnd) -> bool {
+    match x {
+        Opnd::Reg(r) => r.size == 16,
+        _ => false,
+    }
+}
+
+fn rnum(x: &Opnd) -> Result<u32, String> {
+    match x {
+        Opnd::Reg(r) => Ok(r.n),
+        _ => Err("expected a register".to_string()),
+    }
+}
+
+fn immv(x: &Opnd) -> Result<i64, String> {
+    match x {
+        Opnd::Imm(v) => Ok(*v),
+        _ => Err("expected an immediate".to_string()),
+    }
+}
+
+// The size prefix and REX.W of an integer operation of size bytes.
+fn int_size(e: &mut Enc, size: u32) -> Result<(), String> {
+    match size {
+        8 => e.w = true,
+        4 => {}
+        2 => e.pre.push(0x66),
+        1 => {}
+        _ => return Err("the operand size is unknown (byte/word/dword/qword ptr)".to_string()),
+    }
+    Ok(())
+}
+
+fn cc(s: &str) -> Option<u8> {
+    match s {
+        "o" => Some(0),
+        "no" => Some(1),
+        "b" | "c" | "nae" => Some(2),
+        "ae" | "nb" | "nc" => Some(3),
+        "e" | "z" => Some(4),
+        "ne" | "nz" => Some(5),
+        "be" | "na" => Some(6),
+        "a" | "nbe" => Some(7),
+        "s" => Some(8),
+        "ns" => Some(9),
+        "p" | "pe" => Some(10),
+        "np" | "po" => Some(11),
+        "l" | "nge" => Some(12),
+        "ge" | "nl" => Some(13),
+        "le" | "ng" => Some(14),
+        "g" | "nle" => Some(15),
+        _ => None,
+    }
+}
+
+// An SSE instruction xmm, xmm/m (prefix, opcode bytes), maybe with imm8.
+fn sse(a: &mut Asm, pre: u8, op: &[u8], ops: &Vec<Opnd>, imm: bool) -> Result<Enc, String> {
+    want(ops, if imm { 3 } else { 2 })?;
+    if !is_xmm(&ops[0]) { return Err("the first operand is an xmm register".to_string()); }
+    let mut e = enc();
+    if pre != 0 { e.pre.push(pre); }
+    e.op.extend_from_slice(op);
+    e.rm(a, rnum(&ops[0])?, &ops[1])?;
+    if imm { e.imm = le(immv(&ops[2])?, 1); }
+    Ok(e)
+}
+
+// An SSE shift by an immediate: opcode, the /digit, xmm, imm8.
+fn sse_shift(a: &mut Asm, op: u8, digit: u32, ops: &Vec<Opnd>) -> Result<Enc, String> {
+    want(ops, 2)?;
+    if !is_xmm(&ops[0]) { return Err("the first operand is an xmm register".to_string()); }
+    let mut e = enc();
+    e.pre.push(0x66);
+    e.op.push(0x0f);
+    e.op.push(op);
+    e.rm(a, digit, &ops[0])?;
+    e.imm = le(immv(&ops[1])?, 1);
+    Ok(e)
+}
+
+fn inst(a: &mut Asm, op: &str, ops: &Vec<Opnd>, pc: i64) -> Result<Enc, String> {
+    let mut e = enc();
+    // Jumps: rel32 always.
+    if op == "jmp" || (op.starts_with("j") && cc(&op[1..]).is_some()) {
+        want(ops, 1)?;
+        let to = match &ops[0] { Opnd::Label(l) => a.label(l.as_str())?, _ => return Err("jumps go to labels".to_string()) };
+        if op == "jmp" { e.op.push(0xe9); } else {
+            e.op.push(0x0f);
+            e.op.push(0x80 + cc(&op[1..]).unwrap());
+        }
+        // (The displacement is from the end: 5 or 6 bytes.)
+        let len = e.op.len() as i64 + 4;
+        e.imm = le(to - (pc + len), 4);
+        return Ok(e);
+    }
+    if op.starts_with("cmov") {
+        let c = match cc(&op[4..]) { Some(c) => c, None => return Err("bad condition".to_string()) };
+        want(ops, 2)?;
+        int_size(&mut e, osize(&ops[0]))?;
+        e.op.push(0x0f);
+        e.op.push(0x40 + c);
+        e.rm(a, rnum(&ops[0])?, &ops[1])?;
+        return Ok(e);
+    }
+    if op.starts_with("set") {
+        let c = match cc(&op[3..]) { Some(c) => c, None => return Err("bad condition".to_string()) };
+        want(ops, 1)?;
+        e.op.push(0x0f);
+        e.op.push(0x90 + c);
+        e.rm(a, 0, &ops[0])?;
+        return Ok(e);
+    }
+    match op {
+        "ret" => {
+            e.op.push(0xc3);
+            Ok(e)
+        }
+        "nop" => {
+            e.op.push(0x90);
+            Ok(e)
+        }
+        "int3" => {
+            e.op.push(0xcc);
+            Ok(e)
+        }
+        "cpuid" => {
+            e.op.push(0x0f);
+            e.op.push(0xa2);
+            Ok(e)
+        }
+        "push" | "pop" => {
+            want(ops, 1)?;
+            let n = rnum(&ops[0])?;
+            e.rb = (n >> 3) & 1;
+            e.op.push((if op == "push" { 0x50 } else { 0x58 }) + (n & 7) as u8);
+            Ok(e)
+        }
+        "add" | "or" | "adc" | "sbb" | "and" | "sub" | "xor" | "cmp" => {
+            want(ops, 2)?;
+            let k: u32 = match op { "add" => 0, "or" => 1, "adc" => 2, "sbb" => 3, "and" => 4, "sub" => 5, "xor" => 6, _ => 7 };
+            let size = if osize(&ops[0]) != 0 { osize(&ops[0]) } else { osize(&ops[1]) };
+            int_size(&mut e, size)?;
+            match &ops[1] {
+                Opnd::Imm(v) => {
+                    if *v >= -128 && *v <= 127 && size != 1 {
+                        e.op.push(0x83);
+                        e.rm(a, k, &ops[0])?;
+                        e.imm = le(*v, 1);
+                    } else {
+                        e.op.push(if size == 1 { 0x80 } else { 0x81 });
+                        e.rm(a, k, &ops[0])?;
+                        e.imm = le(*v, if size == 1 { 1 } else if size == 2 { 2 } else { 4 });
+                    }
+                }
+                Opnd::Reg(r) => {
+                    e.op.push((k * 8 + (if size == 1 { 0 } else { 1 })) as u8);
+                    e.rm(a, r.n, &ops[0])?;
+                    if r.rex8 { e.rex = true; }
+                }
+                Opnd::Mem(_) => {
+                    e.op.push((k * 8 + (if size == 1 { 2 } else { 3 })) as u8);
+                    e.rm(a, rnum(&ops[0])?, &ops[1])?;
+                }
+                _ => return Err("bad operand".to_string()),
+            }
+            Ok(e)
+        }
+        "test" => {
+            want(ops, 2)?;
+            let size = osize(&ops[0]);
+            int_size(&mut e, size)?;
+            match &ops[1] {
+                Opnd::Imm(v) => {
+                    e.op.push(if size == 1 { 0xf6 } else { 0xf7 });
+                    e.rm(a, 0, &ops[0])?;
+                    e.imm = le(*v, if size == 1 { 1 } else if size == 2 { 2 } else { 4 });
+                }
+                _ => {
+                    e.op.push(if size == 1 { 0x84 } else { 0x85 });
+                    e.rm(a, rnum(&ops[1])?, &ops[0])?;
+                }
+            }
+            Ok(e)
+        }
+        "mov" => {
+            want(ops, 2)?;
+            let size = if osize(&ops[0]) != 0 { osize(&ops[0]) } else { osize(&ops[1]) };
+            int_size(&mut e, size)?;
+            match (&ops[0], &ops[1]) {
+                (Opnd::Reg(d), Opnd::Imm(v)) => {
+                    if size == 8 && (*v < -2147483648 || *v > 2147483647) {
+                        e.rb = (d.n >> 3) & 1;
+                        e.op.push(0xb8 + (d.n & 7) as u8);
+                        e.imm = le(*v, 8);
+                    } else if size == 8 {
+                        e.op.push(0xc7);
+                        e.rm(a, 0, &ops[0])?;
+                        e.imm = le(*v, 4);
+                    } else {
+                        e.rb = (d.n >> 3) & 1;
+                        if d.rex8 { e.rex = true; }
+                        e.op.push((if size == 1 { 0xb0 } else { 0xb8 }) + (d.n & 7) as u8);
+                        e.imm = le(*v, size as usize);
+                    }
+                }
+                (Opnd::Mem(_), Opnd::Imm(v)) => {
+                    e.op.push(if size == 1 { 0xc6 } else { 0xc7 });
+                    e.rm(a, 0, &ops[0])?;
+                    e.imm = le(*v, if size == 1 { 1 } else if size == 2 { 2 } else { 4 });
+                }
+                (_, Opnd::Reg(s)) => {
+                    e.op.push(if size == 1 { 0x88 } else { 0x89 });
+                    e.rm(a, s.n, &ops[0])?;
+                    if s.rex8 { e.rex = true; }
+                }
+                (Opnd::Reg(d), Opnd::Mem(_)) => {
+                    e.op.push(if size == 1 { 0x8a } else { 0x8b });
+                    e.rm(a, d.n, &ops[1])?;
+                    if d.rex8 { e.rex = true; }
+                }
+                _ => return Err("bad operands".to_string()),
+            }
+            Ok(e)
+        }
+        "movzx" | "movsx" => {
+            want(ops, 2)?;
+            int_size(&mut e, osize(&ops[0]))?;
+            let from = osize(&ops[1]);
+            e.op.push(0x0f);
+            let b: u8 = if op == "movzx" { 0xb6 } else { 0xbe };
+            e.op.push(if from == 1 { b } else if from == 2 { b + 1 } else { return Err("movzx/movsx from a byte or a word".to_string()) });
+            e.rm(a, rnum(&ops[0])?, &ops[1])?;
+            Ok(e)
+        }
+        "lea" => {
+            want(ops, 2)?;
+            int_size(&mut e, osize(&ops[0]))?;
+            e.op.push(0x8d);
+            e.rm(a, rnum(&ops[0])?, &ops[1])?;
+            Ok(e)
+        }
+        "inc" | "dec" | "neg" | "not" | "mul" | "div" => {
+            want(ops, 1)?;
+            let size = osize(&ops[0]);
+            int_size(&mut e, size)?;
+            let (o, k): (u8, u32) = match op { "inc" => (0xff, 0), "dec" => (0xff, 1), "not" => (0xf7, 2), "neg" => (0xf7, 3), "mul" => (0xf7, 4), _ => (0xf7, 6) };
+            e.op.push(if size == 1 { o - 1 } else { o });
+            e.rm(a, k, &ops[0])?;
+            Ok(e)
+        }
+        "shl" | "shr" | "sar" | "rol" | "ror" => {
+            want(ops, 2)?;
+            let size = osize(&ops[0]);
+            int_size(&mut e, size)?;
+            let k: u32 = match op { "rol" => 0, "ror" => 1, "shl" => 4, "shr" => 5, _ => 7 };
+            match &ops[1] {
+                Opnd::Imm(v) => {
+                    e.op.push(if size == 1 { 0xc0 } else { 0xc1 });
+                    e.rm(a, k, &ops[0])?;
+                    e.imm = le(*v, 1);
+                }
+                Opnd::Reg(r) => {
+                    if r.n != 1 || r.size != 1 { return Err("a shift count register is cl".to_string()); }
+                    e.op.push(if size == 1 { 0xd2 } else { 0xd3 });
+                    e.rm(a, k, &ops[0])?;
+                }
+                _ => return Err("bad shift count".to_string()),
+            }
+            Ok(e)
+        }
+        "imul" => {
+            if ops.len() < 2 || ops.len() > 3 { return Err("expected 2 or 3 operands".to_string()); }
+            int_size(&mut e, osize(&ops[0]))?;
+            if ops.len() == 3 {
+                let v = immv(&ops[2])?;
+                e.op.push(if v >= -128 && v <= 127 { 0x6b } else { 0x69 });
+                e.rm(a, rnum(&ops[0])?, &ops[1])?;
+                e.imm = le(v, if v >= -128 && v <= 127 { 1 } else { 4 });
+            } else {
+                e.op.push(0x0f);
+                e.op.push(0xaf);
+                e.rm(a, rnum(&ops[0])?, &ops[1])?;
+            }
+            Ok(e)
+        }
+        "bswap" => {
+            want(ops, 1)?;
+            int_size(&mut e, osize(&ops[0]))?;
+            let n = rnum(&ops[0])?;
+            e.rb = (n >> 3) & 1;
+            e.op.push(0x0f);
+            e.op.push(0xc8 + (n & 7) as u8);
+            Ok(e)
+        }
+        // SSE moves.
+        "movdqu" | "movdqa" | "movups" | "movaps" => {
+            want(ops, 2)?;
+            let (pre, load, store): (u8, u8, u8) = match op { "movdqu" => (0xf3, 0x6f, 0x7f), "movdqa" => (0x66, 0x6f, 0x7f), "movups" => (0, 0x10, 0x11), _ => (0, 0x28, 0x29) };
+            if pre != 0 { e.pre.push(pre); }
+            e.op.push(0x0f);
+            if is_xmm(&ops[0]) {
+                e.op.push(load);
+                e.rm(a, rnum(&ops[0])?, &ops[1])?;
+            } else {
+                e.op.push(store);
+                e.rm(a, rnum(&ops[1])?, &ops[0])?;
+            }
+            Ok(e)
+        }
+        "movq" | "movd" => {
+            want(ops, 2)?;
+            let wide = op == "movq";
+            if is_xmm(&ops[0]) && is_xmm(&ops[1]) {
+                // movq xmm, xmm: F3 0F 7E.
+                e.pre.push(0xf3);
+                e.op.push(0x0f);
+                e.op.push(0x7e);
+                e.rm(a, rnum(&ops[0])?, &ops[1])?;
+                return Ok(e);
+            }
+            if is_xmm(&ops[0]) {
+                if let Opnd::Mem(_) = &ops[1] {
+                    if wide {
+                        e.pre.push(0xf3);
+                        e.op.push(0x0f);
+                        e.op.push(0x7e);
+                        e.rm(a, rnum(&ops[0])?, &ops[1])?;
+                        return Ok(e);
+                    }
+                }
+                e.pre.push(0x66);
+                e.w = wide;
+                e.op.push(0x0f);
+                e.op.push(0x6e);
+                e.rm(a, rnum(&ops[0])?, &ops[1])?;
+                return Ok(e);
+            }
+            if let Opnd::Mem(_) = &ops[0] {
+                if wide {
+                    e.pre.push(0x66);
+                    e.op.push(0x0f);
+                    e.op.push(0xd6);
+                    e.rm(a, rnum(&ops[1])?, &ops[0])?;
+                    return Ok(e);
+                }
+            }
+            e.pre.push(0x66);
+            e.w = wide;
+            e.op.push(0x0f);
+            e.op.push(0x7e);
+            e.rm(a, rnum(&ops[1])?, &ops[0])?;
+            Ok(e)
+        }
+        "pxor" => sse(a, 0x66, &[0x0f, 0xef], ops, false),
+        "por" => sse(a, 0x66, &[0x0f, 0xeb], ops, false),
+        "pand" => sse(a, 0x66, &[0x0f, 0xdb], ops, false),
+        "pandn" => sse(a, 0x66, &[0x0f, 0xdf], ops, false),
+        "paddd" => sse(a, 0x66, &[0x0f, 0xfe], ops, false),
+        "paddq" => sse(a, 0x66, &[0x0f, 0xd4], ops, false),
+        "psubq" => sse(a, 0x66, &[0x0f, 0xfb], ops, false),
+        "pcmpeqb" => sse(a, 0x66, &[0x0f, 0x74], ops, false),
+        "punpcklqdq" => sse(a, 0x66, &[0x0f, 0x6c], ops, false),
+        "punpckhqdq" => sse(a, 0x66, &[0x0f, 0x6d], ops, false),
+        "pshufb" => sse(a, 0x66, &[0x0f, 0x38, 0x00], ops, false),
+        "pshufd" => sse(a, 0x66, &[0x0f, 0x70], ops, true),
+        "palignr" => sse(a, 0x66, &[0x0f, 0x3a, 0x0f], ops, true),
+        "aesenc" => sse(a, 0x66, &[0x0f, 0x38, 0xdc], ops, false),
+        "aesenclast" => sse(a, 0x66, &[0x0f, 0x38, 0xdd], ops, false),
+        "aesdec" => sse(a, 0x66, &[0x0f, 0x38, 0xde], ops, false),
+        "aesdeclast" => sse(a, 0x66, &[0x0f, 0x38, 0xdf], ops, false),
+        "aesimc" => sse(a, 0x66, &[0x0f, 0x38, 0xdb], ops, false),
+        "aeskeygenassist" => sse(a, 0x66, &[0x0f, 0x3a, 0xdf], ops, true),
+        "pclmulqdq" => sse(a, 0x66, &[0x0f, 0x3a, 0x44], ops, true),
+        "shufps" => sse(a, 0, &[0x0f, 0xc6], ops, true),
+        "pslldq" => sse_shift(a, 0x73, 7, ops),
+        "psrldq" => sse_shift(a, 0x73, 3, ops),
+        "psllq" => sse_shift(a, 0x73, 6, ops),
+        "psrlq" => sse_shift(a, 0x73, 2, ops),
+        "pslld" => sse_shift(a, 0x72, 6, ops),
+        "psrld" => sse_shift(a, 0x72, 2, ops),
+        "psrad" => sse_shift(a, 0x72, 4, ops),
+        "pinsrq" | "pinsrd" => {
+            want(ops, 3)?;
+            e.pre.push(0x66);
+            e.w = op == "pinsrq";
+            e.op.extend_from_slice(&[0x0f, 0x3a, 0x22]);
+            e.rm(a, rnum(&ops[0])?, &ops[1])?;
+            e.imm = le(immv(&ops[2])?, 1);
+            Ok(e)
+        }
+        "pextrq" | "pextrd" => {
+            want(ops, 3)?;
+            e.pre.push(0x66);
+            e.w = op == "pextrq";
+            e.op.extend_from_slice(&[0x0f, 0x3a, 0x16]);
+            e.rm(a, rnum(&ops[1])?, &ops[0])?;
+            e.imm = le(immv(&ops[2])?, 1);
+            Ok(e)
+        }
+        _ => Err("unknown instruction".to_string()),
+    }
+}

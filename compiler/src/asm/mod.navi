@@ -1,0 +1,183 @@
+//! The assembler of #[asm] functions (as Go's): a module's
+//! <file>_arm64.s and <file>_amd64.s define its #[asm] fn declarations,
+//! one label each. The syntax is the usual one of each architecture (GNU
+//! for arm64, Intel for amd64), with // comments; labels starting with .
+//! are local to the function above them; .byte, .hword, .word, .quad and
+//! .balign put data (a function's constants follow its code).
+//!
+//! The functions use navi's calling convention (lower.navi): the
+//! arguments are on the stack, 8 bytes each (arm64: at [sp, #8*i] on entry;
+//! amd64: at [rsp + 8 + 8*i]), and the result is written to the address in
+//! the result register (arm64 x8, amd64 r13). They are leaves, as Go's
+//! NOSPLIT functions: no calls, no stack of their own, no allocation, no
+//! GC pointers stored to memory. They must keep arm64's x18-x29, sp and
+//! x30 (to return), and amd64's rbx, rbp, r12, r14 and rsp; every vector
+//! register is free.
+
+pub mod arm64;
+pub mod amd64;
+
+use crate::obj::Reloc;
+
+/// An assembled function: its code and the relocations in it (offsets
+/// from its start).
+pub struct Func {
+    pub name: String,
+    pub code: Vec<u8>,
+    pub relocs: Vec<Reloc>,
+    /// The line of its label.
+    pub line: u32,
+}
+
+/// An error at a line of the source.
+pub struct Error {
+    pub line: u32,
+    pub msg: String,
+}
+
+/// One statement: a label, a directive or an instruction (its mnemonic in
+/// lower case and its operands as written).
+#[derive(Clone)]
+pub struct Stmt {
+    pub line: u32,
+    pub label: String,
+    pub op: String,
+    pub args: Vec<String>,
+}
+
+/// Assembles src (a .s file) for arch ("arm64" or "amd64").
+pub fn assemble(arch: &str, src: &str) -> Result<Vec<Func>, Vec<Error>> {
+    let stmts = match split(src) {
+        Ok(s) => s,
+        Err(e) => {
+            let mut v: Vec<Error> = Vec::new();
+            v.push(e);
+            return Err(v);
+        }
+    };
+    if arch == "arm64" { arm64::assemble(&stmts) } else { amd64::assemble(&stmts) }
+}
+
+// The statements of src: comments removed, labels apart, operands split at
+// the top-level commas.
+fn split(src: &str) -> Result<Vec<Stmt>, Error> {
+    let mut out: Vec<Stmt> = Vec::new();
+    let mut ln = 0u32;
+    for raw in src.lines() {
+        ln += 1;
+        let mut line = match raw.find("//") { Some(i) => &raw[..i], None => raw }.trim();
+        // Labels (several may share a line).
+        loop {
+            let b = line.as_bytes();
+            let mut i = 0;
+            while i < b.len() && (b[i] == b'_' || b[i] == b'.' || b[i].is_ascii_alphanumeric()) { i += 1; }
+            if i > 0 && i < b.len() && b[i] == b':' {
+                out.push(Stmt { line: ln, label: line[..i].to_string(), op: String::new(), args: Vec::new() });
+                line = line[i + 1..].trim();
+                continue;
+            }
+            break;
+        }
+        if line.len() == 0 { continue; }
+        let lb = line.as_bytes();
+        let mut sp = 0;
+        while sp < lb.len() && lb[sp] != b' ' && lb[sp] != b'\t' { sp += 1; }
+        let (op, rest) = (&line[..sp], line[sp..].trim());
+        let mut args: Vec<String> = Vec::new();
+        let mut depth = 0;
+        let mut cur = String::new();
+        for c in rest.chars() {
+            if c == '[' || c == '{' || c == '(' { depth += 1; }
+            if c == ']' || c == '}' || c == ')' { depth -= 1; }
+            if c == ',' && depth == 0 {
+                args.push(cur.trim().to_string());
+                cur = String::new();
+                continue;
+            }
+            cur.push(c);
+        }
+        if cur.trim().len() > 0 { args.push(cur.trim().to_string()); }
+        if depth != 0 { return Err(Error { line: ln, msg: "unbalanced brackets".to_string() }); }
+        out.push(Stmt { line: ln, label: String::new(), op: op.to_lowercase(), args });
+    }
+    Ok(out)
+}
+
+/// Whether a label is local (to the function above it).
+pub fn is_local(label: &str) -> bool { label.starts_with(".") }
+
+/// An integer as written: decimal, 0x hex or 0b binary, maybe negative.
+pub fn int(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (neg, t) = if t.starts_with("-") { (true, &t[1..]) } else { (false, t) };
+    let v = if t.starts_with("0x") || t.starts_with("0X") {
+        radix(&t[2..], 16)?
+    } else if t.starts_with("0b") {
+        radix(&t[2..], 2)?
+    } else {
+        t.replace('_', "").parse::<i64>().ok()?
+    };
+    Some(if neg { 0 - v } else { v })
+}
+
+// Digits in base b (wrapping to 64 bits).
+fn radix(s: &str, b: u64) -> Option<i64> {
+    let mut v = 0u64;
+    let mut any = false;
+    for c in s.chars() {
+        if c == '_' { continue; }
+        let d = match c.to_digit(b as u32) { Some(d) => d as u64, None => return None };
+        v = v.wrapping_mul(b).wrapping_add(d);
+        any = true;
+    }
+    if any { Some(v as i64) } else { None }
+}
+
+/// The bytes of a data directive (.byte, .hword, .word, .quad), or None if
+/// op is not one.
+pub fn data(op: &str, args: &Vec<String>) -> Option<Result<Vec<u8>, String>> {
+    let size = match op {
+        ".byte" => 1,
+        ".hword" | ".short" => 2,
+        ".word" | ".long" => 4,
+        ".quad" => 8,
+        _ => return None,
+    };
+    let mut out: Vec<u8> = Vec::new();
+    for a in args.iter() {
+        let v = match int(a.as_str()) { Some(v) => v, None => return Some(Err(`bad number ${a}`.to_string())) };
+        let mut k = 0;
+        while k < size {
+            out.push((v >> (8 * k)) as u8);
+            k += 1;
+        }
+    }
+    Some(Ok(out))
+}
+
+/// The functions of assembled statements: each non-local label starts one;
+/// local labels are offsets within it. sizes: each statement's size
+/// (labels 0); code: each statement's bytes.
+pub fn functions(stmts: &Vec<Stmt>, code: &Vec<Vec<u8>>, relocs: &Vec<Vec<Reloc>>) -> Result<Vec<Func>, Vec<Error>> {
+    let mut out: Vec<Func> = Vec::new();
+    let mut errs: Vec<Error> = Vec::new();
+    let mut i = 0;
+    while i < stmts.len() {
+        let s = &stmts[i];
+        if s.label.len() > 0 && !is_local(s.label.as_str()) {
+            out.push(Func { name: s.label.clone(), code: Vec::new(), relocs: Vec::new(), line: s.line });
+        } else if s.label.len() == 0 {
+            if out.len() == 0 {
+                errs.push(Error { line: s.line, msg: "code before the first function's label".to_string() });
+            } else {
+                let n = out.len();
+                let f = &mut out[n - 1];
+                let base = f.code.len() as u32;
+                for r in relocs[i].iter() { f.relocs.push(Reloc { sec: r.sec, off: r.off + base, kind: r.kind, sym: r.sym.clone() }); }
+                f.code.extend_from_slice(code[i].as_slice());
+            }
+        }
+        i += 1;
+    }
+    if errs.len() > 0 { Err(errs) } else { Ok(out) }
+}
