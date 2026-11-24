@@ -213,7 +213,7 @@ fn round8(n: i64) -> i64 { (n + 7) & !7 }
 
 fn int_min(size: i64) -> i64 { -1i64 << (size * 8 - 1) as u32 }
 
-// Descriptor kinds (std::reflect::Kind): integers are DK_INT0 + their
+// Descriptor kinds (no reader now; kept so the layout stays): integers are DK_INT0 + their
 // IntKind (i8 i16 i32 i64 isize u8 u16 u32 u64 usize i128 u128).
 const DK_BOOL: u64 = 1;
 const DK_CHAR: u64 = 2;
@@ -941,134 +941,30 @@ impl Gen {
         }
     }
 
-    /// Type descriptors (std::reflect), 12 words each: kind, size, align,
-    /// name (pointer, length), element (or a map's key), array length (or a
-    /// map's value), field or variant count, their table, the enum tag
-    /// (kind | size << 8 | niche variant << 16), flags (1: has pointers,
-    /// 2: a mutable reference or pointer), a map's ReflectMap vtable.
-    /// Fields: name (pointer, length), descriptor, offset. Variants: name
-    /// (pointer, length), discriminant, field count, field table.
+    /// Type descriptors (type_desc::<T>()), 5 words each: kind, size,
+    /// align, name (pointer, length). std::any::type_name reads the name,
+    /// std::unique takes the address for the type.
     fn gen_descs(&mut self) {
         let mut ds: Vec<&mut codegen::Desc> = self.p.desc_list.clone();
         ds.sort_by(|a, b| a.sym.cmp(&b.sym));
         for d in ds.iter() {
             let t = d.ty;
             let l = self.lay.of(t);
-            let mut w: Vec<u64> = Vec::new();
-            let mut i = 0;
-            while i < 12 {
-                w.push(0);
-                i += 1;
-            }
             let name = `${t}`.to_string();
-            w[0] = self.desc_kind(t);
-            w[1] = if l.unsized { 0 } else { l.size as u64 };
-            w[2] = l.align as u64;
-            w[4] = name.len() as u64;
-            if !l.unsized && l.ptrs.len() > 0 { w[10] = 1; }
-            if (t.kind == types::K_REF || t.kind == types::K_PTR) && t.is_mut { w[10] = w[10] | 2; }
-            let mut relocs: Vec<(usize, String)> = Vec::new();
-            relocs.push((3, self.p.str_sym(&name.as_bytes().to_vec())));
-            let parts = self.p.desc_parts(t);
-            let k = t.kind;
-            if k == types::K_REF || k == types::K_PTR || k == types::K_ARRAY || k == types::K_SLICE {
-                relocs.push((5, self.p.descs[&parts[0].id].sym.clone()));
-                if k == types::K_ARRAY { w[6] = t.len as u64; }
-            } else if w[0] == DK_VEC {
-                relocs.push((5, self.p.descs[&parts[0].id].sym.clone()));
-            } else if w[0] == DK_MAP {
-                relocs.push((5, self.p.descs[&parts[0].id].sym.clone()));
-                relocs.push((6, self.p.descs[&parts[1].id].sym.clone()));
-                if let Some(v) = d.map_vt { relocs.push((11, v.sym.clone())); }
-            } else if k == types::K_TUPLE || w[0] == DK_STRUCT {
-                let mut names: Vec<String> = Vec::new();
-                if k == types::K_ADT {
-                    for f in self.p.info.adts[&t.d().id].fields.iter() { names.push(f.name.clone()); }
-                }
-                w[7] = parts.len() as u64;
-                if parts.len() > 0 {
-                    let fs = `${d.sym}_f`.to_string();
-                    self.desc_fields(fs.as_str(), &names, &parts, &l.fields);
-                    relocs.push((8, fs));
-                }
-            } else if w[0] == DK_ENUM {
-                let ai = self.p.info.adts[&t.d().id];
-                w[7] = ai.variants.len() as u64;
-                w[9] = l.tag as u64 | (l.tag_size as u64) << 8 | (l.niche_variant as u64) << 16;
-                // The field tables, then the variant table.
-                let mut vrel: Vec<String> = Vec::new();
-                let mut v = 0;
-                while v < ai.variants.len() {
-                    let vi = ai.variants[v];
-                    let fts = self.lay.field_types(t, v as i64);
-                    let mut names: Vec<String> = Vec::new();
-                    for f in vi.fields.iter() { names.push(f.name.clone()); }
-                    let fs = `${d.sym}_v${v}`.to_string();
-                    let offs = if v < l.variants.len() { l.variants[v].clone() } else { Vec::new() };
-                    if fts.len() > 0 { self.desc_fields(fs.as_str(), &names, &fts, &offs); }
-                    vrel.push(if fts.len() > 0 { fs } else { String::new() });
-                    v += 1;
-                }
-                if ai.variants.len() > 0 {
-                    let vs = `${d.sym}_v`.to_string();
-                    let off = self.o.define(vs.as_str(), obj::DATA_CONST, 8, false);
-                    let mut buf = zeros(40 * ai.variants.len() as i64);
-                    v = 0;
-                    while v < ai.variants.len() {
-                        let vi = ai.variants[v];
-                        put_u64(&mut buf, 40 * v + 8, vi.def.name.len() as u64);
-                        put_u64(&mut buf, 40 * v + 16, vi.discr as u64);
-                        put_u64(&mut buf, 40 * v + 24, vi.fields.len() as u64);
-                        v += 1;
-                    }
-                    self.o.append(obj::DATA_CONST, buf.as_slice());
-                    v = 0;
-                    while v < ai.variants.len() {
-                        let ns = self.p.str_sym(&ai.variants[v].def.name.as_bytes().to_vec());
-                        self.o.reloc(obj::DATA_CONST, (off + 40 * v as u64) as u32, obj::ABS64, ns.as_str());
-                        if vrel[v].len() > 0 { self.o.reloc(obj::DATA_CONST, (off + 40 * v as u64 + 32) as u32, obj::ABS64, vrel[v].as_str()); }
-                        v += 1;
-                    }
-                    relocs.push((8, vs));
-                }
-            }
+            let mut buf = zeros(40);
+            put_u64(&mut buf, 0, self.desc_kind(t));
+            put_u64(&mut buf, 8, if l.unsized { 0 } else { l.size as u64 });
+            put_u64(&mut buf, 16, l.align as u64);
+            put_u64(&mut buf, 32, name.len() as u64);
             let off = self.o.define(d.sym.as_str(), obj::DATA_CONST, 8, false);
-            let mut buf = zeros(96);
-            i = 0;
-            while i < 12 {
-                put_u64(&mut buf, 8 * i, w[i]);
-                i += 1;
-            }
             self.o.append(obj::DATA_CONST, buf.as_slice());
-            for r in relocs.iter() { self.o.reloc(obj::DATA_CONST, (off + 8 * r.0 as u64) as u32, obj::ABS64, r.1.as_str()); }
+            let ns = self.p.str_sym(&name.as_bytes().to_vec());
+            self.o.reloc(obj::DATA_CONST, (off + 24) as u32, obj::ABS64, ns.as_str());
         }
     }
 
-    // A field table: name (pointer, length), descriptor, offset per field
-    // (tuple fields are named 0, 1, ...).
-    fn desc_fields(&mut self, sym: &str, names: &Vec<String>, tys: &Vec<&Type>, offs: &Vec<i64>) {
-        let off = self.o.define(sym, obj::DATA_CONST, 8, false);
-        let mut buf = zeros(32 * tys.len() as i64);
-        let mut fnames: Vec<String> = Vec::new();
-        let mut j = 0;
-        while j < tys.len() {
-            fnames.push(if j < names.len() { names[j].clone() } else { `${j}`.to_string() });
-            put_u64(&mut buf, 32 * j + 8, fnames[j].len() as u64);
-            put_u64(&mut buf, 32 * j + 24, if j < offs.len() { offs[j] as u64 } else { 0 });
-            j += 1;
-        }
-        self.o.append(obj::DATA_CONST, buf.as_slice());
-        j = 0;
-        while j < tys.len() {
-            let ns = self.p.str_sym(&fnames[j].as_bytes().to_vec());
-            self.o.reloc(obj::DATA_CONST, (off + 32 * j as u64) as u32, obj::ABS64, ns.as_str());
-            let ds = self.p.descs[&tys[j].id].sym.clone();
-            self.o.reloc(obj::DATA_CONST, (off + 32 * j as u64 + 16) as u32, obj::ABS64, ds.as_str());
-            j += 1;
-        }
-    }
 
-    // The kind a descriptor records (std::reflect::Kind's numbering).
+    // The kind a descriptor records.
     fn desc_kind(&mut self, t: &Type) -> u64 {
         let k = t.kind;
         if k == types::K_BOOL { return DK_BOOL; }

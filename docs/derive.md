@@ -97,7 +97,7 @@ t.impl_for("::std::clone::Clone", body)
 - **impl 头**：`t.impl_for("::path::Trait", items)`（trait 的路径写成字符串，编译器解析并检查）生成 `impl<...> trait for Self<...> where ...`，类型参数自动加上这个 trait 的约束（同 Rust 的 derive）；`impl_for_with(trait, bounds, items)` 自己给约束。
 - **属性解析**：`#[derive(FromAttrs)]` 描述一个属性的形状（`Option<T>` 是可选的键，`bool` 是标志，其余必填），`f.attrs::<T>("json")` 解析成它；未知的键、缺少的键、类型不对都自动报错，位置在属性上。`FromAttrs` 本身是内置派生。
 - **查看展开结果**：`navi expand <crate> [类型]` 打印派生展开后的代码（格式化后），相当于 `cargo expand`。
-- **测试**：宏可以在普通的 `#[test]` 里调用：`TypeInfo::of::<T>()` 由运行期反射构造，`code.to_string()` 得到格式化后的文本用来比较。
+- **测试**：宏可以在普通的 `#[test]` 里调用：`TypeInfo::of::<T>()` 由编译器内建函数在编译期构造，`code.to_string()` 得到格式化后的文本用来比较。
 
 ## 宏能看到什么：`std::derive`
 
@@ -172,8 +172,9 @@ t.impl_for("::std::clone::Clone", body)
 去掉反射时一起改的：
 
 - `std::reflect`、`HashMap` 的 `ReflectMap`、`Vec` 里给反射用的辅助、`tests/run/reflect.navi` 删除。
-- `std::any::type_name::<T>()` 改成编译器内建函数，直接生成字符串常量。
-- 编译器生成的类型描述去掉字段名、变体名、元素类型这些反射用的信息，只留 GC 需要的大小、对齐和指针位图；二进制会变小，量一下。
+- `std::any::type_name::<T>()` 直接读 `type_desc::<T>()` 描述里的名字。
+- 编译器生成的类型描述从 12 个字减到 5 个（kind、大小、对齐、名字），也不再为各部分的类型（字段、变体、元素、map 的键和值）生成描述；`ReflectMap` 虚表去掉。描述只在用到 `type_name` 或 `std::unique` 的程序里生成，别的程序不受影响。实测：一个对含 `Vec<HashMap<String, (i32, f64)>>` 字段的结构体调用 `type_name` 的程序，1,149,760 → 1,125,312 字节（−2.1%）；编译器本身 13.50 → 13.44 MB。
+- 内置派生给只有一个变体的枚举生成 `PartialEq`、`Ord` 时不再带 `_` 分支（`NAVI_CHECK_STD` 下会报不可达的模式）。
 - `TypeInfo::of::<T>()`（宏的测试用）改成编译器内建函数，在编译期构造。
 - spec 和 `spec/std-diff.md` 里关于反射的部分改掉。
 

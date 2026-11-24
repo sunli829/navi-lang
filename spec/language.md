@@ -512,7 +512,7 @@ let s: String = p.to_string();
    - `assert!` 系列 → `std::panic::{assert, assert_eq, assert_ne}`
    - 以上都在 prelude 里；`format!` 就是模板字符串本身
 8. **GC 语言特有的功能**放在新模块 `std::gc`，比如 `gc::collect()`、弱引用 `gc::Weak<T>`、finalizer。这一版不做
-   - 元编程不用宏，用运行时反射 `std::reflect`（照 Go 的 reflect，不需要标注），`std::json` 建在它上面（见 std-diff 第 6 节）
+   - 元编程用派生（`#[derive(...)]`，见 docs/derive.md），没有运行时反射；序列化照搬 serde（`std::serde`），`std::json`、`std::csv` 建在它上面
 9. **每一处和 Rust 不同的地方**，都在 `spec/std-diff.md` 里列出来
 10. **约束的写法同 Rust std 的习惯**：一个类型参数只有一个约束时写在参数上（`fn max<T: Ord>`、`I: IntoIterator<Item = T>`）；有参数带多个约束（`T: Hash + Eq`），或约束里用到同一条目的另一个类型参数（`A: PartialEq<B>`）时，这个函数或 impl 的约束全部写到 `where` 里，和签名写在同一行：`pub fn assert_eq<A, B>(left: A, right: B) where A: PartialEq<B> + Debug, B: Debug {`
 

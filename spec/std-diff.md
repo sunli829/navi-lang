@@ -65,8 +65,8 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `std::gc` | `collect()`（同 Go 的 `runtime.GC`）、`stats()`、`set_min_heap(bytes)`（M9）、`set_percent(percent)`（同 Go 的 `debug.SetGCPercent`）、`free_os_memory()`（同 Go 的 `debug.FreeOSMemory`）、`set_memory_limit(bytes)`（同 Go 的 `debug.SetMemoryLimit`；环境变量 `NAVI_GC`、`NAVI_MEMLIMIT` 同 `GOGC`、`GOMEMLIMIT`）、`Weak<T>`（同 Go 的 `weak.Pointer`：`new(&T)`、`upgrade()`）、`add_cleanup(&T, fn(A), A) -> Cleanup`（同 Go 的 `runtime.AddCleanup`）|
 | `std::unique` | `Handle<T>`（同 Go 的 `unique` 包：`Handle::new(v)`、`value()`，相等的值同一个句柄；Rust 的 std 没有） |
 | `std::bench::Bencher` | `navi bench` 用（Rust 里是不稳定的 `test::Bencher`）：`iter(f)` |
-| `std::reflect` | 运行时反射，照 Go 的 reflect，不需要标注（navi 没有过程宏）：`type_of::<T>()`、`value_of(&x)`、`value_of_mut(&mut x)`、`Value::new(ty)`；`Type` 能查 kind、名字、大小、字段、变体、元素类型、map 的键和值类型；`Value` 能读写基本类型和字符串，按下标或字段名访问，`push` 到 Vec，切换枚举变体，读写 HashMap。编译器只为程序里实际反射的类型（连同它们各部分的类型）生成描述，不用反射的程序不受影响 |
-| `std::json` | 用反射实现的 JSON，任意类型都能用（Go 的 encoding/json；Rust 里这是 serde_json 这个 crate）：`to_string`、`to_string_pretty`、`from_str`，返回 `Result<_, json::Error>`；结构体、枚举、Option、HashMap 的对应规则和 serde_json 的默认规则相同 |
+| `std::serde` | 照搬 serde 这个 crate（Rust 的 std 没有）：`Serialize`、`Serializer`、`Deserialize`、`Deserializer`、`Visitor`、`SeqAccess`、`MapAccess`、`EnumAccess` 等，签名去掉生命周期；`#[derive(Serialize, Deserialize)]` 是内置派生，`#[serde(...)]` 支持 rename、rename_all、skip、skip_serializing、skip_deserializing、default、skip_serializing_if、deny_unknown_fields；枚举只有默认的外部标记表示（没有 tag、content、untagged） |
+| `std::json` | 照 serde_json 这个 crate：`to_string`、`to_string_pretty`、`to_writer`、`from_str`、`from_reader`，类型要实现 `Serialize` / `Deserialize`（一般用派生），返回 `Result<_, json::Error>`；`json::Value` 表示任意 JSON |
 | `std::any::type_name` | 和 Rust 一样，但名字不带模块路径（`Vec<i32>`，Rust 是 `alloc::vec::Vec<i32>`）；`TypeId`、`Any` 不提供 |
 
 ## 5. M7 补充标准库时新增的偏离
@@ -281,7 +281,7 @@ DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）�
 | 项目 | csv crate | navi | 原因 |
 |---|---|---|---|
 | `Position` 的 `line`、`byte` | 由 csv-core 的状态机得出：`\r\n` 的 `\n` 算在下一条记录的开头，引号字段里的换行不计行数 | 记录第一个字节的偏移和它所在的行 | 照记录的真实位置 |
-| `deserialize`、`serialize` | serde | 通过 `std::reflect`：结构体按表头名对应字段（没有表头时按位置），元组、数组、`Vec` 按位置；`Option` 字段空字符串或解析失败是 `None` | 没有 serde |
+| `deserialize`、`serialize` | serde | 通过 `std::serde`，和 csv crate 相同：结构体按表头名对应字段（没有表头时按位置），元组、数组、`Vec` 按位置；`Option` 字段空字符串是 `None` | 相同 |
 | `headers()` | 返回 `&StringRecord` | 返回 `StringRecord`（拷贝） | 简化 |
 | 写入 | `Writer` drop 时刷新缓冲 | 必须 `flush()` 或 `into_inner()` | 没有 Drop |
 | `write_record` 结束只用 `write_field` 写出的记录 | `write_record(None::<&[u8]>)` | 传一个空迭代器（如空 `Vec`） | 写法差异 |
