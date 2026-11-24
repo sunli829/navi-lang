@@ -26,12 +26,13 @@
 //! AES-GCM, ChaCha20-Poly1305 or (last) AES-CBC with HMAC-SHA1 (Go's
 //! defaults), ECDSA
 //! and RSA certificates (PKCS#1 v1.5 or PSS), the extended master secret;
-//! no renegotiation. Not yet: session resumption, client certificates (an
-//! empty one is sent when asked).
+//! no renegotiation. Client certificates: `TlsConnectorBuilder::identity`
+//! (sent when the server asks). Not yet: session resumption.
 //!
 //! Servers: a `TlsAcceptor` of an `Identity` (a certificate chain and its
 //! key: RSA, ECDSA P-256 or P-384) accepts TLS 1.3 and 1.2 clients the
-//! same way:
+//! same way (`client_auth` asks clients for certificates, as Go's
+//! ClientAuth):
 //!
 //!     let id = Identity::from_pkcs8(&std::fs::read("cert.pem")?, &std::fs::read("key.pem")?)?;
 //!     let acceptor = TlsAcceptor::new(id)?;
@@ -125,9 +126,16 @@ pub struct TlsConnectorBuilder {
     test_hello: Option<(Vec<u8>, Vec<u8>)>,
     test_rand: Option<Vec<u8>>,
     test_suites: Option<Vec<u16>>,
+    identity: Option<Identity>,
 }
 
 impl TlsConnectorBuilder {
+    /// The client certificate (and key) to send when the server asks.
+    pub fn identity(&mut self, identity: Identity) -> &mut TlsConnectorBuilder {
+        self.identity = Some(identity);
+        self
+    }
+
     /// Trusts cert too (as a root).
     pub fn add_root_certificate(&mut self, cert: Certificate) -> &mut TlsConnectorBuilder {
         self.roots.push(cert);
@@ -245,7 +253,7 @@ impl TlsConnector {
     pub fn new() -> Result<TlsConnector, Error> { TlsConnector::builder().build() }
 
     pub fn builder() -> TlsConnectorBuilder {
-        TlsConnectorBuilder { roots: Vec::new(), builtin_roots: true, invalid_certs: false, invalid_hostnames: false, sni: true, alpn: Vec::new(), min: None, max: None, test_hello: None, test_rand: None, test_suites: None }
+        TlsConnectorBuilder { roots: Vec::new(), builtin_roots: true, invalid_certs: false, invalid_hostnames: false, sni: true, alpn: Vec::new(), min: None, max: None, test_hello: None, test_rand: None, test_suites: None, identity: None }
     }
 
     /// Runs the handshake over stream (connected to domain's server) and
@@ -1068,7 +1076,7 @@ fn extensions(b: &[u8]) -> Result<Vec<(usize, Vec<u8>)>, Error> {
     Ok(out)
 }
 
-fn ext_of(exts: &Vec<(usize, Vec<u8>)>, t: usize) -> Option<Vec<u8>> {
+fn ext_of(exts: &[(usize, Vec<u8>)], t: usize) -> Option<Vec<u8>> {
     for e in exts.iter() {
         if e.0 == t { return Some(e.1.clone()); }
     }
@@ -1342,14 +1350,21 @@ impl Handshake {
             if !offered { return Err(Error::new("tls: server selected unadvertised ALPN protocol")); }
             conn.alpn = Some(p);
         }
-        // CertificateRequest (answered with no certificate), Certificate.
+        // CertificateRequest, Certificate.
         let (mut t, mut msg) = conn.read_handshake(s)?;
         let mut cert_requested = false;
         let mut request_context: Vec<u8> = Vec::new();
+        let mut request_schemes: Vec<u16> = Vec::new();
         if t == 13 {
             cert_requested = true;
             let mut cm = Msg::new(&msg[4..]);
             request_context = cm.vec8()?;
+            let rx = extensions(cm.vec16()?.as_slice())?;
+            if cm.left() != 0 { return Err(decode_error()); }
+            if let Some(sa) = ext_of(&rx, 13) {
+                let mut sm = Msg::new(sa.as_slice());
+                request_schemes = u16s(sm.vec16()?.as_slice())?;
+            }
             self.transcript.extend_from_slice(msg.as_slice());
             let (t2, msg2) = conn.read_handshake(s)?;
             t = t2;
@@ -1384,17 +1399,25 @@ impl Handshake {
         if conn.hs_buf.len() != 0 { return Err(Error::new("tls: handshake data after the server's Finished in one record")); }
         let c_ap = suite.derive(master.as_slice(), "c ap traffic", self.transcript.as_slice());
         let s_ap = suite.derive(master.as_slice(), "s ap traffic", self.transcript.as_slice());
-        // The client's flight: an empty Certificate if asked, Finished.
+        // The client's flight: if asked, its Certificate (empty without an
+        // identity the server's schemes fit) and CertificateVerify;
+        // Finished.
         if cert_requested {
-            let mut cm: Vec<u8> = Vec::new();
-            cm.push(request_context.len() as u8);
-            cm.extend_from_slice(request_context.as_slice());
-            push24(&mut cm, 0);
-            let mut full: Vec<u8> = vec_of(&[11]);
-            push24(&mut full, cm.len());
-            full.extend_from_slice(cm.as_slice());
-            conn.write_record(s, HANDSHAKE, full.as_slice()).map_err(io_err)?;
-            self.transcript.extend_from_slice(full.as_slice());
+            let mut chosen: Option<(Identity, u16)> = None;
+            if let Some(id) = &self.c.b.identity {
+                if let Some(sc) = pick_scheme(&id.key, &request_schemes, true) { chosen = Some((id.clone(), sc)); }
+            }
+            let empty: Vec<Certificate> = Vec::new();
+            let certs = match &chosen { Some((id, _)) => id.certs.clone(), None => empty };
+            let cm = certificate_msg(certs.as_slice(), Some(request_context.as_slice()));
+            conn.write_record(s, HANDSHAKE, cm.as_slice()).map_err(io_err)?;
+            self.transcript.extend_from_slice(cm.as_slice());
+            if let Some((id, sc)) = &chosen {
+                let signed = verify_content(false, suite.hash(self.transcript.as_slice()).as_slice());
+                let cv = certificate_verify_msg(*sc, sign_with(&id.key, *sc, signed.as_slice())?.as_slice());
+                conn.write_record(s, HANDSHAKE, cv.as_slice()).map_err(io_err)?;
+                self.transcript.extend_from_slice(cv.as_slice());
+            }
         }
         let c_key = suite.expand_label(c_hs.as_slice(), "finished", &[], suite.hash_len());
         let verify = suite.hmac(c_key.as_slice(), suite.hash(self.transcript.as_slice()).as_slice());
@@ -1408,7 +1431,7 @@ impl Handshake {
         Ok(())
     }
 
-    fn selected_suite(&self, sh: &Vec<u8>) -> Result<u16, Error> {
+    fn selected_suite(&self, sh: &[u8]) -> Result<u16, Error> {
         let mut m = Msg::new(&sh[4..]);
         m.bytes(34)?;
         m.vec8()?;
@@ -1421,7 +1444,7 @@ impl Handshake {
     }
 
     // A HelloRetryRequest's group and cookie.
-    fn retry_request(&self, sh: &Vec<u8>) -> Result<(u16, Option<Vec<u8>>), Error> {
+    fn retry_request(&self, sh: &[u8]) -> Result<(u16, Option<Vec<u8>>), Error> {
         let mut m = Msg::new(&sh[4..]);
         m.bytes(34)?;
         m.vec8()?;
@@ -1446,7 +1469,7 @@ impl Handshake {
     }
 
     // Checks the ServerHello; the shared secret.
-    fn server_hello(&self, sh: &Vec<u8>) -> Result<Vec<u8>, Error> {
+    fn server_hello(&self, sh: &[u8]) -> Result<Vec<u8>, Error> {
         let mut m = Msg::new(&sh[4..]);
         let version = m.u16()?;
         m.bytes(32)?;
@@ -1479,7 +1502,7 @@ impl Handshake {
     }
 
     // The Certificate message's certificates.
-    fn certificates(&self, msg: &Vec<u8>) -> Result<Vec<Certificate>, Error> {
+    fn certificates(&self, msg: &[u8]) -> Result<Vec<Certificate>, Error> {
         let mut m = Msg::new(&msg[4..]);
         let ctx = m.vec8()?;
         if ctx.len() != 0 { return Err(Error::new("tls: received certificate with a request context")); }
@@ -1496,7 +1519,7 @@ impl Handshake {
     }
 
     // The chain's verification (Go's verifyServerCertificate).
-    fn verify_server(&self, certs: &Vec<Certificate>) -> Result<(), Error> {
+    fn verify_server(&self, certs: &[Certificate]) -> Result<(), Error> {
         if self.c.b.invalid_certs { return Ok(()); }
         let mut opts = VerifyOptions::default();
         opts.roots = self.c.roots.clone();
@@ -1531,7 +1554,7 @@ impl Handshake {
 const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
 
 // Whether a ServerHello chose TLS 1.3 (by supported_versions).
-fn is_tls13(sh: &Vec<u8>) -> Result<bool, Error> {
+fn is_tls13(sh: &[u8]) -> Result<bool, Error> {
     let mut m = Msg::new(&sh[4..]);
     m.u16()?;
     m.bytes(32)?;
@@ -1655,8 +1678,8 @@ impl Suite12 {
 }
 
 // The protocol an ALPN extension (from the server) chose, if offered.
-fn alpn_choice(a: &Vec<u8>, offered: &Vec<String>) -> Result<Vec<u8>, Error> {
-    let mut am = Msg::new(a.as_slice());
+fn alpn_choice(a: &[u8], offered: &[String]) -> Result<Vec<u8>, Error> {
+    let mut am = Msg::new(a);
     let mut list = Msg::new(am.vec16()?.as_slice());
     let p = list.vec8()?;
     if list.left() != 0 || am.left() != 0 || p.len() == 0 { return Err(Error::new("tls: server selected invalid ALPN protocol")); }
@@ -1739,8 +1762,22 @@ impl Handshake {
         // CertificateRequest (answered with no certificate), ServerHelloDone.
         let (mut t, mut msg) = conn.read_handshake(s)?;
         let mut cert_requested = false;
+        let mut chosen: Option<(Identity, u16)> = None;
         if t == 13 {
             cert_requested = true;
+            // certificate_types, supported_signature_algorithms,
+            // certificate_authorities.
+            let mut rm = Msg::new(&msg[4..]);
+            let types = rm.vec8()?;
+            let schemes = u16s(rm.vec16()?.as_slice())?;
+            rm.vec16()?;
+            if rm.left() != 0 { return Err(decode_error()); }
+            if let Some(id) = &self.c.b.identity {
+                let kind: u8 = match &id.key { x509::PrivateKey::Rsa(_) => 1, _ => 64 };
+                if types.contains(&kind) {
+                    if let Some(sc) = pick_scheme(&id.key, &schemes, false) { chosen = Some((id.clone(), sc)); }
+                }
+            }
             self.transcript.extend_from_slice(msg.as_slice());
             let (t2, msg2) = conn.read_handshake(s)?;
             t = t2;
@@ -1753,9 +1790,11 @@ impl Handshake {
         let share = self.new_share(group);
         let pms = share.shared(public.as_slice())?;
         if cert_requested {
-            let empty: Vec<u8> = vec_of(&[11, 0, 0, 3, 0, 0, 0]);
-            conn.write_record(s, HANDSHAKE, empty.as_slice()).map_err(io_err)?;
-            self.transcript.extend_from_slice(empty.as_slice());
+            let empty: Vec<Certificate> = Vec::new();
+            let certs = match &chosen { Some((id, _)) => id.certs.clone(), None => empty };
+            let cm = certificate_msg(certs.as_slice(), None);
+            conn.write_record(s, HANDSHAKE, cm.as_slice()).map_err(io_err)?;
+            self.transcript.extend_from_slice(cm.as_slice());
         }
         let mine = share.public();
         let mut cke: Vec<u8> = vec_of(&[16]);
@@ -1771,6 +1810,13 @@ impl Handshake {
             seed.extend_from_slice(server_random.as_slice());
             suite.prf(pms.as_slice(), "master secret", seed.as_slice(), 48)
         };
+        // CertificateVerify: the handshake so far, signed (after the master
+        // secret, whose session hash ends at ClientKeyExchange).
+        if let Some((id, sc)) = &chosen {
+            let cv = certificate_verify_msg(*sc, sign_with(&id.key, *sc, self.transcript.as_slice())?.as_slice());
+            conn.write_record(s, HANDSHAKE, cv.as_slice()).map_err(io_err)?;
+            self.transcript.extend_from_slice(cv.as_slice());
+        }
         let (client_half, server_half) = suite.halves(master.as_slice(), self.random.as_slice(), server_random.as_slice());
         // (Tests: the rest of the randomness is the records' (CBC's IVs).)
         if let Some(t) = &self.rand {
@@ -1909,6 +1955,22 @@ impl Identity {
     pub fn certificates(&self) -> &[Certificate] { self.certs.as_slice() }
 }
 
+/// Whether a server asks clients for certificates and checks them (Go's
+/// ClientAuthType).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientAuth {
+    /// Not asked (the default).
+    NoClientCert,
+    /// Asked; none or any is taken, unchecked.
+    RequestClientCert,
+    /// Required; any is taken, unchecked.
+    RequireAnyClientCert,
+    /// Asked; one sent must verify.
+    VerifyClientCertIfGiven,
+    /// Required and must verify.
+    RequireAndVerifyClientCert,
+}
+
 /// Makes `TlsAcceptor`s.
 #[derive(Clone)]
 pub struct TlsAcceptorBuilder {
@@ -1916,6 +1978,8 @@ pub struct TlsAcceptorBuilder {
     min: Option<Protocol>,
     max: Option<Protocol>,
     alpn: Vec<String>,
+    client_auth: ClientAuth,
+    client_cas: Vec<Certificate>,
 }
 
 impl TlsAcceptorBuilder {
@@ -1934,6 +1998,20 @@ impl TlsAcceptorBuilder {
     /// others is refused.
     pub fn alpn_protocols(&mut self, protocols: &[&str]) -> &mut TlsAcceptorBuilder {
         self.alpn = protocols.iter().map(|p: &&str| -> String { p.to_string() }).collect();
+        self
+    }
+
+    /// Asks clients for certificates (as Go's Config.ClientAuth; native-tls
+    /// has none).
+    pub fn client_auth(&mut self, mode: ClientAuth) -> &mut TlsAcceptorBuilder {
+        self.client_auth = mode;
+        self
+    }
+
+    /// Trusts cert as a root for client certificates (Go's ClientCAs; none
+    /// added: the system's roots).
+    pub fn add_client_ca(&mut self, cert: Certificate) -> &mut TlsAcceptorBuilder {
+        self.client_cas.push(cert);
         self
     }
 
@@ -1963,7 +2041,9 @@ pub struct TlsAcceptor {
 impl TlsAcceptor {
     pub fn new(identity: Identity) -> Result<TlsAcceptor, Error> { TlsAcceptor::builder(identity).build() }
 
-    pub fn builder(identity: Identity) -> TlsAcceptorBuilder { TlsAcceptorBuilder { identity, min: None, max: None, alpn: Vec::new() } }
+    pub fn builder(identity: Identity) -> TlsAcceptorBuilder {
+        TlsAcceptorBuilder { identity, min: None, max: None, alpn: Vec::new(), client_auth: ClientAuth::NoClientCert, client_cas: Vec::new() }
+    }
 
     /// Runs the server's handshake over stream (connected to a client) and
     /// returns the encrypted stream.
@@ -2023,7 +2103,7 @@ fn u16s(b: &[u8]) -> Result<Vec<u16>, Error> {
     Ok(out)
 }
 
-fn parse_client_hello(msg: &Vec<u8>) -> Result<ClientHello, Error> {
+fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, Error> {
     let mut m = Msg::new(&msg[4..]);
     let version = m.u16()?;
     let random = m.bytes(32)?;
@@ -2090,46 +2170,51 @@ fn server_random() -> Vec<u8> { random_bytes(32) }
 impl ServerHandshake {
     fn key(&self) -> &x509::PrivateKey { &self.a.b.identity.key }
 
-    // The signature scheme for the client's list (its preference, as Go)
-    // and the key; TLS 1.3 takes no PKCS#1 v1.5.
-    fn scheme(&self, offered: &Vec<u16>, tls13: bool) -> Result<u16, Error> {
-        let ok: Vec<u16> = match self.key() {
-            x509::PrivateKey::P256(_) => if tls13 { vec_u16(&[0x0403]) } else { vec_u16(&[0x0403, 0x0503]) },
-            x509::PrivateKey::P384(_) => if tls13 { vec_u16(&[0x0503]) } else { vec_u16(&[0x0503, 0x0403]) },
-            x509::PrivateKey::Rsa(_) => if tls13 { vec_u16(&[0x0804, 0x0805, 0x0806]) } else { vec_u16(&[0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]) },
-        };
-        for o in offered.iter() {
-            if ok.contains(o) { return Ok(*o); }
+    fn scheme(&self, offered: &[u16], tls13: bool) -> Result<u16, Error> {
+        match pick_scheme(self.key(), offered, tls13) {
+            Some(x) => Ok(x),
+            None => Err(Error::with_alert("tls: peer doesn't support any of the certificate's signature algorithms", 40)),
         }
-        Err(Error::with_alert("tls: peer doesn't support any of the certificate's signature algorithms", 40))
     }
 
-    // signed's signature under scheme.
-    fn sign(&self, scheme: u16, signed: &[u8]) -> Result<Vec<u8>, Error> {
-        let fail = |_e: crate::crypto::rsa::Error| -> Error { Error::with_alert("tls: signing failed", 80) };
-        match self.key() {
-            x509::PrivateKey::P256(k) => {
-                let h = if scheme == 0x0503 { Sha384::digest(signed) } else { Sha256::digest(signed) };
-                Ok(k.sign_prehash(h.as_slice()).unwrap().to_der())
+    fn sign(&self, scheme: u16, signed: &[u8]) -> Result<Vec<u8>, Error> { sign_with(self.key(), scheme, signed) }
+
+    fn asks_cert(&self) -> bool { self.a.b.client_auth != ClientAuth::NoClientCert }
+
+    // The client's certificates checked as the mode says (Go's
+    // processCertsFromClient); certificate_required is TLS 1.3's alert.
+    fn client_certs(&self, conn: &mut Conn, certs: Vec<Certificate>, tls13: bool) -> Result<(), Error> {
+        let mode = &self.a.b.client_auth;
+        if certs.len() == 0 {
+            if *mode == ClientAuth::RequireAnyClientCert || *mode == ClientAuth::RequireAndVerifyClientCert {
+                return Err(Error::with_alert("tls: client didn't provide a certificate", if tls13 { 116 } else { 42 }));
             }
-            x509::PrivateKey::P384(k) => {
-                let h = if scheme == 0x0403 { Sha256::digest(signed) } else { Sha384::digest(signed) };
-                Ok(k.sign_prehash(h.as_slice()).unwrap().to_der())
+            return Ok(());
+        }
+        if *mode == ClientAuth::VerifyClientCertIfGiven || *mode == ClientAuth::RequireAndVerifyClientCert {
+            let mut opts = VerifyOptions::default();
+            if self.a.b.client_cas.len() > 0 {
+                let mut p = CertPool::new();
+                for c in self.a.b.client_cas.iter() { p.add_cert(c.clone()); }
+                opts.roots = Some(p);
             }
-            x509::PrivateKey::Rsa(k) => {
-                if scheme == 0x0804 { return k.sign(Pss::new::<Sha256>(), Sha256::digest(signed).as_slice()).map_err(fail); }
-                if scheme == 0x0805 { return k.sign(Pss::new::<Sha384>(), Sha384::digest(signed).as_slice()).map_err(fail); }
-                if scheme == 0x0806 { return k.sign(Pss::new::<Sha512>(), Sha512::digest(signed).as_slice()).map_err(fail); }
-                if scheme == 0x0401 { return k.sign(Pkcs1v15Sign::new::<Sha256>(), Sha256::digest(signed).as_slice()).map_err(fail); }
-                if scheme == 0x0501 { return k.sign(Pkcs1v15Sign::new::<Sha384>(), Sha384::digest(signed).as_slice()).map_err(fail); }
-                k.sign(Pkcs1v15Sign::new::<Sha512>(), Sha512::digest(signed).as_slice()).map_err(fail)
+            let mut i = 1;
+            while i < certs.len() {
+                opts.intermediates.add_cert(certs[i].clone());
+                i += 1;
+            }
+            opts.key_usages.push(x509::ExtKeyUsage::ClientAuth);
+            if let Err(e) = certs[0].verify(&opts) {
+                return Err(Error { msg: `tls: failed to verify certificate: ${e}`.to_string(), cert: Some(e), eof: false, alert: 42 });
             }
         }
+        conn.peer_certs = certs;
+        Ok(())
     }
 
     // The protocol for the client's ALPN list (the server's preference);
     // an error when both have lists that do not meet (as Go).
-    fn alpn(&self, offered: &Vec<Vec<u8>>) -> Result<Option<Vec<u8>>, Error> {
+    fn alpn(&self, offered: &[Vec<u8>]) -> Result<Option<Vec<u8>>, Error> {
         if offered.len() == 0 || self.a.b.alpn.len() == 0 { return Ok(None); }
         for p in self.a.b.alpn.iter() {
             for o in offered.iter() {
@@ -2266,29 +2351,25 @@ impl ServerHandshake {
         push16(&mut ee, ee_ext.len());
         ee.extend_from_slice(ee_ext.as_slice());
         self.write_msg(conn, s, ee.as_slice())?;
-        let mut list: Vec<u8> = Vec::new();
-        for c in self.a.b.identity.certs.iter() {
-            push24(&mut list, c.raw().len());
-            list.extend_from_slice(c.raw());
-            push16(&mut list, 0);
+        // CertificateRequest: no context, the schemes accepted.
+        if self.asks_cert() {
+            let mut sa: Vec<u8> = Vec::new();
+            push16(&mut sa, 2 * SIG_SCHEMES.len());
+            for x in SIG_SCHEMES.iter() { push16(&mut sa, *x as usize); }
+            let mut cr: Vec<u8> = vec_of(&[13]);
+            push24(&mut cr, 1 + 2 + 4 + sa.len());
+            cr.push(0);
+            push16(&mut cr, 4 + sa.len());
+            push16(&mut cr, 13);
+            push16(&mut cr, sa.len());
+            cr.extend_from_slice(sa.as_slice());
+            self.write_msg(conn, s, cr.as_slice())?;
         }
-        let mut cm: Vec<u8> = vec_of(&[11]);
-        push24(&mut cm, list.len() + 4);
-        cm.push(0);
-        push24(&mut cm, list.len());
-        cm.extend_from_slice(list.as_slice());
+        let cm = certificate_msg(self.a.b.identity.certs.as_slice(), Some(&[]));
         self.write_msg(conn, s, cm.as_slice())?;
-        let mut signed: Vec<u8> = Vec::new();
-        signed.resize(64, 0x20);
-        signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-        signed.push(0);
-        signed.extend_from_slice(suite.hash(self.transcript.as_slice()).as_slice());
+        let signed = verify_content(true, suite.hash(self.transcript.as_slice()).as_slice());
         let sig = self.sign(scheme, signed.as_slice())?;
-        let mut cv: Vec<u8> = vec_of(&[15]);
-        push24(&mut cv, sig.len() + 4);
-        push16(&mut cv, scheme as usize);
-        push16(&mut cv, sig.len());
-        cv.extend_from_slice(sig.as_slice());
+        let cv = certificate_verify_msg(scheme, sig.as_slice());
         self.write_msg(conn, s, cv.as_slice())?;
         let s_key = suite.expand_label(s_hs.as_slice(), "finished", &[], suite.hash_len());
         let verify = suite.hmac(s_key.as_slice(), suite.hash(self.transcript.as_slice()).as_slice());
@@ -2300,6 +2381,37 @@ impl ServerHandshake {
         let c_ap = suite.derive(master.as_slice(), "c ap traffic", self.transcript.as_slice());
         let s_ap = suite.derive(master.as_slice(), "s ap traffic", self.transcript.as_slice());
         conn.write = suite.half(s_ap.as_slice());
+        // The client's Certificate and CertificateVerify, if asked.
+        if self.asks_cert() {
+            let (t, cm) = conn.read_handshake(s)?;
+            if t != 11 { return Err(Error::with_alert("tls: unexpected message instead of the client's Certificate", 10)); }
+            let mut m = Msg::new(&cm[4..]);
+            if m.vec8()?.len() != 0 { return Err(Error::with_alert("tls: client's Certificate has a context", 47)); }
+            let mut list = Msg::new(m.vec24()?.as_slice());
+            if m.left() != 0 { return Err(decode_error()); }
+            let mut certs: Vec<Certificate> = Vec::new();
+            while list.left() > 0 {
+                let der = list.vec24()?;
+                list.vec16()?;
+                certs.push(Certificate::from_der(der.as_slice()).map_err(|e: x509::Error| -> Error { Error { msg: `tls: failed to parse client certificate: ${e}`.to_string(), cert: Some(e), eof: false, alert: 42 } })?);
+            }
+            self.transcript.extend_from_slice(cm.as_slice());
+            let given = certs.len() > 0;
+            let leaf = if given { Some(certs[0].clone()) } else { None };
+            self.client_certs(conn, certs, true)?;
+            if let Some(leaf) = leaf {
+                let (t, cv) = conn.read_handshake(s)?;
+                if t != 15 { return Err(Error::with_alert("tls: unexpected message instead of the client's CertificateVerify", 10)); }
+                let mut vm = Msg::new(&cv[4..]);
+                let scheme = vm.u16()? as u16;
+                let sig = vm.vec16()?;
+                if vm.left() != 0 { return Err(decode_error()); }
+                if !SIG_SCHEMES.contains(&scheme) { return Err(Error::with_alert("tls: client certificate used with invalid signature algorithm", 47)); }
+                let signed = verify_content(false, suite.hash(self.transcript.as_slice()).as_slice());
+                check_certificate_verify(&leaf, scheme, signed.as_slice(), sig.as_slice())?;
+                self.transcript.extend_from_slice(cv.as_slice());
+            }
+        }
         // The client's Finished.
         let (t, cf) = conn.read_handshake(s)?;
         if t != 20 { return Err(Error::with_alert("tls: unexpected message instead of the client's Finished", 10)); }
@@ -2406,8 +2518,43 @@ impl ServerHandshake {
         push16(&mut ske, sig.len());
         ske.extend_from_slice(sig.as_slice());
         self.write_msg(conn, s, ske.as_slice())?;
+        // CertificateRequest: RSA and ECDSA certificates, the schemes, the
+        // client CAs' names.
+        if self.asks_cert() {
+            let mut cas: Vec<u8> = Vec::new();
+            for c in self.a.b.client_cas.iter() {
+                push16(&mut cas, c.raw_subject().len());
+                cas.extend_from_slice(c.raw_subject());
+            }
+            let mut body: Vec<u8> = vec_of(&[2, 1, 64]);
+            push16(&mut body, 2 * SIG_SCHEMES.len());
+            for x in SIG_SCHEMES.iter() { push16(&mut body, *x as usize); }
+            push16(&mut body, cas.len());
+            body.extend_from_slice(cas.as_slice());
+            let mut cr: Vec<u8> = vec_of(&[13]);
+            push24(&mut cr, body.len());
+            cr.extend_from_slice(body.as_slice());
+            self.write_msg(conn, s, cr.as_slice())?;
+        }
         self.write_msg(conn, s, &[14, 0, 0, 0])?;
         s.flush().map_err(io_err)?;
+        // The client's Certificate, if asked.
+        let mut client_leaf: Option<Certificate> = None;
+        if self.asks_cert() {
+            let (t, cm) = conn.read_handshake(s)?;
+            if t != 11 { return Err(Error::with_alert("tls: unexpected message instead of the client's Certificate", 10)); }
+            let mut m = Msg::new(&cm[4..]);
+            let mut list = Msg::new(m.vec24()?.as_slice());
+            if m.left() != 0 { return Err(decode_error()); }
+            let mut certs: Vec<Certificate> = Vec::new();
+            while list.left() > 0 {
+                let der = list.vec24()?;
+                certs.push(Certificate::from_der(der.as_slice()).map_err(|e: x509::Error| -> Error { Error { msg: `tls: failed to parse client certificate: ${e}`.to_string(), cert: Some(e), eof: false, alert: 42 } })?);
+            }
+            self.transcript.extend_from_slice(cm.as_slice());
+            if certs.len() > 0 { client_leaf = Some(certs[0].clone()); }
+            self.client_certs(conn, certs, false)?;
+        }
         // ClientKeyExchange.
         let (t, cke) = conn.read_handshake(s)?;
         if t != 16 { return Err(Error::with_alert("tls: unexpected message instead of ClientKeyExchange", 10)); }
@@ -2423,6 +2570,17 @@ impl ServerHandshake {
             seed.extend_from_slice(random.as_slice());
             suite.prf(pms.as_slice(), "master secret", seed.as_slice(), 48)
         };
+        // The client's CertificateVerify: the handshake so far, signed.
+        if let Some(leaf) = &client_leaf {
+            let (t, cv) = conn.read_handshake(s)?;
+            if t != 15 { return Err(Error::with_alert("tls: unexpected message instead of the client's CertificateVerify", 10)); }
+            let mut vm = Msg::new(&cv[4..]);
+            let scheme = vm.u16()? as u16;
+            let sig = vm.vec16()?;
+            if vm.left() != 0 { return Err(decode_error()); }
+            check_key_exchange_signature(&leaf.public_key(), scheme, self.transcript.as_slice(), sig.as_slice())?;
+            self.transcript.extend_from_slice(cv.as_slice());
+        }
         let (client_half, server_half) = suite.halves(master.as_slice(), ch.random.as_slice(), random.as_slice());
         conn.pending_read = Some(client_half);
         // The client's change_cipher_spec and Finished.
@@ -2446,6 +2604,85 @@ impl ServerHandshake {
 
 fn vec_u16(v: &[u16]) -> Vec<u16> { v.to_vec() }
 
+// The signature scheme for the peer's list (its preference, as Go) and
+// the key; TLS 1.3 takes no PKCS#1 v1.5.
+fn pick_scheme(key: &x509::PrivateKey, offered: &[u16], tls13: bool) -> Option<u16> {
+    let ok: Vec<u16> = match key {
+        x509::PrivateKey::P256(_) => if tls13 { vec_u16(&[0x0403]) } else { vec_u16(&[0x0403, 0x0503]) },
+        x509::PrivateKey::P384(_) => if tls13 { vec_u16(&[0x0503]) } else { vec_u16(&[0x0503, 0x0403]) },
+        x509::PrivateKey::Rsa(_) => if tls13 { vec_u16(&[0x0804, 0x0805, 0x0806]) } else { vec_u16(&[0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]) },
+    };
+    for o in offered.iter() {
+        if ok.contains(o) { return Some(*o); }
+    }
+    None
+}
+
+// signed's signature by key under scheme.
+fn sign_with(key: &x509::PrivateKey, scheme: u16, signed: &[u8]) -> Result<Vec<u8>, Error> {
+    let fail = |_e: crate::crypto::rsa::Error| -> Error { Error::with_alert("tls: signing failed", 80) };
+    match key {
+        x509::PrivateKey::P256(k) => {
+            let h = if scheme == 0x0503 { Sha384::digest(signed) } else { Sha256::digest(signed) };
+            Ok(k.sign_prehash(h.as_slice()).unwrap().to_der())
+        }
+        x509::PrivateKey::P384(k) => {
+            let h = if scheme == 0x0403 { Sha256::digest(signed) } else { Sha384::digest(signed) };
+            Ok(k.sign_prehash(h.as_slice()).unwrap().to_der())
+        }
+        x509::PrivateKey::Rsa(k) => {
+            if scheme == 0x0804 { return k.sign(Pss::new::<Sha256>(), Sha256::digest(signed).as_slice()).map_err(fail); }
+            if scheme == 0x0805 { return k.sign(Pss::new::<Sha384>(), Sha384::digest(signed).as_slice()).map_err(fail); }
+            if scheme == 0x0806 { return k.sign(Pss::new::<Sha512>(), Sha512::digest(signed).as_slice()).map_err(fail); }
+            if scheme == 0x0401 { return k.sign(Pkcs1v15Sign::new::<Sha256>(), Sha256::digest(signed).as_slice()).map_err(fail); }
+            if scheme == 0x0501 { return k.sign(Pkcs1v15Sign::new::<Sha384>(), Sha384::digest(signed).as_slice()).map_err(fail); }
+            k.sign(Pkcs1v15Sign::new::<Sha512>(), Sha512::digest(signed).as_slice()).map_err(fail)
+        }
+    }
+}
+
+// A Certificate message: TLS 1.3's (a context, extensions per
+// certificate) or 1.2's.
+fn certificate_msg(certs: &[Certificate], context: Option<&[u8]>) -> Vec<u8> {
+    let mut list: Vec<u8> = Vec::new();
+    for c in certs.iter() {
+        push24(&mut list, c.raw().len());
+        list.extend_from_slice(c.raw());
+        if context.is_some() { push16(&mut list, 0); }
+    }
+    let mut body: Vec<u8> = Vec::new();
+    if let Some(ctx) = context {
+        body.push(ctx.len() as u8);
+        body.extend_from_slice(ctx);
+    }
+    push24(&mut body, list.len());
+    body.extend_from_slice(list.as_slice());
+    let mut m: Vec<u8> = vec_of(&[11]);
+    push24(&mut m, body.len());
+    m.extend_from_slice(body.as_slice());
+    m
+}
+
+// A CertificateVerify message.
+fn certificate_verify_msg(scheme: u16, sig: &[u8]) -> Vec<u8> {
+    let mut m: Vec<u8> = vec_of(&[15]);
+    push24(&mut m, sig.len() + 4);
+    push16(&mut m, scheme as usize);
+    push16(&mut m, sig.len());
+    m.extend_from_slice(sig);
+    m
+}
+
+// The content TLS 1.3's CertificateVerify signs (RFC 8446 4.4.3).
+fn verify_content(server: bool, transcript_hash: &[u8]) -> Vec<u8> {
+    let mut signed: Vec<u8> = Vec::new();
+    signed.resize(64, 0x20);
+    signed.extend_from_slice(if server { b"TLS 1.3, server CertificateVerify" } else { b"TLS 1.3, client CertificateVerify" });
+    signed.push(0);
+    signed.extend_from_slice(transcript_hash);
+    signed
+}
+
 // A server's key share for group.
 fn new_server_share(group: u16) -> KeyShare {
     loop {
@@ -2455,11 +2692,11 @@ fn new_server_share(group: u16) -> KeyShare {
 }
 
 // A ServerHello message (or HelloRetryRequest).
-fn server_hello_msg(random: &[u8], session_id: &Vec<u8>, suite: u16, ext: &[u8]) -> Vec<u8> {
+fn server_hello_msg(random: &[u8], session_id: &[u8], suite: u16, ext: &[u8]) -> Vec<u8> {
     let mut b: Vec<u8> = vec_of(&[3, 3]);
     b.extend_from_slice(random);
     b.push(session_id.len() as u8);
-    b.extend_from_slice(session_id.as_slice());
+    b.extend_from_slice(session_id);
     push16(&mut b, suite as usize);
     b.push(0);
     push16(&mut b, ext.len());

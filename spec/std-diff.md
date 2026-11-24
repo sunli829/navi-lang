@@ -189,7 +189,8 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | `connect` | 返回 `Result<TlsStream<S>, HandshakeError<S>>`（可能 `WouldBlock`） | 返回 `Result<TlsStream<S>, Error>`；流都是阻塞的 | 没有非阻塞流 |
 | `Certificate` | `native_tls::Certificate` | 就是 `crypto::x509::Certificate` | 不需要两个类型 |
 | `Identity`、`TlsAcceptor` | `Identity::from_pkcs8`、`from_pkcs12` | `Identity::from_pkcs8`（私钥也可以是 PKCS#1、SEC 1 的 PEM）、`from_parts`；没有 PKCS#12；`TlsAcceptorBuilder::alpn_protocols` 是新增的（同 Go 的 NextProtos） | 不需要 PKCS#12 |
-| 客户端证书、会话恢复、0-RTT | 有 | 没有；服务器要求客户端证书时发空的 | 暂不需要 |
+| 客户端证书 | `TlsConnectorBuilder::identity`；服务端没有 | 客户端同 native-tls；服务端照 Go：`TlsAcceptorBuilder::client_auth(ClientAuth::…)`（Go 的五种 ClientAuthType）和 `add_client_ca`，`TlsStream::peer_certificate` 取客户端证书 | native-tls 服务端不支持 |
+| 会话恢复、0-RTT | 有 | 没有 | 暂不需要 |
 | 没有 close_notify 就断开 | 视实现而定 | 记录边界上的断开当作数据结束（同 Go） | 很多服务器这样关连接 |
 
 ### std::regex（regex crate）

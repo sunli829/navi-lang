@@ -1,12 +1,13 @@
 // std::tls servers: TlsAcceptor with certificates and keys made by Go
 // 1.26 (P-256 in PKCS#8, P-384 in SEC 1, RSA in PKCS#1), std::tls clients
 // over localhost: TLS 1.3, TLS 1.2 with each suite (AES-GCM, ChaCha20,
-// AES-CBC), ALPN, SNI, version limits; and std::http over https. (Go's
+// AES-CBC), ALPN, SNI, version limits, client certificates in each
+// ClientAuth mode; and std::http over https. (Go's
 // clients were checked against these servers by hand: /tmp/goref10.)
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::tls::{Certificate, Identity, Protocol, TlsAcceptor, TlsConnector};
+use std::tls::{Certificate, ClientAuth, Identity, Protocol, TlsAcceptor, TlsConnector};
 use std::http;
 
 fn identity(cert: &str, key: &str) -> Identity { Identity::from_pkcs8(cert.as_bytes(), key.as_bytes()).unwrap() }
@@ -36,7 +37,8 @@ fn server(acceptor: TlsAcceptor) -> u16 {
                 }
                 let n = String::from_utf8_lossy(line.as_slice()).parse::<usize>().unwrap_or(0);
                 let alpn = match tls.negotiated_alpn().unwrap() { Some(p) => String::from_utf8_lossy(p.as_slice()), None => "-".to_string() };
-                let head = `${tls.server_name().unwrap_or("-")} ${alpn}\n`.to_string();
+                let peer = match tls.peer_certificate().unwrap() { Some(c) => c.subject().common_name().to_string(), None => "-".to_string() };
+                let head = `${tls.server_name().unwrap_or("-")} ${alpn} ${peer}\n`.to_string();
                 tls.write_all(head.as_bytes()).unwrap();
                 let mut data: Vec<u8> = Vec::new();
                 let mut i = 0;
@@ -62,9 +64,11 @@ fn fetch(b: &mut std::tls::TlsConnectorBuilder, port: u16, host: &str, n: usize)
         Ok(t) => t,
         Err(e) => return Err(e.to_string()),
     };
-    tls.write_all(`${n}\n`.to_string().as_bytes()).unwrap();
+    if let Err(e) = tls.write_all(`${n}\n`.to_string().as_bytes()) { return Err(e.to_string()); }
     let mut out: Vec<u8> = Vec::new();
-    tls.read_to_end(&mut out).unwrap();
+    // (TLS 1.3: a server's refusal of the client certificate comes after
+    // the client's handshake.)
+    if let Err(e) = tls.read_to_end(&mut out) { return Err(e.to_string()); }
     let text_end = out.iter().position(|b: &u8| -> bool { *b == b'\n' }).unwrap();
     let head = String::from_utf8_lossy(&out[..text_end]);
     let data = &out[text_end + 1..];
@@ -86,17 +90,17 @@ fn versions_and_suites() {
         for suite in [0x1301u16, 0x1302, 0x1303].iter() {
             let mut b = TlsConnector::builder();
             b.min_protocol_version(Some(Protocol::Tlsv13)).test_cipher_suites(&[*suite]);
-            assert_eq(fetch(&mut b, port, "localhost", 40000).unwrap(), "localhost -".to_string());
+            assert_eq(fetch(&mut b, port, "localhost", 40000).unwrap(), "localhost - -".to_string());
         }
         // TLS 1.2, each suite of the key's kind.
         let suites: [u16; 5] = if *ecdsa { [0xc02b, 0xc02c, 0xcca9, 0xc009, 0xc00a] } else { [0xc02f, 0xc030, 0xcca8, 0xc013, 0xc014] };
         for suite in suites.iter() {
             let mut b = TlsConnector::builder();
             b.max_protocol_version(Some(Protocol::Tlsv12)).test_cipher_suites(&[*suite]);
-            assert_eq(fetch(&mut b, port, "localhost", 40000).unwrap(), "localhost -".to_string());
+            assert_eq(fetch(&mut b, port, "localhost", 40000).unwrap(), "localhost - -".to_string());
         }
         // By IP address: no SNI.
-        assert_eq(fetch(&mut TlsConnector::builder(), port, "127.0.0.1", 10).unwrap(), "- -".to_string());
+        assert_eq(fetch(&mut TlsConnector::builder(), port, "127.0.0.1", 10).unwrap(), "- - -".to_string());
         // Another name.
         assert(fetch(&mut TlsConnector::builder(), port, "example.com", 10).unwrap_err().contains("not example.com"));
     }
@@ -110,10 +114,10 @@ fn alpn_and_limits() {
     let mut b = TlsConnector::builder();
     b.request_alpns(&["http/1.1", "h2"]);
     // (The server's preference.)
-    assert_eq(fetch(&mut b, port, "localhost", 10).unwrap(), "localhost h2".to_string());
+    assert_eq(fetch(&mut b, port, "localhost", 10).unwrap(), "localhost h2 -".to_string());
     let mut b12 = TlsConnector::builder();
     b12.request_alpns(&["http/1.1"]).max_protocol_version(Some(Protocol::Tlsv12));
-    assert_eq(fetch(&mut b12, port, "localhost", 10).unwrap(), "localhost http/1.1".to_string());
+    assert_eq(fetch(&mut b12, port, "localhost", 10).unwrap(), "localhost http/1.1 -".to_string());
     // No protocol in common: refused.
     let mut bx = TlsConnector::builder();
     bx.request_alpns(&["spdy/3"]);
@@ -122,12 +126,59 @@ fn alpn_and_limits() {
     let mut a12 = TlsAcceptor::builder(identity(RSA_PEM, RSA_KEY));
     a12.max_protocol_version(Some(Protocol::Tlsv12));
     let p12 = server(a12.build().unwrap());
-    assert_eq(fetch(&mut TlsConnector::builder(), p12, "localhost", 10).unwrap(), "localhost -".to_string());
+    assert_eq(fetch(&mut TlsConnector::builder(), p12, "localhost", 10).unwrap(), "localhost - -".to_string());
     let mut c13 = TlsConnector::builder();
     c13.min_protocol_version(Some(Protocol::Tlsv13));
     assert(fetch(&mut c13, p12, "localhost", 10).is_err());
     // A key that is not the certificate's.
     assert(Identity::from_pkcs8(EC256_PEM.as_bytes(), EC384_KEY.as_bytes()).is_err());
+}
+
+#[test]
+fn client_certificates() {
+    let ec = identity(CLIENT_EC_PEM, CLIENT_EC_KEY);
+    let rsa = identity(CLIENT_RSA_PEM, CLIENT_RSA_KEY);
+    let ca = Certificate::from_pem(CLIENT_ROOT.as_bytes()).unwrap();
+    let acceptor = |mode: ClientAuth| -> TlsAcceptor {
+        let mut b = TlsAcceptor::builder(identity(EC256_PEM, EC256_KEY));
+        b.client_auth(mode).add_client_ca(ca.clone());
+        b.build().unwrap()
+    };
+    let verify = server(acceptor(ClientAuth::RequireAndVerifyClientCert));
+    for v12 in [false, true].iter() {
+        for (id, cn) in [(ec.clone(), "client_ec"), (rsa.clone(), "client_rsa")].iter() {
+            let mut b = TlsConnector::builder();
+            b.identity(id.clone());
+            if *v12 { b.max_protocol_version(Some(Protocol::Tlsv12)); }
+            assert_eq(fetch(&mut b, verify, "localhost", 1000).unwrap(), `localhost - ${cn}`.to_string());
+        }
+        // None: refused.
+        let mut none = TlsConnector::builder();
+        if *v12 { none.max_protocol_version(Some(Protocol::Tlsv12)); }
+        assert(fetch(&mut none, verify, "localhost", 10).is_err());
+        // One the client CAs did not issue (a server certificate).
+        let mut other = TlsConnector::builder();
+        other.identity(identity(EC384_PEM, EC384_KEY));
+        if *v12 { other.max_protocol_version(Some(Protocol::Tlsv12)); }
+        assert(fetch(&mut other, verify, "localhost", 10).is_err());
+    }
+    // Asked but optional: none is fine, one sent is checked (and named).
+    let request = server(acceptor(ClientAuth::RequestClientCert));
+    assert_eq(fetch(&mut TlsConnector::builder(), request, "localhost", 10).unwrap(), "localhost - -".to_string());
+    let if_given = server(acceptor(ClientAuth::VerifyClientCertIfGiven));
+    assert_eq(fetch(&mut TlsConnector::builder(), if_given, "localhost", 10).unwrap(), "localhost - -".to_string());
+    let mut with = TlsConnector::builder();
+    with.identity(rsa.clone());
+    assert_eq(fetch(&mut with, if_given, "localhost", 10).unwrap(), "localhost - client_rsa".to_string());
+    let mut bad = TlsConnector::builder();
+    bad.identity(identity(EC384_PEM, EC384_KEY));
+    assert(fetch(&mut bad, if_given, "localhost", 10).is_err());
+    // Required, any: an unverifiable one is taken.
+    let any = server(acceptor(ClientAuth::RequireAnyClientCert));
+    let mut b2 = TlsConnector::builder();
+    b2.identity(identity(EC384_PEM, EC384_KEY));
+    assert_eq(fetch(&mut b2, any, "localhost", 10).unwrap(), "localhost - localhost".to_string());
+    assert(fetch(&mut TlsConnector::builder(), any, "localhost", 10).is_err());
 }
 
 #[test]
@@ -239,4 +290,76 @@ GqHD2wKBgQDD8kBY+UlLpAF0nZyO+90FgeHzBg51jqcz935MILaDf5XB+74QQhkP
 yiugziWMloTGJ40BobCPyfSlEoCA4WI/cDTWSB0s2xVRX6QnGzAYhBsblzAoJUOc
 3fIP7cljWkFxAuOyzAC58GEDdGZKgOmtbv9y1W/7IXs9RJo/SuRkmw==
 -----END RSA PRIVATE KEY-----";
+
+const CLIENT_ROOT: &str = "-----BEGIN CERTIFICATE-----
+MIIBaTCCAQ+gAwIBAgIBCjAKBggqhkjOPQQDAjAbMRkwFwYDVQQDExBuYXZpIGNs
+aWVudCByb290MCAXDTI2MTEyNDE1NTE0OVoYDzIxMjYxMDMxMTY1MTQ5WjAbMRkw
+FwYDVQQDExBuYXZpIGNsaWVudCByb290MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD
+QgAEE7IwYLou78lzpiCtaj7ry+/rg2XwHofnyf7+QWvPC9qv+3Npk58mqJFJ2NiU
+WEr6av89ktDcFcbSQb9fZ5gZZ6NCMEAwDgYDVR0PAQH/BAQDAgIEMA8GA1UdEwEB
+/wQFMAMBAf8wHQYDVR0OBBYEFF+IOtrSDk4QqdK+LEDv9FF7U6pRMAoGCCqGSM49
+BAMCA0gAMEUCIQDEEgPQBp3iOMkuR/iteUAx/GdxjnlDBhqX1y0FpGofxgIgbo8o
+yTdN06HMRTwKXG+NHfFf4HHdRcodlM+pK5slMro=
+-----END CERTIFICATE-----";
+
+const CLIENT_EC_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBWDCB/qADAgECAgELMAoGCCqGSM49BAMCMBsxGTAXBgNVBAMTEG5hdmkgY2xp
+ZW50IHJvb3QwIBcNMjYxMTI0MTU1MTQ5WhgPMjEyNjEwMzExNjUxNDlaMBQxEjAQ
+BgNVBAMMCWNsaWVudF9lYzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABLbKK6yP
+nTEN96+Ld1cVJnm0o2gL3+QlUmWSY6SfE5RpMEOx2t3bCw60q2aRfQWUVUOsYhAK
+Qg7Y4CtUV7E0go+jODA2MBMGA1UdJQQMMAoGCCsGAQUFBwMCMB8GA1UdIwQYMBaA
+FF+IOtrSDk4QqdK+LEDv9FF7U6pRMAoGCCqGSM49BAMCA0kAMEYCIQCWXnyJC9wn
+tsoqElkK1VdLuMGmoNdD1o37ppO+/L31tQIhAJD5ZAhK8WtKOEkvsygkN0yJs+F1
+O9AeV0sECzuu8eEs
+-----END CERTIFICATE-----";
+
+const CLIENT_EC_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgasJSZbk53/6piZ9E
+2p6+/9mavm1U5cj4oZN6wK2jYqihRANCAAS2yiusj50xDfevi3dXFSZ5tKNoC9/k
+JVJlkmOknxOUaTBDsdrd2wsOtKtmkX0FlFVDrGIQCkIO2OArVFexNIKP
+-----END PRIVATE KEY-----";
+
+const CLIENT_RSA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIICJTCCAcqgAwIBAgIBDDAKBggqhkjOPQQDAjAbMRkwFwYDVQQDExBuYXZpIGNs
+aWVudCByb290MCAXDTI2MTEyNDE1NTE0OVoYDzIxMjYxMDMxMTY1MTQ5WjAVMRMw
+EQYDVQQDDApjbGllbnRfcnNhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
+AQEAwSr+KmL2CcHHcWbUzQmlr48dF6dRH7JrxkaWxNfzyxF+db5h77mzfgASCAF4
+juLQlWU4c0FXlzJdPXZkSoe3Y0s4PrR0YZQvgl4DOZEWtty6dfAS6hh0/1dvuURL
+8fd9TErvGOT76T96PbU/kQGtRphWd93a5vcD93q5Og17ihQ2f6/A5DA9vx6vRgbZ
+kBMO9ZeeFBtmEsnHuBerCQSOE+yGG1atyqO1Rr4z2xlqFNmHz++lmIxgDUKLDfZP
+cUHQET0NqfHtXX1cbes1qtoaBCTuwaVUJInAYK6oIPfd8eUVf13rPxBylf0Cpz93
+9Q6E3ny3WgRJ+wfhGTbLocv/XQIDAQABozgwNjATBgNVHSUEDDAKBggrBgEFBQcD
+AjAfBgNVHSMEGDAWgBRfiDra0g5OEKnSvixA7/RRe1OqUTAKBggqhkjOPQQDAgNJ
+ADBGAiEArBhkXHbVUxbiWIskioB5Cwbr1aGCHcKcxd29CydWJbgCIQCA4h2LPB5+
+0Fm7Geo1GUP4UgLxxnKs+wf6AKenUoBcAQ==
+-----END CERTIFICATE-----";
+
+const CLIENT_RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDBKv4qYvYJwcdx
+ZtTNCaWvjx0Xp1EfsmvGRpbE1/PLEX51vmHvubN+ABIIAXiO4tCVZThzQVeXMl09
+dmRKh7djSzg+tHRhlC+CXgM5kRa23Lp18BLqGHT/V2+5REvx931MSu8Y5PvpP3o9
+tT+RAa1GmFZ33drm9wP3erk6DXuKFDZ/r8DkMD2/Hq9GBtmQEw71l54UG2YSyce4
+F6sJBI4T7IYbVq3Ko7VGvjPbGWoU2YfP76WYjGANQosN9k9xQdARPQ2p8e1dfVxt
+6zWq2hoEJO7BpVQkicBgrqgg993x5RV/Xes/EHKV/QKnP3f1DoTefLdaBEn7B+EZ
+Nsuhy/9dAgMBAAECggEAJWH3nCZYrRy2R0j6R8/lI6uTmr9DoNm7p7yDcwbD5Hm3
+OnwkoesTRIAo/SmjtitI6JCVMyDjHZyelMVztUS8hdfJw8DSgQvXgehFwX9FoQ/o
+eeiDEJC5G61FLtp7xBD8S6Z4zR2LbuFc+9I2wg5MBUx392yU73vAZcV3UTfIv7jB
+DI1xjCU3lbsRVyyZnwpJs8tpryYS85cFSVfuXZScDC2Cplg6OgvKRGd0llRe2I8P
+c/c9bwkDo+esJk9FO8NSclq4EKBjVQK5mJ5Ia5VtciJf7FpYIyMktL3NiwRluK/F
+z85ZrrCVZEpYzSZikST/Gqo3zVHnH7C8R6u9jSyBIQKBgQD5VaUtCcuGIsEpPrGV
+j9NeCRNRoWUSiHdV+kJw4s0qrRxGIMlmXg7RP4SCgndmQfmDgiuLVpZZQgk4AEsj
+Gr0V2aHe1WlQ4wU73Jh8KDlHIhS+O72teRMy3BAak/2bqmn25RaqpaTRY3vZbJ7z
+6kLWhnBGLR49pDOoY32y63B8ZQKBgQDGVPa78qPHb76Rtej1sT+dleHx7fGGg1GP
+BZrHWYaetT06wPz37pwcR0vrZrPLP31f+zKLSQlpA2QdTWxJmtTvtnE1/R2S3M6V
+2lU6DD/L2PayAxqbZajQvBikqmM5PCCU/kThgmJxr34CqqWwUPc78e3AkgI8q0il
+dKsA1fcbmQKBgFaksm+CNd14+lLQ3Hkyr6q/0JzPTwYvsfiIrMn5pn4sBeVAw3v1
+N4TzY6LOn5tDVeejNmqHPlvqHLX/NB0Qz6BmLl/3HU/kdA8nSz3p5G2ZpEevDuzX
+ZBqKanYx8zFC+Ou5FDVctnek8IbPvjTYtT1DHoTkbNvS0bi0ShwAwOgZAoGAZ1yi
+ViNHXcoL7E58wYcFm3AgmAAk7rCDkeEe4CP1N8NGzNcFP4VYUJiLpXwZ2aQWCC6X
+EeYXhGYjB+5wsA+ESAWyDKwEfKSc+ZYW8rCtkuRY9T8O38vkZhyRT0gJfCus41l8
+tnZILe2C44rh3PjlUJVuDf1KMyolKy2ZbU8VgIkCgYEA3Jjb1voHKTe9cp+tBXsA
+WV0hnO2V19aPCGBX80toEADjhBnf8j3shi+b/mlER4i6AhtDtmjH5ajaTzLq9pJB
+OqikbANcwsbLGmZQQn5+9hY8ITEYa+KUdJUQmIGPeMToFujjav5d4EFZdD9kkwJm
+wUHdXAU6EUiN8DpXC2XhKG4=
+-----END PRIVATE KEY-----";
 
