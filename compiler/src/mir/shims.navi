@@ -1,6 +1,6 @@
 //! Shims: MIR bodies the compiler generates for builtin impls (lang traits
-//! on primitive and structural types) and #[derive] impls, for one concrete
-//! self type.
+//! on primitive and structural types), for one concrete self type.
+//! (#[derive] impls are source: crate::derive.)
 
 use std::collections::HashMap;
 use crate::resolve::{self, Def};
@@ -13,7 +13,7 @@ use crate::mir::build::*;
 use crate::mir::expr::{variant_index, zero_const};
 use crate::mir::boxing::box_address_taken;
 
-/// Whether method of a builtin/derived impl of trait is implemented by a
+/// Whether method of a builtin impl of trait is implemented by a
 /// shim (rather than the trait's default body).
 pub fn uses_shim(trait_name: &str, method: &str) -> bool {
     match trait_name {
@@ -167,11 +167,6 @@ impl Sb {
         let ret = local_place(0);
         let a1 = local_place(1);
         let a2 = local_place(2);
-        let derived = self_ty.kind == types::K_ADT && self.p.info.derives_of(self_ty.d()).contains_key(&trait_name.to_string());
-        if derived {
-            self.derived(trait_name, self_ty, targs);
-            return;
-        }
         let t = trait_name;
         let unit = const_op(cnst(C_UNIT, Some(self.ctx.unit)));
         match t {
@@ -827,252 +822,6 @@ impl Sb {
         }
     }
 
-    // --- Derived impls ---------------------------------------------------------------
-
-    /// The arms of a walk over the variants of the value at p (one arm with
-    /// variant -1 in the current block for structs), and the join block.
-    fn variant_arms(&mut self, self_ty: &Type, p: Place) -> (Vec<VariantArm>, Option<usize>) {
-        let ai = self.p.info.adts[&self_ty.d().id];
-        let mut arms = Vec::new();
-        if !ai.is_enum {
-            let fts = self.lay.field_types(self_ty, -1);
-            arms.push(VariantArm { v: -1, fp: p, fts, block: self.cur });
-            return (arms, None);
-        }
-        let end = self.block();
-        let isize_ = self.ctx.int(types::ISIZE);
-        let d = self.local(isize_);
-        self.assign(d.clone(), Rvalue::Discr(p.clone()));
-        let mut vals = Vec::new();
-        let mut targets = Vec::new();
-        let mut i = 0;
-        while i < ai.variants.len() {
-            vals.push(i as i64);
-            targets.push(self.block());
-            i += 1;
-        }
-        let unreach = self.block();
-        self.term(Term::Switch { x: copy(d), ty: isize_, vals, targets: targets.clone(), els: unreach });
-        self.cur = unreach;
-        self.term(Term::Unreachable);
-        i = 0;
-        while i < ai.variants.len() {
-            arms.push(VariantArm { v: i as i64, fp: p.downcast(i), fts: Vec::new(), block: targets[i] });
-            i += 1;
-        }
-        (arms, Some(end))
-    }
-
-    /// Starts an arm (computing its field types, as the Go walk does when it
-    /// reaches the variant).
-    fn arm_start(&mut self, self_ty: &Type, arm: &mut VariantArm) {
-        self.cur = arm.block;
-        if arm.v >= 0 { arm.fts = self.lay.field_types(self_ty, arm.v); }
-    }
-
-    fn arm_end(&mut self, end: Option<usize>) {
-        if let Some(e) = end {
-            if let Term::None = self.f.blocks[self.cur].term { self.term(Term::Goto(e)); }
-        }
-    }
-
-    fn derived(&mut self, trait_name: &str, self_ty: &Type, targs: &Vec<&Type>) {
-        let ai = self.p.info.adts[&self_ty.d().id];
-        let ret = local_place(0);
-        let a1 = local_place(1);
-        let a2 = local_place(2);
-        let isize_ = self.ctx.int(types::ISIZE);
-        let bool_ = self.ctx.bool_;
-        let t = trait_name;
-        match t {
-            "Clone" => {
-                let (mut arms, end) = self.variant_arms(self_ty, a1.deref());
-                for arm in arms.iter_mut() {
-                    self.arm_start(self_ty, arm);
-                    let mut ops = Vec::new();
-                    let mut i = 0;
-                    while i < arm.fts.len() {
-                        let tmp = self.local(arm.fts[i]);
-                        self.clone_into(arm.fts[i], arm.fp.field(i), tmp.clone());
-                        ops.push(copy(tmp));
-                        i += 1;
-                    }
-                    let v = if arm.v < 0 { 0 } else { arm.v as usize };
-                    self.assign(ret.clone(), aggregate(AGG_ADT, self_ty, v, ops));
-                    self.arm_end(end);
-                }
-                if let Some(e) = end { self.cur = e; }
-                self.ret();
-            }
-            "Default" => {
-                let fts = self.lay.field_types(self_ty, -1);
-                let mut ops = Vec::new();
-                for ft in fts.iter() {
-                    let tmp = self.local(*ft);
-                    self.default_val(*ft, tmp.clone());
-                    ops.push(copy(tmp));
-                }
-                self.assign(ret, aggregate(AGG_ADT, self_ty, 0, ops));
-                self.ret();
-            }
-            "PartialEq" => {
-                let end = self.block();
-                let fail = self.block();
-                if ai.is_enum {
-                    let d1 = self.local(isize_);
-                    let d2 = self.local(isize_);
-                    self.assign(d1.clone(), Rvalue::Discr(a1.deref()));
-                    self.assign(d2.clone(), Rvalue::Discr(a2.deref()));
-                    let same = self.local(bool_);
-                    self.assign(same.clone(), Rvalue::Bin { op: EQ, x: copy(d1), y: copy(d2), ty: isize_, pos: 0 });
-                    let next = self.block();
-                    self.branch(copy(same), next, fail);
-                    self.cur = next;
-                }
-                let (mut arms, vend) = self.variant_arms(self_ty, a1.deref());
-                for arm in arms.iter_mut() {
-                    self.arm_start(self_ty, arm);
-                    let other = if arm.v >= 0 { a2.deref().downcast(arm.v as usize) } else { a2.deref() };
-                    let mut i = 0;
-                    while i < arm.fts.len() {
-                        let r = self.local(bool_);
-                        self.eq(arm.fts[i], arm.fts[i], arm.fp.field(i), other.field(i), r.clone());
-                        let next = self.block();
-                        self.branch(copy(r), next, fail);
-                        self.cur = next;
-                        i += 1;
-                    }
-                    self.arm_end(vend);
-                }
-                if let Some(e) = vend { self.cur = e; }
-                let tc = self.bool_const(true);
-                self.assign(ret.clone(), Rvalue::Use(tc));
-                self.term(Term::Goto(end));
-                self.cur = fail;
-                let fc = self.bool_const(false);
-                self.assign(ret, Rvalue::Use(fc));
-                self.term(Term::Goto(end));
-                self.cur = end;
-                self.ret();
-            }
-            "PartialOrd" | "Ord" => {
-                if ai.is_enum {
-                    let d1 = self.local(isize_);
-                    let d2 = self.local(isize_);
-                    self.assign(d1.clone(), Rvalue::Discr(a1.deref()));
-                    self.assign(d2.clone(), Rvalue::Discr(a2.deref()));
-                    let ct = self.cmp_type(t == "PartialOrd");
-                    let r = self.local(ct);
-                    self.cmp(t, isize_, d1.clone(), d2.clone(), r.clone());
-                    // Different variants: the variant order decides.
-                    let eqv = self.local(bool_);
-                    self.assign(eqv.clone(), Rvalue::Bin { op: EQ, x: copy(d1), y: copy(d2), ty: isize_, pos: 0 });
-                    let same = self.block();
-                    let diff = self.block();
-                    let end = self.block();
-                    self.branch(copy(eqv), same, diff);
-                    self.cur = diff;
-                    self.assign(ret.clone(), Rvalue::Use(copy(r)));
-                    self.term(Term::Goto(end));
-                    self.cur = same;
-                    let (mut arms, vend) = self.variant_arms(self_ty, a1.deref());
-                    for arm in arms.iter_mut() {
-                        self.arm_start(self_ty, arm);
-                        let other = a2.deref().downcast(arm.v as usize);
-                        let fts = arm.fts.clone();
-                        self.lexicographic(t, &fts, arm.fp.clone(), other, ret.clone());
-                        self.arm_end(vend);
-                    }
-                    if let Some(e) = vend { self.cur = e; }
-                    self.term(Term::Goto(end));
-                    self.cur = end;
-                    self.ret();
-                    return;
-                }
-                let fts = self.lay.field_types(self_ty, -1);
-                self.lexicographic(t, &fts, a1.deref(), a2.deref(), ret);
-                self.ret();
-            }
-            "Hash" => {
-                let hasher = targs[targs.len() - 1];
-                if ai.is_enum {
-                    let d = self.local(isize_);
-                    self.assign(d.clone(), Rvalue::Discr(a1.deref()));
-                    self.hash(isize_, d, copy(a2.clone()), hasher);
-                }
-                let (mut arms, vend) = self.variant_arms(self_ty, a1.deref());
-                for arm in arms.iter_mut() {
-                    self.arm_start(self_ty, arm);
-                    let mut i = 0;
-                    while i < arm.fts.len() {
-                        self.hash(arm.fts[i], arm.fp.field(i), copy(a2.clone()), hasher);
-                        i += 1;
-                    }
-                    self.arm_end(vend);
-                }
-                if let Some(e) = vend { self.cur = e; }
-                let unit = const_op(cnst(C_UNIT, Some(self.ctx.unit)));
-                self.assign(ret, Rvalue::Use(unit));
-                self.ret();
-            }
-            "Debug" => {
-                let fmtr = self.p.info.lang_def("Formatter").unwrap();
-                let f = copy(a2);
-                let (mut arms, vend) = self.variant_arms(self_ty, a1.deref());
-                for arm in arms.iter_mut() {
-                    self.arm_start(self_ty, arm);
-                    let (name, kind, fields) = if arm.v >= 0 {
-                        let vi = ai.variants[arm.v as usize];
-                        (vi.def.name.clone(), vi.kind.clone(), vi.fields)
-                    } else {
-                        (self_ty.d().name.clone(), ai.kind.clone(), ai.fields)
-                    };
-                    match kind {
-                        StructKind::Unit => {
-                            let ws = self.p.inherent_fn(fmtr, "write_str");
-                            let nc = str_const(self.ctx, name.as_str());
-                            self.call(ws, None, Vec::new(), vec2(f.clone(), nc), ret.clone());
-                        }
-                        StructKind::Tuple => {
-                            let fts = arm.fts.clone();
-                            self.debug_tuple(name.as_str(), &fts, arm.fp.clone(), f.clone(), ret.clone());
-                        }
-                        StructKind::Named => {
-                            let bt = self.p.std_type(&["fmt", "DebugStruct"]);
-                            let b = self.local(bt);
-                            let ds = self.p.inherent_fn(fmtr, "debug_struct");
-                            let nc = str_const(self.ctx, name.as_str());
-                            self.call(ds, None, Vec::new(), vec2(f.clone(), nc), b.clone());
-                            let rbt = self.ctx.reference(true, bt);
-                            let bref = self.local(rbt);
-                            self.assign(bref.clone(), Rvalue::Ref { is_mut: true, place: b });
-                            let mut i = 0;
-                            while i < arm.fts.len() {
-                                let r = self.local(rbt);
-                                let fld = self.p.inherent_fn(bt.d(), "field");
-                                let fnc = str_const(self.ctx, fields[i].name.as_str());
-                                let dd = self.dyn_debug(arm.fp.field(i), arm.fts[i]);
-                                let mut args = Vec::new();
-                                args.push(copy(bref.clone()));
-                                args.push(fnc);
-                                args.push(dd);
-                                self.call(fld, None, Vec::new(), args, r);
-                                i += 1;
-                            }
-                            let fin = self.p.inherent_fn(bt.d(), "finish");
-                            self.call(fin, None, Vec::new(), vec1(copy(bref)), ret.clone());
-                        }
-                    }
-                    self.arm_end(vend);
-                }
-                if let Some(e) = vend { self.cur = e; }
-                self.ret();
-            }
-            _ => {
-                panic(`mir: no derived shim for ${t}`);
-            }
-        }
-    }
 }
 
 impl Program {
@@ -1104,7 +853,7 @@ impl Program {
         panic(`mir: no std method ${adt.name}::${name}`)
     }
 
-    /// The shim for a builtin or derived impl method.
+    /// The shim for a builtin impl method.
     pub fn shim(&mut self, trait_name: &str, method: &mut Def, self_ty: &Type, targs: &Vec<&Type>) -> &mut Func {
         let key = shim_key(trait_name, method, self_ty, targs);
         if let Some(f) = self.shims.get(&key) { return *f; }
