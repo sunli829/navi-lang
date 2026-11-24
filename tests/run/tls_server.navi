@@ -1,0 +1,242 @@
+// std::tls servers: TlsAcceptor with certificates and keys made by Go
+// 1.26 (P-256 in PKCS#8, P-384 in SEC 1, RSA in PKCS#1), std::tls clients
+// over localhost: TLS 1.3, TLS 1.2 with each suite (AES-GCM, ChaCha20,
+// AES-CBC), ALPN, SNI, version limits; and std::http over https. (Go's
+// clients were checked against these servers by hand: /tmp/goref10.)
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::tls::{Certificate, Identity, Protocol, TlsAcceptor, TlsConnector};
+use std::http;
+
+fn identity(cert: &str, key: &str) -> Identity { Identity::from_pkcs8(cert.as_bytes(), key.as_bytes()).unwrap() }
+
+fn root() -> Certificate { Certificate::from_pem(ROOT.as_bytes()).unwrap() }
+
+// A server on a free port: each connection answers "n\n" with SNI, ALPN
+// and n bytes, then closes. The port.
+fn server(acceptor: TlsAcceptor) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(|| {
+        for c in l.incoming() {
+            let stream: TcpStream = c.unwrap();
+            let a = acceptor.clone();
+            std::thread::spawn(|| {
+                let mut tls = match a.accept(stream) {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                let mut line: Vec<u8> = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    if tls.read(&mut byte).unwrap_or(0) == 0 { break; }
+                    if byte[0] == b'\n' { break; }
+                    line.push(byte[0]);
+                }
+                let n = String::from_utf8_lossy(line.as_slice()).parse::<usize>().unwrap_or(0);
+                let alpn = match tls.negotiated_alpn().unwrap() { Some(p) => String::from_utf8_lossy(p.as_slice()), None => "-".to_string() };
+                let head = `${tls.server_name().unwrap_or("-")} ${alpn}\n`.to_string();
+                tls.write_all(head.as_bytes()).unwrap();
+                let mut data: Vec<u8> = Vec::new();
+                let mut i = 0;
+                while i < n {
+                    data.push((i % 251) as u8);
+                    i += 1;
+                }
+                tls.write_all(data.as_slice()).unwrap();
+                let _ = tls.shutdown();
+                tls.get_ref().close();
+            });
+        }
+    });
+    port
+}
+
+// Connects with b, asks for n bytes; the head line.
+fn fetch(b: &mut std::tls::TlsConnectorBuilder, port: u16, host: &str, n: usize) -> Result<String, String> {
+    b.add_root_certificate(root()).disable_built_in_roots(true);
+    let c = b.build().unwrap();
+    let s = TcpStream::connect(`127.0.0.1:${port}`.to_string().as_str()).unwrap();
+    let mut tls = match c.connect(host, s) {
+        Ok(t) => t,
+        Err(e) => return Err(e.to_string()),
+    };
+    tls.write_all(`${n}\n`.to_string().as_bytes()).unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    tls.read_to_end(&mut out).unwrap();
+    let text_end = out.iter().position(|b: &u8| -> bool { *b == b'\n' }).unwrap();
+    let head = String::from_utf8_lossy(&out[..text_end]);
+    let data = &out[text_end + 1..];
+    assert_eq(data.len(), n);
+    let mut i = 0;
+    while i < n {
+        assert_eq(data[i], (i % 251) as u8);
+        i += 1;
+    }
+    Ok(head)
+}
+
+#[test]
+fn versions_and_suites() {
+    let ids = [(identity(EC256_PEM, EC256_KEY), true), (identity(EC384_PEM, EC384_KEY), true), (identity(RSA_PEM, RSA_KEY), false)];
+    for (id, ecdsa) in ids.iter() {
+        let port = server(TlsAcceptor::new(id.clone()).unwrap());
+        // TLS 1.3, each suite.
+        for suite in [0x1301u16, 0x1302, 0x1303].iter() {
+            let mut b = TlsConnector::builder();
+            b.min_protocol_version(Some(Protocol::Tlsv13)).test_cipher_suites(&[*suite]);
+            assert_eq(fetch(&mut b, port, "localhost", 40000).unwrap(), "localhost -".to_string());
+        }
+        // TLS 1.2, each suite of the key's kind.
+        let suites: [u16; 5] = if *ecdsa { [0xc02b, 0xc02c, 0xcca9, 0xc009, 0xc00a] } else { [0xc02f, 0xc030, 0xcca8, 0xc013, 0xc014] };
+        for suite in suites.iter() {
+            let mut b = TlsConnector::builder();
+            b.max_protocol_version(Some(Protocol::Tlsv12)).test_cipher_suites(&[*suite]);
+            assert_eq(fetch(&mut b, port, "localhost", 40000).unwrap(), "localhost -".to_string());
+        }
+        // By IP address: no SNI.
+        assert_eq(fetch(&mut TlsConnector::builder(), port, "127.0.0.1", 10).unwrap(), "- -".to_string());
+        // Another name.
+        assert(fetch(&mut TlsConnector::builder(), port, "example.com", 10).unwrap_err().contains("not example.com"));
+    }
+}
+
+#[test]
+fn alpn_and_limits() {
+    let mut ab = TlsAcceptor::builder(identity(EC256_PEM, EC256_KEY));
+    ab.alpn_protocols(&["h2", "http/1.1"]);
+    let port = server(ab.build().unwrap());
+    let mut b = TlsConnector::builder();
+    b.request_alpns(&["http/1.1", "h2"]);
+    // (The server's preference.)
+    assert_eq(fetch(&mut b, port, "localhost", 10).unwrap(), "localhost h2".to_string());
+    let mut b12 = TlsConnector::builder();
+    b12.request_alpns(&["http/1.1"]).max_protocol_version(Some(Protocol::Tlsv12));
+    assert_eq(fetch(&mut b12, port, "localhost", 10).unwrap(), "localhost http/1.1".to_string());
+    // No protocol in common: refused.
+    let mut bx = TlsConnector::builder();
+    bx.request_alpns(&["spdy/3"]);
+    assert(fetch(&mut bx, port, "localhost", 10).is_err());
+    // A TLS 1.2-only server and a TLS 1.3-only client.
+    let mut a12 = TlsAcceptor::builder(identity(RSA_PEM, RSA_KEY));
+    a12.max_protocol_version(Some(Protocol::Tlsv12));
+    let p12 = server(a12.build().unwrap());
+    assert_eq(fetch(&mut TlsConnector::builder(), p12, "localhost", 10).unwrap(), "localhost -".to_string());
+    let mut c13 = TlsConnector::builder();
+    c13.min_protocol_version(Some(Protocol::Tlsv13));
+    assert(fetch(&mut c13, p12, "localhost", 10).is_err());
+    // A key that is not the certificate's.
+    assert(Identity::from_pkcs8(EC256_PEM.as_bytes(), EC384_KEY.as_bytes()).is_err());
+}
+
+#[test]
+fn https() {
+    let server = http::Server::bind("127.0.0.1:0").unwrap().tls(TlsAcceptor::new(identity(EC256_PEM, EC256_KEY)).unwrap());
+    let port = server.local_addr().port();
+    let s2 = server.clone();
+    std::thread::spawn(|| { let _ = s2.serve(|req: &mut http::Request| -> http::Response { http::Response::from_string(`${req.url().scheme()} ${req.url().path()}`.to_string()) }); });
+    let c = http::Client::builder().add_root_certificate(root()).tls_built_in_root_certs(false).build().unwrap();
+    let url = `https://localhost:${port}/hello`.to_string();
+    assert_eq(c.get(url.as_str()).send().unwrap().text().unwrap(), "https /hello".to_string());
+    // Again: the pooled connection.
+    assert_eq(c.get(url.as_str()).send().unwrap().text().unwrap(), "https /hello".to_string());
+    // Without the root: refused.
+    assert(http::get(url.as_str()).is_err());
+    server.close();
+}
+
+const ROOT: &str = "-----BEGIN CERTIFICATE-----
+MIIBojCCASigAwIBAgIBATAKBggqhkjOPQQDAzAZMRcwFQYDVQQDEw5uYXZpIHRl
+c3Qgcm9vdDAgFw0yNjExMjQxNTM2MDFaGA8yMTI2MTAzMTE2MzYwMVowGTEXMBUG
+A1UEAxMObmF2aSB0ZXN0IHJvb3QwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAATvFeSS
+IJbf4zQN6hRvpLGrFl1hdfaNQtZs8bG9kYvfLUFedUG7IfuOPdUXTIsqK0Qt13Dc
+GEk/qDSK7tRW3raczmqc38gYQeZNr6DX4TaL1mFPjyNpkLZe3t9ffY74MTijQjBA
+MA4GA1UdDwEB/wQEAwICBDAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBRVe16e
+agLHMModiC5gUr2/Mzll1DAKBggqhkjOPQQDAwNoADBlAjEAozzJr8/tMHVgdJ91
+aFLsMhK2XOFFTKwKoAmS5JNJRs+8qgZ2a9nX/rBsIcobWkvTAjAjiUD6gXNbkVy2
+AkcvpsLze7angVcHRC8uu5IpKCMStdWD1sUmv5E9wCsKn+/etv0=
+-----END CERTIFICATE-----";
+
+const EC256_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBkjCCARigAwIBAgIBAjAKBggqhkjOPQQDAzAZMRcwFQYDVQQDEw5uYXZpIHRl
+c3Qgcm9vdDAgFw0yNjExMjQxNTM2MDFaGA8yMTI2MTAzMTE2MzYwMVowFDESMBAG
+A1UEAxMJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEicc7CVX5
+1ZlO1lqIMjXh1G+N/otazay0OVF/M+/nsY67OwCuE0pWKvJyLi6rQiwC+W13Nk1F
+TRs74+L93/a2Y6NUMFIwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHwYDVR0jBBgwFoAU
+VXtenmoCxzDKHYguYFK9vzM5ZdQwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAAB
+MAoGCCqGSM49BAMDA2gAMGUCMQDcEysx+rwTCL1rDAVl3zfFbpwPSeXxqWYeta7l
++6BJ7x7V4kg2hgh/s7N1hWA4hl4CMGDjD4zHPpIu3ACTGN1g7Ud+Yc3m18SJSfv2
+ZGL+Ul7+RB0Tc5okD1dcAsvZkqo9wg==
+-----END CERTIFICATE-----";
+
+const EC256_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTd8dIIjuW5S4KY+M
+f0aL+xEx0DcnkK+7ws/gwsXfoLihRANCAASJxzsJVfnVmU7WWogyNeHUb43+i1rN
+rLQ5UX8z7+exjrs7AK4TSlYq8nIuLqtCLAL5bXc2TUVNGzvj4v3f9rZj
+-----END PRIVATE KEY-----";
+
+const EC384_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBrzCCATWgAwIBAgIBAzAKBggqhkjOPQQDAzAZMRcwFQYDVQQDEw5uYXZpIHRl
+c3Qgcm9vdDAgFw0yNjExMjQxNTM2MDFaGA8yMTI2MTAzMTE2MzYwMVowFDESMBAG
+A1UEAxMJbG9jYWxob3N0MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE8xlWJ5J5y/jl
+DPWXOvifPevDRYgFA6c64MyTJ6OtnBlmcvWLiZnzSW4xxeRKstr0Q38Gp6BWuo7j
+x+56bHHFfs9qOaJofmnK9QM9+eUbBALd7piJQhq0Kyqtoxm2slS0o1QwUjATBgNV
+HSUEDDAKBggrBgEFBQcDATAfBgNVHSMEGDAWgBRVe16eagLHMModiC5gUr2/Mzll
+1DAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZIzj0EAwMDaAAwZQIw
+fKRNSbyKp2esvGpJN7QVrwWK3SGQ+k8P6rUGwIDRPk51TycK8tba7aR7aq4QsQ1n
+AjEAqRNwrSTLTzBhxDoJxWbfucQ577EGNUei10HeoZgy6uMA9DZhAwoKzi/9tk/v
+tMxq
+-----END CERTIFICATE-----";
+
+const EC384_KEY: &str = "-----BEGIN EC PRIVATE KEY-----
+MIGkAgEBBDCK88gtJOlGDjGxirtEAdg3x6Wg7sTXM1AHDOLfXeCG82Ltsv28wnlq
+1/Qo9DmjCRmgBwYFK4EEACKhZANiAATzGVYnknnL+OUM9Zc6+J8968NFiAUDpzrg
+zJMno62cGWZy9YuJmfNJbjHF5Eqy2vRDfwanoFa6juPH7npsccV+z2o5omh+acr1
+Az355RsEAt3umIlCGrQrKq2jGbayVLQ=
+-----END EC PRIVATE KEY-----";
+
+const RSA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIICXTCCAeOgAwIBAgIBBDAKBggqhkjOPQQDAzAZMRcwFQYDVQQDEw5uYXZpIHRl
+c3Qgcm9vdDAgFw0yNjExMjQxNTM2MDFaGA8yMTI2MTAzMTE2MzYwMVowFDESMBAG
+A1UEAxMJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA
+8VJ4vv5KSykvfbebTfr+98tIrI8FmJGkRTDnR32OfvXoENmgbdNykMzd8sJ/c9Lj
+xdGtmaLHhMDgY7NNknHq42JdJNIdWSN9yigJLturCwTdxCN9pnWIwyP2MBWVhzKa
+981HMlPSzNnLO6zAgORLamb9xx0QP+/wsY7t01/BgZCuJvxhMVidoXCc7oyarM0u
+Ns8ZfWi5K9w86mBZd+/g4YVlYLSIDAEl01hAym3t2i8JkG7kKapfQav9dVWR1TJa
+IXZidIJpCLwIrIVkMpjN9YVT//hhIWe26oAvdK0OtWYnTcHuzZehVcBvaMFxB2mM
+wJIpdCTPO0K80hvgbcrY9QIDAQABo1QwUjATBgNVHSUEDDAKBggrBgEFBQcDATAf
+BgNVHSMEGDAWgBRVe16eagLHMModiC5gUr2/Mzll1DAaBgNVHREEEzARgglsb2Nh
+bGhvc3SHBH8AAAEwCgYIKoZIzj0EAwMDaAAwZQIwFkobriRr68O7C4TtABTvjQF0
+TPpKzAAu14LzgKZJqJAj348T8zm82cWBtmk03qdnAjEAy2oyrDVhRi2UtnU+oJBL
+Xn2o9LIvwQFtbMDf5+GgTvBNuqSIPvFuyrHpApkLAYZW
+-----END CERTIFICATE-----";
+
+const RSA_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEA8VJ4vv5KSykvfbebTfr+98tIrI8FmJGkRTDnR32OfvXoENmg
+bdNykMzd8sJ/c9LjxdGtmaLHhMDgY7NNknHq42JdJNIdWSN9yigJLturCwTdxCN9
+pnWIwyP2MBWVhzKa981HMlPSzNnLO6zAgORLamb9xx0QP+/wsY7t01/BgZCuJvxh
+MVidoXCc7oyarM0uNs8ZfWi5K9w86mBZd+/g4YVlYLSIDAEl01hAym3t2i8JkG7k
+KapfQav9dVWR1TJaIXZidIJpCLwIrIVkMpjN9YVT//hhIWe26oAvdK0OtWYnTcHu
+zZehVcBvaMFxB2mMwJIpdCTPO0K80hvgbcrY9QIDAQABAoIBAAwC7Nuk0JHZJPH+
+9430FkjDJ4TfQYoMhb6j5n8acsNC/iAIlQGiaqtmZw20PJ/JOWkZPKjO/1tONl0A
+CbZmUSisNrKkeq17JMGxKHPanzLXNSqUEab9Zqc/3Psbt+uYyznWT9rjbTShCoqX
+2KURt+c95RfKDIsCKFrOIGxK8di/AA3anlWRTd0tfKO54hBob6iUf7pF6pvKqEPR
+4Ys+NBkdr982aE8llG9T1jw25zpxyvNJX2gE3ld2CGT/c5IiFNKlI0NeJdBhzCVt
+7TSqcrTFFe+xozQXIgXiBMyYaUJgVDaSc++xgi8ou5CQWCjNFRk8lZOM3ci89Wy1
+94HwgGkCgYEA+Rmh7lpQ4WfBn4RcW/UzRtqOkCHmH/Errgls26pnpJbJZ9IjKz9c
+2nYqdriLW75x9PKd0SaAuT2bYy8BW/y4+RRPniFEP9UBGJPDeKrcDPSDf95SfV0V
+aAXi4u3gFPpIVmMYWtpUc2cCehj/FW2z+tleMK/tvbP12SCvtrvj/+cCgYEA+AGv
+gWwraNeimr/Y1diF9vn7w6+C1+D3f8XxWAtk0IO6L7aSByKBy9eV4y3kLx5TptFG
+HHpF32/dwmAVEXa3TYgNqSGwpfFd+gu5ZPhN1VAhepqKMcv8cVgiCFuy7oZpHC+s
+DKPigJj4cnaJAtQoUJVLm9YS3PpzLLRz1jM8NMMCgYA7iZTak1uhhFsS9V/d2s1W
+sgZBDNkj6VC3WClcl24OOLwKxH8DZzGaRYQAvDsSwoIaOaLeyoUZwU/SdPmuMslD
+P0eIVAsr9o08gpTF0pClyAtmFI1CyWzEYCPKeXCFkwyXGThI/sYQjx5YcIEHbiEG
+Y83PdT0tikXIj7dvxZjJIQKBgQDjtUB8d2HgEGUm6tDff794xYwI3wQmzFLSiV8P
+tN5qqRfxKRMo4+EC1T206fTh4llyCCH0kbvH7EFTb77IWxTwZeQND3bO1i+wHsWp
+VGa6XalvlacfE6kENKSCwhcm9Fhb3dV9gZe89Tbgeb9QzpT5cCqMueB17qqDOGhH
+GqHD2wKBgQDD8kBY+UlLpAF0nZyO+90FgeHzBg51jqcz935MILaDf5XB+74QQhkP
+yiugziWMloTGJ40BobCPyfSlEoCA4WI/cDTWSB0s2xVRX6QnGzAYhBsblzAoJUOc
+3fIP7cljWkFxAuOyzAC58GEDdGZKgOmtbv9y1W/7IXs9RJo/SuRkmw==
+-----END RSA PRIVATE KEY-----";
+

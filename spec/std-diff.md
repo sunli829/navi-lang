@@ -185,10 +185,11 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | 项目 | native-tls | navi | 原因 |
 |---|---|---|---|
 | 实现 | 调系统的 TLS 库（OpenSSL、Secure Transport、SChannel） | 纯 navi 实现（同 Go），证书验证用 `crypto::x509`（macOS、Windows 上是系统的验证器） | 用户选择照 Go 自己实现 |
-| 版本 | 系统支持的都行 | TLS 1.3 和 1.2 客户端（同 Go 的默认）；1.2 只有 ECDHE 加 AES-GCM 或 ChaCha20-Poly1305（Go 默认里的 CBC 套件没有），不支持重协商；不支持 1.1 及更早 | 服务端在后面做 |
+| 版本 | 系统支持的都行 | TLS 1.3 和 1.2 的客户端和服务端（同 Go 的默认）：1.2 是 ECDHE 加 AES-GCM、ChaCha20-Poly1305 或 AES-CBC-SHA；不支持重协商、会话恢复，不支持 1.1 及更早 | 同 Go |
 | `connect` | 返回 `Result<TlsStream<S>, HandshakeError<S>>`（可能 `WouldBlock`） | 返回 `Result<TlsStream<S>, Error>`；流都是阻塞的 | 没有非阻塞流 |
 | `Certificate` | `native_tls::Certificate` | 就是 `crypto::x509::Certificate` | 不需要两个类型 |
-| `Identity`（客户端证书）、会话恢复、0-RTT | 有 | 没有；服务器要求客户端证书时发空的 | 暂不需要 |
+| `Identity`、`TlsAcceptor` | `Identity::from_pkcs8`、`from_pkcs12` | `Identity::from_pkcs8`（私钥也可以是 PKCS#1、SEC 1 的 PEM）、`from_parts`；没有 PKCS#12；`TlsAcceptorBuilder::alpn_protocols` 是新增的（同 Go 的 NextProtos） | 不需要 PKCS#12 |
+| 客户端证书、会话恢复、0-RTT | 有 | 没有；服务器要求客户端证书时发空的 | 暂不需要 |
 | 没有 close_notify 就断开 | 视实现而定 | 记录边界上的断开当作数据结束（同 Go） | 很多服务器这样关连接 |
 
 ### std::regex（regex crate）
@@ -249,8 +250,8 @@ API 照 base64 0.22（`Engine`）、hex、RustCrypto（`Digest`、`Mac`、`Hmac<
 | AES、AES-GCM 的实现 | 有 CPU 指令时用指令，否则软件 | 相同：arm64 的 AES/PMULL、x86 的 AES-NI/PCLMULQDQ 用 `.s` 汇编（docs/asm.md），计数器模式和 GHASH 都在汇编里（M4 上 AES-128-GCM 约 1.9 GB/s）；软件路径的 GHASH 是恒定时间的（BearSSL ctmul64），AES 查表；`NAVI_NOAES=1` 强制走软件 | — |
 | ChaCha20-Poly1305 | 有 SIMD 汇编 | 纯软件（M4 上约 40 MB/s，待优化） | 先求正确 |
 | X25519（`x25519-dalek`） | `StaticSecret`、`PublicKey`、`SharedSecret`、`x25519` | `crypto::x25519`，相同；恒定时间（51 位分肢，蒙哥马利阶梯） | — |
-| P-256、P-384（`p256`、`p384` crate） | `ecdsa::{VerifyingKey, SigningKey, Signature}`、`ecdh` | `crypto::p256`、`crypto::p384`：只有验签（`VerifyingKey`、DER 或定长的 `Signature`）和 ECDH（`ecdh::{EphemeralSecret, PublicKey, SharedSecret}`），没有签名；完全加法公式（同 Go 的 nistec），标量乘恒定时间，验签用 Shamir 技巧（变时间，数据是公开的）。M4 上 P-256 验签约 11 ms、ECDH 约 8 ms（字段运算还在堆上分配，待优化） | TLS 客户端只需要验签和密钥交换 |
-| RSA（`rsa` crate） | `RsaPublicKey`、`RsaPrivateKey`，`verify(Pkcs1v15Sign::new::<D>() / Pss::new::<D>(), hashed, sig)`，加解密和签名 | `crypto::rsa`：只有公钥验签（`RsaPublicKey::from_be_bytes` / `from_pkcs1_der`，`Pkcs1v15Sign`、`Pss`；`Pss::new_with_any_salt` 同 Go 的 `PSSSaltLengthAuto`）；模幂在 `crypto::nat` 上（变时间，公钥是公开的） | TLS 客户端只需要验签 |
+| P-256、P-384（`p256`、`p384` crate） | `ecdsa::{VerifyingKey, SigningKey, Signature}`、`ecdh` | `crypto::p256`、`crypto::p384`：签名和验签（`SigningKey`、`VerifyingKey`、DER 或定长的 `Signature`，签名的 nonce 用系统随机数）和 ECDH（`ecdh::{EphemeralSecret, PublicKey, SharedSecret}`）；完全加法公式（同 Go 的 nistec），标量乘恒定时间，验签用 Shamir 技巧（变时间，数据是公开的）。M4 上 P-256 验签约 11 ms、ECDH 约 8 ms（字段运算还在堆上分配，待优化） | TLS 客户端只需要验签和密钥交换 |
+| RSA（`rsa` crate） | `RsaPublicKey`、`RsaPrivateKey`，`verify` / `sign`（`Pkcs1v15Sign`、`Pss`），加解密 | `crypto::rsa`：验签和签名（`RsaPrivateKey::from_pkcs1_der` / `from_pkcs8_der`，私钥运算是恒定时间的定长窗口，还没用 CRT，2048 位约 30 ms），没有加解密；`Pss::new_with_any_salt` 同 Go 的 `PSSSaltLengthAuto` | TLS 只需要签名和验签 |
 | PEM（`pem` crate） | `parse`、`parse_many`、`encode`、`Pem` | `std::pem`，相同；不保留 RFC 1421 的头部（读的时候跳过） | 用不到 |
 | X.509（Go 的 crypto/x509；Rust 没有对应的常用 crate） | `Certificate`、`CertPool`、`VerifyOptions`、`Verify`、`VerifyHostname`、`SystemCertPool` | `crypto::x509`：解析（`Certificate::from_der` / `from_pem`）和验证链，行为和错误信息与 Go 1.26 一致（40 个用例逐字对照）；字段改成方法，时间是 Unix 秒；签名支持 RSA（PKCS#1 v1.5、PSS）和 ECDSA P-256/P-384，不支持 Ed25519；不检查证书策略；名称约束只检查 DNS 名和 IP，带邮箱或 URI 约束且证书有这类名字时验证失败；系统根证书同 Go：macOS 用 Security.framework 的 SecTrustEvaluateWithError，Windows 用 CryptoAPI 的 CertGetCertificateChain（这两个平台的吊销检查和策略由系统做），其他平台读 CA 文件，不做吊销检查。`crypto::der` 是读 DER 的游标（同 Go 的 cryptobyte） | 只做 TLS 客户端需要的部分 |
 

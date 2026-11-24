@@ -7,7 +7,8 @@ use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::time::Duration;
 use crate::url::Url;
 use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
-use crate::http::wire;
+use crate::http::wire::{self, NetStream};
+use crate::tls::{Identity, TlsAcceptor};
 
 /// Listens for HTTP connections and answers each request with a handler.
 #[derive(Clone)]
@@ -19,6 +20,7 @@ pub struct Server {
     write_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     max_header_bytes: usize,
+    tls: Option<TlsAcceptor>,
 }
 
 /// Serves handler on addr (as Go's http.ListenAndServe).
@@ -26,11 +28,20 @@ pub fn serve<A: ToSocketAddrs>(addr: A, handler: fn(&mut Request) -> Response) -
     Server::bind(addr)?.serve(handler)
 }
 
+/// Serves handler over https on addr with the certificate chain and key
+/// of two PEM files (as Go's http.ListenAndServeTLS).
+pub fn serve_tls<A: ToSocketAddrs>(addr: A, cert_file: &str, key_file: &str, handler: fn(&mut Request) -> Response) -> io::Result<()> {
+    let id = Identity::from_pkcs8(crate::fs::read(cert_file)?.as_slice(), crate::fs::read(key_file)?.as_slice())?;
+    let mut b = TlsAcceptor::builder(id);
+    b.alpn_protocols(&["http/1.1"]);
+    Server::bind(addr)?.tls(b.build()?).serve(handler)
+}
+
 impl Server {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Server> {
         let l = TcpListener::bind(addr)?;
         let a = l.local_addr()?;
-        Ok(Server { listener: l, addr: a, closed: &AtomicBool::new(false), read_timeout: None, write_timeout: None, idle_timeout: Some(Duration::from_secs(120)), max_header_bytes: 1 << 20 })
+        Ok(Server { listener: l, addr: a, closed: &AtomicBool::new(false), read_timeout: None, write_timeout: None, idle_timeout: Some(Duration::from_secs(120)), max_header_bytes: 1 << 20, tls: None })
     }
 
     /// The address it listens on (the port, after binding port 0).
@@ -55,6 +66,14 @@ impl Server {
     pub fn idle_timeout(&self, d: Option<Duration>) -> Server {
         let mut s = self.clone();
         s.idle_timeout = d;
+        s
+    }
+
+    /// Serves https: each connection's TLS handshake with acceptor (on the
+    /// connection's thread, within read_timeout).
+    pub fn tls(&self, acceptor: TlsAcceptor) -> Server {
+        let mut s = self.clone();
+        s.tls = Some(acceptor);
         s
     }
 
@@ -93,8 +112,23 @@ impl Server {
 
     fn conn(&self, stream: TcpStream, remote: SocketAddr, handler: fn(&mut Request) -> Response) {
         let _ = stream.set_nodelay(true);
-        let r = &mut BufReader::new(wire::NetStream::plain(stream.clone()));
-        let mut w = stream.clone();
+        let net = match &self.tls {
+            None => NetStream::plain(stream.clone()),
+            Some(a) => {
+                let _ = stream.set_read_timeout(self.read_timeout);
+                let _ = stream.set_write_timeout(self.read_timeout);
+                match a.accept(stream.clone()) {
+                    Ok(t) => NetStream::tls(t),
+                    Err(_) => {
+                        stream.close();
+                        return;
+                    }
+                }
+            }
+        };
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        let r = &mut BufReader::new(net.clone());
+        let mut w = net.clone();
         let mut first = true;
         loop {
             let _ = stream.set_read_timeout(if first { self.read_timeout } else { self.idle_timeout });
@@ -144,9 +178,9 @@ impl Server {
                 }
             };
             let url = if target.starts_with("/") {
-                Url::parse(`http://${host}${target}`.to_string().as_str())
+                Url::parse(`${scheme}://${host}${target}`.to_string().as_str())
             } else if target == "*" {
-                Url::parse(`http://${host}/`.to_string().as_str())
+                Url::parse(`${scheme}://${host}/`.to_string().as_str())
             } else {
                 Url::parse(target.as_str())
             };
@@ -178,7 +212,7 @@ impl Server {
             if write_response(&mut w, &mut resp, version, is_head, &mut keep).is_err() { break; }
             if !keep { break; }
         }
-        stream.close();
+        net.close();
     }
 }
 
@@ -203,13 +237,13 @@ fn parse_request_line(line: &str) -> Result<(Method, String, Version), StatusCod
 }
 
 // Answers a request that could not be read, and the connection closes.
-fn reply_error(w: &mut TcpStream, code: StatusCode, msg: &str) {
+fn reply_error(w: &mut NetStream, code: StatusCode, msg: &str) {
     let reason = code.canonical_reason().unwrap_or("");
     let s = `HTTP/1.1 ${code.as_u16()} ${reason}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: ${msg.len() + 1}\r\n\r\n${msg}\n`.to_string();
     let _ = w.write_all(s.as_bytes());
 }
 
-fn write_response(w: &mut TcpStream, resp: &mut Response, version: Version, is_head: bool, keep: &mut bool) -> io::Result<()> {
+fn write_response(w: &mut NetStream, resp: &mut Response, version: Version, is_head: bool, keep: &mut bool) -> io::Result<()> {
     let code = resp.status.as_u16();
     let mut h = String::with_capacity(256);
     h.push_str(`HTTP/1.1 ${code} ${resp.status.canonical_reason().unwrap_or("")}\r\n`.to_string().as_str());

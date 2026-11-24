@@ -9,13 +9,18 @@
 //!     key.verify(Pkcs1v15Sign::new::<Sha256>(), &hashed, &sig)?;
 //!     key.verify(Pss::new::<Sha256>(), &hashed, &sig)?;
 //!
-//! Only public-key operations (no signing or decryption): what a TLS
-//! client needs. Variable-time, which public keys allow.
+//! Signing too (`RsaPrivateKey::sign`, from PKCS#1 or PKCS#8 DER): the
+//! private exponentiation is constant-time (a fixed window, masked table
+//! reads) and checked against the public key. No encryption or
+//! decryption: TLS (1.2 with ECDHE, 1.3) does not use them.
 
 use crate::fmt::{self, Display, Formatter};
 use crate::crypto::Digest;
 use crate::crypto::nat::Modulus;
 use crate::crypto::subtle::constant_time_eq;
+use crate::crypto::der::{self, Reader};
+use crate::rand::rngs::OsRng;
+use crate::rand::RngCore;
 
 /// A bad key or a signature that does not verify (as the crate's
 /// `rsa::Error`, without detail for signatures).
@@ -115,9 +120,90 @@ impl RsaPublicKey {
     }
 }
 
-/// A signature scheme (as the crate's `SignatureScheme`, verifying only).
+/// An RSA secret key (the modulus's factors are kept for completeness;
+/// signing uses d).
+#[derive(Clone)]
+pub struct RsaPrivateKey {
+    public: RsaPublicKey,
+    d: Vec<u8>,
+    primes: Vec<Vec<u8>>,
+}
+
+impl RsaPrivateKey {
+    /// The key of n, e, d and the primes (big-endian).
+    pub fn from_components(n: &[u8], e: &[u8], d: &[u8], primes: Vec<Vec<u8>>) -> Result<RsaPrivateKey, Error> {
+        let public = RsaPublicKey::from_be_bytes(n, e)?;
+        let d = strip(d);
+        if d.len() == 0 || d.len() > public.size() { return Err(Error::InvalidKey); }
+        let k = RsaPrivateKey { public, d, primes };
+        // A sign-and-check round trip catches inconsistent components.
+        let mut m: Vec<u8> = Vec::new();
+        m.resize(k.public.size(), 0);
+        m[k.public.size() - 1] = 2;
+        k.private_op(m.as_slice())?;
+        Ok(k)
+    }
+
+    /// The key of a PKCS#1 RSAPrivateKey: SEQUENCE { version, n, e, d, p, q,
+    /// dP, dQ, qInv } (two primes).
+    pub fn from_pkcs1_der(der: &[u8]) -> Result<RsaPrivateKey, Error> {
+        let mut top = Reader::new(der);
+        let mut r = top.read_nested(der::SEQUENCE).ok_or(Error::InvalidKey)?;
+        if !top.is_empty() { return Err(Error::InvalidKey); }
+        if r.read_i64() != Some(0) { return Err(Error::InvalidKey); }
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        while v.len() < 8 { v.push(r.read_unsigned().ok_or(Error::InvalidKey)?.to_vec()); }
+        if !r.is_empty() { return Err(Error::InvalidKey); }
+        RsaPrivateKey::from_components(v[0].as_slice(), v[1].as_slice(), v[2].as_slice(), vec_of2(v[3].clone(), v[4].clone()))
+    }
+
+    /// The key of a PKCS#8 PrivateKeyInfo holding an rsaEncryption key.
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<RsaPrivateKey, Error> {
+        let mut top = Reader::new(der);
+        let mut r = top.read_nested(der::SEQUENCE).ok_or(Error::InvalidKey)?;
+        if r.read_i64() != Some(0) { return Err(Error::InvalidKey); }
+        let mut alg = r.read_nested(der::SEQUENCE).ok_or(Error::InvalidKey)?;
+        let oid = alg.read_oid().ok_or(Error::InvalidKey)?;
+        if der::oid_string(oid) != "1.2.840.113549.1.1.1" { return Err(Error::InvalidKey); }
+        let inner = r.read(der::OCTET_STRING).ok_or(Error::InvalidKey)?;
+        RsaPrivateKey::from_pkcs1_der(inner)
+    }
+
+    pub fn to_public_key(&self) -> RsaPublicKey { self.public.clone() }
+
+    /// The modulus's length in bytes.
+    pub fn size(&self) -> usize { self.public.size() }
+
+    pub fn d(&self) -> &[u8] { self.d.as_slice() }
+
+    pub fn primes(&self) -> &[Vec<u8>] { self.primes.as_slice() }
+
+    /// Signs hashed under scheme (PSS salts come from the operating system).
+    pub fn sign<S: SignatureScheme>(&self, scheme: S, hashed: &[u8]) -> Result<Vec<u8>, Error> { scheme.sign(self, hashed) }
+
+    // m^d mod n (m the modulus's length), constant-time in d; checked by
+    // raising back to e.
+    fn private_op(&self, m: &[u8]) -> Result<Vec<u8>, Error> {
+        let md = &self.public.m;
+        let x = md.from_be(m).ok_or(Error::Verification)?;
+        let c = md.from_mont(&md.pow_secret(&md.to_mont(&x), self.d.as_slice()));
+        let back = md.from_mont(&md.pow(&md.to_mont(&c), self.public.e.as_slice()));
+        if !md.eq(&back, &x) { return Err(Error::InvalidKey); }
+        Ok(md.to_be(&c))
+    }
+}
+
+fn vec_of2(a: Vec<u8>, b: Vec<u8>) -> Vec<Vec<u8>> {
+    let mut v: Vec<Vec<u8>> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v
+}
+
+/// A signature scheme (as the crate's `SignatureScheme`).
 pub trait SignatureScheme {
     fn verify(&self, key: &RsaPublicKey, hashed: &[u8], sig: &[u8]) -> Result<(), Error>;
+    fn sign(&self, key: &RsaPrivateKey, hashed: &[u8]) -> Result<Vec<u8>, Error>;
 }
 
 // The DigestInfo prefix of a hash by its output length (SHA-1, SHA-224,
@@ -149,22 +235,33 @@ impl Pkcs1v15Sign {
     pub fn new_unprefixed() -> Pkcs1v15Sign { Pkcs1v15Sign { prefix: Vec::new(), hash_len: 0 } }
 }
 
+impl Pkcs1v15Sign {
+    // 00 01 ff... 00 || DigestInfo || hash, k bytes.
+    fn encode(&self, hashed: &[u8], k: usize) -> Option<Vec<u8>> {
+        if self.hash_len != 0 && hashed.len() != self.hash_len { return None; }
+        let t_len = self.prefix.len() + hashed.len();
+        if k < t_len + 11 { return None; }
+        let mut em: Vec<u8> = Vec::with_capacity(k);
+        em.push(0);
+        em.push(1);
+        while em.len() < k - t_len - 1 { em.push(0xff); }
+        em.push(0);
+        em.extend_from_slice(self.prefix.as_slice());
+        em.extend_from_slice(hashed);
+        Some(em)
+    }
+}
+
 impl SignatureScheme for Pkcs1v15Sign {
     fn verify(&self, key: &RsaPublicKey, hashed: &[u8], sig: &[u8]) -> Result<(), Error> {
-        if self.hash_len != 0 && hashed.len() != self.hash_len { return Err(Error::Verification); }
-        let k = key.size();
-        let t_len = self.prefix.len() + hashed.len();
-        if k < t_len + 11 { return Err(Error::Verification); }
+        let want = self.encode(hashed, key.size()).ok_or(Error::Verification)?;
         let em = key.public_op(sig).ok_or(Error::Verification)?;
-        // 00 01 ff... 00 || DigestInfo || hash
-        let mut want: Vec<u8> = Vec::with_capacity(k);
-        want.push(0);
-        want.push(1);
-        while want.len() < k - t_len - 1 { want.push(0xff); }
-        want.push(0);
-        want.extend_from_slice(self.prefix.as_slice());
-        want.extend_from_slice(hashed);
         if constant_time_eq(em.as_slice(), want.as_slice()) { Ok(()) } else { Err(Error::Verification) }
+    }
+
+    fn sign(&self, key: &RsaPrivateKey, hashed: &[u8]) -> Result<Vec<u8>, Error> {
+        let em = self.encode(hashed, key.size()).ok_or(Error::Verification)?;
+        key.private_op(em.as_slice())
     }
 }
 
@@ -246,5 +343,44 @@ impl SignatureScheme for Pss {
         m2.extend_from_slice(salt);
         let h2 = (self.hash)(m2.as_slice());
         if constant_time_eq(h2.as_slice(), h) { Ok(()) } else { Err(Error::Verification) }
+    }
+
+    // EMSA-PSS-ENCODE (RFC 8017 9.1.1) with a random salt (as long as the
+    // hash when the length is any).
+    fn sign(&self, key: &RsaPrivateKey, hashed: &[u8]) -> Result<Vec<u8>, Error> {
+        let h_len = self.hash_len;
+        if hashed.len() != h_len { return Err(Error::Verification); }
+        let em_bits = key.public.m.bits() - 1;
+        let em_len = (em_bits + 7) / 8;
+        let s_len = match self.salt_len { Some(n) => n, None => h_len };
+        if em_len < h_len + s_len + 2 { return Err(Error::Verification); }
+        let mut salt: Vec<u8> = Vec::new();
+        salt.resize(s_len, 0);
+        OsRng.fill_bytes(salt.as_mut_slice());
+        let mut m2: Vec<u8> = Vec::new();
+        m2.resize(8, 0);
+        m2.extend_from_slice(hashed);
+        m2.extend_from_slice(salt.as_slice());
+        let h = (self.hash)(m2.as_slice());
+        let db_len = em_len - h_len - 1;
+        let mut db: Vec<u8> = Vec::new();
+        db.resize(db_len - s_len - 1, 0);
+        db.push(1);
+        db.extend_from_slice(salt.as_slice());
+        let mask = self.mgf1(h.as_slice(), db_len);
+        let mut i = 0;
+        while i < db_len {
+            db[i] = db[i] ^ mask[i];
+            i += 1;
+        }
+        let top = 8 * em_len - em_bits;
+        if top > 0 { db[0] = db[0] & (0xffu16 >> top as u16) as u8; }
+        // EM, left-padded to the modulus's length.
+        let mut em: Vec<u8> = Vec::new();
+        em.resize(key.size() - em_len, 0);
+        em.extend_from_slice(db.as_slice());
+        em.extend_from_slice(h.as_slice());
+        em.push(0xbc);
+        key.private_op(em.as_slice())
     }
 }

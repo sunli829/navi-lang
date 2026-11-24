@@ -245,14 +245,9 @@ impl Curve {
         Some(self.p.to_be(&x))
     }
 
-    /// Whether (r, s) (big-endian) is the ECDSA signature of hash by the
-    /// key q (FIPS 186-4 6.4.2).
-    pub fn verify(&self, q: &Point, hash: &[u8], r: &[u8], s: &[u8]) -> bool {
+    // The hash as a scalar: its leftmost bits, as many as n has, mod n.
+    fn hash_scalar(&self, hash: &[u8]) -> Vec<u64> {
         let nm = &self.n;
-        let rv = match nm.from_be(r) { Some(v) => v, None => return false };
-        let sv = match nm.from_be(s) { Some(v) => v, None => return false };
-        if nm.is_zero(&rv) || nm.is_zero(&sv) { return false; }
-        // The hash's leftmost bits, as many as n has.
         let nb = nm.byte_len();
         let e_bytes = if hash.len() > nb { &hash[..nb] } else { hash };
         let mut padded: Vec<u8> = Vec::new();
@@ -268,7 +263,6 @@ impl Curve {
         }
         let shift = 8 * nb - nm.bits();
         if shift > 0 {
-            // (Not for P-256 and P-384, whose n are whole bytes.)
             let mut i = 0;
             while i < e.len() {
                 let hi = if i + 1 < e.len() { e[i + 1] << (64 - shift) } else { 0 };
@@ -276,7 +270,41 @@ impl Curve {
                 i += 1;
             }
         }
-        let e = nm.reduce_once(&e);
+        nm.reduce_once(&e)
+    }
+
+    /// An ECDSA signature (r, s), big-endian, of hash by the secret scalar
+    /// d (FIPS 186-4 6.4.1), with a random nonce; constant-time in d and
+    /// the nonce.
+    pub fn sign(&self, d: &[u8], hash: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let nm = &self.n;
+        let e = nm.to_mont(&self.hash_scalar(hash));
+        let dm = nm.to_mont(&nm.from_be(d).unwrap());
+        loop {
+            let k = self.random_scalar();
+            let (x, _) = match self.affine(&self.mul(&self.g, k.as_slice())) {
+                Some(a) => a,
+                None => continue,
+            };
+            // r = x mod n (x < p < 2n).
+            let r = nm.reduce_once(&x);
+            if nm.is_zero(&r) { continue; }
+            let kinv = nm.inv(&nm.to_mont(&nm.from_be(k.as_slice()).unwrap()));
+            // s = (e + r d) / k
+            let s = nm.from_mont(&nm.mont_mul(&kinv, &nm.add(&e, &nm.mont_mul(&nm.to_mont(&r), &dm))));
+            if nm.is_zero(&s) { continue; }
+            return (nm.to_be(&r), nm.to_be(&s));
+        }
+    }
+
+    /// Whether (r, s) (big-endian) is the ECDSA signature of hash by the
+    /// key q (FIPS 186-4 6.4.2).
+    pub fn verify(&self, q: &Point, hash: &[u8], r: &[u8], s: &[u8]) -> bool {
+        let nm = &self.n;
+        let rv = match nm.from_be(r) { Some(v) => v, None => return false };
+        let sv = match nm.from_be(s) { Some(v) => v, None => return false };
+        if nm.is_zero(&rv) || nm.is_zero(&sv) { return false; }
+        let e = self.hash_scalar(hash);
         let w = nm.inv(&nm.to_mont(&sv));
         let u1 = nm.from_mont(&nm.mont_mul(&nm.to_mont(&e), &w));
         let u2 = nm.from_mont(&nm.mont_mul(&nm.to_mont(&rv), &w));
@@ -381,6 +409,82 @@ impl<C: CurveId> Signature<C> {
         let mut v = self.r.clone();
         v.extend_from_slice(self.s.as_slice());
         v
+    }
+
+    /// The DER encoding: SEQUENCE { INTEGER r, INTEGER s }.
+    pub fn to_der(&self) -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        der_integer(&mut body, self.r.as_slice());
+        der_integer(&mut body, self.s.as_slice());
+        let mut out: Vec<u8> = Vec::new();
+        out.push(0x30);
+        der_push_len(&mut out, body.len());
+        out.extend_from_slice(body.as_slice());
+        out
+    }
+}
+
+fn der_push_len(out: &mut Vec<u8>, n: usize) {
+    if n < 0x80 {
+        out.push(n as u8);
+    } else if n < 0x100 {
+        out.push(0x81);
+        out.push(n as u8);
+    } else {
+        out.push(0x82);
+        out.push((n >> 8) as u8);
+        out.push(n as u8);
+    }
+}
+
+// An unsigned big-endian value as a DER INTEGER.
+fn der_integer(out: &mut Vec<u8>, v: &[u8]) {
+    let mut b = v;
+    while b.len() > 1 && b[0] == 0 { b = &b[1..]; }
+    let pad = b.len() > 0 && (b[0] & 0x80) != 0;
+    out.push(2);
+    der_push_len(out, b.len() + if pad { 1 } else { 0 });
+    if pad { out.push(0); }
+    out.extend_from_slice(b);
+}
+
+/// An ECDSA secret key.
+#[derive(Clone)]
+pub struct SigningKey<C: CurveId> {
+    d: Vec<u8>,
+    marker: PhantomData<C>,
+}
+
+impl<C: CurveId> SigningKey<C> {
+    /// A random key.
+    pub fn random() -> SigningKey<C> { SigningKey { d: C::curve().random_scalar(), marker: PhantomData } }
+
+    /// The key of the scalar d (big-endian, in [1, n); shorter is padded).
+    pub fn from_bytes(d: &[u8]) -> Result<SigningKey<C>, Error> {
+        let size = C::curve().size();
+        if d.len() > size { return Err(Error); }
+        let mut k: Vec<u8> = Vec::new();
+        k.resize(size - d.len(), 0);
+        k.extend_from_slice(d);
+        if !C::curve().valid_scalar(k.as_slice()) { return Err(Error); }
+        Ok(SigningKey { d: k, marker: PhantomData })
+    }
+
+    /// The scalar (big-endian, the curve's size).
+    pub fn to_bytes(&self) -> Vec<u8> { self.d.clone() }
+
+    pub fn verifying_key(&self) -> VerifyingKey<C> {
+        let c = C::curve();
+        VerifyingKey { q: c.decode(c.public_key(self.d.as_slice()).as_slice()).unwrap(), marker: PhantomData }
+    }
+
+    /// The signature of msg (hashed with the curve's hash).
+    pub fn sign(&self, msg: &[u8]) -> Signature<C> { self.sign_prehash(C::hash(msg).as_slice()).unwrap() }
+
+    /// The signature of a message's hash (any hash: its leftmost bits).
+    pub fn sign_prehash(&self, hash: &[u8]) -> Result<Signature<C>, Error> {
+        let (r, s) = C::curve().sign(self.d.as_slice(), hash);
+        Ok(Signature { r, s, marker: PhantomData })
     }
 }
 
