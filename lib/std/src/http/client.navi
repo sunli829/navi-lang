@@ -7,7 +7,8 @@ use crate::sync::Mutex;
 use crate::time::Duration;
 use crate::url::Url;
 use crate::http::{Body, Error, ErrorKind, HeaderMap, Method, Request, Response, StatusCode, Version};
-use crate::http::wire;
+use crate::http::wire::{self, NetStream};
+use crate::tls::{Certificate, TlsConnector};
 
 /// What can be turned into a URL (&str, String, Url).
 pub trait IntoUrl {
@@ -40,8 +41,8 @@ pub fn post<U: IntoUrl, B: Into<Body>>(url: U, body: B) -> Result<Response, Erro
 #[derive(Clone)]
 struct Conn {
     key: String,
-    stream: TcpStream,
-    r: &mut BufReader<TcpStream>,
+    stream: NetStream,
+    r: &mut BufReader<NetStream>,
 }
 
 /// Sends requests; clones share the connection pool.
@@ -54,6 +55,10 @@ pub struct Client {
     headers: HeaderMap,
     pool_max_idle: usize,
     pool: &Mutex<Vec<Conn>>,
+    tls_roots: Vec<Certificate>,
+    tls_built_in_roots: bool,
+    tls_invalid_certs: bool,
+    tls_invalid_hostnames: bool,
 }
 
 /// Configures a Client.
@@ -103,6 +108,35 @@ impl ClientBuilder {
         b
     }
 
+    /// Trusts cert for https (as a root), besides the system's.
+    pub fn add_root_certificate(&self, cert: Certificate) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.tls_roots.push(cert);
+        b
+    }
+
+    /// Whether https trusts the system's roots (default true).
+    pub fn tls_built_in_root_certs(&self, on: bool) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.tls_built_in_roots = on;
+        b
+    }
+
+    /// Accepts any server certificate for https (no checks at all: anyone
+    /// in the middle can read and change the traffic).
+    pub fn danger_accept_invalid_certs(&self, accept: bool) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.tls_invalid_certs = accept;
+        b
+    }
+
+    /// Accepts server certificates for other host names.
+    pub fn danger_accept_invalid_hostnames(&self, accept: bool) -> ClientBuilder {
+        let mut b = self.clone();
+        b.c.tls_invalid_hostnames = accept;
+        b
+    }
+
     pub fn build(&self) -> Result<Client, Error> { Ok(self.c.clone()) }
 }
 
@@ -112,7 +146,8 @@ impl Default for Client {
 
 impl Client {
     pub fn new() -> Client {
-        Client { timeout: None, connect_timeout: None, max_redirects: 10, user_agent: "navi-http/1.0".to_string(), headers: HeaderMap::new(), pool_max_idle: 32, pool: &Mutex::new(Vec::new()) }
+        Client { timeout: None, connect_timeout: None, max_redirects: 10, user_agent: "navi-http/1.0".to_string(), headers: HeaderMap::new(), pool_max_idle: 32, pool: &Mutex::new(Vec::new()),
+            tls_roots: Vec::new(), tls_built_in_roots: true, tls_invalid_certs: false, tls_invalid_hostnames: false }
     }
 
     pub fn builder() -> ClientBuilder { ClientBuilder { c: Client::new() } }
@@ -182,12 +217,8 @@ impl Client {
     // One request and its response's head.
     fn send_once(&self, req: &mut Request, timeout: Option<Duration>) -> Result<Response, Error> {
         let url = req.url.clone();
-        if url.scheme() == "https" {
-            let mut e = Error::new(ErrorKind::Builder, "https is not supported (std::http has no TLS)");
-            e.url = Some(url);
-            return Err(e);
-        }
-        if url.scheme() != "http" {
+        let https = url.scheme() == "https";
+        if url.scheme() != "http" && !https {
             let mut e = Error::new(ErrorKind::Builder, `unsupported URL scheme ${url.scheme()}`.to_string());
             e.url = Some(url);
             return Err(e);
@@ -196,8 +227,9 @@ impl Client {
             Some(h) => h.to_string(),
             None => return Err(Error::new(ErrorKind::Builder, "URL without a host")),
         };
-        let port = url.port_or_known_default().unwrap_or(80);
-        let key = `${host}:${port}`.to_string();
+        let port = url.port_or_known_default().unwrap_or(if https { 443 } else { 80 });
+        // (Pooled by scheme too: http and https to one port differ.)
+        let key = `${url.scheme()}://${host}:${port}`.to_string();
         let head = self.request_head(req, url.port().is_some(), host.as_str(), port);
         // A pooled connection may have been closed by the server: then the
         // request is sent again on a new one (if its body can be).
@@ -308,7 +340,8 @@ impl Client {
             match r {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
-                    return Ok(Conn { key: key.to_string(), stream: s.clone(), r: &mut BufReader::new(s) });
+                    let stream = if url.scheme() == "https" { self.tls_handshake(s, url, timeout)? } else { NetStream::plain(s) };
+                    return Ok(Conn { key: key.to_string(), stream: stream.clone(), r: &mut BufReader::new(stream) });
                 }
                 Err(e) => last = Some(e),
             }
@@ -327,6 +360,40 @@ impl Client {
         let mut x = Error::new(ErrorKind::Connect, msg);
         x.url = Some(url.clone());
         Err(x)
+    }
+
+    // The TLS handshake over s for url's host.
+    fn tls_handshake(&self, s: TcpStream, url: &Url, timeout: Option<Duration>) -> Result<NetStream, Error> {
+        let mut b = TlsConnector::builder();
+        for c in self.tls_roots.iter() { b.add_root_certificate(c.clone()); }
+        b.disable_built_in_roots(!self.tls_built_in_roots);
+        b.danger_accept_invalid_certs(self.tls_invalid_certs);
+        b.danger_accept_invalid_hostnames(self.tls_invalid_hostnames);
+        b.request_alpns(&["http/1.1"]);
+        let fail = |msg: String| -> Error {
+            let mut x = Error::new(ErrorKind::Connect, msg);
+            x.url = Some(url.clone());
+            x
+        };
+        let c = match b.build() {
+            Ok(c) => c,
+            Err(e) => return Err(fail(e.to_string())),
+        };
+        let host = match url.host() {
+            Some(crate::url::Host::Domain(d)) => d,
+            Some(crate::url::Host::Ipv4(a)) => a.to_string(),
+            Some(crate::url::Host::Ipv6(a)) => a.to_string(),
+            None => String::new(),
+        };
+        let _ = s.set_read_timeout(timeout);
+        let _ = s.set_write_timeout(timeout);
+        match c.connect(host.as_str(), s.clone()) {
+            Ok(t) => Ok(NetStream::tls(t)),
+            Err(e) => {
+                s.close();
+                Err(fail(e.to_string()))
+            }
+        }
     }
 
     fn round_trip(&self, conn: &mut Conn, req: &mut Request, head: &str, url: &Url) -> Result<Response, Error> {

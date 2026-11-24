@@ -165,7 +165,7 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 
 | 项目 | 参考 | navi | 原因 |
 |---|---|---|---|
-| TLS | reqwest 支持 https | 没有 TLS：https URL 返回 `ErrorKind::Builder` 错误 | 还没有 TLS 实现 |
+| TLS | reqwest 用 native-tls 或 rustls，支持 TLS 1.2 和 1.3 | https 走 `std::tls`，只有 TLS 1.3（只支持 1.2 的服务器握手失败）；`ClientBuilder::add_root_certificate`、`tls_built_in_root_certs`、`danger_accept_invalid_certs`、`danger_accept_invalid_hostnames` 同 reqwest；证书类型是 `crypto::x509::Certificate`（`http::Certificate`） | TLS 1.2 在后面做 |
 | `HeaderMap` | 键是 `HeaderName`，值是 `HeaderValue` | 键和值都是字符串：`get` 返回 `Option<&str>`，`get_all` 返回 `Vec<&str>`；名字不区分大小写，存成小写，按插入顺序保留多个值 | 简化 |
 | `Request<T>` / `Response<T>` | 泛型 body | 不带类型参数，body 是 `Body`（字节或 `&mut dyn Read`）；收到的消息的 body 从连接上读 | 简化 |
 | `Method` | `Method::GET` 等常量 | 相同；不是 `Copy`（值类型，赋值即拷贝） | 没有 `Copy` |
@@ -179,6 +179,17 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | 未读完的请求体 | Go 读掉最多 256 KiB 后复用连接 | 相同 | — |
 | 路由 | Go 1.22 `ServeMux` 模式 | 支持 `[METHOD ][HOST]/path`、`{name}`、`{name...}`、`{$}`、末尾 `/` 的子树、404/405（带 `Allow`）、子树根补斜杠的 301；不做路径清理（`//`、`..`）的重定向；冲突检查只查完全相同的模式 | 简化 |
 | HTTP/2、代理、Cookie jar、压缩 | reqwest 有 | 没有 | 暂不需要 |
+
+### std::tls（API 照 native-tls crate，实现照 Go 的 crypto/tls）
+
+| 项目 | native-tls | navi | 原因 |
+|---|---|---|---|
+| 实现 | 调系统的 TLS 库（OpenSSL、Secure Transport、SChannel） | 纯 navi 实现（同 Go），证书验证用 `crypto::x509`（macOS、Windows 上是系统的验证器） | 用户选择照 Go 自己实现 |
+| 版本 | 系统支持的都行 | 只有 TLS 1.3 客户端；`max_protocol_version` 只能是 1.3 | TLS 1.2 和服务端在后面做 |
+| `connect` | 返回 `Result<TlsStream<S>, HandshakeError<S>>`（可能 `WouldBlock`） | 返回 `Result<TlsStream<S>, Error>`；流都是阻塞的 | 没有非阻塞流 |
+| `Certificate` | `native_tls::Certificate` | 就是 `crypto::x509::Certificate` | 不需要两个类型 |
+| `Identity`（客户端证书）、会话恢复、0-RTT | 有 | 没有；服务器要求客户端证书时发空的 | 暂不需要 |
+| 没有 close_notify 就断开 | 视实现而定 | 记录边界上的断开当作数据结束（同 Go） | 很多服务器这样关连接 |
 
 ### std::regex（regex crate）
 

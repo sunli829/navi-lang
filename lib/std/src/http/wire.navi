@@ -3,6 +3,60 @@
 
 use crate::io::{self, Read, Write, BufRead, BufReader};
 use crate::net::TcpStream;
+use crate::time::Duration;
+use crate::tls::TlsStream;
+
+/// A connection's stream: TCP, or TLS over TCP (whose state the copies
+/// share).
+#[derive(Clone)]
+pub(crate) struct NetStream {
+    pub tcp: TcpStream,
+    tls: Option<&mut TlsStream<TcpStream>>,
+}
+
+impl NetStream {
+    pub fn plain(tcp: TcpStream) -> NetStream { NetStream { tcp, tls: None } }
+
+    pub fn tls(mut s: TlsStream<TcpStream>) -> NetStream {
+        let tcp = s.get_ref().clone();
+        NetStream { tcp, tls: Some(&mut s) }
+    }
+
+    pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> { self.tcp.set_read_timeout(d) }
+
+    pub fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> { self.tcp.set_write_timeout(d) }
+
+    /// Closes the connection (after TLS's close_notify).
+    pub fn close(&self) {
+        if let Some(t) = &self.tls { let _ = t.shutdown(); }
+        self.tcp.close();
+    }
+}
+
+impl Read for NetStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &self.tls {
+            Some(t) => t.read(buf),
+            None => self.tcp.read(buf),
+        }
+    }
+}
+
+impl Write for NetStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match &self.tls {
+            Some(t) => t.write(buf),
+            None => self.tcp.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &self.tls {
+            Some(t) => t.flush(),
+            None => self.tcp.flush(),
+        }
+    }
+}
 use crate::url::Url;
 use crate::http::{Body, HeaderMap, is_token};
 
@@ -21,7 +75,7 @@ fn bad(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, msg)
 
 /// Reads a line ending in LF (CRLF or LF; without them). None at the end of
 /// the stream before any byte.
-pub(crate) fn read_line(r: &mut BufReader<TcpStream>, max: usize) -> io::Result<Option<String>> {
+pub(crate) fn read_line(r: &mut BufReader<NetStream>, max: usize) -> io::Result<Option<String>> {
     let mut v: Vec<u8> = Vec::new();
     loop {
         let (n, found) = {
@@ -50,7 +104,7 @@ pub(crate) fn read_line(r: &mut BufReader<TcpStream>, max: usize) -> io::Result<
 }
 
 /// Reads header fields up to the empty line (at most max bytes).
-pub(crate) fn read_headers(r: &mut BufReader<TcpStream>, max: usize) -> io::Result<HeaderMap> {
+pub(crate) fn read_headers(r: &mut BufReader<NetStream>, max: usize) -> io::Result<HeaderMap> {
     let mut h = HeaderMap::new();
     let mut total = 0;
     loop {
@@ -81,7 +135,7 @@ pub(crate) const TO_CLOSE: u8 = 2;
 /// A received body read from the connection: Content-Length bytes,
 /// chunked, or up to the end of the connection.
 pub(crate) struct Incoming {
-    r: &mut BufReader<TcpStream>,
+    r: &mut BufReader<NetStream>,
     mode: u8,
     // Bytes left of the body (LEN) or of the chunk (CHUNKED).
     remaining: u64,
@@ -91,7 +145,7 @@ pub(crate) struct Incoming {
     pub(crate) failed: bool,
 }
 
-pub(crate) fn incoming(r: &mut BufReader<TcpStream>, mode: u8, len: u64) -> &mut Incoming {
+pub(crate) fn incoming(r: &mut BufReader<NetStream>, mode: u8, len: u64) -> &mut Incoming {
     let inc = &mut Incoming { r, mode, remaining: len, done: false, on_done: None, failed: false };
     if mode == LEN && len == 0 { inc.done = true; }
     inc
@@ -225,7 +279,7 @@ pub(crate) fn framing(h: &HeaderMap) -> io::Result<(u8, u64)> {
 }
 
 /// Writes the body (chunked: in chunks, ending with the last chunk).
-pub(crate) fn write_body(w: &mut TcpStream, body: &mut Body, chunked: bool) -> io::Result<()> {
+pub(crate) fn write_body<W: Write>(w: &mut W, body: &mut Body, chunked: bool) -> io::Result<()> {
     if let Some(b) = body.as_bytes() {
         if b.len() == 0 {
             if chunked { w.write_all(b"0\r\n\r\n")?; }
