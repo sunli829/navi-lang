@@ -1,8 +1,8 @@
 //! CSV reading and writing (as Go's encoding/csv, with the API of Rust's
 //! csv crate): RFC 4180 quoting, configurable delimiters, quotes,
 //! escapes, comments and trimming, records as StringRecord or ByteRecord,
-//! and records to and from structs by header names (through
-//! std::reflect, as std::json does).
+//! and records to and from types that implement std::serde's Serialize and
+//! Deserialize (structs by header names, as the crate's).
 //!
 //!     let mut rdr = Reader::from_reader(data.as_bytes());
 //!     for rec in rdr.records() {
@@ -18,7 +18,8 @@
 
 use crate::fmt::{self, Display, Debug, Formatter};
 use crate::io::{self, Read, Write};
-use crate::reflect::{self, Kind, Value};
+use crate::serde::ser::{self, Serialize, Serializer, SerializeSeq, SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, SerializeMap, SerializeStruct, SerializeStructVariant};
+use crate::serde::de::{self, Deserialize, Deserializer, Visitor, SeqAccess, MapAccess, EnumAccess, VariantAccess};
 
 // --- Records and positions -----------------------------------------------------------
 
@@ -554,7 +555,7 @@ impl<R: Read> Reader<R> {
 
     /// The records as values of D (structs by header names, or by
     /// position without headers; tuples and Vecs by position).
-    pub fn deserialize<D>(&mut self) -> DeserializeRecordsIter<R, D> { DeserializeRecordsIter { r: self, t: crate::marker::PhantomData } }
+    pub fn deserialize<D: Deserialize>(&mut self) -> DeserializeRecordsIter<R, D> { DeserializeRecordsIter { r: self, t: crate::marker::PhantomData } }
 
     /// The position of the next record.
     pub fn position(&self) -> Position { Position { byte: self.byte, line: self.line, record: self.record } }
@@ -604,7 +605,7 @@ pub struct DeserializeRecordsIter<R: Read, D> {
     t: crate::marker::PhantomData<D>,
 }
 
-impl<R: Read, D> Iterator for DeserializeRecordsIter<R, D> {
+impl<R: Read, D: Deserialize> Iterator for DeserializeRecordsIter<R, D> {
     type Item = Result<D>;
     fn next(&mut self) -> Option<Result<D>> {
         let mut rec = StringRecord::new();
@@ -614,9 +615,8 @@ impl<R: Read, D> Iterator for DeserializeRecordsIter<R, D> {
             Err(e) => return Some(Err(e)),
         }
         let headers = self.r.headers.clone();
-        let v = Value::new(reflect::type_of::<D>());
-        match fill(&v, &rec, &headers) {
-            Ok(()) => Some(Ok(unsafe { (v.as_ptr() as *const D).read() })),
+        match D::deserialize(RecordReader { rec: &rec, headers: &headers }) {
+            Ok(v) => Some(Ok(v)),
             Err(err) => Some(Err(Error { kind: ErrorKind::Deserialize { pos: rec.pos.clone(), err } })),
         }
     }
@@ -626,134 +626,178 @@ fn derr(field: Option<usize>, msg: String) -> DeserializeError {
     DeserializeError { field: match field { Some(f) => Some(f as u64), None => None }, msg }
 }
 
-// Fills v (a new value) from the record.
-fn fill(v: &Value, rec: &StringRecord, headers: &Option<StringRecord>) -> crate::result::Result<(), DeserializeError> {
-    let mut t = v.clone();
-    match t.kind() {
-        Kind::Struct => {
-            let n = t.num_fields();
-            let names = t.ty().fields();
-            let mut k = 0;
-            while k < n {
-                let fname = names[k].name;
-                let idx = match headers {
-                    Some(h) => {
-                        let mut found: Option<usize> = None;
-                        let mut i = 0;
-                        while i < h.len() {
-                            if h.get(i).unwrap() == fname { found = Some(i); }
-                            i += 1;
-                        }
-                        found
-                    }
-                    None => if k < rec.len() { Some(k) } else { None },
-                };
-                let mut f = t.field(k);
-                match idx {
-                    Some(i) => match rec.get(i) {
-                        Some(s) => set_from(&mut f, s, i)?,
-                        None => if !is_option(&f) { return Err(derr(None, `missing field \`${fname}\``.to_string())); },
-                    },
-                    None => if !is_option(&f) { return Err(derr(None, `missing field \`${fname}\``.to_string())); },
-                }
-                k += 1;
-            }
-            Ok(())
+impl de::Error for DeserializeError {
+    fn custom<T: Display>(msg: T) -> DeserializeError { derr(None, msg.to_string()) }
+}
+
+// An error of field i (unless it says its field already).
+fn at_field(e: DeserializeError, i: usize) -> DeserializeError {
+    if e.field.is_some() { e } else { derr(Some(i), e.msg) }
+}
+
+// A record as a value: a struct or map by header names (by position
+// without headers), a tuple or sequence by position, else its first field.
+struct RecordReader {
+    rec: &StringRecord,
+    headers: &Option<StringRecord>,
+}
+
+impl Deserializer for RecordReader {
+    type Error = DeserializeError;
+    fn deserialize_any<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        if self.rec.len() == 0 { return Err(derr(None, "no fields".to_string())); }
+        let f = FieldReader { s: self.rec.get(0).unwrap(), i: 0 };
+        match f.deserialize_any(v) {
+            Ok(x) => Ok(x),
+            Err(e) => Err(at_field(e, 0)),
         }
-        Kind::Tuple | Kind::Array => {
-            let tuple = t.kind() == Kind::Tuple;
-            let n = if tuple { t.num_fields() } else { t.ty().len() };
-            if rec.len() < n { return Err(derr(None, `invalid length ${rec.len()}, expected ${n} fields`.to_string())); }
-            let mut k = 0;
-            while k < n {
-                let mut f = if tuple { t.field(k) } else { t.index(k) };
-                set_from(&mut f, rec.get(k).unwrap(), k)?;
-                k += 1;
-            }
-            Ok(())
+    }
+    fn deserialize_option<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        if self.rec.len() == 0 { return v.visit_none(); }
+        v.visit_some(self)
+    }
+    fn deserialize_seq<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { v.visit_seq(Fields { rec: self.rec, i: 0 }) }
+    fn deserialize_tuple<V: Visitor>(self, len: usize, v: V) -> crate::result::Result<V::Value, DeserializeError> { v.visit_seq(Fields { rec: self.rec, i: 0 }) }
+    fn deserialize_tuple_struct<V: Visitor>(self, name: &str, len: usize, v: V) -> crate::result::Result<V::Value, DeserializeError> { v.visit_seq(Fields { rec: self.rec, i: 0 }) }
+    fn deserialize_map<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        match self.headers {
+            Some(h) => v.visit_map(Named { rec: self.rec, headers: h, i: 0 }),
+            None => Err(derr(None, "a map needs a header row".to_string())),
         }
-        Kind::Vec => {
-            let mut i = 0;
-            while i < rec.len() {
-                let mut e = t.push();
-                set_from(&mut e, rec.get(i).unwrap(), i)?;
-                i += 1;
-            }
-            Ok(())
-        }
-        _ => {
-            if rec.len() == 0 { return Err(derr(None, "no fields".to_string())); }
-            set_from(&mut t, rec.get(0).unwrap(), 0)
+    }
+    fn deserialize_struct<V: Visitor>(self, name: &str, fields: &[&str], v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        match self.headers {
+            Some(h) => v.visit_map(Named { rec: self.rec, headers: h, i: 0 }),
+            None => v.visit_seq(Fields { rec: self.rec, i: 0 }),
         }
     }
 }
 
-fn is_option(v: &Value) -> bool {
-    if v.kind() != Kind::Enum { return false; }
-    let vs = v.ty().variants();
-    vs.len() == 2 && vs[0].name == "None" && vs[1].name == "Some"
+// A record's fields in order.
+struct Fields {
+    rec: &StringRecord,
+    i: usize,
 }
 
-// Sets a field from its text (field i of the record).
-fn set_from(v: &mut Value, s: &str, i: usize) -> crate::result::Result<(), DeserializeError> {
-    if is_option(v) {
-        if s.len() == 0 {
-            v.set_variant(0);
-            return Ok(());
-        }
-        v.set_variant(1);
-        let mut inner = v.variant_field(0);
-        // As the crate: a value that does not parse is None.
-        if set_from(&mut inner, s, i).is_err() { v.set_variant(0); }
-        return Ok(());
-    }
-    match v.kind() {
-        Kind::Bool => match s {
-            "true" => v.set_bool(true),
-            "false" => v.set_bool(false),
-            _ => return Err(derr(Some(i), "provided string was not `true` or `false`".to_string())),
-        },
-        Kind::Char => {
-            let mut cs = s.chars();
-            match (cs.next(), cs.next()) {
-                (Some(c), None) => v.set_char(c),
-                _ => return Err(derr(Some(i), `expected single character but got ${s.chars().count()} characters in '${s}'`.to_string())),
-            }
-        }
-        Kind::F32 | Kind::F64 => match s.parse::<f64>() {
-            Ok(x) => v.set_f64(x),
-            Err(e) => return Err(derr(Some(i), e.to_string())),
-        },
-        _ => {
-            if v.is_int() {
-                if v.is_signed() {
-                    match s.parse::<i128>() {
-                        Ok(x) => v.set_i128(x),
-                        Err(e) => return Err(derr(Some(i), e.to_string())),
-                    }
-                } else {
-                    match s.parse::<u64>() {
-                        Ok(x) => v.set_u64(x),
-                        Err(e) => return Err(derr(Some(i), e.to_string())),
-                    }
-                }
-                return Ok(());
-            }
-            if v.is_str() {
-                v.set_str(s);
-                return Ok(());
-            }
-            if v.kind() == Kind::Enum {
-                match v.variant_named(s) {
-                    Some(k) => v.set_variant(k),
-                    None => return Err(derr(Some(i), `unknown variant \`${s}\``.to_string())),
-                }
-                return Ok(());
-            }
-            return Err(derr(Some(i), `unsupported type ${v.ty().name()}`.to_string()));
+impl SeqAccess for Fields {
+    type Error = DeserializeError;
+    fn next_element<T: Deserialize>(&mut self) -> crate::result::Result<Option<T>, DeserializeError> {
+        if self.i >= self.rec.len() { return Ok(None); }
+        let i = self.i;
+        self.i += 1;
+        match T::deserialize(FieldReader { s: self.rec.get(i).unwrap(), i }) {
+            Ok(x) => Ok(Some(x)),
+            Err(e) => Err(at_field(e, i)),
         }
     }
-    Ok(())
+    fn size_hint(&self) -> Option<usize> { Some(self.rec.len() - self.i) }
+}
+
+// A record's fields by header name.
+struct Named {
+    rec: &StringRecord,
+    headers: &StringRecord,
+    i: usize,
+}
+
+impl MapAccess for Named {
+    type Error = DeserializeError;
+    fn next_key<K: Deserialize>(&mut self) -> crate::result::Result<Option<K>, DeserializeError> {
+        if self.i >= self.headers.len() || self.i >= self.rec.len() { return Ok(None); }
+        Ok(Some(K::deserialize(FieldReader { s: self.headers.get(self.i).unwrap(), i: self.i })?))
+    }
+    fn next_value<T: Deserialize>(&mut self) -> crate::result::Result<T, DeserializeError> {
+        let i = self.i;
+        self.i += 1;
+        match T::deserialize(FieldReader { s: self.rec.get(i).unwrap(), i }) {
+            Ok(x) => Ok(x),
+            Err(e) => Err(at_field(e, i)),
+        }
+    }
+}
+
+// A field's text as the value its type asks for.
+struct FieldReader {
+    s: &str,
+    i: usize,
+}
+
+impl FieldReader {
+    fn fail<T>(&self, msg: String) -> crate::result::Result<T, DeserializeError> { Err(derr(Some(self.i), msg)) }
+}
+
+impl Deserializer for FieldReader {
+    type Error = DeserializeError;
+    fn deserialize_any<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { v.visit_str(self.s) }
+    fn deserialize_bool<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        match self.s {
+            "true" => v.visit_bool(true),
+            "false" => v.visit_bool(false),
+            _ => self.fail("provided string was not `true` or `false`".to_string()),
+        }
+    }
+    fn deserialize_i8<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { self.deserialize_i64(v) }
+    fn deserialize_i16<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { self.deserialize_i64(v) }
+    fn deserialize_i32<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { self.deserialize_i64(v) }
+    fn deserialize_i64<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        match self.s.parse::<i64>() { Ok(x) => v.visit_i64(x), Err(e) => self.fail(e.to_string()) }
+    }
+    fn deserialize_u8<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { self.deserialize_u64(v) }
+    fn deserialize_u16<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { self.deserialize_u64(v) }
+    fn deserialize_u32<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { self.deserialize_u64(v) }
+    fn deserialize_u64<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        match self.s.parse::<u64>() { Ok(x) => v.visit_u64(x), Err(e) => self.fail(e.to_string()) }
+    }
+    fn deserialize_f32<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> { self.deserialize_f64(v) }
+    fn deserialize_f64<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        match self.s.parse::<f64>() { Ok(x) => v.visit_f64(x), Err(e) => self.fail(e.to_string()) }
+    }
+    fn deserialize_char<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        let mut cs = self.s.chars();
+        match (cs.next(), cs.next()) {
+            (Some(c), None) => v.visit_char(c),
+            _ => self.fail(`expected single character but got ${self.s.chars().count()} characters in '${self.s}'`.to_string()),
+        }
+    }
+    fn deserialize_option<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        if self.s.len() == 0 { return v.visit_none(); }
+        v.visit_some(self)
+    }
+    fn deserialize_unit<V: Visitor>(self, v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        if self.s.len() == 0 { return v.visit_unit(); }
+        self.fail(`expected an empty field but got '${self.s}'`.to_string())
+    }
+    fn deserialize_newtype_struct<V: Visitor>(self, name: &str, v: V) -> crate::result::Result<V::Value, DeserializeError> { v.visit_newtype_struct(self) }
+    fn deserialize_enum<V: Visitor>(self, name: &str, variants: &[&str], v: V) -> crate::result::Result<V::Value, DeserializeError> {
+        v.visit_enum(UnitVariant { s: self.s, i: self.i })
+    }
+}
+
+// A unit variant named by a field.
+struct UnitVariant {
+    s: &str,
+    i: usize,
+}
+
+impl EnumAccess for UnitVariant {
+    type Error = DeserializeError;
+    type Variant = UnitOnly;
+    fn variant<V: Deserialize>(self) -> crate::result::Result<(V, UnitOnly), DeserializeError> {
+        let v = V::deserialize(FieldReader { s: self.s, i: self.i })?;
+        Ok((v, UnitOnly { i: self.i }))
+    }
+}
+
+struct UnitOnly {
+    i: usize,
+}
+
+impl VariantAccess for UnitOnly {
+    type Error = DeserializeError;
+    fn unit_variant(self) -> crate::result::Result<(), DeserializeError> { Ok(()) }
+    fn newtype_variant<T: Deserialize>(self) -> crate::result::Result<T, DeserializeError> { Err(derr(Some(self.i), "a field holds a unit variant only".to_string())) }
+    fn tuple_variant<V: Visitor>(self, len: usize, v: V) -> crate::result::Result<V::Value, DeserializeError> { Err(derr(Some(self.i), "a field holds a unit variant only".to_string())) }
+    fn struct_variant<V: Visitor>(self, fields: &[&str], v: V) -> crate::result::Result<V::Value, DeserializeError> { Err(derr(Some(self.i), "a field holds a unit variant only".to_string())) }
 }
 
 // --- Writing -------------------------------------------------------------------------
@@ -902,34 +946,15 @@ impl<W: Write> Writer<W> {
     /// Writes x as a record: a struct's fields (after a header row of its
     /// field names, the first time, with has_headers), or a tuple's,
     /// array's or Vec's elements, or one value.
-    pub fn serialize<T>(&mut self, x: &T) -> Result<()> {
-        let v = reflect::value_of(x);
-        if v.kind() == Kind::Struct && self.cfg.has_headers && !self.header_done {
+    pub fn serialize<T: Serialize>(&mut self, x: &T) -> Result<()> {
+        let rec = &mut RecordWriter { names: Vec::new(), fields: Vec::new(), is_struct: false };
+        x.serialize(&mut *rec)?;
+        if rec.is_struct && self.cfg.has_headers && !self.header_done {
             self.header_done = true;
-            let mut names: Vec<String> = Vec::new();
-            for f in v.ty().fields().iter() { names.push(f.name.to_string()); }
-            self.write_record(names.iter())?;
+            self.write_record(rec.names.iter())?;
         }
         self.header_done = true;
-        let mut fields: Vec<String> = Vec::new();
-        match v.kind() {
-            Kind::Struct | Kind::Tuple => {
-                let mut i = 0;
-                while i < v.num_fields() {
-                    fields.push(text_of(&v.field(i))?);
-                    i += 1;
-                }
-            }
-            Kind::Array | Kind::Vec => {
-                let mut i = 0;
-                while i < v.len() {
-                    fields.push(text_of(&v.index(i))?);
-                    i += 1;
-                }
-            }
-            _ => fields.push(text_of(&v)?),
-        }
-        self.write_record(fields.iter())
+        self.write_record(rec.fields.iter())
     }
 
     fn flush_buf(&mut self) -> Result<()> {
@@ -956,23 +981,204 @@ impl<W: Write> Writer<W> {
     pub fn get_ref(&self) -> &W { &self.wtr }
 }
 
-// The text of a serialized value.
-fn text_of(v: &Value) -> Result<String> {
-    if is_option(v) {
-        if v.variant() == 0 { return Ok(String::new()); }
-        return text_of(&v.variant_field(0));
+impl ser::Error for Error {
+    fn custom<T: Display>(msg: T) -> Error { Error { kind: ErrorKind::Serialize(msg.to_string()) } }
+}
+
+fn not_field(what: &str) -> Error { Error { kind: ErrorKind::Serialize(`cannot serialize ${what} as a field`.to_string()) } }
+
+// A record being serialized: its fields' texts (and a struct's field names).
+struct RecordWriter {
+    names: Vec<String>,
+    fields: Vec<String>,
+    is_struct: bool,
+}
+
+impl Serializer for &mut RecordWriter {
+    type Ok = ();
+    type Error = Error;
+    type SerializeSeq = RecordFields;
+    type SerializeTuple = RecordFields;
+    type SerializeTupleStruct = RecordFields;
+    type SerializeTupleVariant = RecordFields;
+    type SerializeMap = RecordFields;
+    type SerializeStruct = RecordFields;
+    type SerializeStructVariant = RecordFields;
+
+    fn serialize_bool(self, v: bool) -> Result<()> { self.one(FieldWriter.serialize_bool(v)?) }
+    fn serialize_i64(self, v: i64) -> Result<()> { self.one(FieldWriter.serialize_i64(v)?) }
+    fn serialize_u64(self, v: u64) -> Result<()> { self.one(FieldWriter.serialize_u64(v)?) }
+    fn serialize_f32(self, v: f32) -> Result<()> { self.one(FieldWriter.serialize_f32(v)?) }
+    fn serialize_f64(self, v: f64) -> Result<()> { self.one(FieldWriter.serialize_f64(v)?) }
+    fn serialize_str(self, v: &str) -> Result<()> { self.one(v.to_string()) }
+    fn serialize_bytes(self, v: &[u8]) -> Result<()> { Err(not_field("bytes")) }
+    fn serialize_none(self) -> Result<()> { self.one(String::new()) }
+    fn serialize_some<T: Serialize>(self, value: &T) -> Result<()> { value.serialize(self) }
+    fn serialize_unit(self) -> Result<()> { self.one(String::new()) }
+    fn serialize_unit_struct(self, name: &str) -> Result<()> { self.one(String::new()) }
+    fn serialize_unit_variant(self, name: &str, variant_index: u32, variant: &str) -> Result<()> { self.one(variant.to_string()) }
+    fn serialize_newtype_struct<T: Serialize>(self, name: &str, value: &T) -> Result<()> { value.serialize(self) }
+    fn serialize_newtype_variant<T: Serialize>(self, name: &str, variant_index: u32, variant: &str, value: &T) -> Result<()> { Err(not_field("a newtype variant")) }
+    fn serialize_seq(self, len: Option<usize>) -> Result<RecordFields> { Ok(RecordFields { rec: self }) }
+    fn serialize_tuple(self, len: usize) -> Result<RecordFields> { Ok(RecordFields { rec: self }) }
+    fn serialize_tuple_struct(self, name: &str, len: usize) -> Result<RecordFields> { Ok(RecordFields { rec: self }) }
+    fn serialize_tuple_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<RecordFields> { Err(not_field("a tuple variant")) }
+    fn serialize_map(self, len: Option<usize>) -> Result<RecordFields> { Err(not_field("a map")) }
+    fn serialize_struct(self, name: &str, len: usize) -> Result<RecordFields> {
+        self.is_struct = true;
+        Ok(RecordFields { rec: self })
     }
-    if v.kind() == Kind::Ref { return text_of(&v.deref()); }
-    match v.kind() {
-        Kind::Bool => Ok(if v.as_bool() { "true".to_string() } else { "false".to_string() }),
-        Kind::Char => Ok(v.as_char().to_string()),
-        Kind::F32 => Ok(`${v.as_f64() as f32:?}`.to_string()),
-        Kind::F64 => Ok(`${v.as_f64():?}`.to_string()),
-        _ => {
-            if v.is_int() { return Ok(if v.is_signed() { v.as_i128().to_string() } else { (v.as_i128() as u128).to_string() }); }
-            if v.is_str() { return Ok(v.as_str().to_string()); }
-            if v.kind() == Kind::Enum && v.num_variant_fields() == 0 { return Ok(v.variant_name().to_string()); }
-            Err(Error { kind: ErrorKind::Serialize(`cannot serialize ${v.ty().name()} as a field`.to_string()) })
-        }
+    fn serialize_struct_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<RecordFields> { Err(not_field("a struct variant")) }
+}
+
+impl RecordWriter {
+    fn one(&mut self, s: String) -> Result<()> {
+        self.fields.push(s);
+        Ok(())
     }
+}
+
+// The fields of a record (a struct's, tuple's or sequence's).
+struct RecordFields {
+    rec: &mut RecordWriter,
+}
+
+impl RecordFields {
+    fn add<T: Serialize>(&mut self, value: &T) -> Result<()> {
+        let s = value.serialize(FieldWriter)?;
+        self.rec.fields.push(s);
+        Ok(())
+    }
+}
+
+impl SerializeSeq for RecordFields {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_element<T: Serialize>(&mut self, value: &T) -> Result<()> { self.add(value) }
+    fn end(self) -> Result<()> { Ok(()) }
+}
+impl SerializeTuple for RecordFields {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_element<T: Serialize>(&mut self, value: &T) -> Result<()> { self.add(value) }
+    fn end(self) -> Result<()> { Ok(()) }
+}
+impl SerializeTupleStruct for RecordFields {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, value: &T) -> Result<()> { self.add(value) }
+    fn end(self) -> Result<()> { Ok(()) }
+}
+impl SerializeTupleVariant for RecordFields {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, value: &T) -> Result<()> { self.add(value) }
+    fn end(self) -> Result<()> { Ok(()) }
+}
+impl SerializeMap for RecordFields {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_key<T: Serialize>(&mut self, key: &T) -> Result<()> { Err(not_field("a map")) }
+    fn serialize_value<T: Serialize>(&mut self, value: &T) -> Result<()> { Err(not_field("a map")) }
+    fn end(self) -> Result<()> { Ok(()) }
+}
+impl SerializeStruct for RecordFields {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> {
+        self.rec.names.push(key.to_string());
+        self.add(value)
+    }
+    fn end(self) -> Result<()> { Ok(()) }
+}
+impl SerializeStructVariant for RecordFields {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> { Err(not_field("a struct variant")) }
+    fn end(self) -> Result<()> { Ok(()) }
+}
+
+// A field's text (a scalar, an Option of one, or a unit variant's name).
+struct FieldWriter;
+
+impl Serializer for FieldWriter {
+    type Ok = String;
+    type Error = Error;
+    type SerializeSeq = NoCompound;
+    type SerializeTuple = NoCompound;
+    type SerializeTupleStruct = NoCompound;
+    type SerializeTupleVariant = NoCompound;
+    type SerializeMap = NoCompound;
+    type SerializeStruct = NoCompound;
+    type SerializeStructVariant = NoCompound;
+
+    fn serialize_bool(self, v: bool) -> Result<String> { Ok(if v { "true".to_string() } else { "false".to_string() }) }
+    fn serialize_i64(self, v: i64) -> Result<String> { Ok(v.to_string()) }
+    fn serialize_u64(self, v: u64) -> Result<String> { Ok(v.to_string()) }
+    fn serialize_f32(self, v: f32) -> Result<String> { Ok(`${v:?}`.to_string()) }
+    fn serialize_f64(self, v: f64) -> Result<String> { Ok(`${v:?}`.to_string()) }
+    fn serialize_char(self, v: char) -> Result<String> { Ok(v.to_string()) }
+    fn serialize_str(self, v: &str) -> Result<String> { Ok(v.to_string()) }
+    fn serialize_bytes(self, v: &[u8]) -> Result<String> { Err(not_field("bytes")) }
+    fn serialize_none(self) -> Result<String> { Ok(String::new()) }
+    fn serialize_some<T: Serialize>(self, value: &T) -> Result<String> { value.serialize(self) }
+    fn serialize_unit(self) -> Result<String> { Ok(String::new()) }
+    fn serialize_unit_struct(self, name: &str) -> Result<String> { Ok(String::new()) }
+    fn serialize_unit_variant(self, name: &str, variant_index: u32, variant: &str) -> Result<String> { Ok(variant.to_string()) }
+    fn serialize_newtype_struct<T: Serialize>(self, name: &str, value: &T) -> Result<String> { value.serialize(self) }
+    fn serialize_newtype_variant<T: Serialize>(self, name: &str, variant_index: u32, variant: &str, value: &T) -> Result<String> { Err(not_field(`variant ${name}::${variant}`.to_string().as_str())) }
+    fn serialize_seq(self, len: Option<usize>) -> Result<NoCompound> { Err(not_field("a sequence")) }
+    fn serialize_tuple(self, len: usize) -> Result<NoCompound> { Err(not_field("a tuple")) }
+    fn serialize_tuple_struct(self, name: &str, len: usize) -> Result<NoCompound> { Err(not_field(name)) }
+    fn serialize_tuple_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<NoCompound> { Err(not_field(`variant ${name}::${variant}`.to_string().as_str())) }
+    fn serialize_map(self, len: Option<usize>) -> Result<NoCompound> { Err(not_field("a map")) }
+    fn serialize_struct(self, name: &str, len: usize) -> Result<NoCompound> { Err(not_field(name)) }
+    fn serialize_struct_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<NoCompound> { Err(not_field(`variant ${name}::${variant}`.to_string().as_str())) }
+}
+
+// (A field holds no compound value: FieldWriter refuses them first.)
+struct NoCompound;
+
+impl SerializeSeq for NoCompound {
+    type Ok = String;
+    type Error = Error;
+    fn serialize_element<T: Serialize>(&mut self, value: &T) -> Result<()> { Ok(()) }
+    fn end(self) -> Result<String> { Ok(String::new()) }
+}
+impl SerializeTuple for NoCompound {
+    type Ok = String;
+    type Error = Error;
+    fn serialize_element<T: Serialize>(&mut self, value: &T) -> Result<()> { Ok(()) }
+    fn end(self) -> Result<String> { Ok(String::new()) }
+}
+impl SerializeTupleStruct for NoCompound {
+    type Ok = String;
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, value: &T) -> Result<()> { Ok(()) }
+    fn end(self) -> Result<String> { Ok(String::new()) }
+}
+impl SerializeTupleVariant for NoCompound {
+    type Ok = String;
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, value: &T) -> Result<()> { Ok(()) }
+    fn end(self) -> Result<String> { Ok(String::new()) }
+}
+impl SerializeMap for NoCompound {
+    type Ok = String;
+    type Error = Error;
+    fn serialize_key<T: Serialize>(&mut self, key: &T) -> Result<()> { Ok(()) }
+    fn serialize_value<T: Serialize>(&mut self, value: &T) -> Result<()> { Ok(()) }
+    fn end(self) -> Result<String> { Ok(String::new()) }
+}
+impl SerializeStruct for NoCompound {
+    type Ok = String;
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> { Ok(()) }
+    fn end(self) -> Result<String> { Ok(String::new()) }
+}
+impl SerializeStructVariant for NoCompound {
+    type Ok = String;
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> { Ok(()) }
+    fn end(self) -> Result<String> { Ok(String::new()) }
 }

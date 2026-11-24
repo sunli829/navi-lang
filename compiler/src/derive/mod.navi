@@ -13,11 +13,13 @@ use crate::syntax::ast::*;
 use crate::syntax::print;
 use crate::syntax::token;
 
+pub mod serde;
+
 /// Whether derive name expands here (as source) rather than in the type
 /// checker and MIR shims.
 pub fn expanded(name: &str) -> bool {
     match name {
-        "Clone" | "Default" | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash" | "Debug" => true,
+        "Clone" | "Default" | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash" | "Debug" | "Serialize" | "Deserialize" => true,
         _ => false,
     }
 }
@@ -59,6 +61,8 @@ pub fn expand(it: &Item) -> (String, String) {
             "Ord" => ord(t, false),
             "Hash" => hash(t),
             "Debug" => debug(t),
+            "Serialize" => serde::serialize(t),
+            "Deserialize" => serde::deserialize(t),
             _ => String::new(),
         };
         src.push_str(code.as_str());
@@ -68,16 +72,20 @@ pub fn expand(it: &Item) -> (String, String) {
 }
 
 // The item a derive expands for.
-struct Target {
-    it: Item,
-    name: String,
-    generics: &Generics,
+pub struct Target {
+    pub it: Item,
+    pub name: String,
+    pub generics: &Generics,
 }
 
 impl Target {
     // The impl header: impl<params, each type parameter bounded by
     // trait_path too> trait_path for Name<params> where ... .
-    fn header(&self, trait_path: &str) -> String {
+    pub fn header(&self, trait_path: &str) -> String { self.header_for(trait_path, trait_path, self.self_type().as_str()) }
+
+    // impl<params, each type parameter bounded by bound too> trait_path for
+    // self_ty where ... (a helper type of the derive's).
+    pub fn header_for(&self, trait_path: &str, bound: &str, self_ty: &str) -> String {
         let mut b = String::new();
         b.push_str("impl");
         let ps = &self.generics.params;
@@ -96,7 +104,7 @@ impl Target {
                             b.push_str(print::bounds(&p.bounds).as_str());
                             b.push_str(" + ");
                         }
-                        b.push_str(trait_path);
+                        b.push_str(bound);
                     }
                 }
                 i += 1;
@@ -106,7 +114,7 @@ impl Target {
         b.push(' ');
         b.push_str(trait_path);
         b.push_str(" for ");
-        b.push_str(self.self_type().as_str());
+        b.push_str(self_ty);
         let ws = &self.generics.wheres;
         if ws.len() > 0 {
             b.push_str(" where ");
@@ -122,8 +130,26 @@ impl Target {
         b
     }
 
+    // <P, ...> of the type's parameters (a helper type's), "" if none.
+    pub fn params(&self) -> String {
+        let ps = &self.generics.params;
+        if ps.len() == 0 { return String::new(); }
+        let mut b = "<".to_string();
+        let mut i = 0;
+        while i < ps.len() {
+            if i > 0 { b.push_str(", "); }
+            match ps[i].ty {
+                Some(t) => b.push_str(`const ${ps[i].name.value}: ${print::ty(t)}`.to_string().as_str()),
+                None => b.push_str(ps[i].name.value.as_str()),
+            }
+            i += 1;
+        }
+        b.push('>');
+        b
+    }
+
     // Name<params>.
-    fn self_type(&self) -> String {
+    pub fn self_type(&self) -> String {
         let mut b = self.name.clone();
         let ps = &self.generics.params;
         if ps.len() > 0 {
@@ -142,17 +168,17 @@ impl Target {
 
 // The name a field is bound to in a pattern (__0, __1, ...; the other
 // value's __b0, __b1, ...).
-fn binding(i: usize) -> String { `__${i}`.to_string() }
+pub fn binding(i: usize) -> String { `__${i}`.to_string() }
 fn binding_b(i: usize) -> String { `__b${i}`.to_string() }
 
 // A field's name (named fields) or index (tuple fields).
-fn field_name(f: &Field, i: usize) -> String {
+pub fn field_name(f: &Field, i: usize) -> String {
     match f.name { Some(n) => n.value.clone(), None => `${i}`.to_string() }
 }
 
 // The pattern of a variant (or struct) path with its fields bound to
 // __0, __1, ...
-fn pattern(path: &str, kind: &StructKind, fields: &Vec<&Field>) -> String { pattern_with(path, kind, fields, binding) }
+pub fn pattern(path: &str, kind: &StructKind, fields: &Vec<&Field>) -> String { pattern_with(path, kind, fields, binding) }
 
 fn pattern_with(path: &str, kind: &StructKind, fields: &Vec<&Field>, bind: fn(usize) -> String) -> String {
     let mut b = path.to_string();
@@ -173,7 +199,7 @@ fn pattern_with(path: &str, kind: &StructKind, fields: &Vec<&Field>, bind: fn(us
 }
 
 // The construction of path with field i given by value(i, binding).
-fn construct(path: &str, kind: &StructKind, fields: &Vec<&Field>, value: fn(usize) -> String) -> String {
+pub fn construct(path: &str, kind: &StructKind, fields: &Vec<&Field>, value: fn(usize) -> String) -> String {
     let mut b = path.to_string();
     if *kind == StructKind::Unit { return b; }
     b.push_str(if *kind == StructKind::Named { " { " } else { "(" });
@@ -207,15 +233,15 @@ fn clone(t: &Target) -> String {
 }
 
 // A shape: a struct, or a variant of an enum (path, kind, fields).
-struct Case {
-    path: String,
-    name: String,
-    kind: StructKind,
-    fields: Vec<&Field>,
+pub struct Case {
+    pub path: String,
+    pub name: String,
+    pub kind: StructKind,
+    pub fields: Vec<&Field>,
 }
 
 // The struct, or each variant.
-fn cases(t: &Target) -> Vec<Case> {
+pub fn cases(t: &Target) -> Vec<Case> {
     let mut out: Vec<Case> = Vec::new();
     match &t.it {
         Item::Struct(s) => out.push(Case { path: t.name.clone(), name: t.name.clone(), kind: s.kind.clone(), fields: s.fields.clone() }),
@@ -229,7 +255,7 @@ fn cases(t: &Target) -> Vec<Case> {
     out
 }
 
-fn is_enum(t: &Target) -> bool { match &t.it { Item::Enum(_) => true, _ => false } }
+pub fn is_enum(t: &Target) -> bool { match &t.it { Item::Enum(_) => true, _ => false } }
 
 // The fields of self (fs[i] an expression for field i: self.name for a
 // struct, a binding __i in a match arm per variant for an enum) and the

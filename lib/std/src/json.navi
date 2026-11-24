@@ -1,22 +1,29 @@
-//! JSON for every type, through std::reflect (as Go's encoding/json; the
-//! function names and the mapping follow Rust's serde_json):
+//! JSON (as Rust's serde_json): values of types that implement
+//! std::serde's Serialize and Deserialize (#[derive(Serialize,
+//! Deserialize)]), in serde's data model:
 //!
 //! - bool, integers and floats are JSON booleans and numbers (NaN and the
 //!   infinities are written as null); char, String and &str are strings.
-//! - Structs are objects (missing fields keep their zero values, unknown
-//!   ones are skipped); tuple structs, tuples, arrays and Vecs are arrays;
-//!   a one-field tuple struct is its field; () and unit structs are null.
+//! - Structs are objects (unknown fields are skipped, a missing one is an
+//!   error unless an Option or #[serde(default)]); tuple structs, tuples,
+//!   arrays and Vecs are arrays; a one-field tuple struct is its field; ()
+//!   and unit structs are null.
 //! - Option is null or its value; other enums are "Variant" (no fields) or
 //!   {"Variant": payload}, the payload being the field, an array of the
 //!   fields, or an object of them.
-//! - HashMaps with string or integer keys are objects.
-//! - References are what they point to.
+//! - Maps with string or integer keys are objects.
+//! - json::Value is any JSON.
+//!
+//!     #[derive(Serialize, Deserialize)]
+//!     struct Point { x: i32, y: f64 }
 //!
 //!     let s = json::to_string(&p).unwrap();
 //!     let q: Point = json::from_str(s.as_str()).unwrap();
 
 use crate::fmt::{self, Display, Debug, Formatter};
-use crate::reflect::{self, Kind, Value};
+use crate::collections::BTreeMap;
+use crate::serde::ser::{self, Serialize, Serializer, SerializeSeq, SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, SerializeMap, SerializeStruct, SerializeStructVariant};
+use crate::serde::de::{self, Deserialize, Deserializer, Visitor, SeqAccess, MapAccess, EnumAccess, VariantAccess, Unexpected};
 
 /// Why a value could not be written or read (with the byte offset in the
 /// input when reading).
@@ -36,43 +43,45 @@ impl Debug for Error {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result { Display::fmt(self, f) }
 }
 
-fn err<T>(msg: String) -> Result<T, Error> { Err(Error { msg, pos: usize::MAX }) }
+impl ser::Error for Error {
+    fn custom<T: Display>(msg: T) -> Error { Error { msg: `json: ${msg}`.to_string(), pos: usize::MAX } }
+}
+
+impl de::Error for Error {
+    fn custom<T: Display>(msg: T) -> Error { Error { msg: `json: ${msg}`.to_string(), pos: usize::MAX } }
+}
 
 /// The JSON text of x.
-pub fn to_string<T>(x: &T) -> Result<String, Error> {
-    let mut w = Writer { out: String::new(), indent: -1, depth: 0 };
-    w.value(&reflect::value_of(x))?;
+pub fn to_string<T: Serialize>(x: &T) -> Result<String, Error> {
+    let w = &mut Writer { out: String::new(), indent: -1, depth: 0 };
+    x.serialize(w)?;
     Ok(w.out)
 }
 
 /// The JSON text of x, indented by two spaces.
-pub fn to_string_pretty<T>(x: &T) -> Result<String, Error> {
-    let mut w = Writer { out: String::new(), indent: 2, depth: 0 };
-    w.value(&reflect::value_of(x))?;
+pub fn to_string_pretty<T: Serialize>(x: &T) -> Result<String, Error> {
+    let w = &mut Writer { out: String::new(), indent: 2, depth: 0 };
+    x.serialize(w)?;
     Ok(w.out)
 }
 
 /// The value of type T that s describes.
-pub fn from_str<T>(s: &str) -> Result<T, Error> {
-    let v = Value::new(reflect::type_of::<T>());
-    let mut r = Reader { b: s.as_bytes(), i: 0 };
-    let mut target = v.clone();
-    r.value(&mut target)?;
+pub fn from_str<T: Deserialize>(s: &str) -> Result<T, Error> {
+    let r = &mut Reader { b: s.as_bytes(), i: 0 };
+    let v = match T::deserialize(r) {
+        Ok(v) => v,
+        // (An error of a Visitor's has no offset: where the reading was.)
+        Err(e) => return Err(if e.pos == usize::MAX { Error { msg: e.msg, pos: r.i } } else { e }),
+    };
     r.ws();
     if r.i < r.b.len() { return r.fail("trailing characters"); }
-    Ok(unsafe { (v.as_ptr() as *const T).read() })
+    Ok(v)
 }
 
-// Whether an enum type is Option.
-fn is_option(v: &Value) -> bool {
-    let vs = v.ty().variants();
-    vs.len() == 2 && vs[0].name == "None" && vs[0].fields.len() == 0 && vs[1].name == "Some" && vs[1].fields.len() == 1
-}
+// --- Writing ----------------------------------------------------------------------
 
-// A tuple struct's fields are named 0, 1, ...
-fn is_tuple_like(fields: &Vec<reflect::Field>) -> bool { fields.len() > 0 && fields[0].name == "0" }
-
-struct Writer {
+/// The writer of JSON text (a Serializer through &mut).
+pub struct Writer {
     out: String,
     /// Spaces per level, or -1: compact.
     indent: i64,
@@ -111,7 +120,6 @@ impl Writer {
         self.out.push('"');
     }
 
-    // [ items ] or { items }, items written by each.
     fn open(&mut self, c: char) {
         self.out.push(c);
         self.depth += 1;
@@ -134,129 +142,213 @@ impl Writer {
         if self.indent >= 0 { self.out.push(' '); }
     }
 
-    fn fields(&mut self, v: &Value, fields: &Vec<reflect::Field>, variant: bool) -> Result<(), Error> {
-        let get = |i: usize| -> Value { if variant { v.variant_field(i) } else { v.field(i) } };
-        if fields.len() == 1 && is_tuple_like(fields) { return self.value(&get(0)); }
-        if is_tuple_like(fields) {
-            self.open('[');
-            let mut i = 0;
-            while i < fields.len() {
-                self.item(i == 0);
-                self.value(&get(i))?;
-                i += 1;
-            }
-            self.close(']', fields.len() == 0);
-            return Ok(());
-        }
+    // {"variant": (the content follows)
+    fn variant_open(&mut self, variant: &str) {
         self.open('{');
-        let mut i = 0;
-        while i < fields.len() {
-            self.item(i == 0);
-            self.key(fields[i].name);
-            self.value(&get(i))?;
-            i += 1;
-        }
-        self.close('}', fields.len() == 0);
-        Ok(())
+        self.item(true);
+        self.key(variant);
+    }
+}
+
+/// An array or object being written ([ ... ] or { ... }; a variant's
+/// content also closes the { "Variant": around it).
+pub struct Compound {
+    w: &mut Writer,
+    first: bool,
+    close: char,
+    variant: bool,
+}
+
+fn compound(w: &mut Writer, open: char, variant: bool) -> Compound {
+    w.open(open);
+    Compound { w, first: true, close: if open == '[' { ']' } else { '}' }, variant }
+}
+
+impl Compound {
+    fn element<T: Serialize>(&mut self, value: &T) -> Result<(), Error> {
+        self.w.item(self.first);
+        self.first = false;
+        value.serialize(&mut *self.w)
     }
 
-    fn value(&mut self, v: &Value) -> Result<(), Error> {
-        match v.kind() {
-            Kind::Bool => self.out.push_str(if v.as_bool() { "true" } else { "false" }),
-            Kind::Char => {
-                let mut s = String::new();
-                s.push(v.as_char());
-                self.string(s.as_str());
-            }
-            Kind::F32 | Kind::F64 => {
-                let x = v.as_f64();
-                if x.is_nan() || x.is_infinite() { self.out.push_str("null"); } else { self.out.push_str(`${x}`.to_string().as_str()); }
-            }
-            Kind::String => self.string(v.as_str()),
-            Kind::Tuple | Kind::Struct => {
-                let fs = v.ty().fields();
-                if fs.len() == 0 { self.out.push_str("null"); } else { self.fields(v, &fs, false)?; }
-            }
-            Kind::Array | Kind::Vec => {
-                let n = v.len();
-                self.open('[');
-                let mut i = 0;
-                while i < n {
-                    self.item(i == 0);
-                    self.value(&v.index(i))?;
-                    i += 1;
-                }
-                self.close(']', n == 0);
-            }
-            Kind::Enum => {
-                let vi = v.variant();
-                let var = v.ty().variants()[vi].clone();
-                if is_option(v) {
-                    if vi == 0 { self.out.push_str("null"); } else { self.value(&v.variant_field(0))?; }
-                } else if var.fields.len() == 0 {
-                    self.string(var.name);
-                } else {
-                    self.open('{');
-                    self.item(true);
-                    self.key(var.name);
-                    self.fields(v, &var.fields, true)?;
-                    self.close('}', false);
-                }
-            }
-            Kind::Map => {
-                let mut es = v.map_entries();
-                // Sorted by key, so the text does not depend on hashing.
-                let mut keys: Vec<String> = Vec::new();
-                for e in es.iter() {
-                    let k = &e.0;
-                    if k.is_str() { keys.push(k.as_str().to_string()); }
-                    else if k.is_int() { keys.push(`${k.as_i128()}`.to_string()); }
-                    else { return err(`json: map keys of type ${k.ty()} are not supported`.to_string()); }
-                }
-                let mut order: Vec<usize> = (0..es.len()).collect();
-                order.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
-                self.open('{');
-                let mut i = 0;
-                while i < order.len() {
-                    self.item(i == 0);
-                    self.key(keys[order[i]].as_str());
-                    self.value(&es[order[i]].1)?;
-                    i += 1;
-                }
-                self.close('}', es.len() == 0);
-            }
-            Kind::Ref => {
-                if v.is_str() {
-                    self.string(v.as_str());
-                } else if v.ty().elem().unwrap().kind() == Kind::Slice {
-                    let n = v.len();
-                    self.open('[');
-                    let mut i = 0;
-                    while i < n {
-                        self.item(i == 0);
-                        self.value(&v.index(i))?;
-                        i += 1;
-                    }
-                    self.close(']', n == 0);
-                } else if v.is_null() {
-                    self.out.push_str("null");
-                } else {
-                    match v.ty().elem().unwrap().kind() {
-                        Kind::Dyn => return err(`json: ${v.ty()} is not supported`.to_string()),
-                        _ => self.value(&v.deref())?,
-                    }
-                }
-            }
-            _ => {
-                if v.is_int() {
-                    self.out.push_str(`${v.as_i128()}`.to_string().as_str());
-                } else {
-                    return err(`json: ${v.ty()} is not supported`.to_string());
-                }
-            }
-        }
+    fn field<T: Serialize>(&mut self, key: &str, value: &T) -> Result<(), Error> {
+        self.w.item(self.first);
+        self.first = false;
+        self.w.key(key);
+        value.serialize(&mut *self.w)
+    }
+
+    fn finish(self) -> Result<(), Error> {
+        self.w.close(self.close, self.first);
+        if self.variant { self.w.close('}', false); }
         Ok(())
     }
+}
+
+impl Serializer for &mut Writer {
+    type Ok = ();
+    type Error = Error;
+    type SerializeSeq = Compound;
+    type SerializeTuple = Compound;
+    type SerializeTupleStruct = Compound;
+    type SerializeTupleVariant = Compound;
+    type SerializeMap = Compound;
+    type SerializeStruct = Compound;
+    type SerializeStructVariant = Compound;
+
+    fn serialize_bool(self, v: bool) -> Result<(), Error> {
+        self.out.push_str(if v { "true" } else { "false" });
+        Ok(())
+    }
+    fn serialize_i64(self, v: i64) -> Result<(), Error> {
+        self.out.push_str(`${v}`.to_string().as_str());
+        Ok(())
+    }
+    fn serialize_u64(self, v: u64) -> Result<(), Error> {
+        self.out.push_str(`${v}`.to_string().as_str());
+        Ok(())
+    }
+    fn serialize_f64(self, v: f64) -> Result<(), Error> {
+        if v.is_nan() || v.is_infinite() { self.out.push_str("null"); } else { self.out.push_str(`${v}`.to_string().as_str()); }
+        Ok(())
+    }
+    fn serialize_str(self, v: &str) -> Result<(), Error> {
+        self.string(v);
+        Ok(())
+    }
+    fn serialize_bytes(self, v: &[u8]) -> Result<(), Error> {
+        let mut c = compound(self, '[', false);
+        for b in v.iter() { c.element(b)?; }
+        c.finish()
+    }
+    fn serialize_none(self) -> Result<(), Error> { self.serialize_unit() }
+    fn serialize_some<T: Serialize>(self, value: &T) -> Result<(), Error> { value.serialize(self) }
+    fn serialize_unit(self) -> Result<(), Error> {
+        self.out.push_str("null");
+        Ok(())
+    }
+    fn serialize_unit_struct(self, name: &str) -> Result<(), Error> { self.serialize_unit() }
+    fn serialize_unit_variant(self, name: &str, variant_index: u32, variant: &str) -> Result<(), Error> { self.serialize_str(variant) }
+    fn serialize_newtype_struct<T: Serialize>(self, name: &str, value: &T) -> Result<(), Error> { value.serialize(self) }
+    fn serialize_newtype_variant<T: Serialize>(self, name: &str, variant_index: u32, variant: &str, value: &T) -> Result<(), Error> {
+        self.variant_open(variant);
+        value.serialize(&mut *self)?;
+        self.close('}', false);
+        Ok(())
+    }
+    fn serialize_seq(self, len: Option<usize>) -> Result<Compound, Error> { Ok(compound(self, '[', false)) }
+    fn serialize_tuple(self, len: usize) -> Result<Compound, Error> { Ok(compound(self, '[', false)) }
+    fn serialize_tuple_struct(self, name: &str, len: usize) -> Result<Compound, Error> { Ok(compound(self, '[', false)) }
+    fn serialize_tuple_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<Compound, Error> {
+        self.variant_open(variant);
+        Ok(compound(self, '[', true))
+    }
+    fn serialize_map(self, len: Option<usize>) -> Result<Compound, Error> { Ok(compound(self, '{', false)) }
+    fn serialize_struct(self, name: &str, len: usize) -> Result<Compound, Error> { Ok(compound(self, '{', false)) }
+    fn serialize_struct_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<Compound, Error> {
+        self.variant_open(variant);
+        Ok(compound(self, '{', true))
+    }
+}
+
+impl SerializeSeq for Compound {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_element<T: Serialize>(&mut self, value: &T) -> Result<(), Error> { self.element(value) }
+    fn end(self) -> Result<(), Error> { self.finish() }
+}
+
+impl SerializeTuple for Compound {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_element<T: Serialize>(&mut self, value: &T) -> Result<(), Error> { self.element(value) }
+    fn end(self) -> Result<(), Error> { self.finish() }
+}
+
+impl SerializeTupleStruct for Compound {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, value: &T) -> Result<(), Error> { self.element(value) }
+    fn end(self) -> Result<(), Error> { self.finish() }
+}
+
+impl SerializeTupleVariant for Compound {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, value: &T) -> Result<(), Error> { self.element(value) }
+    fn end(self) -> Result<(), Error> { self.finish() }
+}
+
+impl SerializeMap for Compound {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_key<T: Serialize>(&mut self, key: &T) -> Result<(), Error> {
+        self.w.item(self.first);
+        self.first = false;
+        key.serialize(KeyWriter { w: self.w })?;
+        self.w.out.push(':');
+        if self.w.indent >= 0 { self.w.out.push(' '); }
+        Ok(())
+    }
+    fn serialize_value<T: Serialize>(&mut self, value: &T) -> Result<(), Error> { value.serialize(&mut *self.w) }
+    fn end(self) -> Result<(), Error> { self.finish() }
+}
+
+impl SerializeStruct for Compound {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, key: &str, value: &T) -> Result<(), Error> { self.field(key, value) }
+    fn end(self) -> Result<(), Error> { self.finish() }
+}
+
+impl SerializeStructVariant for Compound {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_field<T: Serialize>(&mut self, key: &str, value: &T) -> Result<(), Error> { self.field(key, value) }
+    fn end(self) -> Result<(), Error> { self.finish() }
+}
+
+// A map's key: a string, an integer, a bool or a char (written as a string).
+struct KeyWriter {
+    w: &mut Writer,
+}
+
+fn key_error() -> Error { Error { msg: "json: a map key must be a string, a number, a bool or a char".to_string(), pos: usize::MAX } }
+
+impl Serializer for KeyWriter {
+    type Ok = ();
+    type Error = Error;
+    type SerializeSeq = Compound;
+    type SerializeTuple = Compound;
+    type SerializeTupleStruct = Compound;
+    type SerializeTupleVariant = Compound;
+    type SerializeMap = Compound;
+    type SerializeStruct = Compound;
+    type SerializeStructVariant = Compound;
+
+    fn serialize_bool(self, v: bool) -> Result<(), Error> { self.serialize_str(if v { "true" } else { "false" }) }
+    fn serialize_i64(self, v: i64) -> Result<(), Error> { self.serialize_str(`${v}`.to_string().as_str()) }
+    fn serialize_u64(self, v: u64) -> Result<(), Error> { self.serialize_str(`${v}`.to_string().as_str()) }
+    fn serialize_f64(self, v: f64) -> Result<(), Error> { Err(key_error()) }
+    fn serialize_str(self, v: &str) -> Result<(), Error> {
+        self.w.string(v);
+        Ok(())
+    }
+    fn serialize_bytes(self, v: &[u8]) -> Result<(), Error> { Err(key_error()) }
+    fn serialize_none(self) -> Result<(), Error> { Err(key_error()) }
+    fn serialize_some<T: Serialize>(self, value: &T) -> Result<(), Error> { value.serialize(self) }
+    fn serialize_unit(self) -> Result<(), Error> { Err(key_error()) }
+    fn serialize_unit_struct(self, name: &str) -> Result<(), Error> { Err(key_error()) }
+    fn serialize_unit_variant(self, name: &str, variant_index: u32, variant: &str) -> Result<(), Error> { self.serialize_str(variant) }
+    fn serialize_newtype_struct<T: Serialize>(self, name: &str, value: &T) -> Result<(), Error> { value.serialize(self) }
+    fn serialize_newtype_variant<T: Serialize>(self, name: &str, variant_index: u32, variant: &str, value: &T) -> Result<(), Error> { Err(key_error()) }
+    fn serialize_seq(self, len: Option<usize>) -> Result<Compound, Error> { Err(key_error()) }
+    fn serialize_tuple(self, len: usize) -> Result<Compound, Error> { Err(key_error()) }
+    fn serialize_tuple_struct(self, name: &str, len: usize) -> Result<Compound, Error> { Err(key_error()) }
+    fn serialize_tuple_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<Compound, Error> { Err(key_error()) }
+    fn serialize_map(self, len: Option<usize>) -> Result<Compound, Error> { Err(key_error()) }
+    fn serialize_struct(self, name: &str, len: usize) -> Result<Compound, Error> { Err(key_error()) }
+    fn serialize_struct_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<Compound, Error> { Err(key_error()) }
 }
 
 fn hex4(n: u32) -> String {
@@ -271,29 +363,18 @@ fn hex4(n: u32) -> String {
     s
 }
 
-// A decimal integer (at most 38 digits: within i128).
-fn parse_int(s: &str) -> Option<i128> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    let neg = b.len() > 0 && b[0] == b'-';
-    if neg { i = 1; }
-    if i == b.len() || b.len() - i > 38 { return None; }
-    let mut n: i128 = 0;
-    while i < b.len() {
-        if b[i] < b'0' || b[i] > b'9' { return None; }
-        n = n * 10 + (b[i] - b'0') as i128;
-        i += 1;
-    }
-    Some(if neg { -n } else { n })
-}
+// --- Reading ----------------------------------------------------------------------
 
-struct Reader {
+/// The reader of JSON text (a Deserializer through &mut).
+pub struct Reader {
     b: &[u8],
     i: usize,
 }
 
 impl Reader {
-    fn fail<T>(&self, msg: &str) -> Result<T, Error> { Err(Error { msg: `json: ${msg}`.to_string(), pos: self.i }) }
+    fn fail<T>(&self, msg: &str) -> Result<T, Error> { Err(self.error(msg)) }
+
+    fn error(&self, msg: &str) -> Error { Error { msg: `json: ${msg}`.to_string(), pos: self.i } }
 
     fn ws(&mut self) {
         while self.i < self.b.len() {
@@ -312,6 +393,17 @@ impl Reader {
         if self.peek() != c { return self.fail(`expected '${c as char}'`.to_string().as_str()); }
         self.i += 1;
         Ok(())
+    }
+
+    // The , between elements (close: what ends them).
+    fn separator(&mut self, close: u8) -> Result<(), Error> {
+        let c = self.peek();
+        if c == b',' {
+            self.i += 1;
+            return Ok(());
+        }
+        if c == 0 { return self.fail(`expected '${close as char}'`.to_string().as_str()); }
+        self.fail(`expected ',' or '${close as char}'`.to_string().as_str())
     }
 
     fn word(&mut self, w: &str) -> bool {
@@ -395,8 +487,23 @@ impl Reader {
             let c = self.b[self.i];
             if c >= b'0' && c <= b'9' || c == b'-' || c == b'+' || c == b'.' || c == b'e' || c == b'E' { self.i += 1; } else { break; }
         }
-        if self.i == start { return self.fail("expected a number"); }
+        if self.i == start { return self.fail("expected a value"); }
         Ok(crate::rt::str_from_raw(crate::rt::ptr_offset(crate::rt::slice_ptr(self.b), start), self.i - start))
+    }
+
+    // A number to the visitor: an integer if it has no fraction or
+    // exponent (u64, else i64, else a float), else a float.
+    fn visit_number<V: Visitor>(&mut self, v: V) -> Result<V::Value, Error> {
+        let start = self.i;
+        let t = self.number()?;
+        if !t.contains('.') && !t.contains('e') && !t.contains('E') {
+            if let Ok(n) = t.parse::<u64>() { return v.visit_u64(n); }
+            if let Ok(n) = t.parse::<i64>() { return v.visit_i64(n); }
+        }
+        match t.parse::<f64>() {
+            Ok(x) => v.visit_f64(x),
+            Err(_) => Err(Error { msg: `json: invalid number ${t}`.to_string(), pos: start }),
+        }
     }
 
     // Skips a value of any type.
@@ -431,213 +538,376 @@ impl Reader {
         Ok(())
     }
 
-    // [ each... ]: calls item for every element.
-    fn array(&mut self, v: &mut Value, n: i64) -> Result<(), Error> {
+    // [ ... ] to the visitor (which must take all of it).
+    fn seq<V: Visitor>(&mut self, v: V) -> Result<V::Value, Error> {
         self.expect(b'[')?;
-        let mut i = 0;
-        if self.peek() == b']' {
+        let st = &mut SeqState { first: true, done: false };
+        let out = v.visit_seq(Seq { r: self, st })?;
+        if !st.done {
+            if self.peek() != b']' { return self.fail("expected ']' (more elements than expected)"); }
             self.i += 1;
-        } else {
-            loop {
-                if v.kind() == Kind::Vec {
-                    let mut e = v.push();
-                    self.value(&mut e)?;
-                } else {
-                    if i >= n { return self.fail(`more than ${n} elements`.to_string().as_str()); }
-                    let mut e = if v.kind() == Kind::Array { v.index(i as usize) } else { v.field(i as usize) };
-                    self.value(&mut e)?;
-                }
-                i += 1;
-                if self.peek() == b',' {
-                    self.i += 1;
-                    continue;
-                }
-                self.expect(b']')?;
-                break;
-            }
         }
-        if n >= 0 && i != n { return self.fail(`expected ${n} elements, found ${i}`.to_string().as_str()); }
-        Ok(())
+        Ok(out)
     }
 
-    // The fields of a struct (or of variant vi, if >= 0) from an array,
-    // an object or (one tuple field) the field's value.
-    fn fields(&mut self, v: &mut Value, fields: &Vec<reflect::Field>, vi: i64) -> Result<(), Error> {
-        if fields.len() == 1 && is_tuple_like(fields) {
-            let mut f = if vi >= 0 { v.field_of_variant(vi as usize, 0) } else { v.field(0) };
-            return self.value(&mut f);
-        }
-        if is_tuple_like(fields) {
-            self.expect(b'[')?;
-            let mut i = 0;
-            while i < fields.len() {
-                if i > 0 { self.expect(b',')?; }
-                let mut f = if vi >= 0 { v.field_of_variant(vi as usize, i) } else { v.field(i) };
-                self.value(&mut f)?;
-                i += 1;
-            }
-            return self.expect(b']');
-        }
+    // { ... } to the visitor.
+    fn map<V: Visitor>(&mut self, v: V) -> Result<V::Value, Error> {
         self.expect(b'{')?;
-        if self.peek() == b'}' {
+        let st = &mut SeqState { first: true, done: false };
+        let out = v.visit_map(Map { r: self, st })?;
+        if !st.done {
+            // (The visitor stopped early: the rest is skipped.)
+            loop {
+                let c = self.peek();
+                if c == b'}' { break; }
+                if !st.first { self.expect(b',')?; }
+                st.first = false;
+                self.string()?;
+                self.expect(b':')?;
+                self.skip()?;
+            }
             self.i += 1;
-            return Ok(());
         }
-        loop {
-            let k = self.string()?;
-            self.expect(b':')?;
-            let mut found = false;
-            let mut i = 0;
-            while i < fields.len() {
-                if fields[i].name == k.as_str() {
-                    let mut f = if vi >= 0 { v.field_of_variant(vi as usize, i) } else { v.field(i) };
-                    self.value(&mut f)?;
-                    found = true;
-                    break;
-                }
-                i += 1;
-            }
-            if !found { self.skip()?; }
-            if self.peek() == b',' {
-                self.i += 1;
-                continue;
-            }
-            return self.expect(b'}');
+        Ok(out)
+    }
+}
+
+impl Deserializer for &mut Reader {
+    type Error = Error;
+
+    fn deserialize_any<V: Visitor>(self, v: V) -> Result<V::Value, Error> {
+        let c = self.peek();
+        if c == b'n' {
+            if !self.word("null") { return self.fail("expected a value"); }
+            return v.visit_unit();
         }
+        if c == b't' || c == b'f' {
+            if self.word("true") { return v.visit_bool(true); }
+            if self.word("false") { return v.visit_bool(false); }
+            return self.fail("expected a value");
+        }
+        if c == b'"' {
+            let s = self.string()?;
+            return v.visit_string(s);
+        }
+        if c == b'[' { return self.seq(v); }
+        if c == b'{' { return self.map(v); }
+        if c == 0 { return self.fail("unexpected end of input"); }
+        self.visit_number(v)
     }
 
-    fn value(&mut self, v: &mut Value) -> Result<(), Error> {
-        let c = self.peek();
-        match v.kind() {
-            Kind::Bool => {
-                if self.word("true") { v.set_bool(true); } else if self.word("false") { v.set_bool(false); } else { return self.fail("expected a boolean"); }
-            }
-            Kind::Char => {
-                let s = self.string()?;
-                let mut cs = s.chars();
-                match (cs.next(), cs.next()) {
-                    (Some(ch), None) => v.set_char(ch),
-                    _ => return self.fail("expected a one-character string"),
-                }
-            }
-            Kind::F32 | Kind::F64 => {
-                if self.word("null") {
-                    v.set_f64(f64::NAN);
-                } else {
-                    let t = self.number()?;
-                    match t.parse::<f64>() {
-                        Ok(x) => v.set_f64(x),
-                        Err(_) => return self.fail("invalid number"),
-                    }
-                }
-            }
-            Kind::String => {
-                let s = self.string()?;
-                v.set_str(s.as_str());
-            }
-            Kind::Tuple | Kind::Struct => {
-                let fs = v.ty().fields();
-                if fs.len() == 0 {
-                    if !self.word("null") { return self.fail("expected null"); }
-                } else {
-                    self.fields(v, &fs, -1)?;
-                }
-            }
-            Kind::Array => self.array(v, v.ty().len() as i64)?,
-            Kind::Vec => self.array(v, -1)?,
-            Kind::Enum => {
-                if is_option(v) {
-                    if self.word("null") {
-                        v.set_variant(0);
-                    } else {
-                        v.set_variant(1);
-                        let mut f = v.field_of_variant(1, 0);
-                        self.value(&mut f)?;
-                    }
-                } else if c == b'"' {
-                    let name = self.string()?;
-                    match v.variant_named(name.as_str()) {
-                        Some(i) => {
-                            if v.ty().variants()[i].fields.len() > 0 { return self.fail(`variant ${name} has fields`.to_string().as_str()); }
-                            v.set_variant(i);
-                        }
-                        None => return self.fail(`unknown variant ${name}`.to_string().as_str()),
-                    }
-                } else {
-                    self.expect(b'{')?;
-                    let name = self.string()?;
-                    self.expect(b':')?;
-                    let i = match v.variant_named(name.as_str()) { Some(i) => i, None => return self.fail(`unknown variant ${name}`.to_string().as_str()) };
-                    v.set_variant(i);
-                    let fs = v.ty().variants()[i].fields.clone();
-                    if fs.len() == 0 {
-                        if !self.word("null") { return self.fail("expected null"); }
-                    } else {
-                        self.fields(v, &fs, i as i64)?;
-                    }
-                    self.expect(b'}')?;
-                }
-            }
-            Kind::Map => {
-                let kt = v.ty().key().unwrap();
-                let vt = v.ty().value().unwrap();
-                self.expect(b'{')?;
-                if self.peek() == b'}' {
-                    self.i += 1;
-                    return Ok(());
-                }
-                loop {
-                    let ks = self.string()?;
-                    let mut k = Value::new(kt.clone());
-                    if k.is_str() {
-                        k.set_str(ks.as_str());
-                    } else if k.is_int() {
-                        match parse_int(ks.as_str()) {
-                            Some(n) => k.set_i128(n),
-                            None => return self.fail("expected an integer key"),
-                        }
-                    } else {
-                        return self.fail(`map keys of type ${kt} are not supported`.to_string().as_str());
-                    }
-                    self.expect(b':')?;
-                    let mut val = Value::new(vt.clone());
-                    self.value(&mut val)?;
-                    v.map_insert(&k, &val);
-                    if self.peek() == b',' {
-                        self.i += 1;
-                        continue;
-                    }
-                    return self.expect(b'}');
-                }
-            }
-            Kind::Ref => {
-                if v.is_str() {
-                    let s = self.string()?;
-                    v.set_str(s.as_str());
-                } else {
-                    match v.ty().elem().unwrap().kind() {
-                        Kind::Slice | Kind::Dyn => return self.fail(`${v.ty()} is not supported`.to_string().as_str()),
-                        _ => {
-                            let mut t = v.set_new();
-                            self.value(&mut t)?;
-                        }
-                    }
-                }
-            }
-            _ => {
-                if !v.is_int() { return self.fail(`${v.ty()} is not supported`.to_string().as_str()); }
-                let t = self.number()?;
-                let n = match parse_int(t) { Some(n) => n, None => return self.fail("expected an integer") };
-                let bits = 8 * v.ty().size() as u32;
-                let (lo, hi) = if v.is_signed() {
-                    if bits == 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) }
-                } else {
-                    if bits == 128 { (0, i128::MAX) } else { (0, (1i128 << bits) - 1) }
-                };
-                if n < lo || n > hi { return self.fail(`${n} out of range for ${v.ty()}`.to_string().as_str()); }
-                v.set_i128(n);
-            }
-        }
-        Ok(())
+    fn deserialize_option<V: Visitor>(self, v: V) -> Result<V::Value, Error> {
+        if self.peek() == b'n' && self.word("null") { return v.visit_none(); }
+        v.visit_some(self)
     }
+
+    fn deserialize_unit<V: Visitor>(self, v: V) -> Result<V::Value, Error> {
+        if self.peek() == b'n' && self.word("null") { return v.visit_unit(); }
+        self.deserialize_any(v)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor>(self, name: &str, v: V) -> Result<V::Value, Error> { v.visit_newtype_struct(self) }
+
+    fn deserialize_enum<V: Visitor>(self, name: &str, variants: &[&str], v: V) -> Result<V::Value, Error> {
+        let c = self.peek();
+        if c == b'"' {
+            let s = self.string()?;
+            return v.visit_enum(UnitVariant { name: s });
+        }
+        if c == b'{' {
+            self.i += 1;
+            let out = v.visit_enum(Variant { r: self })?;
+            self.expect(b'}')?;
+            return Ok(out);
+        }
+        self.fail("expected a string or an object (an enum)")
+    }
+
+    fn deserialize_ignored_any<V: Visitor>(self, v: V) -> Result<V::Value, Error> {
+        self.skip()?;
+        v.visit_unit()
+    }
+}
+
+struct SeqState {
+    first: bool,
+    done: bool,
+}
+
+// The elements of [ ... ].
+struct Seq {
+    r: &mut Reader,
+    st: &mut SeqState,
+}
+
+impl SeqAccess for Seq {
+    type Error = Error;
+    fn next_element<T: Deserialize>(&mut self) -> Result<Option<T>, Error> {
+        if self.st.done { return Ok(None); }
+        if self.r.peek() == b']' {
+            self.r.i += 1;
+            self.st.done = true;
+            return Ok(None);
+        }
+        if !self.st.first { self.r.separator(b']')?; }
+        self.st.first = false;
+        Ok(Some(T::deserialize(&mut *self.r)?))
+    }
+}
+
+// The entries of { ... }.
+struct Map {
+    r: &mut Reader,
+    st: &mut SeqState,
+}
+
+impl MapAccess for Map {
+    type Error = Error;
+    fn next_key<K: Deserialize>(&mut self) -> Result<Option<K>, Error> {
+        if self.st.done { return Ok(None); }
+        if self.r.peek() == b'}' {
+            self.r.i += 1;
+            self.st.done = true;
+            return Ok(None);
+        }
+        if !self.st.first { self.r.separator(b'}')?; }
+        self.st.first = false;
+        let k = K::deserialize(KeyReader { r: self.r })?;
+        self.r.expect(b':')?;
+        Ok(Some(k))
+    }
+    fn next_value<V: Deserialize>(&mut self) -> Result<V, Error> { V::deserialize(&mut *self.r) }
+}
+
+// A map's key: a string, given as a string, or parsed as the number, bool
+// or char the key's type asks for.
+struct KeyReader {
+    r: &mut Reader,
+}
+
+impl KeyReader {
+    fn number<V: Visitor>(self, v: V) -> Result<V::Value, Error> {
+        let at = self.r.i;
+        let s = self.r.string()?;
+        let inner = &mut Reader { b: s.as_bytes(), i: 0 };
+        match inner.visit_number(v) {
+            Ok(x) => Ok(x),
+            Err(e) => Err(Error { msg: e.msg, pos: at }),
+        }
+    }
+}
+
+impl Deserializer for KeyReader {
+    type Error = Error;
+    fn deserialize_any<V: Visitor>(self, v: V) -> Result<V::Value, Error> {
+        let s = self.r.string()?;
+        v.visit_string(s)
+    }
+    fn deserialize_i8<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_i16<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_i32<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_i64<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_u8<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_u16<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_u32<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_u64<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_f32<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_f64<V: Visitor>(self, v: V) -> Result<V::Value, Error> { self.number(v) }
+    fn deserialize_bool<V: Visitor>(self, v: V) -> Result<V::Value, Error> {
+        let s = self.r.string()?;
+        if s == "true" { return v.visit_bool(true); }
+        if s == "false" { return v.visit_bool(false); }
+        v.visit_string(s)
+    }
+    fn deserialize_option<V: Visitor>(self, v: V) -> Result<V::Value, Error> { v.visit_some(self) }
+    fn deserialize_newtype_struct<V: Visitor>(self, name: &str, v: V) -> Result<V::Value, Error> { v.visit_newtype_struct(self) }
+    fn deserialize_enum<V: Visitor>(self, name: &str, variants: &[&str], v: V) -> Result<V::Value, Error> {
+        let s = self.r.string()?;
+        v.visit_enum(UnitVariant { name: s })
+    }
+}
+
+// An enum written "Variant": only a unit variant.
+struct UnitVariant {
+    name: String,
+}
+
+impl EnumAccess for UnitVariant {
+    type Error = Error;
+    type Variant = UnitOnly;
+    fn variant<V: Deserialize>(self) -> Result<(V, UnitOnly), Error> {
+        let v = V::deserialize(Name { s: self.name })?;
+        Ok((v, UnitOnly))
+    }
+}
+
+struct UnitOnly;
+
+fn wants(what: &str) -> Error { Error { msg: `json: invalid type: unit variant, expected ${what}`.to_string(), pos: usize::MAX } }
+
+impl VariantAccess for UnitOnly {
+    type Error = Error;
+    fn unit_variant(self) -> Result<(), Error> { Ok(()) }
+    fn newtype_variant<T: Deserialize>(self) -> Result<T, Error> { Err(wants("newtype variant")) }
+    fn tuple_variant<V: Visitor>(self, len: usize, v: V) -> Result<V::Value, Error> { Err(wants("tuple variant")) }
+    fn struct_variant<V: Visitor>(self, fields: &[&str], v: V) -> Result<V::Value, Error> { Err(wants("struct variant")) }
+}
+
+// A variant's name, as an identifier.
+struct Name {
+    s: String,
+}
+
+impl Deserializer for Name {
+    type Error = Error;
+    fn deserialize_any<V: Visitor>(self, v: V) -> Result<V::Value, Error> { v.visit_string(self.s) }
+}
+
+// An enum written {"Variant": content}: the reader is after the {.
+struct Variant {
+    r: &mut Reader,
+}
+
+impl EnumAccess for Variant {
+    type Error = Error;
+    type Variant = Variant;
+    fn variant<V: Deserialize>(self) -> Result<(V, Variant), Error> {
+        let s = self.r.string()?;
+        self.r.expect(b':')?;
+        let v = V::deserialize(Name { s })?;
+        Ok((v, self))
+    }
+}
+
+impl VariantAccess for Variant {
+    type Error = Error;
+    fn unit_variant(self) -> Result<(), Error> {
+        if self.r.peek() == b'n' && self.r.word("null") { return Ok(()); }
+        self.r.fail("expected null (a unit variant)")
+    }
+    fn newtype_variant<T: Deserialize>(self) -> Result<T, Error> { T::deserialize(self.r) }
+    fn tuple_variant<V: Visitor>(self, len: usize, v: V) -> Result<V::Value, Error> { self.r.seq(v) }
+    fn struct_variant<V: Visitor>(self, fields: &[&str], v: V) -> Result<V::Value, Error> {
+        if self.r.peek() == b'[' { return self.r.seq(v); }
+        self.r.map(v)
+    }
+}
+
+// --- Any JSON ----------------------------------------------------------------------
+
+/// Any JSON value (as serde_json's Value; objects keep their keys in
+/// order).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Number(Number),
+    String(String),
+    Array(Vec<Value>),
+    Object(BTreeMap<String, Value>),
+}
+
+/// A JSON number: an integer when it is one, else a float.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Number {
+    PosInt(u64),
+    NegInt(i64),
+    Float(f64),
+}
+
+impl Number {
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Number::PosInt(n) => if *n <= i64::MAX as u64 { Some(*n as i64) } else { None },
+            Number::NegInt(n) => Some(*n),
+            Number::Float(_) => None,
+        }
+    }
+    pub fn as_u64(&self) -> Option<u64> { match self { Number::PosInt(n) => Some(*n), _ => None } }
+    pub fn as_f64(&self) -> f64 {
+        match self {
+            Number::PosInt(n) => *n as f64,
+            Number::NegInt(n) => *n as f64,
+            Number::Float(x) => *x,
+        }
+    }
+}
+
+impl Value {
+    pub fn is_null(&self) -> bool { match self { Value::Null => true, _ => false } }
+    pub fn as_bool(&self) -> Option<bool> { match self { Value::Bool(b) => Some(*b), _ => None } }
+    pub fn as_i64(&self) -> Option<i64> { match self { Value::Number(n) => n.as_i64(), _ => None } }
+    pub fn as_u64(&self) -> Option<u64> { match self { Value::Number(n) => n.as_u64(), _ => None } }
+    pub fn as_f64(&self) -> Option<f64> { match self { Value::Number(n) => Some(n.as_f64()), _ => None } }
+    pub fn as_str(&self) -> Option<&str> { match self { Value::String(s) => Some(s.as_str()), _ => None } }
+    pub fn as_array(&self) -> Option<&Vec<Value>> { match self { Value::Array(a) => Some(a), _ => None } }
+    pub fn as_object(&self) -> Option<&BTreeMap<String, Value>> { match self { Value::Object(o) => Some(o), _ => None } }
+    /// The value of an object's key, or None.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match self { Value::Object(o) => o.get(&key.to_string()), _ => None }
+    }
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match to_string(self) {
+            Ok(s) => f.write_str(s.as_str()),
+            Err(_) => Err(fmt::Error),
+        }
+    }
+}
+
+impl Serialize for Number {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Number::PosInt(n) => s.serialize_u64(*n),
+            Number::NegInt(n) => s.serialize_i64(*n),
+            Number::Float(x) => s.serialize_f64(*x),
+        }
+    }
+}
+
+impl Serialize for Value {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Value::Null => s.serialize_unit(),
+            Value::Bool(b) => s.serialize_bool(*b),
+            Value::Number(n) => n.serialize(s),
+            Value::String(x) => s.serialize_str(x.as_str()),
+            Value::Array(a) => a.serialize(s),
+            Value::Object(o) => o.serialize(s),
+        }
+    }
+}
+
+struct ValueVisitor;
+
+impl Visitor for ValueVisitor {
+    type Value = Value;
+    fn expecting(&self, f: &mut Formatter) -> fmt::Result { f.write_str("any JSON value") }
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Value, E> { Ok(Value::Bool(v)) }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> { Ok(Value::Number(if v < 0 { Number::NegInt(v) } else { Number::PosInt(v as u64) })) }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> { Ok(Value::Number(Number::PosInt(v))) }
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> { Ok(Value::Number(Number::Float(v))) }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> { Ok(Value::String(v.to_string())) }
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Value, E> { Ok(Value::String(v)) }
+    fn visit_none<E: de::Error>(self) -> Result<Value, E> { Ok(Value::Null) }
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> { Ok(Value::Null) }
+    fn visit_some<D: Deserializer>(self, d: D) -> Result<Value, D::Error> { Value::deserialize(d) }
+    fn visit_seq<A: SeqAccess>(self, seq: A) -> Result<Value, A::Error> {
+        let mut s = seq;
+        let mut out = Vec::new();
+        while let Some(x) = s.next_element::<Value>()? { out.push(x); }
+        Ok(Value::Array(out))
+    }
+    fn visit_map<A: MapAccess>(self, map: A) -> Result<Value, A::Error> {
+        let mut m = map;
+        let mut out = BTreeMap::new();
+        while let Some((k, v)) = m.next_entry::<String, Value>()? { out.insert(k, v); }
+        Ok(Value::Object(out))
+    }
+}
+
+impl Deserialize for Value {
+    fn deserialize<D: Deserializer>(d: D) -> Result<Value, D::Error> { d.deserialize_any(ValueVisitor) }
 }
