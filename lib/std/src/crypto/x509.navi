@@ -1,0 +1,1436 @@
+//! X.509 certificates (RFC 5280), as Go's crypto/x509: parsing (DER or
+//! PEM), and verifying a chain from a leaf through intermediates to a
+//! trusted root, for a host name and a key usage.
+//!
+//!     use std::crypto::x509::{Certificate, CertPool, VerifyOptions};
+//!     let leaf = Certificate::from_der(&der)?;
+//!     let mut opts = VerifyOptions::default();
+//!     opts.dns_name = Some("example.com".to_string());
+//!     opts.intermediates.add_cert(Certificate::from_der(&der2)?);
+//!     let chains = leaf.verify(&opts)?;       // roots: the system's
+//!
+//! As Go: names are checked against the subject alternative names only
+//! (not the common name), wildcards only as a whole leftmost label; a
+//! CA's name constraints apply to DNS names and IP addresses (a chain
+//! with constrained email or URI names fails); SHA-1 signatures fail;
+//! the leaf and intermediates must not have critical extensions this
+//! does not know. Signatures: RSA (PKCS#1 v1.5 and PSS with SHA-2), ECDSA
+//! on P-256 and P-384. No revocation (CRL, OCSP).
+//!
+//! The system's roots (`system_cert_pool`) are those of the CA bundle
+//! files and directories, as Go on Linux: the first of
+//! /etc/ssl/certs/ca-certificates.crt, /etc/pki/tls/certs/ca-bundle.crt,
+//! ... /etc/ssl/cert.pem (SSL_CERT_FILE instead), and the files in
+//! /etc/ssl/certs, /etc/pki/tls/certs and Android's
+//! /system/etc/security/cacerts (SSL_CERT_DIR, colon-separated, instead).
+
+use crate::collections::{HashMap, HashSet};
+use crate::crypto::der::{self, Reader};
+use crate::crypto::Digest;
+use crate::crypto::sha2::{Sha256, Sha384, Sha512};
+use crate::crypto::rsa::{RsaPublicKey, Pkcs1v15Sign, Pss};
+use crate::crypto::{p256, p384};
+use crate::fmt::{self, Display, Formatter};
+use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use crate::sync::LazyLock;
+
+/// Why a certificate could not be parsed or verified (Go's error types,
+/// as variants).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// Not a well-formed certificate: what is wrong.
+    Parse(String),
+    /// A certificate of the chain is outside its validity period: the
+    /// detail (current time and the period).
+    Expired(String),
+    /// An intermediate that is not a CA.
+    NotAuthorizedToSign,
+    /// A chain longer than a CA's path length constraint allows.
+    TooManyIntermediates,
+    /// No chain allows the requested key usages.
+    IncompatibleUsage,
+    /// A name of the leaf that a CA's name constraints do not allow.
+    CANotAuthorizedForThisName(String),
+    /// The leaf is not for the host: the host and the names it is for.
+    Hostname { host: String, valid: Vec<String> },
+    /// No chain leads to a trusted root: why the first candidate parent
+    /// failed and its name, if there was one.
+    UnknownAuthority { hint: String, candidate: String },
+    /// A critical extension this does not know.
+    UnhandledCriticalExtension,
+    /// A signature by an algorithm too weak to trust (SHA-1).
+    InsecureAlgorithm(SignatureAlgorithm),
+    /// A signature or key algorithm this does not implement.
+    UnsupportedAlgorithm,
+    /// The parent cannot sign certificates.
+    ConstraintViolation,
+    /// A signature that does not verify (the message).
+    Signature(String),
+    /// The system's roots could not be loaded.
+    SystemRoots(String),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Error::Parse(s) => f.write_fmt(`x509: ${s}`),
+            Error::Expired(s) => f.write_fmt(`x509: certificate has expired or is not yet valid: ${s}`),
+            Error::NotAuthorizedToSign => f.write_str("x509: certificate is not authorized to sign other certificates"),
+            Error::TooManyIntermediates => f.write_str("x509: too many intermediates for path length constraint"),
+            Error::IncompatibleUsage => f.write_str("x509: certificate specifies an incompatible key usage"),
+            Error::CANotAuthorizedForThisName(s) => f.write_fmt(`x509: a root or intermediate certificate is not authorized to sign for this name: ${s}`),
+            Error::Hostname { host, valid } => {
+                if valid.len() == 0 {
+                    if host.parse::<IpAddr>().is_ok() { return f.write_fmt(`x509: cannot validate certificate for ${host} because it doesn't contain any IP SANs`); }
+                    return f.write_fmt(`x509: certificate is not valid for any names, but wanted to match ${host}`);
+                }
+                f.write_fmt(`x509: certificate is valid for ${valid.join(", ")}, not ${host}`)
+            }
+            Error::UnknownAuthority { hint, candidate } => {
+                if hint.len() == 0 { return f.write_str("x509: certificate signed by unknown authority"); }
+                f.write_fmt(`x509: certificate signed by unknown authority (possibly because of ${quote(hint.as_str())} while trying to verify candidate authority certificate ${quote(candidate.as_str())})`)
+            }
+            Error::UnhandledCriticalExtension => f.write_str("x509: unhandled critical extension"),
+            Error::InsecureAlgorithm(a) => f.write_fmt(`x509: cannot verify signature: insecure algorithm ${a}`),
+            Error::UnsupportedAlgorithm => f.write_str("x509: cannot verify signature: algorithm unimplemented"),
+            Error::ConstraintViolation => f.write_str("x509: invalid signature: parent certificate cannot sign this kind of certificate"),
+            Error::Signature(s) => f.write_str(s.as_str()),
+            Error::SystemRoots(s) => f.write_fmt(`x509: failed to load system roots: ${s}`),
+        }
+    }
+}
+
+fn bad(what: &str) -> Error { Error::Parse(what.to_string()) }
+
+// s in double quotes, escaped (Go's %q for the usual text).
+fn quote(s: &str) -> String {
+    let mut out = String::new();
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' { out.push('\\'); }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// How a certificate is signed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignatureAlgorithm {
+    Sha1WithRsa,
+    Sha256WithRsa,
+    Sha384WithRsa,
+    Sha512WithRsa,
+    Sha256WithRsaPss,
+    Sha384WithRsaPss,
+    Sha512WithRsaPss,
+    EcdsaWithSha1,
+    EcdsaWithSha256,
+    EcdsaWithSha384,
+    EcdsaWithSha512,
+    Ed25519,
+    Unknown,
+}
+
+impl Display for SignatureAlgorithm {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.write_str(match self {
+            SignatureAlgorithm::Sha1WithRsa => "SHA1-RSA",
+            SignatureAlgorithm::Sha256WithRsa => "SHA256-RSA",
+            SignatureAlgorithm::Sha384WithRsa => "SHA384-RSA",
+            SignatureAlgorithm::Sha512WithRsa => "SHA512-RSA",
+            SignatureAlgorithm::Sha256WithRsaPss => "SHA256-RSAPSS",
+            SignatureAlgorithm::Sha384WithRsaPss => "SHA384-RSAPSS",
+            SignatureAlgorithm::Sha512WithRsaPss => "SHA512-RSAPSS",
+            SignatureAlgorithm::EcdsaWithSha1 => "ECDSA-SHA1",
+            SignatureAlgorithm::EcdsaWithSha256 => "ECDSA-SHA256",
+            SignatureAlgorithm::EcdsaWithSha384 => "ECDSA-SHA384",
+            SignatureAlgorithm::EcdsaWithSha512 => "ECDSA-SHA512",
+            SignatureAlgorithm::Ed25519 => "Ed25519",
+            SignatureAlgorithm::Unknown => "0",
+        })
+    }
+}
+
+/// A subject's public key.
+#[derive(Clone)]
+pub enum PublicKey {
+    Rsa(RsaPublicKey),
+    P256(p256::ecdsa::VerifyingKey),
+    P384(p384::ecdsa::VerifyingKey),
+    /// Another algorithm (Ed25519, P-521, DSA...), or a key this rejects:
+    /// the algorithm's OID.
+    Unsupported(String),
+}
+
+// The key's algorithm, decoded only when a signature is checked (an RSA
+// key's Montgomery constants take a while, and the system's roots are
+// mostly not used).
+#[derive(Clone, PartialEq)]
+enum KeyAlg {
+    Rsa,
+    P256,
+    P384,
+    Other(String),
+}
+
+/// An extended key usage (Go's ExtKeyUsage).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ExtKeyUsage {
+    Any,
+    ServerAuth,
+    ClientAuth,
+    CodeSigning,
+    EmailProtection,
+    TimeStamping,
+    OcspSigning,
+    MicrosoftServerGatedCrypto,
+    NetscapeServerGatedCrypto,
+    /// Another, by OID.
+    Other(String),
+}
+
+/// Key usage bits (Go's KeyUsage): `key_usage()` is their union, 0 when
+/// the certificate does not restrict them.
+pub const KEY_USAGE_DIGITAL_SIGNATURE: u16 = 1;
+pub const KEY_USAGE_CONTENT_COMMITMENT: u16 = 2;
+pub const KEY_USAGE_KEY_ENCIPHERMENT: u16 = 4;
+pub const KEY_USAGE_DATA_ENCIPHERMENT: u16 = 8;
+pub const KEY_USAGE_KEY_AGREEMENT: u16 = 16;
+pub const KEY_USAGE_CERT_SIGN: u16 = 32;
+pub const KEY_USAGE_CRL_SIGN: u16 = 64;
+pub const KEY_USAGE_ENCIPHER_ONLY: u16 = 128;
+pub const KEY_USAGE_DECIPHER_ONLY: u16 = 256;
+
+/// A distinguished name: its attributes in order (OID in dotted form and
+/// value).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Name {
+    attrs: Vec<(String, String)>,
+}
+
+fn short_name(oid: &str) -> Option<&str> {
+    match oid {
+        "2.5.4.3" => Some("CN"),
+        "2.5.4.5" => Some("SERIALNUMBER"),
+        "2.5.4.6" => Some("C"),
+        "2.5.4.7" => Some("L"),
+        "2.5.4.8" => Some("ST"),
+        "2.5.4.9" => Some("STREET"),
+        "2.5.4.10" => Some("O"),
+        "2.5.4.11" => Some("OU"),
+        "2.5.4.17" => Some("POSTALCODE"),
+        _ => None,
+    }
+}
+
+impl Name {
+    /// The values of an attribute (dotted OID, "2.5.4.10" for O).
+    pub fn get(&self, oid: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for a in self.attrs.iter() {
+            if a.0 == oid { out.push(a.1.as_str()); }
+        }
+        out
+    }
+
+    /// The (last) common name, or "".
+    pub fn common_name(&self) -> &str {
+        let v = self.get("2.5.4.3");
+        if v.len() == 0 { "" } else { v[v.len() - 1] }
+    }
+
+    pub fn organization(&self) -> Vec<&str> { self.get("2.5.4.10") }
+
+    pub fn organizational_unit(&self) -> Vec<&str> { self.get("2.5.4.11") }
+
+    pub fn country(&self) -> Vec<&str> { self.get("2.5.4.6") }
+
+    /// Every attribute: (dotted OID, value).
+    pub fn attributes(&self) -> &[(String, String)] { self.attrs.as_slice() }
+}
+
+impl Display for Name {
+    /// As RFC 2253 (and Go): last attribute first, "CN=x,O=y,C=z".
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut i = self.attrs.len();
+        while i > 0 {
+            i -= 1;
+            let (oid, v) = (&self.attrs[i].0, &self.attrs[i].1);
+            let key = match short_name(oid.as_str()) { Some(s) => s, None => oid.as_str() };
+            let mut esc = String::new();
+            let chars: Vec<char> = v.chars().collect();
+            let mut k = 0;
+            while k < chars.len() {
+                let c = chars[k];
+                let special = c == ',' || c == '+' || c == '"' || c == '\\' || c == '<' || c == '>' || c == ';'
+                    || (k == 0 && (c == ' ' || c == '#')) || (k == chars.len() - 1 && c == ' ');
+                if special { esc.push('\\'); }
+                esc.push(c);
+                k += 1;
+            }
+            if i + 1 < self.attrs.len() { f.write_str(",")?; }
+            f.write_fmt(`${key}=${esc}`)?;
+        }
+        Ok(())
+    }
+}
+
+/// A parsed certificate. Copies share the bytes (no need to clone).
+#[derive(Clone)]
+pub struct Certificate {
+    raw: Vec<u8>,
+    raw_tbs: Vec<u8>,
+    raw_subject: Vec<u8>,
+    raw_issuer: Vec<u8>,
+    raw_spki: Vec<u8>,
+    version: u8,
+    serial: Vec<u8>,
+    subject: Name,
+    issuer: Name,
+    not_before: i64,
+    not_after: i64,
+    key_alg: KeyAlg,
+    key: Vec<u8>,
+    sig_alg: SignatureAlgorithm,
+    signature: Vec<u8>,
+    key_usage: u16,
+    ext_key_usage: Vec<ExtKeyUsage>,
+    basic_constraints_valid: bool,
+    is_ca: bool,
+    /// -1: none.
+    max_path_len: i64,
+    dns_names: Vec<String>,
+    emails: Vec<String>,
+    uris: Vec<String>,
+    /// 4 or 16 bytes each.
+    ips: Vec<Vec<u8>>,
+    /// The subject alternative names extension's value, if it has one.
+    raw_san: Option<Vec<u8>>,
+    subject_key_id: Vec<u8>,
+    authority_key_id: Vec<u8>,
+    constraints: Option<NameConstraints>,
+    unhandled_critical: bool,
+}
+
+#[derive(Clone)]
+struct NameConstraints {
+    permitted_dns: Vec<String>,
+    excluded_dns: Vec<String>,
+    /// (address, mask), both 4 or 16 bytes.
+    permitted_ips: Vec<(Vec<u8>, Vec<u8>)>,
+    excluded_ips: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Constraints on email addresses or URIs (not checked: a chain with
+    /// such names under them fails).
+    other: bool,
+}
+
+
+impl Certificate {
+    /// The certificate of a DER encoding.
+    pub fn from_der(der: &[u8]) -> Result<Certificate, Error> {
+        let mut outer = Reader::new(der);
+        let mut cert = outer.read_nested(der::SEQUENCE).ok_or(bad("malformed certificate"))?;
+        if !outer.is_empty() { return Err(bad("trailing data after certificate")); }
+        let raw_tbs = cert.read_element(der::SEQUENCE).ok_or(bad("malformed tbs certificate"))?;
+        let outer_alg = cert.read_element(der::SEQUENCE).ok_or(bad("malformed signature algorithm identifier"))?;
+        let signature = cert.read_bytes_bit_string().ok_or(bad("malformed signature"))?;
+        if !cert.is_empty() { return Err(bad("malformed certificate")); }
+        let (mut c, inner_alg) = parse_tbs(raw_tbs)?;
+        if inner_alg != outer_alg { return Err(bad("inner and outer signature algorithm identifiers don't match")); }
+        c.raw = der.to_vec();
+        c.raw_tbs = raw_tbs.to_vec();
+        c.signature = signature.to_vec();
+        c.sig_alg = signature_algorithm(outer_alg);
+        Ok(c)
+    }
+
+    /// The certificate of the first "CERTIFICATE" block of PEM text.
+    pub fn from_pem(pem: &[u8]) -> Result<Certificate, Error> {
+        for p in crate::pem::parse_many(pem).map_err(|e: crate::pem::PemError| -> Error { Error::Parse(e.to_string()) })?.iter() {
+            if p.tag() == "CERTIFICATE" { return Certificate::from_der(p.contents()); }
+        }
+        Err(bad("no CERTIFICATE block in PEM"))
+    }
+
+    /// Every "CERTIFICATE" block of PEM text.
+    pub fn from_pem_many(pem: &[u8]) -> Result<Vec<Certificate>, Error> {
+        let mut out: Vec<Certificate> = Vec::new();
+        for p in crate::pem::parse_many(pem).map_err(|e: crate::pem::PemError| -> Error { Error::Parse(e.to_string()) })?.iter() {
+            if p.tag() == "CERTIFICATE" { out.push(Certificate::from_der(p.contents())?); }
+        }
+        Ok(out)
+    }
+
+    /// The DER encoding.
+    pub fn raw(&self) -> &[u8] { self.raw.as_slice() }
+
+    /// The signed part's DER encoding.
+    pub fn raw_tbs(&self) -> &[u8] { self.raw_tbs.as_slice() }
+
+    pub fn raw_subject(&self) -> &[u8] { self.raw_subject.as_slice() }
+
+    pub fn raw_issuer(&self) -> &[u8] { self.raw_issuer.as_slice() }
+
+    /// The SubjectPublicKeyInfo's DER encoding.
+    pub fn raw_subject_public_key_info(&self) -> &[u8] { self.raw_spki.as_slice() }
+
+    /// 1, 2 or 3.
+    pub fn version(&self) -> u8 { self.version }
+
+    /// The serial number (two's complement, big-endian).
+    pub fn serial_number(&self) -> &[u8] { self.serial.as_slice() }
+
+    pub fn subject(&self) -> &Name { &self.subject }
+
+    pub fn issuer(&self) -> &Name { &self.issuer }
+
+    /// The validity period's start, in seconds since the Unix epoch.
+    pub fn not_before(&self) -> i64 { self.not_before }
+
+    /// The validity period's end, in seconds since the Unix epoch.
+    pub fn not_after(&self) -> i64 { self.not_after }
+
+    pub fn signature_algorithm(&self) -> SignatureAlgorithm { self.sig_alg.clone() }
+
+    pub fn signature(&self) -> &[u8] { self.signature.as_slice() }
+
+    /// The subject's public key.
+    pub fn public_key(&self) -> PublicKey {
+        match &self.key_alg {
+            KeyAlg::Rsa => match RsaPublicKey::from_pkcs1_der(self.key.as_slice()) {
+                Ok(k) => PublicKey::Rsa(k),
+                Err(_) => PublicKey::Unsupported("1.2.840.113549.1.1.1".to_string()),
+            },
+            KeyAlg::P256 => match p256::ecdsa::VerifyingKey::from_sec1_bytes(self.key.as_slice()) {
+                Ok(k) => PublicKey::P256(k),
+                Err(_) => PublicKey::Unsupported("1.2.840.10045.2.1".to_string()),
+            },
+            KeyAlg::P384 => match p384::ecdsa::VerifyingKey::from_sec1_bytes(self.key.as_slice()) {
+                Ok(k) => PublicKey::P384(k),
+                Err(_) => PublicKey::Unsupported("1.2.840.10045.2.1".to_string()),
+            },
+            KeyAlg::Other(oid) => PublicKey::Unsupported(oid.clone()),
+        }
+    }
+
+    /// The KEY_USAGE_* bits; 0 when not restricted.
+    pub fn key_usage(&self) -> u16 { self.key_usage }
+
+    pub fn ext_key_usage(&self) -> &[ExtKeyUsage] { self.ext_key_usage.as_slice() }
+
+    /// Whether it has the basic constraints extension.
+    pub fn basic_constraints_valid(&self) -> bool { self.basic_constraints_valid }
+
+    pub fn is_ca(&self) -> bool { self.is_ca }
+
+    /// The path length constraint, if any.
+    pub fn max_path_len(&self) -> Option<u32> { if self.max_path_len < 0 { None } else { Some(self.max_path_len as u32) } }
+
+    pub fn dns_names(&self) -> &[String] { self.dns_names.as_slice() }
+
+    pub fn email_addresses(&self) -> &[String] { self.emails.as_slice() }
+
+    pub fn uris(&self) -> &[String] { self.uris.as_slice() }
+
+    pub fn ip_addresses(&self) -> Vec<IpAddr> {
+        let mut out: Vec<IpAddr> = Vec::new();
+        for b in self.ips.iter() {
+            if b.len() == 4 {
+                out.push(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])));
+            } else {
+                let mut s = [0u16; 8];
+                let mut i = 0;
+                while i < 8 {
+                    s[i] = ((b[2 * i] as u16) << 8) | (b[2 * i + 1] as u16);
+                    i += 1;
+                }
+                out.push(IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7])));
+            }
+        }
+        out
+    }
+
+    pub fn subject_key_id(&self) -> &[u8] { self.subject_key_id.as_slice() }
+
+    pub fn authority_key_id(&self) -> &[u8] { self.authority_key_id.as_slice() }
+
+    /// Whether the certificate has critical extensions this does not know.
+    pub fn has_unhandled_critical_extensions(&self) -> bool { self.unhandled_critical }
+
+    /// Checks that parent signed this certificate (and may sign
+    /// certificates).
+    pub fn check_signature_from(&self, parent: &Certificate) -> Result<(), Error> {
+        if (parent.version == 3 && !parent.basic_constraints_valid) || (parent.basic_constraints_valid && !parent.is_ca) { return Err(Error::ConstraintViolation); }
+        if parent.key_usage != 0 && (parent.key_usage & KEY_USAGE_CERT_SIGN) == 0 { return Err(Error::ConstraintViolation); }
+        check_signature(self.sig_alg.clone(), self.raw_tbs.as_slice(), self.signature.as_slice(), &parent.public_key())
+    }
+
+    /// Checks that the certificate is for host: a DNS name (matched
+    /// against the DNS names, a wildcard standing for one leftmost label)
+    /// or an IP address (against the IP addresses; "[::1]" too).
+    pub fn verify_hostname(&self, host: &str) -> Result<(), Error> {
+        let mut ip_text = host;
+        if host.len() >= 3 && host.starts_with("[") && host.ends_with("]") { ip_text = &host[1..host.len() - 1]; }
+        if let Ok(ip) = ip_text.parse::<IpAddr>() {
+            let want = ip_bytes(&ip);
+            for c in self.ips.iter() {
+                if normalize_ip(c.as_slice()) == want { return Ok(()); }
+            }
+            return Err(Error::Hostname { host: host.to_string(), valid: self.ip_addresses().iter().map(|a: &IpAddr| -> String { a.to_string() }).collect() });
+        }
+        let name = host.to_ascii_lowercase();
+        let valid_name = valid_hostname(name.as_str(), false);
+        for pattern in self.dns_names.iter() {
+            if valid_name && valid_hostname(pattern.as_str(), true) {
+                if match_hostnames(pattern.as_str(), name.as_str()) { return Ok(()); }
+            } else if name.len() > 0 && name != "." && pattern.len() > 0 && pattern.to_ascii_lowercase() == name {
+                return Ok(());
+            }
+        }
+        Err(Error::Hostname { host: host.to_string(), valid: self.dns_names.clone() })
+    }
+
+    /// Verifies the certificate as Go's Certificate.Verify: builds every
+    /// chain from it through opts.intermediates to one of opts.roots (the
+    /// system's when None), checking validity periods, CA and path length
+    /// constraints, name constraints and signatures; checks opts.dns_name
+    /// (if any) against it; keeps the chains that allow opts.key_usages.
+    /// Each chain starts with this certificate and ends with a root.
+    pub fn verify(&self, opts: &VerifyOptions) -> Result<Vec<Vec<Certificate>>, Error> {
+        let roots: &CertPool = match &opts.roots {
+            Some(r) => r,
+            None => system_roots()?,
+        };
+        let now = match opts.current_time { Some(t) => t, None => unix_now() };
+        if self.unhandled_critical { return Err(Error::UnhandledCriticalExtension); }
+        check_validity(self, now)?;
+        if let Some(h) = &opts.dns_name {
+            if h.len() > 0 { self.verify_hostname(h.as_str())?; }
+        }
+        let mut chains: Vec<Vec<Certificate>> = Vec::new();
+        if roots.contains(self) {
+            let mut one: Vec<Certificate> = Vec::new();
+            one.push(self.clone());
+            chains.push(one);
+        } else {
+            let mut start: Vec<Certificate> = Vec::new();
+            start.push(self.clone());
+            let mut b = Builder { roots, intermediates: &opts.intermediates, now, sig_checks: 0 };
+            chains = b.build(&start)?;
+        }
+        // Go: the chains whose usages allow the requested ones and whose
+        // names its CAs' constraints allow (certificate policies are not
+        // checked).
+        let mut usages = opts.key_usages.clone();
+        let any = usages.contains(&ExtKeyUsage::Any);
+        if usages.len() == 0 { usages.push(ExtKeyUsage::ServerAuth); }
+        let mut ok: Vec<Vec<Certificate>> = Vec::new();
+        let mut incompatible = 0;
+        let mut constraints_err: Option<Error> = None;
+        for ch in chains.iter() {
+            if !any && !chain_allows(ch.as_slice(), usages.as_slice()) {
+                incompatible += 1;
+                continue;
+            }
+            if let Err(e) = check_chain_constraints(ch.as_slice()) {
+                if constraints_err.is_none() { constraints_err = Some(Error::CANotAuthorizedForThisName(e)); }
+                continue;
+            }
+            ok.push(ch.clone());
+        }
+        if ok.len() == 0 {
+            if let Some(e) = constraints_err { return Err(e); }
+            return Err(Error::IncompatibleUsage);
+        }
+        Ok(ok)
+    }
+}
+
+impl PartialEq for Certificate {
+    /// Same DER encoding.
+    fn eq(&self, other: &Certificate) -> bool { self.raw == other.raw }
+}
+
+impl fmt::Debug for Certificate {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_struct("Certificate").field("subject", &self.subject.to_string()).field("issuer", &self.issuer.to_string()).finish()
+    }
+}
+
+// --- Parsing ------------------------------------------------------------------
+
+// The certificate of a TBSCertificate (raw and signature unset) and its
+// signature algorithm identifier.
+fn parse_tbs(raw_tbs: &[u8]) -> Result<(Certificate, &[u8]), Error> {
+    let mut t0 = Reader::new(raw_tbs);
+    let mut tbs = t0.read_nested(der::SEQUENCE).ok_or(bad("malformed tbs certificate"))?;
+    let mut version = 1i64;
+    if tbs.peek_tag() == Some(der::context(0)) {
+        let mut v = tbs.read_nested(der::context(0)).ok_or(bad("malformed version"))?;
+        version = v.read_i64().ok_or(bad("malformed version"))? + 1;
+        if !v.is_empty() || version < 1 || version > 3 { return Err(bad("invalid version")); }
+    }
+    let serial = tbs.read_integer_bytes().ok_or(bad("malformed serial number"))?;
+    let alg = tbs.read_element(der::SEQUENCE).ok_or(bad("malformed signature algorithm identifier"))?;
+    let raw_issuer = tbs.read_element(der::SEQUENCE).ok_or(bad("malformed issuer"))?;
+    let mut validity = tbs.read_nested(der::SEQUENCE).ok_or(bad("malformed validity"))?;
+    let not_before = validity.read_time().ok_or(bad("malformed validity"))?;
+    let not_after = validity.read_time().ok_or(bad("malformed validity"))?;
+    if !validity.is_empty() { return Err(bad("malformed validity")); }
+    let raw_subject = tbs.read_element(der::SEQUENCE).ok_or(bad("malformed subject"))?;
+    let raw_spki = tbs.read_element(der::SEQUENCE).ok_or(bad("malformed spki"))?;
+    tbs.skip_optional(der::context_primitive(1)).ok_or(bad("malformed issuerUniqueID"))?;
+    tbs.skip_optional(der::context_primitive(2)).ok_or(bad("malformed subjectUniqueID"))?;
+    let issuer = parse_name(raw_issuer).ok_or(bad("malformed issuer"))?;
+    let subject = parse_name(raw_subject).ok_or(bad("malformed subject"))?;
+    let (key_alg, key) = parse_spki(raw_spki).ok_or(bad("malformed spki"))?;
+    let mut c = Certificate {
+        raw: Vec::new(), raw_tbs: Vec::new(), raw_subject: raw_subject.to_vec(), raw_issuer: raw_issuer.to_vec(), raw_spki: raw_spki.to_vec(),
+        version: version as u8, serial: serial.to_vec(), subject, issuer, not_before, not_after,
+        key_alg, key, sig_alg: SignatureAlgorithm::Unknown, signature: Vec::new(),
+        key_usage: 0, ext_key_usage: Vec::new(), basic_constraints_valid: false, is_ca: false, max_path_len: -1,
+        dns_names: Vec::new(), emails: Vec::new(), uris: Vec::new(), ips: Vec::new(), raw_san: None,
+        subject_key_id: Vec::new(), authority_key_id: Vec::new(), constraints: None, unhandled_critical: false,
+    };
+    if tbs.peek_tag() == Some(der::context(3)) {
+        if version != 3 { return Err(bad("only version 3 certificates can have extensions")); }
+        let mut e = tbs.read_nested(der::context(3)).ok_or(bad("malformed extensions"))?;
+        let exts = e.read_nested(der::SEQUENCE).ok_or(bad("malformed extensions"))?;
+        if !e.is_empty() { return Err(bad("malformed extensions")); }
+        parse_extensions(&mut c, exts)?;
+    }
+    if !tbs.is_empty() { return Err(bad("malformed tbs certificate")); }
+    Ok((c, alg))
+}
+
+// A Name's attributes.
+fn parse_name(raw: &[u8]) -> Option<Name> {
+    let mut r0 = Reader::new(raw);
+    let mut seq = r0.read_nested(der::SEQUENCE)?;
+    let mut attrs: Vec<(String, String)> = Vec::new();
+    while !seq.is_empty() {
+        let mut set = seq.read_nested(der::SET)?;
+        while !set.is_empty() {
+            let mut atv = set.read_nested(der::SEQUENCE)?;
+            let oid = der::oid_string(atv.read_oid()?);
+            let (tag, v, _) = atv.read_any()?;
+            if !atv.is_empty() { return None; }
+            attrs.push((oid, decode_string(tag, v)?));
+        }
+    }
+    Some(Name { attrs })
+}
+
+// A directory string's text (Go's parseASN1String).
+fn decode_string(tag: u8, v: &[u8]) -> Option<String> {
+    let mut s = String::new();
+    if tag == der::UTF8_STRING {
+        return match crate::str::from_utf8(v) { Ok(t) => Some(t.to_string()), Err(_) => None };
+    } else if tag == der::PRINTABLE_STRING || tag == der::IA5_STRING || tag == der::T61_STRING {
+        // (T.61 as Latin-1, as Go.)
+        for b in v.iter() {
+            if tag != der::T61_STRING && *b >= 0x80 { return None; }
+            s.push(*b as char);
+        }
+    } else if tag == der::BMP_STRING {
+        if v.len() % 2 != 0 { return None; }
+        let mut units: Vec<u16> = Vec::new();
+        let mut i = 0;
+        while i < v.len() {
+            units.push(((v[i] as u16) << 8) | (v[i + 1] as u16));
+            i += 2;
+        }
+        // (A trailing NUL, as some encoders add.)
+        if units.len() > 0 && units[units.len() - 1] == 0 { units.pop(); }
+        return match String::from_utf16(units.as_slice()) { Ok(t) => Some(t), Err(_) => None };
+    } else if tag == der::UNIVERSAL_STRING {
+        if v.len() % 4 != 0 { return None; }
+        let mut i = 0;
+        while i < v.len() {
+            let u = ((v[i] as u32) << 24) | ((v[i + 1] as u32) << 16) | ((v[i + 2] as u32) << 8) | (v[i + 3] as u32);
+            s.push(char::from_u32(u)?);
+            i += 4;
+        }
+    } else {
+        return None;
+    }
+    Some(s)
+}
+
+// The key's algorithm and bytes (PKCS#1 for RSA, SEC 1 for EC).
+fn parse_spki(raw: &[u8]) -> Option<(KeyAlg, Vec<u8>)> {
+    let mut r0 = Reader::new(raw);
+    let mut r = r0.read_nested(der::SEQUENCE)?;
+    let mut alg = r.read_nested(der::SEQUENCE)?;
+    let key = r.read_bytes_bit_string()?;
+    if !r.is_empty() { return None; }
+    let oid = der::oid_string(alg.read_oid()?);
+    let kind = if oid == "1.2.840.113549.1.1.1" {
+        // NULL parameters (or none, as some encoders write).
+        alg.skip_optional(der::NULL)?;
+        KeyAlg::Rsa
+    } else if oid == "1.2.840.10045.2.1" {
+        let curve = if alg.peek_tag() == Some(der::OID) { der::oid_string(alg.read_oid()?) } else { String::new() };
+        if !alg.is_empty() { return None; }
+        if curve == "1.2.840.10045.3.1.7" {
+            KeyAlg::P256
+        } else if curve == "1.3.132.0.34" {
+            KeyAlg::P384
+        } else {
+            KeyAlg::Other(`${oid} ${curve}`.to_string())
+        }
+    } else {
+        KeyAlg::Other(oid)
+    };
+    Some((kind, key.to_vec()))
+}
+
+// The canonical RSASSA-PSS parameters (as Go writes and accepts):
+// SHA-2, MGF1 with the same hash, salt as long as the hash.
+fn pss_params(hash_oid_last: u8, salt: u8) -> Vec<u8> {
+    let h = [0x30u8, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, hash_oid_last, 0x05, 0x00];
+    let mut out: Vec<u8> = vec_of(&[0x30, 0x34, 0xa0, 0x0f]);
+    out.extend_from_slice(&h);
+    out.extend_from_slice(&[0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08]);
+    out.extend_from_slice(&h);
+    out.extend_from_slice(&[0xa2, 0x03, 0x02, 0x01, salt]);
+    out
+}
+
+fn vec_of(b: &[u8]) -> Vec<u8> { b.to_vec() }
+
+fn signature_algorithm(raw: &[u8]) -> SignatureAlgorithm {
+    let mut r0 = Reader::new(raw);
+    let mut r = match r0.read_nested(der::SEQUENCE) { Some(r) => r, None => return SignatureAlgorithm::Unknown };
+    let oid = match r.read_oid() { Some(o) => der::oid_string(o), None => return SignatureAlgorithm::Unknown };
+    let params = r.rest();
+    let null_or_none = params.len() == 0 || (params.len() == 2 && params[0] == der::NULL && params[1] == 0);
+    let none = params.len() == 0;
+    match oid.as_str() {
+        "1.2.840.113549.1.1.5" => if null_or_none { SignatureAlgorithm::Sha1WithRsa } else { SignatureAlgorithm::Unknown },
+        "1.2.840.113549.1.1.11" => if null_or_none { SignatureAlgorithm::Sha256WithRsa } else { SignatureAlgorithm::Unknown },
+        "1.2.840.113549.1.1.12" => if null_or_none { SignatureAlgorithm::Sha384WithRsa } else { SignatureAlgorithm::Unknown },
+        "1.2.840.113549.1.1.13" => if null_or_none { SignatureAlgorithm::Sha512WithRsa } else { SignatureAlgorithm::Unknown },
+        "1.2.840.113549.1.1.10" => {
+            if params == pss_params(1, 32).as_slice() {
+                SignatureAlgorithm::Sha256WithRsaPss
+            } else if params == pss_params(2, 48).as_slice() {
+                SignatureAlgorithm::Sha384WithRsaPss
+            } else if params == pss_params(3, 64).as_slice() {
+                SignatureAlgorithm::Sha512WithRsaPss
+            } else {
+                SignatureAlgorithm::Unknown
+            }
+        }
+        "1.2.840.10045.4.1" => if none { SignatureAlgorithm::EcdsaWithSha1 } else { SignatureAlgorithm::Unknown },
+        "1.2.840.10045.4.3.2" => if none { SignatureAlgorithm::EcdsaWithSha256 } else { SignatureAlgorithm::Unknown },
+        "1.2.840.10045.4.3.3" => if none { SignatureAlgorithm::EcdsaWithSha384 } else { SignatureAlgorithm::Unknown },
+        "1.2.840.10045.4.3.4" => if none { SignatureAlgorithm::EcdsaWithSha512 } else { SignatureAlgorithm::Unknown },
+        "1.3.101.112" => if none { SignatureAlgorithm::Ed25519 } else { SignatureAlgorithm::Unknown },
+        _ => SignatureAlgorithm::Unknown,
+    }
+}
+
+fn ext_key_usage_of(oid: &str) -> ExtKeyUsage {
+    match oid {
+        "2.5.29.37.0" => ExtKeyUsage::Any,
+        "1.3.6.1.5.5.7.3.1" => ExtKeyUsage::ServerAuth,
+        "1.3.6.1.5.5.7.3.2" => ExtKeyUsage::ClientAuth,
+        "1.3.6.1.5.5.7.3.3" => ExtKeyUsage::CodeSigning,
+        "1.3.6.1.5.5.7.3.4" => ExtKeyUsage::EmailProtection,
+        "1.3.6.1.5.5.7.3.8" => ExtKeyUsage::TimeStamping,
+        "1.3.6.1.5.5.7.3.9" => ExtKeyUsage::OcspSigning,
+        "1.3.6.1.4.1.311.10.3.3" => ExtKeyUsage::MicrosoftServerGatedCrypto,
+        "2.16.840.1.113730.4.1" => ExtKeyUsage::NetscapeServerGatedCrypto,
+        _ => ExtKeyUsage::Other(oid.to_string()),
+    }
+}
+
+fn ascii(b: &[u8]) -> Option<String> {
+    let mut s = String::new();
+    for c in b.iter() {
+        if *c >= 0x80 { return None; }
+        s.push(*c as char);
+    }
+    Some(s)
+}
+
+fn parse_extensions(c: &mut Certificate, exts: Reader) -> Result<(), Error> {
+    let mut exts = exts;
+    let mut seen: HashSet<String> = HashSet::new();
+    while !exts.is_empty() {
+        let mut e = exts.read_nested(der::SEQUENCE).ok_or(bad("malformed extension"))?;
+        let oid = der::oid_string(e.read_oid().ok_or(bad("malformed extension OID field"))?);
+        let critical = if e.peek_tag() == Some(der::BOOLEAN) { e.read_bool().ok_or(bad("malformed extension critical field"))? } else { false };
+        let value = e.read(der::OCTET_STRING).ok_or(bad("malformed extension value field"))?;
+        if !e.is_empty() { return Err(bad("malformed extension")); }
+        if seen.contains(&oid) { return Err(Error::Parse(`certificate contains duplicate extensions: ${oid}`.to_string())); }
+        seen.insert(oid.clone());
+        let handled = match oid.as_str() {
+            "2.5.29.15" => {
+                let mut r = Reader::new(value);
+                let (bits, unused) = r.read_bit_string().ok_or(bad("invalid key usage"))?;
+                let n = 8 * bits.len() - unused as usize;
+                let mut usage = 0u16;
+                let mut i = 0;
+                while i < 9 && i < n {
+                    if ((bits[i / 8] >> (7 - (i % 8)) as u8) & 1) != 0 { usage = usage | (1u16 << i as u16); }
+                    i += 1;
+                }
+                c.key_usage = usage;
+                true
+            }
+            "2.5.29.19" => {
+                let mut r0 = Reader::new(value);
+                let mut r = r0.read_nested(der::SEQUENCE).ok_or(bad("invalid basic constraints"))?;
+                if r.peek_tag() == Some(der::BOOLEAN) { c.is_ca = r.read_bool().ok_or(bad("invalid basic constraints"))?; }
+                if r.peek_tag() == Some(der::INTEGER) {
+                    let n = r.read_i64().ok_or(bad("invalid basic constraints"))?;
+                    if n < 0 { return Err(bad("invalid basic constraints")); }
+                    c.max_path_len = n;
+                }
+                if !r.is_empty() { return Err(bad("invalid basic constraints")); }
+                c.basic_constraints_valid = true;
+                true
+            }
+            "2.5.29.17" => {
+                parse_san(c, value).ok_or(bad("invalid subject alternative names"))?;
+                c.raw_san = Some(value.to_vec());
+                true
+            }
+            "2.5.29.37" => {
+                let mut r0 = Reader::new(value);
+                let mut r = r0.read_nested(der::SEQUENCE).ok_or(bad("invalid extended key usages"))?;
+                while !r.is_empty() {
+                    let o = r.read_oid().ok_or(bad("invalid extended key usages"))?;
+                    c.ext_key_usage.push(ext_key_usage_of(der::oid_string(o).as_str()));
+                }
+                true
+            }
+            "2.5.29.14" => {
+                let mut r = Reader::new(value);
+                c.subject_key_id = r.read(der::OCTET_STRING).ok_or(bad("invalid subject key identifier"))?.to_vec();
+                true
+            }
+            "2.5.29.35" => {
+                let mut r0 = Reader::new(value);
+                let mut r = r0.read_nested(der::SEQUENCE).ok_or(bad("invalid authority key identifier"))?;
+                if let Some(id) = r.read_optional(der::context_primitive(0)).ok_or(bad("invalid authority key identifier"))? { c.authority_key_id = id.to_vec(); }
+                true
+            }
+            "2.5.29.30" => {
+                let (nc, unhandled) = parse_name_constraints(value).ok_or(bad("invalid name constraints"))?;
+                c.constraints = Some(nc);
+                !unhandled
+            }
+            // Policies (not checked, as Go unless asked), the authority
+            // information access, CRL distribution points.
+            "2.5.29.32" | "2.5.29.33" | "2.5.29.36" | "2.5.29.54" | "1.3.6.1.5.5.7.1.1" | "2.5.29.31" => true,
+            _ => false,
+        };
+        if critical && !handled { c.unhandled_critical = true; }
+    }
+    Ok(())
+}
+
+fn parse_san(c: &mut Certificate, value: &[u8]) -> Option<()> {
+    let mut r0 = Reader::new(value);
+    let mut r = r0.read_nested(der::SEQUENCE)?;
+    if !r0.is_empty() { return None; }
+    while !r.is_empty() {
+        let (tag, v, _) = r.read_any()?;
+        if tag == der::context_primitive(1) {
+            c.emails.push(ascii(v)?);
+        } else if tag == der::context_primitive(2) {
+            c.dns_names.push(ascii(v)?);
+        } else if tag == der::context_primitive(6) {
+            c.uris.push(ascii(v)?);
+        } else if tag == der::context_primitive(7) {
+            if v.len() != 4 && v.len() != 16 { return None; }
+            c.ips.push(v.to_vec());
+        }
+    }
+    Some(())
+}
+
+// The constraints and whether some are of a kind this does not check.
+fn parse_name_constraints(value: &[u8]) -> Option<(NameConstraints, bool)> {
+    let mut nc = NameConstraints { permitted_dns: Vec::new(), excluded_dns: Vec::new(), permitted_ips: Vec::new(), excluded_ips: Vec::new(), other: false };
+    let mut unhandled = false;
+    let mut r0 = Reader::new(value);
+    let mut r = r0.read_nested(der::SEQUENCE)?;
+    let mut k = 0u8;
+    while k < 2 {
+        if let Some(subtrees) = r.read_optional(der::context(k))? {
+            let mut st = Reader::new(subtrees);
+            while !st.is_empty() {
+                let mut sub = st.read_nested(der::SEQUENCE)?;
+                let (tag, v, _) = sub.read_any()?;
+                if tag == der::context_primitive(2) {
+                    let name = ascii(v)?;
+                    if k == 0 { nc.permitted_dns.push(name); } else { nc.excluded_dns.push(name); }
+                } else if tag == der::context_primitive(7) {
+                    if v.len() != 8 && v.len() != 32 { return None; }
+                    let half = v.len() / 2;
+                    let pair = (v[..half].to_vec(), v[half..].to_vec());
+                    if k == 0 { nc.permitted_ips.push(pair); } else { nc.excluded_ips.push(pair); }
+                } else if tag == der::context_primitive(1) || tag == der::context_primitive(6) {
+                    nc.other = true;
+                } else {
+                    unhandled = true;
+                }
+            }
+        }
+        k += 1;
+    }
+    if !r.is_empty() { return None; }
+    Some((nc, unhandled))
+}
+
+// --- Signatures ---------------------------------------------------------------
+
+fn check_signature(alg: SignatureAlgorithm, signed: &[u8], sig: &[u8], key: &PublicKey) -> Result<(), Error> {
+    match alg {
+        SignatureAlgorithm::Sha1WithRsa | SignatureAlgorithm::EcdsaWithSha1 => return Err(Error::InsecureAlgorithm(alg)),
+        SignatureAlgorithm::Ed25519 | SignatureAlgorithm::Unknown => return Err(Error::UnsupportedAlgorithm),
+        _ => {}
+    }
+    match key {
+        PublicKey::Rsa(k) => {
+            let r = match alg {
+                SignatureAlgorithm::Sha256WithRsa => k.verify(Pkcs1v15Sign::new::<Sha256>(), Sha256::digest(signed).as_slice(), sig),
+                SignatureAlgorithm::Sha384WithRsa => k.verify(Pkcs1v15Sign::new::<Sha384>(), Sha384::digest(signed).as_slice(), sig),
+                SignatureAlgorithm::Sha512WithRsa => k.verify(Pkcs1v15Sign::new::<Sha512>(), Sha512::digest(signed).as_slice(), sig),
+                SignatureAlgorithm::Sha256WithRsaPss => k.verify(Pss::new::<Sha256>(), Sha256::digest(signed).as_slice(), sig),
+                SignatureAlgorithm::Sha384WithRsaPss => k.verify(Pss::new::<Sha384>(), Sha384::digest(signed).as_slice(), sig),
+                SignatureAlgorithm::Sha512WithRsaPss => k.verify(Pss::new::<Sha512>(), Sha512::digest(signed).as_slice(), sig),
+                _ => return Err(Error::UnsupportedAlgorithm),
+            };
+            // (Go: keys under 1024 bits are insecure.)
+            if k.size() < 128 { return Err(Error::InsecureAlgorithm(alg)); }
+            r.map_err(|_e: crate::crypto::rsa::Error| -> Error { Error::Signature("crypto/rsa: verification error".to_string()) })
+        }
+        PublicKey::P256(k) => {
+            let s = p256::ecdsa::Signature::from_der(sig).map_err(|_e: crate::crypto::ec::Error| -> Error { ecdsa_failure() })?;
+            k.verify_prehash(ecdsa_hash(&alg, signed)?.as_slice(), &s).map_err(|_e: crate::crypto::ec::Error| -> Error { ecdsa_failure() })
+        }
+        PublicKey::P384(k) => {
+            let s = p384::ecdsa::Signature::from_der(sig).map_err(|_e: crate::crypto::ec::Error| -> Error { ecdsa_failure() })?;
+            k.verify_prehash(ecdsa_hash(&alg, signed)?.as_slice(), &s).map_err(|_e: crate::crypto::ec::Error| -> Error { ecdsa_failure() })
+        }
+        PublicKey::Unsupported(_) => Err(Error::UnsupportedAlgorithm),
+    }
+}
+
+fn ecdsa_failure() -> Error { Error::Signature("x509: ECDSA verification failure".to_string()) }
+
+fn ecdsa_hash(alg: &SignatureAlgorithm, signed: &[u8]) -> Result<Vec<u8>, Error> {
+    match alg {
+        SignatureAlgorithm::EcdsaWithSha256 => Ok(Sha256::digest(signed)),
+        SignatureAlgorithm::EcdsaWithSha384 => Ok(Sha384::digest(signed)),
+        SignatureAlgorithm::EcdsaWithSha512 => Ok(Sha512::digest(signed)),
+        _ => Err(Error::UnsupportedAlgorithm),
+    }
+}
+
+// --- Host names -----------------------------------------------------------------
+
+fn ip_bytes(ip: &IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(a) => a.octets().to_vec(),
+        IpAddr::V6(a) => normalize_ip(&a.octets()),
+    }
+}
+
+// An IPv4-mapped IPv6 address as its IPv4 one (Go's IP.Equal).
+fn normalize_ip(b: &[u8]) -> Vec<u8> {
+    if b.len() == 16 {
+        let mut mapped = b[10] == 0xff && b[11] == 0xff;
+        let mut i = 0;
+        while i < 10 {
+            if b[i] != 0 { mapped = false; }
+            i += 1;
+        }
+        if mapped { return b[12..].to_vec(); }
+    }
+    b.to_vec()
+}
+
+// Go's validHostname: labels of letters, digits, '-' (not first) and '_';
+// a pattern may start with a "*" label.
+fn valid_hostname(host: &str, pattern: bool) -> bool {
+    let h = if !pattern && host.ends_with(".") { &host[..host.len() - 1] } else { host };
+    if h.len() == 0 || h.len() > 253 { return false; }
+    let mut i = 0;
+    for part in h.split('.') {
+        if part.len() == 0 { return false; }
+        if pattern && i == 0 && part == "*" {
+            i += 1;
+            continue;
+        }
+        let b = part.as_bytes();
+        let mut j = 0;
+        while j < b.len() {
+            let c = b[j];
+            let ok = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || (c == b'-' && j != 0) || c == b'_';
+            if !ok { return false; }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn match_hostnames(pattern: &str, host: &str) -> bool {
+    let h = if host.ends_with(".") { &host[..host.len() - 1] } else { host };
+    if pattern.len() == 0 || h.len() == 0 { return false; }
+    let p: Vec<&str> = pattern.split('.').collect();
+    let hs: Vec<&str> = h.split('.').collect();
+    if p.len() != hs.len() { return false; }
+    let mut i = 0;
+    while i < p.len() {
+        if !(i == 0 && p[i] == "*") && p[i].to_ascii_lowercase() != hs[i] { return false; }
+        i += 1;
+    }
+    true
+}
+
+// --- Chains -------------------------------------------------------------------
+
+/// What `Certificate::verify` checks against (Go's VerifyOptions).
+#[derive(Clone, Default)]
+pub struct VerifyOptions {
+    /// The host the leaf must be for (none: not checked).
+    pub dns_name: Option<String>,
+    /// Certificates that may be in the chain between the leaf and a root.
+    pub intermediates: CertPool,
+    /// The trusted roots; None: the system's.
+    pub roots: Option<CertPool>,
+    /// The time to check validity at, in Unix seconds; None: now.
+    pub current_time: Option<i64>,
+    /// Usages every certificate of a chain must allow; empty: ServerAuth.
+    pub key_usages: Vec<ExtKeyUsage>,
+}
+
+fn unix_now() -> i64 {
+    match crate::time::SystemTime::now().duration_since(crate::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    }
+}
+
+// "YYYY-MM-DDTHH:MM:SSZ" of Unix seconds (civil_from_days).
+fn format_time(t: i64) -> String {
+    let days = if t >= 0 { t / 86400 } else { (t - 86399) / 86400 };
+    let secs = t - days * 86400;
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 });
+    `${y:04}-${m:02}-${d:02}T${secs / 3600:02}:${(secs / 60) % 60:02}:${secs % 60:02}Z`.to_string()
+}
+
+fn check_validity(c: &Certificate, now: i64) -> Result<(), Error> {
+    if now < c.not_before {
+        return Err(Error::Expired(`current time ${format_time(now)} is before ${format_time(c.not_before)}`.to_string()));
+    }
+    if now > c.not_after {
+        return Err(Error::Expired(`current time ${format_time(now)} is after ${format_time(c.not_after)}`.to_string()));
+    }
+    Ok(())
+}
+
+// Go's matchDomainConstraint: domain is under constraint ("example.com"
+// takes itself and its subdomains, ".example.com" only subdomains).
+fn match_domain_constraint(domain: &str, constraint: &str) -> bool {
+    if constraint.len() == 0 { return true; }
+    let mut cons = constraint;
+    let mut must_sub = false;
+    if cons.starts_with(".") {
+        must_sub = true;
+        cons = &cons[1..];
+    }
+    let d: Vec<&str> = domain.split('.').collect();
+    let c: Vec<&str> = cons.split('.').collect();
+    for l in d.iter() {
+        if l.len() == 0 { return false; }
+    }
+    if d.len() < c.len() || (must_sub && d.len() == c.len()) { return false; }
+    let mut i = 0;
+    while i < c.len() {
+        if c[c.len() - 1 - i].to_ascii_lowercase() != d[d.len() - 1 - i].to_ascii_lowercase() { return false; }
+        i += 1;
+    }
+    true
+}
+
+fn ip_in(ip: &[u8], net: &(Vec<u8>, Vec<u8>)) -> bool {
+    if ip.len() != net.0.len() { return false; }
+    let mut i = 0;
+    while i < ip.len() {
+        if (ip[i] & net.1[i]) != (net.0[i] & net.1[i]) { return false; }
+        i += 1;
+    }
+    true
+}
+
+// The name without its first label ("" if it has one label).
+fn trim_first_label(s: &str) -> &str {
+    match s.find('.') {
+        Some(i) => &s[i + 1..],
+        None => "",
+    }
+}
+
+// Whether one of the constraints takes name; which one.
+fn dns_query(constraints: &Vec<String>, name: &str, permitted: bool) -> Option<String> {
+    for c in constraints.iter() {
+        if match_domain_constraint(name, c.as_str()) { return Some(c.clone()); }
+    }
+    // An excluded name's wildcard covers it ("*.example.com" and
+    // "bad.example.com").
+    if !permitted && name.starts_with("*") {
+        let trimmed = trim_first_label(name);
+        for c in constraints.iter() {
+            let t = trim_first_label(c.as_str());
+            if t.len() > 0 && t == trimmed { return Some(c.clone()); }
+        }
+    }
+    None
+}
+
+fn ip_string(b: &[u8]) -> String {
+    if b.len() == 4 { return IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])).to_string(); }
+    let mut s = [0u16; 8];
+    let mut i = 0;
+    while i < 8 {
+        s[i] = ((b[2 * i] as u16) << 8) | (b[2 * i + 1] as u16);
+        i += 1;
+    }
+    IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7])).to_string()
+}
+
+// Whether a CA's constraints allow c's names (Go's chainConstraints.check:
+// IP addresses then DNS names, permitted then excluded).
+fn check_constraints(nc: &NameConstraints, c: &Certificate) -> Result<(), String> {
+    for ip in c.ips.iter() {
+        let b = normalize_ip(ip.as_slice());
+        if nc.permitted_ips.len() > 0 {
+            let mut ok = false;
+            for p in nc.permitted_ips.iter() {
+                if ip_in(b.as_slice(), p) { ok = true; }
+            }
+            if !ok { return Err(`IP address ${quote(ip_string(b.as_slice()).as_str())} is not permitted by any constraint`.to_string()); }
+        }
+        for e in nc.excluded_ips.iter() {
+            if ip_in(b.as_slice(), e) { return Err(`IP address ${quote(ip_string(b.as_slice()).as_str())} is excluded by constraint ${quote(ip_net_string(e).as_str())}`.to_string()); }
+        }
+    }
+    for name in c.dns_names.iter() {
+        let n = name.as_str();
+        if nc.permitted_dns.len() > 0 && dns_query(&nc.permitted_dns, n, true).is_none() { return Err(`DNS name ${quote(n)} is not permitted by any constraint`.to_string()); }
+        if let Some(e) = dns_query(&nc.excluded_dns, n, false) { return Err(`DNS name ${quote(n)} is excluded by constraint ${quote(e.as_str())}`.to_string()); }
+    }
+    if nc.other && (c.emails.len() > 0 || c.uris.len() > 0) { return Err("email address and URI constraints are not supported".to_string()); }
+    Ok(())
+}
+
+// "10.0.0.0/8" of an (address, mask) pair.
+fn ip_net_string(n: &(Vec<u8>, Vec<u8>)) -> String {
+    let mut ones = 0;
+    for b in n.1.iter() { ones += b.count_ones(); }
+    `${ip_string(n.0.as_slice())}/${ones}`.to_string()
+}
+
+// Go's checkChainConstraints: each certificate's names (if it has the
+// extension) against the constraints of every CA above it.
+fn check_chain_constraints(chain: &[Certificate]) -> Result<(), String> {
+    let mut i = 0;
+    while i < chain.len() {
+        if chain[i].raw_san.is_some() {
+            let mut j = i + 1;
+            while j < chain.len() {
+                if let Some(nc) = &chain[j].constraints { check_constraints(nc, &chain[i])?; }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+// Go's checkChainForKeyUsage: every certificate with extended key usages
+// allows each of usages (from the root down; Any allows all).
+fn chain_allows(chain: &[Certificate], usages: &[ExtKeyUsage]) -> bool {
+    let mut left: Vec<ExtKeyUsage> = usages.to_vec();
+    let mut i = chain.len();
+    while i > 0 {
+        i -= 1;
+        let c = &chain[i];
+        if c.ext_key_usage.len() == 0 || c.ext_key_usage.contains(&ExtKeyUsage::Any) { continue; }
+        let mut keep: Vec<ExtKeyUsage> = Vec::new();
+        for u in left.iter() {
+            let mut ok = c.ext_key_usage.contains(u);
+            // (Old CAs: the server-gated-crypto usages stand for
+            // ServerAuth.)
+            if !ok && *u == ExtKeyUsage::ServerAuth {
+                ok = c.ext_key_usage.contains(&ExtKeyUsage::NetscapeServerGatedCrypto) || c.ext_key_usage.contains(&ExtKeyUsage::MicrosoftServerGatedCrypto);
+            }
+            if ok { keep.push(u.clone()); }
+        }
+        if keep.len() == 0 { return false; }
+        left = keep;
+    }
+    true
+}
+
+// A certificate's name in messages: the common name, else the first
+// organization, else the serial number.
+fn candidate_name(c: &Certificate) -> String {
+    let cn = c.subject.common_name();
+    if cn.len() > 0 { return cn.to_string(); }
+    let o = c.subject.organization();
+    if o.len() > 0 { return o[0].to_string(); }
+    `serial:${crate::hex::encode(c.serial.as_slice())}`.to_string()
+}
+
+// At most this many signature checks a verification (Go's
+// maxChainSignatureChecks).
+const MAX_SIG_CHECKS: usize = 100;
+
+struct Builder {
+    roots: &CertPool,
+    intermediates: &CertPool,
+    now: i64,
+    sig_checks: usize,
+}
+
+// Go's alreadyInChain: the same subject, key and alternative names as one
+// of the chain.
+fn already_in_chain(c: &Certificate, chain: &Vec<Certificate>) -> bool {
+    for x in chain.iter() {
+        if x.raw_subject == c.raw_subject && x.raw_spki == c.raw_spki && x.raw_san == c.raw_san { return true; }
+    }
+    false
+}
+
+impl Builder {
+    // Every chain that extends chain (whose last is the certificate to
+    // find a parent of) to a root, as Go's buildChains, errors included:
+    // when none, the error of the last candidate that failed its checks
+    // as a parent (not its signature), else UnknownAuthority with why the
+    // first candidate failed.
+    fn build(&mut self, chain: &Vec<Certificate>) -> Result<Vec<Vec<Certificate>>, Error> {
+        let mut out: Vec<Vec<Certificate>> = Vec::new();
+        let mut err: Option<Error> = None;
+        let mut hint: Option<(Error, String)> = None;
+        let c = chain[chain.len() - 1].clone();
+        let mut k = 0;
+        while k < 2 {
+            let pool = if k == 0 { self.roots } else { self.intermediates };
+            let is_root = k == 0;
+            k += 1;
+            for cand in pool.find_parents(&c).iter() {
+                if already_in_chain(cand, chain) { continue; }
+                self.sig_checks += 1;
+                if self.sig_checks > MAX_SIG_CHECKS {
+                    err = Some(Error::Parse("signature check attempts limit reached while verifying certificate chain".to_string()));
+                    continue;
+                }
+                if let Err(e) = c.check_signature_from(cand) {
+                    if hint.is_none() { hint = Some((e, candidate_name(cand))); }
+                    continue;
+                }
+                if let Err(e) = self.valid_parent(cand, chain, is_root) {
+                    if hint.is_none() { hint = Some((e.clone(), candidate_name(cand))); }
+                    err = Some(e);
+                    continue;
+                }
+                err = None;
+                let mut next = chain.clone();
+                next.push(cand.clone());
+                if is_root {
+                    out.push(next);
+                } else {
+                    match self.build(&next) {
+                        Ok(chs) => for ch in chs.iter() { out.push(ch.clone()); },
+                        Err(e) => err = Some(e),
+                    }
+                }
+            }
+        }
+        if out.len() > 0 { return Ok(out); }
+        if let Some(e) = err { return Err(e); }
+        match hint {
+            Some((e, name)) => Err(Error::UnknownAuthority { hint: e.to_string(), candidate: name }),
+            None => Err(Error::UnknownAuthority { hint: String::new(), candidate: String::new() }),
+        }
+    }
+
+    // Go's isValid for an intermediate or root under chain.
+    fn valid_parent(&self, c: &Certificate, chain: &Vec<Certificate>, is_root: bool) -> Result<(), Error> {
+        if c.unhandled_critical { return Err(Error::UnhandledCriticalExtension); }
+        check_validity(c, self.now)?;
+        if !is_root && (!c.basic_constraints_valid || !c.is_ca) { return Err(Error::NotAuthorizedToSign); }
+        if c.basic_constraints_valid && c.max_path_len >= 0 {
+            let intermediates = (chain.len() - 1) as i64;
+            if intermediates > c.max_path_len { return Err(Error::TooManyIntermediates); }
+        }
+        Ok(())
+    }
+}
+
+// --- Pools ----------------------------------------------------------------------
+
+/// A set of certificates (Go's CertPool): trusted roots, or
+/// intermediates to build chains with.
+#[derive(Clone, Default)]
+pub struct CertPool {
+    certs: Vec<Certificate>,
+    /// By raw subject: indices into certs.
+    by_subject: HashMap<Vec<u8>, Vec<usize>>,
+    /// SHA-256 of each certificate's DER (to skip duplicates).
+    hashes: HashSet<Vec<u8>>,
+}
+
+impl CertPool {
+    pub fn new() -> CertPool { CertPool::default() }
+
+    /// Adds a certificate (once).
+    pub fn add_cert(&mut self, c: Certificate) {
+        let h = Sha256::digest(c.raw.as_slice());
+        if self.hashes.contains(&h) { return; }
+        self.hashes.insert(h);
+        let i = self.certs.len();
+        match self.by_subject.get_mut(&c.raw_subject) {
+            Some(v) => v.push(i),
+            None => {
+                let mut v: Vec<usize> = Vec::new();
+                v.push(i);
+                self.by_subject.insert(c.raw_subject.clone(), v);
+            }
+        }
+        self.certs.push(c);
+    }
+
+    /// Adds the certificates of PEM text; whether any was added (blocks
+    /// that are not certificates, or do not parse, are skipped as Go).
+    pub fn append_certs_from_pem(&mut self, pem: &[u8]) -> bool {
+        let blocks = match crate::pem::parse_many(pem) { Ok(b) => b, Err(_) => return false };
+        let mut any = false;
+        for p in blocks.iter() {
+            if p.tag() != "CERTIFICATE" { continue; }
+            if let Ok(c) = Certificate::from_der(p.contents()) {
+                self.add_cert(c);
+                any = true;
+            }
+        }
+        any
+    }
+
+    pub fn len(&self) -> usize { self.certs.len() }
+
+    pub fn is_empty(&self) -> bool { self.certs.len() == 0 }
+
+    /// The certificates in the order added.
+    pub fn certs(&self) -> &[Certificate] { self.certs.as_slice() }
+
+    pub fn contains(&self, c: &Certificate) -> bool { self.hashes.contains(&Sha256::digest(c.raw.as_slice())) }
+
+    // The certificates whose subject is c's issuer, in Go's order: those
+    // whose key ID is c's authority key ID, then those where one of the
+    // two is missing, then the rest.
+    fn find_parents(&self, c: &Certificate) -> Vec<Certificate> {
+        let mut matching: Vec<Certificate> = Vec::new();
+        let mut one: Vec<Certificate> = Vec::new();
+        let mut rest: Vec<Certificate> = Vec::new();
+        if let Some(v) = self.by_subject.get(&c.raw_issuer) {
+            for i in v.iter() {
+                let p = &self.certs[*i];
+                if p.subject_key_id == c.authority_key_id {
+                    matching.push(p.clone());
+                } else if p.subject_key_id.len() == 0 || c.authority_key_id.len() == 0 {
+                    one.push(p.clone());
+                } else {
+                    rest.push(p.clone());
+                }
+            }
+        }
+        for p in one.iter() { matching.push(p.clone()); }
+        for p in rest.iter() { matching.push(p.clone()); }
+        matching
+    }
+}
+
+static SYSTEM: LazyLock<Result<CertPool, String>> = LazyLock::new(load_system_roots);
+
+fn system_roots() -> Result<&CertPool, Error> {
+    match LazyLock::force(&SYSTEM) {
+        Ok(p) => Ok(p),
+        Err(e) => Err(Error::SystemRoots(e.clone())),
+    }
+}
+
+/// A copy of the system's trusted roots.
+pub fn system_cert_pool() -> Result<CertPool, Error> { Ok(system_roots()?.clone()) }
+
+const CERT_FILES: [&str; 6] = [
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/tls/cacert.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+];
+
+const CERT_DIRS: [&str; 3] = ["/etc/ssl/certs", "/etc/pki/tls/certs", "/system/etc/security/cacerts"];
+
+// Go's loadSystemRoots for Unix.
+fn load_system_roots() -> Result<CertPool, String> {
+    let mut pool = CertPool::new();
+    let mut files: Vec<String> = CERT_FILES.iter().map(|s: &&str| -> String { s.to_string() }).collect();
+    if let Ok(f) = crate::env::var("SSL_CERT_FILE") {
+        if f.len() > 0 { files = vec_of_str(f); }
+    }
+    let mut first_err = String::new();
+    for f in files.iter() {
+        match crate::fs::read(f.as_str()) {
+            Ok(data) => {
+                pool.append_certs_from_pem(data.as_slice());
+                break;
+            }
+            Err(e) => if first_err.len() == 0 { first_err = `${f}: ${e}`.to_string(); },
+        }
+    }
+    let mut dirs: Vec<String> = CERT_DIRS.iter().map(|s: &&str| -> String { s.to_string() }).collect();
+    if let Ok(d) = crate::env::var("SSL_CERT_DIR") {
+        if d.len() > 0 { dirs = d.split(':').map(|s: &str| -> String { s.to_string() }).collect(); }
+    }
+    for d in dirs.iter() {
+        let entries = match crate::fs::read_dir(d.as_str()) { Ok(e) => e, Err(_) => continue };
+        for ent in entries {
+            let ent = match ent { Ok(e) => e, Err(_) => continue };
+            // (Links within the directory are the same certificates by
+            // their hashes, as Go's readUniqueDirectoryEntries.)
+            let path = ent.path();
+            if let Ok(target) = crate::fs::read_link(&path) {
+                if !target.to_str().unwrap_or("/").contains("/") { continue; }
+            }
+            if let Ok(data) = crate::fs::read(&path) { pool.append_certs_from_pem(data.as_slice()); }
+        }
+    }
+    if pool.len() > 0 || first_err.len() == 0 { return Ok(pool); }
+    Err(first_err)
+}
+
+fn vec_of_str(s: String) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    v.push(s);
+    v
+}

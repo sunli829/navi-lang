@@ -1,0 +1,138 @@
+//! PEM (RFC 7468), with the API of Rust's pem crate: `parse` /
+//! `parse_many` read "-----BEGIN tag-----" blocks of base64, `encode`
+//! writes one.
+//!
+//!     let certs = std::pem::parse_many(&bundle)?;
+//!     for p in certs.iter() {
+//!         if p.tag() == "CERTIFICATE" { use_der(p.contents()); }
+//!     }
+//!
+//! Text outside the blocks is ignored (as in the crate and Go's
+//! encoding/pem); RFC 1421 headers ("Proc-Type: ...") are skipped.
+
+use crate::base64::prelude::*;
+use crate::fmt::{self, Display, Formatter};
+
+/// Why PEM input could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PemError {
+    /// No BEGIN line.
+    MissingBeginTag,
+    /// A BEGIN line without its END.
+    MissingEndTag,
+    /// END's tag is not BEGIN's.
+    MismatchedTags(String, String),
+    /// The body is not base64.
+    InvalidData(crate::base64::DecodeError),
+}
+
+impl Display for PemError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            PemError::MissingBeginTag => f.write_str("missing BEGIN tag"),
+            PemError::MissingEndTag => f.write_str("missing END tag"),
+            PemError::MismatchedTags(a, b) => f.write_fmt(`mismatching BEGIN (\"${a}\") and END (\"${b}\") tags`),
+            PemError::InvalidData(e) => f.write_fmt(`invalid data: ${e}`),
+        }
+    }
+}
+
+/// A PEM block: its tag ("CERTIFICATE") and decoded contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pem {
+    tag: String,
+    contents: Vec<u8>,
+}
+
+impl Pem {
+    pub fn new(tag: &str, contents: Vec<u8>) -> Pem { Pem { tag: tag.to_string(), contents } }
+
+    pub fn tag(&self) -> &str { self.tag.as_str() }
+
+    pub fn contents(&self) -> &[u8] { self.contents.as_slice() }
+
+    pub fn into_contents(self) -> Vec<u8> { self.contents }
+}
+
+// The tag of a "-----BEGIN x-----" (or END) line.
+fn boundary(line: &str, kind: &str) -> Option<String> {
+    let l = line.trim_end();
+    let pre = `-----${kind} `.to_string();
+    if !l.starts_with(pre.as_str()) || !l.ends_with("-----") || l.len() < pre.len() + 5 { return None; }
+    Some(l[pre.len()..l.len() - 5].to_string())
+}
+
+// The next block from lines[*i..], moving *i past it.
+fn next_block(lines: &Vec<&str>, i: &mut usize) -> Option<Result<Pem, PemError>> {
+    while *i < lines.len() {
+        let line = lines[*i];
+        *i += 1;
+        let tag = match boundary(line, "BEGIN") {
+            Some(t) => t,
+            None => continue,
+        };
+        let mut body = String::new();
+        let mut in_headers = true;
+        while *i < lines.len() {
+            let l = lines[*i].trim();
+            *i += 1;
+            if let Some(end) = boundary(l, "END") {
+                if end != tag { return Some(Err(PemError::MismatchedTags(tag, end))); }
+                return Some(match BASE64_STANDARD.decode(body.as_str()) {
+                    Ok(c) => Ok(Pem { tag, contents: c }),
+                    Err(e) => Err(PemError::InvalidData(e)),
+                });
+            }
+            // Headers come first, up to a blank line.
+            if in_headers && l.contains(":") { continue; }
+            in_headers = false;
+            body.push_str(l);
+        }
+        return Some(Err(PemError::MissingEndTag));
+    }
+    None
+}
+
+/// The first block of input.
+pub fn parse<B: AsRef<[u8]>>(input: B) -> Result<Pem, PemError> {
+    let text = String::from_utf8_lossy(input.as_ref());
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    match next_block(&lines, &mut i) {
+        Some(r) => r,
+        None => Err(PemError::MissingBeginTag),
+    }
+}
+
+/// Every block of input (none if it has none).
+pub fn parse_many<B: AsRef<[u8]>>(input: B) -> Result<Vec<Pem>, PemError> {
+    let text = String::from_utf8_lossy(input.as_ref());
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    let mut out: Vec<Pem> = Vec::new();
+    while let Some(r) = next_block(&lines, &mut i) { out.push(r?); }
+    Ok(out)
+}
+
+/// The block as PEM text: 64 base64 characters a line, "\r\n" line ends
+/// (as the crate's default).
+pub fn encode(pem: &Pem) -> String {
+    let b = BASE64_STANDARD.encode(pem.contents.as_slice());
+    let mut out = `-----BEGIN ${pem.tag}-----\r\n`.to_string();
+    let mut i = 0;
+    while i < b.len() {
+        let end = if i + 64 < b.len() { i + 64 } else { b.len() };
+        out.push_str(&b[i..end]);
+        out.push_str("\r\n");
+        i = end;
+    }
+    out.push_str(`-----END ${pem.tag}-----\r\n`.to_string().as_str());
+    out
+}
+
+/// Every block as PEM text.
+pub fn encode_many(pems: &[Pem]) -> String {
+    let mut out = String::new();
+    for p in pems.iter() { out.push_str(encode(p).as_str()); }
+    out
+}
