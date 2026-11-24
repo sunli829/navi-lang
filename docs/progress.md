@@ -243,6 +243,7 @@
     - 收集器的栈在停世界期间搬了家：它先取了自己的 SP/FP，再调函数取栈顶，这个调用触发了栈增长，结果扫描范围横跨新旧两个栈，越界读。Go 让收集器在系统栈上运行；navi 改成停世界前先留出 256KB 的栈余量（`stack_headroom`）。停世界期间收集器的栈不再搬（压力模式也不搬），真需要增长就报 fatal，不再悄悄出错。
   - 修完以后，16 线程编译 navic 在各种模式下共 150 次，0 次崩溃（修之前普通模式约 5%，压力模式每次都崩）。
   - `tools/navictest.sh` 给每个测试程序 5 分钟超时，卡住算失败，不会再让整套测试挂住。压力模式只在已用栈不到 256KB 时生效，否则深递归会让拷贝量变成平方级。
+- TLS 第一部分（2026-11-24）：`crypto::aead`、`crypto::aes`（软件查表 + arm64 AES / x86 AES-NI 汇编）、`crypto::aes_gcm`（GHASH 软件为 BearSSL ctmul64，硬件为 PMULL/PCLMULQDQ 汇编；计数器模式也在汇编里）、`crypto::chacha20poly1305`、`crypto::hkdf`。测试对照 FIPS 197、RFC 5869 和 Go 的 crypto（含 x/crypto 的 chacha20poly1305）生成的 56 组向量（`tests/run/crypto_aead.navi`）。
 - 汇编函数（2026-11-24，docs/asm.md）：`#[asm] fn` 声明加同目录的 `<模块>_arm64.s` / `<模块>_amd64.s`，编译器内置的汇编器（`compiler/src/asm`，arm64 GNU 语法、amd64 Intel 语法；通用指令和 AES、PMULL/PCLMULQDQ 等），按 navi 的调用约定调用；编码和 clang 对照（`tools/asmcheck.py`）。为 TLS 的 AES-GCM 加速做准备。
 - 派生宏（2026-11-24，docs/derive.md）：内置派生改成生成源码；`std::serde` 照搬 serde，json、csv、http 改用它；去掉运行期反射；用户的派生宏（`#[derive_macro]`、`` quote`...` ``、`std::derive`、`FromAttrs`、`navi expand`、`TypeInfo::of`），宏 crate 编成宿主平台的小程序运行。
 - 反射（照 Go 的 reflect，不需要标注；代替过程宏；2026-11-24 已去掉，改用派生和 serde，见 docs/derive.md）：

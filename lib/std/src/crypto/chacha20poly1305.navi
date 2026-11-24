@@ -1,0 +1,305 @@
+//! ChaCha20-Poly1305 (RFC 8439), with the API of RustCrypto's
+//! chacha20poly1305 crate: `ChaCha20Poly1305`, a 32-byte key, 12-byte
+//! nonces and 16-byte tags, used through crypto::aead's traits. Software,
+//! constant-time (additions, rotations and xors; Poly1305 in 26-bit limbs,
+//! as poly1305-donna).
+
+use crate::crypto::aead::{AeadInPlace, KeyInit, Error, InvalidLength};
+use crate::crypto::subtle::constant_time_eq;
+
+fn le32(b: &[u8], i: usize) -> u32 { (b[i] as u32) | ((b[i + 1] as u32) << 8) | ((b[i + 2] as u32) << 16) | ((b[i + 3] as u32) << 24) }
+
+fn qr(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    s[a] = s[a].wrapping_add(s[b]);
+    s[d] = (s[d] ^ s[a]).rotate_left(16);
+    s[c] = s[c].wrapping_add(s[d]);
+    s[b] = (s[b] ^ s[c]).rotate_left(12);
+    s[a] = s[a].wrapping_add(s[b]);
+    s[d] = (s[d] ^ s[a]).rotate_left(8);
+    s[c] = s[c].wrapping_add(s[d]);
+    s[b] = (s[b] ^ s[c]).rotate_left(7);
+}
+
+/// The ChaCha20 block (64 bytes) of key, counter and nonce (RFC 8439
+/// 2.3).
+pub fn chacha20_block(key: &[u8], counter: u32, nonce: &[u8], out: &mut [u8]) {
+    let mut init: [u32; 16] = [0; 16];
+    init[0] = 0x61707865;
+    init[1] = 0x3320646e;
+    init[2] = 0x79622d32;
+    init[3] = 0x6b206574;
+    let mut i = 0;
+    while i < 8 {
+        init[4 + i] = le32(key, 4 * i);
+        i += 1;
+    }
+    init[12] = counter;
+    init[13] = le32(nonce, 0);
+    init[14] = le32(nonce, 4);
+    init[15] = le32(nonce, 8);
+    let mut s = init;
+    i = 0;
+    while i < 10 {
+        qr(&mut s, 0, 4, 8, 12);
+        qr(&mut s, 1, 5, 9, 13);
+        qr(&mut s, 2, 6, 10, 14);
+        qr(&mut s, 3, 7, 11, 15);
+        qr(&mut s, 0, 5, 10, 15);
+        qr(&mut s, 1, 6, 11, 12);
+        qr(&mut s, 2, 7, 8, 13);
+        qr(&mut s, 3, 4, 9, 14);
+        i += 1;
+    }
+    i = 0;
+    while i < 16 {
+        let w = s[i].wrapping_add(init[i]);
+        out[4 * i] = w as u8;
+        out[4 * i + 1] = (w >> 8) as u8;
+        out[4 * i + 2] = (w >> 16) as u8;
+        out[4 * i + 3] = (w >> 24) as u8;
+        i += 1;
+    }
+}
+
+/// buf ^= the ChaCha20 key stream from block counter on (RFC 8439 2.4).
+pub fn chacha20_xor(key: &[u8], counter: u32, nonce: &[u8], buf: &mut [u8]) {
+    let mut ks: [u8; 64] = [0; 64];
+    let mut c = counter;
+    let mut at = 0;
+    while at < buf.len() {
+        chacha20_block(key, c, nonce, &mut ks);
+        c = c.wrapping_add(1);
+        let mut i = 0;
+        while i < 64 && at + i < buf.len() {
+            buf[at + i] = buf[at + i] ^ ks[i];
+            i += 1;
+        }
+        at += 64;
+    }
+}
+
+/// The Poly1305 tag of msg under a one-time 32-byte key (RFC 8439 2.5).
+pub fn poly1305(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let mut p = Poly1305::new(key);
+    p.update(msg);
+    p.finish()
+}
+
+/// Poly1305 in 26-bit limbs (poly1305-donna-32).
+struct Poly1305 {
+    r: [u64; 5],
+    h: [u64; 5],
+    pad: [u64; 4],
+    buf: [u8; 16],
+    n: usize,
+}
+
+const M26: u64 = 0x3ffffff;
+
+impl Poly1305 {
+    fn new(key: &[u8]) -> Poly1305 {
+        let r: [u64; 5] = [
+            (le32(key, 0) as u64) & 0x3ffffff,
+            ((le32(key, 3) as u64) >> 2) & 0x3ffff03,
+            ((le32(key, 6) as u64) >> 4) & 0x3ffc0ff,
+            ((le32(key, 9) as u64) >> 6) & 0x3f03fff,
+            ((le32(key, 12) as u64) >> 8) & 0x00fffff,
+        ];
+        let pad: [u64; 4] = [le32(key, 16) as u64, le32(key, 20) as u64, le32(key, 24) as u64, le32(key, 28) as u64];
+        Poly1305 { r, h: [0; 5], pad, buf: [0; 16], n: 0 }
+    }
+
+    // One 16-byte block (hibit: 1 << 24 for a full block, 0 for the padded
+    // last one).
+    fn block(&mut self, m: &[u8], hibit: u64) {
+        let r = self.r;
+        let s1 = r[1] * 5;
+        let s2 = r[2] * 5;
+        let s3 = r[3] * 5;
+        let s4 = r[4] * 5;
+        let mut h0 = self.h[0] + ((le32(m, 0) as u64) & M26);
+        let mut h1 = self.h[1] + (((le32(m, 3) as u64) >> 2) & M26);
+        let mut h2 = self.h[2] + (((le32(m, 6) as u64) >> 4) & M26);
+        let mut h3 = self.h[3] + (((le32(m, 9) as u64) >> 6) & M26);
+        let mut h4 = self.h[4] + (((le32(m, 12) as u64) >> 8) | hibit);
+        let d0 = h0 * r[0] + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+        let mut d1 = h0 * r[1] + h1 * r[0] + h2 * s4 + h3 * s3 + h4 * s2;
+        let mut d2 = h0 * r[2] + h1 * r[1] + h2 * r[0] + h3 * s4 + h4 * s3;
+        let mut d3 = h0 * r[3] + h1 * r[2] + h2 * r[1] + h3 * r[0] + h4 * s4;
+        let mut d4 = h0 * r[4] + h1 * r[3] + h2 * r[2] + h3 * r[1] + h4 * r[0];
+        let mut c = d0 >> 26;
+        h0 = d0 & M26;
+        d1 += c;
+        c = d1 >> 26;
+        h1 = d1 & M26;
+        d2 += c;
+        c = d2 >> 26;
+        h2 = d2 & M26;
+        d3 += c;
+        c = d3 >> 26;
+        h3 = d3 & M26;
+        d4 += c;
+        c = d4 >> 26;
+        h4 = d4 & M26;
+        h0 += c * 5;
+        c = h0 >> 26;
+        h0 = h0 & M26;
+        h1 += c;
+        self.h = [h0, h1, h2, h3, h4];
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        let mut at = 0;
+        if self.n > 0 {
+            while self.n < 16 && at < data.len() {
+                self.buf[self.n] = data[at];
+                self.n += 1;
+                at += 1;
+            }
+            if self.n < 16 { return; }
+            let b = self.buf;
+            self.block(&b, 1 << 24);
+            self.n = 0;
+        }
+        while data.len() - at >= 16 {
+            self.block(&data[at..at + 16], 1 << 24);
+            at += 16;
+        }
+        while at < data.len() {
+            self.buf[self.n] = data[at];
+            self.n += 1;
+            at += 1;
+        }
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.n > 0 {
+            let mut b: [u8; 16] = [0; 16];
+            let mut i = 0;
+            while i < self.n {
+                b[i] = self.buf[i];
+                i += 1;
+            }
+            b[self.n] = 1;
+            self.block(&b, 0);
+        }
+        let mut h0 = self.h[0];
+        let mut h1 = self.h[1];
+        let mut h2 = self.h[2];
+        let mut h3 = self.h[3];
+        let mut h4 = self.h[4];
+        let mut c = h1 >> 26;
+        h1 = h1 & M26;
+        h2 += c;
+        c = h2 >> 26;
+        h2 = h2 & M26;
+        h3 += c;
+        c = h3 >> 26;
+        h3 = h3 & M26;
+        h4 += c;
+        c = h4 >> 26;
+        h4 = h4 & M26;
+        h0 += c * 5;
+        c = h0 >> 26;
+        h0 = h0 & M26;
+        h1 += c;
+        // g = h + 5 - 2^130; h if g is negative, else g.
+        let mut g0 = h0 + 5;
+        c = g0 >> 26;
+        g0 = g0 & M26;
+        let mut g1 = h1 + c;
+        c = g1 >> 26;
+        g1 = g1 & M26;
+        let mut g2 = h2 + c;
+        c = g2 >> 26;
+        g2 = g2 & M26;
+        let mut g3 = h3 + c;
+        c = g3 >> 26;
+        g3 = g3 & M26;
+        let g4 = (h4 + c).wrapping_sub(1 << 26);
+        // All ones if g4 did not go negative (take g), else zero.
+        let mask = ((g4 >> 63) ^ 1).wrapping_neg();
+        h0 = (h0 & !mask) | (g0 & mask);
+        h1 = (h1 & !mask) | (g1 & mask);
+        h2 = (h2 & !mask) | (g2 & mask);
+        h3 = (h3 & !mask) | (g3 & mask);
+        h4 = (h4 & !mask) | (g4 & mask & M26);
+        // h mod 2^128, then + pad.
+        let w0 = (h0 | (h1 << 26)) & 0xffffffff;
+        let w1 = ((h1 >> 6) | (h2 << 20)) & 0xffffffff;
+        let w2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff;
+        let w3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff;
+        let mut f = w0 + self.pad[0];
+        let o0 = f & 0xffffffff;
+        f = w1 + self.pad[1] + (f >> 32);
+        let o1 = f & 0xffffffff;
+        f = w2 + self.pad[2] + (f >> 32);
+        let o2 = f & 0xffffffff;
+        f = w3 + self.pad[3] + (f >> 32);
+        let o3 = f & 0xffffffff;
+        let mut out: Vec<u8> = Vec::with_capacity(16);
+        for w in [o0, o1, o2, o3].iter() {
+            out.push(*w as u8);
+            out.push((*w >> 8) as u8);
+            out.push((*w >> 16) as u8);
+            out.push((*w >> 24) as u8);
+        }
+        out
+    }
+}
+
+/// ChaCha20-Poly1305.
+#[derive(Clone)]
+pub struct ChaCha20Poly1305 {
+    key: Vec<u8>,
+}
+
+impl KeyInit for ChaCha20Poly1305 {
+    const KEY_SIZE: usize = 32;
+    fn new_from_slice(key: &[u8]) -> Result<ChaCha20Poly1305, InvalidLength> {
+        if key.len() != 32 { return Err(InvalidLength); }
+        Ok(ChaCha20Poly1305 { key: key.to_vec() })
+    }
+}
+
+impl ChaCha20Poly1305 {
+    // The tag of aad and ciphertext ct (RFC 8439 2.8).
+    fn tag(&self, nonce: &[u8], aad: &[u8], ct: &[u8]) -> Vec<u8> {
+        let mut otk: [u8; 64] = [0; 64];
+        chacha20_block(self.key.as_slice(), 0, nonce, &mut otk);
+        let mut p = Poly1305::new(&otk[..32]);
+        let zeros: [u8; 16] = [0; 16];
+        p.update(aad);
+        p.update(&zeros[..(16 - aad.len() % 16) % 16]);
+        p.update(ct);
+        p.update(&zeros[..(16 - ct.len() % 16) % 16]);
+        let mut lens: [u8; 16] = [0; 16];
+        let mut i = 0;
+        while i < 8 {
+            lens[i] = ((aad.len() as u64) >> (8 * i)) as u8;
+            lens[8 + i] = ((ct.len() as u64) >> (8 * i)) as u8;
+            i += 1;
+        }
+        p.update(&lens);
+        p.finish()
+    }
+}
+
+impl AeadInPlace for ChaCha20Poly1305 {
+    const NONCE_SIZE: usize = 12;
+    const TAG_SIZE: usize = 16;
+
+    fn encrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> Result<Vec<u8>, Error> {
+        if nonce.len() != 12 { return Err(Error); }
+        chacha20_xor(self.key.as_slice(), 1, nonce, buffer);
+        Ok(self.tag(nonce, aad, buffer))
+    }
+
+    fn decrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8], tag: &[u8]) -> Result<(), Error> {
+        if nonce.len() != 12 || tag.len() != 16 { return Err(Error); }
+        let want = self.tag(nonce, aad, buffer);
+        if !constant_time_eq(want.as_slice(), tag) { return Err(Error); }
+        chacha20_xor(self.key.as_slice(), 1, nonce, buffer);
+        Ok(())
+    }
+}

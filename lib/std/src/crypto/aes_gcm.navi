@@ -1,0 +1,349 @@
+//! AES-GCM (NIST SP 800-38D), with the API of RustCrypto's aes-gcm crate:
+//! `Aes128Gcm` and `Aes256Gcm`, 12-byte nonces and 16-byte tags, used
+//! through crypto::aead's traits.
+//!
+//! With the CPU's AES and carry-less multiplication instructions, the
+//! counter mode and GHASH run in assembly (aes_gcm_arm64.s,
+//! aes_gcm_amd64.s); otherwise in software, constant-time (GHASH as
+//! BearSSL's ctmul64: carry-less products from integer multiplications, no
+//! table lookups).
+
+use crate::crypto::aes::Key;
+use crate::crypto::aead::{AeadInPlace, KeyInit, Error, InvalidLength};
+use crate::crypto::subtle::constant_time_eq;
+
+#[cfg(target_arch = "aarch64")]
+#[asm]
+fn ghash_blocks(h: *const u8, y: *mut u8, data: *const u8, n: usize);
+
+#[cfg(target_arch = "aarch64")]
+#[asm]
+fn aes_ctr_xor(xk: *const u8, rounds: usize, ctr: *mut u8, src: *const u8, dst: *mut u8, n: usize);
+
+#[cfg(target_arch = "x86_64")]
+#[asm]
+fn ghash_blocks(h: *const u8, y: *mut u8, data: *const u8, n: usize);
+
+#[cfg(target_arch = "x86_64")]
+#[asm]
+fn aes_ctr_xor(xk: *const u8, rounds: usize, ctr: *mut u8, src: *const u8, dst: *mut u8, n: usize);
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn hw_ghash(h: &[u8], y: &mut [u8], data: &[u8], n: usize) { ghash_blocks(h.as_ptr(), y.as_mut_ptr(), data.as_ptr(), n); }
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn hw_ghash(h: &[u8], y: &mut [u8], data: &[u8], n: usize) {}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn hw_ctr(k: &Key, ctr: &mut [u8], buf: &mut [u8], n: usize) { aes_ctr_xor(k.round_keys().as_ptr(), k.rounds(), ctr.as_mut_ptr(), buf.as_ptr(), buf.as_mut_ptr(), n); }
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn hw_ctr(k: &Key, ctr: &mut [u8], buf: &mut [u8], n: usize) {}
+
+/// AES-GCM with a key of any AES size.
+#[derive(Clone)]
+pub struct AesGcm {
+    key: Key,
+    // H = E(K, 0^128), as two big-endian words.
+    h1: u64,
+    h0: u64,
+}
+
+fn be64(b: &[u8], i: usize) -> u64 {
+    let mut v = 0u64;
+    let mut k = 0;
+    while k < 8 {
+        v = (v << 8) | (b[i + k] as u64);
+        k += 1;
+    }
+    v
+}
+
+fn put64(b: &mut [u8], i: usize, v: u64) {
+    let mut k = 0;
+    while k < 8 {
+        b[i + k] = (v >> (56 - 8 * k)) as u8;
+        k += 1;
+    }
+}
+
+// The carry-less product of x and y, its low 64 bits (BearSSL's bmul64:
+// four interleaved integer products whose carries fall in unused bits).
+fn bmul64(x: u64, y: u64) -> u64 {
+    let x0 = x & 0x1111111111111111;
+    let x1 = x & 0x2222222222222222;
+    let x2 = x & 0x4444444444444444;
+    let x3 = x & 0x8888888888888888;
+    let y0 = y & 0x1111111111111111;
+    let y1 = y & 0x2222222222222222;
+    let y2 = y & 0x4444444444444444;
+    let y3 = y & 0x8888888888888888;
+    let z0 = x0.wrapping_mul(y0) ^ x1.wrapping_mul(y3) ^ x2.wrapping_mul(y2) ^ x3.wrapping_mul(y1);
+    let z1 = x0.wrapping_mul(y1) ^ x1.wrapping_mul(y0) ^ x2.wrapping_mul(y3) ^ x3.wrapping_mul(y2);
+    let z2 = x0.wrapping_mul(y2) ^ x1.wrapping_mul(y1) ^ x2.wrapping_mul(y0) ^ x3.wrapping_mul(y3);
+    let z3 = x0.wrapping_mul(y3) ^ x1.wrapping_mul(y2) ^ x2.wrapping_mul(y1) ^ x3.wrapping_mul(y0);
+    (z0 & 0x1111111111111111) | (z1 & 0x2222222222222222) | (z2 & 0x4444444444444444) | (z3 & 0x8888888888888888)
+}
+
+fn rev64(v: u64) -> u64 {
+    let mut x = v;
+    x = ((x & 0x5555555555555555) << 1) | ((x >> 1) & 0x5555555555555555);
+    x = ((x & 0x3333333333333333) << 2) | ((x >> 2) & 0x3333333333333333);
+    x = ((x & 0x0f0f0f0f0f0f0f0f) << 4) | ((x >> 4) & 0x0f0f0f0f0f0f0f0f);
+    x = ((x & 0x00ff00ff00ff00ff) << 8) | ((x >> 8) & 0x00ff00ff00ff00ff);
+    x = ((x & 0x0000ffff0000ffff) << 16) | ((x >> 16) & 0x0000ffff0000ffff);
+    (x << 32) | (x >> 32)
+}
+
+/// GHASH state: Y as two big-endian words.
+struct Ghash {
+    y1: u64,
+    y0: u64,
+}
+
+impl Ghash {
+    // Y = (Y ^ block) * H for each 16-byte block of data (the last padded
+    // with zeros); BearSSL's br_ghash_ctmul64.
+    fn update(&mut self, h1: u64, h0: u64, data: &[u8]) {
+        let h0r = rev64(h0);
+        let h1r = rev64(h1);
+        let h2 = h0 ^ h1;
+        let h2r = h0r ^ h1r;
+        let mut y0 = self.y0;
+        let mut y1 = self.y1;
+        let mut at = 0;
+        while at < data.len() {
+            if data.len() - at >= 16 {
+                y1 = y1 ^ be64(data, at);
+                y0 = y0 ^ be64(data, at + 8);
+            } else {
+                let mut tmp: [u8; 16] = [0; 16];
+                let mut k = 0;
+                while at + k < data.len() {
+                    tmp[k] = data[at + k];
+                    k += 1;
+                }
+                y1 = y1 ^ be64(&tmp, 0);
+                y0 = y0 ^ be64(&tmp, 8);
+            }
+            at += 16;
+            let y0r = rev64(y0);
+            let y1r = rev64(y1);
+            let y2 = y0 ^ y1;
+            let y2r = y0r ^ y1r;
+            let z0 = bmul64(y0, h0);
+            let z1 = bmul64(y1, h1);
+            let mut z2 = bmul64(y2, h2);
+            let mut z0h = bmul64(y0r, h0r);
+            let mut z1h = bmul64(y1r, h1r);
+            let mut z2h = bmul64(y2r, h2r);
+            z2 = z2 ^ z0 ^ z1;
+            z2h = z2h ^ z0h ^ z1h;
+            z0h = rev64(z0h) >> 1;
+            z1h = rev64(z1h) >> 1;
+            z2h = rev64(z2h) >> 1;
+            let mut v0 = z0;
+            let mut v1 = z0h ^ z2;
+            let mut v2 = z1 ^ z2h;
+            let mut v3 = z1h;
+            v3 = (v3 << 1) | (v2 >> 63);
+            v2 = (v2 << 1) | (v1 >> 63);
+            v1 = (v1 << 1) | (v0 >> 63);
+            v0 = v0 << 1;
+            v2 = v2 ^ v0 ^ (v0 >> 1) ^ (v0 >> 2) ^ (v0 >> 7);
+            v1 = v1 ^ (v0 << 63) ^ (v0 << 62) ^ (v0 << 57);
+            v3 = v3 ^ v1 ^ (v1 >> 1) ^ (v1 >> 2) ^ (v1 >> 7);
+            v2 = v2 ^ (v1 << 63) ^ (v1 << 62) ^ (v1 << 57);
+            y0 = v2;
+            y1 = v3;
+        }
+        self.y0 = y0;
+        self.y1 = y1;
+    }
+}
+
+impl AesGcm {
+    /// AES-GCM with a 16, 24 or 32-byte key.
+    pub fn new_any(key: &[u8]) -> Result<AesGcm, InvalidLength> {
+        let k = Key::new(key)?;
+        let mut h: [u8; 16] = [0; 16];
+        k.encrypt_block(&mut h);
+        Ok(AesGcm { key: k, h1: be64(&h, 0), h0: be64(&h, 8) })
+    }
+
+    /// The same with AES in software even with the CPU's instructions (to
+    /// compare the two).
+    pub fn software(&self) -> AesGcm { AesGcm { key: self.key.software(), h1: self.h1, h0: self.h0 } }
+
+    // buf ^= the key stream of the counter blocks nonce || c, c from
+    // first on (wrapping at 32 bits).
+    fn ctr(&self, nonce: &[u8], first: u32, buf: &mut [u8]) {
+        if self.key.hardware() {
+            let mut cb: [u8; 16] = [0; 16];
+            let mut i = 0;
+            while i < 12 {
+                cb[i] = nonce[i];
+                i += 1;
+            }
+            cb[12] = (first >> 24) as u8;
+            cb[13] = (first >> 16) as u8;
+            cb[14] = (first >> 8) as u8;
+            cb[15] = first as u8;
+            let full = buf.len() / 16;
+            hw_ctr(&self.key, &mut cb, buf, full);
+            let rest = buf.len() - 16 * full;
+            if rest > 0 {
+                let mut ks: [u8; 16] = [0; 16];
+                self.key.encrypt_blocks(&cb, &mut ks);
+                i = 0;
+                while i < rest {
+                    buf[16 * full + i] = buf[16 * full + i] ^ ks[i];
+                    i += 1;
+                }
+            }
+            return;
+        }
+        let chunk = 64;
+        let mut ctrs: Vec<u8> = Vec::with_capacity(16 * chunk);
+        let mut ks: Vec<u8> = Vec::with_capacity(16 * chunk);
+        let mut c = first;
+        let mut at = 0;
+        while at < buf.len() {
+            let left = buf.len() - at;
+            let blocks = if left >= 16 * chunk { chunk } else { (left + 15) / 16 };
+            ctrs.clear();
+            let mut b = 0;
+            while b < blocks {
+                ctrs.extend_from_slice(nonce);
+                ctrs.push((c >> 24) as u8);
+                ctrs.push((c >> 16) as u8);
+                ctrs.push((c >> 8) as u8);
+                ctrs.push(c as u8);
+                c = c.wrapping_add(1);
+                b += 1;
+            }
+            ks.clear();
+            ks.resize(16 * blocks, 0);
+            self.key.encrypt_blocks(ctrs.as_slice(), ks.as_mut_slice());
+            let n = if left < 16 * blocks { left } else { 16 * blocks };
+            let mut i = 0;
+            while i < n {
+                buf[at + i] = buf[at + i] ^ ks[i];
+                i += 1;
+            }
+            at += n;
+        }
+    }
+
+    // GHASH of data (padded) into y, on the CPU's instructions.
+    fn hw_update(&self, h: &[u8], y: &mut [u8], data: &[u8]) {
+        let full = data.len() / 16;
+        hw_ghash(h, y, data, full);
+        let rest = data.len() - 16 * full;
+        if rest > 0 {
+            let mut b: [u8; 16] = [0; 16];
+            let mut i = 0;
+            while i < rest {
+                b[i] = data[16 * full + i];
+                i += 1;
+            }
+            hw_ghash(h, y, &b, 1);
+        }
+    }
+
+    // The tag of aad and ciphertext ct under nonce.
+    fn tag(&self, nonce: &[u8], aad: &[u8], ct: &[u8]) -> Vec<u8> {
+        let mut lens: [u8; 16] = [0; 16];
+        put64(&mut lens, 0, (aad.len() as u64) * 8);
+        put64(&mut lens, 8, (ct.len() as u64) * 8);
+        let mut t: [u8; 16] = [0; 16];
+        if self.key.hardware() {
+            let mut h: [u8; 16] = [0; 16];
+            put64(&mut h, 0, self.h1);
+            put64(&mut h, 8, self.h0);
+            self.hw_update(&h, &mut t, aad);
+            self.hw_update(&h, &mut t, ct);
+            self.hw_update(&h, &mut t, &lens);
+        } else {
+            let mut g = Ghash { y1: 0, y0: 0 };
+            g.update(self.h1, self.h0, aad);
+            g.update(self.h1, self.h0, ct);
+            g.update(self.h1, self.h0, &lens);
+            put64(&mut t, 0, g.y1);
+            put64(&mut t, 8, g.y0);
+        }
+        // E(K, J0) ^ S, J0 = nonce || 1.
+        let mut j0: Vec<u8> = nonce.to_vec();
+        j0.extend_from_slice(&[0, 0, 0, 1]);
+        let mut ek: [u8; 16] = [0; 16];
+        self.key.encrypt_blocks(j0.as_slice(), &mut ek);
+        let mut out: Vec<u8> = Vec::with_capacity(16);
+        let mut i = 0;
+        while i < 16 {
+            out.push(t[i] ^ ek[i]);
+            i += 1;
+        }
+        out
+    }
+}
+
+impl AeadInPlace for AesGcm {
+    const NONCE_SIZE: usize = 12;
+    const TAG_SIZE: usize = 16;
+
+    fn encrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> Result<Vec<u8>, Error> {
+        if nonce.len() != 12 { return Err(Error); }
+        self.ctr(nonce, 2, buffer);
+        Ok(self.tag(nonce, aad, buffer))
+    }
+
+    fn decrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8], tag: &[u8]) -> Result<(), Error> {
+        if nonce.len() != 12 || tag.len() != 16 { return Err(Error); }
+        let want = self.tag(nonce, aad, buffer);
+        if !constant_time_eq(want.as_slice(), tag) { return Err(Error); }
+        self.ctr(nonce, 2, buffer);
+        Ok(())
+    }
+}
+
+/// AES-128-GCM.
+#[derive(Clone)]
+pub struct Aes128Gcm {
+    g: AesGcm,
+}
+
+/// AES-256-GCM.
+#[derive(Clone)]
+pub struct Aes256Gcm {
+    g: AesGcm,
+}
+
+impl KeyInit for Aes128Gcm {
+    const KEY_SIZE: usize = 16;
+    fn new_from_slice(key: &[u8]) -> Result<Aes128Gcm, InvalidLength> {
+        if key.len() != 16 { return Err(InvalidLength); }
+        Ok(Aes128Gcm { g: AesGcm::new_any(key)? })
+    }
+}
+
+impl KeyInit for Aes256Gcm {
+    const KEY_SIZE: usize = 32;
+    fn new_from_slice(key: &[u8]) -> Result<Aes256Gcm, InvalidLength> {
+        if key.len() != 32 { return Err(InvalidLength); }
+        Ok(Aes256Gcm { g: AesGcm::new_any(key)? })
+    }
+}
+
+impl AeadInPlace for Aes128Gcm {
+    const NONCE_SIZE: usize = 12;
+    const TAG_SIZE: usize = 16;
+    fn encrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> Result<Vec<u8>, Error> { self.g.encrypt_in_place_detached(nonce, aad, buffer) }
+    fn decrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8], tag: &[u8]) -> Result<(), Error> { self.g.decrypt_in_place_detached(nonce, aad, buffer, tag) }
+}
+
+impl AeadInPlace for Aes256Gcm {
+    const NONCE_SIZE: usize = 12;
+    const TAG_SIZE: usize = 16;
+    fn encrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> Result<Vec<u8>, Error> { self.g.encrypt_in_place_detached(nonce, aad, buffer) }
+    fn decrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8], tag: &[u8]) -> Result<(), Error> { self.g.decrypt_in_place_detached(nonce, aad, buffer, tag) }
+}
