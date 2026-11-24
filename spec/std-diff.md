@@ -165,7 +165,7 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 
 | 项目 | 参考 | navi | 原因 |
 |---|---|---|---|
-| TLS | reqwest 用 native-tls 或 rustls，支持 TLS 1.2 和 1.3 | https 走 `std::tls`，只有 TLS 1.3（只支持 1.2 的服务器握手失败）；`ClientBuilder::add_root_certificate`、`tls_built_in_root_certs`、`danger_accept_invalid_certs`、`danger_accept_invalid_hostnames` 同 reqwest；证书类型是 `crypto::x509::Certificate`（`http::Certificate`） | TLS 1.2 在后面做 |
+| TLS | reqwest 用 native-tls 或 rustls，支持 TLS 1.2 和 1.3 | https 走 `std::tls`（TLS 1.3 和 1.2）；`ClientBuilder::add_root_certificate`、`tls_built_in_root_certs`、`danger_accept_invalid_certs`、`danger_accept_invalid_hostnames` 同 reqwest；证书类型是 `crypto::x509::Certificate`（`http::Certificate`） | TLS 1.2 在后面做 |
 | `HeaderMap` | 键是 `HeaderName`，值是 `HeaderValue` | 键和值都是字符串：`get` 返回 `Option<&str>`，`get_all` 返回 `Vec<&str>`；名字不区分大小写，存成小写，按插入顺序保留多个值 | 简化 |
 | `Request<T>` / `Response<T>` | 泛型 body | 不带类型参数，body 是 `Body`（字节或 `&mut dyn Read`）；收到的消息的 body 从连接上读 | 简化 |
 | `Method` | `Method::GET` 等常量 | 相同；不是 `Copy`（值类型，赋值即拷贝） | 没有 `Copy` |
@@ -185,7 +185,7 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | 项目 | native-tls | navi | 原因 |
 |---|---|---|---|
 | 实现 | 调系统的 TLS 库（OpenSSL、Secure Transport、SChannel） | 纯 navi 实现（同 Go），证书验证用 `crypto::x509`（macOS、Windows 上是系统的验证器） | 用户选择照 Go 自己实现 |
-| 版本 | 系统支持的都行 | 只有 TLS 1.3 客户端；`max_protocol_version` 只能是 1.3 | TLS 1.2 和服务端在后面做 |
+| 版本 | 系统支持的都行 | TLS 1.3 和 1.2 客户端（同 Go 的默认）；1.2 只有 ECDHE 加 AES-GCM 或 ChaCha20-Poly1305（Go 默认里的 CBC 套件没有），不支持重协商；不支持 1.1 及更早 | 服务端在后面做 |
 | `connect` | 返回 `Result<TlsStream<S>, HandshakeError<S>>`（可能 `WouldBlock`） | 返回 `Result<TlsStream<S>, Error>`；流都是阻塞的 | 没有非阻塞流 |
 | `Certificate` | `native_tls::Certificate` | 就是 `crypto::x509::Certificate` | 不需要两个类型 |
 | `Identity`（客户端证书）、会话恢复、0-RTT | 有 | 没有；服务器要求客户端证书时发空的 | 暂不需要 |
