@@ -1,0 +1,469 @@
+//! The NIST prime curves y^2 = x^3 - 3x + b (P-256, P-384), for
+//! crypto::p256 and crypto::p384: points in projective coordinates with
+//! the complete addition formulas of Renes, Costello and Batina (2016,
+//! algorithm 4: no special cases for doubling or the identity), as Go's
+//! crypto/internal/nistec; field and scalars through crypto::nat. Scalar
+//! multiplication is constant-time (double and add always, masked
+//! selects).
+
+use crate::crypto::nat::Modulus;
+use crate::hex;
+use crate::rand::rngs::OsRng;
+use crate::rand::RngCore;
+
+/// A point (X : Y : Z), the coordinates in Montgomery form; the identity
+/// is (0 : 1 : 0).
+#[derive(Clone)]
+pub struct Point {
+    x: Vec<u64>,
+    y: Vec<u64>,
+    z: Vec<u64>,
+}
+
+/// A curve's constants.
+pub struct Curve {
+    pub name: &str,
+    p: Modulus,
+    n: Modulus,
+    b: Vec<u64>,
+    g: Point,
+    /// (p + 1) / 4, big-endian: square roots (p = 3 mod 4).
+    sqrt_exp: Vec<u8>,
+}
+
+fn h(s: &str) -> Vec<u8> { hex::decode(s).unwrap() }
+
+impl Curve {
+    pub fn new(name: &str, p: &str, n: &str, b: &str, gx: &str, gy: &str) -> Curve {
+        let pm = Modulus::new(h(p).as_slice());
+        let nm = Modulus::new(h(n).as_slice());
+        let bm = pm.to_mont(&pm.from_be(h(b).as_slice()).unwrap());
+        let g = Point { x: pm.to_mont(&pm.from_be(h(gx).as_slice()).unwrap()), y: pm.to_mont(&pm.from_be(h(gy).as_slice()).unwrap()), z: pm.one() };
+        // (p + 1) / 4 on the bytes.
+        let mut e = h(p);
+        let mut i = e.len();
+        let mut carry = 1u16;
+        while i > 0 && carry != 0 {
+            i -= 1;
+            let s = e[i] as u16 + carry;
+            e[i] = s as u8;
+            carry = s >> 8;
+        }
+        let mut rem = 0u16;
+        let mut k = 0;
+        while k < e.len() {
+            let cur = (rem << 8) | (e[k] as u16);
+            e[k] = (cur >> 2) as u8;
+            rem = cur & 3;
+            k += 1;
+        }
+        Curve { name, p: pm, n: nm, b: bm, g, sqrt_exp: e }
+    }
+
+    /// The length of a coordinate or a scalar in bytes.
+    pub fn size(&self) -> usize { self.p.byte_len() }
+
+    fn identity(&self) -> Point {
+        let mut zero: Vec<u64> = Vec::new();
+        zero.resize(self.p.limbs(), 0);
+        Point { x: zero.clone(), y: self.p.one(), z: zero }
+    }
+
+    /// p1 + p2 (RCB16 algorithm 4, a = -3).
+    fn add(&self, p1: &Point, p2: &Point) -> Point {
+        let f = &self.p;
+        let mut t0 = f.mont_mul(&p1.x, &p2.x);
+        let mut t1 = f.mont_mul(&p1.y, &p2.y);
+        let mut t2 = f.mont_mul(&p1.z, &p2.z);
+        let mut t3 = f.add(&p1.x, &p1.y);
+        let mut t4 = f.add(&p2.x, &p2.y);
+        t3 = f.mont_mul(&t3, &t4);
+        t4 = f.add(&t0, &t1);
+        t3 = f.sub(&t3, &t4);
+        t4 = f.add(&p1.y, &p1.z);
+        let mut x3 = f.add(&p2.y, &p2.z);
+        t4 = f.mont_mul(&t4, &x3);
+        x3 = f.add(&t1, &t2);
+        t4 = f.sub(&t4, &x3);
+        x3 = f.add(&p1.x, &p1.z);
+        let mut y3 = f.add(&p2.x, &p2.z);
+        x3 = f.mont_mul(&x3, &y3);
+        y3 = f.add(&t0, &t2);
+        y3 = f.sub(&x3, &y3);
+        let mut z3 = f.mont_mul(&self.b, &t2);
+        x3 = f.sub(&y3, &z3);
+        z3 = f.add(&x3, &x3);
+        x3 = f.add(&x3, &z3);
+        z3 = f.sub(&t1, &x3);
+        x3 = f.add(&t1, &x3);
+        y3 = f.mont_mul(&self.b, &y3);
+        t1 = f.add(&t2, &t2);
+        t2 = f.add(&t1, &t2);
+        y3 = f.sub(&y3, &t2);
+        y3 = f.sub(&y3, &t0);
+        t1 = f.add(&y3, &y3);
+        y3 = f.add(&t1, &y3);
+        t1 = f.add(&t0, &t0);
+        t0 = f.add(&t1, &t0);
+        t0 = f.sub(&t0, &t2);
+        t1 = f.mont_mul(&t4, &y3);
+        t2 = f.mont_mul(&t0, &y3);
+        y3 = f.mont_mul(&x3, &z3);
+        y3 = f.add(&y3, &t2);
+        x3 = f.mont_mul(&t3, &x3);
+        x3 = f.sub(&x3, &t1);
+        z3 = f.mont_mul(&t4, &z3);
+        t1 = f.mont_mul(&t3, &t0);
+        z3 = f.add(&z3, &t1);
+        Point { x: x3, y: y3, z: z3 }
+    }
+
+    fn pick(&self, c: u64, a: &Point, b: &Point) -> Point {
+        Point { x: self.p.pick(c, &a.x, &b.x), y: self.p.pick(c, &a.y, &b.y), z: self.p.pick(c, &a.z, &b.z) }
+    }
+
+    /// k * pt (k big-endian bytes), in constant time.
+    fn mul(&self, pt: &Point, k: &[u8]) -> Point {
+        let mut q = self.identity();
+        for byte in k.iter() {
+            let mut i = 8;
+            while i > 0 {
+                i -= 1;
+                q = self.add(&q, &q);
+                let t = self.add(&q, pt);
+                q = self.pick(((*byte >> i as u8) & 1) as u64, &t, &q);
+            }
+        }
+        q
+    }
+
+    /// a * G + b * q for public a and b (variable-time: Shamir's trick,
+    /// one doubling a bit and an addition where either bit is set).
+    fn mul2(&self, a: &[u8], q: &Point, b: &[u8]) -> Point {
+        let gq = self.add(&self.g, q);
+        let mut r = self.identity();
+        let mut i = 0;
+        while i < a.len() {
+            let mut k = 8;
+            while k > 0 {
+                k -= 1;
+                r = self.add(&r, &r);
+                let x = (a[i] >> k as u8) & 1;
+                let y = (b[i] >> k as u8) & 1;
+                if x == 1 && y == 1 { r = self.add(&r, &gq); } else if x == 1 { r = self.add(&r, &self.g); } else if y == 1 { r = self.add(&r, q); }
+            }
+            i += 1;
+        }
+        r
+    }
+
+    // Affine (x, y) in normal form; None for the identity.
+    fn affine(&self, pt: &Point) -> Option<(Vec<u64>, Vec<u64>)> {
+        if self.p.is_zero(&pt.z) { return None; }
+        let zi = self.p.inv(&pt.z);
+        Some((self.p.from_mont(&self.p.mont_mul(&pt.x, &zi)), self.p.from_mont(&self.p.mont_mul(&pt.y, &zi))))
+    }
+
+    // x^3 - 3x + b (Montgomery form).
+    fn rhs(&self, x: &Vec<u64>) -> Vec<u64> {
+        let f = &self.p;
+        let x3 = f.mont_mul(&f.mont_mul(x, x), x);
+        let three_x = f.add(&f.add(x, x), x);
+        f.add(&f.sub(&x3, &three_x), &self.b)
+    }
+
+    /// The point of a SEC1 encoding (uncompressed 04 || x || y, or
+    /// compressed 02/03 || x), if on the curve (and not the identity).
+    pub fn decode(&self, b: &[u8]) -> Option<Point> {
+        let n = self.size();
+        let f = &self.p;
+        if b.len() == 1 + 2 * n && b[0] == 4 {
+            let x = f.to_mont(&f.from_be(&b[1..1 + n])?);
+            let y = f.to_mont(&f.from_be(&b[1 + n..])?);
+            if !f.eq(&f.mont_mul(&y, &y), &self.rhs(&x)) { return None; }
+            return Some(Point { x, y, z: f.one() });
+        }
+        if b.len() == 1 + n && (b[0] == 2 || b[0] == 3) {
+            let x = f.to_mont(&f.from_be(&b[1..])?);
+            let r = self.rhs(&x);
+            let mut y = f.pow(&r, self.sqrt_exp.as_slice());
+            if !f.eq(&f.mont_mul(&y, &y), &r) { return None; }
+            let odd = (f.from_mont(&y)[0] & 1) as u8;
+            if odd != (b[0] & 1) {
+                let mut zero: Vec<u64> = Vec::new();
+                zero.resize(f.limbs(), 0);
+                y = f.sub(&zero, &y);
+            }
+            return Some(Point { x, y, z: f.one() });
+        }
+        None
+    }
+
+    /// The uncompressed SEC1 encoding of a point (not the identity).
+    pub fn encode(&self, pt: &Point) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        match self.affine(pt) {
+            Some((x, y)) => {
+                out.push(4);
+                out.extend_from_slice(self.p.to_be(&x).as_slice());
+                out.extend_from_slice(self.p.to_be(&y).as_slice());
+            }
+            None => {}
+        }
+        out
+    }
+
+    /// A random scalar in [1, n).
+    pub fn random_scalar(&self) -> Vec<u8> {
+        let size = self.size();
+        loop {
+            let mut k: Vec<u8> = Vec::new();
+            k.resize(size, 0);
+            OsRng.fill_bytes(k.as_mut_slice());
+            if let Some(v) = self.n.from_be(k.as_slice()) {
+                if !self.n.is_zero(&v) { return k; }
+            }
+        }
+    }
+
+    /// Whether k (big-endian) is a valid secret scalar: in [1, n).
+    pub fn valid_scalar(&self, k: &[u8]) -> bool {
+        if k.len() != self.size() { return false; }
+        match self.n.from_be(k) {
+            Some(v) => !self.n.is_zero(&v),
+            None => false,
+        }
+    }
+
+    /// The public key (uncompressed) of the secret scalar k.
+    pub fn public_key(&self, k: &[u8]) -> Vec<u8> { self.encode(&self.mul(&self.g, k)) }
+
+    /// ECDH: the x-coordinate of k * peer (big-endian, the size), if not
+    /// the identity.
+    pub fn ecdh(&self, k: &[u8], peer: &Point) -> Option<Vec<u8>> {
+        let (x, _) = self.affine(&self.mul(peer, k))?;
+        Some(self.p.to_be(&x))
+    }
+
+    /// Whether (r, s) (big-endian) is the ECDSA signature of hash by the
+    /// key q (FIPS 186-4 6.4.2).
+    pub fn verify(&self, q: &Point, hash: &[u8], r: &[u8], s: &[u8]) -> bool {
+        let nm = &self.n;
+        let rv = match nm.from_be(r) { Some(v) => v, None => return false };
+        let sv = match nm.from_be(s) { Some(v) => v, None => return false };
+        if nm.is_zero(&rv) || nm.is_zero(&sv) { return false; }
+        // The hash's leftmost bits, as many as n has.
+        let nb = nm.byte_len();
+        let e_bytes = if hash.len() > nb { &hash[..nb] } else { hash };
+        let mut padded: Vec<u8> = Vec::new();
+        padded.resize(nb - e_bytes.len(), 0);
+        padded.extend_from_slice(e_bytes);
+        let mut e: Vec<u64> = Vec::new();
+        e.resize(nm.limbs(), 0);
+        let mut k = 0;
+        while k < padded.len() {
+            let byte = padded[padded.len() - 1 - k] as u64;
+            e[k / 8] = e[k / 8] | (byte << (8 * (k % 8)));
+            k += 1;
+        }
+        let shift = 8 * nb - nm.bits();
+        if shift > 0 {
+            // (Not for P-256 and P-384, whose n are whole bytes.)
+            let mut i = 0;
+            while i < e.len() {
+                let hi = if i + 1 < e.len() { e[i + 1] << (64 - shift) } else { 0 };
+                e[i] = (e[i] >> shift as u64) | hi;
+                i += 1;
+            }
+        }
+        let e = nm.reduce_once(&e);
+        let w = nm.inv(&nm.to_mont(&sv));
+        let u1 = nm.from_mont(&nm.mont_mul(&nm.to_mont(&e), &w));
+        let u2 = nm.from_mont(&nm.mont_mul(&nm.to_mont(&rv), &w));
+        let pt = self.mul2(nm.to_be(&u1).as_slice(), q, nm.to_be(&u2).as_slice());
+        let (x, _) = match self.affine(&pt) { Some(a) => a, None => return false };
+        // x mod n (x < p < 2n).
+        let xr = nm.reduce_once(&x);
+        nm.eq(&xr, &rv)
+    }
+}
+
+// --- The API of RustCrypto's p256 and p384 crates, over any curve ---------------
+
+use crate::marker::PhantomData;
+use crate::fmt::{self, Display, Formatter};
+
+/// A curve of crypto::p256 or crypto::p384.
+pub trait CurveId {
+    fn curve() -> &Curve;
+    /// The hash `VerifyingKey::verify` applies (SHA-256 for P-256, SHA-384
+    /// for P-384, as the crates).
+    fn hash(msg: &[u8]) -> Vec<u8>;
+}
+
+/// A bad key, point or signature (as signature::Error and
+/// elliptic_curve::Error: no detail).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Error;
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_str("elliptic curve error") }
+}
+
+/// An ECDSA signature (r, s).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature<C: CurveId> {
+    r: Vec<u8>,
+    s: Vec<u8>,
+    marker: PhantomData<C>,
+}
+
+// A DER INTEGER's value as the curve's size (unsigned, big-endian).
+fn fixed(v: &[u8], size: usize) -> Option<Vec<u8>> {
+    let mut b = v;
+    while b.len() > 0 && b[0] == 0 { b = &b[1..]; }
+    if b.len() > size { return None; }
+    let mut out: Vec<u8> = Vec::new();
+    out.resize(size - b.len(), 0);
+    out.extend_from_slice(b);
+    Some(out)
+}
+
+// A DER length at b[i..]: the length and where the contents start.
+fn der_len(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if i >= b.len() { return None; }
+    let first = b[i] as usize;
+    if first < 0x80 { return Some((first, i + 1)); }
+    let n = first & 0x7f;
+    if n == 0 || n > 2 || i + 1 + n > b.len() { return None; }
+    let mut len = 0usize;
+    let mut k = 0;
+    while k < n {
+        len = (len << 8) | (b[i + 1 + k] as usize);
+        k += 1;
+    }
+    Some((len, i + 1 + n))
+}
+
+impl<C: CurveId> Signature<C> {
+    /// r || s, each the curve's size.
+    pub fn from_slice(b: &[u8]) -> Result<Signature<C>, Error> {
+        let size = C::curve().size();
+        if b.len() != 2 * size { return Err(Error); }
+        Ok(Signature { r: b[..size].to_vec(), s: b[size..].to_vec(), marker: PhantomData })
+    }
+
+    /// The DER encoding: SEQUENCE { INTEGER r, INTEGER s }.
+    pub fn from_der(b: &[u8]) -> Result<Signature<C>, Error> {
+        let size = C::curve().size();
+        if b.len() < 2 || b[0] != 0x30 { return Err(Error); }
+        let (len, at) = der_len(b, 1).ok_or(Error)?;
+        if at + len != b.len() { return Err(Error); }
+        let mut i = at;
+        let mut ints: Vec<Vec<u8>> = Vec::new();
+        while ints.len() < 2 {
+            if i >= b.len() || b[i] != 2 { return Err(Error); }
+            let (l, s) = der_len(b, i + 1).ok_or(Error)?;
+            if s + l > b.len() || l == 0 || (b[s] & 0x80) != 0 { return Err(Error); }
+            ints.push(fixed(&b[s..s + l], size).ok_or(Error)?);
+            i = s + l;
+        }
+        if i != b.len() { return Err(Error); }
+        Ok(Signature { r: ints[0].clone(), s: ints[1].clone(), marker: PhantomData })
+    }
+
+    pub fn r(&self) -> &[u8] { self.r.as_slice() }
+
+    pub fn s(&self) -> &[u8] { self.s.as_slice() }
+
+    /// r || s.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = self.r.clone();
+        v.extend_from_slice(self.s.as_slice());
+        v
+    }
+}
+
+/// An ECDSA public key.
+#[derive(Clone)]
+pub struct VerifyingKey<C: CurveId> {
+    q: Point,
+    marker: PhantomData<C>,
+}
+
+impl<C: CurveId> VerifyingKey<C> {
+    /// From a SEC1 point (uncompressed or compressed).
+    pub fn from_sec1_bytes(b: &[u8]) -> Result<VerifyingKey<C>, Error> {
+        match C::curve().decode(b) {
+            Some(q) => Ok(VerifyingKey { q, marker: PhantomData }),
+            None => Err(Error),
+        }
+    }
+
+    /// The uncompressed SEC1 encoding.
+    pub fn to_sec1_bytes(&self) -> Vec<u8> { C::curve().encode(&self.q) }
+
+    /// Checks sig over msg (hashed with the curve's hash).
+    pub fn verify(&self, msg: &[u8], sig: &Signature<C>) -> Result<(), Error> { self.verify_prehash(C::hash(msg).as_slice(), sig) }
+
+    /// Checks sig over a message's hash (any hash: its leftmost bits).
+    pub fn verify_prehash(&self, hash: &[u8], sig: &Signature<C>) -> Result<(), Error> {
+        if C::curve().verify(&self.q, hash, sig.r.as_slice(), sig.s.as_slice()) { Ok(()) } else { Err(Error) }
+    }
+}
+
+/// A secret key for one Diffie-Hellman exchange.
+#[derive(Clone)]
+pub struct EphemeralSecret<C: CurveId> {
+    k: Vec<u8>,
+    marker: PhantomData<C>,
+}
+
+/// A Diffie-Hellman public key.
+#[derive(Clone)]
+pub struct PublicKey<C: CurveId> {
+    q: Point,
+    marker: PhantomData<C>,
+}
+
+/// The shared secret: the x-coordinate (the curve's size).
+#[derive(Clone)]
+pub struct SharedSecret {
+    s: Vec<u8>,
+}
+
+impl SharedSecret {
+    pub fn raw_secret_bytes(&self) -> &[u8] { self.s.as_slice() }
+}
+
+impl<C: CurveId> EphemeralSecret<C> {
+    pub fn random() -> EphemeralSecret<C> { EphemeralSecret { k: C::curve().random_scalar(), marker: PhantomData } }
+
+    /// A secret of the given scalar (big-endian, in [1, n)).
+    pub fn from_bytes(k: &[u8]) -> Result<EphemeralSecret<C>, Error> {
+        if !C::curve().valid_scalar(k) { return Err(Error); }
+        Ok(EphemeralSecret { k: k.to_vec(), marker: PhantomData })
+    }
+
+    pub fn public_key(&self) -> PublicKey<C> {
+        let c = C::curve();
+        PublicKey { q: c.decode(c.public_key(self.k.as_slice()).as_slice()).unwrap(), marker: PhantomData }
+    }
+
+    pub fn diffie_hellman(&self, their: &PublicKey<C>) -> SharedSecret {
+        // (A valid public key times a valid scalar is never the identity.)
+        SharedSecret { s: C::curve().ecdh(self.k.as_slice(), &their.q).unwrap() }
+    }
+}
+
+impl<C: CurveId> PublicKey<C> {
+    pub fn from_sec1_bytes(b: &[u8]) -> Result<PublicKey<C>, Error> {
+        match C::curve().decode(b) {
+            Some(q) => Ok(PublicKey { q, marker: PhantomData }),
+            None => Err(Error),
+        }
+    }
+
+    /// The uncompressed SEC1 encoding.
+    pub fn to_sec1_bytes(&self) -> Vec<u8> { C::curve().encode(&self.q) }
+}

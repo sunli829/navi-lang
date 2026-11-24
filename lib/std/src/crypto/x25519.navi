@@ -1,0 +1,351 @@
+//! X25519 Diffie-Hellman (RFC 7748), with the API of the x25519-dalek
+//! crate: `StaticSecret` (random or from bytes), the `PublicKey` of a
+//! secret, and `diffie_hellman` with another's public key; `x25519(k, u)`
+//! is the function itself.
+//!
+//!     use std::crypto::x25519::{StaticSecret, PublicKey};
+//!     let a = StaticSecret::random();
+//!     let b = StaticSecret::random();
+//!     let ab = a.diffie_hellman(&PublicKey::from(&b));
+//!     let ba = b.diffie_hellman(&PublicKey::from(&a));   // the same
+//!
+//! Constant-time: the field (mod 2^255 - 19) in five 51-bit limbs, the
+//! Montgomery ladder with masked swaps.
+
+use crate::rand::rngs::OsRng;
+use crate::rand::RngCore;
+
+const MASK51: u64 = (1 << 51) - 1;
+
+// x0*y0 + ... + x4*y4 as (lo, hi) words.
+fn mac5(x0: u64, y0: u64, x1: u64, y1: u64, x2: u64, y2: u64, x3: u64, y3: u64, x4: u64, y4: u64) -> (u64, u64) {
+    let mut acc = x0.widening_mul(y0);
+    acc = add_wide(acc, x1.widening_mul(y1));
+    acc = add_wide(acc, x2.widening_mul(y2));
+    acc = add_wide(acc, x3.widening_mul(y3));
+    add_wide(acc, x4.widening_mul(y4))
+}
+
+fn add_wide(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+    let lo = a.0.wrapping_add(b.0);
+    (lo, a.1 + b.1 + ((lo < a.0) as u64))
+}
+
+// A (lo, hi) value shifted right by 51 (it fits a word: below 2^115).
+fn shr51(a: (u64, u64)) -> (u64, u64) { ((a.0 >> 51) | (a.1 << 13), 0) }
+
+// An element of GF(2^255 - 19): five 51-bit limbs, least significant
+// first (each a little over 51 bits between reductions).
+#[derive(Clone)]
+struct Fe {
+    l: [u64; 5],
+}
+
+fn load64(b: &[u8], i: usize) -> u64 {
+    let mut v = 0u64;
+    let mut k = 0;
+    while k < 8 {
+        v = v | ((b[i + k] as u64) << (8 * k));
+        k += 1;
+    }
+    v
+}
+
+impl Fe {
+    fn zero() -> Fe { Fe { l: [0; 5] } }
+
+    fn one() -> Fe { Fe { l: [1, 0, 0, 0, 0] } }
+
+    // From 32 little-endian bytes (the top bit ignored).
+    fn from_bytes(b: &[u8]) -> Fe {
+        Fe { l: [
+            load64(b, 0) & MASK51,
+            (load64(b, 6) >> 3) & MASK51,
+            (load64(b, 12) >> 6) & MASK51,
+            (load64(b, 19) >> 1) & MASK51,
+            (load64(b, 24) >> 12) & MASK51,
+        ] }
+    }
+
+    // Carries each limb into the next (the top's times 19 into the
+    // first): every limb below 2^52 after.
+    fn carry(&self) -> Fe {
+        let mut l = self.l;
+        let mut c = l[0] >> 51;
+        l[0] = l[0] & MASK51;
+        l[1] += c;
+        c = l[1] >> 51;
+        l[1] = l[1] & MASK51;
+        l[2] += c;
+        c = l[2] >> 51;
+        l[2] = l[2] & MASK51;
+        l[3] += c;
+        c = l[3] >> 51;
+        l[3] = l[3] & MASK51;
+        l[4] += c;
+        c = l[4] >> 51;
+        l[4] = l[4] & MASK51;
+        l[0] += c * 19;
+        Fe { l }
+    }
+
+    fn add(&self, o: &Fe) -> Fe {
+        Fe { l: [self.l[0] + o.l[0], self.l[1] + o.l[1], self.l[2] + o.l[2], self.l[3] + o.l[3], self.l[4] + o.l[4]] }.carry()
+    }
+
+    // self - o, plus 4p so that limbs stay positive.
+    fn sub(&self, o: &Fe) -> Fe {
+        Fe { l: [
+            (self.l[0] + 0x1fffffffffffb4) - o.l[0],
+            (self.l[1] + 0x1ffffffffffffc) - o.l[1],
+            (self.l[2] + 0x1ffffffffffffc) - o.l[2],
+            (self.l[3] + 0x1ffffffffffffc) - o.l[3],
+            (self.l[4] + 0x1ffffffffffffc) - o.l[4],
+        ] }.carry()
+    }
+
+    fn mul(&self, o: &Fe) -> Fe {
+        let a = self.l;
+        let b = o.l;
+        let b1_19 = b[1] * 19;
+        let b2_19 = b[2] * 19;
+        let b3_19 = b[3] * 19;
+        let b4_19 = b[4] * 19;
+        // Each column a sum of five products, as (lo, hi) words.
+        let c0 = mac5(a[0], b[0], a[1], b4_19, a[2], b3_19, a[3], b2_19, a[4], b1_19);
+        let c1 = mac5(a[0], b[1], a[1], b[0], a[2], b4_19, a[3], b3_19, a[4], b2_19);
+        let c2 = mac5(a[0], b[2], a[1], b[1], a[2], b[0], a[3], b4_19, a[4], b3_19);
+        let c3 = mac5(a[0], b[3], a[1], b[2], a[2], b[1], a[3], b[0], a[4], b4_19);
+        let c4 = mac5(a[0], b[4], a[1], b[3], a[2], b[2], a[3], b[1], a[4], b[0]);
+        // Carry each column's bits above 51 into the next.
+        let r0 = c0.0 & MASK51;
+        let (l1, h1) = add_wide(c1, shr51(c0));
+        let r1 = l1 & MASK51;
+        let (l2, h2) = add_wide(c2, shr51((l1, h1)));
+        let r2 = l2 & MASK51;
+        let (l3, h3) = add_wide(c3, shr51((l2, h2)));
+        let r3 = l3 & MASK51;
+        let (l4, h4) = add_wide(c4, shr51((l3, h3)));
+        let r4 = l4 & MASK51;
+        let top = shr51((l4, h4)).0;
+        let r0b = r0 + top * 19;
+        Fe { l: [r0b & MASK51, r1 + (r0b >> 51), r2, r3, r4] }
+    }
+
+    fn square(&self) -> Fe { self.mul(self) }
+
+    fn mul_small(&self, k: u64) -> Fe {
+        let t0 = self.l[0].widening_mul(k);
+        let t1 = add_wide(self.l[1].widening_mul(k), shr51(t0));
+        let t2 = add_wide(self.l[2].widening_mul(k), shr51(t1));
+        let t3 = add_wide(self.l[3].widening_mul(k), shr51(t2));
+        let t4 = add_wide(self.l[4].widening_mul(k), shr51(t3));
+        let r0 = (t0.0 & MASK51) + shr51(t4).0 * 19;
+        Fe { l: [r0 & MASK51, (t1.0 & MASK51) + (r0 >> 51), t2.0 & MASK51, t3.0 & MASK51, t4.0 & MASK51] }
+    }
+
+    fn square_n(&self, n: usize) -> Fe {
+        let mut x = self.square();
+        let mut i = 1;
+        while i < n {
+            x = x.square();
+            i += 1;
+        }
+        x
+    }
+
+    // self^(p-2) = 1/self (ref10's addition chain).
+    fn invert(&self) -> Fe {
+        let z = self;
+        let t0 = z.square();
+        let mut t1 = t0.square_n(2);
+        t1 = z.mul(&t1);
+        let t0b = t0.mul(&t1);
+        let mut t2 = t0b.square();
+        t1 = t1.mul(&t2);
+        t2 = t1.square_n(5);
+        t1 = t2.mul(&t1);
+        t2 = t1.square_n(10);
+        t2 = t2.mul(&t1);
+        let mut t3 = t2.square_n(20);
+        t2 = t3.mul(&t2);
+        t2 = t2.square_n(10);
+        t1 = t2.mul(&t1);
+        t2 = t1.square_n(50);
+        t2 = t2.mul(&t1);
+        t3 = t2.square_n(100);
+        t2 = t3.mul(&t2);
+        t2 = t2.square_n(50);
+        t1 = t2.mul(&t1);
+        t1 = t1.square_n(5);
+        t1.mul(&t0b)
+    }
+
+    // The 32 little-endian bytes of the fully reduced value.
+    fn to_bytes(&self) -> [u8; 32] {
+        let h = self.carry().carry();
+        let mut l = h.l;
+        // q = 1 if h >= p.
+        let mut q = (l[0] + 19) >> 51;
+        q = (l[1] + q) >> 51;
+        q = (l[2] + q) >> 51;
+        q = (l[3] + q) >> 51;
+        q = (l[4] + q) >> 51;
+        l[0] += 19 * q;
+        l[1] += l[0] >> 51;
+        l[0] = l[0] & MASK51;
+        l[2] += l[1] >> 51;
+        l[1] = l[1] & MASK51;
+        l[3] += l[2] >> 51;
+        l[2] = l[2] & MASK51;
+        l[4] += l[3] >> 51;
+        l[3] = l[3] & MASK51;
+        l[4] = l[4] & MASK51;
+        let w: [u64; 4] = [l[0] | (l[1] << 51), (l[1] >> 13) | (l[2] << 38), (l[2] >> 26) | (l[3] << 25), (l[3] >> 39) | (l[4] << 12)];
+        let mut out: [u8; 32] = [0; 32];
+        let mut i = 0;
+        while i < 32 {
+            out[i] = (w[i / 8] >> (8 * (i % 8))) as u8;
+            i += 1;
+        }
+        out
+    }
+}
+
+// Swaps a and b if swap is 1, in constant time.
+fn cswap(swap: u64, a: &mut Fe, b: &mut Fe) {
+    let mask = 0u64.wrapping_sub(swap);
+    let mut i = 0;
+    while i < 5 {
+        let t = mask & (a.l[i] ^ b.l[i]);
+        a.l[i] = a.l[i] ^ t;
+        b.l[i] = b.l[i] ^ t;
+        i += 1;
+    }
+}
+
+/// The base point's u-coordinate (9).
+pub const X25519_BASEPOINT_BYTES: [u8; 32] = [9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// X25519(k, u): the scalar k (clamped) times the point with
+/// u-coordinate u (RFC 7748 5). Both 32 bytes, little-endian.
+pub fn x25519(k: &[u8], u: &[u8]) -> [u8; 32] {
+    if k.len() != 32 || u.len() != 32 { crate::panic::panic("x25519: k and u are 32 bytes"); }
+    let mut s: [u8; 32] = [0; 32];
+    let mut i = 0;
+    while i < 32 {
+        s[i] = k[i];
+        i += 1;
+    }
+    s[0] = s[0] & 248;
+    s[31] = s[31] & 127;
+    s[31] = s[31] | 64;
+    let x1 = Fe::from_bytes(u);
+    let mut x2 = Fe::one();
+    let mut z2 = Fe::zero();
+    let mut x3 = x1.clone();
+    let mut z3 = Fe::one();
+    let mut swap = 0u64;
+    let mut t: i64 = 254;
+    while t >= 0 {
+        let bit = ((s[(t / 8) as usize] >> (t % 8) as u8) & 1) as u64;
+        swap = swap ^ bit;
+        cswap(swap, &mut x2, &mut x3);
+        cswap(swap, &mut z2, &mut z3);
+        swap = bit;
+        let a = x2.add(&z2);
+        let aa = a.square();
+        let b = x2.sub(&z2);
+        let bb = b.square();
+        let e = aa.sub(&bb);
+        let c = x3.add(&z3);
+        let d = x3.sub(&z3);
+        let da = d.mul(&a);
+        let cb = c.mul(&b);
+        x3 = da.add(&cb).square();
+        z3 = x1.mul(&da.sub(&cb).square());
+        x2 = aa.mul(&bb);
+        z2 = e.mul(&aa.add(&e.mul_small(121665)));
+        t -= 1;
+    }
+    cswap(swap, &mut x2, &mut x3);
+    cswap(swap, &mut z2, &mut z3);
+    x2.mul(&z2.invert()).to_bytes()
+}
+
+/// A secret key.
+#[derive(Clone)]
+pub struct StaticSecret {
+    k: [u8; 32],
+}
+
+impl StaticSecret {
+    /// A random secret (from the operating system).
+    pub fn random() -> StaticSecret {
+        let mut k: [u8; 32] = [0; 32];
+        OsRng.fill_bytes(&mut k);
+        StaticSecret { k }
+    }
+
+    /// The secret of 32 bytes.
+    pub fn from_bytes(b: &[u8]) -> StaticSecret {
+        let mut k: [u8; 32] = [0; 32];
+        let mut i = 0;
+        while i < 32 {
+            k[i] = b[i];
+            i += 1;
+        }
+        StaticSecret { k }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 32] { self.k }
+
+    /// The shared secret with the holder of their public key.
+    pub fn diffie_hellman(&self, their: &PublicKey) -> SharedSecret { SharedSecret { s: x25519(&self.k, &their.u) } }
+}
+
+/// A public key: a u-coordinate.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PublicKey {
+    u: [u8; 32],
+}
+
+impl PublicKey {
+    pub fn from_bytes(b: &[u8]) -> PublicKey {
+        let mut u: [u8; 32] = [0; 32];
+        let mut i = 0;
+        while i < 32 {
+            u[i] = b[i];
+            i += 1;
+        }
+        PublicKey { u }
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] { &self.u }
+
+    pub fn to_bytes(&self) -> [u8; 32] { self.u }
+}
+
+impl From<&StaticSecret> for PublicKey {
+    fn from(s: &StaticSecret) -> PublicKey { PublicKey { u: x25519(&s.k, &X25519_BASEPOINT_BYTES) } }
+}
+
+/// The result of a Diffie-Hellman exchange.
+#[derive(Clone)]
+pub struct SharedSecret {
+    s: [u8; 32],
+}
+
+impl SharedSecret {
+    pub fn as_bytes(&self) -> &[u8; 32] { &self.s }
+
+    pub fn to_bytes(&self) -> [u8; 32] { self.s }
+
+    /// Whether the secret is not all zeros (their key was not a
+    /// low-order point), in constant time.
+    pub fn was_contributory(&self) -> bool {
+        let mut acc = 0u8;
+        for b in self.s.iter() { acc = acc | *b; }
+        acc != 0
+    }
+}

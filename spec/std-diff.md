@@ -237,6 +237,8 @@ API 照 base64 0.22（`Engine`）、hex、RustCrypto（`Digest`、`Mac`、`Hmac<
 | AEAD（`aead`、`aes`、`aes-gcm`、`chacha20poly1305`、`hkdf` crate） | 密钥、nonce、标签是定长数组（`GenericArray`），`encrypt_in_place_detached` 返回 `Tag` | `crypto::aead`、`crypto::aes`、`crypto::aes_gcm`、`crypto::chacha20poly1305`、`crypto::hkdf`，用 `&[u8]`，长度不对返回错误；`encrypt_in_place_detached` 返回 `Vec<u8>` 的标签 | 没有定长数组输出 |
 | AES、AES-GCM 的实现 | 有 CPU 指令时用指令，否则软件 | 相同：arm64 的 AES/PMULL、x86 的 AES-NI/PCLMULQDQ 用 `.s` 汇编（docs/asm.md），计数器模式和 GHASH 都在汇编里（M4 上 AES-128-GCM 约 1.9 GB/s）；软件路径的 GHASH 是恒定时间的（BearSSL ctmul64），AES 查表；`NAVI_NOAES=1` 强制走软件 | — |
 | ChaCha20-Poly1305 | 有 SIMD 汇编 | 纯软件（M4 上约 40 MB/s，待优化） | 先求正确 |
+| X25519（`x25519-dalek`） | `StaticSecret`、`PublicKey`、`SharedSecret`、`x25519` | `crypto::x25519`，相同；恒定时间（51 位分肢，蒙哥马利阶梯） | — |
+| P-256、P-384（`p256`、`p384` crate） | `ecdsa::{VerifyingKey, SigningKey, Signature}`、`ecdh` | `crypto::p256`、`crypto::p384`：只有验签（`VerifyingKey`、DER 或定长的 `Signature`）和 ECDH（`ecdh::{EphemeralSecret, PublicKey, SharedSecret}`），没有签名；完全加法公式（同 Go 的 nistec），标量乘恒定时间，验签用 Shamir 技巧（变时间，数据是公开的）。M4 上 P-256 验签约 11 ms、ECDH 约 8 ms（字段运算还在堆上分配，待优化） | TLS 客户端只需要验签和密钥交换 |
 
 ### std::compress（flate2 crate）
 
