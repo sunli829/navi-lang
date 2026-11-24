@@ -20,3 +20,372 @@ impl<E: Error> Deserializer for MissingField<E> {
     fn deserialize_any<V: Visitor>(self, visitor: V) -> Result<V::Value, E> { Err(E::missing_field(self.field)) }
     fn deserialize_option<V: Visitor>(self, visitor: V) -> Result<V::Value, E> { visitor.visit_none() }
 }
+
+// --- Content: a value held to be deserialized again --------------------------
+
+use crate::serde::de::{SeqAccess, MapAccess, EnumAccess, VariantAccess, Unexpected};
+use crate::serde::ser::{self, Serialize, Serializer, SerializeStruct, SerializeMap};
+use crate::fmt::{self, Formatter};
+
+/// Any deserialized value, kept to be deserialized again (as serde's
+/// Content): the internally tagged and untagged enums read their input as
+/// this first, then try their variants on it.
+#[derive(Clone, Debug)]
+pub enum Content {
+    Bool(bool),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Char(char),
+    String(String),
+    Bytes(Vec<u8>),
+    None,
+    Some(&Content),
+    Unit,
+    Newtype(&Content),
+    Seq(Vec<Content>),
+    Map(Vec<(Content, Content)>),
+}
+
+impl Content {
+    fn unexpected(&self) -> Unexpected {
+        match self {
+            Content::Bool(b) => Unexpected::Bool(*b),
+            Content::U64(n) => Unexpected::Unsigned(*n),
+            Content::I64(n) => Unexpected::Signed(*n),
+            Content::F64(f) => Unexpected::Float(*f),
+            Content::Char(c) => Unexpected::Char(*c),
+            Content::String(s) => Unexpected::Str(s.clone()),
+            Content::Bytes(_) => Unexpected::Bytes,
+            Content::None | Content::Some(_) => Unexpected::Option,
+            Content::Unit => Unexpected::Unit,
+            Content::Newtype(_) => Unexpected::NewtypeStruct,
+            Content::Seq(_) => Unexpected::Seq,
+            Content::Map(_) => Unexpected::Map,
+        }
+    }
+
+    // The string a key or tag holds.
+    fn as_str(&self) -> Option<String> {
+        match self {
+            Content::String(s) => Some(s.clone()),
+            Content::Char(c) => Some(c.to_string()),
+            _ => None,
+        }
+    }
+}
+
+impl Deserialize for Content {
+    fn deserialize<D: Deserializer>(d: D) -> Result<Content, D::Error> { d.deserialize_any(ContentVisitor) }
+}
+
+struct ContentVisitor;
+
+impl Visitor for ContentVisitor {
+    type Value = Content;
+    fn expecting(&self, f: &mut Formatter) -> fmt::Result { f.write_str("any value") }
+    fn visit_bool<E: Error>(self, v: bool) -> Result<Content, E> { Ok(Content::Bool(v)) }
+    fn visit_i64<E: Error>(self, v: i64) -> Result<Content, E> { Ok(Content::I64(v)) }
+    fn visit_u64<E: Error>(self, v: u64) -> Result<Content, E> { Ok(Content::U64(v)) }
+    fn visit_f64<E: Error>(self, v: f64) -> Result<Content, E> { Ok(Content::F64(v)) }
+    fn visit_char<E: Error>(self, v: char) -> Result<Content, E> { Ok(Content::Char(v)) }
+    fn visit_str<E: Error>(self, v: &str) -> Result<Content, E> { Ok(Content::String(v.to_string())) }
+    fn visit_string<E: Error>(self, v: String) -> Result<Content, E> { Ok(Content::String(v)) }
+    fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Content, E> { Ok(Content::Bytes(v.to_vec())) }
+    fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Content, E> { Ok(Content::Bytes(v)) }
+    fn visit_none<E: Error>(self) -> Result<Content, E> { Ok(Content::None) }
+    fn visit_some<D: Deserializer>(self, d: D) -> Result<Content, D::Error> { Ok(Content::Some(&Content::deserialize(d)?)) }
+    fn visit_unit<E: Error>(self) -> Result<Content, E> { Ok(Content::Unit) }
+    fn visit_newtype_struct<D: Deserializer>(self, d: D) -> Result<Content, D::Error> { Ok(Content::Newtype(&Content::deserialize(d)?)) }
+    fn visit_seq<A: SeqAccess>(self, seq: A) -> Result<Content, A::Error> {
+        let mut s = seq;
+        let mut v: Vec<Content> = Vec::new();
+        while let Some(x) = s.next_element::<Content>()? { v.push(x); }
+        Ok(Content::Seq(v))
+    }
+    fn visit_map<A: MapAccess>(self, map: A) -> Result<Content, A::Error> {
+        let mut m = map;
+        let mut v: Vec<(Content, Content)> = Vec::new();
+        while let Some(k) = m.next_key::<Content>()? {
+            let x = m.next_value::<Content>()?;
+            v.push((k, x));
+        }
+        Ok(Content::Map(v))
+    }
+}
+
+/// A Deserializer reading a Content.
+pub struct ContentDeserializer<E> {
+    content: Content,
+    marker: PhantomData<E>,
+}
+
+impl<E: Error> ContentDeserializer<E> {
+    pub fn new(content: Content) -> ContentDeserializer<E> { ContentDeserializer { content, marker: PhantomData } }
+}
+
+impl<E: Error> Deserializer for ContentDeserializer<E> {
+    type Error = E;
+    fn deserialize_any<V: Visitor>(self, visitor: V) -> Result<V::Value, E> {
+        match self.content {
+            Content::Bool(b) => visitor.visit_bool(b),
+            Content::U64(n) => visitor.visit_u64(n),
+            Content::I64(n) => visitor.visit_i64(n),
+            Content::F64(f) => visitor.visit_f64(f),
+            Content::Char(c) => visitor.visit_char(c),
+            Content::String(s) => visitor.visit_string(s),
+            Content::Bytes(b) => visitor.visit_byte_buf(b),
+            Content::None => visitor.visit_none(),
+            Content::Some(x) => visitor.visit_some(ContentDeserializer::<E>::new(*x)),
+            Content::Unit => visitor.visit_unit(),
+            Content::Newtype(x) => visitor.visit_newtype_struct(ContentDeserializer::<E>::new(*x)),
+            Content::Seq(v) => visitor.visit_seq(ContentSeq::<E> { items: v, at: 0, marker: PhantomData }),
+            Content::Map(v) => visitor.visit_map(ContentMap::<E> { items: v, at: 0, marker: PhantomData }),
+        }
+    }
+    fn deserialize_option<V: Visitor>(self, visitor: V) -> Result<V::Value, E> {
+        match self.content {
+            Content::None | Content::Unit => visitor.visit_none(),
+            Content::Some(x) => visitor.visit_some(ContentDeserializer::<E>::new(*x)),
+            _ => visitor.visit_some(self),
+        }
+    }
+    fn deserialize_newtype_struct<V: Visitor>(self, name: &str, visitor: V) -> Result<V::Value, E> {
+        match self.content {
+            Content::Newtype(x) => visitor.visit_newtype_struct(ContentDeserializer::<E>::new(*x)),
+            _ => visitor.visit_newtype_struct(self),
+        }
+    }
+    fn deserialize_enum<V: Visitor>(self, name: &str, variants: &[&str], visitor: V) -> Result<V::Value, E> {
+        match self.content {
+            Content::String(_) | Content::Char(_) => visitor.visit_enum(ContentEnum::<E> { variant: self.content, value: None, marker: PhantomData }),
+            Content::Map(v) => {
+                if v.len() != 1 { return Err(E::invalid_value(Unexpected::Map, "a map with a single key")); }
+                let (k, x) = v[0].clone();
+                visitor.visit_enum(ContentEnum::<E> { variant: k, value: Some(x), marker: PhantomData })
+            }
+            c => Err(E::invalid_type(c.unexpected(), "a string or a map")),
+        }
+    }
+}
+
+struct ContentSeq<E> {
+    items: Vec<Content>,
+    at: usize,
+    marker: PhantomData<E>,
+}
+
+impl<E: Error> SeqAccess for ContentSeq<E> {
+    type Error = E;
+    fn next_element<T: Deserialize>(&mut self) -> Result<Option<T>, E> {
+        if self.at >= self.items.len() { return Ok(None); }
+        let c = self.items[self.at].clone();
+        self.at += 1;
+        Ok(Some(T::deserialize(ContentDeserializer::<E>::new(c))?))
+    }
+    fn size_hint(&self) -> Option<usize> { Some(self.items.len() - self.at) }
+}
+
+struct ContentMap<E> {
+    items: Vec<(Content, Content)>,
+    at: usize,
+    marker: PhantomData<E>,
+}
+
+impl<E: Error> MapAccess for ContentMap<E> {
+    type Error = E;
+    fn next_key<K: Deserialize>(&mut self) -> Result<Option<K>, E> {
+        if self.at >= self.items.len() { return Ok(None); }
+        let (k, _) = self.items[self.at].clone();
+        Ok(Some(K::deserialize(ContentDeserializer::<E>::new(k))?))
+    }
+    fn next_value<V: Deserialize>(&mut self) -> Result<V, E> {
+        let (_, x) = self.items[self.at].clone();
+        self.at += 1;
+        V::deserialize(ContentDeserializer::<E>::new(x))
+    }
+    fn size_hint(&self) -> Option<usize> { Some(self.items.len() - self.at) }
+}
+
+struct ContentEnum<E> {
+    variant: Content,
+    value: Option<Content>,
+    marker: PhantomData<E>,
+}
+
+impl<E: Error> EnumAccess for ContentEnum<E> {
+    type Error = E;
+    type Variant = ContentVariant<E>;
+    fn variant<V: Deserialize>(self) -> Result<(V, ContentVariant<E>), E> {
+        let v = V::deserialize(ContentDeserializer::<E>::new(self.variant))?;
+        Ok((v, ContentVariant::<E> { value: self.value, marker: PhantomData }))
+    }
+}
+
+struct ContentVariant<E> {
+    value: Option<Content>,
+    marker: PhantomData<E>,
+}
+
+impl<E: Error> VariantAccess for ContentVariant<E> {
+    type Error = E;
+    fn unit_variant(self) -> Result<(), E> {
+        match self.value {
+            None | Some(Content::Unit) => Ok(()),
+            Some(c) => Err(E::invalid_type(c.unexpected(), "unit variant")),
+        }
+    }
+    fn newtype_variant<T: Deserialize>(self) -> Result<T, E> {
+        match self.value {
+            Some(c) => T::deserialize(ContentDeserializer::<E>::new(c)),
+            None => Err(E::invalid_type(Unexpected::UnitVariant, "newtype variant")),
+        }
+    }
+    fn tuple_variant<V: Visitor>(self, len: usize, visitor: V) -> Result<V::Value, E> {
+        match self.value {
+            Some(Content::Seq(v)) => visitor.visit_seq(ContentSeq::<E> { items: v, at: 0, marker: PhantomData }),
+            Some(c) => Err(E::invalid_type(c.unexpected(), "tuple variant")),
+            None => Err(E::invalid_type(Unexpected::UnitVariant, "tuple variant")),
+        }
+    }
+    fn struct_variant<V: Visitor>(self, fields: &[&str], visitor: V) -> Result<V::Value, E> {
+        match self.value {
+            Some(Content::Map(v)) => visitor.visit_map(ContentMap::<E> { items: v, at: 0, marker: PhantomData }),
+            Some(Content::Seq(v)) => visitor.visit_seq(ContentSeq::<E> { items: v, at: 0, marker: PhantomData }),
+            Some(c) => Err(E::invalid_type(c.unexpected(), "struct variant")),
+            None => Err(E::invalid_type(Unexpected::UnitVariant, "struct variant")),
+        }
+    }
+}
+
+/// An internally tagged enum's input ({tag: "Variant", fields...}): the
+/// variant's name and the rest of the map.
+pub fn take_tag<E: Error>(content: Content, tag: &str) -> Result<(String, Content), E> {
+    let entries = match content {
+        Content::Map(v) => v,
+        c => return Err(E::invalid_type(c.unexpected(), "a map with the tag")),
+    };
+    let mut name: Option<String> = None;
+    let mut rest: Vec<(Content, Content)> = Vec::new();
+    for (k, v) in entries.iter() {
+        if name.is_none() && k.as_str() == Some(tag.to_string()) {
+            match v.as_str() {
+                Some(s) => name = Some(s),
+                None => return Err(E::invalid_type(v.unexpected(), "a variant's name")),
+            }
+            continue;
+        }
+        rest.push((k.clone(), v.clone()));
+    }
+    match name {
+        Some(n) => Ok((n, Content::Map(rest))),
+        None => Err(E::missing_field(tag)),
+    }
+}
+
+/// An adjacently tagged enum's input ({tag: "Variant", content: ...}, in
+/// either order): the variant's name and its content, if any.
+pub fn take_adjacent<E: Error>(content: Content, tag: &str, key: &str) -> Result<(String, Option<Content>), E> {
+    let entries = match content {
+        Content::Map(v) => v,
+        c => return Err(E::invalid_type(c.unexpected(), "a map with the tag and content")),
+    };
+    let mut name: Option<String> = None;
+    let mut value: Option<Content> = None;
+    for (k, v) in entries.iter() {
+        let ks = k.as_str();
+        if ks == Some(tag.to_string()) {
+            if name.is_some() { return Err(E::duplicate_field(tag)); }
+            match v.as_str() {
+                Some(s) => name = Some(s),
+                None => return Err(E::invalid_type(v.unexpected(), "a variant's name")),
+            }
+        } else if ks == Some(key.to_string()) {
+            if value.is_some() { return Err(E::duplicate_field(key)); }
+            value = Some(v.clone());
+        } else {
+            return Err(E::unknown_field(match &ks { Some(s) => s.as_str(), None => "?" }, &[]));
+        }
+    }
+    match name {
+        Some(n) => Ok((n, value)),
+        None => Err(E::missing_field(tag)),
+    }
+}
+
+/// An untagged enum's input that no variant took.
+pub fn untagged_error<E: Error>(name: &str) -> E { E::custom(`data did not match any variant of untagged enum ${name}`) }
+
+// --- Serializing an internally tagged newtype variant -------------------------
+
+/// The Serializer an internally tagged enum's newtype variant serializes its
+/// value with: a struct or map gets the tag as its first entry (as serde's
+/// TaggedSerializer); other values cannot carry it.
+pub struct TaggedSerializer<S> {
+    pub tag: &str,
+    pub variant: &str,
+    pub delegate: S,
+}
+
+impl<S: Serializer> TaggedSerializer<S> {
+    fn bad(&self, what: &str) -> S::Error { <S::Error as ser::Error>::custom(`cannot serialize tagged newtype variant ${self.variant} containing ${what}`) }
+}
+
+impl<S: Serializer> Serializer for TaggedSerializer<S> {
+    type Ok = S::Ok;
+    type Error = S::Error;
+    type SerializeSeq = S::SerializeSeq;
+    type SerializeTuple = S::SerializeTuple;
+    type SerializeTupleStruct = S::SerializeTupleStruct;
+    type SerializeTupleVariant = S::SerializeTupleVariant;
+    type SerializeMap = S::SerializeMap;
+    type SerializeStruct = S::SerializeStruct;
+    type SerializeStructVariant = S::SerializeStructVariant;
+    fn serialize_bool(self, v: bool) -> Result<S::Ok, S::Error> { Err(self.bad("a bool")) }
+    fn serialize_i64(self, v: i64) -> Result<S::Ok, S::Error> { Err(self.bad("an integer")) }
+    fn serialize_u64(self, v: u64) -> Result<S::Ok, S::Error> { Err(self.bad("an integer")) }
+    fn serialize_f64(self, v: f64) -> Result<S::Ok, S::Error> { Err(self.bad("a float")) }
+    fn serialize_str(self, v: &str) -> Result<S::Ok, S::Error> { Err(self.bad("a string")) }
+    fn serialize_bytes(self, v: &[u8]) -> Result<S::Ok, S::Error> { Err(self.bad("bytes")) }
+    fn serialize_none(self) -> Result<S::Ok, S::Error> { Err(self.bad("an Option")) }
+    fn serialize_some<T: Serialize>(self, value: &T) -> Result<S::Ok, S::Error> { Err(self.bad("an Option")) }
+    fn serialize_unit(self) -> Result<S::Ok, S::Error> {
+        let mut m = self.delegate.serialize_map(Some(1))?;
+        m.serialize_entry(&self.tag, &self.variant)?;
+        m.end()
+    }
+    fn serialize_unit_struct(self, name: &str) -> Result<S::Ok, S::Error> {
+        let mut st = self.delegate.serialize_struct(name, 1)?;
+        st.serialize_field(self.tag, &self.variant)?;
+        st.end()
+    }
+    fn serialize_unit_variant(self, name: &str, variant_index: u32, variant: &str) -> Result<S::Ok, S::Error> {
+        let mut m = self.delegate.serialize_map(Some(2))?;
+        m.serialize_entry(&self.tag, &self.variant)?;
+        m.serialize_entry(&variant, &())?;
+        m.end()
+    }
+    fn serialize_newtype_struct<T: Serialize>(self, name: &str, value: &T) -> Result<S::Ok, S::Error> { value.serialize(self) }
+    fn serialize_newtype_variant<T: Serialize>(self, name: &str, variant_index: u32, variant: &str, value: &T) -> Result<S::Ok, S::Error> {
+        let mut m = self.delegate.serialize_map(Some(2))?;
+        m.serialize_entry(&self.tag, &self.variant)?;
+        m.serialize_entry(&variant, value)?;
+        m.end()
+    }
+    fn serialize_seq(self, len: Option<usize>) -> Result<S::SerializeSeq, S::Error> { Err(self.bad("a sequence")) }
+    fn serialize_tuple(self, len: usize) -> Result<S::SerializeTuple, S::Error> { Err(self.bad("a tuple")) }
+    fn serialize_tuple_struct(self, name: &str, len: usize) -> Result<S::SerializeTupleStruct, S::Error> { Err(self.bad("a tuple struct")) }
+    fn serialize_tuple_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<S::SerializeTupleVariant, S::Error> { Err(self.bad("a tuple variant")) }
+    fn serialize_map(self, len: Option<usize>) -> Result<S::SerializeMap, S::Error> {
+        let n = match len { Some(n) => Some(n + 1), None => None };
+        let mut m = self.delegate.serialize_map(n)?;
+        m.serialize_entry(&self.tag, &self.variant)?;
+        Ok(m)
+    }
+    fn serialize_struct(self, name: &str, len: usize) -> Result<S::SerializeStruct, S::Error> {
+        let mut st = self.delegate.serialize_struct(name, len + 1)?;
+        st.serialize_field(self.tag, &self.variant)?;
+        Ok(st)
+    }
+    fn serialize_struct_variant(self, name: &str, variant_index: u32, variant: &str, len: usize) -> Result<S::SerializeStructVariant, S::Error> { Err(self.bad("a struct variant")) }
+}

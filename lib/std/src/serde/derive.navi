@@ -1,13 +1,16 @@
 //! #[derive(Serialize, Deserialize)] (re-exported as std::serde's
 //! Serialize and Deserialize, with the traits): the code serde_derive
-//! makes, for structs (named, tuple, newtype, unit) and enums (externally
-//! tagged: "Variant" or {"Variant": content}), with the #[serde(...)]
-//! attributes rename, rename_all, skip, skip_serializing,
+//! makes, for structs (named, tuple, newtype, unit) and enums, with the
+//! #[serde(...)] attributes rename, rename_all, skip, skip_serializing,
 //! skip_deserializing, default (or default = "path"), skip_serializing_if
-//! and deny_unknown_fields. The helper types of Deserialize (field and
+//! and deny_unknown_fields, and serde's enum representations: externally
+//! tagged ("Variant" or {"Variant": content}, the default), internally
+//! tagged (tag = "t": {"t": "Variant", fields...}), adjacently tagged
+//! (tag = "t", content = "c": {"t": "Variant", "c": content}) and
+//! untagged (the content alone; reading tries the variants in order). The helper types of Deserialize (field and
 //! variant identifiers, visitors) go next to the type, named __Type_...
 
-use crate::derive::{TypeInfo, Code, Error, Variant, Kind, FromAttrs, FromAttrValue, AttrValue, AttrArgs, quote};
+use crate::derive::{TypeInfo, Code, Error, Variant, Binding, Kind, FromAttrs, FromAttrValue, AttrValue, AttrArgs, quote};
 
 // Code of text as written (a path, a number).
 fn c(text: &str) -> Code { Code::from_text(text) }
@@ -27,6 +30,9 @@ struct Attrs {
     default: Option<DefaultTo>,
     skip_serializing_if: Option<String>,
     deny_unknown_fields: bool,
+    tag: Option<String>,
+    content: Option<String>,
+    untagged: bool,
 }
 
 // #[serde(default)] (the type's Default) or default = "path" (a function).
@@ -57,6 +63,9 @@ impl FromAttrs for Attrs {
             default: a.get::<Option<DefaultTo>>("default")?,
             skip_serializing_if: a.get::<Option<String>>("skip_serializing_if")?,
             deny_unknown_fields: a.get::<bool>("deny_unknown_fields")?,
+            tag: a.get::<Option<String>>("tag")?,
+            content: a.get::<Option<String>>("content")?,
+            untagged: a.get::<bool>("untagged")?,
         })
     }
 }
@@ -157,13 +166,178 @@ fn name_list(names: &Vec<String>) -> Code {
 
 // --- Serialize ---------------------------------------------------------------------
 
+// How an enum is represented (serde's enum representations).
+enum Repr {
+    External,
+    Internal(String),
+    Adjacent(String, String),
+    Untagged,
+}
+
+fn repr(t: &TypeInfo, ia: &Attrs) -> Result<Repr, Error> {
+    if ia.untagged {
+        if ia.tag.is_some() || ia.content.is_some() { return Err(Error::at(t, "untagged cannot be used with tag or content")); }
+        if !t.is_enum() { return Err(Error::at(t, "untagged is for enums")); }
+        return Ok(Repr::Untagged);
+    }
+    match (&ia.tag, &ia.content) {
+        (None, None) => Ok(Repr::External),
+        (Some(tg), None) => if t.is_enum() { Ok(Repr::Internal(tg.clone())) } else { Err(Error::at(t, "tag is for enums")) },
+        (Some(tg), Some(ct)) => if t.is_enum() { Ok(Repr::Adjacent(tg.clone(), ct.clone())) } else { Err(Error::at(t, "tag and content are for enums")) },
+        (None, Some(_)) => Err(Error::at(t, "content needs tag")),
+    }
+}
+
 #[derive_macro(Serialize, attrs = [serde])]
 pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
     let ia: Attrs = t.parse_attrs("serde")?;
-    let body = t.each_variant(|v| ser_fields(t, v, &ia))?;
+    let r = repr(t, &ia)?;
+    let mut helpers = Code::new();
+    let body = match &r {
+        Repr::External => t.each_variant(|v| ser_fields(t, v, &ia))?,
+        _ => t.each_variant(|v| ser_tagged(t, v, &ia, &r, &mut helpers))?,
+    };
     let ser = c(SER);
     let items = quote`fn serialize<__S: ${ser}::Serializer>(&self, __serializer: __S) -> std::result::Result<__S::Ok, __S::Error> { ${body} }`;
-    Ok(t.impl_for(`${SER}::Serialize`.to_string().as_str(), items))
+    helpers.push(&t.impl_for(`${SER}::Serialize`.to_string().as_str(), items));
+    Ok(helpers)
+}
+
+// The fields of a struct or struct variant written to a SerializeStruct-like
+// state __st (trait tr) by key, and how many.
+fn struct_fields(bs: &Vec<Binding>, ia: &Attrs, tr: &Code) -> Result<(Vec<Code>, usize), Error> {
+    let ser = c(SER);
+    let mut fields: Vec<Code> = Vec::new();
+    let mut n = 0;
+    for b in bs.iter() {
+        let fa: Attrs = b.field().parse_attrs("serde")?;
+        if fa.skip_ser() { continue; }
+        n += 1;
+        let key = data_name(b.field().ident().to_string().as_str(), &fa, ia.rule().as_str(), false);
+        let field = quote`${ser}::${tr}::serialize_field(&mut __st, ${key}, &${b})?;`;
+        match &fa.skip_serializing_if {
+            Some(p) => {
+                let skip = c(p.as_str());
+                fields.push(quote`if ${skip}(&${b}) { ${ser}::${tr}::skip_field(&mut __st, ${key})?; } else { ${field} }`);
+            }
+            None => fields.push(field),
+        }
+    }
+    Ok((fields, n))
+}
+
+// A variant of an internally or adjacently tagged or untagged enum written
+// (helpers: the types an adjacently tagged variant's content needs).
+fn ser_tagged(t: &TypeInfo, v: &Variant, ia: &Attrs, r: &Repr, helpers: &mut Code) -> Result<Code, Error> {
+    let ser = c(SER);
+    let tname = t.name().to_string();
+    let va: Attrs = v.parse_attrs("serde")?;
+    let vname = data_name(v.name().to_string().as_str(), &va, ia.rule().as_str(), true);
+    let bs = v.bindings();
+    let st = c("SerializeStruct");
+    let tu = c("SerializeTuple");
+    match r {
+        Repr::Internal(tag) => Ok(match v.kind() {
+            Kind::Unit => quote`let mut __st = __serializer.serialize_struct(${tname}, 1)?; ${ser}::SerializeStruct::serialize_field(&mut __st, ${tag}, ${vname})?; ${ser}::SerializeStruct::end(__st)`,
+            Kind::Tuple => {
+                if bs.len() != 1 { return Err(Error::at(v, "an internally tagged enum cannot have tuple variants")); }
+                let x = &bs[0];
+                quote`${ser}::Serialize::serialize(&${x}, std::serde::private::TaggedSerializer { tag: ${tag}, variant: ${vname}, delegate: __serializer })`
+            }
+            Kind::Named => {
+                let (fields, n) = struct_fields(&bs, ia, &st)?;
+                let n1 = num(n + 1);
+                quote`let mut __st = __serializer.serialize_struct(${tname}, ${n1})?; ${ser}::SerializeStruct::serialize_field(&mut __st, ${tag}, ${vname})?; ${fields} ${ser}::SerializeStruct::end(__st)`
+            }
+        }),
+        Repr::Adjacent(tag, content) => {
+            if v.kind() == Kind::Unit {
+                return Ok(quote`let mut __st = __serializer.serialize_struct(${tname}, 1)?; ${ser}::SerializeStruct::serialize_field(&mut __st, ${tag}, ${vname})?; ${ser}::SerializeStruct::end(__st)`);
+            }
+            let value = if v.kind() == Kind::Tuple && bs.len() == 1 {
+                let x = &bs[0];
+                quote`&${x}`
+            } else {
+                helpers.push(&adjacent_content(t, v, ia, vname.as_str())?);
+                let h = c(`__${t.name()}_${v.name()}_Content`.to_string().as_str());
+                let mut inits: Vec<Code> = Vec::new();
+                let mut i = 0;
+                for b in bs.iter() {
+                    let f = c(`f${i}`.to_string().as_str());
+                    inits.push(quote`${f}: &${b},`);
+                    i += 1;
+                }
+                quote`&${h} { ${inits} __m: std::marker::PhantomData }`
+            };
+            Ok(quote`let mut __st = __serializer.serialize_struct(${tname}, 2)?; ${ser}::SerializeStruct::serialize_field(&mut __st, ${tag}, ${vname})?; ${ser}::SerializeStruct::serialize_field(&mut __st, ${content}, ${value})?; ${ser}::SerializeStruct::end(__st)`)
+        }
+        _ => Ok(match v.kind() {
+            Kind::Unit => quote`__serializer.serialize_unit()`,
+            Kind::Tuple => {
+                if bs.len() == 1 {
+                    let x = &bs[0];
+                    return Ok(quote`${ser}::Serialize::serialize(&${x}, __serializer)`);
+                }
+                let n = num(bs.len());
+                let mut elems: Vec<Code> = Vec::new();
+                for b in bs.iter() { elems.push(quote`${ser}::${tu}::serialize_element(&mut __st, &${b})?;`); }
+                quote`let mut __st = __serializer.serialize_tuple(${n})?; ${elems} ${ser}::${tu}::end(__st)`
+            }
+            Kind::Named => {
+                let (fields, n) = struct_fields(&bs, ia, &st)?;
+                let nn = num(n);
+                quote`let mut __st = __serializer.serialize_struct(${vname}, ${nn})?; ${fields} ${ser}::SerializeStruct::end(__st)`
+            }
+        }),
+    }
+}
+
+// The content of an adjacently tagged tuple or struct variant: a struct of
+// references to its fields that serializes as the variant's content would
+// (a tuple, or a struct named after the variant).
+fn adjacent_content(t: &TypeInfo, v: &Variant, ia: &Attrs, vname: &str) -> Result<Code, Error> {
+    let ser = c(SER);
+    let h = c(`__${t.name()}_${v.name()}_Content`.to_string().as_str());
+    let ps = t.params();
+    let me = t.self_type();
+    let mut decls: Vec<Code> = Vec::new();
+    let mut i = 0;
+    for f in v.fields().iter() {
+        let fname = c(`f${i}`.to_string().as_str());
+        let ty = f.ty();
+        decls.push(quote`${fname}: &${ty},`);
+        i += 1;
+    }
+    let mut body: Vec<Code> = Vec::new();
+    let mut count = 0;
+    i = 0;
+    for f in v.fields().iter() {
+        let fname = c(`f${i}`.to_string().as_str());
+        i += 1;
+        if v.kind() == Kind::Tuple {
+            body.push(quote`${ser}::SerializeTuple::serialize_element(&mut __st, self.${fname})?;`);
+            count += 1;
+            continue;
+        }
+        let fa: Attrs = f.parse_attrs("serde")?;
+        if fa.skip_ser() { continue; }
+        count += 1;
+        let key = data_name(f.ident().to_string().as_str(), &fa, ia.rule().as_str(), false);
+        body.push(quote`${ser}::SerializeStruct::serialize_field(&mut __st, ${key}, self.${fname})?;`);
+    }
+    let n = num(count);
+    let write = if v.kind() == Kind::Tuple {
+        quote`let mut __st = __serializer.serialize_tuple(${n})?; ${body} ${ser}::SerializeTuple::end(__st)`
+    } else {
+        quote`let mut __st = __serializer.serialize_struct(${vname}, ${n})?; ${body} ${ser}::SerializeStruct::end(__st)`
+    };
+    let items = quote`fn serialize<__S: ${ser}::Serializer>(&self, __serializer: __S) -> std::result::Result<__S::Ok, __S::Error> { ${write} }`;
+    let self_ty = quote`${h}${ps}`;
+    let bound = c(`${SER}::Serialize`.to_string().as_str());
+    let decl = quote`#[allow(non_camel_case_types)] struct ${h}${ps} { ${decls} __m: std::marker::PhantomData<${me}> }`;
+    let mut out = decl;
+    out.push(&t.impl_for_type(`${SER}::Serialize`.to_string().as_str(), bound, self_ty, items));
+    Ok(out)
 }
 
 // The serialization of a struct's or variant's fields (its bindings).
@@ -229,6 +403,11 @@ fn ser_fields(t: &TypeInfo, v: &Variant, ia: &Attrs) -> Result<Code, Error> {
 pub fn deserialize(t: &TypeInfo) -> Result<Code, Error> {
     let de = c(DE);
     let ia: Attrs = t.parse_attrs("serde")?;
+    let r = repr(t, &ia)?;
+    match &r {
+        Repr::External => {}
+        _ => return de_tagged(t, &ia, &r),
+    }
     let mut out = Code::new();
     let vis = c(`__${t.name()}_Visitor`.to_string().as_str());
     out.push(&visitor_struct(t, &vis));
@@ -513,5 +692,76 @@ fn enum_visitor(t: &TypeInfo, ia: &Attrs, vis: &Code) -> Result<Code, Error> {
             match __tag { ${arms} ${vid}::__ignore => std::result::Result::Err(<__A::Error as ${de}::Error>::custom("unknown variant")), }
         }`;
     out.push(&visitor_impl(t, vis, items));
+    Ok(out)
+}
+
+// The Deserialize of an internally or adjacently tagged or untagged enum:
+// the input read as Content first (std::serde::private), then the variant
+// it names (or, untagged, the first that takes it) from that.
+fn de_tagged(t: &TypeInfo, ia: &Attrs, r: &Repr) -> Result<Code, Error> {
+    let de = c(DE);
+    let p = c("std::serde::private");
+    let mut out = Code::new();
+    let mk = marker();
+    let tname = t.name().to_string();
+    let list = name_list(&variant_names(t, ia)?);
+    let mut arms: Vec<Code> = Vec::new();
+    for v in t.variants().iter() {
+        let path = v.path();
+        let va: Attrs = v.parse_attrs("serde")?;
+        let vname = data_name(v.name().to_string().as_str(), &va, ia.rule().as_str(), true);
+        let newtype = v.kind() == Kind::Tuple && v.fields().len() == 1;
+        // A visitor for a tuple or struct variant's content.
+        let vv = c(`__${t.name()}_${v.name()}_Visitor`.to_string().as_str());
+        if v.kind() == Kind::Named || (v.kind() == Kind::Tuple && !newtype) {
+            if let Repr::Internal(_) = r { if v.kind() == Kind::Tuple { return Err(Error::at(v, "an internally tagged enum cannot have tuple variants")); } }
+            out.push(&visitor_struct(t, &vv));
+            out.push(&struct_visitor(t, v, ia, &vv, `${v.name()}_`.to_string().as_str())?);
+        }
+        let read = if v.kind() == Kind::Named { c("deserialize_map") } else { c("deserialize_seq") };
+        let arm = match r {
+            Repr::Internal(_) => match v.kind() {
+                Kind::Unit => quote`${vname} => std::result::Result::Ok(${path}),`,
+                Kind::Tuple => {
+                    let ty = v.fields()[0].ty();
+                    quote`${vname} => std::result::Result::Ok(${path}(<${ty} as ${de}::Deserialize>::deserialize(${p}::ContentDeserializer::<__D::Error>::new(__rest))?)),`
+                }
+                Kind::Named => quote`${vname} => ${de}::Deserializer::deserialize_map(${p}::ContentDeserializer::<__D::Error>::new(__rest), ${vv}${mk}),`,
+            },
+            Repr::Adjacent(_, content) => {
+                let missing = quote`std::option::Option::None => std::result::Result::Err(<__D::Error as ${de}::Error>::missing_field(${content})),`;
+                if v.kind() == Kind::Unit {
+                    quote`${vname} => std::result::Result::Ok(${path}),`
+                } else if newtype {
+                    let ty = v.fields()[0].ty();
+                    quote`${vname} => match __val { std::option::Option::Some(__v) => std::result::Result::Ok(${path}(<${ty} as ${de}::Deserialize>::deserialize(${p}::ContentDeserializer::<__D::Error>::new(__v))?)), ${missing} },`
+                } else {
+                    quote`${vname} => match __val { std::option::Option::Some(__v) => ${de}::Deserializer::${read}(${p}::ContentDeserializer::<__D::Error>::new(__v), ${vv}${mk}), ${missing} },`
+                }
+            }
+            _ => {
+                if v.kind() == Kind::Unit {
+                    quote`if let ${p}::Content::Unit = __c { return std::result::Result::Ok(${path}); }`
+                } else if newtype {
+                    let ty = v.fields()[0].ty();
+                    quote`if let std::result::Result::Ok(__x) = <${ty} as ${de}::Deserialize>::deserialize(${p}::ContentDeserializer::<__D::Error>::new(__c.clone())) { return std::result::Result::Ok(${path}(__x)); }`
+                } else {
+                    quote`if let std::result::Result::Ok(__x) = ${de}::Deserializer::${read}(${p}::ContentDeserializer::<__D::Error>::new(__c.clone()), ${vv}${mk}) { return std::result::Result::Ok(__x); }`
+                }
+            }
+        };
+        arms.push(arm);
+    }
+    let unknown = quote`_ => std::result::Result::Err(<__D::Error as ${de}::Error>::unknown_variant(__name.as_str(), ${list})),`;
+    let body = match r {
+        Repr::Internal(tag) => quote`let (__name, __rest) = ${p}::take_tag::<__D::Error>(__c, ${tag})?; match __name.as_str() { ${arms} ${unknown} }`,
+        Repr::Adjacent(tag, content) => quote`let (__name, __val) = ${p}::take_adjacent::<__D::Error>(__c, ${tag}, ${content})?; match __name.as_str() { ${arms} ${unknown} }`,
+        _ => quote`${arms} std::result::Result::Err(${p}::untagged_error::<__D::Error>(${tname}))`,
+    };
+    let items = quote`fn deserialize<__D: ${de}::Deserializer>(__deserializer: __D) -> std::result::Result<Self, __D::Error> {
+        let __c = <${p}::Content as ${de}::Deserialize>::deserialize(__deserializer)?;
+        ${body}
+    }`;
+    out.push(&t.impl_for(`${DE}::Deserialize`.to_string().as_str(), items));
     Ok(out)
 }

@@ -172,7 +172,7 @@ t.impl_for("std::clone::Clone", body)
 - `de`：`Deserialize`（`fn deserialize<D: Deserializer>(d: D) -> Result<Self, D::Error>`）、`Deserializer`（`deserialize_any`/`i64`/`str`/`seq`/`map`/`struct`/`enum`/`identifier`/`ignored_any`……）、`Visitor`、`SeqAccess`、`MapAccess`、`EnumAccess`、`VariantAccess`；`de::Error`。
 - std 的类型手写实现：整数、浮点、`bool`、`char`、`String`、`&str`（只序列化）、`Option`、`Vec`、数组、元组、`HashMap`、`BTreeMap`、`()`、引用。
 - `#[derive(Serialize, Deserialize)]` 是 std 里的派生宏（`std::serde::derive`，原来写在编译器里，2026-11-24 搬出来，同 Rust 的 serde_derive；std 自己的类型不用它们，所以 std 可以定义它们），生成的代码和 serde_derive 的一样，表示方式也一样：结构体是 map，元组结构体是 seq，单字段元组结构体是它的字段，枚举默认外部标记（`"Variant"` 或 `{"Variant": ...}`）。现在 `std::json` 的映射就是这样，所以数据格式不变。
-- 属性（`#[serde(...)]`，serde 的常用子集）：`rename`、`rename_all`、`skip`、`skip_serializing_if`、`default`、`deny_unknown_fields`、`tag`/`content`/`untagged`（枚举表示），以后按需要再加。
+- 属性（`#[serde(...)]`，serde 的常用子集）：`rename`、`rename_all`、`skip`、`skip_serializing_if`、`default`、`deny_unknown_fields`、`tag`/`content`/`untagged`（枚举的内部标记、相邻标记、不带标记；2026-11-24 加上：序列化照 serde_derive，内部标记的 newtype 变体经 `private::TaggedSerializer`，相邻标记的元组和结构体变体经一个引用字段的辅助结构体；反序列化先读成 `private::Content`，再取标记或逐个变体去试），以后按需要再加。
 - `std::json`：`to_string`、`to_string_pretty`、`to_writer`、`from_str`、`from_reader`，`T: Serialize` / `T: Deserialize`；`json::Value` 也实现两者（任意 JSON）。
 - `std::csv`：按 serde 读写记录（同 Rust 的 csv crate）。
 - `std::http` 里 JSON 请求体和响应体的辅助函数加上相应约束。
