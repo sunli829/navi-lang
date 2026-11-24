@@ -10,11 +10,14 @@
 //! Resolution and collection then run on these trees as on parsed ones,
 //! minus the lexing, parsing and the resolution of the bodies left out.
 //!
-//! A file: the magic, the SHA-256 of the rest, then for each source file
-//! its path in the crate, its line starts and its tree. (Not its name: the
-//! crate may be elsewhere now, and a file's name is the crate's directory
-//! and the path, as resolve::load makes it, which symbols::def_id relies
-//! on.)
+//! A file: the magic, the SHA-256 of the rest, the number of source files,
+//! then for each its path in the crate, how many nodes with an id it has,
+//! and its part (its line starts and its tree), written alone so that the
+//! files decode on several threads, each node id from the file's own range
+//! (the ids do not depend on the threads). (A file's name is not written:
+//! the crate may be elsewhere now, and a file's name is the crate's
+//! directory and the path, as resolve::load makes it, which symbols::def_id
+//! relies on.)
 
 use std::collections::HashMap;
 use crate::syntax::ast::*;
@@ -25,7 +28,7 @@ use crate::syntax::walk::{self, Visit};
 use crate::sha256;
 use crate::util;
 
-const MAGIC: &str = "navih1\n";
+const MAGIC: &str = "navih2\n";
 
 /// The writing of trees.
 pub struct Enc {
@@ -37,6 +40,8 @@ pub struct Enc {
     // the writing is inside one (everything in a body written is).
     keep: HashMap<u32, bool>,
     inside: u32,
+    // The node ids the decoding of the file gives.
+    ids: u32,
 }
 
 impl Enc {
@@ -81,6 +86,7 @@ impl Enc {
         while self.counts.len() <= kind { self.counts.push(0); }
         self.seen.insert(id, self.counts[kind]);
         self.counts[kind] += 1;
+        self.ids += 1;
     }
 
     /// A function's body: none (0), written (1) or left out (2, with where
@@ -102,6 +108,7 @@ impl Enc {
             return;
         }
         self.u(2);
+        self.ids += 1;
         let (lo, hi) = match &body.kind {
             ExprKind::Block(blk) => (blk.lbrace, blk.rbrace),
             _ => (body.pos(), body.pos()),
@@ -124,9 +131,19 @@ pub struct Dec {
     pub at: usize,
     pub bad: bool,
     pub seen: Seen,
+    // The next node id (the file's range).
+    next: u32,
+    end: u32,
 }
 
 impl Dec {
+    /// A node id.
+    pub fn id(&mut self) -> u32 {
+        if self.next >= self.end { self.bad = true; return self.end - 1; }
+        self.next += 1;
+        self.next - 1
+    }
+
     pub fn u(&mut self) -> u32 {
         let mut v = 0u32;
         let mut shift = 0u32;
@@ -205,7 +222,8 @@ impl Dec {
                 let lbrace = self.pos();
                 let rbrace = self.pos();
                 let blk = &mut Block { lbrace, rbrace, is_unsafe: false, stmts: Vec::new(), tail: None };
-                (Some(expr(ExprKind::Block(blk))), true)
+                let id = self.id();
+                (Some(&Expr { id, kind: ExprKind::Block(blk) }), true)
             }
         }
     }
@@ -300,11 +318,11 @@ pub fn encode_with(files: &HashMap<String, &SourceFile>, all: bool) -> Vec<u8> {
         keep_items(&sf.items, all, &mut keep);
     }
     paths.sort();
-    let e = &mut Enc { b: Vec::new(), seen: HashMap::new(), counts: Vec::new(), keep, inside: 0 };
-    e.u(paths.len() as u32);
+    let out = &mut Enc { b: Vec::new(), seen: HashMap::new(), counts: Vec::new(), keep: HashMap::new(), inside: 0, ids: 0 };
+    out.u(paths.len() as u32);
     for p in paths.iter() {
         let sf = files[p];
-        e.s_str(p.as_str());
+        let e = &mut Enc { b: Vec::new(), seen: HashMap::new(), counts: Vec::new(), keep, inside: 0, ids: 0 };
         let lines = sf.file.line_starts();
         e.u(lines.len() as u32);
         let mut prev = 0;
@@ -316,12 +334,16 @@ pub fn encode_with(files: &HashMap<String, &SourceFile>, all: bool) -> Vec<u8> {
         for a in sf.attrs.iter() { astcodec::enc_Attr(e, *a); }
         e.u(sf.items.len() as u32);
         for it in sf.items.iter() { astcodec::enc_Item(e, it); }
+        out.s_str(p.as_str());
+        out.u(e.ids);
+        out.u(e.b.len() as u32);
+        out.b.extend_from_slice(e.b.as_slice());
     }
-    let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(MAGIC.as_bytes());
-    out.extend_from_slice(&sha256::sum(e.b.as_slice()));
-    out.extend_from_slice(e.b.as_slice());
-    out
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(MAGIC.as_bytes());
+    data.extend_from_slice(&sha256::sum(out.b.as_slice()));
+    data.extend_from_slice(out.b.as_slice());
+    data
 }
 
 /// A crate's files again from its export data, the crate's directory dir
@@ -331,42 +353,77 @@ pub fn decode(data: Vec<u8>, dir: &str) -> Option<HashMap<String, &SourceFile>> 
     if data.len() < head || &data[0..MAGIC.len()] != MAGIC.as_bytes() { return None; }
     let body = data[head..].to_vec();
     if &sha256::sum(body.as_slice())[0..32] != &data[MAGIC.len()..head] { return None; }
-    let d = &mut Dec { b: body, at: 0, bad: false, seen: new_seen() };
-    let mut out: HashMap<String, &SourceFile> = HashMap::new();
-    let n = d.u();
+    // The files' parts and id ranges, then the parts decoded on several
+    // threads.
+    let d = &mut Dec { b: body, at: 0, bad: false, seen: new_seen(), next: 0, end: 0 };
+    let n = d.u() as usize;
+    let mut parts: Vec<(String, u32, usize, usize)> = Vec::new(); // (path, ids, from, to)
+    let mut total = 0u64;
     let mut k = 0;
     while k < n && !d.bad {
         let p = d.s();
-        let name = util::path_join(dir, p.as_str());
-        let nl = d.u() as usize;
-        let mut lines: Vec<Pos> = Vec::with_capacity(nl);
-        let mut prev = 0;
-        let mut i = 0;
-        while i < nl {
-            prev = prev + d.u() as Pos;
-            lines.push(prev);
-            i += 1;
-        }
-        let file = File::with_lines(name.as_str(), lines);
-        let na = d.u() as usize;
-        let mut attrs: Vec<&Attr> = Vec::with_capacity(na);
-        i = 0;
-        while i < na {
-            attrs.push(astcodec::dec_Attr(d));
-            i += 1;
-        }
-        let ni = d.u() as usize;
-        let mut items: Vec<Item> = Vec::with_capacity(ni);
-        i = 0;
-        while i < ni {
-            items.push(astcodec::dec_val_Item(d));
-            i += 1;
-        }
-        out.insert(p, &SourceFile { file, attrs, items });
+        let ids = d.u();
+        let len = d.u() as usize;
+        if len > d.b.len() - d.at { return None; }
+        parts.push((p, ids, d.at, d.at + len));
+        d.at += len;
+        total += ids as u64;
         k += 1;
     }
-    if d.bad || d.at != d.b.len() { return None; }
+    if d.bad || d.at != d.b.len() || total > 0x40000000 { return None; }
+    let base = next_id();
+    set_next_id(base + total as u32);
+    let mut bases: Vec<u32> = Vec::new();
+    let mut b = base;
+    for (_, ids, _, _) in parts.iter() {
+        bases.push(b);
+        b += *ids;
+    }
+    let mut outs: Vec<Option<&SourceFile>> = Vec::new();
+    for _ in parts.iter() { outs.push(None); }
+    let all = d.b;
+    crate::util::par_for(parts.len(), 1, |i| {
+        let (p, ids, from, to) = parts[i];
+        let fd = &mut Dec { b: all[from..to].to_vec(), at: 0, bad: false, seen: new_seen(), next: bases[i], end: bases[i] + ids };
+        if let Some(sf) = decode_file(fd, util::path_join(dir, p.as_str()).as_str()) { outs[i] = Some(sf); }
+    });
+    let mut out: HashMap<String, &SourceFile> = HashMap::new();
+    let mut i = 0;
+    while i < parts.len() {
+        match outs[i] { Some(sf) => { out.insert(parts[i].0.clone(), sf); } None => return None }
+        i += 1;
+    }
     Some(out)
+}
+
+// One file's part (see decode).
+fn decode_file(d: &mut Dec, name: &str) -> Option<&SourceFile> {
+    let nl = d.u() as usize;
+    let mut lines: Vec<Pos> = Vec::with_capacity(nl);
+    let mut prev = 0;
+    let mut i = 0;
+    while i < nl && !d.bad {
+        prev = prev + d.u() as Pos;
+        lines.push(prev);
+        i += 1;
+    }
+    let file = File::with_lines(name, lines);
+    let na = d.u() as usize;
+    let mut attrs: Vec<&Attr> = Vec::with_capacity(na);
+    i = 0;
+    while i < na && !d.bad {
+        attrs.push(astcodec::dec_Attr(d));
+        i += 1;
+    }
+    let ni = d.u() as usize;
+    let mut items: Vec<Item> = Vec::with_capacity(ni);
+    i = 0;
+    while i < ni && !d.bad {
+        items.push(astcodec::dec_val_Item(d));
+        i += 1;
+    }
+    if d.bad || d.at != d.b.len() || d.next != d.end { return None; }
+    Some(&SourceFile { file, attrs, items })
 }
 
 // The crates whose files come from their export data, by name (set before

@@ -9,7 +9,8 @@ Each struct and enum of ast.navi gets enc_X (writing it) and dec_X (making
 it again). Nodes with an id (expressions, types, patterns, paths, ...) are
 written once: a node met again (the parser shares a few) is written as a
 reference to the first, so the decoded tree shares it too. Ids are not
-written: decoding gives the nodes new ones. The few parts written by hand
+written: decoding gives the nodes new ones, from its own range (files are
+decoded on several threads). The few parts written by hand
 (a file's text, a function's body left out) are in navih.navi.
 """
 
@@ -179,7 +180,7 @@ class Gen:
         parts = []
         for f, t in fields:
             if f == "id" and t == "u32":
-                parts.append("id: new_id()")
+                parts.append("id: d.id()")
             else:
                 parts.append(f"{f}: {safe(f)}" if safe(f) != f else f)
         o.append(f"    let x = &mut {name} {{ {', '.join(parts)} }};")
