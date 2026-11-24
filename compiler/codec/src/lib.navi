@@ -1,0 +1,156 @@
+//! #[derive(Codec)]: the binary encoding of the compiler's AST
+//! (compiler/src/syntax/ast.navi) for a crate's export data
+//! (compiler/src/navih.navi), as serde's derives: the impl of the trait
+//! crate::syntax::astcodec::Codec writes and reads each field through the
+//! field type's own Codec (scalars, Option, Vec and references are
+//! implemented there by hand).
+//!
+//! A node with an id field marked #[codec(kind = n)] (expressions, types,
+//! paths, ...; n numbers the kinds) is written once: one met again (the parser shares a few) is written as
+//! a reference to the first, so the decoded tree shares it too; its
+//! codec_dec_ref keeps the decoded ones in Dec's seen.n_<snake name> and
+//! gives them new ids. A function's body (#[codec(fn_body)], with
+//! #[codec(skip)] on elided, which says whether it was left out) is written
+//! by hand (navih.navi).
+
+use std::derive::{TypeInfo, Code, Error, FromAttrs, Variant, Kind};
+
+#[derive(FromAttrs)]
+struct TypeAttr {
+    kind: Option<i64>,
+}
+
+#[derive(FromAttrs)]
+struct FieldAttr {
+    skip: bool,
+    fn_body: bool,
+}
+
+const C: &str = "crate::syntax::astcodec::Codec";
+const E: &str = "crate::navih::Enc";
+const D: &str = "crate::navih::Dec";
+
+#[derive_macro(Codec, attrs = [codec])]
+pub fn codec(t: &TypeInfo) -> Result<Code, Error> {
+    let name = t.name().to_string();
+    let ta: TypeAttr = t.parse_attrs("codec")?;
+    let src = if t.is_enum() { enum_codec(t, name.as_str())? } else { struct_codec(t, name.as_str(), ta.kind)? };
+    Ok(Code::from_text(src.as_str()))
+}
+
+// n_ and the name in snake case: Dec's list of the nodes of a kind.
+fn seen_list(name: &str) -> String {
+    let mut s = "n_".to_string();
+    let mut first = true;
+    for c in name.chars() {
+        if c.is_uppercase() && !first { s.push('_'); }
+        s.push_str(c.to_lowercase().to_string().as_str());
+        first = false;
+    }
+    s
+}
+
+fn struct_codec(t: &TypeInfo, name: &str, kind: Option<i64>) -> Result<String, Error> {
+    let fields = t.fields();
+    // #[codec(kind = n)]: a node with an id, written once.
+    let has_id = kind.is_some();
+    if has_id {
+        let mut found = false;
+        for f in fields.iter() { if f.ident().as_str() == "id" { found = true; } }
+        if !found { return Err(Error::at(t, "#[codec(kind = n)] is for a node with an id field")); }
+    }
+    let mut en = String::new();
+    let mut de = String::new();
+    let mut inits: Vec<String> = Vec::new();
+    for f in fields.iter() {
+        let fname = f.ident().to_string();
+        if fname == "id" && has_id {
+            inits.push("id: d.id()".to_string());
+            continue;
+        }
+        let fa: FieldAttr = f.parse_attrs("codec")?;
+        inits.push(`${fname}: f_${fname}`.to_string());
+        if fa.skip { continue; }
+        if fa.fn_body {
+            en.push_str("e.fn_body(self); ");
+            de.push_str(`let (f_${fname}, f_elided) = d.fn_body(); `.to_string().as_str());
+            continue;
+        }
+        en.push_str(`${C}::codec_enc(&self.${fname}, e); `.to_string().as_str());
+        de.push_str(`let f_${fname} = <${f.ty().text()} as ${C}>::codec_dec(d); `.to_string().as_str());
+    }
+    let make = `let x = &mut ${name} { ${inits.join(", ")} };`.to_string();
+    if !has_id {
+        return Ok(`impl ${C} for ${name} {
+    fn codec_enc(&self, e: &mut ${E}) { ${en}}
+    fn codec_dec(d: &mut ${D}) -> ${name} { ${de}${make} *x }
+}`.to_string());
+    }
+    let list = seen_list(name);
+    Ok(`impl ${C} for ${name} {
+    fn codec_enc(&self, e: &mut ${E}) {
+        if e.again(self.id) { return; }
+        ${en}e.done(self.id, ${kind.unwrap()});
+    }
+    fn codec_dec(d: &mut ${D}) -> ${name} { *<${name} as ${C}>::codec_dec_ref(d) }
+    fn codec_dec_ref(d: &mut ${D}) -> &mut ${name} {
+        if let Some(i) = d.again() { return d.seen.${list}[i]; }
+        ${de}${make}
+        d.seen.${list}.push(x);
+        x
+    }
+}`.to_string())
+}
+
+// The names a variant's fields are bound to.
+fn bound(v: &Variant) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in v.fields().iter() {
+        match f.name() {
+            Some(n) => out.push(n.to_string()),
+            None => out.push(`a${f.index()}`.to_string()),
+        }
+    }
+    out
+}
+
+fn enum_codec(t: &TypeInfo, name: &str) -> Result<String, Error> {
+    let mut en = String::new();
+    let mut de = String::new();
+    for v in t.variants().iter() {
+        let i = v.index();
+        let vn = v.name().to_string();
+        let names = bound(v);
+        let mut body = String::new();
+        let mut lets = String::new();
+        let mut k = 0;
+        while k < names.len() {
+            // (Bound by reference: self is a &.)
+            body.push_str(`${C}::codec_enc(${names[k]}, e); `.to_string().as_str());
+            lets.push_str(`let f_${names[k]} = <${v.fields()[k].ty().text()} as ${C}>::codec_dec(d); `.to_string().as_str());
+            k += 1;
+        }
+        match v.kind() {
+            Kind::Unit => {
+                en.push_str(`${name}::${vn} => e.u(${i}), `.to_string().as_str());
+                de.push_str(`${i} => ${name}::${vn}, `.to_string().as_str());
+            }
+            Kind::Tuple => {
+                let fs: Vec<String> = names.iter().map(|n| `f_${n}`.to_string()).collect();
+                en.push_str(`${name}::${vn}(${names.join(", ")}) => { e.u(${i}); ${body}} `.to_string().as_str());
+                de.push_str(`${i} => { ${lets}${name}::${vn}(${fs.join(", ")}) } `.to_string().as_str());
+            }
+            Kind::Named => {
+                let inits: Vec<String> = names.iter().map(|n| `${n}: f_${n}`.to_string()).collect();
+                en.push_str(`${name}::${vn} { ${names.join(", ")} } => { e.u(${i}); ${body}} `.to_string().as_str());
+                de.push_str(`${i} => { ${lets}${name}::${vn} { ${inits.join(", ")} } } `.to_string().as_str());
+            }
+        }
+    }
+    // (Export data is checked against its hash before decoding: a bad tag
+    // is a bug.)
+    Ok(`impl ${C} for ${name} {
+    fn codec_enc(&self, e: &mut ${E}) { match self { ${en}} }
+    fn codec_dec(d: &mut ${D}) -> ${name} { match d.u() { ${de}_ => panic("navih: bad export data"), } }
+}`.to_string())
+}

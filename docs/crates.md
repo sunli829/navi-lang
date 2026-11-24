@@ -89,7 +89,7 @@
 - git 依赖的版本（tag 或锁定的提交）体现在检出的源文件内容里，不用单独进键。
 - crate 一律带调试信息编译；构建不要调试信息（`-s`）时，合并前去掉它的行表。所以键里没有这一项。
 
-**导出数据（第 4 步第一版）**：存的是 crate 各个文件的语法树，编解码器由 `tools/gen_astcodec.py` 从 `ast.navi` 生成，写到 `syntax/astcodec.navi`。
+**导出数据（第 4 步第一版）**：存的是 crate 各个文件的语法树，编解码器由派生宏 `#[derive(Codec)]`（`compiler/codec`，docs/derive.md）从 `ast.navi` 的各个类型生成（原来是 `tools/gen_astcodec.py` 生成的 `syntax/astcodec.navi`，编码不变）。
 
 - **去掉的函数体**：下游不会编译的函数体，换成空块并标上 `elided`。
 - **保留的函数体**：

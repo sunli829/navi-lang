@@ -98,7 +98,7 @@ t.impl_for("std::clone::Clone", body)
   - `t.each_construct(|b| ...)`：生成构造同一变体的表达式（`Clone` 这类）。
   - 两个值一起比较时（`PartialEq`、`Ord`），`t.each_pair(other, |a, b| ..., differ)` 同时解构两边，变体不同时是 `differ`。
 - **impl 头**：`t.impl_for("path::Trait", items)` 生成 `impl<...> path::Trait for Type<...> where ...`，类型参数自动加上这个 trait 的约束（同 Rust 的 derive）；`impl_for_with(trait, bound, items)` 给类型参数加的是 `bound`（空代码就不加）。
-- **属性解析**：`#[derive(FromAttrs)]` 描述一个属性的形状（具名字段的结构体：`Option<T>` 是可选的 `key = value`，`bool` 是标志，其余必填），`f.parse_attrs::<T>("json")`（字段、变体、类型都有）把所有 `#[json(...)]` 的参数解析成它；未知的键、重复的键、缺少的键、值的类型不对都自动报错，位置在属性上。值可以是 `String`、`bool`、`i64`、`i32`、`usize`，或 `std::derive::Raw`（路径等，照写的文本）。`FromAttrs` 本身是内置派生。
+- **属性解析**：`#[derive(FromAttrs)]` 描述一个属性的形状（具名字段的结构体，每个字段按它的类型的 `FromAttrValue` 取同名的键，同 darling 的 `FromMeta`：`from_value` 是 `key = value`，`from_word` 是只写了键（`bool` 是 true），`from_missing` 是没写（`Option` 是 None，`bool` 是 false，其余报缺少）；派生不看类型的名字），`f.parse_attrs::<T>("json")`（字段、变体、类型都有）把所有 `#[json(...)]` 的参数解析成它；未知的键、重复的键、缺少的键、值的类型不对都自动报错，位置在属性上。值可以是 `String`、`bool`、`i64`、`i32`、`usize`，或 `std::derive::Raw`（路径等，照写的文本）。`FromAttrs` 本身是内置派生。
 - **查看展开结果**：`navi expand [-p 名字] [目录或文件] [类型]` 打印 crate（或其中某个类型）的派生展开后的代码（格式化后），相当于 `cargo expand`；内置派生的也打印。
 - **测试**：宏可以在普通的 `#[test]` 里调用：`TypeInfo::of::<T>()` 由编译器内建函数（`type_info`）在编译期构造，`code.text()` 是生成的文本，用来比较（`tests/run/derive_api.navi`）。
 
@@ -195,4 +195,4 @@ t.impl_for("std::clone::Clone", body)
 5. **去掉运行期反射**：删除 `std::reflect` 和相关辅助，`type_name` 改内建，类型描述瘦身，spec 更新。
 6. **用户的派生宏**：`#[derive_macro]`、派生命名空间的名字解析、宏程序的编译和调用、属性命名空间的检查和报错，`FromAttrs`，`navi expand`，`TypeInfo::of`。（已完成，2026-11-24：`std::derive`、`quote` 标签模板、`resolve/expand.navi`、`navi derive-build`、`navi expand`；测试是 `tests/derive`（宏 crate、用它的程序、报错）、`tests/run/derive_api.navi`、`tests/ui/quote.navi`）
 7. **缓存和导出数据**：展开结果的缓存键、存进 `.navih`；**LSP**：跳转、悬停显示展开结果、错误位置。（已完成，2026-11-24：回答按请求缓存，不存进 `.navih`，理由见“缓存”）
-8. **用例**：`compiler/src/syntax/astcodec.navi` 改成派生，去掉 `tools/gen_astcodec.py`。
+8. **用例**：`compiler/src/syntax/astcodec.navi` 改成派生，去掉 `tools/gen_astcodec.py`。（已完成：编译器依赖宏 crate `compiler/codec`，ast.navi 的 45 个类型 `#[derive(Codec)]`；写出的 `.navih` 和原来逐字节相同，解码一样快。要求自举用的发布版有派生宏：tools/bootstrap-version 为 v0.0.4）
