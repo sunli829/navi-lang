@@ -2,14 +2,12 @@
 //! makes, for structs (named, tuple, newtype, unit) and enums (externally
 //! tagged: "Variant" or {"Variant": content}), with the #[serde(...)]
 //! attributes rename, rename_all, skip, skip_serializing,
-//! skip_deserializing, default, skip_serializing_if and
-//! deny_unknown_fields. The helper types of Deserialize (field and variant
-//! identifiers, visitors) go next to the type, named __Type_...
+//! skip_deserializing, default (or default = "path"), skip_serializing_if
+//! and deny_unknown_fields. The helper types of Deserialize (field and
+//! variant identifiers, visitors) go next to the type, named __Type_...
 
-use crate::syntax::ast::*;
-use crate::syntax::print;
-use crate::syntax::token;
-use crate::derive::{Target, Case, cases, is_enum, field_name, binding, pattern};
+use std::derive::{TypeInfo, Code, Error, Variant, Kind, FromAttrs, FromAttrValue, AttrValue, quote};
+use crate::derive::c;
 
 const SER: &str = "std::serde::ser";
 const DE: &str = "std::serde::de";
@@ -17,51 +15,53 @@ const DE: &str = "std::serde::de";
 // --- Attributes --------------------------------------------------------------------
 
 // The #[serde(...)] settings of an item, field or variant.
+#[derive(FromAttrs)]
 struct Attrs {
-    rename: String,
-    rename_all: String,
-    skip_ser: bool,
-    skip_de: bool,
-    default: bool,
-    default_path: String,
-    skip_if: String,
-    deny_unknown: bool,
+    rename: Option<String>,
+    rename_all: Option<String>,
+    skip: bool,
+    skip_serializing: bool,
+    skip_deserializing: bool,
+    default: Option<DefaultTo>,
+    skip_serializing_if: Option<String>,
+    deny_unknown_fields: bool,
 }
 
-fn attrs(list: &Vec<&Attr>) -> Attrs {
-    let a = &mut Attrs { rename: String::new(), rename_all: String::new(), skip_ser: false, skip_de: false, default: false,
-        default_path: String::new(), skip_if: String::new(), deny_unknown: false };
-    for at in list.iter() {
-        if at.path.segments.len() != 1 || at.path.segments[0].name.value != "serde" { continue; }
-        let toks = &at.args;
-        let mut i = 0;
-        while i < toks.len() {
-            if toks[i].kind != token::IDENT { i += 1; continue; }
-            let key = toks[i].text;
-            let mut val = String::new();
-            if i + 2 < toks.len() && toks[i + 1].kind == token::EQ {
-                val = unquote(toks[i + 2].text);
-                i += 2;
-            }
-            match key {
-                "rename" => a.rename = val,
-                "rename_all" => a.rename_all = val,
-                "skip" => { a.skip_ser = true; a.skip_de = true; }
-                "skip_serializing" => a.skip_ser = true,
-                "skip_deserializing" => a.skip_de = true,
-                "default" => { a.default = true; a.default_path = val; }
-                "skip_serializing_if" => a.skip_if = val,
-                "deny_unknown_fields" => a.deny_unknown = true,
-                _ => {}
-            }
-            i += 1;
+// #[serde(default)] (the type's Default) or default = "path" (a function).
+struct DefaultTo {
+    path: String,
+}
+
+impl FromAttrValue for DefaultTo {
+    fn from_value(v: &AttrValue) -> Option<DefaultTo> {
+        match v {
+            AttrValue::Str(s, _) => Some(DefaultTo { path: s.clone() }),
+            _ => None,
         }
     }
-    *a
+    fn from_word() -> Option<DefaultTo> { Some(DefaultTo { path: String::new() }) }
+    fn expected() -> &str { "a function's path as a string" }
 }
 
-fn unquote(s: &str) -> String {
-    if s.len() >= 2 && s.starts_with("\"") && s.ends_with("\"") { s[1..s.len() - 1].to_string() } else { s.to_string() }
+impl Attrs {
+    fn skip_ser(&self) -> bool { self.skip || self.skip_serializing }
+
+    fn skip_de(&self) -> bool { self.skip || self.skip_deserializing }
+
+    fn rule(&self) -> String {
+        match &self.rename_all {
+            Some(r) => r.clone(),
+            None => String::new(),
+        }
+    }
+}
+
+// A field's default (#[serde(default)] or default = "path").
+fn default_of(a: &Attrs) -> Code {
+    match &a.default {
+        Some(d) => if d.path.len() > 0 { c(`${d.path}()`.to_string().as_str()) } else { c("std::default::Default::default()") },
+        None => c("std::default::Default::default()"),
+    }
 }
 
 // A name as rename_all says (serde's casing rules: fields are written in
@@ -115,373 +115,383 @@ fn renamed(name: &str, rule: &str, variant: bool) -> String {
 
 // What a field or variant is called in the data.
 fn data_name(name: &str, own: &Attrs, rule: &str, variant: bool) -> String {
-    if own.rename.len() > 0 { own.rename.clone() } else { renamed(name, rule, variant) }
-}
-
-fn item_attrs(t: &Target) -> Attrs {
-    match &t.it {
-        Item::Struct(s) => attrs(&s.base.attrs),
-        Item::Enum(e) => attrs(&e.base.attrs),
-        _ => attrs(&Vec::new()),
+    match &own.rename {
+        Some(r) => r.clone(),
+        None => renamed(name, rule, variant),
     }
 }
 
-fn variant_attrs(t: &Target, i: usize) -> Attrs {
-    match &t.it {
-        Item::Enum(e) => attrs(&e.variants[i].attrs),
-        _ => attrs(&Vec::new()),
-    }
-}
-
-fn q(s: &str) -> String { print::quote_str(s) }
+// A number as written (no suffix: its type is inferred).
+fn num(n: usize) -> Code { c(`${n}`.to_string().as_str()) }
 
 // &["a", "b"] of the names.
-fn name_list(names: &Vec<String>) -> String {
-    let mut b = "&[".to_string();
+fn name_list(names: &Vec<String>) -> Code {
+    let mut parts: Vec<Code> = Vec::new();
     let mut i = 0;
     while i < names.len() {
-        if i > 0 { b.push_str(", "); }
-        b.push_str(q(names[i].as_str()).as_str());
+        let n = names[i].clone();
+        if i > 0 { parts.push(c(",")); }
+        parts.push(quote`${n}`);
         i += 1;
     }
-    b.push(']');
-    b
+    quote`&[${parts}]`
 }
 
 // --- Serialize ---------------------------------------------------------------------
 
-pub fn serialize(t: &Target) -> String {
-    let ia = item_attrs(t);
-    let tname = q(t.name.as_str());
-    let body = if !is_enum(t) {
-        let c = &cases(t)[0];
-        ser_fields(c, &ia, tname.as_str(), "self.", "", -1)
-    } else {
-        let mut b = "match *self { ".to_string();
-        let cs = cases(t);
-        let mut vi = 0;
-        while vi < cs.len() {
-            let c = &cs[vi];
-            let va = variant_attrs(t, vi);
-            let vname = q(data_name(c.name.as_str(), &va, ia.rename_all.as_str(), true).as_str());
-            b.push_str(`${pattern(c.path.as_str(), &c.kind, &c.fields)} => { `.to_string().as_str());
-            b.push_str(ser_fields(c, &ia, tname.as_str(), "", vname.as_str(), vi as i64).as_str());
-            b.push_str(" } ");
-            vi += 1;
-        }
-        b.push('}');
-        b
-    };
-    let head = t.header(`${SER}::Serialize`.to_string().as_str());
-    `${head} { fn serialize<__S: ${SER}::Serializer>(&self, __serializer: __S) -> std::result::Result<__S::Ok, __S::Error> { ${body} } }\n`.to_string()
+pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
+    let ia: Attrs = t.parse_attrs("serde")?;
+    let body = t.each_variant(|v| ser_fields(t, v, &ia))?;
+    let ser = c(SER);
+    let items = quote`fn serialize<__S: ${ser}::Serializer>(&self, __serializer: __S) -> std::result::Result<__S::Ok, __S::Error> { ${body} }`;
+    Ok(t.impl_for(`${SER}::Serialize`.to_string().as_str(), items))
 }
 
-// The serialization of a struct's or variant's fields: self.x (prefix
-// "self.") or the bindings __0, __1 ... (prefix ""); vi >= 0 for a variant.
-fn ser_fields(c: &Case, ia: &Attrs, tname: &str, prefix: &str, vname: &str, vi: i64) -> String {
-    let fx = |i: usize| -> String { if prefix.len() > 0 { `${prefix}${field_name(c.fields[i], i)}`.to_string() } else { binding(i) } };
-    let variant = vi >= 0;
-    match c.kind {
-        StructKind::Unit => {
-            if variant { `__serializer.serialize_unit_variant(${tname}, ${vi}, ${vname})`.to_string() } else { `__serializer.serialize_unit_struct(${tname})`.to_string() }
-        }
-        StructKind::Tuple => {
-            if c.fields.len() == 1 {
-                let x = fx(0);
-                return if variant { `__serializer.serialize_newtype_variant(${tname}, ${vi}, ${vname}, &${x})`.to_string() } else { `__serializer.serialize_newtype_struct(${tname}, &${x})`.to_string() };
+// The serialization of a struct's or variant's fields (its bindings).
+fn ser_fields(t: &TypeInfo, v: &Variant, ia: &Attrs) -> Result<Code, Error> {
+    let ser = c(SER);
+    let tname = t.name().to_string();
+    let variant = t.is_enum();
+    let vi = num(v.index());
+    let va: Attrs = v.parse_attrs("serde")?;
+    let vname = data_name(v.name().to_string().as_str(), &va, ia.rule().as_str(), true);
+    let bs = v.bindings();
+    Ok(match v.kind() {
+        Kind::Unit => if variant { quote`__serializer.serialize_unit_variant(${tname}, ${vi}, ${vname})` } else { quote`__serializer.serialize_unit_struct(${tname})` },
+        Kind::Tuple => {
+            if bs.len() == 1 {
+                let x = &bs[0];
+                return Ok(if variant { quote`__serializer.serialize_newtype_variant(${tname}, ${vi}, ${vname}, &${x})` } else { quote`__serializer.serialize_newtype_struct(${tname}, &${x})` });
             }
+            let n = num(bs.len());
             let (open, tr) = if variant {
-                (`__serializer.serialize_tuple_variant(${tname}, ${vi}, ${vname}, ${c.fields.len()})`.to_string(), "SerializeTupleVariant")
+                (quote`__serializer.serialize_tuple_variant(${tname}, ${vi}, ${vname}, ${n})`, c("SerializeTupleVariant"))
             } else {
-                (`__serializer.serialize_tuple_struct(${tname}, ${c.fields.len()})`.to_string(), "SerializeTupleStruct")
+                (quote`__serializer.serialize_tuple_struct(${tname}, ${n})`, c("SerializeTupleStruct"))
             };
-            let mut b = `let mut __st = ${open}?; `.to_string();
-            let mut i = 0;
-            while i < c.fields.len() {
-                b.push_str(`${SER}::${tr}::serialize_field(&mut __st, &${fx(i)})?; `.to_string().as_str());
-                i += 1;
-            }
-            b.push_str(`${SER}::${tr}::end(__st)`.to_string().as_str());
-            b
+            let mut fields: Vec<Code> = Vec::new();
+            for b in bs.iter() { fields.push(quote`${ser}::${tr}::serialize_field(&mut __st, &${b})?;`); }
+            quote`let mut __st = ${open}?; ${fields} ${ser}::${tr}::end(__st)`
         }
-        StructKind::Named => {
-            let mut n = 0;
-            for f in c.fields.iter() { if !attrs(&f.attrs).skip_ser { n += 1; } }
+        Kind::Named => {
+            let mut count = 0;
+            for b in bs.iter() {
+                let fa: Attrs = b.field().parse_attrs("serde")?;
+                if !fa.skip_ser() { count += 1; }
+            }
+            let n = num(count);
             let (open, tr) = if variant {
-                (`__serializer.serialize_struct_variant(${tname}, ${vi}, ${vname}, ${n})`.to_string(), "SerializeStructVariant")
+                (quote`__serializer.serialize_struct_variant(${tname}, ${vi}, ${vname}, ${n})`, c("SerializeStructVariant"))
             } else {
-                (`__serializer.serialize_struct(${tname}, ${n})`.to_string(), "SerializeStruct")
+                (quote`__serializer.serialize_struct(${tname}, ${n})`, c("SerializeStruct"))
             };
-            let mut b = `let mut __st = ${open}?; `.to_string();
-            let mut i = 0;
-            while i < c.fields.len() {
-                let fa = attrs(&c.fields[i].attrs);
-                if fa.skip_ser { i += 1; continue; }
-                let key = q(data_name(field_name(c.fields[i], i).as_str(), &fa, ia.rename_all.as_str(), false).as_str());
-                let field = `${SER}::${tr}::serialize_field(&mut __st, ${key}, &${fx(i)})?;`.to_string();
-                if fa.skip_if.len() > 0 {
-                    b.push_str(`if ${fa.skip_if}(&${fx(i)}) { ${SER}::${tr}::skip_field(&mut __st, ${key})?; } else { ${field} } `.to_string().as_str());
-                } else {
-                    b.push_str(field.as_str());
-                    b.push(' ');
+            let mut fields: Vec<Code> = Vec::new();
+            for b in bs.iter() {
+                let fa: Attrs = b.field().parse_attrs("serde")?;
+                if fa.skip_ser() { continue; }
+                let key = data_name(b.field().ident().to_string().as_str(), &fa, ia.rule().as_str(), false);
+                let field = quote`${ser}::${tr}::serialize_field(&mut __st, ${key}, &${b})?;`;
+                match &fa.skip_serializing_if {
+                    Some(p) => {
+                        let skip = c(p.as_str());
+                        fields.push(quote`if ${skip}(&${b}) { ${ser}::${tr}::skip_field(&mut __st, ${key})?; } else { ${field} }`);
+                    }
+                    None => fields.push(field),
                 }
-                i += 1;
             }
-            b.push_str(`${SER}::${tr}::end(__st)`.to_string().as_str());
-            b
+            quote`let mut __st = ${open}?; ${fields} ${ser}::${tr}::end(__st)`
         }
-    }
+    })
 }
 
 // --- Deserialize -------------------------------------------------------------------
 
-pub fn deserialize(t: &Target) -> String {
-    let ia = item_attrs(t);
-    let mut out = String::new();
-    let vis = `__${t.name}_Visitor`.to_string();
-    out.push_str(visitor_struct(t, vis.as_str()).as_str());
-    let tname = q(t.name.as_str());
-    let call = if !is_enum(t) {
-        let c = &cases(t)[0];
-        out.push_str(struct_visitor(t, c, &ia, vis.as_str(), "", c.path.as_str()).as_str());
-        match c.kind {
-            StructKind::Unit => `__deserializer.deserialize_unit_struct(${tname}, ${vis}${marker(t)})`.to_string(),
-            StructKind::Tuple => {
-                if c.fields.len() == 1 { `__deserializer.deserialize_newtype_struct(${tname}, ${vis}${marker(t)})`.to_string() } else { `__deserializer.deserialize_tuple_struct(${tname}, ${c.fields.len()}, ${vis}${marker(t)})`.to_string() }
+pub fn deserialize(t: &TypeInfo) -> Result<Code, Error> {
+    let de = c(DE);
+    let ia: Attrs = t.parse_attrs("serde")?;
+    let mut out = Code::new();
+    let vis = c(`__${t.name()}_Visitor`.to_string().as_str());
+    out.push(&visitor_struct(t, &vis));
+    let tname = t.name().to_string();
+    let mk = marker();
+    let call = if !t.is_enum() {
+        let v = &t.variants()[0];
+        out.push(&struct_visitor(t, v, &ia, &vis, "")?);
+        match v.kind() {
+            Kind::Unit => quote`__deserializer.deserialize_unit_struct(${tname}, ${vis}${mk})`,
+            Kind::Tuple => {
+                if v.fields().len() == 1 {
+                    quote`__deserializer.deserialize_newtype_struct(${tname}, ${vis}${mk})`
+                } else {
+                    let n = num(v.fields().len());
+                    quote`__deserializer.deserialize_tuple_struct(${tname}, ${n}, ${vis}${mk})`
+                }
             }
-            StructKind::Named => `__deserializer.deserialize_struct(${tname}, ${name_list(&field_names(c, &ia))}, ${vis}${marker(t)})`.to_string(),
+            Kind::Named => {
+                let list = name_list(&field_names(v, &ia)?);
+                quote`__deserializer.deserialize_struct(${tname}, ${list}, ${vis}${mk})`
+            }
         }
     } else {
-        out.push_str(enum_visitor(t, &ia, vis.as_str()).as_str());
-        `__deserializer.deserialize_enum(${tname}, ${name_list(&variant_names(t, &ia))}, ${vis}${marker(t)})`.to_string()
+        out.push(&enum_visitor(t, &ia, &vis)?);
+        let list = name_list(&variant_names(t, &ia)?);
+        quote`__deserializer.deserialize_enum(${tname}, ${list}, ${vis}${mk})`
     };
-    let head = t.header(`${DE}::Deserialize`.to_string().as_str());
-    out.push_str(`${head} { fn deserialize<__D: ${DE}::Deserializer>(__deserializer: __D) -> std::result::Result<Self, __D::Error> { ${call} } }\n`.to_string().as_str());
-    out
+    let items = quote`fn deserialize<__D: ${de}::Deserializer>(__deserializer: __D) -> std::result::Result<Self, __D::Error> { ${call} }`;
+    out.push(&t.impl_for(`${DE}::Deserialize`.to_string().as_str(), items));
+    Ok(out)
 }
 
 // struct Name<P...> { marker: PhantomData<Type<P...>> } (Name: a visitor).
-fn visitor_struct(t: &Target, name: &str) -> String {
-    `struct ${name}${t.params()} { marker: std::marker::PhantomData<${t.self_type()}> }\n`.to_string()
+fn visitor_struct(t: &TypeInfo, name: &Code) -> Code {
+    let ps = t.params();
+    let st = t.self_type();
+    quote`struct ${name}${ps} { marker: std::marker::PhantomData<${st}> }`
 }
 
-// The construction of a visitor of the type's parameters.
-fn marker(t: &Target) -> String { " { marker: std::marker::PhantomData }".to_string() }
+// The construction of a visitor.
+fn marker() -> Code { quote` { marker: std::marker::PhantomData }` }
 
-fn field_names(c: &Case, ia: &Attrs) -> Vec<String> {
+// The visitor's impl (of Visitor, its value the type).
+fn visitor_impl(t: &TypeInfo, vis: &Code, items: Code) -> Code {
+    let ps = t.params();
+    let self_ty = quote`${vis}${ps}`;
+    let bound = c(`${DE}::Deserialize`.to_string().as_str());
+    t.impl_for_type(`${DE}::Visitor`.to_string().as_str(), bound, self_ty, items)
+}
+
+fn field_names(v: &Variant, ia: &Attrs) -> Result<Vec<String>, Error> {
     let mut out: Vec<String> = Vec::new();
+    for f in v.fields().iter() {
+        let fa: Attrs = f.parse_attrs("serde")?;
+        if !fa.skip_de() { out.push(data_name(f.ident().to_string().as_str(), &fa, ia.rule().as_str(), false)); }
+    }
+    Ok(out)
+}
+
+fn variant_names(t: &TypeInfo, ia: &Attrs) -> Result<Vec<String>, Error> {
+    let mut out: Vec<String> = Vec::new();
+    for v in t.variants().iter() {
+        let va: Attrs = v.parse_attrs("serde")?;
+        out.push(data_name(v.name().to_string().as_str(), &va, ia.rule().as_str(), true));
+    }
+    Ok(out)
+}
+
+// The local each field is read into.
+fn local(i: usize) -> Code { c(`__${i}`.to_string().as_str()) }
+
+// The struct or variant v built from the locals.
+fn made(v: &Variant) -> Code {
+    let mut vals: Vec<Code> = Vec::new();
     let mut i = 0;
-    while i < c.fields.len() {
-        let fa = attrs(&c.fields[i].attrs);
-        if !fa.skip_de { out.push(data_name(field_name(c.fields[i], i).as_str(), &fa, ia.rename_all.as_str(), false)); }
+    while i < v.fields().len() {
+        vals.push(local(i));
         i += 1;
     }
-    out
+    v.construct(&vals)
 }
 
-fn variant_names(t: &Target, ia: &Attrs) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let cs = cases(t);
-    let mut i = 0;
-    while i < cs.len() {
-        out.push(data_name(cs[i].name.as_str(), &variant_attrs(t, i), ia.rename_all.as_str(), true));
-        i += 1;
-    }
-    out
-}
-
-// A visitor (struct vis, already declared) building a struct or a variant
-// (built by path) from a sequence or a map; for a named struct also its
-// field identifier __Type_Field (prefix: the variant's name, for a struct
-// variant's).
-fn struct_visitor(t: &Target, c: &Case, ia: &Attrs, vis: &str, prefix: &str, path: &str) -> String {
-    let mut out = String::new();
+// A visitor (struct vis, declared already) building a struct or a variant
+// from a sequence or a map; for named fields also their identifier
+// __Type_Field (prefix: the variant's name and _, for a struct variant's).
+fn struct_visitor(t: &TypeInfo, v: &Variant, ia: &Attrs, vis: &Code, prefix: &str) -> Result<Code, Error> {
+    let de = c(DE);
+    let mut out = Code::new();
     let value = t.self_type();
-    let what = if prefix.len() > 0 { q(`struct variant ${t.name}::${c.name}`.to_string().as_str()) } else { q(`${if c.kind == StructKind::Unit { "unit struct" } else if c.kind == StructKind::Tuple { "tuple struct" } else { "struct" }} ${t.name}`.to_string().as_str()) };
-    let mut methods = `fn expecting(&self, __f: &mut std::fmt::Formatter) -> std::fmt::Result { __f.write_str(${what}) } `.to_string();
+    let what = if prefix.len() > 0 {
+        `struct variant ${t.name()}::${v.name()}`.to_string()
+    } else {
+        `${if v.kind() == Kind::Unit { "unit struct" } else if v.kind() == Kind::Tuple { "tuple struct" } else { "struct" }} ${t.name()}`.to_string()
+    };
+    let mut methods = quote`fn expecting(&self, __f: &mut std::fmt::Formatter) -> std::fmt::Result { __f.write_str(${what}) }`;
     // From a sequence: the fields in order (skipped ones from their
     // defaults).
-    let mut seq = String::new();
+    let mut seq: Vec<Code> = Vec::new();
     let mut k = 0;
     let mut i = 0;
-    while i < c.fields.len() {
-        let fa = attrs(&c.fields[i].attrs);
-        let ty = print::ty(c.fields[i].ty);
-        if fa.skip_de {
-            seq.push_str(`let ${binding(i)}: ${ty} = ${default_of(&fa)}; `.to_string().as_str());
+    for f in v.fields().iter() {
+        let fa: Attrs = f.parse_attrs("serde")?;
+        let ty = f.ty();
+        let x = local(i);
+        if fa.skip_de() {
+            let d = default_of(&fa);
+            seq.push(quote`let ${x}: ${ty} = ${d};`);
         } else {
-            seq.push_str(`let ${binding(i)}: ${ty} = match ${DE}::SeqAccess::next_element::<${ty}>(&mut __seq)? { std::option::Option::Some(__v) => __v, std::option::Option::None => return std::result::Result::Err(<__A::Error as ${DE}::Error>::invalid_length(${k}, &self)), }; `.to_string().as_str());
+            let kn = num(k);
+            seq.push(quote`let ${x}: ${ty} = match ${de}::SeqAccess::next_element::<${ty}>(&mut __seq)? { std::option::Option::Some(__v) => __v, std::option::Option::None => return std::result::Result::Err(<__A::Error as ${de}::Error>::invalid_length(${kn}, &self)), };`);
             k += 1;
         }
         i += 1;
     }
-    let made = construct_from_bindings(path, &c.kind, &c.fields);
-    match c.kind {
-        StructKind::Unit => {
-            methods.push_str(`fn visit_unit<__E: ${DE}::Error>(self) -> std::result::Result<${value}, __E> { std::result::Result::Ok(${made}) } `.to_string().as_str());
+    let mv = made(v);
+    match v.kind() {
+        Kind::Unit => {
+            methods.push(&quote`fn visit_unit<__E: ${de}::Error>(self) -> std::result::Result<${value}, __E> { std::result::Result::Ok(${mv}) }`);
         }
-        StructKind::Tuple => {
-            if c.fields.len() == 1 && prefix.len() == 0 {
-                let ty = print::ty(c.fields[0].ty);
-                methods.push_str(`fn visit_newtype_struct<__E2: ${DE}::Deserializer>(self, __e: __E2) -> std::result::Result<${value}, __E2::Error> { let ${binding(0)}: ${ty} = <${ty} as ${DE}::Deserialize>::deserialize(__e)?; std::result::Result::Ok(${made}) } `.to_string().as_str());
+        Kind::Tuple => {
+            if v.fields().len() == 1 && prefix.len() == 0 {
+                let ty = v.fields()[0].ty();
+                let x = local(0);
+                methods.push(&quote`fn visit_newtype_struct<__E2: ${de}::Deserializer>(self, __e: __E2) -> std::result::Result<${value}, __E2::Error> { let ${x}: ${ty} = <${ty} as ${de}::Deserialize>::deserialize(__e)?; std::result::Result::Ok(${mv}) }`);
             }
-            methods.push_str(`fn visit_seq<__A: ${DE}::SeqAccess>(self, __s: __A) -> std::result::Result<${value}, __A::Error> { let mut __seq = __s; ${seq}std::result::Result::Ok(${made}) } `.to_string().as_str());
+            methods.push(&quote`fn visit_seq<__A: ${de}::SeqAccess>(self, __s: __A) -> std::result::Result<${value}, __A::Error> { let mut __seq = __s; ${seq} std::result::Result::Ok(${mv}) }`);
         }
-        StructKind::Named => {
-            methods.push_str(`fn visit_seq<__A: ${DE}::SeqAccess>(self, __s: __A) -> std::result::Result<${value}, __A::Error> { let mut __seq = __s; ${seq}std::result::Result::Ok(${made}) } `.to_string().as_str());
-            let fid = `__${t.name}_${prefix}Field`.to_string();
-            out.push_str(identifier(fid.as_str(), &field_names(c, ia), ia.deny_unknown, false).as_str());
-            methods.push_str(visit_map(t, c, ia, fid.as_str(), value.as_str(), made.as_str()).as_str());
+        Kind::Named => {
+            methods.push(&quote`fn visit_seq<__A: ${de}::SeqAccess>(self, __s: __A) -> std::result::Result<${value}, __A::Error> { let mut __seq = __s; ${seq} std::result::Result::Ok(${mv}) }`);
+            let fid = c(`__${t.name()}_${prefix}Field`.to_string().as_str());
+            out.push(&identifier(&fid, &field_names(v, ia)?, ia.deny_unknown_fields, false));
+            methods.push(&visit_map(v, ia, &fid, &value, &mv)?);
         }
     }
-    let head = t.header_for(`${DE}::Visitor`.to_string().as_str(), `${DE}::Deserialize`.to_string().as_str(), `${vis}${t.params()}`.to_string().as_str());
-    out.push_str(`${head} { type Value = ${value}; ${methods}}\n`.to_string().as_str());
-    out
+    out.push(&visitor_impl(t, vis, quote`type Value = ${value}; ${methods}`));
+    Ok(out)
 }
 
 // The fields (not skipped) from a map: each once, unknown ones skipped (or
 // an error with deny_unknown_fields), missing ones from their defaults or
 // missing_field (None for an Option).
-fn visit_map(t: &Target, c: &Case, ia: &Attrs, fid: &str, value: &str, made: &str) -> String {
-    let mut b = `fn visit_map<__A: ${DE}::MapAccess>(self, __m: __A) -> std::result::Result<${value}, __A::Error> { let mut __map = __m; `.to_string();
-    let mut i = 0;
-    while i < c.fields.len() {
-        let fa = attrs(&c.fields[i].attrs);
-        if !fa.skip_de { b.push_str(`let mut ${binding(i)}: std::option::Option<${print::ty(c.fields[i].ty)}> = std::option::Option::None; `.to_string().as_str()); }
-        i += 1;
-    }
-    b.push_str(`while let std::option::Option::Some(__key) = ${DE}::MapAccess::next_key::<${fid}>(&mut __map)? { match __key { `.to_string().as_str());
+fn visit_map(v: &Variant, ia: &Attrs, fid: &Code, value: &Code, mv: &Code) -> Result<Code, Error> {
+    let de = c(DE);
+    let mut lets: Vec<Code> = Vec::new();
+    let mut arms: Vec<Code> = Vec::new();
+    let mut finals: Vec<Code> = Vec::new();
     let mut k = 0;
-    i = 0;
-    while i < c.fields.len() {
-        let fa = attrs(&c.fields[i].attrs);
-        if fa.skip_de { i += 1; continue; }
-        let ty = print::ty(c.fields[i].ty);
-        let dn = q(data_name(field_name(c.fields[i], i).as_str(), &fa, ia.rename_all.as_str(), false).as_str());
-        b.push_str(`${fid}::__f${k} => { if ${binding(i)}.is_some() { return std::result::Result::Err(<__A::Error as ${DE}::Error>::duplicate_field(${dn})); } ${binding(i)} = std::option::Option::Some(${DE}::MapAccess::next_value::<${ty}>(&mut __map)?); } `.to_string().as_str());
-        k += 1;
-        i += 1;
-    }
-    b.push_str(`_ => { let _ = ${DE}::MapAccess::next_value::<${DE}::IgnoredAny>(&mut __map)?; } } } `.to_string().as_str());
-    // A container #[serde(default)]: missing fields from the default value.
-    if ia.default {
-        b.push_str(`let __default: ${value} = ${if ia.default_path.len() > 0 { `${ia.default_path}()`.to_string() } else { "std::default::Default::default()".to_string() }}; `.to_string().as_str());
-    }
-    i = 0;
-    while i < c.fields.len() {
-        let fa = attrs(&c.fields[i].attrs);
-        let ty = print::ty(c.fields[i].ty);
-        let dn = q(data_name(field_name(c.fields[i], i).as_str(), &fa, ia.rename_all.as_str(), false).as_str());
-        let missing = if fa.default || fa.skip_de {
+    let mut i = 0;
+    for f in v.fields().iter() {
+        let fa: Attrs = f.parse_attrs("serde")?;
+        let ty = f.ty();
+        let x = local(i);
+        let dn = data_name(f.ident().to_string().as_str(), &fa, ia.rule().as_str(), false);
+        if !fa.skip_de() {
+            lets.push(quote`let mut ${x}: std::option::Option<${ty}> = std::option::Option::None;`);
+            let fk = c(`__f${k}`.to_string().as_str());
+            arms.push(quote`${fid}::${fk} => { if ${x}.is_some() { return std::result::Result::Err(<__A::Error as ${de}::Error>::duplicate_field(${dn})); } ${x} = std::option::Option::Some(${de}::MapAccess::next_value::<${ty}>(&mut __map)?); }`);
+            k += 1;
+        }
+        let missing = if fa.default.is_some() || fa.skip_de() {
             default_of(&fa)
-        } else if ia.default {
-            `__default.${field_name(c.fields[i], i)}`.to_string()
+        } else if ia.default.is_some() {
+            let fi = f.ident();
+            quote`__default.${fi}`
         } else {
-            `std::serde::private::missing_field::<${ty}, __A::Error>(${dn})?`.to_string()
+            quote`std::serde::private::missing_field::<${ty}, __A::Error>(${dn})?`
         };
-        if fa.skip_de {
-            b.push_str(`let ${binding(i)}: ${ty} = ${missing}; `.to_string().as_str());
+        if fa.skip_de() {
+            finals.push(quote`let ${x}: ${ty} = ${missing};`);
         } else {
-            b.push_str(`let ${binding(i)}: ${ty} = match ${binding(i)} { std::option::Option::Some(__v) => __v, std::option::Option::None => ${missing}, }; `.to_string().as_str());
+            finals.push(quote`let ${x}: ${ty} = match ${x} { std::option::Option::Some(__v) => __v, std::option::Option::None => ${missing}, };`);
         }
         i += 1;
     }
-    b.push_str(`std::result::Result::Ok(${made}) } `.to_string().as_str());
-    b
-}
-
-// A field's default (#[serde(default)] or default = "path").
-fn default_of(fa: &Attrs) -> String {
-    if fa.default_path.len() > 0 { `${fa.default_path}()`.to_string() } else { "std::default::Default::default()".to_string() }
-}
-
-// path { name: __0, ... } / path(__0, ...) / path.
-fn construct_from_bindings(path: &str, kind: &StructKind, fields: &Vec<&Field>) -> String {
-    crate::derive::construct(path, kind, fields, |i| binding(i))
+    // A container #[serde(default)]: missing fields from the default value.
+    let mut dflt = Code::new();
+    if ia.default.is_some() {
+        let d = default_of(ia);
+        dflt = quote`let __default: ${value} = ${d};`;
+    }
+    Ok(quote`fn visit_map<__A: ${de}::MapAccess>(self, __m: __A) -> std::result::Result<${value}, __A::Error> {
+        let mut __map = __m;
+        ${lets}
+        while let std::option::Option::Some(__key) = ${de}::MapAccess::next_key::<${fid}>(&mut __map)? {
+            match __key { ${arms} _ => { let _ = ${de}::MapAccess::next_value::<${de}::IgnoredAny>(&mut __map)?; } }
+        }
+        ${dflt} ${finals}
+        std::result::Result::Ok(${mv})
+    }`)
 }
 
 // An identifier enum (fields or variants) and its Deserialize: from a name
 // or an index; an unknown one is __ignore (fields) or an error (variants,
 // and fields with deny_unknown_fields).
-fn identifier(name: &str, names: &Vec<String>, deny: bool, variants: bool) -> String {
-    let mut out = String::new();
-    let mut e = `#[allow(non_camel_case_types)] enum ${name} { `.to_string();
+fn identifier(name: &Code, names: &Vec<String>, deny: bool, variants: bool) -> Code {
+    let de = c(DE);
+    let mut cases: Vec<Code> = Vec::new();
+    let mut by_str: Vec<Code> = Vec::new();
+    let mut by_index: Vec<Code> = Vec::new();
     let mut i = 0;
     while i < names.len() {
-        e.push_str(`__f${i}, `.to_string().as_str());
+        let f = c(`__f${i}`.to_string().as_str());
+        let n = names[i].clone();
+        let ix = num(i);
+        cases.push(quote`${f},`);
+        by_str.push(quote`${n} => std::result::Result::Ok(${name}::${f}),`);
+        by_index.push(quote`${ix} => std::result::Result::Ok(${name}::${f}),`);
         i += 1;
     }
-    e.push_str("__ignore }\n");
-    out.push_str(e.as_str());
-    let vis = `${name}Visitor`.to_string();
-    out.push_str(`struct ${vis};\n`.to_string().as_str());
+    let vis = c(`${name.text()}Visitor`.to_string().as_str());
     let list = name_list(names);
     let unknown_str = if variants {
-        `return std::result::Result::Err(__E::unknown_variant(__v, ${list}))`.to_string()
+        quote`return std::result::Result::Err(__E::unknown_variant(__v, ${list}))`
     } else if deny {
-        `return std::result::Result::Err(__E::unknown_field(__v, ${list}))`.to_string()
+        quote`return std::result::Result::Err(__E::unknown_field(__v, ${list}))`
     } else {
-        `std::result::Result::Ok(${name}::__ignore)`.to_string()
+        quote`std::result::Result::Ok(${name}::__ignore)`
     };
-    let mut by_str = `match __v { `.to_string();
-    let mut by_index = `match __v { `.to_string();
-    i = 0;
-    while i < names.len() {
-        by_str.push_str(`${q(names[i].as_str())} => std::result::Result::Ok(${name}::__f${i}), `.to_string().as_str());
-        by_index.push_str(`${i} => std::result::Result::Ok(${name}::__f${i}), `.to_string().as_str());
-        i += 1;
-    }
-    by_str.push_str(`_ => { ${unknown_str} } }`.to_string().as_str());
+    let below = `an index below ${names.len()}`.to_string();
     let bad_index = if variants || deny {
-        `std::result::Result::Err(__E::invalid_value(${DE}::Unexpected::Unsigned(__v), "an index below ${names.len()}"))`.to_string()
+        quote`std::result::Result::Err(__E::invalid_value(${de}::Unexpected::Unsigned(__v), ${below}))`
     } else {
-        `std::result::Result::Ok(${name}::__ignore)`.to_string()
+        quote`std::result::Result::Ok(${name}::__ignore)`
     };
-    by_index.push_str(`_ => ${bad_index}, }`.to_string().as_str());
-    let what = q(if variants { "variant identifier" } else { "field identifier" });
-    out.push_str(`impl ${DE}::Visitor for ${vis} { type Value = ${name}; fn expecting(&self, __f: &mut std::fmt::Formatter) -> std::fmt::Result { __f.write_str(${what}) } fn visit_u64<__E: ${DE}::Error>(self, __v: u64) -> std::result::Result<${name}, __E> { ${by_index} } fn visit_str<__E: ${DE}::Error>(self, __v: &str) -> std::result::Result<${name}, __E> { ${by_str} } }\n`.to_string().as_str());
-    out.push_str(`impl ${DE}::Deserialize for ${name} { fn deserialize<__D: ${DE}::Deserializer>(__d: __D) -> std::result::Result<${name}, __D::Error> { __d.deserialize_identifier(${vis}) } }\n`.to_string().as_str());
-    out
+    let what = if variants { "variant identifier" } else { "field identifier" };
+    quote`#[allow(non_camel_case_types)] enum ${name} { ${cases} __ignore }
+    struct ${vis};
+    impl ${de}::Visitor for ${vis} {
+        type Value = ${name};
+        fn expecting(&self, __f: &mut std::fmt::Formatter) -> std::fmt::Result { __f.write_str(${what}) }
+        fn visit_u64<__E: ${de}::Error>(self, __v: u64) -> std::result::Result<${name}, __E> { match __v { ${by_index} _ => ${bad_index}, } }
+        fn visit_str<__E: ${de}::Error>(self, __v: &str) -> std::result::Result<${name}, __E> { match __v { ${by_str} _ => { ${unknown_str} } } }
+    }
+    impl ${de}::Deserialize for ${name} {
+        fn deserialize<__D: ${de}::Deserializer>(__d: __D) -> std::result::Result<${name}, __D::Error> { __d.deserialize_identifier(${vis}) }
+    }`
 }
 
 // An enum's visitor (externally tagged): the variant identifier, then the
 // variant's content (a visitor per tuple and struct variant).
-fn enum_visitor(t: &Target, ia: &Attrs, vis: &str) -> String {
-    let mut out = String::new();
-    let vid = `__${t.name}_Variant`.to_string();
-    out.push_str(identifier(vid.as_str(), &variant_names(t, ia), true, true).as_str());
+fn enum_visitor(t: &TypeInfo, ia: &Attrs, vis: &Code) -> Result<Code, Error> {
+    let de = c(DE);
+    let mut out = Code::new();
+    let vid = c(`__${t.name()}_Variant`.to_string().as_str());
+    out.push(&identifier(&vid, &variant_names(t, ia)?, true, true));
     let value = t.self_type();
-    let mut arms = String::new();
-    let cs = cases(t);
-    let mut i = 0;
-    while i < cs.len() {
-        let c = &cs[i];
-        let arm = match c.kind {
-            StructKind::Unit => `{ ${DE}::VariantAccess::unit_variant(__va)?; std::result::Result::Ok(${c.path}) }`.to_string(),
-            StructKind::Tuple => {
-                if c.fields.len() == 1 {
-                    let ty = print::ty(c.fields[0].ty);
-                    `std::result::Result::Ok(${c.path}(${DE}::VariantAccess::newtype_variant::<${ty}>(__va)?))`.to_string()
+    let mk = marker();
+    let mut arms: Vec<Code> = Vec::new();
+    for v in t.variants().iter() {
+        let path = v.path();
+        let f = c(`__f${v.index()}`.to_string().as_str());
+        let arm = match v.kind() {
+            Kind::Unit => quote`{ ${de}::VariantAccess::unit_variant(__va)?; std::result::Result::Ok(${path}) }`,
+            Kind::Tuple => {
+                if v.fields().len() == 1 {
+                    let ty = v.fields()[0].ty();
+                    quote`std::result::Result::Ok(${path}(${de}::VariantAccess::newtype_variant::<${ty}>(__va)?))`
                 } else {
-                    let v = `__${t.name}_${c.name}_Visitor`.to_string();
-                    out.push_str(visitor_struct(t, v.as_str()).as_str());
-                    out.push_str(struct_visitor(t, c, ia, v.as_str(), `${c.name}_`.to_string().as_str(), c.path.as_str()).as_str());
-                    `${DE}::VariantAccess::tuple_variant(__va, ${c.fields.len()}, ${v}${marker(t)})`.to_string()
+                    let vv = c(`__${t.name()}_${v.name()}_Visitor`.to_string().as_str());
+                    out.push(&visitor_struct(t, &vv));
+                    out.push(&struct_visitor(t, v, ia, &vv, `${v.name()}_`.to_string().as_str())?);
+                    let n = num(v.fields().len());
+                    quote`${de}::VariantAccess::tuple_variant(__va, ${n}, ${vv}${mk})`
                 }
             }
-            StructKind::Named => {
-                let v = `__${t.name}_${c.name}_Visitor`.to_string();
-                out.push_str(visitor_struct(t, v.as_str()).as_str());
-                out.push_str(struct_visitor(t, c, ia, v.as_str(), `${c.name}_`.to_string().as_str(), c.path.as_str()).as_str());
-                `${DE}::VariantAccess::struct_variant(__va, ${name_list(&field_names(c, ia))}, ${v}${marker(t)})`.to_string()
+            Kind::Named => {
+                let vv = c(`__${t.name()}_${v.name()}_Visitor`.to_string().as_str());
+                out.push(&visitor_struct(t, &vv));
+                out.push(&struct_visitor(t, v, ia, &vv, `${v.name()}_`.to_string().as_str())?);
+                let list = name_list(&field_names(v, ia)?);
+                quote`${de}::VariantAccess::struct_variant(__va, ${list}, ${vv}${mk})`
             }
         };
-        arms.push_str(`${vid}::__f${i} => ${arm}, `.to_string().as_str());
-        i += 1;
+        arms.push(quote`${vid}::${f} => ${arm},`);
     }
-    arms.push_str(`${vid}::__ignore => std::result::Result::Err(<__A::Error as ${DE}::Error>::custom("unknown variant")), `.to_string().as_str());
-    let what = q(`enum ${t.name}`.to_string().as_str());
-    let head = t.header_for(`${DE}::Visitor`.to_string().as_str(), `${DE}::Deserialize`.to_string().as_str(), `${vis}${t.params()}`.to_string().as_str());
-    out.push_str(`${head} { type Value = ${value}; fn expecting(&self, __f: &mut std::fmt::Formatter) -> std::fmt::Result { __f.write_str(${what}) } fn visit_enum<__A: ${DE}::EnumAccess>(self, __data: __A) -> std::result::Result<${value}, __A::Error> { let (__tag, __va) = ${DE}::EnumAccess::variant::<${vid}>(__data)?; match __tag { ${arms}} } }\n`.to_string().as_str());
-    out
+    let what = `enum ${t.name()}`.to_string();
+    let items = quote`type Value = ${value};
+        fn expecting(&self, __f: &mut std::fmt::Formatter) -> std::fmt::Result { __f.write_str(${what}) }
+        fn visit_enum<__A: ${de}::EnumAccess>(self, __data: __A) -> std::result::Result<${value}, __A::Error> {
+            let (__tag, __va) = ${de}::EnumAccess::variant::<${vid}>(__data)?;
+            match __tag { ${arms} ${vid}::__ignore => std::result::Result::Err(<__A::Error as ${de}::Error>::custom("unknown variant")), }
+        }`;
+    out.push(&visitor_impl(t, vis, items));
+    Ok(out)
 }

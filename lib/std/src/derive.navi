@@ -428,6 +428,8 @@ pub struct Variant {
     attrs: Vec<Attr>,
     discr: String,
     index: usize,
+    /// The struct itself: its fields are read as self.x (no match).
+    of_struct: bool,
 }
 
 impl Variant {
@@ -452,9 +454,20 @@ impl Variant {
     /// Type or Type::Variant, as patterns and constructors write it.
     pub fn path(&self) -> Code { Code::spanned(self.path.as_str(), self.name.pos) }
 
-    /// A binding for each field (named __binding_0, ...), as each and
-    /// each_variant's patterns bind them.
-    pub fn bindings(&self) -> Vec<Binding> { self.bindings_named("__binding") }
+    /// A binding for each field, as each and each_variant bind them: an
+    /// enum's variant's fields are bound by a pattern (__binding_0, ...),
+    /// a struct's are read as self.x.
+    pub fn bindings(&self) -> Vec<Binding> {
+        if self.of_struct { return self.fields_of("self"); }
+        self.bindings_named("__binding")
+    }
+
+    // The fields read from x (an expression): x.a, x.0, ...
+    fn fields_of(&self, x: &str) -> Vec<Binding> {
+        let mut out = Vec::new();
+        for f in self.fields.iter() { out.push(Binding { name: `${x}.${f.ident()}`.to_string(), field: f.clone() }); }
+        out
+    }
 
     fn bindings_named(&self, prefix: &str) -> Vec<Binding> {
         let mut out = Vec::new();
@@ -582,6 +595,12 @@ impl TypeInfo {
     pub fn of<T>() -> TypeInfo {
         let p = crate::intrinsics::type_info::<T>() as *const usize;
         let s = unsafe { crate::rt::str_from_raw(*p as *const u8, *p.add(1)) };
+        TypeInfo::decode(s)
+    }
+
+    /// The TypeInfo the compiler encoded (for its built-in derives, which
+    /// run in the compiler).
+    pub fn decode(s: &str) -> TypeInfo {
         let mut d = Dec { b: s.as_bytes(), i: 0 };
         d.type_info()
     }
@@ -626,6 +645,50 @@ impl TypeInfo {
         c
     }
 
+    /// <T, const N: usize>: the parameters without their bounds (a helper
+    /// type's declaration), empty if none.
+    pub fn params(&self) -> Code {
+        let mut c = Code::new();
+        if self.generics.params.len() == 0 { return c; }
+        let mut ps: Vec<Code> = Vec::new();
+        for p in self.generics.params.iter() {
+            let mut x = Code::new();
+            if p.is_const {
+                x.push_str("const");
+                x.push(&p.name.to_code());
+                x.push_str(":");
+                x.push_str(p.ty.as_str());
+            } else {
+                x.push(&p.name.to_code());
+            }
+            ps.push(x);
+        }
+        c.push_str("<");
+        c.push(&comma_list(&ps));
+        c.push_str(">");
+        c
+    }
+
+    /// The variant of x (an expression of type Self) as an isize: its
+    /// position in the declaration (0 for a struct).
+    pub fn variant_index(&self, x: Code) -> Code {
+        if !self.is_enum { return Code::from_text("0isize"); }
+        let mut c = Code::from_text("match *(");
+        c.push(&x);
+        c.push_str(") {");
+        for v in self.variants.iter() {
+            c.push(&v.path());
+            match v.kind {
+                Kind::Unit => {}
+                Kind::Tuple => c.push_str("(..)"),
+                Kind::Named => c.push_str("{ .. }"),
+            }
+            c.push_str(`=> ${v.index}isize,`.to_string().as_str());
+        }
+        c.push_str("}");
+        c
+    }
+
     /// impl<...> trait_path for Self<...> where ... { items }: every type
     /// parameter must implement the trait too (as Rust's derives).
     pub fn impl_for(&self, trait_path: &str, items: Code) -> Code {
@@ -637,7 +700,11 @@ impl TypeInfo {
     /// impl_for with the bound for each type parameter given ("" for none).
     pub fn impl_for_with(&self, trait_path: &str, bound: Code, items: Code) -> Code { self.impl_with(trait_path, bound, items) }
 
-    fn impl_with(&self, trait_path: &str, bound: Code, items: Code) -> Code {
+    fn impl_with(&self, trait_path: &str, bound: Code, items: Code) -> Code { self.impl_for_type(trait_path, bound, self.self_type(), items) }
+
+    /// impl_for_with for another type with the same parameters (a helper
+    /// type of the derive's: self_ty is it with them).
+    pub fn impl_for_type(&self, trait_path: &str, bound: Code, self_ty: Code, items: Code) -> Code {
         let mut c = Code::from_text("impl");
         if self.generics.params.len() > 0 {
             let mut ps: Vec<Code> = Vec::new();
@@ -671,7 +738,7 @@ impl TypeInfo {
         }
         c.push_str(trait_path);
         c.push_str("for");
-        c.push(&self.self_type());
+        c.push(&self_ty);
         if self.generics.where_clause.len() > 0 {
             c.push_str("where");
             c.push_str(self.generics.where_clause.as_str());
@@ -684,6 +751,12 @@ impl TypeInfo {
 
     /// match *self { each variant's pattern => { f(binding) for each field } }
     pub fn each(&self, f: fn(&Binding) -> Code) -> Code {
+        if !self.is_enum {
+            let mut body = Code::from_text("{");
+            for b in self.variants[0].bindings().iter() { body.push(&f(b)); }
+            body.push_str("}");
+            return body;
+        }
         let mut arms = Code::new();
         for v in self.variants.iter() {
             let mut body = Code::new();
@@ -699,6 +772,12 @@ impl TypeInfo {
     /// match *self { each variant's pattern => { f(variant) } }: the
     /// variant's bindings() are bound.
     pub fn each_variant(&self, f: fn(&Variant) -> Result<Code, Error>) -> Result<Code, Error> {
+        if !self.is_enum {
+            let mut body = Code::from_text("{");
+            body.push(&f(&self.variants[0])?);
+            body.push_str("}");
+            return Ok(body);
+        }
         let mut arms = Code::new();
         for v in self.variants.iter() {
             let body = f(v)?;
@@ -716,7 +795,9 @@ impl TypeInfo {
         let mut arms = Code::new();
         for v in self.variants.iter() {
             let mut vals: Vec<Code> = Vec::new();
-            for b in v.bindings().iter() { vals.push(f(b)); }
+            // (A struct taken apart too: from a copy of self, not through
+            // &self, where a &mut field reads as &.)
+            for b in v.bindings_named("__binding").iter() { vals.push(f(b)); }
             arms.push(&v.pattern());
             arms.push_str("=>");
             arms.push(&v.construct(&vals));
@@ -729,6 +810,19 @@ impl TypeInfo {
     /// the same variant f(self's binding, other's binding) for each field;
     /// differ when the variants differ (as PartialEq).
     pub fn each_pair(&self, other: Code, f: fn(&Binding, &Binding) -> Code, differ: Code) -> Code {
+        if !self.is_enum {
+            let v = &self.variants[0];
+            let a = v.fields_of("self");
+            let b = v.fields_of(`(${other.text})`.to_string().as_str());
+            let mut body = Code::from_text("{");
+            let mut i = 0;
+            while i < a.len() {
+                body.push(&f(&a[i], &b[i]));
+                i += 1;
+            }
+            body.push_str("}");
+            return body;
+        }
         let mut arms = Code::new();
         for v in self.variants.iter() {
             let a = v.bindings_named("__binding");
@@ -1139,6 +1233,7 @@ impl Dec {
         self.open();
         while !self.at_close() { variants.push(self.variant(variants.len())); }
         self.close();
+        if !is_enum { for v in variants.iter_mut() { v.of_struct = true; } }
         TypeInfo { name, module, vis, attrs, generics: Generics { params, where_clause }, is_enum, variants }
     }
 
@@ -1169,7 +1264,7 @@ impl Dec {
             fields.push(Field { name: n, index: fields.len(), ty, attrs: fattrs, vis, pos });
         }
         self.close();
-        Variant { name, path, kind, fields, attrs, discr, index }
+        Variant { name, path, kind, fields, attrs, discr, index, of_struct: false }
     }
 
     // [[name pos [[key pos tag value vpos]...]]...]

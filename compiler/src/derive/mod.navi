@@ -1,40 +1,26 @@
-//! Derives (docs/derive.md): #[derive(X)] on a struct or enum expands, as
-//! the crate's items are collected and before names are resolved, to impl
-//! blocks written as source, which are parsed and collected as any others.
-//! Like Rust's, a derive sees the item's syntax only (fields, their types
-//! as written, generics, attributes), and the impl requires every type
-//! parameter to implement the trait too.
+//! Derives (docs/derive.md): #[derive(X)] on a struct or enum expands,
+//! before names in bodies are resolved, to impl blocks, which are parsed
+//! and collected as any others. Like Rust's, a derive sees the item's
+//! syntax only (fields, their types as written, generics, attributes), and
+//! the impl requires every type parameter to implement the trait too.
 //!
-//! The built-in derives are here (std's own types use them). The ones not
-//! moved here yet are still made by the type checker and the MIR shims:
-//! expanded() says which.
+//! The built-in derives are here (std's own types use them), written as a
+//! derive macro is (std::derive: a TypeInfo in, quote`...` code out) but
+//! called in the compiler.
 
+use std::derive::{TypeInfo, Code, Error, Binding, Variant, Kind, quote};
 use crate::syntax::ast::*;
-use crate::syntax::print;
 use crate::syntax::token;
 
 pub mod serde;
 pub mod info;
 
-/// Whether derive name expands here (as source) rather than in the type
-/// checker and MIR shims.
+/// Whether name is a built-in derive.
 pub fn expanded(name: &str) -> bool {
     match name {
         "Clone" | "Default" | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash" | "Debug" | "Serialize" | "Deserialize" | "FromAttrs" => true,
         _ => false,
     }
-}
-
-/// The names in the item's #[derive(...)] attributes, in order.
-pub fn names(attrs: &Vec<&Attr>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for a in attrs.iter() {
-        if a.path.segments.len() != 1 || a.path.segments[0].name.value != "derive" { continue; }
-        for t in a.args.iter() {
-            if t.kind == token::IDENT { out.push(t.text.to_string()); }
-        }
-    }
-    out
 }
 
 /// A derive named in #[derive(...)]: a name or a path (a macro's).
@@ -109,426 +95,146 @@ pub fn builtin_attrs(name: &str) -> Vec<String> {
     v
 }
 
-/// The source of the impls the item's built-in derives in only make ("" if
-/// none), and a name for it (the derives and the type).
-pub fn expand(it: &Item, only: &Vec<String>) -> (String, String) {
-    let (attrs, name, generics) = match it {
-        Item::Struct(s) => (s.base.attrs.clone(), s.name.value.clone(), s.generics),
-        Item::Enum(e) => (e.base.attrs.clone(), e.name.value.clone(), e.generics),
-        _ => return (String::new(), String::new()),
+/// The code of the item's built-in derives in only (empty if none), a name
+/// for it (the derives and the type), and the derives' errors.
+pub fn expand(it: &Item, only: &Vec<String>) -> (Code, String, Vec<Error>) {
+    let mut code = Code::new();
+    let mut errs: Vec<Error> = Vec::new();
+    let names = match it {
+        Item::Struct(s) => refs(&s.base.attrs),
+        Item::Enum(e) => refs(&e.base.attrs),
+        _ => return (code, String::new(), errs),
     };
-    let t = &Target { it: it.clone(), name, generics };
-    let mut src = String::new();
+    let e = info::Enc::new();
+    info::encode(e, it, "");
+    let t = TypeInfo::decode(e.s.as_str());
     let mut done: Vec<String> = Vec::new();
-    for n in names(&attrs).iter() {
-        if !expanded(n.as_str()) || done.contains(n) || !only.contains(n) { continue; }
+    for r in names.iter() {
+        let n = r.text();
+        if !expanded(n.as_str()) || done.contains(&n) || !only.contains(&n) { continue; }
         // (Not for an enum: the checker reports it.)
-        if n == "Default" && is_enum(t) { continue; }
+        if n == "Default" && t.is_enum() { continue; }
         done.push(n.clone());
-        let code = match n.as_str() {
-            "Clone" => clone(t),
-            "Default" => default(t),
-            "PartialEq" => partial_eq(t),
-            "Eq" => `${t.header("std::cmp::Eq")} {}\n`.to_string(),
-            "PartialOrd" => ord(t, true),
-            "Ord" => ord(t, false),
-            "Hash" => hash(t),
-            "Debug" => debug(t),
-            "Serialize" => serde::serialize(t),
-            "Deserialize" => serde::deserialize(t),
-            "FromAttrs" => from_attrs(t),
-            _ => String::new(),
+        let made = match n.as_str() {
+            "Clone" => Ok(clone(&t)),
+            "Default" => Ok(default(&t)),
+            "PartialEq" => Ok(partial_eq(&t)),
+            "Eq" => Ok(t.impl_for("std::cmp::Eq", Code::new())),
+            "PartialOrd" => Ok(ord(&t, true)),
+            "Ord" => Ok(ord(&t, false)),
+            "Hash" => Ok(hash(&t)),
+            "Debug" => debug(&t),
+            "Serialize" => serde::serialize(&t),
+            "Deserialize" => serde::deserialize(&t),
+            "FromAttrs" => from_attrs(&t),
+            _ => Ok(Code::new()),
         };
-        src.push_str(code.as_str());
-    }
-    if src.len() == 0 { return (String::new(), String::new()); }
-    (src, `derive ${done.join(", ")} for ${t.name}`.to_string())
-}
-
-// The item a derive expands for.
-pub struct Target {
-    pub it: Item,
-    pub name: String,
-    pub generics: &Generics,
-}
-
-impl Target {
-    // The impl header: impl<params, each type parameter bounded by
-    // trait_path too> trait_path for Name<params> where ... .
-    pub fn header(&self, trait_path: &str) -> String { self.header_for(trait_path, trait_path, self.self_type().as_str()) }
-
-    // impl<params, each type parameter bounded by bound too> trait_path for
-    // self_ty where ... (a helper type of the derive's).
-    pub fn header_for(&self, trait_path: &str, bound: &str, self_ty: &str) -> String {
-        let mut b = String::new();
-        b.push_str("impl");
-        let ps = &self.generics.params;
-        if ps.len() > 0 {
-            b.push('<');
-            let mut i = 0;
-            while i < ps.len() {
-                let p = ps[i];
-                if i > 0 { b.push_str(", "); }
-                match p.ty {
-                    Some(t) => b.push_str(`const ${p.name.value}: ${print::ty(t)}`.to_string().as_str()),
-                    None => {
-                        b.push_str(p.name.value.as_str());
-                        b.push_str(": ");
-                        if p.bounds.len() > 0 {
-                            b.push_str(print::bounds(&p.bounds).as_str());
-                            b.push_str(" + ");
-                        }
-                        b.push_str(bound);
-                    }
-                }
-                i += 1;
-            }
-            b.push('>');
-        }
-        b.push(' ');
-        b.push_str(trait_path);
-        b.push_str(" for ");
-        b.push_str(self_ty);
-        let ws = &self.generics.wheres;
-        if ws.len() > 0 {
-            b.push_str(" where ");
-            let mut i = 0;
-            while i < ws.len() {
-                if i > 0 { b.push_str(", "); }
-                b.push_str(print::ty(ws[i].ty).as_str());
-                b.push_str(": ");
-                b.push_str(print::bounds(&ws[i].bounds).as_str());
-                i += 1;
-            }
-        }
-        b
-    }
-
-    // <P, ...> of the type's parameters (a helper type's), "" if none.
-    pub fn params(&self) -> String {
-        let ps = &self.generics.params;
-        if ps.len() == 0 { return String::new(); }
-        let mut b = "<".to_string();
-        let mut i = 0;
-        while i < ps.len() {
-            if i > 0 { b.push_str(", "); }
-            match ps[i].ty {
-                Some(t) => b.push_str(`const ${ps[i].name.value}: ${print::ty(t)}`.to_string().as_str()),
-                None => b.push_str(ps[i].name.value.as_str()),
-            }
-            i += 1;
-        }
-        b.push('>');
-        b
-    }
-
-    // Name<params>.
-    pub fn self_type(&self) -> String {
-        let mut b = self.name.clone();
-        let ps = &self.generics.params;
-        if ps.len() > 0 {
-            b.push('<');
-            let mut i = 0;
-            while i < ps.len() {
-                if i > 0 { b.push_str(", "); }
-                b.push_str(ps[i].name.value.as_str());
-                i += 1;
-            }
-            b.push('>');
-        }
-        b
-    }
-}
-
-// The name a field is bound to in a pattern (__0, __1, ...; the other
-// value's __b0, __b1, ...).
-pub fn binding(i: usize) -> String { `__${i}`.to_string() }
-fn binding_b(i: usize) -> String { `__b${i}`.to_string() }
-
-// A field's name (named fields) or index (tuple fields).
-pub fn field_name(f: &Field, i: usize) -> String {
-    match f.name { Some(n) => n.value.clone(), None => `${i}`.to_string() }
-}
-
-// The pattern of a variant (or struct) path with its fields bound to
-// __0, __1, ...
-pub fn pattern(path: &str, kind: &StructKind, fields: &Vec<&Field>) -> String { pattern_with(path, kind, fields, binding) }
-
-fn pattern_with(path: &str, kind: &StructKind, fields: &Vec<&Field>, bind: fn(usize) -> String) -> String {
-    let mut b = path.to_string();
-    if *kind == StructKind::Unit { return b; }
-    b.push_str(if *kind == StructKind::Named { " { " } else { "(" });
-    let mut i = 0;
-    while i < fields.len() {
-        if i > 0 { b.push_str(", "); }
-        if *kind == StructKind::Named {
-            b.push_str(field_name(fields[i], i).as_str());
-            b.push_str(": ");
-        }
-        b.push_str(bind(i).as_str());
-        i += 1;
-    }
-    b.push_str(if *kind == StructKind::Named { " }" } else { ")" });
-    b
-}
-
-// The construction of path with field i given by value(i, binding).
-pub fn construct(path: &str, kind: &StructKind, fields: &Vec<&Field>, value: fn(usize) -> String) -> String {
-    let mut b = path.to_string();
-    if *kind == StructKind::Unit { return b; }
-    b.push_str(if *kind == StructKind::Named { " { " } else { "(" });
-    let mut i = 0;
-    while i < fields.len() {
-        if i > 0 { b.push_str(", "); }
-        if *kind == StructKind::Named {
-            b.push_str(field_name(fields[i], i).as_str());
-            b.push_str(": ");
-        }
-        b.push_str(value(i).as_str());
-        i += 1;
-    }
-    b.push_str(if *kind == StructKind::Named { " }" } else { ")" });
-    b
-}
-
-// #[derive(Clone)]: each field cloned.
-// (A struct's fields from a copy of it, as an enum's: through &self a
-// &mut field reads as &, which the clone could not be.)
-fn clone(t: &Target) -> String {
-    let mut body = each(t, |c, fs| construct(c.path.as_str(), &c.kind, &c.fields, |i| `std::clone::Clone::clone(&${fs[i]})`.to_string()));
-    if !is_enum(t) {
-        let c = &cases(t)[0];
-        if c.kind != StructKind::Unit {
-            let made = construct(c.path.as_str(), &c.kind, &c.fields, |i| `std::clone::Clone::clone(&${binding(i)})`.to_string());
-            body = `let ${pattern(c.path.as_str(), &c.kind, &c.fields)} = *self; ${made}`.to_string();
+        match made {
+            Ok(c) => code.push(&c),
+            Err(x) => errs.push(x),
         }
     }
-    `${t.header("std::clone::Clone")} { fn clone(&self) -> Self { ${body} } }\n`.to_string()
+    if done.len() == 0 { return (code, String::new(), errs); }
+    (code, `derive ${done.join(", ")} for ${t.name()}`.to_string(), errs)
 }
 
-// A shape: a struct, or a variant of an enum (path, kind, fields).
-pub struct Case {
-    pub path: String,
-    pub name: String,
-    pub kind: StructKind,
-    pub fields: Vec<&Field>,
-}
+/// Code of text as written (a path, a number).
+pub fn c(text: &str) -> Code { Code::from_text(text) }
 
-// The struct, or each variant.
-pub fn cases(t: &Target) -> Vec<Case> {
-    let mut out: Vec<Case> = Vec::new();
-    match &t.it {
-        Item::Struct(s) => out.push(Case { path: t.name.clone(), name: t.name.clone(), kind: s.kind.clone(), fields: s.fields.clone() }),
-        Item::Enum(e) => {
-            for v in e.variants.iter() {
-                out.push(Case { path: `${t.name}::${v.name.value}`.to_string(), name: v.name.value.clone(), kind: v.kind.clone(), fields: v.fields.clone() });
-            }
-        }
-        _ => {}
-    }
-    out
-}
-
-pub fn is_enum(t: &Target) -> bool { match &t.it { Item::Enum(_) => true, _ => false } }
-
-// The fields of self (fs[i] an expression for field i: self.name for a
-// struct, a binding __i in a match arm per variant for an enum) and the
-// code body(case, fs) for them.
-fn each(t: &Target, body: fn(&Case, &Vec<String>) -> String) -> String {
-    let cs = cases(t);
-    if !is_enum(t) {
-        let c = &cs[0];
-        return body(c, &field_exprs("self", c));
-    }
-    let mut b = String::new();
-    b.push_str("match *self { ");
-    for c in cs.iter() {
-        let fs = bindings(c, binding);
-        b.push_str(`${pattern(c.path.as_str(), &c.kind, &c.fields)} => { ${body(c, &fs)} } `.to_string().as_str());
-    }
-    b.push('}');
-    b
-}
-
-// The fields of self and other of the same shape (a variant each, for an
-// enum: other when they differ) and body(case, self's, other's) for them.
-fn each_pair(t: &Target, body: fn(&Case, &Vec<String>, &Vec<String>) -> String, other: &str) -> String {
-    let cs = cases(t);
-    if !is_enum(t) {
-        let c = &cs[0];
-        return body(c, &field_exprs("self", c), &field_exprs("other", c));
-    }
-    // (With one variant the two always match: no other arm.)
-    let rest = if cs.len() > 1 { `_ => { ${other} } `.to_string() } else { String::new() };
-    let mut b = String::new();
-    b.push_str("match *self { ");
-    for c in cs.iter() {
-        let pa = pattern(c.path.as_str(), &c.kind, &c.fields);
-        let pb = pattern_with(c.path.as_str(), &c.kind, &c.fields, binding_b);
-        let fa = bindings(c, binding);
-        let fb = bindings(c, binding_b);
-        b.push_str(`${pa} => match *other { ${pb} => { ${body(c, &fa, &fb)} } ${rest}} `.to_string().as_str());
-    }
-    b.push('}');
-    b
-}
-
-// x.name (x.0 for a tuple field) for each field.
-fn field_exprs(x: &str, c: &Case) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < c.fields.len() {
-        out.push(`${x}.${field_name(c.fields[i], i)}`.to_string());
-        i += 1;
-    }
-    out
-}
-
-// The names fields are bound to in a pattern.
-fn bindings(c: &Case, bind: fn(usize) -> String) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < c.fields.len() {
-        out.push(bind(i));
-        i += 1;
-    }
-    out
-}
-
-// The variant of *x (an enum) as an isize: its index in the declaration
-// (as the MIR's Discr the derived impls used before; explicit discriminant
-// values do not matter).
-fn discr(t: &Target, x: &str) -> String {
-    let e = match &t.it { Item::Enum(e) => *e, _ => return "0isize".to_string() };
-    let mut b = String::new();
-    b.push_str(`match *${x} { `.to_string().as_str());
-    let mut i = 0;
-    for v in e.variants.iter() {
-        let pat = match v.kind {
-            StructKind::Unit => `${t.name}::${v.name.value}`.to_string(),
-            StructKind::Tuple => `${t.name}::${v.name.value}(..)`.to_string(),
-            StructKind::Named => `${t.name}::${v.name.value} { .. }`.to_string(),
-        };
-        b.push_str(`${pat} => ${i}isize, `.to_string().as_str());
-        i += 1;
-    }
-    b.push('}');
-    b
+// #[derive(Clone)]: each field cloned. (From a copy of self, taken apart:
+// through &self a &mut field reads as &, which the clone could not be.)
+fn clone(t: &TypeInfo) -> Code {
+    let body = t.each_construct(|b| quote`std::clone::Clone::clone(&${b})`);
+    t.impl_for("std::clone::Clone", quote`fn clone(&self) -> Self { ${body} }`)
 }
 
 // #[derive(Default)] (structs only): each field's default.
-fn default(t: &Target) -> String {
-    let cs = cases(t);
-    if cs.len() == 0 { return String::new(); }
-    let c = &cs[0];
-    let made = construct(c.path.as_str(), &c.kind, &c.fields, |i| "std::default::Default::default()".to_string());
-    `${t.header("std::default::Default")} { fn default() -> Self { ${made} } }\n`.to_string()
-}
-
-// #[derive(FromAttrs)] (std::derive): a struct with named fields made from
-// an attribute's arguments, each field from the key of its name by its
-// type's FromAttrValue. (The checker reports other items.)
-fn from_attrs(t: &Target) -> String {
-    let fields = match &t.it {
-        Item::Struct(s) => if s.kind == StructKind::Named { s.fields.clone() } else { return String::new() },
-        _ => return String::new(),
-    };
-    let mut inits: Vec<String> = Vec::new();
-    for f in fields.iter() {
-        let n = f.name.unwrap().value.clone();
-        inits.push(`${n}: __args.get::<${print::ty(f.ty)}>(${print::quote_str(n.as_str())})?`.to_string());
-    }
-    `${t.header("std::derive::FromAttrs")} { fn from_attrs(__args: &mut std::derive::AttrArgs) -> Result<Self, std::derive::Error> { Ok(${t.name} { ${inits.join(", ")} }) } }\n`.to_string()
+fn default(t: &TypeInfo) -> Code {
+    let v = &t.variants()[0];
+    let mut vals: Vec<Code> = Vec::new();
+    for _ in v.fields().iter() { vals.push(c("std::default::Default::default()")); }
+    let made = v.construct(&vals);
+    t.impl_for("std::default::Default", quote`fn default() -> Self { ${made} }`)
 }
 
 // #[derive(PartialEq)]: the same variant and equal fields.
-fn partial_eq(t: &Target) -> String {
-    let body = each_pair(t, |c, fa, fb| {
-        let mut b = "true".to_string();
-        let mut i = 0;
-        while i < c.fields.len() {
-            b.push_str(` && std::cmp::PartialEq::eq(&${fa[i]}, &${fb[i]})`.to_string().as_str());
-            i += 1;
-        }
-        b
-    }, "false");
-    `${t.header("std::cmp::PartialEq")} { fn eq(&self, other: &Self) -> bool { ${body} } }\n`.to_string()
+fn partial_eq(t: &TypeInfo) -> Code {
+    let other = quote`other`;
+    let differ = quote`return false;`;
+    let body = t.each_pair(other, |a, b| quote`if !std::cmp::PartialEq::eq(&${a}, &${b}) { return false; }`, differ);
+    t.impl_for("std::cmp::PartialEq", quote`fn eq(&self, other: &Self) -> bool { ${body} true }`)
 }
 
 // #[derive(PartialOrd)] / #[derive(Ord)]: the variant order, then the
 // fields in order (the first that differs decides).
-fn ord(t: &Target, partial: bool) -> String {
+fn ord(t: &TypeInfo, partial: bool) -> Code {
     let (tr, m, ret, eq) = if partial {
         ("std::cmp::PartialOrd", "partial_cmp", "std::option::Option<std::cmp::Ordering>", "std::option::Option::Some(std::cmp::Ordering::Equal)")
     } else {
         ("std::cmp::Ord", "cmp", "std::cmp::Ordering", "std::cmp::Ordering::Equal")
     };
-    let fields = each_pair(t, |c, fa, fb| {
-        let mut b = String::new();
-        let mut i = 0;
-        while i < c.fields.len() {
-            b.push_str(`match ${tr}::${m}(&${fa[i]}, &${fb[i]}) { ${eq} => {} r => return r, } `.to_string().as_str());
-            i += 1;
-        }
-        b.push_str(eq);
-        b
-    }, eq);
-    let mut body = String::new();
-    if is_enum(t) {
-        body.push_str(`let __da = ${discr(t, "self")}; let __db = ${discr(t, "other")}; `.to_string().as_str());
-        body.push_str(`if __da != __db { return ${tr}::${m}(&__da, &__db); } `.to_string().as_str());
+    let (trc, mc, retc, eqc) = (c(tr), c(m), c(ret), c(eq));
+    let other = quote`other`;
+    let same = quote`{}`;
+    let fields = t.each_pair(other, |a, b| quote`match ${trc}::${mc}(&${a}, &${b}) { ${eqc} => {} r => return r, }`, same);
+    let mut body = Code::new();
+    if t.is_enum() {
+        let me = quote`self`;
+        let them = quote`other`;
+        let da = t.variant_index(me);
+        let db = t.variant_index(them);
+        body = quote`let __da = ${da}; let __db = ${db}; if __da != __db { return ${trc}::${mc}(&__da, &__db); }`;
     }
-    body.push_str(fields.as_str());
-    `${t.header(tr)} { fn ${m}(&self, other: &Self) -> ${ret} { ${body} } }\n`.to_string()
+    t.impl_for(tr, quote`fn ${mc}(&self, other: &Self) -> ${retc} { ${body} ${fields} ${eqc} }`)
 }
 
-// #[derive(Hash)]: the variant (its discriminant as an isize), then each
-// field.
-fn hash(t: &Target) -> String {
-    let mut body = String::new();
-    if is_enum(t) {
-        body.push_str(`let __d: isize = ${discr(t, "self")}; std::hash::Hash::hash(&__d, state); `.to_string().as_str());
+// #[derive(Hash)]: the variant (its position as an isize), then each field.
+fn hash(t: &TypeInfo) -> Code {
+    let mut pre = Code::new();
+    if t.is_enum() {
+        let me = quote`self`;
+        let d = t.variant_index(me);
+        pre = quote`let __d: isize = ${d}; std::hash::Hash::hash(&__d, state);`;
     }
-    body.push_str(each(t, |c, fs| {
-        let mut b = String::new();
-        let mut i = 0;
-        while i < c.fields.len() {
-            b.push_str(`std::hash::Hash::hash(&${fs[i]}, state); `.to_string().as_str());
-            i += 1;
-        }
-        b
-    }).as_str());
-    `${t.header("std::hash::Hash")} { fn hash<__H: std::hash::Hasher>(&self, state: &mut __H) { ${body} } }\n`.to_string()
+    let body = t.each(|b| quote`std::hash::Hash::hash(&${b}, state);`);
+    t.impl_for("std::hash::Hash", quote`fn hash<__H: std::hash::Hasher>(&self, state: &mut __H) { ${pre} ${body} }`)
 }
 
 // #[derive(Debug)]: the name (a variant's, for an enum), then the fields
 // through Formatter's debug_tuple or debug_struct.
-fn debug(t: &Target) -> String {
-    let body = each(t, |c, fs| {
-        let name = print::quote_str(c.name.as_str());
-        match c.kind {
-            StructKind::Unit => `f.write_str(${name})`.to_string(),
-            StructKind::Tuple => {
-                let mut b = `let mut __w = f.debug_tuple(${name}); `.to_string();
-                let mut i = 0;
-                while i < c.fields.len() {
-                    b.push_str(`__w.field(&${fs[i]}); `.to_string().as_str());
-                    i += 1;
-                }
-                b.push_str("__w.finish()");
-                b
-            }
-            StructKind::Named => {
-                let mut b = `let mut __w = f.debug_struct(${name}); `.to_string();
-                let mut i = 0;
-                while i < c.fields.len() {
-                    b.push_str(`__w.field(${print::quote_str(field_name(c.fields[i], i).as_str())}, &${fs[i]}); `.to_string().as_str());
-                    i += 1;
-                }
-                b.push_str("__w.finish()");
-                b
+fn debug(t: &TypeInfo) -> Result<Code, Error> {
+    let body = t.each_variant(|v| {
+        let name = v.name().to_string();
+        let mut calls: Vec<Code> = Vec::new();
+        for b in v.bindings().iter() {
+            if v.kind() == Kind::Named {
+                let key = b.field().ident().to_string();
+                calls.push(quote`__w.field(${key}, &${b});`);
+            } else {
+                calls.push(quote`__w.field(&${b});`);
             }
         }
-    });
-    `${t.header("std::fmt::Debug")} { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { ${body} } }\n`.to_string()
+        Ok(match v.kind() {
+            Kind::Unit => quote`f.write_str(${name})`,
+            Kind::Tuple => quote`let mut __w = f.debug_tuple(${name}); ${calls} __w.finish()`,
+            Kind::Named => quote`let mut __w = f.debug_struct(${name}); ${calls} __w.finish()`,
+        })
+    })?;
+    Ok(t.impl_for("std::fmt::Debug", quote`fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { ${body} }`))
+}
+
+// #[derive(FromAttrs)] (std::derive): a struct with named fields made from
+// an attribute's arguments, each field from the key of its name by its
+// type's FromAttrValue. (The checker reports other items.)
+fn from_attrs(t: &TypeInfo) -> Result<Code, Error> {
+    if t.is_enum() || t.variants()[0].kind() != Kind::Named { return Ok(Code::new()); }
+    let mut inits: Vec<Code> = Vec::new();
+    for f in t.fields().iter() {
+        let name = f.ident();
+        let key = name.to_string();
+        let ty = f.ty();
+        inits.push(quote`${name}: __args.get::<${ty}>(${key})?,`);
+    }
+    let tn = t.name();
+    Ok(t.impl_for("std::derive::FromAttrs", quote`fn from_attrs(__args: &mut std::derive::AttrArgs) -> Result<Self, std::derive::Error> { Ok(${tn} { ${inits} }) }`))
 }
