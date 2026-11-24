@@ -48,12 +48,65 @@ fn add64(a: u64, b: u64) -> u64 { crate::intrinsics::wrapping_add(a, b) }
 fn rotr32(x: u32, n: u32) -> u32 { x >> n | x << (32 - n) }
 fn rotr64(x: u64, n: u64) -> u64 { x >> n | x << (64 - n) }
 
+// SHA-256 on the CPU's instructions (arm64's SHA2, x86's SHA extensions).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[asm]
+fn sha256_blocks(h: *mut u32, data: *const u8, n: usize, k: *const u32);
+
+#[cfg(target_arch = "x86_64")]
+#[asm]
+fn cpuid7_ebx() -> u64;
+
+#[cfg(target_arch = "x86_64")]
+#[asm]
+fn cpuid1_ecx() -> u64;
+
+// SHA (leaf 7), SSSE3 and SSE4.1 (leaf 1), as Go.
+#[cfg(target_arch = "x86_64")]
+fn detect() -> bool { (cpuid7_ebx() & (1 << 29)) != 0 && (cpuid1_ecx() & (1 << 9)) != 0 && (cpuid1_ecx() & (1 << 19)) != 0 }
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn detect() -> bool { true }
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+extern "C" {
+    #[nonblocking]
+    fn getauxval(t: u64) -> u64;
+}
+
+// AT_HWCAP: HWCAP_SHA2 (bit 6).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn detect() -> bool { (unsafe { getauxval(16) } & (1 << 6)) != 0 }
+
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))))]
+fn detect() -> bool { false }
+
+static HW: crate::sync::LazyLock<bool> = crate::sync::LazyLock::new(detect_now);
+
+// (NAVI_NOAES=1: software, as for AES.)
+fn detect_now() -> bool {
+    if crate::env::var("NAVI_NOAES").is_ok() { return false; }
+    detect()
+}
+
+// The blocks on the CPU's instructions, if it has them.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn hw_blocks(h: &mut [u32; 8], data: &[u8], at: usize, n: usize) -> bool {
+    if !*crate::sync::LazyLock::force(&HW) { return false; }
+    if n > 0 { unsafe { sha256_blocks(h.as_mut_ptr(), data.as_ptr().add(at), n, K256.as_ptr()) }; }
+    true
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn hw_blocks(h: &mut [u32; 8], data: &[u8], at: usize, n: usize) -> bool { false }
+
 #[derive(Clone)]
 pub(crate) struct Core256 { h: [u32; 8] }
 
 impl BlockCore for Core256 {
     const BLOCK: usize = 64;
     fn compress(&mut self, data: &[u8], at: usize, n: usize) {
+        if hw_blocks(&mut self.h, data, at, n) { return; }
         let mut w = [0u32; 64];
         let mut a0 = self.h[0];
         let mut b0 = self.h[1];

@@ -248,6 +248,7 @@ API 照 base64 0.22（`Engine`）、hex、RustCrypto（`Digest`、`Mac`、`Hmac<
 | base64 的自定义 `GeneralPurpose` 配置、`read`/`write` 包装器 | 有 | 只有四个预设引擎（`STANDARD`、`STANDARD_NO_PAD`、`URL_SAFE`、`URL_SAFE_NO_PAD`） | 暂不需要 |
 | crc32 的 `Hasher::new_with_initial` | 有 | 有；没有 SIMD 加速 | — |
 | AEAD（`aead`、`aes`、`aes-gcm`、`chacha20poly1305`、`hkdf` crate） | 密钥、nonce、标签是定长数组（`GenericArray`），`encrypt_in_place_detached` 返回 `Tag` | `crypto::aead`、`crypto::aes`、`crypto::aes_gcm`、`crypto::chacha20poly1305`、`crypto::hkdf`，用 `&[u8]`，长度不对返回错误；`encrypt_in_place_detached` 返回 `Vec<u8>` 的标签 | 没有定长数组输出 |
+| SHA-256 的实现 | sha2 crate 有 CPU 指令时用指令 | 相同：arm64 的 SHA2 指令、x86 的 SHA 扩展（`.s` 汇编，同 Go）；M4 上约 2.8 GB/s（软件约 0.16 GB/s）；`NAVI_NOAES=1` 也让它走软件 | — |
 | AES、AES-GCM 的实现 | 有 CPU 指令时用指令，否则软件 | 相同：arm64 的 AES/PMULL、x86 的 AES-NI/PCLMULQDQ 用 `.s` 汇编（docs/asm.md），计数器模式和 GHASH 都在汇编里（M4 上 AES-128-GCM 约 1.9 GB/s）；软件路径的 GHASH 是恒定时间的（BearSSL ctmul64），AES 查表；`NAVI_NOAES=1` 强制走软件 | — |
 | ChaCha20-Poly1305 | 有 SIMD 汇编 | 纯软件（M4 上约 40 MB/s，待优化） | 先求正确 |
 | X25519（`x25519-dalek`） | `StaticSecret`、`PublicKey`、`SharedSecret`、`x25519` | `crypto::x25519`，相同；恒定时间（51 位分肢，蒙哥马利阶梯） | — |
