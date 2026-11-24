@@ -18,26 +18,28 @@
 派生宏是库 crate 里一个带 `#[derive_macro]` 的函数，返回生成的代码：
 
 ```navi
-use std::derive::{TypeInfo, Shape, Code, Error, quote};
+use std::derive::{TypeInfo, Code, Error, FromAttrs, quote};
+
+// 字段属性 #[json(rename = "...", skip)] 的形状：解析和报错由 FromAttrs 生成。
+#[derive(FromAttrs)]
+struct JsonField { rename: Option<String>, skip: bool }
 
 #[derive_macro(Serialize, attrs = [json])]
 pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
-    let body = match t.shape() {
-        Shape::Struct(fields) => {
-            let keys = fields.iter().filter(|f| !f.has_attr("json", "skip")).map(|f| {
-                let key = f.attr_str("json", "rename").unwrap_or(f.name());
-                quote`w.key(${key}); self.${f.ident()}.serialize(w);`.at(f)
-            });
-            quote`w.begin_object(); ${keys} w.end_object();`
-        }
-        Shape::Enum(variants) => { /* 按变体生成 match */ }
-        Shape::Unit => quote`w.null();`,
-    };
-    Ok(quote`
-        impl${t.generics()} ::myjson::Serialize for ${t.self_type()} ${t.where_clause("::myjson::Serialize")} {
-            fn serialize(&self, w: &mut ::myjson::Writer) { ${body} }
-        }
-    `)
+    // 结构体、元组结构体、枚举一样写：each_variant 生成 match 和每个字段的绑定。
+    let body = t.each_variant(|v| {
+        let fields = v.bindings().try_filter_map(|b| {
+            let a: JsonField = b.field().attrs("json")?;
+            if a.skip { return Ok(None); }
+            let key = a.rename.unwrap_or(b.field().name());
+            Ok(Some(quote`w.key(${key}); ${b}.serialize(w);`))
+        })?;
+        Ok(quote`w.begin_object(); ${fields} w.end_object();`)
+    })?;
+    // impl 头（泛型参数、给类型参数加的约束）由 impl_for 生成。
+    Ok(t.impl_for(quote`::myjson::Serialize`, quote`
+        fn serialize(&self, w: &mut ::myjson::Writer) { ${body} }
+    `))
 }
 ```
 
@@ -62,6 +64,15 @@ pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
 
 要生成的代码里本身有模板字符串时，用 spec 已有的转义：`` \` `` 和 `\${`。
 
+**片段先存进变量**（同 Rust：`quote!` 里不套 `quote!`，先生成 `TokenStream` 再用 `#body` 插入）：`${}` 里只写普通表达式，不写模板。每个片段是一个 `Code` 值，存进变量后在外层插入：
+
+```navi
+let fields = t.each_construct(|b| quote`${b}.clone()`);
+t.impl_for(quote`::std::clone::Clone`, quote`fn clone(&self) -> Self { ${fields} }`)
+```
+
+闭包里的 `quote` 不在任何 `${}` 里。词法分析器不需要支持模板里套模板。
+
 **位置映射到用户代码**（同 Rust `quote!` 保留 span）：
 
 - `Ident`、`TypeRef`、`Field`、`Generics` 等来自用户代码的值，插进去后生成的 token 保留它们在用户源文件里的位置。比如字段类型没有实现 `Serialize`，`self.${f.ident()}.serialize(w)` 的错误指向用户结构体里的那个字段。
@@ -72,6 +83,20 @@ pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
 **语法提前检查**：编译宏所在的 crate 时，编译器检查每个 `quote` 模板本身能否组成合法的语法片段（括号配对、插值所在的位置），错误在写宏时就报，不用等展开。
 
 **名字解析**：navi 没有卫生宏，生成的代码放在类型所在的模块里解析。宏里引用的外部条目要写完整路径（`::myjson::Serialize`，`::std::fmt::Debug`），和现在内置 derive 的做法一样。
+
+## 写宏的辅助
+
+写派生宏的时间大多不花在拼代码上，而在下面几件事上（Rust 里分别靠 synstructure、darling 和 cargo expand），这里都内置：
+
+- **按绑定遍历**：结构体、元组结构体、枚举不用分别处理，也不用手写解构模式。
+  - `t.each(|b| ...)`：生成 `match self { 模式 => { 每个绑定的代码 } ... }`，`b` 插入时是那个字段的绑定。
+  - `t.each_variant(|v| ...)`：按变体生成，`v.bindings()` 是它的字段绑定，`v.name()` 是变体名。
+  - `t.each_construct(|b| ...)`：生成构造同一变体的表达式（`Clone`、`Default` 这类）。
+  - 两个值一起比较时（`PartialEq`、`Ord`），`t.each_pair(other, |a, b| ...)` 同时解构两边。
+- **impl 头**：`t.impl_for(trait, items)` 生成 `impl<...> trait for Self<...> where ...`，类型参数自动加上这个 trait 的约束（同 Rust 的 derive）；`impl_for_with(trait, bounds, items)` 自己给约束。
+- **属性解析**：`#[derive(FromAttrs)]` 描述一个属性的形状（`Option<T>` 是可选的键，`bool` 是标志，其余必填），`f.attrs::<T>("json")` 解析成它；未知的键、缺少的键、类型不对都自动报错，位置在属性上。`FromAttrs` 本身是内置派生。
+- **查看展开结果**：`navi expand <crate> [类型]` 打印派生展开后的代码（格式化后），相当于 `cargo expand`。
+- **测试**：宏可以在普通的 `#[test]` 里调用：`TypeInfo::of::<T>()` 由运行期反射构造，`code.to_string()` 得到格式化后的文本用来比较。
 
 ## 宏能看到什么：`std::derive`
 
@@ -127,9 +152,9 @@ pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
 
 ## 分步计划（每一步都能单独验证和提交）
 
-1. **`std::derive` 的接口和编译器里的展开流程**：`TypeInfo`、`Code` 和带标签的模板 `quote`（解析、插值、位置），收集之后、检查函数体之前展开，生成的条目加进模块。先用一个内置的测试派生验证。
+1. **`std::derive` 的接口和编译器里的展开流程**：`TypeInfo`、`Code` 和带标签的模板 `quote`（解析、插值、位置），按绑定遍历和 `impl_for`，收集之后、检查函数体之前展开，生成的条目加进模块。先用一个内置的测试派生验证。
 2. **内置派生改写**：八个派生逐个改成生成源码；每改一个，跑全部测试，并比较改前改后的输出；全部改完后删掉 shims 里的派生和 builtin 里的特殊处理。自举定点照常检查。
-3. **用户的派生宏**：`#[derive_macro]`、派生命名空间的名字解析、宏程序的编译和调用、属性命名空间的检查和报错。
+3. **用户的派生宏**：`#[derive_macro]`、派生命名空间的名字解析、宏程序的编译和调用、属性命名空间的检查和报错，`FromAttrs`，`navi expand`，`TypeInfo::of` 用于测试。
 4. **缓存和导出数据**：展开结果的缓存键、存进 `.navih`。
 5. **LSP**：跳转、悬停显示展开结果、错误位置。
 6. **用例**：`compiler/src/syntax/astcodec.navi` 改成 `#[derive(Encode, Decode)]`，去掉 `tools/gen_astcodec.py`；std 里加一个 JSON 的 `Serialize`/`Deserialize` 派生。
