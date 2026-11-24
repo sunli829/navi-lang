@@ -544,7 +544,7 @@ let s: String = p.to_string();
 
 | 属性 | 作用 |
 |---|---|
-| `#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]` | 编译器内置的派生；另有 `Serialize`、`Deserialize`（`std::serde`）和 `FromAttrs`（`std::derive`），以及用户的派生宏 |
+| `#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]` | 编译器内置的派生（同 Rust）；`Serialize`、`Deserialize`（`std::serde`）、`FromAttrs`（`std::derive`）和用户的派生宏要先 `use` |
 | `#[derive_macro(Name, attrs = [ns, ...])]` | 把库 crate 里的一个 `pub fn(&std::derive::TypeInfo) -> Result<Code, Error>` 定义成派生宏 `Name`，`attrs` 是它接受的字段和类型属性（docs/derive.md）；结构体、枚举、变体、字段上编译器不认识的属性必须有某个派生接受，否则报错 |
 | `#[test]`、`#[bench]` | 只有 `navi test` / `navi bench` 才会编译；`navi test` 运行测试时设置环境变量 `NAVI` 为 navi 自身的路径（同 Cargo 的 `CARGO`），测试可以用它编译程序 |
 | `#[should_panic]`、`#[should_panic(expected = "...")]` | 测试必须 panic（同 Rust），给了 `expected` 时 panic 信息必须包含它 |

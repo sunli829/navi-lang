@@ -11,7 +11,7 @@
 和 Rust 过程宏的区别：
 
 - 宏拿到的不是 token 流，而是类型检查器收集好的结构：字段、字段类型、泛型、属性，还能查询某个类型是否实现了某个 trait。
-- 宏只能生成 impl 块（辅助函数写成 impl 里的关联函数），不能定义新类型、不能改写原来的代码。展开一轮就结束，不需要反复迭代。
+- 宏生成 impl 块，以及它自己要用的辅助类型和函数（如 serde 的 visitor；名字自己起，别和用户的冲突），不能生成 use、mod、extern，不能改写原来的代码。展开一轮就结束，不需要反复迭代。
 - 展开结果按输入缓存，并存进导出数据（`.navih`，见 docs/crates.md），下游和重新编译都不用再展开。
 
 ## 定义和使用
@@ -47,7 +47,7 @@ pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
 - `#[derive_macro(Name, attrs = [ns, ...])]`：`Name` 是 `#[derive(...)]` 里写的名字；`attrs` 是这个宏认领的字段和类型属性的命名空间（`#[json(...)]`）。没有被任何派生认领的属性报错，拼错的属性不会被悄悄忽略。
 - 使用：派生名和普通条目一样经 `use` 引入（`use myjson::Serialize;`），然后 `#[derive(Serialize)]`，也可以写路径 `#[derive(myjson::Serialize)]`。没有全局注册表；同名的 trait 和派生宏可以从同一个路径引入（类型命名空间里的 trait，派生命名空间里的宏）。
 - 宏函数和到它的各级模块都要是 `pub`；宏只能在别的 crate 里用（宏所在的 crate 要先编成程序）。
-- 内置派生不用引入，写法不变。模块里显式引入的同名派生宏（`use myjson::Serialize;`）优先；glob 引入不会遮住内置派生。
+- 内置派生（Rust 的那八个：`Clone`、`Debug`、`PartialEq`、`Eq`、`PartialOrd`、`Ord`、`Hash`、`Default`）不用引入，写法不变。`Serialize`、`Deserialize`（`std::serde`）和 `FromAttrs`（`std::derive`）是 std 里的派生宏，和 Rust 一样要引入（`use std::serde::{Serialize, Deserialize};` 同时引入 trait 和宏）。模块里显式引入的同名派生宏（`use myjson::Serialize;`）优先；glob 引入不会遮住内置派生。
 
 ## 生成代码：`quote`
 
@@ -98,7 +98,7 @@ t.impl_for("std::clone::Clone", body)
   - `t.each_construct(|b| ...)`：生成构造同一变体的表达式（`Clone` 这类）。
   - 两个值一起比较时（`PartialEq`、`Ord`），`t.each_pair(other, |a, b| ..., differ)` 同时解构两边，变体不同时是 `differ`。
 - **impl 头**：`t.impl_for("path::Trait", items)` 生成 `impl<...> path::Trait for Type<...> where ...`，类型参数自动加上这个 trait 的约束（同 Rust 的 derive）；`impl_for_with(trait, bound, items)` 给类型参数加的是 `bound`（空代码就不加）。
-- **属性解析**：`#[derive(FromAttrs)]` 描述一个属性的形状（具名字段的结构体，每个字段按它的类型的 `FromAttrValue` 取同名的键，同 darling 的 `FromMeta`：`from_value` 是 `key = value`，`from_word` 是只写了键（`bool` 是 true），`from_missing` 是没写（`Option` 是 None，`bool` 是 false，其余报缺少）；派生不看类型的名字），`f.parse_attrs::<T>("json")`（字段、变体、类型都有）把所有 `#[json(...)]` 的参数解析成它；未知的键、重复的键、缺少的键、值的类型不对都自动报错，位置在属性上。值可以是 `String`、`bool`、`i64`、`i32`、`usize`，或 `std::derive::Raw`（路径等，照写的文本）。`FromAttrs` 本身是内置派生。
+- **属性解析**：`#[derive(FromAttrs)]` 描述一个属性的形状（具名字段的结构体，每个字段按它的类型的 `FromAttrValue` 取同名的键，同 darling 的 `FromMeta`：`from_value` 是 `key = value`，`from_word` 是只写了键（`bool` 是 true），`from_missing` 是没写（`Option` 是 None，`bool` 是 false，其余报缺少）；派生不看类型的名字），`f.parse_attrs::<T>("json")`（字段、变体、类型都有）把所有 `#[json(...)]` 的参数解析成它；未知的键、重复的键、缺少的键、值的类型不对都自动报错，位置在属性上。值可以是 `String`、`bool`、`i64`、`i32`、`usize`，或 `std::derive::Raw`（路径等，照写的文本）。`FromAttrs` 本身是 std 里的派生宏（`std::derive::from_attrs_derive`）。
 - **查看展开结果**：`navi expand [-p 名字] [目录或文件] [类型]` 打印 crate（或其中某个类型）的派生展开后的代码（格式化后），相当于 `cargo expand`；内置派生的也打印。
 - **测试**：宏可以在普通的 `#[test]` 里调用：`TypeInfo::of::<T>()` 由编译器内建函数（`type_info`）在编译期构造，`code.text()` 是生成的文本，用来比较（`tests/run/derive_api.navi`）。
 
@@ -120,9 +120,9 @@ t.impl_for("std::clone::Clone", body)
 1. 一个 crate 的条目收集完时，内置派生马上展开，除非模块显式引入了同名的东西（可能是派生宏）。
 2. 剩下的名字等所有 crate 的 `use` 解析完，在派生命名空间（`MACRO_NS`）里找：找到派生宏就按宏 crate 分组；找不到但是内置的名字，就按内置展开；都不是就报错。
 3. 每个宏 crate 编成一个程序，一次收到它所有的请求，返回生成的代码或错误。
-4. 生成的代码作为一个文件解析成条目，只允许 impl 块。文件名是原文件名加上 `[derive X for T@位置]`，所以生成条目的稳定符号名（symbols::def_id）不会和别的类型的重复，crate 换了位置也不变；文件的位置映射回用户的文件（`source::Origin`）。
+4. 生成的代码作为一个文件解析成条目（不能有 use、mod、extern）。文件名是原文件名加上 `[derive X for T@位置]`，所以生成条目的稳定符号名（symbols::def_id）不会和别的类型的重复，crate 换了位置也不变；文件的位置映射回用户的文件（`source::Origin`）。
 5. 条目收集进类型所在的模块，之后的名字解析、收集签名、检查函数体、MIR、代码生成对它们一视同仁。
-6. 结构体、枚举、变体、字段上编译器不认识的属性，要有某个派生接受（宏的 `attrs`，内置的 `Serialize`、`Deserialize` 接受 `serde`），否则报错。
+6. 结构体、枚举、变体、字段上编译器不认识的属性，要有某个派生接受（宏的 `attrs`，如 std 的 `Serialize`、`Deserialize` 接受 `serde`），否则报错。
 
 宏看到的是语法：字段的类型是写出来的样子（结构化的，可以拆开路径、泛型参数、引用、数组、元组），不是类型检查后的类型。所以 `implements` 这类需要类型信息的查询暂时没有；以后需要时，作为类型收集之后的第二阶段再加。
 
@@ -171,7 +171,7 @@ t.impl_for("std::clone::Clone", body)
 - `ser`：`Serialize`（`fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error>`）、`Serializer`（`serialize_bool`/`i64`/`str`/`none`/`some`/`unit`/`seq`/`map`/`struct`/`tuple_struct`/各种变体……），以及 `SerializeSeq`、`SerializeMap`、`SerializeStruct`、`SerializeTuple`、`SerializeTupleStruct`、`SerializeTupleVariant`、`SerializeStructVariant`；`ser::Error`。
 - `de`：`Deserialize`（`fn deserialize<D: Deserializer>(d: D) -> Result<Self, D::Error>`）、`Deserializer`（`deserialize_any`/`i64`/`str`/`seq`/`map`/`struct`/`enum`/`identifier`/`ignored_any`……）、`Visitor`、`SeqAccess`、`MapAccess`、`EnumAccess`、`VariantAccess`；`de::Error`。
 - std 的类型手写实现：整数、浮点、`bool`、`char`、`String`、`&str`（只序列化）、`Option`、`Vec`、数组、元组、`HashMap`、`BTreeMap`、`()`、引用。
-- `#[derive(Serialize, Deserialize)]` 是内置派生（和 `Debug` 一样写在编译器里），生成的代码和 serde_derive 的一样，表示方式也一样：结构体是 map，元组结构体是 seq，单字段元组结构体是它的字段，枚举默认外部标记（`"Variant"` 或 `{"Variant": ...}`）。现在 `std::json` 的映射就是这样，所以数据格式不变。
+- `#[derive(Serialize, Deserialize)]` 是 std 里的派生宏（`std::serde::derive`，原来写在编译器里，2026-11-24 搬出来，同 Rust 的 serde_derive；std 自己的类型不用它们，所以 std 可以定义它们），生成的代码和 serde_derive 的一样，表示方式也一样：结构体是 map，元组结构体是 seq，单字段元组结构体是它的字段，枚举默认外部标记（`"Variant"` 或 `{"Variant": ...}`）。现在 `std::json` 的映射就是这样，所以数据格式不变。
 - 属性（`#[serde(...)]`，serde 的常用子集）：`rename`、`rename_all`、`skip`、`skip_serializing_if`、`default`、`deny_unknown_fields`、`tag`/`content`/`untagged`（枚举表示），以后按需要再加。
 - `std::json`：`to_string`、`to_string_pretty`、`to_writer`、`from_str`、`from_reader`，`T: Serialize` / `T: Deserialize`；`json::Value` 也实现两者（任意 JSON）。
 - `std::csv`：按 serde 读写记录（同 Rust 的 csv crate）。
