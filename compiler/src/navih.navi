@@ -1,0 +1,408 @@
+//! A crate's export data (docs/crates.md step 4): what a build of a
+//! program needs of a crate compiled alone, read instead of the crate's
+//! source. For now its files' syntax trees (crate::syntax::astcodec), with
+//! the bodies of the functions a user of the crate never builds left out:
+//! a crate compiled alone has them in its object (crate::libcache), and
+//! its users call them. What a user may build is kept: generic functions
+//! (their own type parameters, an impl's or a trait's, impl Trait
+//! parameters), const fns, functions returning impl Trait (their hidden
+//! types come from the body) and functions declaring items in their body.
+//! Resolution and collection then run on these trees as on parsed ones,
+//! minus the lexing, parsing and the resolution of the bodies left out.
+//!
+//! A file: the magic, the SHA-256 of the rest, then for each source file
+//! its path in the crate, its line starts and its tree. (Not its name: the
+//! crate may be elsewhere now, and a file's name is the crate's directory
+//! and the path, as resolve::load makes it, which symbols::def_id relies
+//! on.)
+
+use std::collections::HashMap;
+use crate::syntax::ast::*;
+use crate::syntax::source::{File, Pos};
+use crate::syntax::token::{Token, Kind};
+use crate::syntax::astcodec::{self, Seen, new_seen};
+use crate::syntax::walk::{self, Visit};
+use crate::sha256;
+use crate::util;
+
+const MAGIC: &str = "navih1\n";
+
+/// The writing of trees.
+pub struct Enc {
+    pub b: Vec<u8>,
+    // The nodes written (by id): their number among their kind's.
+    seen: HashMap<u32, u32>,
+    counts: Vec<u32>,
+    // The functions whose bodies are written (by item id), and how deep
+    // the writing is inside one (everything in a body written is).
+    keep: HashMap<u32, bool>,
+    inside: u32,
+}
+
+impl Enc {
+    pub fn u(&mut self, v: u32) {
+        let mut x = v;
+        while x >= 0x80 {
+            self.b.push((x & 0x7f) as u8 | 0x80);
+            x = x >> 7;
+        }
+        self.b.push(x as u8);
+    }
+
+    pub fn i(&mut self, v: i32) { self.u(((v << 1) ^ (v >> 31)) as u32); }
+
+    pub fn pos(&mut self, p: Pos) { self.i(p); }
+
+    pub fn b(&mut self, v: bool) { self.b.push(if v { 1 } else { 0 }); }
+
+    pub fn k(&mut self, v: Kind) { self.b.push(v as u8); }
+
+    pub fn s(&mut self, v: String) { self.s_str(v.as_str()); }
+
+    pub fn s_str(&mut self, v: &str) {
+        self.u(v.len() as u32);
+        self.b.extend_from_slice(v.as_bytes());
+    }
+
+    /// Whether node id was written before (then a reference to it is).
+    pub fn again(&mut self, id: u32) -> bool {
+        if let Some(i) = self.seen.get(&id) {
+            let n = *i;
+            self.b(true);
+            self.u(n);
+            return true;
+        }
+        self.b(false);
+        false
+    }
+
+    /// Node id, of the given kind, is written.
+    pub fn done(&mut self, id: u32, kind: usize) {
+        while self.counts.len() <= kind { self.counts.push(0); }
+        self.seen.insert(id, self.counts[kind]);
+        self.counts[kind] += 1;
+    }
+
+    /// A function's body: none (0), written (1) or left out (2, with where
+    /// its braces were).
+    pub fn fn_body(&mut self, f: &FnDecl) {
+        let body = match f.body {
+            Some(b) => b,
+            None => {
+                self.u(0);
+                return;
+            }
+        };
+        if self.inside > 0 || self.keep.contains_key(&f.base.id) || f.elided {
+            if f.elided { panic(`navih: the body of ${f.name.value} was left out already`); }
+            self.u(1);
+            self.inside += 1;
+            astcodec::enc_Expr(self, body);
+            self.inside -= 1;
+            return;
+        }
+        self.u(2);
+        let (lo, hi) = match &body.kind {
+            ExprKind::Block(blk) => (blk.lbrace, blk.rbrace),
+            _ => (body.pos(), body.pos()),
+        };
+        self.pos(lo);
+        self.pos(hi);
+    }
+}
+
+pub fn enc_Token(e: &mut Enc, t: &Token) {
+    e.k(t.kind);
+    e.i(t.pos);
+    e.i(t.end);
+    e.s_str(t.text);
+}
+
+/// The reading of trees.
+pub struct Dec {
+    pub b: Vec<u8>,
+    pub at: usize,
+    pub bad: bool,
+    pub seen: Seen,
+}
+
+impl Dec {
+    pub fn u(&mut self) -> u32 {
+        let mut v = 0u32;
+        let mut shift = 0u32;
+        loop {
+            if self.at >= self.b.len() || shift > 28 {
+                self.bad = true;
+                return 0;
+            }
+            let c = self.b[self.at];
+            self.at += 1;
+            v = v | ((c & 0x7f) as u32) << shift;
+            if c < 0x80 { return v; }
+            shift += 7;
+        }
+    }
+
+    pub fn i(&mut self) -> i32 {
+        let z = self.u();
+        ((z >> 1) as i32) ^ -((z & 1) as i32)
+    }
+
+    pub fn pos(&mut self) -> Pos { self.i() }
+
+    pub fn b(&mut self) -> bool {
+        if self.at >= self.b.len() {
+            self.bad = true;
+            return false;
+        }
+        self.at += 1;
+        self.b[self.at - 1] != 0
+    }
+
+    pub fn k(&mut self) -> Kind {
+        if self.at >= self.b.len() {
+            self.bad = true;
+            return 0;
+        }
+        self.at += 1;
+        self.b[self.at - 1]
+    }
+
+    pub fn s(&mut self) -> String {
+        let n = self.u() as usize;
+        if n > self.b.len() - self.at {
+            self.bad = true;
+            return String::new();
+        }
+        let v = self.b[self.at..self.at + n].to_vec();
+        self.at += n;
+        match String::from_utf8(v) {
+            Ok(s) => s,
+            Err(_) => {
+                self.bad = true;
+                String::new()
+            }
+        }
+    }
+
+    pub fn s_str(&mut self) -> &str {
+        let s = self.s();
+        s.as_str()
+    }
+
+    /// The index of a node read before, if the next one is a reference to
+    /// it.
+    pub fn again(&mut self) -> Option<usize> {
+        if self.b() { Some(self.u() as usize) } else { None }
+    }
+
+    /// A function's body (see Enc::fn_body) and whether it was left out.
+    pub fn fn_body(&mut self) -> (Option<&Expr>, bool) {
+        match self.u() {
+            0 => (None, false),
+            1 => (Some(astcodec::dec_Expr(self)), false),
+            _ => {
+                let lbrace = self.pos();
+                let rbrace = self.pos();
+                let blk = &mut Block { lbrace, rbrace, is_unsafe: false, stmts: Vec::new(), tail: None };
+                (Some(expr(ExprKind::Block(blk))), true)
+            }
+        }
+    }
+}
+
+pub fn dec_val_Token(d: &mut Dec) -> Token {
+    let kind = d.k();
+    let pos = d.i();
+    let end = d.i();
+    let text = d.s_str();
+    Token { kind, pos, end, text }
+}
+
+// The functions of items whose bodies a user of the crate may build (see
+// the top).
+fn keep_items(items: &Vec<Item>, generic: bool, keep: &mut HashMap<u32, bool>) {
+    for it in items.iter() {
+        match it {
+            Item::Fn(f) => {
+                if generic || f.is_const || f.generics.params.len() > 0 || has_impl_opt(f.result) || has_items(*f) {
+                    keep.insert(f.base.id, true);
+                    continue;
+                }
+                for p in f.params.iter() {
+                    if let Some(t) = p.ty { if has_impl(t) { keep.insert(f.base.id, true); } }
+                }
+            }
+            Item::Impl(im) => keep_items(&im.items, generic || im.generics.params.len() > 0, keep),
+            Item::Trait(tr) => keep_items(&tr.items, true, keep),
+            Item::Mod(m) => keep_items(&m.items, generic, keep),
+            _ => {}
+        }
+    }
+}
+
+// Whether a function's body declares items (an impl there counts for the
+// whole program).
+fn has_items(f: &FnDecl) -> bool {
+    let b = match f.body { Some(b) => b, None => return false };
+    let mut found = false;
+    walk::inspect_expr(b, |v: Visit| -> bool {
+        if let Visit::Stmt(s) = v {
+            if let Stmt::Item(_) = s { found = true; }
+        }
+        !found
+    });
+    found
+}
+
+fn has_impl_opt(t: Option<&Type>) -> bool {
+    match t { Some(x) => has_impl(x), None => false }
+}
+
+// Whether a type mentions impl Trait.
+fn has_impl(t: &Type) -> bool {
+    match &t.kind {
+        TypeKind::Impl { .. } => true,
+        TypeKind::Ref { elem, .. } => has_impl(*elem),
+        TypeKind::Ptr { elem, .. } => has_impl(*elem),
+        TypeKind::Slice { elem, .. } => has_impl(*elem),
+        TypeKind::Array { elem, .. } => has_impl(*elem),
+        TypeKind::Tuple { elems, .. } => {
+            for e in elems.iter() { if has_impl(*e) { return true; } }
+            false
+        }
+        TypeKind::Fn { params, result, .. } => {
+            for p in params.iter() { if has_impl(*p) { return true; } }
+            has_impl_opt(*result)
+        }
+        TypeKind::Path(p) => {
+            for seg in p.segments.iter() {
+                if let Some(a) = seg.args {
+                    for x in a.args.iter() { if has_impl(*x) { return true; } }
+                    for bd in a.bindings.iter() { if has_impl(bd.ty) { return true; } }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// The export data of a crate's files (by path in the crate).
+pub fn encode(files: &HashMap<String, &SourceFile>) -> Vec<u8> { encode_with(files, false) }
+
+/// encode, every body kept if all (to test the encoding).
+pub fn encode_with(files: &HashMap<String, &SourceFile>, all: bool) -> Vec<u8> {
+    let mut keep: HashMap<u32, bool> = HashMap::new();
+    let mut paths: Vec<String> = Vec::new();
+    for (p, sf) in files.iter() {
+        paths.push(p.clone());
+        keep_items(&sf.items, all, &mut keep);
+    }
+    paths.sort();
+    let e = &mut Enc { b: Vec::new(), seen: HashMap::new(), counts: Vec::new(), keep, inside: 0 };
+    e.u(paths.len() as u32);
+    for p in paths.iter() {
+        let sf = files[p];
+        e.s_str(p.as_str());
+        let lines = sf.file.line_starts();
+        e.u(lines.len() as u32);
+        let mut prev = 0;
+        for l in lines.iter() {
+            e.u((*l - prev) as u32);
+            prev = *l;
+        }
+        e.u(sf.attrs.len() as u32);
+        for a in sf.attrs.iter() { astcodec::enc_Attr(e, *a); }
+        e.u(sf.items.len() as u32);
+        for it in sf.items.iter() { astcodec::enc_Item(e, it); }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(MAGIC.as_bytes());
+    out.extend_from_slice(&sha256::sum(e.b.as_slice()));
+    out.extend_from_slice(e.b.as_slice());
+    out
+}
+
+/// A crate's files again from its export data, the crate's directory dir
+/// (resolve::Crate::dir) naming them (None: not export data, or damaged).
+pub fn decode(data: Vec<u8>, dir: &str) -> Option<HashMap<String, &SourceFile>> {
+    let head = MAGIC.len() + 32;
+    if data.len() < head || &data[0..MAGIC.len()] != MAGIC.as_bytes() { return None; }
+    let body = data[head..].to_vec();
+    if &sha256::sum(body.as_slice())[0..32] != &data[MAGIC.len()..head] { return None; }
+    let d = &mut Dec { b: body, at: 0, bad: false, seen: new_seen() };
+    let mut out: HashMap<String, &SourceFile> = HashMap::new();
+    let n = d.u();
+    let mut k = 0;
+    while k < n && !d.bad {
+        let p = d.s();
+        let name = util::path_join(dir, p.as_str());
+        let nl = d.u() as usize;
+        let mut lines: Vec<Pos> = Vec::with_capacity(nl);
+        let mut prev = 0;
+        let mut i = 0;
+        while i < nl {
+            prev = prev + d.u() as Pos;
+            lines.push(prev);
+            i += 1;
+        }
+        let file = File::with_lines(name.as_str(), lines);
+        let na = d.u() as usize;
+        let mut attrs: Vec<&Attr> = Vec::with_capacity(na);
+        i = 0;
+        while i < na {
+            attrs.push(astcodec::dec_Attr(d));
+            i += 1;
+        }
+        let ni = d.u() as usize;
+        let mut items: Vec<Item> = Vec::with_capacity(ni);
+        i = 0;
+        while i < ni {
+            items.push(astcodec::dec_val_Item(d));
+            i += 1;
+        }
+        out.insert(p, &SourceFile { file, attrs, items });
+        k += 1;
+    }
+    if d.bad || d.at != d.b.len() { return None; }
+    Some(out)
+}
+
+// The crates whose files come from their export data, by name (set before
+// the front end reads them).
+static mut PRELOADED: HashMap<String, HashMap<String, &SourceFile>> = HashMap::new();
+
+/// Forgets the crates set to come from their export data.
+pub fn clear() { PRELOADED = HashMap::new(); }
+
+/// Crate name's files are to come from export data.
+pub fn preload(name: &str, files: HashMap<String, &SourceFile>) { PRELOADED.insert(name.to_string(), files); }
+
+/// Crate name's files from its export data, if so set.
+pub fn preloaded(name: &str) -> Option<HashMap<String, &SourceFile>> {
+    match PRELOADED.get(&name.to_string()) { Some(f) => Some(f.clone()), None => None }
+}
+
+/// The export data stored under a crate's key (crate::libcache).
+pub fn load(key: &str, dir: &str) -> Option<HashMap<String, &SourceFile>> {
+    let p = path(key)?;
+    let data = std::fs::read(p.as_str()).ok()?;
+    let out = decode(data, dir)?;
+    crate::cache::mark_used(p.as_str());
+    Some(out)
+}
+
+/// Stores a crate's export data under its key.
+pub fn store(key: &str, files: &HashMap<String, &SourceFile>) {
+    let p = match path(key) { Some(p) => p, None => return };
+    let data = encode(files);
+    let tmp = `${p}.${std::process::id()}`.to_string();
+    if std::fs::write(tmp.as_str(), data.as_slice()).is_err() { return; }
+    if std::fs::rename(tmp.as_str(), p.as_str()).is_err() { let _ = std::fs::remove_file(tmp.as_str()); }
+}
+
+fn path(key: &str) -> Option<String> {
+    let d = crate::cache::dir()?;
+    Some(util::path_join(d.as_str(), `${key}.navih`.to_string().as_str()))
+}

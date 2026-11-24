@@ -181,6 +181,7 @@ static START: std::time::Instant = std::time::Instant::now();
 /// Runs the front end over the given crates.
 pub fn check_specs(cfg: Config, specs: &Vec<&CrateSpec>) -> (&mut types::collect::Info, Vec<Error>) {
     phase("start");
+    split_prepare(specs);
     let (res, rerrs) = resolve::resolve(cfg, specs);
     phase("parse+resolve");
     let sink = Sink::new();
@@ -188,6 +189,69 @@ pub fn check_specs(cfg: Config, specs: &Vec<&CrateSpec>) -> (&mut types::collect
     let info = types::collect::collect(res, sink);
     phase("types");
     (info, sink.sorted())
+}
+
+// NAVI_SPLIT=1: the crates compiled alone (every one but the program's,
+// the last), by name: their cache keys (crate::libcache).
+static mut SPLIT_KEYS: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+// NAVI_SPLIT=1: each crate compiled alone gets its key, dependencies first;
+// one whose object and export data are in the cache is to be read from its
+// export data (crate::navih) instead of its source. (Not with
+// NAVI_CHECK_STD=1, which checks every body.)
+fn split_prepare(specs: &Vec<&CrateSpec>) {
+    SPLIT_KEYS = std::collections::HashMap::new();
+    crate::navih::clear();
+    if std::env::var("NAVI_SPLIT").is_err() || specs.len() == 0 { return; }
+    let preload = std::env::var("NAVI_CHECK_STD").is_err();
+    let mut by_name: std::collections::HashMap<String, &CrateSpec> = std::collections::HashMap::new();
+    for s in specs.iter() { by_name.insert(s.name.clone(), *s); }
+    let top = specs[specs.len() - 1];
+    let target = target_name();
+    // Depth first, dependencies by name; a crate after its dependencies.
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut stack: Vec<(&CrateSpec, bool)> = Vec::new();
+    stack.push((top, false));
+    while let Some((c, after)) = stack.pop() {
+        let deps = spec_deps(c);
+        if after {
+            if c.name == top.name { continue; }
+            let mut dep_keys: Vec<String> = Vec::new();
+            for d in deps.iter() {
+                match SPLIT_KEYS.get(d) { Some(k) => dep_keys.push(`${d} ${k}`.to_string()), None => dep_keys.push(`${d} -`.to_string()) }
+            }
+            dep_keys.sort();
+            let root = util::path_clean(c.fs_root.as_str());
+            let key = match crate::libcache::key(c.name.as_str(), root.as_str(), target.as_str(), &dep_keys) { Some(k) => k, None => continue };
+            if preload && crate::libcache::exists(key.as_str()) {
+                // (Named as resolve names the files it reads.)
+                let dir = if c.dir.len() == 0 { c.name.clone() } else { c.dir.clone() };
+                if let Some(files) = crate::navih::load(key.as_str(), dir.as_str()) { crate::navih::preload(c.name.as_str(), files); }
+            }
+            SPLIT_KEYS.insert(c.name.clone(), key);
+            continue;
+        }
+        if seen.contains_key(&c.name) { continue; }
+        seen.insert(c.name.clone(), true);
+        stack.push((c, true));
+        let mut ds = deps.clone();
+        ds.sort_by(|a, b| b.cmp(a));
+        for d in ds.iter() {
+            if seen.contains_key(d) { continue; }
+            if let Some(s) = by_name.get(d) { stack.push((*s, false)); }
+        }
+    }
+}
+
+// The crates a crate depends on, by name (std for every other).
+fn spec_deps(c: &CrateSpec) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if c.name != "std" { out.push("std".to_string()); }
+    for d in c.deps.iter() {
+        let n = match d.split_once('=') { Some((_, n)) => n.to_string(), None => d.clone() };
+        if !out.contains(&n) { out.push(n); }
+    }
+    out
 }
 
 /// The diagnostics to print (std's warnings left out); whether there are
@@ -337,38 +401,39 @@ pub fn crate_roots(info: &mut types::collect::Info, name: &str) -> Vec<&mut reso
 // when a build (of any program) compiled the same crate the same way, on
 // the same dependencies (crate::libcache).
 fn code_split(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Result<&mut crate::obj::Object, String> {
-    let target = target_name();
     let mut done: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut sums: std::collections::HashMap<String, crate::mir::escape::Summary> = std::collections::HashMap::new();
-    let mut keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut libs: Vec<&mut crate::obj::Object> = Vec::new();
     let order = split_order(info);
     for c in order.iter() {
-        let mut dep_keys: Vec<String> = Vec::new();
-        for (_, d) in c.deps.iter() {
-            match keys.get(&d.name) { Some(k) => dep_keys.push(`${d.name} ${k}`.to_string()), None => dep_keys.push(`${d.name} -`.to_string()) }
-        }
-        dep_keys.sort();
-        let root = `${util::path_clean(c.fs_root.as_str())}/`.to_string();
-        let key = crate::libcache::key(c.name.as_str(), root.as_str(), target.as_str(), dwarf, &dep_keys);
+        let key = SPLIT_KEYS.get(&c.name).map(|k| k.clone());
         let cached = match key { Some(k) => crate::libcache::load(k.as_str()), None => None };
         let (o, s) = match cached {
             Some(x) => x,
             None => {
+                if c.preloaded { return Err(`internal error: crate ${c.name} was read from its export data, but its object is not in the cache`.to_string()); }
                 let roots = crate_roots(info, c.name.as_str());
                 let ext = &mut crate::mir::build::Ext { crates: done.clone(), summaries: sums.clone() };
                 let lib = crate::mir::build::build_program(info, Some(roots.clone()), if done.len() > 0 { Some(ext) } else { None });
                 lazy_errors(info)?;
                 let s = lib.summaries;
                 let plan = crate::codegen::build_library_plan(lib, c.name.as_str(), &roots);
-                let o = backend(plan, dwarf)?;
-                if let Some(k) = key { crate::libcache::store(k.as_str(), o, &s); }
+                let o = backend(plan, true)?;
+                if let Some(k) = key {
+                    crate::libcache::store(k.as_str(), o, &s);
+                    crate::navih::store(k.as_str(), &c.sources);
+                }
                 (o, s)
             }
         };
+        // (Crates are compiled with debug information: left out here if
+        // the program is built without.)
+        if !dwarf {
+            o.lines = Vec::new();
+            o.funcs = Vec::new();
+        }
         for (d, sm) in s.iter() { sums.insert(d.clone(), sm.clone()); }
         done.insert(c.name.clone(), true);
-        keys.insert(c.name.clone(), match key { Some(k) => k, None => "-".to_string() });
         libs.push(o);
         phase(c.name.as_str());
     }
