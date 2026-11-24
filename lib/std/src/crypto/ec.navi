@@ -1,217 +1,53 @@
 //! The NIST prime curves y^2 = x^3 - 3x + b (P-256, P-384), for
-//! crypto::p256 and crypto::p384: points in projective coordinates with
-//! the complete addition formulas of Renes, Costello and Batina (2016,
-//! algorithm 4: no special cases for doubling or the identity), as Go's
-//! crypto/internal/nistec; field and scalars through crypto::nat. Scalar
-//! multiplication is constant-time (double and add always, masked
-//! selects).
+//! crypto::p256 and crypto::p384: the point arithmetic is each curve's
+//! generated module (crypto::nistec_p256, nistec_p384: fixed-size field
+//! elements, complete addition formulas, constant-time windows and a table
+//! of the generator's multiples, as Go's nistec); here are the scalars
+//! (through crypto::nat, modulo the group's order) and ECDSA.
 
 use crate::crypto::nat::Modulus;
+use crate::crypto::{nistec_p256, nistec_p384};
 use crate::hex;
 use crate::rand::rngs::OsRng;
 use crate::rand::RngCore;
 
-/// A point (X : Y : Z), the coordinates in Montgomery form; the identity
-/// is (0 : 1 : 0).
+/// A point: its uncompressed SEC 1 encoding (validated).
 #[derive(Clone)]
 pub struct Point {
-    x: Vec<u64>,
-    y: Vec<u64>,
-    z: Vec<u64>,
+    enc: Vec<u8>,
 }
 
 /// A curve's constants.
 pub struct Curve {
     pub name: &str,
-    p: Modulus,
     n: Modulus,
-    b: Vec<u64>,
-    g: Point,
-    /// (p + 1) / 4, big-endian: square roots (p = 3 mod 4).
-    sqrt_exp: Vec<u8>,
+    size: usize,
+    /// 0: P-256, 1: P-384.
+    kind: u8,
 }
 
 fn h(s: &str) -> Vec<u8> { hex::decode(s).unwrap() }
 
 impl Curve {
-    pub fn new(name: &str, p: &str, n: &str, b: &str, gx: &str, gy: &str) -> Curve {
-        let pm = Modulus::new(h(p).as_slice());
-        let nm = Modulus::new(h(n).as_slice());
-        let bm = pm.to_mont(&pm.from_be(h(b).as_slice()).unwrap());
-        let g = Point { x: pm.to_mont(&pm.from_be(h(gx).as_slice()).unwrap()), y: pm.to_mont(&pm.from_be(h(gy).as_slice()).unwrap()), z: pm.one() };
-        // (p + 1) / 4 on the bytes.
-        let mut e = h(p);
-        let mut i = e.len();
-        let mut carry = 1u16;
-        while i > 0 && carry != 0 {
-            i -= 1;
-            let s = e[i] as u16 + carry;
-            e[i] = s as u8;
-            carry = s >> 8;
-        }
-        let mut rem = 0u16;
-        let mut k = 0;
-        while k < e.len() {
-            let cur = (rem << 8) | (e[k] as u16);
-            e[k] = (cur >> 2) as u8;
-            rem = cur & 3;
-            k += 1;
-        }
-        Curve { name, p: pm, n: nm, b: bm, g, sqrt_exp: e }
+    /// The curve of name ("P-256" or "P-384") and order n (hex).
+    pub fn new(name: &str, n: &str) -> Curve {
+        let kind: u8 = if name == "P-384" { 1 } else { 0 };
+        Curve { name, n: Modulus::new(h(n).as_slice()), size: if kind == 1 { 48 } else { 32 }, kind }
     }
 
     /// The length of a coordinate or a scalar in bytes.
-    pub fn size(&self) -> usize { self.p.byte_len() }
-
-    fn identity(&self) -> Point {
-        let mut zero: Vec<u64> = Vec::new();
-        zero.resize(self.p.limbs(), 0);
-        Point { x: zero.clone(), y: self.p.one(), z: zero }
-    }
-
-    /// p1 + p2 (RCB16 algorithm 4, a = -3).
-    fn add(&self, p1: &Point, p2: &Point) -> Point {
-        let f = &self.p;
-        let mut t0 = f.mont_mul(&p1.x, &p2.x);
-        let mut t1 = f.mont_mul(&p1.y, &p2.y);
-        let mut t2 = f.mont_mul(&p1.z, &p2.z);
-        let mut t3 = f.add(&p1.x, &p1.y);
-        let mut t4 = f.add(&p2.x, &p2.y);
-        t3 = f.mont_mul(&t3, &t4);
-        t4 = f.add(&t0, &t1);
-        t3 = f.sub(&t3, &t4);
-        t4 = f.add(&p1.y, &p1.z);
-        let mut x3 = f.add(&p2.y, &p2.z);
-        t4 = f.mont_mul(&t4, &x3);
-        x3 = f.add(&t1, &t2);
-        t4 = f.sub(&t4, &x3);
-        x3 = f.add(&p1.x, &p1.z);
-        let mut y3 = f.add(&p2.x, &p2.z);
-        x3 = f.mont_mul(&x3, &y3);
-        y3 = f.add(&t0, &t2);
-        y3 = f.sub(&x3, &y3);
-        let mut z3 = f.mont_mul(&self.b, &t2);
-        x3 = f.sub(&y3, &z3);
-        z3 = f.add(&x3, &x3);
-        x3 = f.add(&x3, &z3);
-        z3 = f.sub(&t1, &x3);
-        x3 = f.add(&t1, &x3);
-        y3 = f.mont_mul(&self.b, &y3);
-        t1 = f.add(&t2, &t2);
-        t2 = f.add(&t1, &t2);
-        y3 = f.sub(&y3, &t2);
-        y3 = f.sub(&y3, &t0);
-        t1 = f.add(&y3, &y3);
-        y3 = f.add(&t1, &y3);
-        t1 = f.add(&t0, &t0);
-        t0 = f.add(&t1, &t0);
-        t0 = f.sub(&t0, &t2);
-        t1 = f.mont_mul(&t4, &y3);
-        t2 = f.mont_mul(&t0, &y3);
-        y3 = f.mont_mul(&x3, &z3);
-        y3 = f.add(&y3, &t2);
-        x3 = f.mont_mul(&t3, &x3);
-        x3 = f.sub(&x3, &t1);
-        z3 = f.mont_mul(&t4, &z3);
-        t1 = f.mont_mul(&t3, &t0);
-        z3 = f.add(&z3, &t1);
-        Point { x: x3, y: y3, z: z3 }
-    }
-
-    fn pick(&self, c: u64, a: &Point, b: &Point) -> Point {
-        Point { x: self.p.pick(c, &a.x, &b.x), y: self.p.pick(c, &a.y, &b.y), z: self.p.pick(c, &a.z, &b.z) }
-    }
-
-    /// k * pt (k big-endian bytes), in constant time.
-    fn mul(&self, pt: &Point, k: &[u8]) -> Point {
-        let mut q = self.identity();
-        for byte in k.iter() {
-            let mut i = 8;
-            while i > 0 {
-                i -= 1;
-                q = self.add(&q, &q);
-                let t = self.add(&q, pt);
-                q = self.pick(((*byte >> i as u8) & 1) as u64, &t, &q);
-            }
-        }
-        q
-    }
-
-    /// a * G + b * q for public a and b (variable-time: Shamir's trick,
-    /// one doubling a bit and an addition where either bit is set).
-    fn mul2(&self, a: &[u8], q: &Point, b: &[u8]) -> Point {
-        let gq = self.add(&self.g, q);
-        let mut r = self.identity();
-        let mut i = 0;
-        while i < a.len() {
-            let mut k = 8;
-            while k > 0 {
-                k -= 1;
-                r = self.add(&r, &r);
-                let x = (a[i] >> k as u8) & 1;
-                let y = (b[i] >> k as u8) & 1;
-                if x == 1 && y == 1 { r = self.add(&r, &gq); } else if x == 1 { r = self.add(&r, &self.g); } else if y == 1 { r = self.add(&r, q); }
-            }
-            i += 1;
-        }
-        r
-    }
-
-    // Affine (x, y) in normal form; None for the identity.
-    fn affine(&self, pt: &Point) -> Option<(Vec<u64>, Vec<u64>)> {
-        if self.p.is_zero(&pt.z) { return None; }
-        let zi = self.p.inv(&pt.z);
-        Some((self.p.from_mont(&self.p.mont_mul(&pt.x, &zi)), self.p.from_mont(&self.p.mont_mul(&pt.y, &zi))))
-    }
-
-    // x^3 - 3x + b (Montgomery form).
-    fn rhs(&self, x: &[u64]) -> Vec<u64> {
-        let f = &self.p;
-        let x3 = f.mont_mul(&f.mont_mul(x, x), x);
-        let three_x = f.add(&f.add(x, x), x);
-        f.add(&f.sub(&x3, &three_x), &self.b)
-    }
+    pub fn size(&self) -> usize { self.size }
 
     /// The point of a SEC1 encoding (uncompressed 04 || x || y, or
     /// compressed 02/03 || x), if on the curve (and not the identity).
     pub fn decode(&self, b: &[u8]) -> Option<Point> {
-        let n = self.size();
-        let f = &self.p;
-        if b.len() == 1 + 2 * n && b[0] == 4 {
-            let x = f.to_mont(&f.from_be(&b[1..1 + n])?);
-            let y = f.to_mont(&f.from_be(&b[1 + n..])?);
-            if !f.eq(&f.mont_mul(&y, &y), &self.rhs(&x)) { return None; }
-            return Some(Point { x, y, z: f.one() });
-        }
-        if b.len() == 1 + n && (b[0] == 2 || b[0] == 3) {
-            let x = f.to_mont(&f.from_be(&b[1..])?);
-            let r = self.rhs(&x);
-            let mut y = f.pow(&r, self.sqrt_exp.as_slice());
-            if !f.eq(&f.mont_mul(&y, &y), &r) { return None; }
-            let odd = (f.from_mont(&y)[0] & 1) as u8;
-            if odd != (b[0] & 1) {
-                let mut zero: Vec<u64> = Vec::new();
-                zero.resize(f.limbs(), 0);
-                y = f.sub(&zero, &y);
-            }
-            return Some(Point { x, y, z: f.one() });
-        }
-        None
+        let enc = if self.kind == 1 { nistec_p384::decode_point(b)? } else { nistec_p256::decode_point(b)? };
+        if enc.len() == 0 { return None; }
+        Some(Point { enc })
     }
 
-    /// The uncompressed SEC1 encoding of a point (not the identity).
-    pub fn encode(&self, pt: &Point) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::new();
-        match self.affine(pt) {
-            Some((x, y)) => {
-                out.push(4);
-                out.extend_from_slice(self.p.to_be(&x).as_slice());
-                out.extend_from_slice(self.p.to_be(&y).as_slice());
-            }
-            None => {}
-        }
-        out
-    }
+    /// The uncompressed SEC1 encoding of a point.
+    pub fn encode(&self, pt: &Point) -> Vec<u8> { pt.enc.clone() }
 
     /// A random scalar in [1, n).
     pub fn random_scalar(&self) -> Vec<u8> {
@@ -235,84 +71,35 @@ impl Curve {
         }
     }
 
+    // k * G, uncompressed.
+    fn base_mult(&self, k: &[u8]) -> Vec<u8> {
+        if self.kind == 1 { nistec_p384::base_mult(k) } else { nistec_p256::base_mult(k) }
+    }
+
     /// The public key (uncompressed) of the secret scalar k.
-    pub fn public_key(&self, k: &[u8]) -> Vec<u8> { self.encode(&self.mul(&self.g, k)) }
+    pub fn public_key(&self, k: &[u8]) -> Vec<u8> { self.base_mult(k) }
 
     /// ECDH: the x-coordinate of k * peer (big-endian, the size), if not
     /// the identity.
     pub fn ecdh(&self, k: &[u8], peer: &Point) -> Option<Vec<u8>> {
-        let (x, _) = self.affine(&self.mul(peer, k))?;
-        Some(self.p.to_be(&x))
-    }
-
-    // The hash as a scalar: its leftmost bits, as many as n has, mod n.
-    fn hash_scalar(&self, hash: &[u8]) -> Vec<u64> {
-        let nm = &self.n;
-        let nb = nm.byte_len();
-        let e_bytes = if hash.len() > nb { &hash[..nb] } else { hash };
-        let mut padded: Vec<u8> = Vec::new();
-        padded.resize(nb - e_bytes.len(), 0);
-        padded.extend_from_slice(e_bytes);
-        let mut e: Vec<u64> = Vec::new();
-        e.resize(nm.limbs(), 0);
-        let mut k = 0;
-        while k < padded.len() {
-            let byte = padded[padded.len() - 1 - k] as u64;
-            e[k / 8] = e[k / 8] | (byte << (8 * (k % 8)));
-            k += 1;
-        }
-        let shift = 8 * nb - nm.bits();
-        if shift > 0 {
-            let mut i = 0;
-            while i < e.len() {
-                let hi = if i + 1 < e.len() { e[i + 1] << (64 - shift) } else { 0 };
-                e[i] = (e[i] >> shift as u64) | hi;
-                i += 1;
-            }
-        }
-        nm.reduce_once(&e)
+        if self.kind == 1 { nistec_p384::ecdh(k, peer.enc.as_slice()) } else { nistec_p256::ecdh(k, peer.enc.as_slice()) }
     }
 
     /// An ECDSA signature (r, s), big-endian, of hash by the secret scalar
     /// d (FIPS 186-4 6.4.1), with a random nonce; constant-time in d and
     /// the nonce.
     pub fn sign(&self, d: &[u8], hash: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let nm = &self.n;
-        let e = nm.to_mont(&self.hash_scalar(hash));
-        let dm = nm.to_mont(&nm.from_be(d).unwrap());
         loop {
             let k = self.random_scalar();
-            let (x, _) = match self.affine(&self.mul(&self.g, k.as_slice())) {
-                Some(a) => a,
-                None => continue,
-            };
-            // r = x mod n (x < p < 2n).
-            let r = nm.reduce_once(&x);
-            if nm.is_zero(&r) { continue; }
-            let kinv = nm.inv(&nm.to_mont(&nm.from_be(k.as_slice()).unwrap()));
-            // s = (e + r d) / k
-            let s = nm.from_mont(&nm.mont_mul(&kinv, &nm.add(&e, &nm.mont_mul(&nm.to_mont(&r), &dm))));
-            if nm.is_zero(&s) { continue; }
-            return (nm.to_be(&r), nm.to_be(&s));
+            let r = if self.kind == 1 { nistec_p384::sign(d, k.as_slice(), hash) } else { nistec_p256::sign(d, k.as_slice(), hash) };
+            if let Some(rs) = r { return rs; }
         }
     }
 
     /// Whether (r, s) (big-endian) is the ECDSA signature of hash by the
     /// key q (FIPS 186-4 6.4.2).
     pub fn verify(&self, q: &Point, hash: &[u8], r: &[u8], s: &[u8]) -> bool {
-        let nm = &self.n;
-        let rv = match nm.from_be(r) { Some(v) => v, None => return false };
-        let sv = match nm.from_be(s) { Some(v) => v, None => return false };
-        if nm.is_zero(&rv) || nm.is_zero(&sv) { return false; }
-        let e = self.hash_scalar(hash);
-        let w = nm.inv(&nm.to_mont(&sv));
-        let u1 = nm.from_mont(&nm.mont_mul(&nm.to_mont(&e), &w));
-        let u2 = nm.from_mont(&nm.mont_mul(&nm.to_mont(&rv), &w));
-        let pt = self.mul2(nm.to_be(&u1).as_slice(), q, nm.to_be(&u2).as_slice());
-        let (x, _) = match self.affine(&pt) { Some(a) => a, None => return false };
-        // x mod n (x < p < 2n).
-        let xr = nm.reduce_once(&x);
-        nm.eq(&xr, &rv)
+        if self.kind == 1 { nistec_p384::verify(q.enc.as_slice(), hash, r, s) } else { nistec_p256::verify(q.enc.as_slice(), hash, r, s) }
     }
 }
 
