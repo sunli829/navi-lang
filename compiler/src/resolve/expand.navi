@@ -30,6 +30,17 @@ use crate::util;
 pub static mut RECORD: bool = false;
 pub static mut EXPANDED: Vec<(String, String, String)> = Vec::new();
 
+/// A derive named in #[derive(...)]: where (the name's position in file),
+/// the derive macro (None: built in) and the code it generated.
+#[derive(Clone)]
+pub struct DeriveUse {
+    pub file: String,
+    pub pos: Pos,
+    pub def: Option<&mut Def>,
+    pub what: String,
+    pub code: String,
+}
+
 /// A struct's or enum's derives.
 pub struct Pending {
     pub m: &mut Module,
@@ -90,6 +101,7 @@ struct Req {
     p: &mut Pending,
     name: String,
     at: Pos,
+    def: Option<&mut Def>,
 }
 
 // A macro crate's macros (name, function path) and requests.
@@ -116,7 +128,11 @@ impl Resolver {
                     later.push(DeriveRef { segs: r.segs.clone() });
                 }
             }
-            self.expand_builtin(p.m, p.file, &p.it, &now);
+            let code = self.expand_builtin(p.m, p.file, &p.it, &now);
+            for r in p.refs.iter() {
+                let n = r.text();
+                if now.contains(&n) { self.use_of(p, r.last().pos, None, n.as_str(), code.clone()); }
+            }
             p.done = now;
             if later.len() > 0 {
                 p.refs = later;
@@ -126,6 +142,12 @@ impl Resolver {
                 self.check_attrs(*p, &claims);
             }
         }
+    }
+
+    // Records a derive's use (DeriveUse).
+    fn use_of(&mut self, p: &Pending, pos: Pos, def: Option<&mut Def>, name: &str, code: String) {
+        let what = `derive ${name} for ${type_name(&p.it)}`.to_string();
+        self.info.derive_uses.push(DeriveUse { file: p.file.name.clone(), pos, def, what, code });
     }
 
     fn builtin_claims(&self, p: &Pending) -> Vec<String> {
@@ -188,7 +210,8 @@ impl Resolver {
                         if r.segs.len() == 1 && crate::derive::expanded(n.as_str()) {
                             let mut one: Vec<String> = Vec::new();
                             one.push(n.clone());
-                            self.expand_builtin(p.m, p.file, &p.it, &one);
+                            let code = self.expand_builtin(p.m, p.file, &p.it, &one);
+                            self.use_of(*p, at, None, n.as_str(), code);
                             for a in builtin_attrs(n.as_str()).iter() { claims.push(a.clone()); }
                         } else {
                             self.errorf(Some(p.file), at, `cannot find derive macro ${n} in this scope`.to_string());
@@ -229,7 +252,7 @@ impl Resolver {
                 let mut have = false;
                 for (mn, _) in grp.macros.iter() { if *mn == md.name.value { have = true; } }
                 if !have { grp.macros.push((md.name.value.clone(), path)); }
-                grp.reqs.push(&mut Req { p: *p, name: md.name.value.clone(), at });
+                grp.reqs.push(&mut Req { p: *p, name: md.name.value.clone(), at, def: Some(d) });
             }
             self.check_attrs(*p, &claims);
         }
@@ -250,54 +273,66 @@ impl Resolver {
     }
 
     // Builds g's macro program, sends it the requests and collects what
-    // they generate.
+    // they generate. Each request's answer is cached under the macro
+    // crate's sources (and its dependencies'), the program's main and the
+    // request: when all are, the program is neither built nor run.
     fn run_group(&mut self, g: &mut Group) {
-        let exe = match self.macro_program(g) {
-            Ok(e) => e,
-            Err(msg) => {
-                for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, msg.clone()); }
-                return;
-            }
-        };
-        let e = info::Enc::new();
-        e.open();
+        let (lines, src) = self.program_source(g);
+        let gkey = self.group_key(g, lines.as_str(), src.as_str());
+        let mut reqs: Vec<String> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        let mut answers: Vec<String> = Vec::new();
+        let mut missing = false;
         for r in g.reqs.iter_mut() {
+            let e = info::Enc::new();
             e.open();
             e.str(r.name.as_str());
             let mp = r.p.m.path();
             let module = match mp.find("::") { Some(i) => mp[i + 2..].to_string(), None => String::new() };
             info::encode(e, &r.p.it, module.as_str());
             e.close();
-        }
-        e.close();
-        let req_file = `${exe}.req`.to_string();
-        if let Err(err) = std::fs::write(req_file.as_str(), e.s.as_bytes()) {
-            for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, `derive macro: ${req_file}: ${err}`.to_string()); }
-            return;
-        }
-        let out = std::process::Command::new(exe.as_str()).arg(req_file.as_str()).output();
-        let _ = std::fs::remove_file(req_file.as_str());
-        let out = match out {
-            Ok(o) => o,
-            Err(err) => {
-                for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, `derive macro: running ${exe}: ${err}`.to_string()); }
-                return;
+            let k = match &gkey {
+                Some(gk) => crate::cache::hex(&crate::sha256::sum(`${gk}\n${e.s}`.to_string().as_bytes())),
+                None => String::new(),
+            };
+            let cached = if k.len() > 0 { answer_cache(k.as_str(), None) } else { None };
+            match cached {
+                Some(a) => answers.push(a),
+                None => {
+                    answers.push(String::new());
+                    missing = true;
+                }
             }
-        };
-        if !out.status.success() {
-            let msg = String::from_utf8_lossy(out.stderr.as_slice()).trim().to_string();
-            for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, `derive macro of crate ${g.krate} failed: ${msg}`.to_string()); }
-            return;
+            reqs.push(e.s.clone());
+            keys.push(k);
         }
-        let text = String::from_utf8_lossy(out.stdout.as_slice());
-        let mut d = Dec { b: text.as_bytes(), i: 0, bad: false };
+        if missing {
+            match self.run_program(g, lines, src, &reqs) {
+                Ok(list) => {
+                    let mut i = 0;
+                    while i < list.len() && i < answers.len() {
+                        answers[i] = list[i].clone();
+                        if keys[i].len() > 0 { answer_cache(keys[i].as_str(), Some(list[i].as_str())); }
+                        i += 1;
+                    }
+                }
+                Err(msg) => {
+                    for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, msg.clone()); }
+                    return;
+                }
+            }
+        }
+        let mut i = 0;
         for r in g.reqs.iter_mut() {
-            if d.bad || d.i >= d.b.len() {
+            let a = answers[i].clone();
+            i += 1;
+            let mut d = Dec { b: a.as_bytes(), i: 0, bad: false };
+            if d.b.len() == 0 {
                 self.errorf(Some(r.p.file), r.at, `derive macro ${r.name}: the program's output is malformed`.to_string());
                 continue;
             }
-            let tag = d.b[d.i];
-            d.i += 1;
+            let tag = d.b[0];
+            d.i = 1;
             if tag == b'e' {
                 let pos = d.int() as Pos;
                 let msg = d.str();
@@ -308,15 +343,93 @@ impl Resolver {
             let mut spans: Vec<(Pos, Pos, Pos)> = Vec::new();
             d.byte(b'[');
             while !d.bad && d.i < d.b.len() && d.b[d.i] != b']' {
-                let s = d.int() as Pos;
+                let st = d.int() as Pos;
                 let en = d.int() as Pos;
                 let p = d.int() as Pos;
-                spans.push((s, en, p));
+                spans.push((st, en, p));
             }
             d.byte(b']');
-            if d.bad { continue; }
+            if d.bad {
+                self.errorf(Some(r.p.file), r.at, `derive macro ${r.name}: the program's output is malformed`.to_string());
+                continue;
+            }
             self.collect_generated(*r, code, spans);
         }
+    }
+
+    // Builds and runs g's program on the requests: each one's answer (its
+    // part of the output: o<code>[spans] or e<pos><message>).
+    fn run_program(&self, g: &Group, lines: String, src: String, reqs: &Vec<String>) -> Result<Vec<String>, String> {
+        let exe = self.macro_program(g, lines, src)?;
+        let mut all = String::new();
+        all.push('[');
+        for r in reqs.iter() { all.push_str(r.as_str()); }
+        all.push(']');
+        let req_file = `${exe}.req`.to_string();
+        if let Err(err) = std::fs::write(req_file.as_str(), all.as_bytes()) { return Err(`derive macro: ${req_file}: ${err}`.to_string()); }
+        let out = std::process::Command::new(exe.as_str()).arg(req_file.as_str()).output();
+        let _ = std::fs::remove_file(req_file.as_str());
+        let out = match out {
+            Ok(o) => o,
+            Err(err) => return Err(`derive macro: running ${exe}: ${err}`.to_string()),
+        };
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(out.stderr.as_slice()).trim().to_string();
+            return Err(`derive macro of crate ${g.krate} failed: ${msg}`.to_string());
+        }
+        let text = String::from_utf8_lossy(out.stdout.as_slice());
+        let mut d = Dec { b: text.as_bytes(), i: 0, bad: false };
+        let mut list: Vec<String> = Vec::new();
+        while !d.bad && d.i < d.b.len() {
+            let start = d.i;
+            let tag = d.b[d.i];
+            d.i += 1;
+            if tag == b'e' {
+                d.int();
+                d.str();
+            } else if tag == b'o' {
+                d.str();
+                d.byte(b'[');
+                while !d.bad && d.i < d.b.len() && d.b[d.i] != b']' {
+                    d.int();
+                    d.int();
+                    d.int();
+                }
+                d.byte(b']');
+            } else {
+                d.bad = true;
+            }
+            if !d.bad { list.push(text[start..d.i].to_string()); }
+        }
+        if d.bad || list.len() != reqs.len() { return Err(`derive macro of crate ${g.krate}: the program's output is malformed`.to_string()); }
+        Ok(list)
+    }
+
+    // The key of g's macros: each crate's (crate::libcache, as built for the
+    // host) and the program's.
+    fn group_key(&self, g: &Group, lines: &str, src: &str) -> Option<String> {
+        crate::cache::dir()?;
+        let need = self.program_crates(g);
+        let mut keys: HashMap<String, String> = HashMap::new();
+        let mut text = String::new();
+        for s in self.specs.iter() {
+            if !need.contains(&s.name) { continue; }
+            let mut dep_keys: Vec<String> = Vec::new();
+            for d in s.deps.iter() {
+                let (alias, n) = match d.split_once('=') { Some((a, n)) => (a.to_string(), n.to_string()), None => (d.clone(), d.clone()) };
+                dep_keys.push(`${alias} ${keys.get(&n).map(|k| k.clone()).unwrap_or("-".to_string())}`.to_string());
+            }
+            if s.name != "std" {
+                if let Some(k) = keys.get(&"std".to_string()) { dep_keys.push(`std ${k}`.to_string()); }
+            }
+            dep_keys.sort();
+            let k = crate::libcache::key(s.name.as_str(), util::path_clean(s.fs_root.as_str()).as_str(), "host", &dep_keys)?;
+            text.push_str(`${s.name} ${k}\n`.to_string().as_str());
+            keys.insert(s.name.clone(), k);
+        }
+        text.push_str(lines);
+        text.push_str(src);
+        Some(crate::cache::hex(&crate::sha256::sum(text.as_bytes())))
     }
 
     // Parses what derive r generated and collects its impls into the
@@ -327,6 +440,7 @@ impl Resolver {
         let what = `derive ${r.name} for ${tn}`.to_string();
         let name = `${p.file.name}[${what}@${p.it.pos()}]`.to_string();
         if RECORD { EXPANDED.push((p.krate.clone(), what.clone(), code.clone())); }
+        self.info.derive_uses.push(DeriveUse { file: p.file.name.clone(), pos: r.at, def: r.def, what: what.clone(), code: code.clone() });
         let origin = &Origin { file: p.file, at: r.at, spans, what };
         let f = File::generated(name.as_str(), code, origin);
         let (sf, errs) = parser::parse_file(f);
@@ -342,11 +456,9 @@ impl Resolver {
         }
     }
 
-    // The macro program of g (built by a navi derive-build of its own,
-    // which uses the build cache).
-    fn macro_program(&self, g: &Group) -> Result<String, String> {
-        // The macro crate and what it depends on (the specs are in
-        // dependency order), and std.
+    // The crates g's program is built from: the macro crate, what it
+    // depends on, and std.
+    fn program_crates(&self, g: &Group) -> Vec<String> {
         let mut need: Vec<String> = Vec::new();
         need.push(g.krate.clone());
         need.push("std".to_string());
@@ -360,6 +472,13 @@ impl Resolver {
                 if !need.contains(&n) { need.push(n); }
             }
         }
+        need
+    }
+
+    // The specs (lines for navi derive-build, but the program's own) and
+    // main of g's program.
+    fn program_source(&self, g: &Group) -> (String, String) {
+        let need = self.program_crates(g);
         let mut lines = String::new();
         for s in self.specs.iter() {
             if !need.contains(&s.name) { continue; }
@@ -370,6 +489,13 @@ impl Resolver {
         src.push_str("fn main() {\n    std::derive::serve(|name: &str, t: &std::derive::TypeInfo| -> Result<std::derive::Code, std::derive::Error> {\n        match name {\n");
         for (n, path) in g.macros.iter() { src.push_str(`            ${util::quote(n.as_str())} => ${path}(t),\n`.to_string().as_str()); }
         src.push_str("            _ => Err(std::derive::Error::new(\"no such derive macro\")),\n        }\n    });\n}\n");
+        (lines, src)
+    }
+
+    // The macro program of g (built by a navi derive-build of its own,
+    // which uses the build cache).
+    fn macro_program(&self, g: &Group, lines_in: String, src: String) -> Result<String, String> {
+        let mut lines = lines_in;
         // main.navi lives where its path is the same each build (the cache
         // key names it).
         let tag = crate::cache::hex(&crate::sha256::sum(`${lines}${src}`.to_string().as_bytes()));
@@ -398,6 +524,18 @@ impl Resolver {
             Err(e) => return Err(`derive macro: running ${navi}: ${e}`.to_string()),
         }
         Ok(exe)
+    }
+}
+
+// The cached answer of request key (or, given one, stores it).
+fn answer_cache(key: &str, store: Option<&str>) -> Option<String> {
+    let p = util::path_join(crate::cache::dir()?.as_str(), `${key}.dx`.to_string().as_str());
+    match store {
+        Some(a) => {
+            let _ = std::fs::write(p.as_str(), a.as_bytes());
+            None
+        }
+        None => std::fs::read_to_string(p.as_str()).ok(),
     }
 }
 

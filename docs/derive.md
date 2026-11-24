@@ -137,13 +137,15 @@ t.impl_for("std::clone::Clone", body)
 ## 缓存
 
 - 宏程序：构建缓存（键是编译器、各 crate 的路径和 main.navi，命中要求读过的源文件都没变）。
-- 展开只看条目自己的语法，所以按 crate 缓存就够了：crate 的缓存键（内容哈希）不变，展开结果就不变。从导出数据（`.navih`）读进来的 crate 再展开一次（很快：只是生成和解析 impl），不另做缓存。
+- 每个请求的回答：键是宏 crate 和它依赖的各 crate 的缓存键（`libcache::key`，内容哈希）、生成的 main 和请求本身（宏名和 `TypeInfo`，含位置），存成缓存目录里的 `<键>.dx`。一个宏 crate 的请求都命中时，宏程序既不编译也不启动。`tests/derive/app`：冷编译 2.38s，回答都在缓存里 0.62s，改了宏 crate 1.36s（重编宏程序）。
+- 展开只看条目自己的语法，所以不需要存进导出数据：从 `.navih` 读进来的 crate 照常再展开一次，内置派生只是生成和解析 impl，派生宏的回答从上面的缓存里取。
 
 ## LSP
 
-- 跳到 `#[derive(X)]` 里的 `X`：到派生宏函数（内置的到编译器源码中的说明）。
-- 悬停在 `X` 上：显示展开后的代码。
-- 生成代码里的错误显示在 `#[derive(...)]` 上，附带生成文件里的位置。
+- 跳到 `#[derive(X)]` 里的 `X`：到派生宏函数（解析时记下每个派生名用的是哪个宏，`resolve::Info.derive_uses`，LSP 的索引把它当作对宏函数的引用，所以查找引用也有）；内置派生没有可跳的地方。
+- 悬停在 `X` 上：显示展开后的代码（格式化后；一个条目的几个内置派生是一起生成的，显示的是它们全部）。
+- 生成代码里的错误照位置映射显示在用户代码上，在 `#[derive(...)]` 上的附带那行生成的代码。
+- 测试：`tests/derive/session.jsonl`。
 
 ## 内置派生的迁移（已完成）
 
@@ -192,5 +194,5 @@ t.impl_for("std::clone::Clone", body)
 4. **`std::json`、`std::csv`、`std::http` 改用 serde**；测试里的类型加上派生。
 5. **去掉运行期反射**：删除 `std::reflect` 和相关辅助，`type_name` 改内建，类型描述瘦身，spec 更新。
 6. **用户的派生宏**：`#[derive_macro]`、派生命名空间的名字解析、宏程序的编译和调用、属性命名空间的检查和报错，`FromAttrs`，`navi expand`，`TypeInfo::of`。（已完成，2026-11-24：`std::derive`、`quote` 标签模板、`resolve/expand.navi`、`navi derive-build`、`navi expand`；测试是 `tests/derive`（宏 crate、用它的程序、报错）、`tests/run/derive_api.navi`、`tests/ui/quote.navi`）
-7. **缓存和导出数据**：展开结果的缓存键、存进 `.navih`；**LSP**：跳转、悬停显示展开结果、错误位置。
+7. **缓存和导出数据**：展开结果的缓存键、存进 `.navih`；**LSP**：跳转、悬停显示展开结果、错误位置。（已完成，2026-11-24：回答按请求缓存，不存进 `.navih`，理由见“缓存”）
 8. **用例**：`compiler/src/syntax/astcodec.navi` 改成派生，去掉 `tools/gen_astcodec.py`。

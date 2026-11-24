@@ -169,6 +169,16 @@ if cmp -s "$tmp/lsp.out" tests/lsp/session.out; then
 else
 	echo "FAIL navi lsp tests/lsp/session.jsonl"; diff tests/lsp/session.out "$tmp/lsp.out" | head -20; fail=1
 fi
+# The same for derives (tests/derive/session.jsonl): hovering a derive
+# shows its code, a derive macro's name goes to its function.
+sed "s#@ROOT@#$uroot#g" tests/derive/session.jsonl | LC_ALL=C awk '{ printf "Content-Length: %d\r\n\r\n%s", length($0), $0 }' \
+	| NAVI_STD="$root/lib/std" "$navi" lsp 2>/dev/null | perl -0777 -pe 's/Content-Length: \d+\r\n\r\n/\n/g' \
+	| sed "s#$uroot#@ROOT@#g" | sed '/^$/d' > "$tmp/lsp.out"
+if cmp -s "$tmp/lsp.out" tests/derive/session.out; then
+	echo "ok   navi lsp tests/derive/session.jsonl"
+else
+	echo "FAIL navi lsp tests/derive/session.jsonl"; diff tests/derive/session.out "$tmp/lsp.out" | head -20; fail=1
+fi
 # The front end: tests/syntax parses; in tests/resolve (name resolution),
 # tests/types and tests/check (type checking) the files of ok/ and sigs/
 # have no errors and those of err/ exactly the errors annotated with
