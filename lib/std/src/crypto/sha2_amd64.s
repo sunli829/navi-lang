@@ -3,7 +3,9 @@
 // sha256_blocks(h, data, n, k): the n 64-byte blocks of data into the
 // state h[0..8] (k: the 64 round constants), on sha256rnds2 and
 // sha256msg1/2 as Go's blockSHANI (Intel's reference): the state as ABEF
-// and CDGH, the message in xmm0 (sha256rnds2 reads it there).
+// and CDGH, the message in xmm0 (sha256rnds2 reads it there). The round
+// constants are read with movdqu (k need not be 16-byte aligned, which
+// paddd's memory operand would want).
 sha256_blocks:
     mov rdi, qword ptr [rsp + 8]        // h
     mov rsi, qword ptr [rsp + 16]       // data
@@ -25,14 +27,16 @@ sha256_blocks:
     movdqu xmm0, xmmword ptr [rsi + 0]
     pshufb xmm0, xmm8
     movdqa xmm3, xmm0
-    paddd xmm0, xmmword ptr [rax + 0]
+    movdqu xmm11, xmmword ptr [rax + 0]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     pshufd xmm0, xmm0, 0x0e
     sha256rnds2 xmm1, xmm2, xmm0
     movdqu xmm0, xmmword ptr [rsi + 16]
     pshufb xmm0, xmm8
     movdqa xmm4, xmm0
-    paddd xmm0, xmmword ptr [rax + 16]
+    movdqu xmm11, xmmword ptr [rax + 16]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     pshufd xmm0, xmm0, 0x0e
     sha256rnds2 xmm1, xmm2, xmm0
@@ -40,7 +44,8 @@ sha256_blocks:
     movdqu xmm0, xmmword ptr [rsi + 32]
     pshufb xmm0, xmm8
     movdqa xmm5, xmm0
-    paddd xmm0, xmmword ptr [rax + 32]
+    movdqu xmm11, xmmword ptr [rax + 32]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     pshufd xmm0, xmm0, 0x0e
     sha256rnds2 xmm1, xmm2, xmm0
@@ -48,7 +53,8 @@ sha256_blocks:
     movdqu xmm0, xmmword ptr [rsi + 48]
     pshufb xmm0, xmm8
     movdqa xmm6, xmm0
-    paddd xmm0, xmmword ptr [rax + 48]
+    movdqu xmm11, xmmword ptr [rax + 48]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm6
     palignr xmm7, xmm5, 4
@@ -58,7 +64,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm5, xmm6
     movdqa xmm0, xmm3
-    paddd xmm0, xmmword ptr [rax + 64]
+    movdqu xmm11, xmmword ptr [rax + 64]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm3
     palignr xmm7, xmm6, 4
@@ -68,7 +75,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm6, xmm3
     movdqa xmm0, xmm4
-    paddd xmm0, xmmword ptr [rax + 80]
+    movdqu xmm11, xmmword ptr [rax + 80]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm4
     palignr xmm7, xmm3, 4
@@ -78,7 +86,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm3, xmm4
     movdqa xmm0, xmm5
-    paddd xmm0, xmmword ptr [rax + 96]
+    movdqu xmm11, xmmword ptr [rax + 96]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm5
     palignr xmm7, xmm4, 4
@@ -88,7 +97,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm4, xmm5
     movdqa xmm0, xmm6
-    paddd xmm0, xmmword ptr [rax + 112]
+    movdqu xmm11, xmmword ptr [rax + 112]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm6
     palignr xmm7, xmm5, 4
@@ -98,7 +108,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm5, xmm6
     movdqa xmm0, xmm3
-    paddd xmm0, xmmword ptr [rax + 128]
+    movdqu xmm11, xmmword ptr [rax + 128]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm3
     palignr xmm7, xmm6, 4
@@ -108,7 +119,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm6, xmm3
     movdqa xmm0, xmm4
-    paddd xmm0, xmmword ptr [rax + 144]
+    movdqu xmm11, xmmword ptr [rax + 144]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm4
     palignr xmm7, xmm3, 4
@@ -118,7 +130,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm3, xmm4
     movdqa xmm0, xmm5
-    paddd xmm0, xmmword ptr [rax + 160]
+    movdqu xmm11, xmmword ptr [rax + 160]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm5
     palignr xmm7, xmm4, 4
@@ -128,7 +141,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm4, xmm5
     movdqa xmm0, xmm6
-    paddd xmm0, xmmword ptr [rax + 176]
+    movdqu xmm11, xmmword ptr [rax + 176]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm6
     palignr xmm7, xmm5, 4
@@ -138,7 +152,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm5, xmm6
     movdqa xmm0, xmm3
-    paddd xmm0, xmmword ptr [rax + 192]
+    movdqu xmm11, xmmword ptr [rax + 192]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm3
     palignr xmm7, xmm6, 4
@@ -148,7 +163,8 @@ sha256_blocks:
     sha256rnds2 xmm1, xmm2, xmm0
     sha256msg1 xmm6, xmm3
     movdqa xmm0, xmm4
-    paddd xmm0, xmmword ptr [rax + 208]
+    movdqu xmm11, xmmword ptr [rax + 208]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm4
     palignr xmm7, xmm3, 4
@@ -157,7 +173,8 @@ sha256_blocks:
     pshufd xmm0, xmm0, 0x0e
     sha256rnds2 xmm1, xmm2, xmm0
     movdqa xmm0, xmm5
-    paddd xmm0, xmmword ptr [rax + 224]
+    movdqu xmm11, xmmword ptr [rax + 224]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     movdqa xmm7, xmm5
     palignr xmm7, xmm4, 4
@@ -166,7 +183,8 @@ sha256_blocks:
     pshufd xmm0, xmm0, 0x0e
     sha256rnds2 xmm1, xmm2, xmm0
     movdqa xmm0, xmm6
-    paddd xmm0, xmmword ptr [rax + 240]
+    movdqu xmm11, xmmword ptr [rax + 240]
+    paddd xmm0, xmm11
     sha256rnds2 xmm2, xmm1, xmm0
     pshufd xmm0, xmm0, 0x0e
     sha256rnds2 xmm1, xmm2, xmm0
