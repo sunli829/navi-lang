@@ -36,10 +36,9 @@ pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
         })?;
         Ok(quote`w.begin_object(); ${fields} w.end_object();`)
     })?;
+    let method = quote`fn serialize(&self, w: &mut ::myjson::Writer) { ${body} }`;
     // impl 头（泛型参数、给类型参数加的约束）由 impl_for 生成。
-    Ok(t.impl_for(quote`::myjson::Serialize`, quote`
-        fn serialize(&self, w: &mut ::myjson::Writer) { ${body} }
-    `))
+    Ok(t.impl_for("::myjson::Serialize", method))
 }
 ```
 
@@ -68,10 +67,11 @@ pub fn serialize(t: &TypeInfo) -> Result<Code, Error> {
 
 ```navi
 let fields = t.each_construct(|b| quote`${b}.clone()`);
-t.impl_for(quote`::std::clone::Clone`, quote`fn clone(&self) -> Self { ${fields} }`)
+let body = quote`fn clone(&self) -> Self { ${fields} }`;
+t.impl_for("::std::clone::Clone", body)
 ```
 
-闭包里的 `quote` 不在任何 `${}` 里。词法分析器不需要支持模板里套模板。
+闭包里的 `quote` 不在任何 `${}` 里；每一步一个变量，一行只写一个 `quote`。词法分析器不需要支持模板里套模板。
 
 **位置映射到用户代码**（同 Rust `quote!` 保留 span）：
 
@@ -93,7 +93,7 @@ t.impl_for(quote`::std::clone::Clone`, quote`fn clone(&self) -> Self { ${fields}
   - `t.each_variant(|v| ...)`：按变体生成，`v.bindings()` 是它的字段绑定，`v.name()` 是变体名。
   - `t.each_construct(|b| ...)`：生成构造同一变体的表达式（`Clone`、`Default` 这类）。
   - 两个值一起比较时（`PartialEq`、`Ord`），`t.each_pair(other, |a, b| ...)` 同时解构两边。
-- **impl 头**：`t.impl_for(trait, items)` 生成 `impl<...> trait for Self<...> where ...`，类型参数自动加上这个 trait 的约束（同 Rust 的 derive）；`impl_for_with(trait, bounds, items)` 自己给约束。
+- **impl 头**：`t.impl_for("::path::Trait", items)`（trait 的路径写成字符串，编译器解析并检查）生成 `impl<...> trait for Self<...> where ...`，类型参数自动加上这个 trait 的约束（同 Rust 的 derive）；`impl_for_with(trait, bounds, items)` 自己给约束。
 - **属性解析**：`#[derive(FromAttrs)]` 描述一个属性的形状（`Option<T>` 是可选的键，`bool` 是标志，其余必填），`f.attrs::<T>("json")` 解析成它；未知的键、缺少的键、类型不对都自动报错，位置在属性上。`FromAttrs` 本身是内置派生。
 - **查看展开结果**：`navi expand <crate> [类型]` 打印派生展开后的代码（格式化后），相当于 `cargo expand`。
 - **测试**：宏可以在普通的 `#[test]` 里调用：`TypeInfo::of::<T>()` 由运行期反射构造，`code.to_string()` 得到格式化后的文本用来比较。
