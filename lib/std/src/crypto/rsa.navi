@@ -16,7 +16,7 @@
 
 use crate::fmt::{self, Display, Formatter};
 use crate::crypto::Digest;
-use crate::crypto::nat::Modulus;
+use crate::crypto::nat::{self, Modulus};
 use crate::crypto::subtle::constant_time_eq;
 use crate::crypto::der::{self, Reader};
 use crate::rand::rngs::OsRng;
@@ -127,6 +127,29 @@ pub struct RsaPrivateKey {
     public: RsaPublicKey,
     d: Vec<u8>,
     primes: Vec<Vec<u8>>,
+    crt: Option<Crt>,
+}
+
+// The Chinese remainder theorem's values (PKCS#1's): signing is two
+// exponentiations of half the size, about 4 times faster.
+#[derive(Clone)]
+struct Crt {
+    p: Modulus,
+    q: Modulus,
+    dp: Vec<u8>,
+    dq: Vec<u8>,
+    /// q^-1 mod p, in p's Montgomery form.
+    qinv: Vec<u64>,
+    q_limbs: Vec<u64>,
+}
+
+fn crt_of(p: &[u8], q: &[u8], dp: &[u8], dq: &[u8], qinv: &[u8]) -> Option<Crt> {
+    let pm = Modulus::new(p);
+    let qm = Modulus::new(q);
+    // (Two primes that fill their limbs, as RSA's are: see reduce_wide.)
+    if pm.limbs() != qm.limbs() || pm.bits() != 64 * pm.limbs() || qm.bits() != 64 * qm.limbs() { return None; }
+    let qi = pm.from_be(qinv)?;
+    Some(Crt { p: pm.clone(), q: qm.clone(), dp: strip(dp), dq: strip(dq), qinv: pm.to_mont(&qi), q_limbs: qm.value() })
 }
 
 impl RsaPrivateKey {
@@ -135,7 +158,7 @@ impl RsaPrivateKey {
         let public = RsaPublicKey::from_be_bytes(n, e)?;
         let d = strip(d);
         if d.len() == 0 || d.len() > public.size() { return Err(Error::InvalidKey); }
-        let k = RsaPrivateKey { public, d, primes };
+        let k = RsaPrivateKey { public, d, primes, crt: None };
         // A sign-and-check round trip catches inconsistent components.
         let mut m: Vec<u8> = Vec::new();
         m.resize(k.public.size(), 0);
@@ -154,7 +177,14 @@ impl RsaPrivateKey {
         let mut v: Vec<Vec<u8>> = Vec::new();
         while v.len() < 8 { v.push(r.read_unsigned().ok_or(Error::InvalidKey)?.to_vec()); }
         if !r.is_empty() { return Err(Error::InvalidKey); }
-        RsaPrivateKey::from_components(v[0].as_slice(), v[1].as_slice(), v[2].as_slice(), vec_of2(v[3].clone(), v[4].clone()))
+        let mut k = RsaPrivateKey::from_components(v[0].as_slice(), v[1].as_slice(), v[2].as_slice(), vec_of2(v[3].clone(), v[4].clone()))?;
+        k.crt = crt_of(v[3].as_slice(), v[4].as_slice(), v[5].as_slice(), v[6].as_slice(), v[7].as_slice());
+        // (The round trip again, through the CRT: bad values are an error.)
+        let mut m: Vec<u8> = Vec::new();
+        m.resize(k.public.size(), 0);
+        m[k.public.size() - 1] = 2;
+        k.private_op(m.as_slice())?;
+        Ok(k)
     }
 
     /// The key of a PKCS#8 PrivateKeyInfo holding an rsaEncryption key.
@@ -186,10 +216,39 @@ impl RsaPrivateKey {
     fn private_op(&self, m: &[u8]) -> Result<Vec<u8>, Error> {
         let md = &self.public.m;
         let x = md.from_be(m).ok_or(Error::Verification)?;
-        let c = md.from_mont(&md.pow_secret(&md.to_mont(&x), self.d.as_slice()));
+        let c = match self.crt_op(m) {
+            Some(c) => c,
+            None => md.from_mont(&md.pow_secret(&md.to_mont(&x), self.d.as_slice())),
+        };
         let back = md.from_mont(&md.pow(&md.to_mont(&c), self.public.e.as_slice()));
         if !md.eq(&back, &x) { return Err(Error::InvalidKey); }
         Ok(md.to_be(&c))
+    }
+}
+
+impl RsaPrivateKey {
+    // m^d mod n by the CRT (Garner): m1 = m^dP mod p, m2 = m^dQ mod q,
+    // h = qInv (m1 - m2) mod p, m2 + h q. None without the CRT values.
+    fn crt_op(&self, m: &[u8]) -> Option<Vec<u64>> {
+        let crt = match &self.crt { Some(c) => c, None => return None };
+        let (p, q) = (&crt.p, &crt.q);
+        let cp = p.reduce_wide(m)?;
+        let cq = q.reduce_wide(m)?;
+        let m1 = p.from_mont(&p.pow_secret(&p.to_mont(&cp), crt.dp.as_slice()));
+        let m2 = q.from_mont(&q.pow_secret(&q.to_mont(&cq), crt.dq.as_slice()));
+        // m2 < q < 2^(64 limbs) < 2p.
+        let m2p = p.reduce_once(&m2);
+        let h = p.mont_mul(&crt.qinv, &p.sub(&m1, &m2p));
+        let r = nat::add_wide(nat::mul_wide(&h, crt.q_limbs.as_slice()).as_slice(), &m2);
+        // As many limbs as n.
+        let n = self.public.m.limbs();
+        let mut out: Vec<u64> = Vec::new();
+        let mut i = 0;
+        while i < n {
+            out.push(if i < r.len() { r[i] } else { 0 });
+            i += 1;
+        }
+        Some(out)
     }
 }
 
