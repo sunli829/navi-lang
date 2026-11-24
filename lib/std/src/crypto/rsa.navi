@@ -1,0 +1,250 @@
+//! RSA signature verification (RFC 8017), with the API of RustCrypto's
+//! rsa crate: an `RsaPublicKey` (from n and e, or PKCS#1 DER) verifies a
+//! hash's signature under `Pkcs1v15Sign` or `Pss`.
+//!
+//!     use std::crypto::rsa::{RsaPublicKey, Pkcs1v15Sign, Pss};
+//!     use std::crypto::sha2::{Digest, Sha256};
+//!     let key = RsaPublicKey::from_pkcs1_der(&der)?;
+//!     let hashed = Sha256::digest(msg);
+//!     key.verify(Pkcs1v15Sign::new::<Sha256>(), &hashed, &sig)?;
+//!     key.verify(Pss::new::<Sha256>(), &hashed, &sig)?;
+//!
+//! Only public-key operations (no signing or decryption): what a TLS
+//! client needs. Variable-time, which public keys allow.
+
+use crate::fmt::{self, Display, Formatter};
+use crate::crypto::Digest;
+use crate::crypto::nat::Modulus;
+use crate::crypto::subtle::constant_time_eq;
+
+/// A bad key or a signature that does not verify (as the crate's
+/// `rsa::Error`, without detail for signatures).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    InvalidKey,
+    Verification,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Error::InvalidKey => f.write_str("invalid RSA public key"),
+            Error::Verification => f.write_str("verification error"),
+        }
+    }
+}
+
+/// An RSA public key.
+#[derive(Clone)]
+pub struct RsaPublicKey {
+    n: Vec<u8>,
+    e: Vec<u8>,
+    m: Modulus,
+}
+
+fn strip(b: &[u8]) -> Vec<u8> {
+    let mut s = b;
+    while s.len() > 0 && s[0] == 0 { s = &s[1..]; }
+    s.to_vec()
+}
+
+// A DER length at b[i..]: the length and where the contents start.
+fn der_len(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if i >= b.len() { return None; }
+    let first = b[i] as usize;
+    if first < 0x80 { return Some((first, i + 1)); }
+    let n = first & 0x7f;
+    if n == 0 || n > 3 || i + 1 + n > b.len() { return None; }
+    let mut len = 0usize;
+    let mut k = 0;
+    while k < n {
+        len = (len << 8) | (b[i + 1 + k] as usize);
+        k += 1;
+    }
+    Some((len, i + 1 + n))
+}
+
+impl RsaPublicKey {
+    /// The key of modulus n and exponent e (big-endian).
+    pub fn from_be_bytes(n: &[u8], e: &[u8]) -> Result<RsaPublicKey, Error> {
+        let n = strip(n);
+        let e = strip(e);
+        // At least 512 bits, odd; e odd, above 1, at most 8 bytes.
+        if n.len() < 64 || (n[n.len() - 1] & 1) == 0 { return Err(Error::InvalidKey); }
+        if e.len() == 0 || e.len() > 8 || (e[e.len() - 1] & 1) == 0 || (e.len() == 1 && e[0] < 3) { return Err(Error::InvalidKey); }
+        let m = Modulus::new(n.as_slice());
+        Ok(RsaPublicKey { n, e, m })
+    }
+
+    /// The key of a PKCS#1 RSAPublicKey: SEQUENCE { INTEGER n, INTEGER e }.
+    pub fn from_pkcs1_der(der: &[u8]) -> Result<RsaPublicKey, Error> {
+        if der.len() < 2 || der[0] != 0x30 { return Err(Error::InvalidKey); }
+        let (len, at) = der_len(der, 1).ok_or(Error::InvalidKey)?;
+        if at + len != der.len() { return Err(Error::InvalidKey); }
+        let mut i = at;
+        let mut ints: Vec<Vec<u8>> = Vec::new();
+        while ints.len() < 2 {
+            if i >= der.len() || der[i] != 2 { return Err(Error::InvalidKey); }
+            let (l, s) = der_len(der, i + 1).ok_or(Error::InvalidKey)?;
+            if s + l > der.len() || l == 0 { return Err(Error::InvalidKey); }
+            ints.push(der[s..s + l].to_vec());
+            i = s + l;
+        }
+        if i != der.len() { return Err(Error::InvalidKey); }
+        RsaPublicKey::from_be_bytes(ints[0].as_slice(), ints[1].as_slice())
+    }
+
+    /// The modulus's length in bytes.
+    pub fn size(&self) -> usize { self.m.byte_len() }
+
+    /// The modulus (big-endian).
+    pub fn n(&self) -> &[u8] { self.n.as_slice() }
+
+    pub fn e(&self) -> &[u8] { self.e.as_slice() }
+
+    /// Checks sig over hashed under scheme.
+    pub fn verify<S: SignatureScheme>(&self, scheme: S, hashed: &[u8], sig: &[u8]) -> Result<(), Error> { scheme.verify(self, hashed, sig) }
+
+    // sig^e mod n as the modulus's length in bytes; None if sig is not
+    // below n or not its length.
+    fn public_op(&self, sig: &[u8]) -> Option<Vec<u8>> {
+        if sig.len() != self.size() { return None; }
+        let s = self.m.from_be(sig)?;
+        let r = self.m.pow(&self.m.to_mont(&s), self.e.as_slice());
+        Some(self.m.to_be(&self.m.from_mont(&r)))
+    }
+}
+
+/// A signature scheme (as the crate's `SignatureScheme`, verifying only).
+pub trait SignatureScheme {
+    fn verify(&self, key: &RsaPublicKey, hashed: &[u8], sig: &[u8]) -> Result<(), Error>;
+}
+
+// The DigestInfo prefix of a hash by its output length (SHA-1, SHA-224,
+// SHA-256, SHA-384, SHA-512).
+fn digest_info(len: usize) -> Vec<u8> {
+    let hex = match len {
+        20 => "3021300906052b0e03021a05000414",
+        28 => "302d300d06096086480165030402040500041c",
+        32 => "3031300d060960864801650304020105000420",
+        48 => "3041300d060960864801650304020205000430",
+        64 => "3051300d060960864801650304020305000440",
+        _ => "",
+    };
+    crate::hex::decode(hex).unwrap()
+}
+
+/// PKCS#1 v1.5 signatures (RFC 8017 8.2).
+#[derive(Clone)]
+pub struct Pkcs1v15Sign {
+    prefix: Vec<u8>,
+    hash_len: usize,
+}
+
+impl Pkcs1v15Sign {
+    /// For hashes by D (SHA-1 or SHA-2).
+    pub fn new<D: Digest>() -> Pkcs1v15Sign { Pkcs1v15Sign { prefix: digest_info(D::OUTPUT_SIZE), hash_len: D::OUTPUT_SIZE } }
+
+    /// Without a DigestInfo (the hash alone, as TLS 1.1's MD5-SHA1).
+    pub fn new_unprefixed() -> Pkcs1v15Sign { Pkcs1v15Sign { prefix: Vec::new(), hash_len: 0 } }
+}
+
+impl SignatureScheme for Pkcs1v15Sign {
+    fn verify(&self, key: &RsaPublicKey, hashed: &[u8], sig: &[u8]) -> Result<(), Error> {
+        if self.hash_len != 0 && hashed.len() != self.hash_len { return Err(Error::Verification); }
+        let k = key.size();
+        let t_len = self.prefix.len() + hashed.len();
+        if k < t_len + 11 { return Err(Error::Verification); }
+        let em = key.public_op(sig).ok_or(Error::Verification)?;
+        // 00 01 ff... 00 || DigestInfo || hash
+        let mut want: Vec<u8> = Vec::with_capacity(k);
+        want.push(0);
+        want.push(1);
+        while want.len() < k - t_len - 1 { want.push(0xff); }
+        want.push(0);
+        want.extend_from_slice(self.prefix.as_slice());
+        want.extend_from_slice(hashed);
+        if constant_time_eq(em.as_slice(), want.as_slice()) { Ok(()) } else { Err(Error::Verification) }
+    }
+}
+
+/// PSS signatures (RFC 8017 8.1), MGF1 with the same hash.
+#[derive(Clone)]
+pub struct Pss {
+    hash: fn(&[u8]) -> Vec<u8>,
+    hash_len: usize,
+    /// None: any salt length (found from the encoding).
+    salt_len: Option<usize>,
+}
+
+impl Pss {
+    /// For hashes by D, the salt as long as the hash (as the crate's, and
+    /// TLS 1.3's).
+    pub fn new<D: Digest>() -> Pss { Pss { hash: |b: &[u8]| -> Vec<u8> { D::digest(b) }, hash_len: D::OUTPUT_SIZE, salt_len: Some(D::OUTPUT_SIZE) } }
+
+    /// With a salt of len bytes.
+    pub fn new_with_salt<D: Digest>(len: usize) -> Pss { Pss { hash: |b: &[u8]| -> Vec<u8> { D::digest(b) }, hash_len: D::OUTPUT_SIZE, salt_len: Some(len) } }
+
+    /// With a salt of any length (as Go's PSSSaltLengthAuto).
+    pub fn new_with_any_salt<D: Digest>() -> Pss { Pss { hash: |b: &[u8]| -> Vec<u8> { D::digest(b) }, hash_len: D::OUTPUT_SIZE, salt_len: None } }
+
+    // MGF1(seed, len).
+    fn mgf1(&self, seed: &[u8], len: usize) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(len + self.hash_len);
+        let mut counter = 0u32;
+        while out.len() < len {
+            let mut b = seed.to_vec();
+            b.push((counter >> 24) as u8);
+            b.push((counter >> 16) as u8);
+            b.push((counter >> 8) as u8);
+            b.push(counter as u8);
+            out.extend_from_slice((self.hash)(b.as_slice()).as_slice());
+            counter += 1;
+        }
+        out.truncate(len);
+        out
+    }
+}
+
+impl SignatureScheme for Pss {
+    fn verify(&self, key: &RsaPublicKey, hashed: &[u8], sig: &[u8]) -> Result<(), Error> {
+        let h_len = self.hash_len;
+        if hashed.len() != h_len { return Err(Error::Verification); }
+        let mod_bits = key.m.bits();
+        let em_bits = mod_bits - 1;
+        let em_len = (em_bits + 7) / 8;
+        let full = key.public_op(sig).ok_or(Error::Verification)?;
+        // (k bytes; when emBits is a multiple of 8 the first is zero.)
+        if full.len() > em_len && full[0] != 0 { return Err(Error::Verification); }
+        let em = &full[full.len() - em_len..];
+        if em_len < h_len + 2 || em[em_len - 1] != 0xbc { return Err(Error::Verification); }
+        let db_len = em_len - h_len - 1;
+        let masked = &em[..db_len];
+        let h = &em[db_len..db_len + h_len];
+        let top = 8 * em_len - em_bits;
+        let top_mask: u8 = if top == 0 { 0 } else { (0xffu16 << (8 - top) as u16) as u8 };
+        if (masked[0] & top_mask) != 0 { return Err(Error::Verification); }
+        let mask = self.mgf1(h, db_len);
+        let mut db: Vec<u8> = Vec::with_capacity(db_len);
+        let mut i = 0;
+        while i < db_len {
+            db.push(masked[i] ^ mask[i]);
+            i += 1;
+        }
+        db[0] = db[0] & !top_mask;
+        // PS (zeros), 01, salt.
+        let mut p = 0;
+        while p < db_len && db[p] == 0 { p += 1; }
+        if p >= db_len || db[p] != 1 { return Err(Error::Verification); }
+        let salt = &db[p + 1..];
+        if let Some(want) = self.salt_len {
+            if salt.len() != want { return Err(Error::Verification); }
+        }
+        let mut m2: Vec<u8> = Vec::with_capacity(8 + h_len + salt.len());
+        m2.resize(8, 0);
+        m2.extend_from_slice(hashed);
+        m2.extend_from_slice(salt);
+        let h2 = (self.hash)(m2.as_slice());
+        if constant_time_eq(h2.as_slice(), h) { Ok(()) } else { Err(Error::Verification) }
+    }
+}

@@ -239,6 +239,7 @@ API 照 base64 0.22（`Engine`）、hex、RustCrypto（`Digest`、`Mac`、`Hmac<
 | ChaCha20-Poly1305 | 有 SIMD 汇编 | 纯软件（M4 上约 40 MB/s，待优化） | 先求正确 |
 | X25519（`x25519-dalek`） | `StaticSecret`、`PublicKey`、`SharedSecret`、`x25519` | `crypto::x25519`，相同；恒定时间（51 位分肢，蒙哥马利阶梯） | — |
 | P-256、P-384（`p256`、`p384` crate） | `ecdsa::{VerifyingKey, SigningKey, Signature}`、`ecdh` | `crypto::p256`、`crypto::p384`：只有验签（`VerifyingKey`、DER 或定长的 `Signature`）和 ECDH（`ecdh::{EphemeralSecret, PublicKey, SharedSecret}`），没有签名；完全加法公式（同 Go 的 nistec），标量乘恒定时间，验签用 Shamir 技巧（变时间，数据是公开的）。M4 上 P-256 验签约 11 ms、ECDH 约 8 ms（字段运算还在堆上分配，待优化） | TLS 客户端只需要验签和密钥交换 |
+| RSA（`rsa` crate） | `RsaPublicKey`、`RsaPrivateKey`，`verify(Pkcs1v15Sign::new::<D>() / Pss::new::<D>(), hashed, sig)`，加解密和签名 | `crypto::rsa`：只有公钥验签（`RsaPublicKey::from_be_bytes` / `from_pkcs1_der`，`Pkcs1v15Sign`、`Pss`；`Pss::new_with_any_salt` 同 Go 的 `PSSSaltLengthAuto`）；模幂在 `crypto::nat` 上（变时间，公钥是公开的） | TLS 客户端只需要验签 |
 
 ### std::compress（flate2 crate）
 
