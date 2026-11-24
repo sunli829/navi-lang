@@ -6,6 +6,7 @@
 - 生成的是普通的 navi 代码，和手写的 impl 一样检查、内联、优化；不靠运行期反射，所以没有逐字段查类型描述的开销。
 - 内置的 `Debug`、`Clone`、`PartialEq`、`Eq`、`PartialOrd`、`Ord`、`Hash`、`Default` 也改成派生宏，和用户的走同一套机制。现在 `mir/shims.navi` 里按具体类型现场生成方法体的那部分可以去掉。
 - 不做 Rust 那样的函数式宏和任意改写代码的属性宏：只做派生，以及派生宏声明的字段属性。
+- 去掉运行期反射（`std::reflect`）：`std::json`、`std::csv` 改成照搬 serde 的 `Serialize`/`Deserialize`，用户类型写 `#[derive(Serialize, Deserialize)]`；编译器生成的类型描述只留 GC 需要的部分。
 
 和 Rust 过程宏的区别：
 
@@ -150,11 +151,34 @@ t.impl_for("::std::clone::Clone", body)
 
 要量的：std 里派生很多，展开出的源码每次都要解析和检查（有导出数据时不用）。迁移前后比较 std 的编译时间和编译器自举的产物大小、速度。
 
+## 序列化：照搬 serde，去掉运行期反射
+
+`std::serde`（模块路径和名字同 serde；navi 没有生命周期，`'de` 都去掉）：
+
+- `ser`：`Serialize`（`fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error>`）、`Serializer`（`serialize_bool`/`i64`/`str`/`none`/`some`/`unit`/`seq`/`map`/`struct`/`tuple_struct`/各种变体……），以及 `SerializeSeq`、`SerializeMap`、`SerializeStruct`、`SerializeTuple`、`SerializeTupleStruct`、`SerializeTupleVariant`、`SerializeStructVariant`；`ser::Error`。
+- `de`：`Deserialize`（`fn deserialize<D: Deserializer>(d: D) -> Result<Self, D::Error>`）、`Deserializer`（`deserialize_any`/`i64`/`str`/`seq`/`map`/`struct`/`enum`/`identifier`/`ignored_any`……）、`Visitor`、`SeqAccess`、`MapAccess`、`EnumAccess`、`VariantAccess`；`de::Error`。
+- std 的类型手写实现：整数、浮点、`bool`、`char`、`String`、`&str`（只序列化）、`Option`、`Vec`、数组、元组、`HashMap`、`BTreeMap`、`()`、引用。
+- `#[derive(Serialize, Deserialize)]` 是内置派生（和 `Debug` 一样写在编译器里），生成的代码和 serde_derive 的一样，表示方式也一样：结构体是 map，元组结构体是 seq，单字段元组结构体是它的字段，枚举默认外部标记（`"Variant"` 或 `{"Variant": ...}`）。现在 `std::json` 的映射就是这样，所以数据格式不变。
+- 属性（`#[serde(...)]`，serde 的常用子集）：`rename`、`rename_all`、`skip`、`skip_serializing_if`、`default`、`deny_unknown_fields`、`tag`/`content`/`untagged`（枚举表示），以后按需要再加。
+- `std::json`：`to_string`、`to_string_pretty`、`to_writer`、`from_str`、`from_reader`，`T: Serialize` / `T: Deserialize`；`json::Value` 也实现两者（任意 JSON）。
+- `std::csv`：按 serde 读写记录（同 Rust 的 csv crate）。
+- `std::http` 里 JSON 请求体和响应体的辅助函数加上相应约束。
+
+去掉反射时一起改的：
+
+- `std::reflect`、`HashMap` 的 `ReflectMap`、`Vec` 里给反射用的辅助、`tests/run/reflect.navi` 删除。
+- `std::any::type_name::<T>()` 改成编译器内建函数，直接生成字符串常量。
+- 编译器生成的类型描述去掉字段名、变体名、元素类型这些反射用的信息，只留 GC 需要的大小、对齐和指针位图；二进制会变小，量一下。
+- `TypeInfo::of::<T>()`（宏的测试用）改成编译器内建函数，在编译期构造。
+- spec 和 `spec/std-diff.md` 里关于反射的部分改掉。
+
 ## 分步计划（每一步都能单独验证和提交）
 
 1. **`std::derive` 的接口和编译器里的展开流程**：`TypeInfo`、`Code` 和带标签的模板 `quote`（解析、插值、位置），按绑定遍历和 `impl_for`，收集之后、检查函数体之前展开，生成的条目加进模块。先用一个内置的测试派生验证。
-2. **内置派生改写**：八个派生逐个改成生成源码；每改一个，跑全部测试，并比较改前改后的输出；全部改完后删掉 shims 里的派生和 builtin 里的特殊处理。自举定点照常检查。
-3. **用户的派生宏**：`#[derive_macro]`、派生命名空间的名字解析、宏程序的编译和调用、属性命名空间的检查和报错，`FromAttrs`，`navi expand`，`TypeInfo::of` 用于测试。
-4. **缓存和导出数据**：展开结果的缓存键、存进 `.navih`。
-5. **LSP**：跳转、悬停显示展开结果、错误位置。
-6. **用例**：`compiler/src/syntax/astcodec.navi` 改成 `#[derive(Encode, Decode)]`，去掉 `tools/gen_astcodec.py`；std 里加一个 JSON 的 `Serialize`/`Deserialize` 派生。
+2. **内置派生改写**：八个派生逐个改成生成源码；每改一个，跑全部测试，并比较改前改后的输出；全部改完后删掉 shims 里的派生和 builtin 里的特殊处理。量 std 的编译时间和编译器自举的产物。自举定点照常检查。
+3. **`std::serde`**：traits、std 类型的实现、内置的 `#[derive(Serialize, Deserialize)]` 和 `#[serde(...)]` 属性。
+4. **`std::json`、`std::csv`、`std::http` 改用 serde**；测试里的类型加上派生。
+5. **去掉运行期反射**：删除 `std::reflect` 和相关辅助，`type_name` 改内建，类型描述瘦身，spec 更新。
+6. **用户的派生宏**：`#[derive_macro]`、派生命名空间的名字解析、宏程序的编译和调用、属性命名空间的检查和报错，`FromAttrs`，`navi expand`，`TypeInfo::of`。
+7. **缓存和导出数据**：展开结果的缓存键、存进 `.navih`；**LSP**：跳转、悬停显示展开结果、错误位置。
+8. **用例**：`compiler/src/syntax/astcodec.navi` 改成派生，去掉 `tools/gen_astcodec.py`。
