@@ -1,0 +1,447 @@
+//! Derives (docs/derive.md). A crate's derives are expanded when it is
+//! loaded: the built-in ones (crate::derive) unless the module imports a
+//! derive of the same name. Those, and derives not built in, may be derive
+//! macros (#[derive_macro] functions of another crate, in MACRO_NS): they
+//! are found once imports are resolved, and each macro crate is built
+//! into a program for the host (navi derive-build) that is sent all its
+//! requests at once.
+//!
+//! Generated code is parsed as a file of its own (named after the type's
+//! file, the derive and the type's position) whose positions map to the
+//! user's file (source::Origin). A derive macro may only generate impl
+//! blocks.
+//!
+//! The attributes of a struct or enum, its variants and its fields that
+//! the compiler does not read must be taken by one of its derives
+//! (#[derive_macro(X, attrs = [ns])], serde for Serialize/Deserialize).
+
+use std::collections::HashMap;
+use crate::syntax::ast::*;
+use crate::syntax::source::{File, Origin, Pos};
+use crate::syntax::parser;
+use crate::syntax::print;
+use crate::derive::{DeriveRef, macro_decl, builtin_attrs};
+use crate::derive::info;
+use crate::resolve::*;
+use crate::util;
+
+/// Set by navi expand: each expansion is recorded in EXPANDED as (crate,
+/// what, code).
+pub static mut RECORD: bool = false;
+pub static mut EXPANDED: Vec<(String, String, String)> = Vec::new();
+
+/// A struct's or enum's derives.
+pub struct Pending {
+    pub m: &mut Module,
+    pub file: &File,
+    pub it: Item,
+    pub refs: Vec<DeriveRef>,
+    /// The built-in derives expanded already.
+    pub done: Vec<String>,
+    pub krate: String,
+}
+
+// Attributes the compiler reads on structs and enums, and on variants and
+// fields.
+const TYPE_ATTRS: [&str; 10] = ["derive", "cfg", "doc", "repr", "allow", "warn", "deny", "deprecated", "must_use", "non_exhaustive"];
+const FIELD_ATTRS: [&str; 6] = ["cfg", "doc", "allow", "warn", "deny", "deprecated"];
+
+fn attr_name(a: &Attr) -> String { print::path(a.path) }
+
+fn known(list: &[&str], name: &str) -> bool {
+    for x in list.iter() { if *x == name { return true; } }
+    false
+}
+
+// Each attribute of it the compiler does not read (with whether it is on
+// the type itself).
+fn odd_list(it: &Item) -> Vec<&Attr> {
+    let mut out: Vec<&Attr> = Vec::new();
+    let (attrs, fields, variants) = match it {
+        Item::Struct(s) => (s.base.attrs.clone(), s.fields.clone(), Vec::new()),
+        Item::Enum(e) => (e.base.attrs.clone(), Vec::new(), e.variants.clone()),
+        _ => return out,
+    };
+    for a in attrs.iter() { if !known(&TYPE_ATTRS, attr_name(*a).as_str()) { out.push(*a); } }
+    let mut fs = fields;
+    for v in variants.iter() {
+        for a in v.attrs.iter() { if !known(&FIELD_ATTRS, attr_name(*a).as_str()) { out.push(*a); } }
+        for f in v.fields.iter() { fs.push(*f); }
+    }
+    for f in fs.iter() {
+        for a in f.attrs.iter() { if !known(&FIELD_ATTRS, attr_name(*a).as_str()) { out.push(*a); } }
+    }
+    out
+}
+
+/// Whether it has attributes a derive must take.
+pub fn odd_attrs(it: &Item) -> bool { odd_list(it).len() > 0 }
+
+fn type_name(it: &Item) -> String {
+    match it {
+        Item::Struct(s) => s.name.value.clone(),
+        Item::Enum(e) => e.name.value.clone(),
+        _ => String::new(),
+    }
+}
+
+// A request to a macro program.
+struct Req {
+    p: &mut Pending,
+    name: String,
+    at: Pos,
+}
+
+// A macro crate's macros (name, function path) and requests.
+struct Group {
+    krate: String,
+    macros: Vec<(String, String)>,
+    reqs: Vec<&mut Req>,
+}
+
+impl Resolver {
+    /// Expands the derives of the crate just loaded: the built-in ones now,
+    /// unless the module imports the name (expand_macros decides then).
+    pub fn decide_derives(&mut self) {
+        let mut list = self.derives.clone();
+        self.derives = Vec::new();
+        for p in list.iter_mut() {
+            let mut now: Vec<String> = Vec::new();
+            let mut later: Vec<DeriveRef> = Vec::new();
+            for r in p.refs.iter() {
+                let n = r.text();
+                if r.segs.len() == 1 && crate::derive::expanded(n.as_str()) && !self.imports_name(p.m, n.as_str()) {
+                    now.push(n);
+                } else {
+                    later.push(DeriveRef { segs: r.segs.clone() });
+                }
+            }
+            self.expand_builtin(p.m, p.file, &p.it, &now);
+            p.done = now;
+            if later.len() > 0 {
+                p.refs = later;
+                self.pending.push(*p);
+            } else {
+                let claims = self.builtin_claims(*p);
+                self.check_attrs(*p, &claims);
+            }
+        }
+    }
+
+    fn builtin_claims(&self, p: &Pending) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for n in p.done.iter() { for a in builtin_attrs(n.as_str()).iter() { out.push(a.clone()); } }
+        out
+    }
+
+    // Whether module m imports name (not by a glob).
+    fn imports_name(&self, m: &Module, name: &str) -> bool {
+        for imp in self.imports.iter() {
+            if imp.module.id == m.id && !imp.glob && imp.name == name { return true; }
+        }
+        false
+    }
+
+    // Reports the attributes of p's item that none of its derives take.
+    fn check_attrs(&mut self, p: &Pending, claims: &Vec<String>) {
+        let tn = type_name(&p.it);
+        for a in odd_list(&p.it).iter() {
+            let n = attr_name(*a);
+            if claims.contains(&n) { continue; }
+            self.errorf(Some(p.file), a.path.pos(), `unknown attribute ${n}: no derive of ${tn} takes it`.to_string());
+        }
+    }
+
+    /// Finds the derive macro r names, as seen from m.
+    fn find_macro(&self, m: &mut Module, r: &DeriveRef) -> Option<&mut Def> {
+        let last = r.last();
+        let res = if r.segs.len() == 1 {
+            self.import_scope(m, last.value.as_str(), MACRO_NS)?
+        } else {
+            let mut prefix = r.segs.clone();
+            prefix.pop();
+            let src = match self.module_path(m, &prefix) { Ok(s) => s, Err(_) => return None };
+            let (b, st) = self.lookup_in(src, last.value.as_str(), MACRO_NS, m);
+            if st != imports::FOUND { return None; }
+            b?.res.clone()
+        };
+        if res.kind != RES_DEF { return None; }
+        res.def
+    }
+
+    /// Expands the derives left for after imports: derive macros, and the
+    /// built-in ones whose name a module imports but that no macro has.
+    pub fn expand_macros(&mut self) {
+        let mut list = self.pending.clone();
+        self.pending = Vec::new();
+        if list.len() == 0 { return; }
+        let mut groups: Vec<&mut Group> = Vec::new();
+        for p in list.iter_mut() {
+            let mut claims = self.builtin_claims(*p);
+            self.cfg.test = self.test_crate == p.krate;
+            for r in p.refs.iter() {
+                let n = r.text();
+                let at = r.last().pos;
+                let d = match self.find_macro(p.m, r) {
+                    Some(d) => d,
+                    None => {
+                        if r.segs.len() == 1 && crate::derive::expanded(n.as_str()) {
+                            let mut one: Vec<String> = Vec::new();
+                            one.push(n.clone());
+                            self.expand_builtin(p.m, p.file, &p.it, &one);
+                            for a in builtin_attrs(n.as_str()).iter() { claims.push(a.clone()); }
+                        } else {
+                            self.errorf(Some(p.file), at, `cannot find derive macro ${n} in this scope`.to_string());
+                        }
+                        continue;
+                    }
+                };
+                let md = match &d.node {
+                    Node::Item(Item::Fn(f)) => macro_decl(&f.base.attrs),
+                    _ => None,
+                };
+                let md = match md {
+                    Some(x) => x,
+                    None => continue,
+                };
+                for a in md.attrs.iter() { claims.push(a.clone()); }
+                if d.krate.name == p.krate {
+                    self.errorf(Some(p.file), at, `derive macro ${n} is defined in this crate: a derive macro is used from other crates`.to_string());
+                    continue;
+                }
+                let path = match self.macro_path(d) {
+                    Some(x) => x,
+                    None => {
+                        self.errorf(Some(p.file), at, `derive macro ${n} is not public: its function and the modules to it must be pub`.to_string());
+                        continue;
+                    }
+                };
+                let mut g: Option<&mut Group> = None;
+                for x in groups.iter() { if x.krate == d.krate.name { g = Some(*x); } }
+                let grp = match g {
+                    Some(x) => x,
+                    None => {
+                        let x = &mut Group { krate: d.krate.name.clone(), macros: Vec::new(), reqs: Vec::new() };
+                        groups.push(x);
+                        x
+                    }
+                };
+                let mut have = false;
+                for (mn, _) in grp.macros.iter() { if *mn == md.name.value { have = true; } }
+                if !have { grp.macros.push((md.name.value.clone(), path)); }
+                grp.reqs.push(&mut Req { p: *p, name: md.name.value.clone(), at });
+            }
+            self.check_attrs(*p, &claims);
+        }
+        for g in groups.iter() { self.run_group(*g); }
+    }
+
+    // The path of macro function d from outside its crate, if public.
+    fn macro_path(&self, d: &Def) -> Option<String> {
+        if d.vis.restricted.is_some() { return None; }
+        let mut x = module_of(d);
+        while let Some(m) = x {
+            if m.anonymous { return None; }
+            if let Some(md) = m.def { if md.vis.restricted.is_some() && m.parent.is_some() { return None; } }
+            x = m.parent;
+        }
+        let m = module_of(d)?;
+        Some(`${m.path()}::${d.name}`.to_string())
+    }
+
+    // Builds g's macro program, sends it the requests and collects what
+    // they generate.
+    fn run_group(&mut self, g: &mut Group) {
+        let exe = match self.macro_program(g) {
+            Ok(e) => e,
+            Err(msg) => {
+                for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, msg.clone()); }
+                return;
+            }
+        };
+        let e = info::Enc::new();
+        e.open();
+        for r in g.reqs.iter_mut() {
+            e.open();
+            e.str(r.name.as_str());
+            let mp = r.p.m.path();
+            let module = match mp.find("::") { Some(i) => mp[i + 2..].to_string(), None => String::new() };
+            info::encode(e, &r.p.it, module.as_str());
+            e.close();
+        }
+        e.close();
+        let req_file = `${exe}.req`.to_string();
+        if let Err(err) = std::fs::write(req_file.as_str(), e.s.as_bytes()) {
+            for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, `derive macro: ${req_file}: ${err}`.to_string()); }
+            return;
+        }
+        let out = std::process::Command::new(exe.as_str()).arg(req_file.as_str()).output();
+        let _ = std::fs::remove_file(req_file.as_str());
+        let out = match out {
+            Ok(o) => o,
+            Err(err) => {
+                for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, `derive macro: running ${exe}: ${err}`.to_string()); }
+                return;
+            }
+        };
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(out.stderr.as_slice()).trim().to_string();
+            for r in g.reqs.iter() { self.errorf(Some(r.p.file), r.at, `derive macro of crate ${g.krate} failed: ${msg}`.to_string()); }
+            return;
+        }
+        let text = String::from_utf8_lossy(out.stdout.as_slice());
+        let mut d = Dec { b: text.as_bytes(), i: 0, bad: false };
+        for r in g.reqs.iter_mut() {
+            if d.bad || d.i >= d.b.len() {
+                self.errorf(Some(r.p.file), r.at, `derive macro ${r.name}: the program's output is malformed`.to_string());
+                continue;
+            }
+            let tag = d.b[d.i];
+            d.i += 1;
+            if tag == b'e' {
+                let pos = d.int() as Pos;
+                let msg = d.str();
+                self.errorf(Some(r.p.file), if pos >= 0 { pos } else { r.at }, msg);
+                continue;
+            }
+            let code = d.str();
+            let mut spans: Vec<(Pos, Pos, Pos)> = Vec::new();
+            d.byte(b'[');
+            while !d.bad && d.i < d.b.len() && d.b[d.i] != b']' {
+                let s = d.int() as Pos;
+                let en = d.int() as Pos;
+                let p = d.int() as Pos;
+                spans.push((s, en, p));
+            }
+            d.byte(b']');
+            if d.bad { continue; }
+            self.collect_generated(*r, code, spans);
+        }
+    }
+
+    // Parses what derive r generated and collects its impls into the
+    // type's module.
+    fn collect_generated(&mut self, r: &mut Req, code: String, spans: Vec<(Pos, Pos, Pos)>) {
+        let p = r.p;
+        let tn = type_name(&p.it);
+        let what = `derive ${r.name} for ${tn}`.to_string();
+        let name = `${p.file.name}[${what}@${p.it.pos()}]`.to_string();
+        if RECORD { EXPANDED.push((p.krate.clone(), what.clone(), code.clone())); }
+        let origin = &Origin { file: p.file, at: r.at, spans, what };
+        let f = File::generated(name.as_str(), code, origin);
+        let (sf, errs) = parser::parse_file(f);
+        for d in errs.diags.iter() { self.errorf(Some(sf.file), d.pos, d.msg.clone()); }
+        self.cfg.test = self.test_crate == p.krate;
+        let mut files: HashMap<String, &SourceFile> = HashMap::new();
+        for gi in sf.items.iter() {
+            if let Item::Impl(_) = gi {
+                self.collect_item(p.m, sf.file, gi, &mut files);
+            } else {
+                self.errorf(Some(sf.file), gi.pos(), `derive macro ${r.name} generated something other than an impl block`.to_string());
+            }
+        }
+    }
+
+    // The macro program of g (built by a navi derive-build of its own,
+    // which uses the build cache).
+    fn macro_program(&self, g: &Group) -> Result<String, String> {
+        // The macro crate and what it depends on (the specs are in
+        // dependency order), and std.
+        let mut need: Vec<String> = Vec::new();
+        need.push(g.krate.clone());
+        need.push("std".to_string());
+        let mut i = self.specs.len();
+        while i > 0 {
+            i -= 1;
+            let s = self.specs[i];
+            if !need.contains(&s.name) { continue; }
+            for d in s.deps.iter() {
+                let n = match d.split_once('=') { Some((_, n)) => n.to_string(), None => d.clone() };
+                if !need.contains(&n) { need.push(n); }
+            }
+        }
+        let mut lines = String::new();
+        for s in self.specs.iter() {
+            if !need.contains(&s.name) { continue; }
+            lines.push_str(`${s.name}\t${s.fs_root}\t${s.root}\t${s.dir}\t${s.deps.join(",")}\n`.to_string().as_str());
+        }
+        let mut src = String::new();
+        src.push_str("// Generated by navi: the program of a crate's derive macros.\n");
+        src.push_str("fn main() {\n    std::derive::serve(|name: &str, t: &std::derive::TypeInfo| -> Result<std::derive::Code, std::derive::Error> {\n        match name {\n");
+        for (n, path) in g.macros.iter() { src.push_str(`            ${util::quote(n.as_str())} => ${path}(t),\n`.to_string().as_str()); }
+        src.push_str("            _ => Err(std::derive::Error::new(\"no such derive macro\")),\n        }\n    });\n}\n");
+        // main.navi lives where its path is the same each build (the cache
+        // key names it).
+        let tag = crate::cache::hex(&crate::sha256::sum(`${lines}${src}`.to_string().as_bytes()));
+        let base = match crate::cache::dir() {
+            Some(d) => util::path_join(d.as_str(), "derive"),
+            None => util::path_join(std::env::temp_dir().to_str().unwrap_or("."), `navi-derive-${std::process::id()}`.to_string().as_str()),
+        };
+        let dir = util::path_join(base.as_str(), tag.as_str());
+        if let Err(e) = std::fs::create_dir_all(dir.as_str()) { return Err(`derive macro: ${dir}: ${e}`.to_string()); }
+        let main = util::path_join(dir.as_str(), "main.navi");
+        let same = match std::fs::read_to_string(main.as_str()) { Ok(s) => s == src, Err(_) => false };
+        if !same {
+            if let Err(e) = std::fs::write(main.as_str(), src.as_bytes()) { return Err(`derive macro: ${main}: ${e}`.to_string()); }
+        }
+        lines.push_str(`navi_derive_main\t${dir}\tmain.navi\t${dir}\t${g.krate}\n`.to_string().as_str());
+        let tmp = util::path_join(std::env::temp_dir().to_str().unwrap_or("."), `navi-derive-${std::process::id()}`.to_string().as_str());
+        if let Err(e) = std::fs::create_dir_all(tmp.as_str()) { return Err(`derive macro: ${tmp}: ${e}`.to_string()); }
+        let specs = util::path_join(tmp.as_str(), `${g.krate}.specs`.to_string().as_str());
+        if let Err(e) = std::fs::write(specs.as_str(), lines.as_bytes()) { return Err(`derive macro: ${specs}: ${e}`.to_string()); }
+        let exe = util::path_join(tmp.as_str(), `${g.krate}${crate::driver::host_exe_suffix()}`.to_string().as_str());
+        let navi = match crate::driver::exe_path() { Some(p) => p, None => return Err("derive macro: cannot find the navi executable".to_string()) };
+        let st = std::process::Command::new(navi.as_str()).arg("derive-build").arg(specs.as_str()).arg(exe.as_str()).status();
+        let _ = std::fs::remove_file(specs.as_str());
+        match st {
+            Ok(s) => if !s.success() { return Err(`the derive macros of crate ${g.krate} failed to build (errors above)`.to_string()); },
+            Err(e) => return Err(`derive macro: running ${navi}: ${e}`.to_string()),
+        }
+        Ok(exe)
+    }
+}
+
+// The macro program's output (std::derive::serve).
+struct Dec {
+    b: &[u8],
+    i: usize,
+    bad: bool,
+}
+
+impl Dec {
+    fn byte(&mut self, c: u8) {
+        if self.i < self.b.len() && self.b[self.i] == c { self.i += 1; } else { self.bad = true; }
+    }
+
+    fn str(&mut self) -> String {
+        let mut n = 0usize;
+        while self.i < self.b.len() && self.b[self.i] >= b'0' && self.b[self.i] <= b'9' {
+            n = n * 10 + (self.b[self.i] - b'0') as usize;
+            self.i += 1;
+        }
+        self.byte(b':');
+        if self.bad || self.i + n > self.b.len() {
+            self.bad = true;
+            return String::new();
+        }
+        let s = String::from_utf8_lossy(&self.b[self.i..self.i + n]);
+        self.i += n;
+        s
+    }
+
+    fn int(&mut self) -> i64 {
+        self.byte(b'i');
+        let mut neg = false;
+        if self.i < self.b.len() && self.b[self.i] == b'-' {
+            neg = true;
+            self.i += 1;
+        }
+        let mut n = 0i64;
+        while self.i < self.b.len() && self.b[self.i] >= b'0' && self.b[self.i] <= b'9' {
+            n = n * 10 + (self.b[self.i] - b'0') as i64;
+            self.i += 1;
+        }
+        self.byte(b';');
+        if neg { -n } else { n }
+    }
+}

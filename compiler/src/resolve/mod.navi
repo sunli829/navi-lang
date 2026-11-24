@@ -6,6 +6,7 @@ pub mod cfg;
 pub mod load;
 pub mod imports;
 pub mod body;
+pub mod expand;
 
 use std::collections::HashMap;
 use crate::syntax::ast::*;
@@ -102,6 +103,9 @@ pub fn same_def(a: Option<&mut Def>, b: Option<&mut Def>) -> bool {
 pub type Namespace = usize;
 pub const TYPE_NS: Namespace = 0;
 pub const VALUE_NS: Namespace = 1;
+/// Derive macros (#[derive_macro(Name)] functions, by their derive name).
+pub const MACRO_NS: Namespace = 2;
+pub const NS_COUNT: usize = 3;
 
 /// Where a definition or import can be named from: anywhere (pub) or
 /// inside a module and its descendants.
@@ -145,11 +149,13 @@ static mut NEXT_MODULE: u32 = 1;
 
 pub fn new_module(c: &mut Crate, parent: Option<&mut Module>, name: &str) -> &mut Module {
     let mut b = Vec::new();
-    b.push(HashMap::new());
-    b.push(HashMap::new());
     let mut g = Vec::new();
-    g.push(HashMap::new());
-    g.push(HashMap::new());
+    let mut i = 0;
+    while i < NS_COUNT {
+        b.push(HashMap::new());
+        g.push(HashMap::new());
+        i += 1;
+    }
     let m = &mut Module { id: NEXT_MODULE, def: None, krate: c, parent, name: name.to_string(), anonymous: false,
         is_enum: false, dir: String::new(), bindings: b, globs: g, glob_srcs: Vec::new(), children: Vec::new(),
         file: None, items: Vec::new(), underscore_traits: Vec::new() };
@@ -386,6 +392,13 @@ pub struct Resolver {
     /// its dependencies are compiled as always); "" if none. cfg.test says
     /// whether it holds in the crate being loaded.
     pub test_crate: String,
+    /// The crates being resolved (derive macros' programs are built from
+    /// them).
+    pub specs: Vec<&CrateSpec>,
+    /// The derives of the crate being loaded (expanded when it is).
+    pub derives: Vec<&mut expand::Pending>,
+    /// Derives that may be macros: expanded once imports are resolved.
+    pub pending: Vec<&mut expand::Pending>,
 }
 
 impl Resolver {
@@ -423,7 +436,7 @@ pub fn resolve(cfg: Config, specs: &Vec<&CrateSpec>) -> (&mut Info, Vec<Error>) 
         labels: HashMap::new() };
     let test_crate = if cfg.test && specs.len() > 0 { specs[specs.len() - 1].name.clone() } else { String::new() };
     let mut r = Resolver { cfg, info, errs: Sink::new(), crates: HashMap::new(), imports: Vec::new(), par: false, bail: false, test_crate,
-        unit_defs: Vec::new() };
+        unit_defs: Vec::new(), specs: specs.clone(), derives: Vec::new(), pending: Vec::new() };
     for spec in specs.iter() {
         let dir = if spec.dir.len() == 0 { spec.name.clone() } else { spec.dir.clone() };
         let c = &mut Crate { name: spec.name.clone(), dir, fs_root: spec.fs_root.clone(), root: None, files: Vec::new(),
@@ -450,6 +463,7 @@ pub fn resolve(cfg: Config, specs: &Vec<&CrateSpec>) -> (&mut Info, Vec<Error>) 
         }
     }
     r.resolve_imports();
+    r.expand_macros();
     if let Some(s) = std {
         if let Some(root) = s.root {
             if let Some(b) = root.bindings[TYPE_NS].get(&"prelude".to_string()) {

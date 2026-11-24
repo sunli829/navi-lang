@@ -1,0 +1,1239 @@
+//! Derive macros (docs/derive.md): what a `#[derive_macro]` function sees
+//! of the type it derives for (TypeInfo, by its syntax), and the code it
+//! returns (Code, written with quote`...`).
+//!
+//! A derive macro is a function in a library crate:
+//!
+//! ```navi
+//! use std::derive::{TypeInfo, Code, Error, quote};
+//!
+//! #[derive_macro(Describe)]
+//! pub fn describe(t: &TypeInfo) -> Result<Code, Error> {
+//!     let name = t.name().to_string();
+//!     let body = quote`fn describe(&self) -> &str { ${name} }`;
+//!     Ok(t.impl_for("::mylib::Describe", body))
+//! }
+//! ```
+//!
+//! The compiler builds the macro's crate into a small program for the host
+//! (serve is its main), sends it the TypeInfo of every type that derives
+//! one of its macros and parses the Code it returns as impl blocks in the
+//! type's module. Positions in a TypeInfo are byte offsets in the type's
+//! file: code made from its parts (identifiers, types, fields) keeps them,
+//! so errors in it point at the user's code; the rest of the code is at the
+//! #[derive(...)] attribute.
+
+use crate::collections::HashMap;
+
+/// No position: the code's default (the #[derive(...)] attribute).
+pub const NO_POS: i32 = -1;
+
+// --- Code ----------------------------------------------------------------
+
+/// Generated code: its text, and the positions in the user's file that
+/// parts of it come from.
+#[derive(Clone)]
+pub struct Code {
+    text: String,
+    spans: Vec<Span>,
+}
+
+/// Bytes start..end of a Code's text come from position pos.
+#[derive(Clone)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+    pub pos: i32,
+}
+
+impl Code {
+    pub fn new() -> Code { Code { text: String::new(), spans: Vec::new() } }
+
+    /// Code with the given text, at the default position.
+    pub fn from_text(text: &str) -> Code { Code { text: text.to_string(), spans: Vec::new() } }
+
+    /// Code with the given text from position pos.
+    pub fn spanned(text: &str, pos: i32) -> Code {
+        let mut c = Code::from_text(text);
+        if pos >= 0 && text.len() > 0 { c.spans.push(Span { start: 0, end: text.len() as u32, pos }); }
+        c
+    }
+
+    pub fn is_empty(&self) -> bool { self.text.trim().len() == 0 }
+
+    /// The code's text (as generated: not formatted).
+    pub fn text(&self) -> &str { self.text.as_str() }
+
+    pub fn spans(&self) -> &Vec<Span> { &self.spans }
+
+    /// Appends other, with a space between unless the code reads as well
+    /// without one (never where two tokens would run together).
+    pub fn push(&mut self, other: &Code) {
+        let a = self.text.as_bytes();
+        let b = other.text.as_bytes();
+        if b.len() == 0 { return; }
+        // Whitespace on both sides: one is enough.
+        let mut skip = 0usize;
+        if a.len() > 0 && is_space(a[a.len() - 1]) {
+            while skip < b.len() && is_space(b[skip]) { skip += 1; }
+        }
+        if skip == b.len() { return; }
+        if a.len() > 0 && spaced(a, b[skip]) { self.text.push(' '); }
+        let base = self.text.len() as u32;
+        self.text.push_str(&other.text[skip..]);
+        for s in other.spans.iter() {
+            if s.end as usize <= skip { continue; }
+            let st = if (s.start as usize) < skip { 0 } else { s.start - skip as u32 };
+            self.spans.push(Span { start: st + base, end: s.end - skip as u32 + base, pos: s.pos });
+        }
+    }
+
+    /// Appends text at the default position.
+    pub fn push_str(&mut self, text: &str) { self.push(&Code::from_text(text)); }
+
+    /// The same code at x's position (as Rust's quote_spanned!): errors in
+    /// it that no inner part claims point at x.
+    pub fn at<X: Spanned>(&self, x: &X) -> Code {
+        let mut c = self.clone();
+        let p = x.pos();
+        if p >= 0 && c.text.len() > 0 {
+            let mut spans = Vec::new();
+            spans.push(Span { start: 0, end: c.text.len() as u32, pos: p });
+            for s in c.spans.iter() { spans.push(s.clone()); }
+            c.spans = spans;
+        }
+        c
+    }
+}
+
+impl crate::fmt::Display for Code {
+    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { f.write_str(self.text.as_str()) }
+}
+
+impl crate::fmt::Debug for Code {
+    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { f.write_fmt(`Code(${self.text:?})`) }
+}
+
+fn is_space(c: u8) -> bool { c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' }
+
+fn is_word(c: u8) -> bool { c == b'_' || (c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c >= 0x80 }
+
+fn is_op(c: u8) -> bool {
+    match c {
+        b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'!' | b'&' | b'|' | b'^' | b':' | b'.' => true,
+        _ => false,
+    }
+}
+
+// Whether code a and code starting with y need a space between: where they
+// would make one token, else unless one side reads tight (f(x), a.b,
+// Vec<T>, x: T, a::b, &x).
+fn spaced(a: &[u8], y: u8) -> bool {
+    let x = a[a.len() - 1];
+    if is_space(x) || is_space(y) { return false; }
+    if (is_word(x) && is_word(y)) || (is_op(x) && is_op(y)) { return true; }
+    match y {
+        b',' | b';' | b'.' | b')' | b']' | b'>' | b':' | b'(' | b'<' => return false,
+        _ => {}
+    }
+    match x {
+        b'(' | b'[' | b'.' | b'<' | b'&' | b'!' => return false,
+        b':' => return !(a.len() >= 2 && a[a.len() - 2] == b':'),
+        _ => {}
+    }
+    true
+}
+
+/// quote`...`: the code of a template. The compiler lexes the template's
+/// text when it compiles the macro (its brackets must match) and calls this
+/// with the text between the holes and each hole's value as code
+/// (ToCode).
+pub fn quote(parts: &[&str], values: &[Code]) -> Code {
+    let mut c = Code::new();
+    let mut i = 0;
+    while i < parts.len() {
+        c.push_str(parts[i]);
+        if i < values.len() { c.push(&values[i]); }
+        i += 1;
+    }
+    c
+}
+
+/// A value that can be put in a quote`...` hole.
+pub trait ToCode {
+    fn to_code(&self) -> Code;
+}
+
+impl ToCode for Code {
+    fn to_code(&self) -> Code { self.clone() }
+}
+
+/// A string literal (escaped).
+impl ToCode for str {
+    fn to_code(&self) -> Code { Code::from_text(string_literal(self).as_str()) }
+}
+
+impl ToCode for String {
+    fn to_code(&self) -> Code { Code::from_text(string_literal(self.as_str()).as_str()) }
+}
+
+impl<T: ToCode> ToCode for &T {
+    fn to_code(&self) -> Code { (**self).to_code() }
+}
+
+impl<T: ToCode> ToCode for &mut T {
+    fn to_code(&self) -> Code { (**self).to_code() }
+}
+
+/// Each element in turn.
+impl<T: ToCode> ToCode for [T] {
+    fn to_code(&self) -> Code {
+        let mut c = Code::new();
+        for x in self.iter() { c.push(&x.to_code()); }
+        c
+    }
+}
+
+impl<T: ToCode> ToCode for Vec<T> {
+    fn to_code(&self) -> Code { self.as_slice().to_code() }
+}
+
+/// None is no code.
+impl<T: ToCode> ToCode for Option<T> {
+    fn to_code(&self) -> Code {
+        match self {
+            Some(x) => x.to_code(),
+            None => Code::new(),
+        }
+    }
+}
+
+impl ToCode for bool {
+    fn to_code(&self) -> Code { Code::from_text(if *self { "true" } else { "false" }) }
+}
+
+impl ToCode for char {
+    fn to_code(&self) -> Code { Code::from_text(`${self:?}`.to_string().as_str()) }
+}
+
+impl ToCode for i32 { fn to_code(&self) -> Code { Code::from_text(`${self}i32`.to_string().as_str()) } }
+impl ToCode for i64 { fn to_code(&self) -> Code { Code::from_text(`${self}i64`.to_string().as_str()) } }
+impl ToCode for u32 { fn to_code(&self) -> Code { Code::from_text(`${self}u32`.to_string().as_str()) } }
+impl ToCode for u64 { fn to_code(&self) -> Code { Code::from_text(`${self}u64`.to_string().as_str()) } }
+impl ToCode for usize { fn to_code(&self) -> Code { Code::from_text(`${self}usize`.to_string().as_str()) } }
+impl ToCode for isize { fn to_code(&self) -> Code { Code::from_text(`${self}isize`.to_string().as_str()) } }
+
+/// s as a navi string literal.
+pub fn string_literal(s: &str) -> String {
+    let mut out = String::new();
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+// --- What a macro sees -----------------------------------------------------
+
+/// Something with a position in the user's code.
+pub trait Spanned {
+    fn pos(&self) -> i32;
+}
+
+/// An identifier; put in code, it keeps its position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ident {
+    name: String,
+    pos: i32,
+}
+
+impl Ident {
+    /// A new identifier (at the default position).
+    pub fn new(name: &str) -> Ident { Ident { name: name.to_string(), pos: NO_POS } }
+
+    pub fn with_pos(name: &str, pos: i32) -> Ident { Ident { name: name.to_string(), pos } }
+
+    pub fn as_str(&self) -> &str { self.name.as_str() }
+}
+
+impl Spanned for Ident { fn pos(&self) -> i32 { self.pos } }
+
+impl ToCode for Ident {
+    fn to_code(&self) -> Code { Code::spanned(self.name.as_str(), self.pos) }
+}
+
+impl crate::fmt::Display for Ident {
+    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { f.write_str(self.name.as_str()) }
+}
+
+/// A type as written: its text, and its parts.
+#[derive(Clone, Debug)]
+pub struct TypeRef {
+    text: String,
+    pos: i32,
+    kind: TypeKind,
+}
+
+/// The parts of a TypeRef.
+#[derive(Clone, Debug)]
+pub enum TypeKind {
+    /// a::b::C<X, Y>: each segment's name and generic arguments.
+    Path(Vec<Segment>),
+    /// &T or &mut T (true).
+    Ref(bool, &TypeRef),
+    /// [T; N]: the element and the length as written.
+    Array(&TypeRef, String),
+    /// [T]
+    Slice(&TypeRef),
+    /// (A, B)
+    Tuple(Vec<TypeRef>),
+    /// Anything else (fn, dyn, raw pointers, !, impl Trait).
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub struct Segment {
+    pub name: String,
+    pub args: Vec<TypeRef>,
+}
+
+impl TypeRef {
+    pub fn kind(&self) -> &TypeKind { &self.kind }
+
+    pub fn text(&self) -> &str { self.text.as_str() }
+
+    /// The last segment's name of a path type (Option for Option<T>).
+    pub fn last_name(&self) -> Option<&str> {
+        match &self.kind {
+            TypeKind::Path(segs) => if segs.len() > 0 { Some(segs[segs.len() - 1].name.as_str()) } else { None },
+            _ => None,
+        }
+    }
+
+    /// The generic arguments of a path type's last segment.
+    pub fn args(&self) -> Vec<TypeRef> {
+        match &self.kind {
+            TypeKind::Path(segs) => if segs.len() > 0 { segs[segs.len() - 1].args.clone() } else { Vec::new() },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether this is the path type name (one segment), as Option<T>.
+    pub fn is(&self, name: &str) -> bool {
+        match &self.kind {
+            TypeKind::Path(segs) => segs.len() == 1 && segs[0].name == name,
+            _ => false,
+        }
+    }
+}
+
+impl Spanned for TypeRef { fn pos(&self) -> i32 { self.pos } }
+
+impl ToCode for TypeRef {
+    fn to_code(&self) -> Code { Code::spanned(self.text.as_str(), self.pos) }
+}
+
+/// An attribute: #[name(key = value, flag, ...)].
+#[derive(Clone, Debug)]
+pub struct Attr {
+    pub name: String,
+    pub pos: i32,
+    pub args: Vec<AttrArg>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttrArg {
+    pub key: Ident,
+    pub value: Option<AttrValue>,
+}
+
+/// An attribute argument's value.
+#[derive(Clone, Debug)]
+pub enum AttrValue {
+    Str(String, i32),
+    Int(i64, i32),
+    Bool(bool, i32),
+    /// Any other literal or path, as written.
+    Other(String, i32),
+}
+
+impl Spanned for Attr { fn pos(&self) -> i32 { self.pos } }
+impl Spanned for AttrArg { fn pos(&self) -> i32 { self.key.pos } }
+
+/// A struct's or variant's field.
+#[derive(Clone, Debug)]
+pub struct Field {
+    name: Option<Ident>,
+    index: usize,
+    ty: TypeRef,
+    attrs: Vec<Attr>,
+    vis: String,
+    pos: i32,
+}
+
+impl Field {
+    /// The name of a named field.
+    pub fn name(&self) -> Option<Ident> { self.name.clone() }
+
+    /// The name, or the index of a tuple field (as in self.0).
+    pub fn ident(&self) -> Ident {
+        match &self.name {
+            Some(n) => n.clone(),
+            None => Ident::with_pos(`${self.index}`.to_string().as_str(), self.pos),
+        }
+    }
+
+    pub fn index(&self) -> usize { self.index }
+
+    pub fn ty(&self) -> &TypeRef { &self.ty }
+
+    /// "" (private), "pub", "pub(crate)" or "pub(super)".
+    pub fn vis(&self) -> &str { self.vis.as_str() }
+
+    pub fn attrs(&self) -> &Vec<Attr> { &self.attrs }
+
+    pub fn has_attr(&self, name: &str) -> bool { has(&self.attrs, name) }
+
+    /// The field's #[ns(...)] attributes parsed as T (FromAttrs).
+    pub fn parse_attrs<T: FromAttrs>(&self, ns: &str) -> Result<T, Error> { parse_attrs::<T>(&self.attrs, ns, self.pos) }
+}
+
+impl Spanned for Field { fn pos(&self) -> i32 { self.pos } }
+
+/// The kind of a struct or variant.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Kind {
+    Named,
+    Tuple,
+    Unit,
+}
+
+/// An enum's variant, or the struct itself (each_variant handles both).
+#[derive(Clone, Debug)]
+pub struct Variant {
+    name: Ident,
+    /// The path in patterns and constructors: Type or Type::Variant.
+    path: String,
+    kind: Kind,
+    fields: Vec<Field>,
+    attrs: Vec<Attr>,
+    discr: String,
+    index: usize,
+}
+
+impl Variant {
+    pub fn name(&self) -> Ident { self.name.clone() }
+
+    pub fn kind(&self) -> Kind { self.kind }
+
+    pub fn fields(&self) -> &Vec<Field> { &self.fields }
+
+    pub fn attrs(&self) -> &Vec<Attr> { &self.attrs }
+
+    pub fn has_attr(&self, name: &str) -> bool { has(&self.attrs, name) }
+
+    pub fn parse_attrs<T: FromAttrs>(&self, ns: &str) -> Result<T, Error> { parse_attrs::<T>(&self.attrs, ns, self.name.pos) }
+
+    /// The explicit discriminant as written ("" if none).
+    pub fn discriminant(&self) -> &str { self.discr.as_str() }
+
+    /// The variant's position in the declaration (0 for a struct).
+    pub fn index(&self) -> usize { self.index }
+
+    /// Type or Type::Variant, as patterns and constructors write it.
+    pub fn path(&self) -> Code { Code::spanned(self.path.as_str(), self.name.pos) }
+
+    /// A binding for each field (named __binding_0, ...), as each and
+    /// each_variant's patterns bind them.
+    pub fn bindings(&self) -> Vec<Binding> { self.bindings_named("__binding") }
+
+    fn bindings_named(&self, prefix: &str) -> Vec<Binding> {
+        let mut out = Vec::new();
+        for f in self.fields.iter() { out.push(Binding { name: `${prefix}_${f.index}`.to_string(), field: f.clone() }); }
+        out
+    }
+
+    /// The pattern binding each field to the binding of the same index.
+    pub fn pattern(&self) -> Code { self.pattern_named("__binding") }
+
+    fn pattern_named(&self, prefix: &str) -> Code {
+        let bs = self.bindings_named(prefix);
+        let mut parts: Vec<Code> = Vec::new();
+        for b in bs.iter() {
+            match &b.field.name {
+                Some(n) => {
+                    let mut c = n.to_code();
+                    c.push_str(":");
+                    c.push_str(b.name.as_str());
+                    parts.push(c);
+                }
+                None => parts.push(Code::from_text(b.name.as_str())),
+            }
+        }
+        self.shape_of(&parts)
+    }
+
+    /// The constructor with one expression per field (in field order).
+    pub fn construct(&self, values: &Vec<Code>) -> Code {
+        let mut parts: Vec<Code> = Vec::new();
+        let mut i = 0;
+        while i < self.fields.len() {
+            let v = if i < values.len() { values[i].clone() } else { Code::new() };
+            match &self.fields[i].name {
+                Some(n) => {
+                    let mut c = n.to_code();
+                    c.push_str(":");
+                    c.push(&v);
+                    parts.push(c);
+                }
+                None => parts.push(v),
+            }
+            i += 1;
+        }
+        self.shape_of(&parts)
+    }
+
+    // path { a, b } / path(a, b) / path
+    fn shape_of(&self, parts: &Vec<Code>) -> Code {
+        let mut c = self.path();
+        match self.kind {
+            Kind::Unit => {}
+            Kind::Named => {
+                c.push_str("{");
+                c.push(&comma_list(parts));
+                c.push_str("}");
+            }
+            Kind::Tuple => {
+                c.push_str("(");
+                c.push(&comma_list(parts));
+                c.push_str(")");
+            }
+        }
+        c
+    }
+}
+
+impl Spanned for Variant { fn pos(&self) -> i32 { self.name.pos } }
+
+/// A field bound by a pattern; put in code, it is the bound variable (at
+/// the field's position).
+#[derive(Clone, Debug)]
+pub struct Binding {
+    name: String,
+    field: Field,
+}
+
+impl Binding {
+    pub fn field(&self) -> &Field { &self.field }
+
+    pub fn ident(&self) -> Ident { Ident::with_pos(self.name.as_str(), self.field.pos) }
+}
+
+impl Spanned for Binding { fn pos(&self) -> i32 { self.field.pos } }
+
+impl ToCode for Binding {
+    fn to_code(&self) -> Code { Code::spanned(self.name.as_str(), self.field.pos) }
+}
+
+/// A type or const parameter.
+#[derive(Clone, Debug)]
+pub struct GenericParam {
+    pub name: Ident,
+    /// const N: usize
+    pub is_const: bool,
+    /// The bounds as written ("" if none): T: Clone + Debug.
+    pub bounds: String,
+    /// A const parameter's type.
+    pub ty: String,
+}
+
+/// The type's generic parameters and where clause.
+#[derive(Clone, Debug)]
+pub struct Generics {
+    pub params: Vec<GenericParam>,
+    /// The where clause's predicates as written ("" if none).
+    pub where_clause: String,
+}
+
+/// The struct or enum a macro derives for.
+#[derive(Clone, Debug)]
+pub struct TypeInfo {
+    name: Ident,
+    module: String,
+    vis: String,
+    attrs: Vec<Attr>,
+    generics: Generics,
+    is_enum: bool,
+    variants: Vec<Variant>,
+}
+
+impl TypeInfo {
+    /// The TypeInfo of T (a struct or enum), made by the compiler: for
+    /// testing a macro in an ordinary #[test].
+    pub fn of<T>() -> TypeInfo {
+        let p = crate::intrinsics::type_info::<T>() as *const usize;
+        let s = unsafe { crate::rt::str_from_raw(*p as *const u8, *p.add(1)) };
+        let mut d = Dec { b: s.as_bytes(), i: 0 };
+        d.type_info()
+    }
+
+    pub fn name(&self) -> Ident { self.name.clone() }
+
+    /// The module the type is in, from its crate's root (a::b, or "").
+    pub fn module(&self) -> &str { self.module.as_str() }
+
+    pub fn vis(&self) -> &str { self.vis.as_str() }
+
+    pub fn attrs(&self) -> &Vec<Attr> { &self.attrs }
+
+    pub fn has_attr(&self, name: &str) -> bool { has(&self.attrs, name) }
+
+    /// The type's #[ns(...)] attributes parsed as T (FromAttrs).
+    pub fn parse_attrs<T: FromAttrs>(&self, ns: &str) -> Result<T, Error> { parse_attrs::<T>(&self.attrs, ns, self.name.pos) }
+
+    pub fn generics(&self) -> &Generics { &self.generics }
+
+    pub fn is_enum(&self) -> bool { self.is_enum }
+
+    /// An enum's variants, or the struct as one variant.
+    pub fn variants(&self) -> &Vec<Variant> { &self.variants }
+
+    /// A struct's fields (an enum has none).
+    pub fn fields(&self) -> Vec<Field> {
+        if self.is_enum { return Vec::new(); }
+        self.variants[0].fields.clone()
+    }
+
+    /// The type with its parameters: Name<T, N>.
+    pub fn self_type(&self) -> Code {
+        let mut c = self.name.to_code();
+        if self.generics.params.len() > 0 {
+            let mut ps: Vec<Code> = Vec::new();
+            for p in self.generics.params.iter() { ps.push(p.name.to_code()); }
+            c.push_str("<");
+            c.push(&comma_list(&ps));
+            c.push_str(">");
+        }
+        c
+    }
+
+    /// impl<...> trait_path for Self<...> where ... { items }: every type
+    /// parameter must implement the trait too (as Rust's derives).
+    pub fn impl_for(&self, trait_path: &str, items: Code) -> Code {
+        let mut bound = Code::new();
+        if self.generics.params.len() > 0 { bound.push_str(trait_path); }
+        self.impl_with(trait_path, bound, items)
+    }
+
+    /// impl_for with the bound for each type parameter given ("" for none).
+    pub fn impl_for_with(&self, trait_path: &str, bound: Code, items: Code) -> Code { self.impl_with(trait_path, bound, items) }
+
+    fn impl_with(&self, trait_path: &str, bound: Code, items: Code) -> Code {
+        let mut c = Code::from_text("impl");
+        if self.generics.params.len() > 0 {
+            let mut ps: Vec<Code> = Vec::new();
+            for p in self.generics.params.iter() {
+                let mut x = Code::new();
+                if p.is_const {
+                    x.push_str("const");
+                    x.push(&p.name.to_code());
+                    x.push_str(":");
+                    x.push_str(p.ty.as_str());
+                } else {
+                    x.push(&p.name.to_code());
+                    let mut bs = Vec::new();
+                    if p.bounds.len() > 0 { bs.push(Code::from_text(p.bounds.as_str())); }
+                    if !bound.is_empty() { bs.push(bound.clone()); }
+                    if bs.len() > 0 {
+                        x.push_str(":");
+                        let mut i = 0;
+                        while i < bs.len() {
+                            if i > 0 { x.push_str("+"); }
+                            x.push(&bs[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                ps.push(x);
+            }
+            c.push_str("<");
+            c.push(&comma_list(&ps));
+            c.push_str(">");
+        }
+        c.push_str(trait_path);
+        c.push_str("for");
+        c.push(&self.self_type());
+        if self.generics.where_clause.len() > 0 {
+            c.push_str("where");
+            c.push_str(self.generics.where_clause.as_str());
+        }
+        c.push_str("{");
+        c.push(&items);
+        c.push_str("}");
+        c
+    }
+
+    /// match *self { each variant's pattern => { f(binding) for each field } }
+    pub fn each(&self, f: fn(&Binding) -> Code) -> Code {
+        let mut arms = Code::new();
+        for v in self.variants.iter() {
+            let mut body = Code::new();
+            for b in v.bindings().iter() { body.push(&f(b)); }
+            arms.push(&v.pattern());
+            arms.push_str("=> {");
+            arms.push(&body);
+            arms.push_str("}");
+        }
+        self.match_self(arms)
+    }
+
+    /// match *self { each variant's pattern => { f(variant) } }: the
+    /// variant's bindings() are bound.
+    pub fn each_variant(&self, f: fn(&Variant) -> Result<Code, Error>) -> Result<Code, Error> {
+        let mut arms = Code::new();
+        for v in self.variants.iter() {
+            let body = f(v)?;
+            arms.push(&v.pattern());
+            arms.push_str("=> {");
+            arms.push(&body);
+            arms.push_str("}");
+        }
+        Ok(self.match_self(arms))
+    }
+
+    /// match *self { each variant's pattern => the same variant built from
+    /// f(binding) for each field } (as Clone).
+    pub fn each_construct(&self, f: fn(&Binding) -> Code) -> Code {
+        let mut arms = Code::new();
+        for v in self.variants.iter() {
+            let mut vals: Vec<Code> = Vec::new();
+            for b in v.bindings().iter() { vals.push(f(b)); }
+            arms.push(&v.pattern());
+            arms.push_str("=>");
+            arms.push(&v.construct(&vals));
+            arms.push_str(",");
+        }
+        self.match_self(arms)
+    }
+
+    /// Both self and other (an expression of type &Self) taken apart: for
+    /// the same variant f(self's binding, other's binding) for each field;
+    /// differ when the variants differ (as PartialEq).
+    pub fn each_pair(&self, other: Code, f: fn(&Binding, &Binding) -> Code, differ: Code) -> Code {
+        let mut arms = Code::new();
+        for v in self.variants.iter() {
+            let a = v.bindings_named("__binding");
+            let b = v.bindings_named("__other");
+            let mut body = Code::new();
+            let mut i = 0;
+            while i < a.len() {
+                body.push(&f(&a[i], &b[i]));
+                i += 1;
+            }
+            arms.push(&v.pattern());
+            arms.push_str("=> match *(");
+            arms.push(&other);
+            arms.push_str(") {");
+            arms.push(&v.pattern_named("__other"));
+            arms.push_str("=> {");
+            arms.push(&body);
+            arms.push_str("}");
+            if self.variants.len() > 1 {
+                arms.push_str("_ => {");
+                arms.push(&differ);
+                arms.push_str("}");
+            }
+            arms.push_str("},");
+        }
+        self.match_self(arms)
+    }
+
+    fn match_self(&self, arms: Code) -> Code {
+        let mut c = Code::from_text("match *self {");
+        c.push(&arms);
+        c.push_str("}");
+        c
+    }
+}
+
+impl Spanned for TypeInfo { fn pos(&self) -> i32 { self.name.pos } }
+
+fn comma_list(parts: &Vec<Code>) -> Code {
+    let mut c = Code::new();
+    let mut i = 0;
+    while i < parts.len() {
+        if i > 0 { c.push_str(","); }
+        c.push(&parts[i]);
+        i += 1;
+    }
+    c
+}
+
+fn has(attrs: &Vec<Attr>, name: &str) -> bool {
+    for a in attrs.iter() { if a.name == name { return true; } }
+    false
+}
+
+// --- Errors ----------------------------------------------------------------
+
+/// A macro's error, at a position in the user's code.
+#[derive(Clone, Debug)]
+pub struct Error {
+    pub pos: i32,
+    pub msg: String,
+}
+
+impl Error {
+    /// An error at the #[derive(...)] attribute.
+    pub fn new(msg: &str) -> Error { Error { pos: NO_POS, msg: msg.to_string() } }
+
+    /// An error at x (a field, variant, type, attribute...).
+    pub fn at<X: Spanned>(x: &X, msg: &str) -> Error { Error { pos: x.pos(), msg: msg.to_string() } }
+}
+
+impl crate::fmt::Display for Error {
+    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { f.write_str(self.msg.as_str()) }
+}
+
+// --- Attributes --------------------------------------------------------------
+
+/// A type made from an attribute's arguments: #[derive(FromAttrs)] on a
+/// struct makes it (an Option<T> field is an optional key, a bool a flag,
+/// any other a required key; unknown and missing keys are errors).
+pub trait FromAttrs {
+    fn from_attrs(args: &mut AttrArgs) -> Result<Self, Error>;
+}
+
+/// The arguments of all of an item's #[ns(...)] attributes, taken key by
+/// key.
+pub struct AttrArgs {
+    ns: String,
+    args: Vec<AttrArg>,
+    used: Vec<bool>,
+    pos: i32,
+}
+
+/// The #[ns(...)] attributes in attrs parsed as T (pos: where a missing
+/// key is reported).
+pub fn parse_attrs<T: FromAttrs>(attrs: &Vec<Attr>, ns: &str, pos: i32) -> Result<T, Error> {
+    let mut args = Vec::new();
+    let mut at = pos;
+    for a in attrs.iter() {
+        if a.name != ns { continue; }
+        at = a.pos;
+        for x in a.args.iter() { args.push(x.clone()); }
+    }
+    let mut used = Vec::new();
+    for _ in args.iter() { used.push(false); }
+    let mut aa = AttrArgs { ns: ns.to_string(), args, used, pos: at };
+    let v = T::from_attrs(&mut aa)?;
+    aa.finish()?;
+    Ok(v)
+}
+
+impl AttrArgs {
+    // The argument key (marking it used); an error if given twice.
+    fn take(&mut self, key: &str) -> Result<Option<AttrArg>, Error> {
+        let mut found: Option<AttrArg> = None;
+        let mut i = 0;
+        while i < self.args.len() {
+            if self.args[i].key.name == key {
+                if found.is_some() { return Err(Error::at(&self.args[i], `${key} is given more than once in #[${self.ns}]`.to_string().as_str())); }
+                found = Some(self.args[i].clone());
+                self.used[i] = true;
+            }
+            i += 1;
+        }
+        Ok(found)
+    }
+
+    /// A flag: present (key, or key = true) or not.
+    pub fn flag(&mut self, key: &str) -> Result<bool, Error> {
+        match self.take(key)? {
+            None => Ok(false),
+            Some(a) => match &a.value {
+                None => Ok(true),
+                Some(AttrValue::Bool(b, _)) => Ok(*b),
+                Some(_) => Err(Error::at(&a, `${key} in #[${self.ns}] takes no value`.to_string().as_str())),
+            },
+        }
+    }
+
+    /// key = value, if given.
+    pub fn optional<T: FromAttrValue>(&mut self, key: &str) -> Result<Option<T>, Error> {
+        match self.take(key)? {
+            None => Ok(None),
+            Some(a) => match &a.value {
+                None => Err(Error::at(&a, `${key} in #[${self.ns}] needs a value (${key} = ...)`.to_string().as_str())),
+                Some(v) => match T::from_value(v) {
+                    Some(x) => Ok(Some(x)),
+                    None => Err(Error::at(&a, `${key} in #[${self.ns}] must be ${T::expected()}`.to_string().as_str())),
+                },
+            },
+        }
+    }
+
+    /// key = value, which must be given.
+    pub fn required<T: FromAttrValue>(&mut self, key: &str) -> Result<T, Error> {
+        match self.optional::<T>(key)? {
+            Some(x) => Ok(x),
+            None => Err(Error { pos: self.pos, msg: `#[${self.ns}] needs ${key} = ...`.to_string() }),
+        }
+    }
+
+    /// An error for the first argument nothing took.
+    pub fn finish(&self) -> Result<(), Error> {
+        let mut i = 0;
+        while i < self.args.len() {
+            if !self.used[i] {
+                let k = self.args[i].key.name.clone();
+                return Err(Error::at(&self.args[i], `unknown argument ${k} in #[${self.ns}]`.to_string().as_str()));
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+}
+
+/// An attribute value a FromAttrs field can have.
+pub trait FromAttrValue {
+    fn from_value(v: &AttrValue) -> Option<Self>;
+    /// What the value must be, for errors.
+    fn expected() -> &str;
+}
+
+impl FromAttrValue for String {
+    fn from_value(v: &AttrValue) -> Option<String> {
+        match v {
+            AttrValue::Str(s, _) => Some(s.clone()),
+            _ => None,
+        }
+    }
+    fn expected() -> &str { "a string" }
+}
+
+impl FromAttrValue for bool {
+    fn from_value(v: &AttrValue) -> Option<bool> {
+        match v {
+            AttrValue::Bool(b, _) => Some(*b),
+            _ => None,
+        }
+    }
+    fn expected() -> &str { "true or false" }
+}
+
+impl FromAttrValue for i64 {
+    fn from_value(v: &AttrValue) -> Option<i64> {
+        match v {
+            AttrValue::Int(n, _) => Some(*n),
+            _ => None,
+        }
+    }
+    fn expected() -> &str { "an integer" }
+}
+
+impl FromAttrValue for i32 {
+    fn from_value(v: &AttrValue) -> Option<i32> {
+        match v {
+            AttrValue::Int(n, _) => if *n >= -2147483648 && *n <= 2147483647 { Some(*n as i32) } else { None },
+            _ => None,
+        }
+    }
+    fn expected() -> &str { "an integer (i32)" }
+}
+
+impl FromAttrValue for usize {
+    fn from_value(v: &AttrValue) -> Option<usize> {
+        match v {
+            AttrValue::Int(n, _) => if *n >= 0 { Some(*n as usize) } else { None },
+            _ => None,
+        }
+    }
+    fn expected() -> &str { "a non-negative integer" }
+}
+
+/// A path or other literal, as written (#[x(with = path::to::f)]).
+pub struct Raw(pub String);
+
+impl FromAttrValue for Raw {
+    fn from_value(v: &AttrValue) -> Option<Raw> {
+        match v {
+            AttrValue::Other(s, _) => Some(Raw(s.clone())),
+            AttrValue::Str(s, _) => Some(Raw(s.clone())),
+            _ => None,
+        }
+    }
+    fn expected() -> &str { "a path" }
+}
+
+// --- The macro program ---------------------------------------------------------
+
+/// The main of a derive macro program (the compiler makes it): reads the
+/// requests (a macro's name and a TypeInfo each) from the file its argument
+/// names and writes each one's code or error to standard output.
+pub fn serve(f: fn(&str, &TypeInfo) -> Result<Code, Error>) {
+    let args: Vec<String> = crate::env::args().collect();
+    if args.len() != 2 {
+        crate::io::eprintln("usage: a derive macro program takes a file of requests (navi runs it)");
+        crate::process::exit(2);
+    }
+    let input = match crate::fs::read_to_string(args[1].as_str()) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::io::eprintln(`derive macro: ${e}`);
+            crate::process::exit(2);
+        }
+    };
+    let mut d = Dec { b: input.as_bytes(), i: 0 };
+    let mut out = Enc { s: String::new() };
+    d.open();
+    while !d.at_close() {
+        d.open();
+        let name = d.str();
+        let t = d.type_info();
+        d.close();
+        match f(name.as_str(), &t) {
+            Ok(c) => {
+                out.s.push('o');
+                out.str(c.text.as_str());
+                out.s.push('[');
+                for s in c.spans.iter() {
+                    out.int(s.start as i64);
+                    out.int(s.end as i64);
+                    out.int(s.pos as i64);
+                }
+                out.s.push(']');
+            }
+            Err(e) => {
+                out.s.push('e');
+                out.int(e.pos as i64);
+                out.str(e.msg.as_str());
+            }
+        }
+    }
+    crate::io::print(out.s);
+}
+
+// The encoding between the compiler and a macro program (and of
+// TypeInfo::of): a string is <length>:<bytes>, an integer i<decimal>; and
+// a list [ ... ]. compiler/src/derive/info.navi writes TypeInfos.
+struct Enc { s: String }
+
+impl Enc {
+    fn str(&mut self, x: &str) {
+        self.s.push_str(`${x.len()}:`.to_string().as_str());
+        self.s.push_str(x);
+    }
+
+    fn int(&mut self, n: i64) { self.s.push_str(`i${n};`.to_string().as_str()); }
+}
+
+struct Dec {
+    b: &[u8],
+    i: usize,
+}
+
+impl Dec {
+    fn fail(&self) -> ! { crate::panic::panic(`derive: bad input at byte ${self.i}`) }
+
+    fn byte(&mut self, c: u8) {
+        if self.i >= self.b.len() || self.b[self.i] != c { self.fail(); }
+        self.i += 1;
+    }
+
+    fn open(&mut self) { self.byte(b'['); }
+
+    fn close(&mut self) { self.byte(b']'); }
+
+    fn at_close(&mut self) -> bool {
+        if self.i >= self.b.len() { self.fail(); }
+        if self.b[self.i] == b']' {
+            self.i += 1;
+            return true;
+        }
+        false
+    }
+
+    fn str(&mut self) -> String {
+        let mut n = 0usize;
+        while self.i < self.b.len() && self.b[self.i] != b':' {
+            let c = self.b[self.i];
+            if c < b'0' || c > b'9' { self.fail(); }
+            n = n * 10 + (c - b'0') as usize;
+            self.i += 1;
+        }
+        self.byte(b':');
+        if self.i + n > self.b.len() { self.fail(); }
+        let s = String::from_utf8_lossy(&self.b[self.i..self.i + n]);
+        self.i += n;
+        s
+    }
+
+    fn int(&mut self) -> i64 {
+        self.byte(b'i');
+        let mut neg = false;
+        if self.i < self.b.len() && self.b[self.i] == b'-' {
+            neg = true;
+            self.i += 1;
+        }
+        let mut n = 0i64;
+        while self.i < self.b.len() && self.b[self.i] != b';' {
+            let c = self.b[self.i];
+            if c < b'0' || c > b'9' { self.fail(); }
+            n = n * 10 + (c - b'0') as i64;
+            self.i += 1;
+        }
+        self.byte(b';');
+        if neg { -n } else { n }
+    }
+
+    fn ident(&mut self) -> Ident {
+        let name = self.str();
+        let pos = self.int() as i32;
+        Ident { name, pos }
+    }
+
+    // [name module vis [attrs] [params] where is_enum [variants]]
+    fn type_info(&mut self) -> TypeInfo {
+        self.open();
+        let name = self.ident();
+        let module = self.str();
+        let vis = self.str();
+        let attrs = self.attrs();
+        let mut params = Vec::new();
+        self.open();
+        while !self.at_close() {
+            self.open();
+            let pname = self.ident();
+            let is_const = self.int() != 0;
+            let bounds = self.str();
+            let ty = self.str();
+            self.close();
+            params.push(GenericParam { name: pname, is_const, bounds, ty });
+        }
+        let where_clause = self.str();
+        let is_enum = self.int() != 0;
+        let mut variants = Vec::new();
+        self.open();
+        while !self.at_close() { variants.push(self.variant(variants.len())); }
+        self.close();
+        TypeInfo { name, module, vis, attrs, generics: Generics { params, where_clause }, is_enum, variants }
+    }
+
+    // [name path kind [attrs] discr [fields]]
+    fn variant(&mut self, index: usize) -> Variant {
+        self.open();
+        let name = self.ident();
+        let path = self.str();
+        let kind = match self.int() {
+            0 => Kind::Named,
+            1 => Kind::Tuple,
+            _ => Kind::Unit,
+        };
+        let attrs = self.attrs();
+        let discr = self.str();
+        let mut fields = Vec::new();
+        self.open();
+        while !self.at_close() {
+            // [name pos vis [attrs] type]
+            self.open();
+            let fname = self.str();
+            let pos = self.int() as i32;
+            let vis = self.str();
+            let fattrs = self.attrs();
+            let ty = self.type_ref();
+            self.close();
+            let n = if fname.len() > 0 { Some(Ident { name: fname, pos }) } else { None };
+            fields.push(Field { name: n, index: fields.len(), ty, attrs: fattrs, vis, pos });
+        }
+        self.close();
+        Variant { name, path, kind, fields, attrs, discr, index }
+    }
+
+    // [[name pos [[key pos tag value vpos]...]]...]
+    fn attrs(&mut self) -> Vec<Attr> {
+        let mut out = Vec::new();
+        self.open();
+        while !self.at_close() {
+            self.open();
+            let name = self.str();
+            let pos = self.int() as i32;
+            let mut args = Vec::new();
+            self.open();
+            while !self.at_close() {
+                self.open();
+                let key = self.ident();
+                let tag = self.str();
+                let text = self.str();
+                let vpos = self.int() as i32;
+                self.close();
+                let value = match tag.as_str() {
+                    "" => None,
+                    "s" => Some(AttrValue::Str(text, vpos)),
+                    "i" => match text.parse::<i64>() {
+                        Ok(n) => Some(AttrValue::Int(n, vpos)),
+                        Err(_) => Some(AttrValue::Other(text, vpos)),
+                    },
+                    "b" => Some(AttrValue::Bool(text == "true", vpos)),
+                    _ => Some(AttrValue::Other(text, vpos)),
+                };
+                args.push(AttrArg { key, value });
+            }
+            self.close();
+            out.push(Attr { name, pos, args });
+        }
+        out
+    }
+
+    // [text pos kind ...]: kind 0 path [[name [args]]...], 1 ref mut type,
+    // 2 array type len, 3 slice type, 4 tuple [types], 5 other.
+    fn type_ref(&mut self) -> TypeRef {
+        self.open();
+        let text = self.str();
+        let pos = self.int() as i32;
+        let kind = match self.int() {
+            0 => {
+                let mut segs = Vec::new();
+                self.open();
+                while !self.at_close() {
+                    self.open();
+                    let name = self.str();
+                    let mut args = Vec::new();
+                    self.open();
+                    while !self.at_close() { args.push(self.type_ref()); }
+                    self.close();
+                    segs.push(Segment { name, args });
+                }
+                TypeKind::Path(segs)
+            }
+            1 => {
+                let m = self.int() != 0;
+                TypeKind::Ref(m, &self.type_ref())
+            }
+            2 => {
+                let e = self.type_ref();
+                let n = self.str();
+                TypeKind::Array(&e, n)
+            }
+            3 => TypeKind::Slice(&self.type_ref()),
+            4 => {
+                let mut ts = Vec::new();
+                self.open();
+                while !self.at_close() { ts.push(self.type_ref()); }
+                TypeKind::Tuple(ts)
+            }
+            _ => TypeKind::Other,
+        };
+        self.close();
+        TypeRef { text, pos, kind }
+    }
+}

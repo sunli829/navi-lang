@@ -81,6 +81,26 @@ for f in tests/ui/*.navi; do
 		echo "FAIL $f (diagnostics)"; head -20 "$tmp/diag.diff"; fail=1
 	fi
 done
+# Derive macros (docs/derive.md): tests/derive/macros's, used by app (its
+# output) and bad (exactly the annotated errors).
+set +e
+(cd tests/derive/app && "$navi" build -o "$tmp/derive-app" > "$tmp/derive-app.build" 2>&1) && "$tmp/derive-app" > "$tmp/derive-app.out" 2>&1
+code=$?
+(cd tests/derive/bad && "$navi" build -o "$tmp/derive-bad" > "$tmp/derive-bad.build" 2>&1)
+bad=$?
+set -e
+if [ "$code" = 0 ] && cmp -s "$tmp/derive-app.out" tests/derive/app/expected.out; then
+	echo "ok   derive macros (tests/derive/app)"
+else
+	echo "FAIL derive macros (tests/derive/app)"; cat "$tmp/derive-app.build" "$tmp/derive-app.out"; fail=1
+fi
+annotations tests/derive/bad/src/main.navi > "$tmp/diag.want"
+diags < "$tmp/derive-bad.build" > "$tmp/diag.got"
+if [ "$bad" != 0 ] && match_diags; then
+	echo "ok   derive macro errors (tests/derive/bad)"
+else
+	echo "FAIL derive macro errors (tests/derive/bad)"; head -20 "$tmp/diag.diff"; fail=1
+fi
 # navi test and navi bench on a crate with passing and failing tests.
 set +e
 "$navi" test tests/harness > "$tmp/harness.out" 2>/dev/null

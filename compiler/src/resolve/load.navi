@@ -35,6 +35,7 @@ impl Resolver {
         if self.cfg_enabled(root_file.file, &root_file.attrs) {
             self.collect_items(rm, root_file.file, &root_file.items, &mut files);
         }
+        self.decide_derives();
     }
 
     // parse_tree parses p and every file reachable through mod declarations.
@@ -150,7 +151,11 @@ impl Resolver {
         let c = m.krate;
         let vis = self.visibility(m, file, base);
         match it {
-            Item::Fn(f) => { self.define(m, file, it, DEF_FN, f.name, &vis, &[VALUE_NS]); }
+            Item::Fn(f) => {
+                let d = self.define(m, file, it, DEF_FN, f.name, &vis, &[VALUE_NS]);
+                // #[derive_macro(Name)]: the derive Name (MACRO_NS).
+                if let Some(md) = crate::derive::macro_decl(&f.base.attrs) { self.bind(m, file, MACRO_NS, md.name, res_def(d), vis.clone()); }
+            }
             Item::Struct(s) => {
                 if s.kind == StructKind::Named {
                     self.define(m, file, it, DEF_STRUCT, s.name, &vis, &[TYPE_NS]);
@@ -250,17 +255,33 @@ impl Resolver {
         }
     }
 
-    // The impls a struct's or enum's derives expand to (crate::derive),
-    // parsed as a file of their own and collected into the same module. The
-    // file is named after the item's (file and position: names in it are
-    // its own, symbols::def_id).
+    // A struct's or enum's derives, expanded once the crate is loaded
+    // (decide_derives).
     fn derive(&mut self, m: &mut Module, file: &File, it: &Item, files: &mut HashMap<String, &SourceFile>) {
-        let (src, what) = crate::derive::expand(it);
+        let attrs = match it {
+            Item::Struct(s) => s.base.attrs.clone(),
+            Item::Enum(e) => e.base.attrs.clone(),
+            _ => return,
+        };
+        let refs = crate::derive::refs(&attrs);
+        if refs.len() == 0 && !expand::odd_attrs(it) { return; }
+        self.derives.push(&mut expand::Pending { m, file, it: it.clone(), refs, done: Vec::new(), krate: m.krate.name.clone() });
+    }
+
+    // The impls the built-in derives (crate::derive) of it expand to
+    // (those in names), parsed as a file of their own and collected into
+    // the same module. The file is named after the item's (file and
+    // position: names in it are its own, symbols::def_id).
+    pub fn expand_builtin(&mut self, m: &mut Module, file: &File, it: &Item, names: &Vec<String>) {
+        if names.len() == 0 { return; }
+        let (src, what) = crate::derive::expand(it, names);
         if src.len() == 0 { return; }
         let name = `${file.name}[${what}@${it.pos()}]`.to_string();
+        if expand::RECORD { expand::EXPANDED.push((m.krate.name.clone(), what.clone(), src.clone())); }
         let (sf, errs) = parser::parse_file(File::new(name.as_str(), src));
         for d in errs.diags.iter() { self.errorf(Some(sf.file), d.pos, `internal error in derived code: ${d.msg}`.to_string()); }
-        for gi in sf.items.iter() { self.collect_item(m, sf.file, gi, files); }
+        let mut files: HashMap<String, &SourceFile> = HashMap::new();
+        for gi in sf.items.iter() { self.collect_item(m, sf.file, gi, &mut files); }
     }
 
     // collect_assoc creates defs for the items of an impl or trait.

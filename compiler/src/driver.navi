@@ -112,11 +112,67 @@ fn default_std() -> String {
 
 // The running executable, symbolic links resolved (a link in a bin
 // directory still finds std).
-fn exe_path() -> Option<String> {
+pub fn exe_path() -> Option<String> {
     let p = std::env::current_exe().ok()?;
     let c = match std::fs::canonicalize(&p) { Ok(c) => c, Err(_) => p };
     Some(util::without_verbatim(c.to_str()?))
 }
+/// The suffix of the host's executables.
+pub fn host_exe_suffix() -> &str { if host_os() == "windows" { ".exe" } else { "" } }
+
+/// navi derive-build specs exe: builds the program of a crate's derive
+/// macros (resolve::expand) for the host from the crates in specs (lines of
+/// name, fs_root, root, dir and deps separated by tabs; the last is the
+/// program's), using the build cache.
+pub fn derive_build_command(args: &Vec<String>) -> i32 {
+    if args.len() != 2 {
+        eprintln("usage: navi derive-build <specs> <exe>");
+        return 2;
+    }
+    let text = match std::fs::read_to_string(args[0].as_str()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln(`${args[0]}: ${e}`);
+            return 1;
+        }
+    };
+    let exe = args[1].as_str();
+    let mut specs: Vec<&CrateSpec> = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 5 { continue; }
+        let mut deps: Vec<String> = Vec::new();
+        for d in f[4].split(',') { if d.len() > 0 { deps.push(d.to_string()); } }
+        specs.push(&CrateSpec { name: f[0].to_string(), fs_root: f[1].to_string(), root: f[2].to_string(), dir: f[3].to_string(), deps });
+    }
+    if specs.len() == 0 { return 2; }
+    let last = specs[specs.len() - 1];
+    let key = crate::cache::key(`derive-build target=${target_name()}\n${text}`.to_string().as_str(), util::path_join(last.fs_root.as_str(), last.root.as_str()).as_str());
+    if let Some(k) = &key {
+        if crate::cache::lookup(k.as_str(), exe) {
+            chmod_x(exe);
+            return 0;
+        }
+    }
+    let (info, errs) = check_specs(host_config(), &specs);
+    let (warnings, failed) = diagnostics(&errs);
+    if warnings.len() > 0 { eprintln(warnings); }
+    if failed { return 1; }
+    let main = match find_main(info, last.name.as_str()) {
+        Some(m) => m,
+        None => {
+            eprintln("derive-build: no main");
+            return 1;
+        }
+    };
+    if let Err(e) = native(info, main_entry(main), exe, false) {
+        eprintln(e);
+        return 1;
+    }
+    if let Some(k) = key { crate::cache::store(k.as_str(), exe, warnings.as_str()); }
+    0
+}
+
 fn crate_name(s: &str) -> String { s.replace('-', "_") }
 
 /// The crate at path: a single .navi file, or the crate a directory is in
@@ -710,6 +766,46 @@ pub fn build_command(args: &Vec<String>) -> i32 {
         if let Err(e) = r {
             if e.len() > 0 { eprintln(e); }
             code = 1;
+        }
+    }
+    code
+}
+
+/// navi expand [-p name] [dir or file] [type]: prints what the derives of
+/// the crate (of the type called type) expand to, formatted (as cargo
+/// expand, for derives only).
+pub fn expand_command(args: &Vec<String>) -> i32 {
+    let mut rest: Vec<String> = Vec::new();
+    let f = match build_flags(args, &mut rest) { Ok(f) => f, Err(c) => return c };
+    let mut path = ".".to_string();
+    let mut ty = String::new();
+    if rest.len() == 2 {
+        path = rest[0].clone();
+        ty = rest[1].clone();
+    } else if rest.len() == 1 {
+        if std::path::Path::new(rest[0].as_str()).exists() { path = rest[0].clone(); } else { ty = rest[0].clone(); }
+    } else if rest.len() > 2 {
+        eprintln("usage: navi expand [-p name] [dir or file] [type]");
+        return 2;
+    }
+    let us = match units(path.as_str(), f.package.as_str()) {
+        Ok(u) => u,
+        Err(e) => { eprintln(e); return 1; }
+    };
+    resolve::expand::RECORD = true;
+    let mut code = 0;
+    for u in us.iter() {
+        resolve::expand::EXPANDED.clear();
+        let (_, errs) = resolve::resolve(host_config(), &u.specs);
+        let (warnings, failed) = diagnostics(&errs);
+        if warnings.len() > 0 { eprintln(warnings); }
+        if failed { code = 1; }
+        let name = u.specs[u.specs.len() - 1].name.clone();
+        for (c, what, src) in resolve::expand::EXPANDED.iter() {
+            if *c != name { continue; }
+            if ty.len() > 0 && !what.ends_with(` for ${ty}`.to_string().as_str()) { continue; }
+            let text = match crate::fmt::format_source(what.as_str(), src.clone()) { Ok(t) => t, Err(_) => src.clone() };
+            println(`// ${what}\n${text.trim_end()}\n`);
         }
     }
     code

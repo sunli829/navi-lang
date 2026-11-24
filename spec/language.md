@@ -421,7 +421,7 @@ let e = `价格 \${price}，反引号 \``;        // 转义
 - 只有反引号字符串会插值，`"..."` 里的 `${` 就是普通字符
 - **格式说明的分隔**：`${...}` 里最外层的单个 `:` 之后是格式说明。`::` 路径不受影响；如果表达式本身在最外层含有单个 `:`（比如带类型标注的闭包），就给表达式加括号
 - 编译器在编译期把模板展开成对 `fmt::Formatter` 的直接调用，运行时不再解析格式
-- 暂不支持 JS 的标签模板（`` tag`...` ``）
+- 标签模板（JS 的 `` tag`...` ``）只有 `` quote`...` ``（`std::derive::quote`，写派生宏时生成代码用，见 docs/derive.md）：模板的文字是代码，`${x}` 插入 `x` 的代码（`std::derive::ToCode`），不能带格式说明；编译器检查模板的括号是否配对
 
 **模板字符串的类型总是 `fmt::Arguments`**，不随上下文变化（相当于 Rust 的 `format_args!`）：
 - `fmt::Arguments` 实现了 `Display`，是一个**惰性格式化对象**：`${}` 里的表达式在创建时就求值，值按 navi 的规则拷贝进去，但要等写入时才格式化
@@ -544,7 +544,8 @@ let s: String = p.to_string();
 
 | 属性 | 作用 |
 |---|---|
-| `#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]` | 编译器内置实现（属性，不是宏） |
+| `#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]` | 编译器内置的派生；另有 `Serialize`、`Deserialize`（`std::serde`）和 `FromAttrs`（`std::derive`），以及用户的派生宏 |
+| `#[derive_macro(Name, attrs = [ns, ...])]` | 把库 crate 里的一个 `pub fn(&std::derive::TypeInfo) -> Result<Code, Error>` 定义成派生宏 `Name`，`attrs` 是它接受的字段和类型属性（docs/derive.md）；结构体、枚举、变体、字段上编译器不认识的属性必须有某个派生接受，否则报错 |
 | `#[test]`、`#[bench]` | 只有 `navi test` / `navi bench` 才会编译；`navi test` 运行测试时设置环境变量 `NAVI` 为 navi 自身的路径（同 Cargo 的 `CARGO`），测试可以用它编译程序 |
 | `#[should_panic]`、`#[should_panic(expected = "...")]` | 测试必须 panic（同 Rust），给了 `expected` 时 panic 信息必须包含它 |
 | `#[cfg(...)]`、`#![cfg(...)]` | 条件编译 |
@@ -592,7 +593,7 @@ let s: String = p.to_string();
 | 生命周期、借用检查、move 语义 | `defer` | `&T` / `&mut T` 变成 GC 指针，可以随意保存 |
 | `Copy`、`Drop`、`Send`、`Sync`、`Box`、`Rc`、`Arc`、`Cell`、`RefCell`、`Cow`、`Pin` | `select`；channel 的 `close()` | 集合类型是引用语义 |
 | `async` / `await` | 模板字符串 `` `${x}` `` | 闭包统一为 `fn(A) -> B` 类型，没有 `Fn*` trait |
-| 所有宏（`macro_rules!`、过程宏、`println!` 等） | `static mut` 不需要 `unsafe` | 打印、断言、panic 都是普通函数 |
+| 宏（`macro_rules!`、函数式和属性过程宏、`println!` 等；只有派生宏） | `static mut` 不需要 `unsafe` | 打印、断言、panic 都是普通函数 |
 | GAT、HRTB、特化、`union` | `#[asm]` 加 `.s` 文件 | `thread::spawn` 启动的是绿色线程 |
 | | `std::gc`（以后） | 锁、文件等资源要显式释放 |
 

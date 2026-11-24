@@ -14,12 +14,13 @@ use crate::syntax::print;
 use crate::syntax::token;
 
 pub mod serde;
+pub mod info;
 
 /// Whether derive name expands here (as source) rather than in the type
 /// checker and MIR shims.
 pub fn expanded(name: &str) -> bool {
     match name {
-        "Clone" | "Default" | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash" | "Debug" | "Serialize" | "Deserialize" => true,
+        "Clone" | "Default" | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash" | "Debug" | "Serialize" | "Deserialize" | "FromAttrs" => true,
         _ => false,
     }
 }
@@ -36,9 +37,81 @@ pub fn names(attrs: &Vec<&Attr>) -> Vec<String> {
     out
 }
 
-/// The source of the impls the item's expanded derives make ("" if none),
-/// and a name for it (the derives and the type).
-pub fn expand(it: &Item) -> (String, String) {
+/// A derive named in #[derive(...)]: a name or a path (a macro's).
+pub struct DeriveRef {
+    pub segs: Vec<&Name>,
+}
+
+impl DeriveRef {
+    pub fn text(&self) -> String {
+        let mut v: Vec<String> = Vec::new();
+        for s in self.segs.iter() { v.push(s.value.clone()); }
+        v.join("::")
+    }
+
+    pub fn last(&self) -> &Name { self.segs[self.segs.len() - 1] }
+}
+
+/// The derives the item's #[derive(...)] attributes name, in order.
+pub fn refs(attrs: &Vec<&Attr>) -> Vec<DeriveRef> {
+    let mut out: Vec<DeriveRef> = Vec::new();
+    for a in attrs.iter() {
+        if a.path.segments.len() != 1 || a.path.segments[0].name.value != "derive" { continue; }
+        let mut cur: Vec<&Name> = Vec::new();
+        for t in a.args.iter() {
+            if t.kind == token::IDENT {
+                cur.push(&Name { pos: t.pos, value: t.text.to_string() });
+            } else if t.kind == token::COMMA {
+                if cur.len() > 0 { out.push(DeriveRef { segs: cur }); }
+                cur = Vec::new();
+            }
+        }
+        if cur.len() > 0 { out.push(DeriveRef { segs: cur }); }
+    }
+    out
+}
+
+/// A function's #[derive_macro(Name, attrs = [ns, ...])]: the derive's
+/// name and the attribute namespaces it takes.
+pub struct MacroDecl {
+    pub name: &Name,
+    pub attrs: Vec<String>,
+}
+
+pub fn macro_decl(attrs: &Vec<&Attr>) -> Option<MacroDecl> {
+    for a in attrs.iter() {
+        if a.path.segments.len() != 1 || a.path.segments[0].name.value != "derive_macro" { continue; }
+        let toks = &a.args;
+        if toks.len() == 0 || toks[0].kind != token::IDENT { return None; }
+        let name = &Name { pos: toks[0].pos, value: toks[0].text.to_string() };
+        let mut claims: Vec<String> = Vec::new();
+        let mut i = 1;
+        while i < toks.len() {
+            if toks[i].kind == token::IDENT && toks[i].text == "attrs" {
+                let mut j = i + 1;
+                while j < toks.len() && toks[j].kind != token::R_BRACKET {
+                    if toks[j].kind == token::IDENT { claims.push(toks[j].text.to_string()); }
+                    j += 1;
+                }
+                i = j;
+            }
+            i += 1;
+        }
+        return Some(MacroDecl { name, attrs: claims });
+    }
+    None
+}
+
+/// The attribute namespaces a built-in derive takes.
+pub fn builtin_attrs(name: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if name == "Serialize" || name == "Deserialize" { v.push("serde".to_string()); }
+    v
+}
+
+/// The source of the impls the item's built-in derives in only make ("" if
+/// none), and a name for it (the derives and the type).
+pub fn expand(it: &Item, only: &Vec<String>) -> (String, String) {
     let (attrs, name, generics) = match it {
         Item::Struct(s) => (s.base.attrs.clone(), s.name.value.clone(), s.generics),
         Item::Enum(e) => (e.base.attrs.clone(), e.name.value.clone(), e.generics),
@@ -48,7 +121,7 @@ pub fn expand(it: &Item) -> (String, String) {
     let mut src = String::new();
     let mut done: Vec<String> = Vec::new();
     for n in names(&attrs).iter() {
-        if !expanded(n.as_str()) || done.contains(n) { continue; }
+        if !expanded(n.as_str()) || done.contains(n) || !only.contains(n) { continue; }
         // (Not for an enum: the checker reports it.)
         if n == "Default" && is_enum(t) { continue; }
         done.push(n.clone());
@@ -63,6 +136,7 @@ pub fn expand(it: &Item) -> (String, String) {
             "Debug" => debug(t),
             "Serialize" => serde::serialize(t),
             "Deserialize" => serde::deserialize(t),
+            "FromAttrs" => from_attrs(t),
             _ => String::new(),
         };
         src.push_str(code.as_str());
@@ -349,6 +423,35 @@ fn default(t: &Target) -> String {
     let c = &cs[0];
     let made = construct(c.path.as_str(), &c.kind, &c.fields, |i| "std::default::Default::default()".to_string());
     `${t.header("std::default::Default")} { fn default() -> Self { ${made} } }\n`.to_string()
+}
+
+// #[derive(FromAttrs)] (std::derive): a struct with named fields made from
+// an attribute's arguments: an Option<T> field is an optional key = value,
+// a bool a flag, any other a required key = value. (The checker reports
+// other items.)
+fn from_attrs(t: &Target) -> String {
+    let fields = match &t.it {
+        Item::Struct(s) => if s.kind == StructKind::Named { s.fields.clone() } else { return String::new() },
+        _ => return String::new(),
+    };
+    let mut inits: Vec<String> = Vec::new();
+    for f in fields.iter() {
+        let n = f.name.unwrap().value.clone();
+        let key = print::quote_str(n.as_str());
+        let mut get = `__args.required::<${print::ty(f.ty)}>(${key})?`.to_string();
+        if let TypeKind::Path(p) = &f.ty.kind {
+            let last = p.segments[p.segments.len() - 1];
+            if p.segments.len() == 1 && last.name.value == "bool" && last.args.is_none() {
+                get = `__args.flag(${key})?`.to_string();
+            } else if p.segments.len() == 1 && last.name.value == "Option" {
+                if let Some(ga) = last.args {
+                    if ga.args.len() == 1 { get = `__args.optional::<${print::ty(ga.args[0])}>(${key})?`.to_string(); }
+                }
+            }
+        }
+        inits.push(`${n}: ${get}`.to_string());
+    }
+    `${t.header("std::derive::FromAttrs")} { fn from_attrs(__args: &mut std::derive::AttrArgs) -> Result<Self, std::derive::Error> { Ok(${t.name} { ${inits.join(", ")} }) } }\n`.to_string()
 }
 
 // #[derive(PartialEq)]: the same variant and equal fields.

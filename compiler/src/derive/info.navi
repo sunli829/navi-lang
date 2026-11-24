@@ -1,0 +1,250 @@
+//! A struct's or enum's std::derive::TypeInfo, encoded as std::derive
+//! decodes it (Dec there): a string is <length>:<bytes>, an integer
+//! i<decimal>; and a list [ ... ]. Positions are byte offsets in the item's
+//! file.
+
+use crate::syntax::ast::*;
+use crate::syntax::print;
+use crate::syntax::token;
+
+pub struct Enc { pub s: String }
+
+impl Enc {
+    pub fn new() -> &mut Enc { &mut Enc { s: String::new() } }
+
+    pub fn str(&mut self, x: &str) {
+        self.s.push_str(`${x.len()}:`.to_string().as_str());
+        self.s.push_str(x);
+    }
+
+    pub fn int(&mut self, n: i64) { self.s.push_str(`i${n};`.to_string().as_str()); }
+
+    pub fn open(&mut self) { self.s.push('['); }
+
+    pub fn close(&mut self) { self.s.push(']'); }
+}
+
+/// The TypeInfo of it (a struct or enum) in module (its path from the
+/// crate root, "" for the root).
+pub fn encode(e: &mut Enc, it: &Item, module: &str) {
+    let (base, name, generics) = match it {
+        Item::Struct(s) => (&s.base, s.name, s.generics),
+        Item::Enum(n) => (&n.base, n.name, n.generics),
+        _ => return,
+    };
+    e.open();
+    e.str(name.value.as_str());
+    e.int(name.pos as i64);
+    e.str(module);
+    e.str(vis_text(&base.vis));
+    attrs(e, &base.attrs);
+    e.open();
+    for p in generics.params.iter() {
+        e.open();
+        e.str(p.name.value.as_str());
+        e.int(p.name.pos as i64);
+        e.int(if p.ty.is_some() { 1 } else { 0 });
+        e.str(print::bounds(&p.bounds).as_str());
+        e.str(match p.ty { Some(t) => print::ty(t), None => String::new() }.as_str());
+        e.close();
+    }
+    e.close();
+    let mut wheres: Vec<String> = Vec::new();
+    for w in generics.wheres.iter() { wheres.push(`${print::ty(w.ty)}: ${print::bounds(&w.bounds)}`.to_string()); }
+    e.str(wheres.join(", ").as_str());
+    match it {
+        Item::Struct(s) => {
+            e.int(0);
+            e.open();
+            variant(e, name, name.value.as_str(), s.kind, &Vec::new(), "", &s.fields);
+            e.close();
+        }
+        Item::Enum(n) => {
+            e.int(1);
+            e.open();
+            for v in n.variants.iter() {
+                let d = match v.discriminant { Some(x) => print::expr(x), None => String::new() };
+                variant(e, v.name, `${name.value}::${v.name.value}`.to_string().as_str(), v.kind, &v.attrs, d.as_str(), &v.fields);
+            }
+            e.close();
+        }
+        _ => {}
+    }
+    e.close();
+}
+
+fn vis_text(v: &Vis) -> &str {
+    match v {
+        Vis::Private => "",
+        Vis::Pub => "pub",
+        Vis::Crate => "pub(crate)",
+        Vis::Super => "pub(super)",
+    }
+}
+
+fn variant(e: &mut Enc, name: &Name, path: &str, kind: StructKind, va: &Vec<&Attr>, discr: &str, fields: &Vec<&Field>) {
+    e.open();
+    e.str(name.value.as_str());
+    e.int(name.pos as i64);
+    e.str(path);
+    e.int(match kind {
+        StructKind::Named => 0,
+        StructKind::Tuple => 1,
+        _ => 2,
+    });
+    attrs(e, va);
+    e.str(discr);
+    e.open();
+    for f in fields.iter() {
+        e.open();
+        match f.name {
+            Some(n) => {
+                e.str(n.value.as_str());
+                e.int(n.pos as i64);
+            }
+            None => {
+                e.str("");
+                e.int(f.ty.pos() as i64);
+            }
+        }
+        e.str(vis_text(&f.vis));
+        attrs(e, &f.attrs);
+        type_ref(e, f.ty);
+        e.close();
+    }
+    e.close();
+    e.close();
+}
+
+// The attributes but derive and doc comments: [name pos [[key keypos tag
+// text pos]...]]. A value's tag is "" (none), s (a string, unescaped), i
+// (an integer), b (a bool) or o (anything else, as written).
+fn attrs(e: &mut Enc, list: &Vec<&Attr>) {
+    e.open();
+    for a in list.iter() {
+        let name = print::path(a.path);
+        if name == "derive" || name == "doc" { continue; }
+        e.open();
+        e.str(name.as_str());
+        e.int(a.path.pos() as i64);
+        e.open();
+        for arg in split_args(&a.args).iter() {
+            if arg.len() == 0 { continue; }
+            let key = arg[0].clone();
+            e.open();
+            e.str(key.text);
+            e.int(key.pos as i64);
+            if arg.len() >= 3 && arg[1].kind == token::EQ {
+                let v = &arg[2..];
+                if v.len() == 1 && (v[0].kind == token::STRING || v[0].kind == token::RAW_STRING) {
+                    e.str("s");
+                    e.str(String::from_utf8_lossy(crate::mir::expr::unquote(v[0].text).as_slice()).as_str());
+                } else if v.len() == 1 && v[0].kind == token::INT {
+                    e.str("i");
+                    e.str(v[0].text.replace('_', "").as_str());
+                } else if v.len() == 2 && v[0].kind == token::MINUS && v[1].kind == token::INT {
+                    e.str("i");
+                    e.str(`-${v[1].text.replace('_', "")}`.to_string().as_str());
+                } else if v.len() == 1 && (v[0].kind == token::KW_TRUE || v[0].kind == token::KW_FALSE) {
+                    e.str("b");
+                    e.str(v[0].text);
+                } else {
+                    e.str("o");
+                    e.str(tokens_text(v).as_str());
+                }
+                e.int(v[0].pos as i64);
+            } else if arg.len() > 1 {
+                // key(...) or anything else: the rest as written.
+                e.str("o");
+                e.str(tokens_text(&arg[1..]).as_str());
+                e.int(arg[1].pos as i64);
+            } else {
+                e.str("");
+                e.str("");
+                e.int(key.pos as i64);
+            }
+            e.close();
+        }
+        e.close();
+        e.close();
+    }
+    e.close();
+}
+
+// An attribute's arguments split at the top-level commas.
+fn split_args(toks: &Vec<token::Token>) -> Vec<Vec<token::Token>> {
+    let mut out: Vec<Vec<token::Token>> = Vec::new();
+    let mut cur: Vec<token::Token> = Vec::new();
+    let mut depth = 0;
+    for t in toks.iter() {
+        match t.kind {
+            token::L_PAREN | token::L_BRACKET | token::L_BRACE => depth += 1,
+            token::R_PAREN | token::R_BRACKET | token::R_BRACE => depth -= 1,
+            token::COMMA if depth == 0 => {
+                out.push(cur);
+                cur = Vec::new();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(t.clone());
+    }
+    if cur.len() > 0 { out.push(cur); }
+    out
+}
+
+/// Tokens as written, a space between those apart in the source.
+pub fn tokens_text(toks: &[token::Token]) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if i > 0 && toks[i].pos > toks[i - 1].end { s.push(' '); }
+        s.push_str(toks[i].text);
+        i += 1;
+    }
+    s
+}
+
+// [text pos kind ...] (see std::derive's Dec::type_ref).
+fn type_ref(e: &mut Enc, t: &Type) {
+    e.open();
+    e.str(print::ty(t).as_str());
+    e.int(t.pos() as i64);
+    match &t.kind {
+        TypeKind::Path(p) if p.qself.is_none() => {
+            e.int(0);
+            e.open();
+            for s in p.segments.iter() {
+                e.open();
+                e.str(s.name.value.as_str());
+                e.open();
+                if let Some(ga) = s.args { for a in ga.args.iter() { type_ref(e, *a); } }
+                e.close();
+                e.close();
+            }
+            e.close();
+        }
+        TypeKind::Ref { is_mut, elem, .. } => {
+            e.int(1);
+            e.int(if *is_mut { 1 } else { 0 });
+            type_ref(e, *elem);
+        }
+        TypeKind::Array { elem, len, .. } => {
+            e.int(2);
+            type_ref(e, *elem);
+            e.str(print::expr(*len).as_str());
+        }
+        TypeKind::Slice { elem, .. } => {
+            e.int(3);
+            type_ref(e, *elem);
+        }
+        TypeKind::Tuple { elems, .. } => {
+            e.int(4);
+            e.open();
+            for x in elems.iter() { type_ref(e, *x); }
+            e.close();
+        }
+        _ => e.int(5),
+    }
+    e.close();
+}

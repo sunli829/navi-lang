@@ -1443,6 +1443,13 @@ impl Parser {
         if self.starts_block_like() { return self.block_like_expr(); }
         if is_path_start(k) {
             let path = self.expr_path();
+            // quote`...` (std::derive::quote): a tagged template.
+            if self.kind() == TEMPLATE && self.toks[self.i - 1].end == self.pos() && path.segments.len() == 1 && path.qself.is_none() {
+                let tt = self.next();
+                if path.segments[0].name.value == "quote" { return self.quote(path, &tt); }
+                self.errorf(tt.pos, "only quote can tag a template string (std::derive::quote)".to_string());
+                return self.template(&tt);
+            }
             if self.kind() == L_BRACE && !self.no_struct_lit { return self.struct_lit(path); }
             return self.mk_expr(ExprKind::Path(path));
         }
@@ -1757,6 +1764,94 @@ impl Parser {
         self.mk_expr(ExprKind::Template { pos: t.pos, parts })
     }
 
+    // quote`text ${x} text`: the call quote(&["text", "text"],
+    // &[std::derive::ToCode::to_code(&(x))]). The text is code: its
+    // escapes stay as written (but \` and \$), and its brackets must match.
+    fn quote(&mut self, tag: &Path, t: &Token) -> &Expr {
+        let tpl = self.template(t);
+        let parts = match &tpl.kind {
+            ExprKind::Template { parts, .. } => parts.clone(),
+            _ => Vec::new(),
+        };
+        let mut texts: Vec<String> = Vec::new();
+        let mut values: Vec<&Expr> = Vec::new();
+        let mut cur = String::new();
+        for p in parts.iter() {
+            match p.x {
+                None => cur.push_str(quote_text(p.text.as_str()).as_str()),
+                Some(x) => {
+                    if p.spec.len() > 0 { self.errorf(x.pos(), "a quote hole takes no format spec".to_string()); }
+                    texts.push(cur);
+                    cur = String::new();
+                    values.push(x);
+                }
+            }
+        }
+        texts.push(cur);
+        // The template's tokens, with a name for each hole.
+        let mut joined = String::new();
+        let mut i = 0;
+        while i < texts.len() {
+            if i > 0 { joined.push_str(" __hole "); }
+            joined.push_str(texts[i].as_str());
+            i += 1;
+        }
+        self.check_quote(t.pos, joined);
+        let pos = t.pos;
+        let mut lits: Vec<&Expr> = Vec::new();
+        for x in texts.iter() {
+            lits.push(self.mk_expr(ExprKind::Lit { pos, kind: LitKind::Str, value: util::quote(x.as_str()) }));
+        }
+        let mut codes: Vec<&Expr> = Vec::new();
+        for x in values.iter() {
+            let mut segs: Vec<&PathSegment> = Vec::new();
+            for n in ["std", "derive", "ToCode", "to_code"].iter() { segs.push(&PathSegment { name: name(x.pos(), *n), args: None }); }
+            let f = self.mk_expr(ExprKind::Path(&Path { id: self.id(), segments: segs, qself: None }));
+            let r = self.mk_expr(ExprKind::Ref { amp: x.pos(), is_mut: false, x: *x });
+            let mut args = Vec::new();
+            args.push(r);
+            codes.push(self.mk_expr(ExprKind::Call { fun: f, lparen: x.pos(), args }));
+        }
+        let a = self.mk_expr(ExprKind::Array { lbrack: pos, elems: lits });
+        let b = self.mk_expr(ExprKind::Array { lbrack: pos, elems: codes });
+        let mut args = Vec::new();
+        args.push(self.mk_expr(ExprKind::Ref { amp: pos, is_mut: false, x: a }));
+        args.push(self.mk_expr(ExprKind::Ref { amp: pos, is_mut: false, x: b }));
+        let fun = self.mk_expr(ExprKind::Path(tag));
+        self.mk_expr(ExprKind::Call { fun, lparen: pos, args })
+    }
+
+    // check_quote reports a quote template whose tokens do not lex or whose
+    // brackets do not match.
+    fn check_quote(&mut self, pos: Pos, text: String) {
+        let f = File::new("quote", text);
+        let sub = Errors::new(f);
+        let mut l = Lexer::new(f.src.as_str(), 0, sub);
+        let mut stack: Vec<Kind> = Vec::new();
+        loop {
+            let tk = l.next();
+            if tk.kind == EOF { break; }
+            match tk.kind {
+                L_PAREN | L_BRACKET | L_BRACE => stack.push(tk.kind),
+                R_PAREN | R_BRACKET | R_BRACE => {
+                    let open = if tk.kind == R_PAREN { L_PAREN } else if tk.kind == R_BRACKET { L_BRACKET } else { L_BRACE };
+                    if stack.len() == 0 || stack[stack.len() - 1] != open {
+                        let c = if tk.kind == R_PAREN { ")" } else if tk.kind == R_BRACKET { "]" } else { "}" };
+                        self.errorf(pos, `unmatched ${c} in quote template`.to_string());
+                        return;
+                    }
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        if sub.len() > 0 {
+            self.errorf(pos, `in quote template: ${sub.diags[0].msg}`.to_string());
+            return;
+        }
+        if stack.len() > 0 { self.errorf(pos, "unclosed bracket in quote template".to_string()); }
+    }
+
     fn template_hole(&mut self, start: usize) -> (&TemplatePart, usize) {
         let sub = Errors::new(self.file);
         let mut l = Lexer::new(self.file.src.as_str(), 0, sub);
@@ -2051,3 +2146,21 @@ fn is_assignee(x: &Expr) -> bool {
 }
 
 fn is_underscore(p: &Path) -> bool { p.qself.is_none() && p.segments.len() == 1 && p.segments[0].name.value == "_" }
+
+// The code a quote template's text stands for: \` and \$ are ` and $;
+// other escapes are the code's own (in its string literals).
+fn quote_text(raw: &str) -> String {
+    let b = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() && (b[i + 1] == b'`' || b[i + 1] == b'$') {
+            out.push(b[i + 1]);
+            i += 2;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(out.as_slice())
+}
