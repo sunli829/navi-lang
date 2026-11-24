@@ -206,6 +206,253 @@ pub fn prune(f: &mut Func) {
 
 /// Branch facts: below an edge of a branch on c, c is known; branches on a
 /// known value become jumps.
+/// Constant folding (a part of Go's generic rewrite rules): integer
+/// operations whose arguments are constants become constants, checked
+/// arithmetic and shifts only when they do not overflow (else they panic
+/// as written), and a branch on a constant becomes a jump. Constant indexes
+/// into fixed-size arrays lose their bounds checks this way.
+pub fn fold(f: &mut Func) {
+    let mut changed = false;
+    let mut again = true;
+    while again {
+        again = false;
+        let mut bi = 0;
+        while bi < f.blocks.len() {
+            let b = f.blocks[bi];
+            bi += 1;
+            let mut vi = 0;
+            while vi < b.values.len() {
+                let v = b.values[vi];
+                vi += 1;
+                // A constant index: a constant offset (loads and stores
+                // take it in their addressing).
+                if v.op == OP_INDEXPTR && v.args.len() == 2 && v.args[1].op == OP_CONST {
+                    let k = v.args[1];
+                    k.uses -= 1;
+                    v.args.truncate(1);
+                    v.aux_int = k.aux_int.wrapping_mul(v.aux_int);
+                    v.op = OP_OFFPTR;
+                    again = true;
+                    changed = true;
+                    continue;
+                }
+                if v.op == OP_CONST || v.args.len() == 0 || v.args.len() > 2 { continue; }
+                let mut all = true;
+                for a in v.args.iter() {
+                    if a.op != OP_CONST { all = false; }
+                }
+                if !all { continue; }
+                if let Some(c) = fold_value(v) {
+                    let mut ai = 0;
+                    while ai < v.args.len() {
+                        let a = v.args[ai];
+                        a.uses -= 1;
+                        ai += 1;
+                    }
+                    v.args = Vec::new();
+                    v.op = OP_CONST;
+                    v.aux_int = c;
+                    v.aux = Aux::None;
+                    again = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        bi += 1;
+        if b.kind != B_IF { continue; }
+        let c = b.control.unwrap();
+        if c.op != OP_CONST { continue; }
+        // Keep the successor taken (succs[0] when true).
+        remove_edge(b, if c.aux_int != 0 { 1 } else { 0 });
+        b.kind = B_PLAIN;
+        c.uses -= 1;
+        b.control = None;
+        changed = true;
+    }
+    if changed {
+        prune(f);
+        copyelim(f);
+    }
+}
+
+/// Merges each block with its only successor when that has no other
+/// predecessor (Go's fuse): chains that folded or proved checks left are
+/// one block again (no jumps between them, longer straight code for the
+/// register allocator).
+pub fn fuse(f: &mut Func) {
+    let entry = f.entry.unwrap().id;
+    let mut changed = false;
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        bi += 1;
+        loop {
+            if b.kind != B_PLAIN || b.succs.len() != 1 { break; }
+            let s = b.succs[0];
+            if s.id == b.id || s.id == entry || s.preds.len() != 1 { break; }
+            let mut vi = 0;
+            while vi < s.values.len() {
+                let v = s.values[vi];
+                vi += 1;
+                v.block = Some(b);
+                // (A phi of one predecessor is its argument.)
+                if v.op == OP_PHI { v.op = OP_COPY; }
+                b.values.push(v);
+            }
+            s.values.clear();
+            b.kind = s.kind;
+            b.control = s.control;
+            s.control = None;
+            b.succs.clear();
+            let mut si = 0;
+            while si < s.succs.len() {
+                let t = s.succs[si];
+                si += 1;
+                b.succs.push(t);
+                let mut k = 0;
+                while k < t.preds.len() {
+                    if t.preds[k].id == s.id { t.preds[k] = b; }
+                    k += 1;
+                }
+            }
+            s.succs.clear();
+            s.preds.clear();
+            changed = true;
+        }
+    }
+    if changed {
+        prune(f);
+        copyelim(f);
+    }
+}
+
+fn int_size(t: Ty) -> i64 {
+    match t {
+        T_BOOL | T_I8 => 1,
+        T_I16 => 2,
+        T_I32 => 4,
+        T_I64 => 8,
+        _ => 0,
+    }
+}
+
+// x of size bytes, sign-extended / zero-extended to 64 bits.
+fn sx(x: i64, size: i64) -> i64 {
+    if size >= 8 { return x; }
+    let sh = 64 - 8 * size;
+    (x << sh) >> sh
+}
+
+fn zx(x: i64, size: i64) -> i64 {
+    if size >= 8 { return x; }
+    x & ((1i64 << (8 * size)) - 1)
+}
+
+// The constant v is, if its arguments are constants and it folds.
+fn fold_value(v: &Value) -> Option<i64> {
+    let size = int_size(v.ty);
+    let a = v.args[0].aux_int;
+    match v.op {
+        OP_ADD | OP_SUB | OP_MUL | OP_AND | OP_OR | OP_XOR | OP_SHL | OP_SHR => {
+            if size == 0 || v.args.len() != 2 { return None; }
+            let b = v.args[1].aux_int;
+            let signed = v.aux_int & 2 != 0;
+            let checked = v.aux_int & 1 != 0;
+            let (x, y) = if signed { (sx(a, size), sx(b, size)) } else { (zx(a, size), zx(b, size)) };
+            let r = match v.op {
+                OP_AND => x & y,
+                OP_OR => x | y,
+                OP_XOR => x ^ y,
+                OP_SHL | OP_SHR => {
+                    // (The shift amount's own type: unsigned, below the
+                    // width.)
+                    let n = zx(b, int_size(v.args[1].ty));
+                    if n < 0 || n >= 8 * size { return None; }
+                    if v.op == OP_SHL {
+                        x << n
+                    } else if signed {
+                        x >> n
+                    } else {
+                        ((x as u64) >> (n as u64)) as i64
+                    }
+                }
+                _ => {
+                    if size == 8 {
+                        if signed {
+                            let r = if v.op == OP_ADD { x.checked_add(y) } else if v.op == OP_SUB { x.checked_sub(y) } else { x.checked_mul(y) };
+                            match r {
+                                Some(r) => r,
+                                None => {
+                                    if checked { return None; }
+                                    if v.op == OP_ADD { x.wrapping_add(y) } else if v.op == OP_SUB { x.wrapping_sub(y) } else { x.wrapping_mul(y) }
+                                }
+                            }
+                        } else {
+                            let (ux, uy) = (x as u64, y as u64);
+                            let r = if v.op == OP_ADD { ux.checked_add(uy) } else if v.op == OP_SUB { ux.checked_sub(uy) } else { ux.checked_mul(uy) };
+                            match r {
+                                Some(r) => r as i64,
+                                None => {
+                                    if checked { return None; }
+                                    (if v.op == OP_ADD { ux.wrapping_add(uy) } else if v.op == OP_SUB { ux.wrapping_sub(uy) } else { ux.wrapping_mul(uy) }) as i64
+                                }
+                            }
+                        }
+                    } else {
+                        // Exact in 64 bits (operands of at most 32 bits;
+                        // unsigned 32-bit products as u64).
+                        let r = if v.op == OP_ADD {
+                            x.wrapping_add(y)
+                        } else if v.op == OP_SUB {
+                            x.wrapping_sub(y)
+                        } else {
+                            ((x as u64).wrapping_mul(y as u64)) as i64
+                        };
+                        if checked {
+                            let fits = if signed { sx(r, size) == r } else { zx(r, size) == r && !(v.op == OP_MUL && size == 4 && (x as u64).checked_mul(y as u64).is_none()) };
+                            if !fits { return None; }
+                        }
+                        r
+                    }
+                }
+            };
+            Some(zx(r, size))
+        }
+        OP_NOT => {
+            if size == 0 { return None; }
+            if v.ty == T_BOOL { return Some(if a != 0 { 0 } else { 1 }); }
+            Some(zx(!a, size))
+        }
+        OP_EQ | OP_NE | OP_LT | OP_LE => {
+            if v.args.len() != 2 { return None; }
+            let t = v.args[0].ty;
+            let s = int_size(t);
+            if s == 0 && t != T_PTR { return None; }
+            let s = if s == 0 { 8 } else { s };
+            let b = v.args[1].aux_int;
+            let signed = v.aux_int & 2 != 0;
+            let r = match v.op {
+                OP_EQ => zx(a, s) == zx(b, s),
+                OP_NE => zx(a, s) != zx(b, s),
+                OP_LT => if signed { sx(a, s) < sx(b, s) } else { (zx(a, s) as u64) < (zx(b, s) as u64) },
+                _ => if signed { sx(a, s) <= sx(b, s) } else { (zx(a, s) as u64) <= (zx(b, s) as u64) },
+            };
+            Some(if r { 1 } else { 0 })
+        }
+        OP_SEXT | OP_ZEXT | OP_TRUNC => {
+            if size == 0 { return None; }
+            let from = v.aux_int & 0xff;
+            let x = if v.op == OP_SEXT { sx(a, from) } else if v.op == OP_ZEXT { zx(a, from) } else { a };
+            Some(zx(x, size))
+        }
+        _ => None,
+    }
+}
+
 pub fn prove(f: &mut Func, d: &dom::Dom) {
     let ch = children(f, d);
     // Known booleans: (value id, truth), a stack the walk unwinds.
