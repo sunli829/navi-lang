@@ -381,9 +381,12 @@ aes_ctr_xor:
 // aes_gcm_arm64.s's, n times eight blocks of counter mode and GHASH in one
 // pass, the GHASH of eight ciphertext blocks spread between the AES rounds
 // of the next eight (as Go's gcmAesEnc; decrypting, of the eight being
-// decrypted, read before they are written). The round keys read from
-// memory, GHASH as ghash_blocks's (bits reversed by pshufb lookups) with
-// ht's H^8..H and one reduction per eight blocks.
+// decrypted, read before they are written). GHASH as ghash_blocks's (bits
+// reversed by pshufb lookups) with ht's H^8..H and one reduction per eight
+// blocks. Memory is read by movdqu only (the round keys and ht need not be
+// 16-byte aligned, as SSE's memory operands must): the round keys, ht's
+// entries and the constants through xmm15, the counter block kept in the
+// argument slots of xk and rounds (read by then).
 gcm_crypt8:
     mov rax, qword ptr [rsp + 8]        // xk
     mov r8, qword ptr [rsp + 16]        // rounds
@@ -397,171 +400,193 @@ gcm_crypt8:
     test rdx, rdx
     jz .gdone
     movdqu xmm12, xmmword ptr [r10]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm8, xmmword ptr [rip + .grev_lo]
     pshufb xmm8, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm8, xmm13
-    movdqu xmm15, xmmword ptr [r9]
-    pshufb xmm15, xmmword ptr [rip + .gbswap]
+    movdqu xmm12, xmmword ptr [r9]
+    movdqu xmm13, xmmword ptr [rip + .gbswap]
+    pshufb xmm12, xmm13
+    movdqu xmmword ptr [rsp + 8], xmm12
     shl r8, 4                           // the last round key's offset
     test r11, r11
     jnz .gdec
     // Encrypting: the first eight alone, then each eight with the GHASH
     // of the eight before, the last eight's after.
-    movdqa xmm0, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm0, xmmword ptr [rip + .gbswap]
-    movdqa xmm1, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm1, xmmword ptr [rip + .gbswap]
-    movdqa xmm2, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm2, xmmword ptr [rip + .gbswap]
-    movdqa xmm3, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm3, xmmword ptr [rip + .gbswap]
-    movdqa xmm4, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm4, xmmword ptr [rip + .gbswap]
-    movdqa xmm5, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm5, xmmword ptr [rip + .gbswap]
-    movdqa xmm6, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm6, xmmword ptr [rip + .gbswap]
-    movdqa xmm7, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm7, xmmword ptr [rip + .gbswap]
-    pxor xmm0, xmmword ptr [rax]
-    pxor xmm1, xmmword ptr [rax]
-    pxor xmm2, xmmword ptr [rax]
-    pxor xmm3, xmmword ptr [rax]
-    pxor xmm4, xmmword ptr [rax]
-    pxor xmm5, xmmword ptr [rax]
-    pxor xmm6, xmmword ptr [rax]
-    pxor xmm7, xmmword ptr [rax]
-    aesenc xmm0, xmmword ptr [rax + 16]
-    aesenc xmm1, xmmword ptr [rax + 16]
-    aesenc xmm2, xmmword ptr [rax + 16]
-    aesenc xmm3, xmmword ptr [rax + 16]
-    aesenc xmm4, xmmword ptr [rax + 16]
-    aesenc xmm5, xmmword ptr [rax + 16]
-    aesenc xmm6, xmmword ptr [rax + 16]
-    aesenc xmm7, xmmword ptr [rax + 16]
-    aesenc xmm0, xmmword ptr [rax + 32]
-    aesenc xmm1, xmmword ptr [rax + 32]
-    aesenc xmm2, xmmword ptr [rax + 32]
-    aesenc xmm3, xmmword ptr [rax + 32]
-    aesenc xmm4, xmmword ptr [rax + 32]
-    aesenc xmm5, xmmword ptr [rax + 32]
-    aesenc xmm6, xmmword ptr [rax + 32]
-    aesenc xmm7, xmmword ptr [rax + 32]
-    aesenc xmm0, xmmword ptr [rax + 48]
-    aesenc xmm1, xmmword ptr [rax + 48]
-    aesenc xmm2, xmmword ptr [rax + 48]
-    aesenc xmm3, xmmword ptr [rax + 48]
-    aesenc xmm4, xmmword ptr [rax + 48]
-    aesenc xmm5, xmmword ptr [rax + 48]
-    aesenc xmm6, xmmword ptr [rax + 48]
-    aesenc xmm7, xmmword ptr [rax + 48]
-    aesenc xmm0, xmmword ptr [rax + 64]
-    aesenc xmm1, xmmword ptr [rax + 64]
-    aesenc xmm2, xmmword ptr [rax + 64]
-    aesenc xmm3, xmmword ptr [rax + 64]
-    aesenc xmm4, xmmword ptr [rax + 64]
-    aesenc xmm5, xmmword ptr [rax + 64]
-    aesenc xmm6, xmmword ptr [rax + 64]
-    aesenc xmm7, xmmword ptr [rax + 64]
-    aesenc xmm0, xmmword ptr [rax + 80]
-    aesenc xmm1, xmmword ptr [rax + 80]
-    aesenc xmm2, xmmword ptr [rax + 80]
-    aesenc xmm3, xmmword ptr [rax + 80]
-    aesenc xmm4, xmmword ptr [rax + 80]
-    aesenc xmm5, xmmword ptr [rax + 80]
-    aesenc xmm6, xmmword ptr [rax + 80]
-    aesenc xmm7, xmmword ptr [rax + 80]
-    aesenc xmm0, xmmword ptr [rax + 96]
-    aesenc xmm1, xmmword ptr [rax + 96]
-    aesenc xmm2, xmmword ptr [rax + 96]
-    aesenc xmm3, xmmword ptr [rax + 96]
-    aesenc xmm4, xmmword ptr [rax + 96]
-    aesenc xmm5, xmmword ptr [rax + 96]
-    aesenc xmm6, xmmword ptr [rax + 96]
-    aesenc xmm7, xmmword ptr [rax + 96]
-    aesenc xmm0, xmmword ptr [rax + 112]
-    aesenc xmm1, xmmword ptr [rax + 112]
-    aesenc xmm2, xmmword ptr [rax + 112]
-    aesenc xmm3, xmmword ptr [rax + 112]
-    aesenc xmm4, xmmword ptr [rax + 112]
-    aesenc xmm5, xmmword ptr [rax + 112]
-    aesenc xmm6, xmmword ptr [rax + 112]
-    aesenc xmm7, xmmword ptr [rax + 112]
-    aesenc xmm0, xmmword ptr [rax + 128]
-    aesenc xmm1, xmmword ptr [rax + 128]
-    aesenc xmm2, xmmword ptr [rax + 128]
-    aesenc xmm3, xmmword ptr [rax + 128]
-    aesenc xmm4, xmmword ptr [rax + 128]
-    aesenc xmm5, xmmword ptr [rax + 128]
-    aesenc xmm6, xmmword ptr [rax + 128]
-    aesenc xmm7, xmmword ptr [rax + 128]
-    aesenc xmm0, xmmword ptr [rax + 144]
-    aesenc xmm1, xmmword ptr [rax + 144]
-    aesenc xmm2, xmmword ptr [rax + 144]
-    aesenc xmm3, xmmword ptr [rax + 144]
-    aesenc xmm4, xmmword ptr [rax + 144]
-    aesenc xmm5, xmmword ptr [rax + 144]
-    aesenc xmm6, xmmword ptr [rax + 144]
-    aesenc xmm7, xmmword ptr [rax + 144]
+    movdqu xmm12, xmmword ptr [rsp + 8]     // the counter block, byte-reversed
+    movdqu xmm13, xmmword ptr [rip + .gone]
+    movdqu xmm14, xmmword ptr [rip + .gbswap]
+    movdqa xmm0, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm0, xmm14
+    movdqa xmm1, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm1, xmm14
+    movdqa xmm2, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm2, xmm14
+    movdqa xmm3, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm3, xmm14
+    movdqa xmm4, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm4, xmm14
+    movdqa xmm5, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm5, xmm14
+    movdqa xmm6, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm6, xmm14
+    movdqa xmm7, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm7, xmm14
+    movdqu xmmword ptr [rsp + 8], xmm12
+    movdqu xmm15, xmmword ptr [rax]
+    pxor xmm0, xmm15
+    pxor xmm1, xmm15
+    pxor xmm2, xmm15
+    pxor xmm3, xmm15
+    pxor xmm4, xmm15
+    pxor xmm5, xmm15
+    pxor xmm6, xmm15
+    pxor xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 16]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 32]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 48]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 64]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 80]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 96]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 112]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 128]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 144]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     cmp r8, 160
     je .galast
-    aesenc xmm0, xmmword ptr [rax + 160]
-    aesenc xmm1, xmmword ptr [rax + 160]
-    aesenc xmm2, xmmword ptr [rax + 160]
-    aesenc xmm3, xmmword ptr [rax + 160]
-    aesenc xmm4, xmmword ptr [rax + 160]
-    aesenc xmm5, xmmword ptr [rax + 160]
-    aesenc xmm6, xmmword ptr [rax + 160]
-    aesenc xmm7, xmmword ptr [rax + 160]
-    aesenc xmm0, xmmword ptr [rax + 176]
-    aesenc xmm1, xmmword ptr [rax + 176]
-    aesenc xmm2, xmmword ptr [rax + 176]
-    aesenc xmm3, xmmword ptr [rax + 176]
-    aesenc xmm4, xmmword ptr [rax + 176]
-    aesenc xmm5, xmmword ptr [rax + 176]
-    aesenc xmm6, xmmword ptr [rax + 176]
-    aesenc xmm7, xmmword ptr [rax + 176]
+    movdqu xmm15, xmmword ptr [rax + 160]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 176]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     cmp r8, 192
     je .galast
-    aesenc xmm0, xmmword ptr [rax + 192]
-    aesenc xmm1, xmmword ptr [rax + 192]
-    aesenc xmm2, xmmword ptr [rax + 192]
-    aesenc xmm3, xmmword ptr [rax + 192]
-    aesenc xmm4, xmmword ptr [rax + 192]
-    aesenc xmm5, xmmword ptr [rax + 192]
-    aesenc xmm6, xmmword ptr [rax + 192]
-    aesenc xmm7, xmmword ptr [rax + 192]
-    aesenc xmm0, xmmword ptr [rax + 208]
-    aesenc xmm1, xmmword ptr [rax + 208]
-    aesenc xmm2, xmmword ptr [rax + 208]
-    aesenc xmm3, xmmword ptr [rax + 208]
-    aesenc xmm4, xmmword ptr [rax + 208]
-    aesenc xmm5, xmmword ptr [rax + 208]
-    aesenc xmm6, xmmword ptr [rax + 208]
-    aesenc xmm7, xmmword ptr [rax + 208]
+    movdqu xmm15, xmmword ptr [rax + 192]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 208]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
 .galast:
-    aesenclast xmm0, xmmword ptr [rax + r8]
-    aesenclast xmm1, xmmword ptr [rax + r8]
-    aesenclast xmm2, xmmword ptr [rax + r8]
-    aesenclast xmm3, xmmword ptr [rax + r8]
-    aesenclast xmm4, xmmword ptr [rax + r8]
-    aesenclast xmm5, xmmword ptr [rax + r8]
-    aesenclast xmm6, xmmword ptr [rax + r8]
-    aesenclast xmm7, xmmword ptr [rax + r8]
+    movdqu xmm15, xmmword ptr [rax + r8]
+    aesenclast xmm0, xmm15
+    aesenclast xmm1, xmm15
+    aesenclast xmm2, xmm15
+    aesenclast xmm3, xmm15
+    aesenclast xmm4, xmm15
+    aesenclast xmm5, xmm15
+    aesenclast xmm6, xmm15
+    aesenclast xmm7, xmm15
     movdqu xmm12, xmmword ptr [rsi + 0]
     pxor xmm0, xmm12
     movdqu xmmword ptr [rdi + 0], xmm0
@@ -593,268 +618,307 @@ gcm_crypt8:
 .genc:
     mov r10, rdi
     sub r10, 128
-    movdqa xmm0, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm0, xmmword ptr [rip + .gbswap]
-    movdqa xmm1, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm1, xmmword ptr [rip + .gbswap]
-    movdqa xmm2, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm2, xmmword ptr [rip + .gbswap]
-    movdqa xmm3, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm3, xmmword ptr [rip + .gbswap]
-    movdqa xmm4, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm4, xmmword ptr [rip + .gbswap]
-    movdqa xmm5, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm5, xmmword ptr [rip + .gbswap]
-    movdqa xmm6, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm6, xmmword ptr [rip + .gbswap]
-    movdqa xmm7, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm7, xmmword ptr [rip + .gbswap]
-    pxor xmm0, xmmword ptr [rax]
-    pxor xmm1, xmmword ptr [rax]
-    pxor xmm2, xmmword ptr [rax]
-    pxor xmm3, xmmword ptr [rax]
-    pxor xmm4, xmmword ptr [rax]
-    pxor xmm5, xmmword ptr [rax]
-    pxor xmm6, xmmword ptr [rax]
-    pxor xmm7, xmmword ptr [rax]
-    aesenc xmm0, xmmword ptr [rax + 16]
-    aesenc xmm1, xmmword ptr [rax + 16]
-    aesenc xmm2, xmmword ptr [rax + 16]
-    aesenc xmm3, xmmword ptr [rax + 16]
-    aesenc xmm4, xmmword ptr [rax + 16]
-    aesenc xmm5, xmmword ptr [rax + 16]
-    aesenc xmm6, xmmword ptr [rax + 16]
-    aesenc xmm7, xmmword ptr [rax + 16]
+    movdqu xmm12, xmmword ptr [rsp + 8]     // the counter block, byte-reversed
+    movdqu xmm13, xmmword ptr [rip + .gone]
+    movdqu xmm14, xmmword ptr [rip + .gbswap]
+    movdqa xmm0, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm0, xmm14
+    movdqa xmm1, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm1, xmm14
+    movdqa xmm2, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm2, xmm14
+    movdqa xmm3, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm3, xmm14
+    movdqa xmm4, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm4, xmm14
+    movdqa xmm5, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm5, xmm14
+    movdqa xmm6, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm6, xmm14
+    movdqa xmm7, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm7, xmm14
+    movdqu xmmword ptr [rsp + 8], xmm12
+    movdqu xmm15, xmmword ptr [rax]
+    pxor xmm0, xmm15
+    pxor xmm1, xmm15
+    pxor xmm2, xmm15
+    pxor xmm3, xmm15
+    pxor xmm4, xmm15
+    pxor xmm5, xmm15
+    pxor xmm6, xmm15
+    pxor xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 16]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 0]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 0]
     pxor xmm14, xmm8
     movdqa xmm9, xmm14
-    pclmulqdq xmm9, xmmword ptr [rcx], 0x00
+    pclmulqdq xmm9, xmm15, 0x00
     movdqa xmm10, xmm14
-    pclmulqdq xmm10, xmmword ptr [rcx], 0x11
+    pclmulqdq xmm10, xmm15, 0x11
+    movdqu xmm15, xmmword ptr [rcx + 16]
     pshufd xmm11, xmm14, 0x4e
     pxor xmm11, xmm14
-    pclmulqdq xmm11, xmmword ptr [rcx + 16], 0x00
-    aesenc xmm0, xmmword ptr [rax + 32]
-    aesenc xmm1, xmmword ptr [rax + 32]
-    aesenc xmm2, xmmword ptr [rax + 32]
-    aesenc xmm3, xmmword ptr [rax + 32]
-    aesenc xmm4, xmmword ptr [rax + 32]
-    aesenc xmm5, xmmword ptr [rax + 32]
-    aesenc xmm6, xmmword ptr [rax + 32]
-    aesenc xmm7, xmmword ptr [rax + 32]
+    pclmulqdq xmm11, xmm15, 0x00
+    movdqu xmm15, xmmword ptr [rax + 32]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 16]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 32]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 32], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 32], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 48]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 48], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 48]
-    aesenc xmm1, xmmword ptr [rax + 48]
-    aesenc xmm2, xmmword ptr [rax + 48]
-    aesenc xmm3, xmmword ptr [rax + 48]
-    aesenc xmm4, xmmword ptr [rax + 48]
-    aesenc xmm5, xmmword ptr [rax + 48]
-    aesenc xmm6, xmmword ptr [rax + 48]
-    aesenc xmm7, xmmword ptr [rax + 48]
+    movdqu xmm15, xmmword ptr [rax + 48]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 32]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 64]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 64], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 64], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 80]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 80], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 64]
-    aesenc xmm1, xmmword ptr [rax + 64]
-    aesenc xmm2, xmmword ptr [rax + 64]
-    aesenc xmm3, xmmword ptr [rax + 64]
-    aesenc xmm4, xmmword ptr [rax + 64]
-    aesenc xmm5, xmmword ptr [rax + 64]
-    aesenc xmm6, xmmword ptr [rax + 64]
-    aesenc xmm7, xmmword ptr [rax + 64]
+    movdqu xmm15, xmmword ptr [rax + 64]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 48]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 96]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 96], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 96], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 112]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 112], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 80]
-    aesenc xmm1, xmmword ptr [rax + 80]
-    aesenc xmm2, xmmword ptr [rax + 80]
-    aesenc xmm3, xmmword ptr [rax + 80]
-    aesenc xmm4, xmmword ptr [rax + 80]
-    aesenc xmm5, xmmword ptr [rax + 80]
-    aesenc xmm6, xmmword ptr [rax + 80]
-    aesenc xmm7, xmmword ptr [rax + 80]
+    movdqu xmm15, xmmword ptr [rax + 80]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 64]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 128]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 128], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 128], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 144]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 144], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 96]
-    aesenc xmm1, xmmword ptr [rax + 96]
-    aesenc xmm2, xmmword ptr [rax + 96]
-    aesenc xmm3, xmmword ptr [rax + 96]
-    aesenc xmm4, xmmword ptr [rax + 96]
-    aesenc xmm5, xmmword ptr [rax + 96]
-    aesenc xmm6, xmmword ptr [rax + 96]
-    aesenc xmm7, xmmword ptr [rax + 96]
+    movdqu xmm15, xmmword ptr [rax + 96]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 80]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 160]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 160], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 160], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 176]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 176], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 112]
-    aesenc xmm1, xmmword ptr [rax + 112]
-    aesenc xmm2, xmmword ptr [rax + 112]
-    aesenc xmm3, xmmword ptr [rax + 112]
-    aesenc xmm4, xmmword ptr [rax + 112]
-    aesenc xmm5, xmmword ptr [rax + 112]
-    aesenc xmm6, xmmword ptr [rax + 112]
-    aesenc xmm7, xmmword ptr [rax + 112]
+    movdqu xmm15, xmmword ptr [rax + 112]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 96]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 192]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 192], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 192], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 208]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 208], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 128]
-    aesenc xmm1, xmmword ptr [rax + 128]
-    aesenc xmm2, xmmword ptr [rax + 128]
-    aesenc xmm3, xmmword ptr [rax + 128]
-    aesenc xmm4, xmmword ptr [rax + 128]
-    aesenc xmm5, xmmword ptr [rax + 128]
-    aesenc xmm6, xmmword ptr [rax + 128]
-    aesenc xmm7, xmmword ptr [rax + 128]
+    movdqu xmm15, xmmword ptr [rax + 128]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 112]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 224]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 224], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 224], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 240]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 240], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 144]
-    aesenc xmm1, xmmword ptr [rax + 144]
-    aesenc xmm2, xmmword ptr [rax + 144]
-    aesenc xmm3, xmmword ptr [rax + 144]
-    aesenc xmm4, xmmword ptr [rax + 144]
-    aesenc xmm5, xmmword ptr [rax + 144]
-    aesenc xmm6, xmmword ptr [rax + 144]
-    aesenc xmm7, xmmword ptr [rax + 144]
+    movdqu xmm15, xmmword ptr [rax + 144]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rip + .gk]
     pxor xmm11, xmm9
     pxor xmm11, xmm10                   // mid
     movdqa xmm12, xmm11
@@ -863,61 +927,66 @@ gcm_crypt8:
     psrldq xmm11, 8
     pxor xmm10, xmm11                   // hi ^= [m1, 0]
     movdqa xmm12, xmm10
-    pclmulqdq xmm12, xmmword ptr [rip + .gk], 0x01   // P3 * 0x87, at x^64
+    pclmulqdq xmm12, xmm15, 0x01        // P3 * 0x87, at x^64
     movdqa xmm13, xmm12
     pslldq xmm13, 8
     pxor xmm9, xmm13
     psrldq xmm12, 8
     pxor xmm10, xmm12
     movdqa xmm12, xmm10
-    pclmulqdq xmm12, xmmword ptr [rip + .gk], 0x00   // P2 * 0x87
+    pclmulqdq xmm12, xmm15, 0x00        // P2 * 0x87
     pxor xmm9, xmm12
     movdqa xmm8, xmm9
     cmp r8, 160
     je .gblast
-    aesenc xmm0, xmmword ptr [rax + 160]
-    aesenc xmm1, xmmword ptr [rax + 160]
-    aesenc xmm2, xmmword ptr [rax + 160]
-    aesenc xmm3, xmmword ptr [rax + 160]
-    aesenc xmm4, xmmword ptr [rax + 160]
-    aesenc xmm5, xmmword ptr [rax + 160]
-    aesenc xmm6, xmmword ptr [rax + 160]
-    aesenc xmm7, xmmword ptr [rax + 160]
-    aesenc xmm0, xmmword ptr [rax + 176]
-    aesenc xmm1, xmmword ptr [rax + 176]
-    aesenc xmm2, xmmword ptr [rax + 176]
-    aesenc xmm3, xmmword ptr [rax + 176]
-    aesenc xmm4, xmmword ptr [rax + 176]
-    aesenc xmm5, xmmword ptr [rax + 176]
-    aesenc xmm6, xmmword ptr [rax + 176]
-    aesenc xmm7, xmmword ptr [rax + 176]
+    movdqu xmm15, xmmword ptr [rax + 160]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 176]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     cmp r8, 192
     je .gblast
-    aesenc xmm0, xmmword ptr [rax + 192]
-    aesenc xmm1, xmmword ptr [rax + 192]
-    aesenc xmm2, xmmword ptr [rax + 192]
-    aesenc xmm3, xmmword ptr [rax + 192]
-    aesenc xmm4, xmmword ptr [rax + 192]
-    aesenc xmm5, xmmword ptr [rax + 192]
-    aesenc xmm6, xmmword ptr [rax + 192]
-    aesenc xmm7, xmmword ptr [rax + 192]
-    aesenc xmm0, xmmword ptr [rax + 208]
-    aesenc xmm1, xmmword ptr [rax + 208]
-    aesenc xmm2, xmmword ptr [rax + 208]
-    aesenc xmm3, xmmword ptr [rax + 208]
-    aesenc xmm4, xmmword ptr [rax + 208]
-    aesenc xmm5, xmmword ptr [rax + 208]
-    aesenc xmm6, xmmword ptr [rax + 208]
-    aesenc xmm7, xmmword ptr [rax + 208]
+    movdqu xmm15, xmmword ptr [rax + 192]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 208]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
 .gblast:
-    aesenclast xmm0, xmmword ptr [rax + r8]
-    aesenclast xmm1, xmmword ptr [rax + r8]
-    aesenclast xmm2, xmmword ptr [rax + r8]
-    aesenclast xmm3, xmmword ptr [rax + r8]
-    aesenclast xmm4, xmmword ptr [rax + r8]
-    aesenclast xmm5, xmmword ptr [rax + r8]
-    aesenclast xmm6, xmmword ptr [rax + r8]
-    aesenclast xmm7, xmmword ptr [rax + r8]
+    movdqu xmm15, xmmword ptr [rax + r8]
+    aesenclast xmm0, xmm15
+    aesenclast xmm1, xmm15
+    aesenclast xmm2, xmm15
+    aesenclast xmm3, xmm15
+    aesenclast xmm4, xmm15
+    aesenclast xmm5, xmm15
+    aesenclast xmm6, xmm15
+    aesenclast xmm7, xmm15
     movdqu xmm12, xmmword ptr [rsi + 0]
     pxor xmm0, xmm12
     movdqu xmmword ptr [rdi + 0], xmm0
@@ -950,163 +1019,188 @@ gcm_crypt8:
     mov r10, rdi
     sub r10, 128
     movdqu xmm12, xmmword ptr [r10 + 0]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 0]
     pxor xmm14, xmm8
     movdqa xmm9, xmm14
-    pclmulqdq xmm9, xmmword ptr [rcx], 0x00
+    pclmulqdq xmm9, xmm15, 0x00
     movdqa xmm10, xmm14
-    pclmulqdq xmm10, xmmword ptr [rcx], 0x11
+    pclmulqdq xmm10, xmm15, 0x11
+    movdqu xmm15, xmmword ptr [rcx + 16]
     pshufd xmm11, xmm14, 0x4e
     pxor xmm11, xmm14
-    pclmulqdq xmm11, xmmword ptr [rcx + 16], 0x00
+    pclmulqdq xmm11, xmm15, 0x00
     movdqu xmm12, xmmword ptr [r10 + 16]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 32]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 32], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 32], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 48]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 48], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
     movdqu xmm12, xmmword ptr [r10 + 32]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 64]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 64], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 64], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 80]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 80], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
     movdqu xmm12, xmmword ptr [r10 + 48]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 96]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 96], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 96], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 112]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 112], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
     movdqu xmm12, xmmword ptr [r10 + 64]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 128]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 128], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 128], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 144]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 144], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
     movdqu xmm12, xmmword ptr [r10 + 80]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 160]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 160], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 160], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 176]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 176], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
     movdqu xmm12, xmmword ptr [r10 + 96]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 192]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 192], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 192], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 208]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 208], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
     movdqu xmm12, xmmword ptr [r10 + 112]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 224]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 224], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 224], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 240]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 240], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
+    movdqu xmm15, xmmword ptr [rip + .gk]
     pxor xmm11, xmm9
     pxor xmm11, xmm10                   // mid
     movdqa xmm12, xmm11
@@ -1115,281 +1209,320 @@ gcm_crypt8:
     psrldq xmm11, 8
     pxor xmm10, xmm11                   // hi ^= [m1, 0]
     movdqa xmm12, xmm10
-    pclmulqdq xmm12, xmmword ptr [rip + .gk], 0x01   // P3 * 0x87, at x^64
+    pclmulqdq xmm12, xmm15, 0x01        // P3 * 0x87, at x^64
     movdqa xmm13, xmm12
     pslldq xmm13, 8
     pxor xmm9, xmm13
     psrldq xmm12, 8
     pxor xmm10, xmm12
     movdqa xmm12, xmm10
-    pclmulqdq xmm12, xmmword ptr [rip + .gk], 0x00   // P2 * 0x87
+    pclmulqdq xmm12, xmm15, 0x00        // P2 * 0x87
     pxor xmm9, xmm12
     movdqa xmm8, xmm9
     jmp .gend
 .gdec:
     mov r10, rsi
-    movdqa xmm0, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm0, xmmword ptr [rip + .gbswap]
-    movdqa xmm1, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm1, xmmword ptr [rip + .gbswap]
-    movdqa xmm2, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm2, xmmword ptr [rip + .gbswap]
-    movdqa xmm3, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm3, xmmword ptr [rip + .gbswap]
-    movdqa xmm4, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm4, xmmword ptr [rip + .gbswap]
-    movdqa xmm5, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm5, xmmword ptr [rip + .gbswap]
-    movdqa xmm6, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm6, xmmword ptr [rip + .gbswap]
-    movdqa xmm7, xmm15
-    paddd xmm15, xmmword ptr [rip + .gone]
-    pshufb xmm7, xmmword ptr [rip + .gbswap]
-    pxor xmm0, xmmword ptr [rax]
-    pxor xmm1, xmmword ptr [rax]
-    pxor xmm2, xmmword ptr [rax]
-    pxor xmm3, xmmword ptr [rax]
-    pxor xmm4, xmmword ptr [rax]
-    pxor xmm5, xmmword ptr [rax]
-    pxor xmm6, xmmword ptr [rax]
-    pxor xmm7, xmmword ptr [rax]
-    aesenc xmm0, xmmword ptr [rax + 16]
-    aesenc xmm1, xmmword ptr [rax + 16]
-    aesenc xmm2, xmmword ptr [rax + 16]
-    aesenc xmm3, xmmword ptr [rax + 16]
-    aesenc xmm4, xmmword ptr [rax + 16]
-    aesenc xmm5, xmmword ptr [rax + 16]
-    aesenc xmm6, xmmword ptr [rax + 16]
-    aesenc xmm7, xmmword ptr [rax + 16]
+    movdqu xmm12, xmmword ptr [rsp + 8]     // the counter block, byte-reversed
+    movdqu xmm13, xmmword ptr [rip + .gone]
+    movdqu xmm14, xmmword ptr [rip + .gbswap]
+    movdqa xmm0, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm0, xmm14
+    movdqa xmm1, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm1, xmm14
+    movdqa xmm2, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm2, xmm14
+    movdqa xmm3, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm3, xmm14
+    movdqa xmm4, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm4, xmm14
+    movdqa xmm5, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm5, xmm14
+    movdqa xmm6, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm6, xmm14
+    movdqa xmm7, xmm12
+    paddd xmm12, xmm13
+    pshufb xmm7, xmm14
+    movdqu xmmword ptr [rsp + 8], xmm12
+    movdqu xmm15, xmmword ptr [rax]
+    pxor xmm0, xmm15
+    pxor xmm1, xmm15
+    pxor xmm2, xmm15
+    pxor xmm3, xmm15
+    pxor xmm4, xmm15
+    pxor xmm5, xmm15
+    pxor xmm6, xmm15
+    pxor xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 16]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 0]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 0]
     pxor xmm14, xmm8
     movdqa xmm9, xmm14
-    pclmulqdq xmm9, xmmword ptr [rcx], 0x00
+    pclmulqdq xmm9, xmm15, 0x00
     movdqa xmm10, xmm14
-    pclmulqdq xmm10, xmmword ptr [rcx], 0x11
+    pclmulqdq xmm10, xmm15, 0x11
+    movdqu xmm15, xmmword ptr [rcx + 16]
     pshufd xmm11, xmm14, 0x4e
     pxor xmm11, xmm14
-    pclmulqdq xmm11, xmmword ptr [rcx + 16], 0x00
-    aesenc xmm0, xmmword ptr [rax + 32]
-    aesenc xmm1, xmmword ptr [rax + 32]
-    aesenc xmm2, xmmword ptr [rax + 32]
-    aesenc xmm3, xmmword ptr [rax + 32]
-    aesenc xmm4, xmmword ptr [rax + 32]
-    aesenc xmm5, xmmword ptr [rax + 32]
-    aesenc xmm6, xmmword ptr [rax + 32]
-    aesenc xmm7, xmmword ptr [rax + 32]
+    pclmulqdq xmm11, xmm15, 0x00
+    movdqu xmm15, xmmword ptr [rax + 32]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 16]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 32]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 32], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 32], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 48]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 48], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 48]
-    aesenc xmm1, xmmword ptr [rax + 48]
-    aesenc xmm2, xmmword ptr [rax + 48]
-    aesenc xmm3, xmmword ptr [rax + 48]
-    aesenc xmm4, xmmword ptr [rax + 48]
-    aesenc xmm5, xmmword ptr [rax + 48]
-    aesenc xmm6, xmmword ptr [rax + 48]
-    aesenc xmm7, xmmword ptr [rax + 48]
+    movdqu xmm15, xmmword ptr [rax + 48]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 32]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 64]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 64], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 64], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 80]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 80], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 64]
-    aesenc xmm1, xmmword ptr [rax + 64]
-    aesenc xmm2, xmmword ptr [rax + 64]
-    aesenc xmm3, xmmword ptr [rax + 64]
-    aesenc xmm4, xmmword ptr [rax + 64]
-    aesenc xmm5, xmmword ptr [rax + 64]
-    aesenc xmm6, xmmword ptr [rax + 64]
-    aesenc xmm7, xmmword ptr [rax + 64]
+    movdqu xmm15, xmmword ptr [rax + 64]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 48]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 96]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 96], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 96], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 112]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 112], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 80]
-    aesenc xmm1, xmmword ptr [rax + 80]
-    aesenc xmm2, xmmword ptr [rax + 80]
-    aesenc xmm3, xmmword ptr [rax + 80]
-    aesenc xmm4, xmmword ptr [rax + 80]
-    aesenc xmm5, xmmword ptr [rax + 80]
-    aesenc xmm6, xmmword ptr [rax + 80]
-    aesenc xmm7, xmmword ptr [rax + 80]
+    movdqu xmm15, xmmword ptr [rax + 80]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 64]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 128]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 128], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 128], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 144]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 144], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 96]
-    aesenc xmm1, xmmword ptr [rax + 96]
-    aesenc xmm2, xmmword ptr [rax + 96]
-    aesenc xmm3, xmmword ptr [rax + 96]
-    aesenc xmm4, xmmword ptr [rax + 96]
-    aesenc xmm5, xmmword ptr [rax + 96]
-    aesenc xmm6, xmmword ptr [rax + 96]
-    aesenc xmm7, xmmword ptr [rax + 96]
+    movdqu xmm15, xmmword ptr [rax + 96]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 80]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 160]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 160], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 160], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 176]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 176], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 112]
-    aesenc xmm1, xmmword ptr [rax + 112]
-    aesenc xmm2, xmmword ptr [rax + 112]
-    aesenc xmm3, xmmword ptr [rax + 112]
-    aesenc xmm4, xmmword ptr [rax + 112]
-    aesenc xmm5, xmmword ptr [rax + 112]
-    aesenc xmm6, xmmword ptr [rax + 112]
-    aesenc xmm7, xmmword ptr [rax + 112]
+    movdqu xmm15, xmmword ptr [rax + 112]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 96]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 192]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 192], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 192], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 208]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 208], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 128]
-    aesenc xmm1, xmmword ptr [rax + 128]
-    aesenc xmm2, xmmword ptr [rax + 128]
-    aesenc xmm3, xmmword ptr [rax + 128]
-    aesenc xmm4, xmmword ptr [rax + 128]
-    aesenc xmm5, xmmword ptr [rax + 128]
-    aesenc xmm6, xmmword ptr [rax + 128]
-    aesenc xmm7, xmmword ptr [rax + 128]
+    movdqu xmm15, xmmword ptr [rax + 128]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     movdqu xmm12, xmmword ptr [r10 + 112]
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
+    movdqu xmm15, xmmword ptr [rcx + 224]
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 224], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm9, xmm12
     movdqa xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 224], 0x11
+    pclmulqdq xmm12, xmm15, 0x11
     pxor xmm10, xmm12
+    movdqu xmm15, xmmword ptr [rcx + 240]
     pshufd xmm12, xmm14, 0x4e
     pxor xmm12, xmm14
-    pclmulqdq xmm12, xmmword ptr [rcx + 240], 0x00
+    pclmulqdq xmm12, xmm15, 0x00
     pxor xmm11, xmm12
-    aesenc xmm0, xmmword ptr [rax + 144]
-    aesenc xmm1, xmmword ptr [rax + 144]
-    aesenc xmm2, xmmword ptr [rax + 144]
-    aesenc xmm3, xmmword ptr [rax + 144]
-    aesenc xmm4, xmmword ptr [rax + 144]
-    aesenc xmm5, xmmword ptr [rax + 144]
-    aesenc xmm6, xmmword ptr [rax + 144]
-    aesenc xmm7, xmmword ptr [rax + 144]
+    movdqu xmm15, xmmword ptr [rax + 144]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rip + .gk]
     pxor xmm11, xmm9
     pxor xmm11, xmm10                   // mid
     movdqa xmm12, xmm11
@@ -1398,61 +1531,66 @@ gcm_crypt8:
     psrldq xmm11, 8
     pxor xmm10, xmm11                   // hi ^= [m1, 0]
     movdqa xmm12, xmm10
-    pclmulqdq xmm12, xmmword ptr [rip + .gk], 0x01   // P3 * 0x87, at x^64
+    pclmulqdq xmm12, xmm15, 0x01        // P3 * 0x87, at x^64
     movdqa xmm13, xmm12
     pslldq xmm13, 8
     pxor xmm9, xmm13
     psrldq xmm12, 8
     pxor xmm10, xmm12
     movdqa xmm12, xmm10
-    pclmulqdq xmm12, xmmword ptr [rip + .gk], 0x00   // P2 * 0x87
+    pclmulqdq xmm12, xmm15, 0x00        // P2 * 0x87
     pxor xmm9, xmm12
     movdqa xmm8, xmm9
     cmp r8, 160
     je .gclast
-    aesenc xmm0, xmmword ptr [rax + 160]
-    aesenc xmm1, xmmword ptr [rax + 160]
-    aesenc xmm2, xmmword ptr [rax + 160]
-    aesenc xmm3, xmmword ptr [rax + 160]
-    aesenc xmm4, xmmword ptr [rax + 160]
-    aesenc xmm5, xmmword ptr [rax + 160]
-    aesenc xmm6, xmmword ptr [rax + 160]
-    aesenc xmm7, xmmword ptr [rax + 160]
-    aesenc xmm0, xmmword ptr [rax + 176]
-    aesenc xmm1, xmmword ptr [rax + 176]
-    aesenc xmm2, xmmword ptr [rax + 176]
-    aesenc xmm3, xmmword ptr [rax + 176]
-    aesenc xmm4, xmmword ptr [rax + 176]
-    aesenc xmm5, xmmword ptr [rax + 176]
-    aesenc xmm6, xmmword ptr [rax + 176]
-    aesenc xmm7, xmmword ptr [rax + 176]
+    movdqu xmm15, xmmword ptr [rax + 160]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 176]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
     cmp r8, 192
     je .gclast
-    aesenc xmm0, xmmword ptr [rax + 192]
-    aesenc xmm1, xmmword ptr [rax + 192]
-    aesenc xmm2, xmmword ptr [rax + 192]
-    aesenc xmm3, xmmword ptr [rax + 192]
-    aesenc xmm4, xmmword ptr [rax + 192]
-    aesenc xmm5, xmmword ptr [rax + 192]
-    aesenc xmm6, xmmword ptr [rax + 192]
-    aesenc xmm7, xmmword ptr [rax + 192]
-    aesenc xmm0, xmmword ptr [rax + 208]
-    aesenc xmm1, xmmword ptr [rax + 208]
-    aesenc xmm2, xmmword ptr [rax + 208]
-    aesenc xmm3, xmmword ptr [rax + 208]
-    aesenc xmm4, xmmword ptr [rax + 208]
-    aesenc xmm5, xmmword ptr [rax + 208]
-    aesenc xmm6, xmmword ptr [rax + 208]
-    aesenc xmm7, xmmword ptr [rax + 208]
+    movdqu xmm15, xmmword ptr [rax + 192]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
+    movdqu xmm15, xmmword ptr [rax + 208]
+    aesenc xmm0, xmm15
+    aesenc xmm1, xmm15
+    aesenc xmm2, xmm15
+    aesenc xmm3, xmm15
+    aesenc xmm4, xmm15
+    aesenc xmm5, xmm15
+    aesenc xmm6, xmm15
+    aesenc xmm7, xmm15
 .gclast:
-    aesenclast xmm0, xmmword ptr [rax + r8]
-    aesenclast xmm1, xmmword ptr [rax + r8]
-    aesenclast xmm2, xmmword ptr [rax + r8]
-    aesenclast xmm3, xmmword ptr [rax + r8]
-    aesenclast xmm4, xmmword ptr [rax + r8]
-    aesenclast xmm5, xmmword ptr [rax + r8]
-    aesenclast xmm6, xmmword ptr [rax + r8]
-    aesenclast xmm7, xmmword ptr [rax + r8]
+    movdqu xmm15, xmmword ptr [rax + r8]
+    aesenclast xmm0, xmm15
+    aesenclast xmm1, xmm15
+    aesenclast xmm2, xmm15
+    aesenclast xmm3, xmm15
+    aesenclast xmm4, xmm15
+    aesenclast xmm5, xmm15
+    aesenclast xmm6, xmm15
+    aesenclast xmm7, xmm15
     movdqu xmm12, xmmword ptr [rsi + 0]
     pxor xmm0, xmm12
     movdqu xmmword ptr [rdi + 0], xmm0
@@ -1484,18 +1622,21 @@ gcm_crypt8:
 .gend:
     mov r10, qword ptr [rsp + 64]
     movdqa xmm12, xmm8
+    movdqu xmm15, xmmword ptr [rip + .gnibble]
     movdqa xmm13, xmm12
-    pand xmm13, xmmword ptr [rip + .gnibble]
+    pand xmm13, xmm15
     psrlw xmm12, 4
-    pand xmm12, xmmword ptr [rip + .gnibble]
+    pand xmm12, xmm15
     movdqu xmm14, xmmword ptr [rip + .grev_lo]
     pshufb xmm14, xmm13
     movdqu xmm13, xmmword ptr [rip + .grev_hi]
     pshufb xmm13, xmm12
     por xmm14, xmm13
     movdqu xmmword ptr [r10], xmm14
-    pshufb xmm15, xmmword ptr [rip + .gbswap]
-    movdqu xmmword ptr [r9], xmm15
+    movdqu xmm12, xmmword ptr [rsp + 8]
+    movdqu xmm13, xmmword ptr [rip + .gbswap]
+    pshufb xmm12, xmm13
+    movdqu xmmword ptr [r9], xmm12
 .gdone:
     ret
     .balign 16
