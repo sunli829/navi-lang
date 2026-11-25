@@ -1,0 +1,1121 @@
+//! Markdown to HTML for documentation (as rustdoc's pulldown-cmark with
+//! tables and strikethrough): CommonMark's blocks and inlines that
+//! documentation uses, intra-doc links, navi code highlighted. Raw HTML is
+//! shown as text.
+
+use std::collections::HashMap;
+
+/// How a page's documentation is rendered: intra-doc links resolved by
+/// link (a path as written, Err when it names nothing: the text stays),
+/// headings moved down by shift (# is h(1 + shift)).
+pub struct Opts {
+    pub link: fn(&str) -> Option<String>,
+    pub shift: usize,
+}
+
+/// A code block of the documentation: its info string (language and
+/// attributes), its lines as written (hidden ones too) and the line it
+/// starts on (0-based, in the documentation).
+#[derive(Clone)]
+pub struct CodeBlock {
+    pub info: String,
+    pub code: String,
+    pub line: usize,
+}
+
+pub fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The documentation src as HTML.
+pub fn to_html(src: &str, o: &Opts) -> String {
+    let (lines, refs) = take_refs(src);
+    let r = &mut Renderer { o, refs };
+    let v: Vec<&str> = lines.iter().map(|l: &String| -> &str { l.as_str() }).collect();
+    r.blocks(v.as_slice())
+}
+
+/// The first paragraph of src, its inlines as HTML (a summary line).
+pub fn summary(src: &str, o: &Opts) -> String {
+    let (lines, refs) = take_refs(src);
+    let mut para: Vec<&str> = Vec::new();
+    for l in lines.iter() {
+        let t = l.trim();
+        if t.len() == 0 {
+            if para.len() > 0 { break; }
+            continue;
+        }
+        if para.len() == 0 && (t.starts_with("#") || t.starts_with("```") || t.starts_with("~~~")) {
+            if t.starts_with("#") {
+                // (A heading first: the paragraph after it.)
+                continue;
+            }
+            break;
+        }
+        para.push(t);
+    }
+    let r = &mut Renderer { o, refs };
+    r.inlines(para.join("\n").as_str())
+}
+
+/// The code blocks of src (fenced and indented), in order.
+pub fn code_blocks(src: &str) -> Vec<CodeBlock> {
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut out: Vec<CodeBlock> = Vec::new();
+    let mut i = 0;
+    let mut in_para = false;
+    while i < lines.len() {
+        let l = lines[i];
+        if let Some((fc, n, indent, info)) = fence_open(l) {
+            let start = i;
+            let mut code: Vec<String> = Vec::new();
+            i += 1;
+            while i < lines.len() && !fence_close(lines[i], fc, n) {
+                code.push(strip_indent(lines[i], indent));
+                i += 1;
+            }
+            out.push(CodeBlock { info, code: code.join("\n"), line: start + 1 });
+            i += 1;
+            in_para = false;
+            continue;
+        }
+        if !in_para && indent_of(l) >= 4 && l.trim().len() > 0 {
+            let start = i;
+            let mut code: Vec<String> = Vec::new();
+            while i < lines.len() && (indent_of(lines[i]) >= 4 || lines[i].trim().len() == 0) {
+                code.push(strip_indent(lines[i], 4));
+                i += 1;
+            }
+            while code.len() > 0 && code[code.len() - 1].trim().len() == 0 { code.pop(); }
+            out.push(CodeBlock { info: String::new(), code: code.join("\n"), line: start });
+            in_para = false;
+            continue;
+        }
+        in_para = l.trim().len() > 0;
+        i += 1;
+    }
+    out
+}
+
+// --- Blocks ------------------------------------------------------------------
+
+struct Renderer {
+    o: &Opts,
+    refs: HashMap<String, (String, String)>,
+}
+
+fn indent_of(l: &str) -> usize {
+    let mut n = 0;
+    for c in l.bytes() {
+        if c == b' ' { n += 1; } else if c == b'\t' { n += 4 - n % 4; } else { break; }
+    }
+    n
+}
+
+// l without up to n columns of leading spaces.
+fn strip_indent(l: &str, n: usize) -> String {
+    let b = l.as_bytes();
+    let mut i = 0;
+    let mut col = 0;
+    while i < b.len() && col < n {
+        if b[i] == b' ' { col += 1; } else if b[i] == b'\t' { col += 4 - col % 4; } else { break; }
+        i += 1;
+    }
+    l[i..].to_string()
+}
+
+// A fence's opening line: (its char, its length, its indent, the info).
+fn fence_open(l: &str) -> Option<(u8, usize, usize, String)> {
+    let ind = indent_of(l);
+    if ind > 3 { return None; }
+    let t = l.trim_start();
+    let b = t.as_bytes();
+    if b.len() < 3 || (b[0] != b'`' && b[0] != b'~') { return None; }
+    let c = b[0];
+    let mut n = 0;
+    while n < b.len() && b[n] == c { n += 1; }
+    if n < 3 { return None; }
+    let info = t[n..].trim().to_string();
+    if c == b'`' && info.contains("`") { return None; }
+    Some((c, n, ind, info))
+}
+
+fn fence_close(l: &str, c: u8, n: usize) -> bool {
+    if indent_of(l) > 3 { return false; }
+    let t = l.trim();
+    let b = t.as_bytes();
+    if b.len() < n { return false; }
+    for x in b.iter() { if *x != c { return false; } }
+    true
+}
+
+fn is_hr(l: &str) -> bool {
+    if indent_of(l) > 3 { return false; }
+    let t = l.trim();
+    let b = t.as_bytes();
+    if b.len() < 3 { return false; }
+    let c = b[0];
+    if c != b'-' && c != b'*' && c != b'_' { return false; }
+    let mut n = 0;
+    for x in b.iter() {
+        if *x == c { n += 1; } else if *x != b' ' && *x != b'\t' { return false; }
+    }
+    n >= 3
+}
+
+// An ATX heading: (level, text).
+fn heading(l: &str) -> Option<(usize, String)> {
+    if indent_of(l) > 3 { return None; }
+    let t = l.trim();
+    let b = t.as_bytes();
+    let mut n = 0;
+    while n < b.len() && b[n] == b'#' { n += 1; }
+    if n == 0 || n > 6 { return None; }
+    if n < b.len() && b[n] != b' ' && b[n] != b'\t' { return None; }
+    let mut text = t[n..].trim().to_string();
+    // (Closing #s.)
+    let tb = text.as_bytes().to_vec();
+    let mut e = tb.len();
+    while e > 0 && tb[e - 1] == b'#' { e -= 1; }
+    if e < tb.len() && (e == 0 || tb[e - 1] == b' ') { text = text[..e].trim().to_string(); }
+    Some((n, text))
+}
+
+// A list item's marker: (ordered, the marker char ('-' or '.'), the start
+// number, the content's column).
+fn list_marker(l: &str) -> Option<(bool, u8, usize, usize)> {
+    let ind = indent_of(l);
+    if ind > 3 { return None; }
+    let t = l.trim_start();
+    let b = t.as_bytes();
+    if b.len() == 0 { return None; }
+    if b[0] == b'-' || b[0] == b'*' || b[0] == b'+' {
+        if b.len() == 1 { return Some((false, b[0], 0, ind + 2)); }
+        if b[1] != b' ' && b[1] != b'\t' { return None; }
+        let sp = indent_of(&t[1..]);
+        let sp = if sp > 4 || t[1..].trim().len() == 0 { 1 } else { sp };
+        return Some((false, b[0], 0, ind + 1 + sp));
+    }
+    let mut n = 0;
+    while n < b.len() && n < 9 && b[n] >= b'0' && b[n] <= b'9' { n += 1; }
+    if n == 0 || n >= b.len() || (b[n] != b'.' && b[n] != b')') { return None; }
+    let num = t[..n].parse::<usize>().unwrap_or(1);
+    if n + 1 == b.len() { return Some((true, b[n], num, ind + n + 2)); }
+    if b[n + 1] != b' ' && b[n + 1] != b'\t' { return None; }
+    let sp = indent_of(&t[n + 1..]);
+    let sp = if sp > 4 || t[n + 1..].trim().len() == 0 { 1 } else { sp };
+    Some((true, b[n], num, ind + n + 1 + sp))
+}
+
+// A table's delimiter row: the columns' alignments.
+fn table_delims(l: &str) -> Option<Vec<u8>> {
+    let t = l.trim();
+    if !t.contains("-") { return None; }
+    let cells = split_row(t);
+    let mut out: Vec<u8> = Vec::new();
+    for c in cells.iter() {
+        let c = c.trim();
+        let b = c.as_bytes();
+        if b.len() == 0 { return None; }
+        let left = b[0] == b':';
+        let right = b[b.len() - 1] == b':';
+        let inner = &c[if left { 1 } else { 0 }..c.len() - if right && c.len() > 1 { 1 } else { 0 }];
+        if inner.len() == 0 { return None; }
+        for x in inner.bytes() { if x != b'-' { return None; } }
+        out.push(if left && right { b'c' } else if right { b'r' } else if left { b'l' } else { 0 });
+    }
+    Some(out)
+}
+
+// A table row's cells (the outer pipes dropped, \| kept as |).
+fn split_row(l: &str) -> Vec<String> {
+    let mut t = l.trim();
+    if t.starts_with("|") { t = &t[1..]; }
+    if t.ends_with("|") && !t.ends_with("\\|") { t = &t[..t.len() - 1]; }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let b = t.as_bytes();
+    let mut i = 0;
+    let mut in_code = false;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() && b[i + 1] == b'|' {
+            cur.push('|');
+            i += 2;
+            continue;
+        }
+        if b[i] == b'`' { in_code = !in_code; }
+        if b[i] == b'|' && !in_code {
+            out.push(cur.trim().to_string());
+            cur = String::new();
+        } else {
+            cur.push_str(&t[i..i + 1]);
+        }
+        i += 1;
+    }
+    out.push(cur.trim().to_string());
+    out
+}
+
+// Whether line l starts a block that ends a paragraph.
+fn interrupts(l: &str) -> bool {
+    if fence_open(l).is_some() || heading(l).is_some() || is_hr(l) { return true; }
+    if indent_of(l) <= 3 && l.trim_start().starts_with(">") { return true; }
+    match list_marker(l) {
+        // (An ordered list interrupts a paragraph only from 1, and no list
+        // with an empty item.)
+        Some((ordered, _, num, col)) => l.len() > col && (!ordered || num == 1),
+        None => false,
+    }
+}
+
+// The lines of src without its link reference definitions, and those.
+fn take_refs(src: &str) -> (Vec<String>, HashMap<String, (String, String)>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut refs: HashMap<String, (String, String)> = HashMap::new();
+    let mut fence: Option<(u8, usize)> = None;
+    let mut prev_blank = true;
+    for l in src.split('\n') {
+        match fence {
+            Some((c, n)) => {
+                if fence_close(l, c, n) { fence = None; }
+                out.push(l.to_string());
+                continue;
+            }
+            None => {}
+        }
+        if let Some((c, n, _, _)) = fence_open(l) {
+            fence = Some((c, n));
+            out.push(l.to_string());
+            prev_blank = false;
+            continue;
+        }
+        if prev_blank && indent_of(l) <= 3 {
+            if let Some((label, url, title)) = ref_def(l.trim()) {
+                let key = label.to_lowercase();
+                if !refs.contains_key(&key) { refs.insert(key, (url, title)); }
+                continue;
+            }
+        }
+        prev_blank = l.trim().len() == 0;
+        out.push(l.to_string());
+    }
+    (out, refs)
+}
+
+// [label]: url "title"
+fn ref_def(t: &str) -> Option<(String, String, String)> {
+    if !t.starts_with("[") { return None; }
+    let close = t.find("]:")?;
+    let label = t[1..close].trim().to_string();
+    if label.len() == 0 { return None; }
+    let rest = t[close + 2..].trim();
+    if rest.len() == 0 { return None; }
+    let (url, after) = match rest.find(' ') {
+        Some(k) => (&rest[..k], rest[k..].trim()),
+        None => (rest, ""),
+    };
+    let url = url.trim_start_matches('<').trim_end_matches('>').to_string();
+    let title = if after.len() >= 2 && (after.starts_with("\"") || after.starts_with("'")) { after[1..after.len() - 1].to_string() } else { String::new() };
+    Some((label, url, title))
+}
+
+impl Renderer {
+    fn blocks(&mut self, lines: &[&str]) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let l = lines[i];
+            if l.trim().len() == 0 {
+                i += 1;
+                continue;
+            }
+            if let Some((fc, n, indent, info)) = fence_open(l) {
+                let mut code: Vec<String> = Vec::new();
+                i += 1;
+                while i < lines.len() && !fence_close(lines[i], fc, n) {
+                    code.push(strip_indent(lines[i], indent));
+                    i += 1;
+                }
+                i += 1;
+                out.push_str(code_block(info.as_str(), code.join("\n").as_str()).as_str());
+                continue;
+            }
+            if indent_of(l) >= 4 {
+                let mut code: Vec<String> = Vec::new();
+                while i < lines.len() && (indent_of(lines[i]) >= 4 || lines[i].trim().len() == 0) {
+                    code.push(strip_indent(lines[i], 4));
+                    i += 1;
+                }
+                while code.len() > 0 && code[code.len() - 1].trim().len() == 0 { code.pop(); }
+                out.push_str(code_block("", code.join("\n").as_str()).as_str());
+                continue;
+            }
+            if let Some((level, text)) = heading(l) {
+                out.push_str(self.heading(level, text.as_str()).as_str());
+                i += 1;
+                continue;
+            }
+            if is_hr(l) {
+                out.push_str("<hr>\n");
+                i += 1;
+                continue;
+            }
+            if l.trim_start().starts_with(">") {
+                let mut inner: Vec<String> = Vec::new();
+                while i < lines.len() && lines[i].trim().len() > 0 {
+                    let t = lines[i].trim_start();
+                    if t.starts_with(">") {
+                        let x = &t[1..];
+                        inner.push((if x.starts_with(" ") { &x[1..] } else { x }).to_string());
+                    } else if interrupts(lines[i]) {
+                        break;
+                    } else {
+                        inner.push(lines[i].to_string());
+                    }
+                    i += 1;
+                }
+                let v: Vec<&str> = inner.iter().map(|s: &String| -> &str { s.as_str() }).collect();
+                out.push_str("<blockquote>\n");
+                out.push_str(self.blocks(v.as_slice()).as_str());
+                out.push_str("</blockquote>\n");
+                continue;
+            }
+            if list_marker(l).is_some() {
+                i = self.list(lines, i, &mut out);
+                continue;
+            }
+            if i + 1 < lines.len() && l.contains("|") {
+                if let Some(al) = table_delims(lines[i + 1]) {
+                    let head = split_row(l);
+                    if head.len() == al.len() {
+                        i = self.table(lines, i, al, &mut out);
+                        continue;
+                    }
+                }
+            }
+            // A paragraph (or a setext heading).
+            let mut para: Vec<&str> = Vec::new();
+            while i < lines.len() && lines[i].trim().len() > 0 {
+                if para.len() > 0 && interrupts(lines[i]) {
+                    let t = lines[i].trim();
+                    // (--- under a paragraph is an h2.)
+                    if !(t.len() > 0 && t.bytes().all(|c: u8| -> bool { c == b'-' }) && indent_of(lines[i]) <= 3) { break; }
+                }
+                if para.len() > 0 && indent_of(lines[i]) <= 3 {
+                    let t = lines[i].trim();
+                    if t.len() > 0 && (t.bytes().all(|c: u8| -> bool { c == b'=' }) || t.bytes().all(|c: u8| -> bool { c == b'-' })) {
+                        let level = if t.starts_with("=") { 1 } else { 2 };
+                        out.push_str(self.heading(level, para.join("\n").trim()).as_str());
+                        para.clear();
+                        i += 1;
+                        break;
+                    }
+                }
+                para.push(lines[i].trim_start());
+                i += 1;
+            }
+            if para.len() > 0 {
+                out.push_str("<p>");
+                out.push_str(self.inlines(para.join("\n").trim_end()).as_str());
+                out.push_str("</p>\n");
+            }
+        }
+        out
+    }
+
+    fn heading(&mut self, level: usize, text: &str) -> String {
+        let h = std::cmp::min(level + self.o.shift, 6);
+        let id = slug(text);
+        `<h${h} id="${id}"><a class="anchor" href="#${id}">§</a>${self.inlines(text)}</h${h}>\n`.to_string()
+    }
+
+    // A list from lines[i]; the index after it.
+    fn list(&mut self, lines: &[&str], start: usize, out: &mut String) -> usize {
+        let (ordered, marker, num, _) = list_marker(lines[start]).unwrap();
+        let mut items: Vec<Vec<String>> = Vec::new();
+        let mut loose = false;
+        let mut i = start;
+        let mut pending_blank = false;
+        loop {
+            if i >= lines.len() { break; }
+            let l = lines[i];
+            match list_marker(l) {
+                Some((o2, m2, _, col)) if o2 == ordered && m2 == marker && indent_of(l) < 4 => {
+                    if pending_blank && items.len() > 0 { loose = true; }
+                    pending_blank = false;
+                    // (The marker's line: what follows the marker.)
+                    let mut item: Vec<String> = Vec::new();
+                    let t = l.trim_start();
+                    let skip = col - indent_of(l);
+                    item.push(if t.len() >= skip { t[skip..].to_string() } else { String::new() });
+                    i += 1;
+                    // Its lines: indented to col, or lazy paragraph lines.
+                    loop {
+                        if i >= lines.len() { break; }
+                        let x = lines[i];
+                        if x.trim().len() == 0 {
+                            // A blank: the item goes on if what follows is
+                            // indented enough.
+                            let mut j = i;
+                            while j < lines.len() && lines[j].trim().len() == 0 { j += 1; }
+                            if j < lines.len() && indent_of(lines[j]) >= col {
+                                while i < j {
+                                    item.push(String::new());
+                                    i += 1;
+                                }
+                                loose = true;
+                                continue;
+                            }
+                            pending_blank = true;
+                            i = j;
+                            break;
+                        }
+                        if indent_of(x) >= col {
+                            item.push(strip_indent(x, col));
+                            i += 1;
+                            continue;
+                        }
+                        if list_marker(x).is_some() || interrupts(x) { break; }
+                        // (A lazy continuation of the item's paragraph.)
+                        item.push(x.trim_start().to_string());
+                        i += 1;
+                    }
+                    items.push(item);
+                }
+                _ => break,
+            }
+            if pending_blank {
+                // A blank line, then another item or the end of the list.
+                match if i < lines.len() { list_marker(lines[i]) } else { None } {
+                    Some((o2, m2, _, _)) if o2 == ordered && m2 == marker => {}
+                    _ => break,
+                }
+            }
+        }
+        if ordered {
+            if num != 1 { out.push_str(`<ol start="${num}">\n`.to_string().as_str()); } else { out.push_str("<ol>\n"); }
+        } else {
+            out.push_str("<ul>\n");
+        }
+        for item in items.iter() {
+            let v: Vec<&str> = item.iter().map(|s: &String| -> &str { s.as_str() }).collect();
+            let mut html = self.blocks(v.as_slice());
+            if !loose {
+                // A tight list: its paragraphs without <p>.
+                html = html.replace("<p>", "").replace("</p>\n", "\n");
+            }
+            out.push_str("<li>");
+            out.push_str(html.trim_end());
+            out.push_str("</li>\n");
+        }
+        out.push_str(if ordered { "</ol>\n" } else { "</ul>\n" });
+        i
+    }
+
+    fn table(&mut self, lines: &[&str], start: usize, al: Vec<u8>, out: &mut String) -> usize {
+        let style = |k: usize| -> String {
+            if k >= al.len() { return String::new(); }
+            match al[k] {
+                b'l' => " style=\"text-align:left\"".to_string(),
+                b'r' => " style=\"text-align:right\"".to_string(),
+                b'c' => " style=\"text-align:center\"".to_string(),
+                _ => String::new(),
+            }
+        };
+        out.push_str("<table>\n<thead><tr>");
+        for (k, c) in split_row(lines[start]).iter().enumerate() {
+            out.push_str(`<th${style(k)}>${self.inlines(c.as_str())}</th>`.to_string().as_str());
+        }
+        out.push_str("</tr></thead>\n<tbody>\n");
+        let mut i = start + 2;
+        while i < lines.len() && lines[i].trim().len() > 0 && !interrupts(lines[i]) {
+            let cells = split_row(lines[i]);
+            out.push_str("<tr>");
+            let mut k = 0;
+            while k < al.len() {
+                let c = if k < cells.len() { cells[k].clone() } else { String::new() };
+                out.push_str(`<td${style(k)}>${self.inlines(c.as_str())}</td>`.to_string().as_str());
+                k += 1;
+            }
+            out.push_str("</tr>\n");
+            i += 1;
+        }
+        out.push_str("</tbody></table>\n");
+        i
+    }
+
+    // --- Inlines ------------------------------------------------------------------
+
+    pub fn inlines(&mut self, s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = String::with_capacity(s.len() + 16);
+        let mut i = 0;
+        let mut text_start = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\\' && i + 1 < b.len() {
+                if b[i + 1] == b'\n' {
+                    out.push_str(escape(&s[text_start..i]).as_str());
+                    out.push_str("<br>\n");
+                    i += 2;
+                    text_start = i;
+                    continue;
+                }
+                if is_punct(b[i + 1]) {
+                    out.push_str(escape(&s[text_start..i]).as_str());
+                    out.push_str(escape(&s[i + 1..i + 2]).as_str());
+                    i += 2;
+                    text_start = i;
+                    continue;
+                }
+            }
+            if c == b'\n' {
+                // (Two spaces before the end of a line: a hard break.)
+                let seg = &s[text_start..i];
+                if seg.ends_with("  ") {
+                    out.push_str(escape(seg.trim_end()).as_str());
+                    out.push_str("<br>\n");
+                } else {
+                    out.push_str(escape(seg.trim_end_matches(' ')).as_str());
+                    out.push('\n');
+                }
+                i += 1;
+                text_start = i;
+                continue;
+            }
+            if c == b'`' {
+                let mut n = 0;
+                while i + n < b.len() && b[i + n] == b'`' { n += 1; }
+                if let Some(end) = find_backticks(b, i + n, n) {
+                    out.push_str(escape(&s[text_start..i]).as_str());
+                    out.push_str("<code>");
+                    out.push_str(escape(code_span(&s[i + n..end]).as_str()).as_str());
+                    out.push_str("</code>");
+                    i = end + n;
+                    text_start = i;
+                    continue;
+                }
+                i += n;
+                continue;
+            }
+            if c == b'<' {
+                if let Some(end) = s[i..].find('>') {
+                    let inner = &s[i + 1..i + end];
+                    let is_url = (inner.starts_with("http://") || inner.starts_with("https://") || inner.starts_with("mailto:")) && !inner.contains(" ");
+                    let is_mail = !inner.contains(" ") && inner.contains("@") && !inner.contains(":");
+                    if is_url || is_mail {
+                        out.push_str(escape(&s[text_start..i]).as_str());
+                        let href = if is_mail { `mailto:${inner}`.to_string() } else { inner.to_string() };
+                        out.push_str(`<a href="${escape(href.as_str())}">${escape(inner)}</a>`.to_string().as_str());
+                        i = i + end + 1;
+                        text_start = i;
+                        continue;
+                    }
+                }
+            }
+            if c == b'[' || (c == b'!' && i + 1 < b.len() && b[i + 1] == b'[') {
+                let img = c == b'!';
+                let open = if img { i + 1 } else { i };
+                if let Some((html, next)) = self.link(s, open, img) {
+                    out.push_str(escape(&s[text_start..i]).as_str());
+                    out.push_str(html.as_str());
+                    i = next;
+                    text_start = i;
+                    continue;
+                }
+            }
+            if c == b'*' || c == b'_' || c == b'~' {
+                if let Some((html, next)) = self.emphasis(s, i) {
+                    out.push_str(escape(&s[text_start..i]).as_str());
+                    out.push_str(html.as_str());
+                    i = next;
+                    text_start = i;
+                    continue;
+                }
+                let mut n = 0;
+                while i + n < b.len() && b[i + n] == c { n += 1; }
+                i += n;
+                continue;
+            }
+            i += 1;
+        }
+        out.push_str(escape(&s[text_start..]).as_str());
+        out
+    }
+
+    // A link or image whose [ is at s[open]: its HTML and the index after it.
+    fn link(&mut self, s: &str, open: usize, img: bool) -> Option<(String, usize)> {
+        let b = s.as_bytes();
+        // The matching ] (code spans and escapes skipped).
+        let mut depth = 0;
+        let mut j = open;
+        let mut close = 0;
+        while j < b.len() {
+            let c = b[j];
+            if c == b'\\' { j += 2; continue; }
+            if c == b'`' {
+                let mut n = 0;
+                while j + n < b.len() && b[j + n] == b'`' { n += 1; }
+                match find_backticks(b, j + n, n) {
+                    Some(e) => { j = e + n; continue; }
+                    None => { j += n; continue; }
+                }
+            }
+            if c == b'[' { depth += 1; }
+            if c == b']' {
+                depth -= 1;
+                if depth == 0 {
+                    close = j;
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if close == 0 { return None; }
+        let text = &s[open + 1..close];
+        let after = close + 1;
+        // [text](url "title")
+        if after < b.len() && b[after] == b'(' {
+            if let Some(end) = matching_paren(b, after) {
+                let inner = s[after + 1..end].trim();
+                let (url, title) = match inner.find(" \"") {
+                    Some(k) => (inner[..k].trim(), inner[k + 2..].trim_end_matches('"')),
+                    None => (inner, ""),
+                };
+                let url = url.trim_start_matches('<').trim_end_matches('>');
+                // (A path as the URL: an intra-doc link.)
+                let href = if is_doc_path(url) {
+                    match (self.o.link)(url) { Some(u) => u, None => url.to_string() }
+                } else {
+                    url.to_string()
+                };
+                return Some((self.anchor(text, href.as_str(), title, img), end + 1));
+            }
+        }
+        // [text][label], [label][], [label]
+        let mut label = text.to_string();
+        let mut next = after;
+        if after < b.len() && b[after] == b'[' {
+            if let Some(e) = s[after..].find(']') {
+                let l2 = &s[after + 1..after + e];
+                if l2.len() > 0 { label = l2.to_string(); }
+                next = after + e + 1;
+            }
+        }
+        if let Some((url, title)) = self.refs.get(&label.to_lowercase()) {
+            let (url, title) = (url.clone(), title.clone());
+            let href = if is_doc_path(url.as_str()) {
+                match (self.o.link)(url.as_str()) { Some(u) => u, None => url.clone() }
+            } else {
+                url
+            };
+            return Some((self.anchor(text, href.as_str(), title.as_str(), img), next));
+        }
+        if img { return None; }
+        // An intra-doc link: [`Name`], [Name], [`a::b`].
+        let target = label.trim_matches('`').trim().to_string();
+        if !is_doc_path(target.as_str()) { return None; }
+        match (self.o.link)(target.as_str()) {
+            Some(u) => Some((self.anchor(text, u.as_str(), "", false), next)),
+            None => None,
+        }
+    }
+
+    fn anchor(&mut self, text: &str, href: &str, title: &str, img: bool) -> String {
+        if img { return `<img src="${escape(href)}" alt="${escape(text)}">`.to_string(); }
+        let t = if title.len() > 0 { ` title="${escape(title)}"`.to_string() } else { String::new() };
+        `<a href="${escape(href)}"${t}>${self.inlines(text)}</a>`.to_string()
+    }
+
+    // Emphasis, strong or strikethrough opening at s[i].
+    fn emphasis(&mut self, s: &str, i: usize) -> Option<(String, usize)> {
+        let b = s.as_bytes();
+        let c = b[i];
+        let mut n = 0;
+        while i + n < b.len() && b[i + n] == c { n += 1; }
+        if c == b'~' && n != 2 { return None; }
+        let n = if n > 3 { 3 } else { n };
+        let open_end = i + n;
+        // Left-flanking: not followed by whitespace; _ not inside a word.
+        if open_end >= b.len() || is_space(b[open_end]) { return None; }
+        if c == b'_' && i > 0 && is_alnum(b[i - 1]) { return None; }
+        // The closing run: the same n, right-flanking.
+        let mut j = open_end;
+        while j < b.len() {
+            if b[j] == b'`' {
+                let mut k = 0;
+                while j + k < b.len() && b[j + k] == b'`' { k += 1; }
+                match find_backticks(b, j + k, k) {
+                    Some(e) => { j = e + k; continue; }
+                    None => { j += k; continue; }
+                }
+            }
+            if b[j] == b'\\' { j += 2; continue; }
+            if b[j] == c {
+                let mut m = 0;
+                while j + m < b.len() && b[j + m] == c { m += 1; }
+                let ok = m >= n && !is_space(b[j - 1]) && !(c == b'_' && j + m < b.len() && is_alnum(b[j + m]));
+                if ok {
+                    let inner = &s[open_end..j];
+                    let html = self.inlines(inner);
+                    let wrapped = if c == b'~' {
+                        `<del>${html}</del>`.to_string()
+                    } else if n == 1 {
+                        `<em>${html}</em>`.to_string()
+                    } else if n == 2 {
+                        `<strong>${html}</strong>`.to_string()
+                    } else {
+                        `<em><strong>${html}</strong></em>`.to_string()
+                    };
+                    return Some((wrapped, j + n));
+                }
+                j += m;
+                continue;
+            }
+            j += 1;
+        }
+        None
+    }
+}
+
+fn is_space(c: u8) -> bool { c == b' ' || c == b'\n' || c == b'\t' }
+
+fn is_alnum(c: u8) -> bool { (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') }
+
+fn is_punct(c: u8) -> bool { (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126) }
+
+// The start of the next run of exactly n backticks from b[i].
+fn find_backticks(b: &[u8], from: usize, n: usize) -> Option<usize> {
+    let mut i = from;
+    while i < b.len() {
+        if b[i] == b'`' {
+            let mut m = 0;
+            while i + m < b.len() && b[i + m] == b'`' { m += 1; }
+            if m == n { return Some(i); }
+            i += m;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+// A code span's text: line ends as spaces, one space stripped from both
+// ends when both have one.
+fn code_span(s: &str) -> String {
+    let t = s.replace("\n", " ");
+    if t.len() >= 2 && t.starts_with(" ") && t.ends_with(" ") && t.trim().len() > 0 { return t[1..t.len() - 1].to_string(); }
+    t
+}
+
+fn matching_paren(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut i = open;
+    while i < b.len() {
+        if b[i] == b'\\' { i += 2; continue; }
+        if b[i] == b'(' { depth += 1; }
+        if b[i] == b')' {
+            depth -= 1;
+            if depth == 0 { return Some(i); }
+        }
+        if b[i] == b'\n' && depth > 0 && i + 1 < b.len() && b[i + 1] == b'\n' { return None; }
+        i += 1;
+    }
+    None
+}
+
+// Whether s looks like a path an intra-doc link names (Name, a::B,
+// Self::new, Vec::<T>::new, fn@name), not a URL.
+pub fn is_doc_path(s: &str) -> bool {
+    if s.len() == 0 || s.contains("/") || s.contains(" ") || s.contains(".") && !s.contains("::") { return false; }
+    let t = match s.find('@') { Some(k) => &s[k + 1..], None => s };
+    let t = t.trim_end_matches("()").trim_end_matches('!');
+    if t.len() == 0 { return false; }
+    for c in t.bytes() {
+        if !(is_alnum(c) || c == b'_' || c == b':' || c == b'<' || c == b'>' || c == b',') { return false; }
+    }
+    let first = t.as_bytes()[0];
+    first == b':' || first == b'_' || (first >= b'a' && first <= b'z') || (first >= b'A' && first <= b'Z')
+}
+
+/// An id for a heading's text.
+pub fn slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.to_lowercase().chars() {
+        if c.is_alphanumeric() || c == '_' {
+            out.push(c);
+            dash = false;
+        } else if !dash && out.len() > 0 {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+// --- Code ------------------------------------------------------------------------
+
+// The info string's language and whether the block is navi code.
+pub fn is_navi(info: &str) -> bool {
+    let lang = info.split(|c: char| -> bool { c == ',' || c == ' ' }).next().unwrap_or("").trim();
+    lang == "" || lang == "navi" || lang == "rust" || lang == "ignore" || lang == "no_run" || lang == "should_panic" || lang == "compile_fail" || lang == "edition2021"
+}
+
+fn code_block(info: &str, code: &str) -> String {
+    if is_navi(info) {
+        // (Lines starting with "# " are compiled in doctests, not shown.)
+        let mut shown: Vec<&str> = Vec::new();
+        for l in code.split('\n') {
+            let t = l.trim_start();
+            if t == "#" || t.starts_with("# ") { continue; }
+            shown.push(if t.starts_with("##") { &l[l.find('#').unwrap() + 1..] } else { l });
+        }
+        let mut cls = "navi".to_string();
+        if info.contains("ignore") { cls.push_str(" ignore"); }
+        if info.contains("should_panic") { cls.push_str(" should-panic"); }
+        if info.contains("compile_fail") { cls.push_str(" compile-fail"); }
+        return `<pre class="${cls}"><code>${highlight(shown.join("\n").as_str())}</code></pre>\n`.to_string();
+    }
+    `<pre><code>${escape(code)}</code></pre>\n`.to_string()
+}
+
+const KEYWORDS: [&str; 46] = ["as", "break", "const", "continue", "crate", "defer", "dyn", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
+    "let", "loop", "match", "mod", "mut", "pub", "return", "select", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+    "use", "where", "while", "async", "await", "box", "macro", "move", "try", "union", "yield", "default", "quote"];
+
+/// navi code as HTML, its tokens in spans (kw, string, comment, number,
+/// attr, lifetime).
+pub fn highlight(code: &str) -> String {
+    let b = code.as_bytes();
+    let mut out = String::with_capacity(code.len() * 2);
+    let mut i = 0;
+    let span = |out: &mut String, cls: &str, text: &str| {
+        out.push_str(`<span class="${cls}">${escape(text)}</span>`.to_string().as_str());
+    };
+    while i < b.len() {
+        let c = b[i];
+        // Comments.
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            let mut e = i;
+            while e < b.len() && b[e] != b'\n' { e += 1; }
+            span(&mut out, if i + 2 < b.len() && (b[i + 2] == b'/' || b[i + 2] == b'!') { "doccomment" } else { "comment" }, &code[i..e]);
+            i = e;
+            continue;
+        }
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            let mut depth = 0;
+            let mut e = i;
+            while e < b.len() {
+                if e + 1 < b.len() && b[e] == b'/' && b[e + 1] == b'*' { depth += 1; e += 2; continue; }
+                if e + 1 < b.len() && b[e] == b'*' && b[e + 1] == b'/' {
+                    depth -= 1;
+                    e += 2;
+                    if depth == 0 { break; }
+                    continue;
+                }
+                e += 1;
+            }
+            span(&mut out, "comment", &code[i..e]);
+            i = e;
+            continue;
+        }
+        // Strings: "..", r#".."#, b"..", `..` (templates).
+        if c == b'"' || c == b'`' || ((c == b'r' || c == b'b') && i + 1 < b.len() && (b[i + 1] == b'"' || b[i + 1] == b'#' || (c == b'b' && b[i + 1] == b'r'))) && (i == 0 || !is_ident_byte(b[i - 1])) {
+            let e = string_end(b, i);
+            if e > i {
+                span(&mut out, "string", &code[i..e]);
+                i = e;
+                continue;
+            }
+        }
+        // Chars and labels.
+        if c == b'\'' {
+            let e = char_end(b, i);
+            if e > i {
+                span(&mut out, "string", &code[i..e]);
+                i = e;
+                continue;
+            }
+            let mut e = i + 1;
+            while e < b.len() && is_ident_byte(b[e]) { e += 1; }
+            span(&mut out, "lifetime", &code[i..e]);
+            i = e;
+            continue;
+        }
+        // Attributes.
+        if c == b'#' && i + 1 < b.len() && (b[i + 1] == b'[' || (b[i + 1] == b'!' && i + 2 < b.len() && b[i + 2] == b'[')) {
+            let mut depth = 0;
+            let mut e = i;
+            while e < b.len() {
+                if b[e] == b'[' { depth += 1; }
+                if b[e] == b']' {
+                    depth -= 1;
+                    if depth == 0 { e += 1; break; }
+                }
+                e += 1;
+            }
+            span(&mut out, "attr", &code[i..e]);
+            i = e;
+            continue;
+        }
+        if c >= b'0' && c <= b'9' && (i == 0 || !is_ident_byte(b[i - 1])) {
+            let mut e = i;
+            while e < b.len() && (is_ident_byte(b[e]) || (b[e] == b'.' && e + 1 < b.len() && b[e + 1] >= b'0' && b[e + 1] <= b'9')) { e += 1; }
+            span(&mut out, "number", &code[i..e]);
+            i = e;
+            continue;
+        }
+        if is_ident_byte(c) && !(c >= b'0' && c <= b'9') {
+            let mut e = i;
+            while e < b.len() && is_ident_byte(b[e]) { e += 1; }
+            let w = &code[i..e];
+            let mut kw = false;
+            for k in KEYWORDS.iter() { if *k == w { kw = true; } }
+            if kw {
+                span(&mut out, if w == "self" || w == "Self" || w == "true" || w == "false" { "kw-2" } else { "kw" }, w);
+            } else if e < b.len() && b[e] == b'!' {
+                span(&mut out, "macro", w);
+            } else {
+                out.push_str(escape(w).as_str());
+            }
+            i = e;
+            continue;
+        }
+        // (Whole characters: a byte at a time would split UTF-8.)
+        let mut e = i + 1;
+        while e < b.len() && (b[e] & 0xc0) == 0x80 { e += 1; }
+        out.push_str(escape(&code[i..e]).as_str());
+        i = e;
+    }
+    out
+}
+
+fn is_ident_byte(c: u8) -> bool { is_alnum(c) || c == b'_' }
+
+// The end of the string literal at b[i] (i when it is none).
+fn string_end(b: &[u8], i: usize) -> usize {
+    let mut j = i;
+    if b[j] == b'b' { j += 1; }
+    if j < b.len() && b[j] == b'r' {
+        j += 1;
+        let mut hashes = 0;
+        while j < b.len() && b[j] == b'#' { hashes += 1; j += 1; }
+        if j >= b.len() || b[j] != b'"' { return i; }
+        j += 1;
+        while j < b.len() {
+            if b[j] == b'"' {
+                let mut k = 0;
+                while k < hashes && j + 1 + k < b.len() && b[j + 1 + k] == b'#' { k += 1; }
+                if k == hashes { return j + 1 + hashes; }
+            }
+            j += 1;
+        }
+        return b.len();
+    }
+    if j >= b.len() || (b[j] != b'"' && b[j] != b'`') { return i; }
+    let q = b[j];
+    j += 1;
+    while j < b.len() {
+        if b[j] == b'\\' { j += 2; continue; }
+        if b[j] == q { return j + 1; }
+        j += 1;
+    }
+    b.len()
+}
+
+// The end of the char literal at b[i] ('a', '\n', '\u{..}'), or i.
+fn char_end(b: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    if j >= b.len() { return i; }
+    if b[j] == b'\\' {
+        j += 1;
+        while j < b.len() && b[j] != b'\'' && b[j] != b'\n' { j += 1; }
+        return if j < b.len() && b[j] == b'\'' { j + 1 } else { i };
+    }
+    // One character (UTF-8).
+    j += 1;
+    while j < b.len() && (b[j] & 0xc0) == 0x80 { j += 1; }
+    if j < b.len() && b[j] == b'\'' { j + 1 } else { i }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(s: &str) -> Option<String> {
+        match s {
+            "Vec" => Some("std/vec/struct.Vec.html".to_string()),
+            "Vec::new" => Some("std/vec/struct.Vec.html#method.new".to_string()),
+            "crate::a::B" => Some("me/a/struct.B.html".to_string()),
+            _ => None,
+        }
+    }
+
+    fn md(s: &str) -> String { to_html(s, &Opts { link: |x: &str| -> Option<String> { link(x) }, shift: 0 }) }
+
+    #[test]
+    fn blocks() {
+        assert_eq(md("hello\nworld\n\nnext"), "<p>hello\nworld</p>\n<p>next</p>\n".to_string());
+        assert_eq(md("# Title #\n## Sub"), "<h1 id=\"title\"><a class=\"anchor\" href=\"#title\">§</a>Title</h1>\n<h2 id=\"sub\"><a class=\"anchor\" href=\"#sub\">§</a>Sub</h2>\n".to_string());
+        assert_eq(md("Setext\n---"), "<h2 id=\"setext\"><a class=\"anchor\" href=\"#setext\">§</a>Setext</h2>\n".to_string());
+        assert_eq(md("a\n\n---\n\nb"), "<p>a</p>\n<hr>\n<p>b</p>\n".to_string());
+        assert_eq(md("```text\n<x>\n  y\n```"), "<pre><code>&lt;x&gt;\n  y</code></pre>\n".to_string());
+        assert_eq(md("text\n\n    code\n      more\n"), "<p>text</p>\n<pre class=\"navi\"><code>code\n  more</code></pre>\n".to_string());
+        assert_eq(md("> quoted\n> *on*\n\nafter"), "<blockquote>\n<p>quoted\n<em>on</em></p>\n</blockquote>\n<p>after</p>\n".to_string());
+        assert_eq(md("- a\n- b\n  - c\n- d"), "<ul>\n<li>a</li>\n<li>b\n<ul>\n<li>c</li>\n</ul></li>\n<li>d</li>\n</ul>\n".to_string());
+        assert_eq(md("1. one\n\n2. two"), "<ol>\n<li><p>one</p></li>\n<li><p>two</p></li>\n</ol>\n".to_string());
+        assert_eq(md("3) x\n4) y"), "<ol start=\"3\">\n<li>x</li>\n<li>y</li>\n</ol>\n".to_string());
+        assert_eq(md("| a | b |\n|:--|--:|\n| 1 | `|` |"), "<table>\n<thead><tr><th style=\"text-align:left\">a</th><th style=\"text-align:right\">b</th></tr></thead>\n<tbody>\n<tr><td style=\"text-align:left\">1</td><td style=\"text-align:right\"><code>|</code></td></tr>\n</tbody></table>\n".to_string());
+        // (# lines are hidden in navi code.)
+        assert_eq(md("```\n# use x;\nlet a = 1;\n```"), "<pre class=\"navi\"><code><span class=\"kw\">let</span> a = <span class=\"number\">1</span>;</code></pre>\n".to_string());
+    }
+
+    #[test]
+    fn inlines() {
+        assert_eq(md("a `b <c>` *d* **e** _f_ ~~g~~ snake_case_name"), "<p>a <code>b &lt;c&gt;</code> <em>d</em> <strong>e</strong> <em>f</em> <del>g</del> snake_case_name</p>\n".to_string());
+        assert_eq(md("``a ` b``"), "<p><code>a ` b</code></p>\n".to_string());
+        assert_eq(md("\\*not\\* 2 * 3 a*b"), "<p>*not* 2 * 3 a*b</p>\n".to_string());
+        assert_eq(md("[x](http://a.b \"T\") <https://c.d> ![i](p.png)"), "<p><a href=\"http://a.b\" title=\"T\">x</a> <a href=\"https://c.d\">https://c.d</a> <img src=\"p.png\" alt=\"i\"></p>\n".to_string());
+        assert_eq(md("[r][1] and [r2]\n\n[1]: http://one\n[r2]: http://two"), "<p><a href=\"http://one\">r</a> and <a href=\"http://two\">r2</a></p>\n".to_string());
+        assert_eq(md("line  \nnext\\\nlast"), "<p>line<br>\nnext<br>\nlast</p>\n".to_string());
+        assert_eq(md("<b>raw</b> & co"), "<p>&lt;b&gt;raw&lt;/b&gt; &amp; co</p>\n".to_string());
+    }
+
+    #[test]
+    fn intra_doc_links() {
+        assert_eq(md("See [`Vec`], [Vec::new] and [b](crate::a::B)."), "<p>See <a href=\"std/vec/struct.Vec.html\"><code>Vec</code></a>, <a href=\"std/vec/struct.Vec.html#method.new\">Vec::new</a> and <a href=\"me/a/struct.B.html\">b</a>.</p>\n".to_string());
+        // (Naming nothing: the text stays.)
+        assert_eq(md("[`Nope`] [x]"), "<p>[<code>Nope</code>] [x]</p>\n".to_string());
+    }
+
+    #[test]
+    fn summaries_and_blocks() {
+        let o = &Opts { link: |x: &str| -> Option<String> { link(x) }, shift: 0 };
+        assert_eq(summary("First *line*\ngoes on.\n\nSecond.", o), "First <em>line</em>\ngoes on.".to_string());
+        let bs = code_blocks("Text\n\n```\nlet x = 1;\n```\n\n```text\nno\n```\n\n    indented();\n");
+        assert_eq(bs.len(), 3);
+        assert_eq(bs[0].code, "let x = 1;".to_string());
+        assert_eq(bs[0].line, 3);
+        assert_eq(bs[1].info, "text".to_string());
+        assert_eq(bs[2].code, "indented();".to_string());
+        assert(is_navi("") && is_navi("no_run") && is_navi("rust,should_panic") && !is_navi("text") && !is_navi("toml"));
+    }
+
+    #[test]
+    fn highlighting() {
+        assert_eq(highlight("fn f(s: &str) -> u8 { // c\n    'a' as u8 + r#\"x\"# .len() }"),
+            "<span class=\"kw\">fn</span> f(s: &amp;str) -&gt; u8 { <span class=\"comment\">// c</span>\n    <span class=\"string\">'a'</span> <span class=\"kw\">as</span> u8 + <span class=\"string\">r#&quot;x&quot;#</span> .len() }".to_string());
+        assert_eq(highlight("#[test] 'outer: `t ${x}` 0x1f"), "<span class=\"attr\">#[test]</span> <span class=\"lifetime\">'outer</span>: <span class=\"string\">`t ${x}`</span> <span class=\"number\">0x1f</span>".to_string());
+    }
+}
