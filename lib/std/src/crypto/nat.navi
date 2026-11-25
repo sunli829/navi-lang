@@ -1,55 +1,42 @@
 //! Arithmetic modulo an odd number (RSA's n, the NIST curves' p and n):
 //! numbers as little-endian 64-bit limbs, as many as the modulus has,
 //! multiplied in Montgomery form (as Go's bigmod: two passes of
-//! z += x * y per limb, in assembly on arm64 and amd64; elsewhere CIOS
-//! with u64::widening_mul, carries by comparison). Constant-time but
+//! z += x * y per limb, the whole multiplication and the table lookups in
+//! assembly on arm64 and amd64; elsewhere CIOS with u64::widening_mul,
+//! carries by comparison). Constant-time but
 //! for `pow`, whose exponent's bits decide the steps (exponents are public
 //! here: RSA's e, p - 2, n - 2).
 
-// z += x * y over n limbs, returning the carry (nat_arm64.s, nat_amd64.s).
+// a * b * R^-1 mod m into out as Go's montgomeryMul, t scratch of 2n + 1
+// words (nat_arm64.s, nat_amd64.s).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[asm]
-fn add_mul_vvw(z: *mut u64, x: *const u64, n: usize, y: u64) -> u64;
+fn mont_mul(t: *mut u64, a: *const u64, b: *const u64, m: *const u64, n: usize, m0inv: u64, out: *mut u64);
 
-// a * b * R^-1 mod m into out as Go's montgomeryMul: t (2n words, zeroed
-// here) += a * b[i] and then the multiple of m that clears t[i], so the
-// result is t[n..2n] plus the carry c (below 2m). False: not here.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn mont_mul_asm(md: &Modulus, a: &[u64], b: &[u64], out: &mut [u64], t: &mut [u64]) -> bool {
     let n = md.m.len();
-    if a.len() != n || b.len() != n || out.len() != n || t.len() < 2 * n { return false; }
-    let mut i = 0;
-    while i < 2 * n {
-        t[i] = 0;
-        i += 1;
-    }
-    let mut c = 0u64;
-    i = 0;
-    while i < n {
-        let c1 = unsafe { add_mul_vvw(t.as_mut_ptr().add(i), a.as_ptr(), n, b[i]) };
-        let y = t[i].wrapping_mul(md.m0inv);
-        let c2 = unsafe { add_mul_vvw(t.as_mut_ptr().add(i), md.m.as_ptr(), n, y) };
-        let s = c1.wrapping_add(c2);
-        let s2 = s.wrapping_add(c);
-        c = ((s < c1) as u64) | ((s2 < s) as u64);
-        t[n + i] = s2;
-        i += 1;
-    }
-    let borrow = sub_limbs(&t[n..2 * n], &md.m, out);
-    // Keep t (no carry and t < m) or the difference.
-    let mask = 0u64.wrapping_sub(borrow & (c ^ 1));
-    i = 0;
-    while i < n {
-        out[i] = (t[n + i] & mask) | (out[i] & !mask);
-        i += 1;
-    }
+    if a.len() != n || b.len() != n || out.len() != n || t.len() < 2 * n + 1 { return false; }
+    mont_mul(t.as_mut_ptr(), a.as_ptr(), b.as_ptr(), md.m.as_ptr(), n, md.m0inv, out.as_mut_ptr());
     true
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn mont_mul_asm(md: &Modulus, a: &[u64], b: &[u64], out: &mut [u64], t: &mut [u64]) -> bool { false }
 
-// out = entry idx (n limbs) of table, every entry read (masked).
+// out = entry idx (n limbs) of table, every entry read (masked; in
+// assembly on aarch64, x86_64).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[asm]
+fn ct_select(table: *const u64, n: usize, count: usize, idx: u64, out: *mut u64);
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn select_entry(table: &[u64], n: usize, idx: u64, out: &mut [u64]) {
+    if n == 0 || out.len() < n || table.len() < n { return; }
+    ct_select(table.as_ptr(), n, table.len() / n, idx, out.as_mut_ptr());
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn select_entry(table: &[u64], n: usize, idx: u64, out: &mut [u64]) {
     let mut l = 0;
     while l < n {
