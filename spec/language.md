@@ -159,7 +159,7 @@ impl<T: Display> ToString for T {           // blanket impl
 
 - 方法调用会自动取引用和自动解引用（`p.len()` 对 `Point`、`&Point`、`&mut Point` 都能用）；调用 `&mut self` 方法时，接收者必须是 `let mut` 绑定或者 `&mut` 引用
 - 固有 impl（`impl Point`）只能写在定义这个类型的 crate 里
-- trait impl 遵守孤儿规则：trait 或类型至少有一个是本 crate 定义的（同 Rust）
+- trait impl 遵守孤儿规则（同 Rust 的 RFC 2451）：trait 是本 crate 定义的；或者按 self 类型、trait 的类型参数的顺序，至少有一个本地类型（本 crate 的 struct、enum，`&` / `&mut` 本地类型，`dyn` 本地 trait），并且在第一个本地类型之前不出现没被别的类型包住的类型参数（`T`、`&T` 不行，`Vec<T>` 可以）。所以 `impl<T> ForeignTrait<Local> for T` 不允许，`impl<T> ForeignTrait<T> for Local` 和 `impl<T> ForeignTrait<Local> for Vec<T>` 允许
 - **impl 不允许重叠**；不支持特化、负 impl、auto trait
 - **trait 对象**：`&dyn Trait`。navi 没有 `Sized`，所以规则和 Rust 稍有不同：任何 trait 都能做成 `dyn`，但只有"可经 dyn 调用"的方法进入 vtable——接收者是 `&self` / `&mut self`、没有自己的类型参数、参数和返回值里不出现 `Self`。其余方法（如 `Iterator::map`）不能通过 `dyn` 调用，效果等同 Rust 给它们加了 `where Self: Sized`。`dyn` 类型必须写出 trait 的全部关联类型（`dyn Iterator<Item = u8>`）
 - **没有 `Drop`**，资源释放用 `defer`（见 1.8）
