@@ -283,13 +283,13 @@ DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）�
 | 颜色、`WriteStyle` | 有 | 接受但不输出颜色 | 简化 |
 | `kv`（结构化字段）、`log::Log` 的 `&'static` 全局记录器以外的用法 | 有 | 没有 | 暂不需要 |
 
-### std::cli（clap 4 的 builder API）
+### std::cli（clap 4 的 builder API 和 derive）
 
 帮助、版本和错误的文本（包括相似参数提示、`--` 提示、错误里的用法行）和 clap 4.6 逐字相同，已经用同样的程序对比过。
 
 | 项目 | clap | navi | 原因 |
 |---|---|---|---|
-| derive API（`#[derive(Parser)]`） | 有 | 没有，只有 builder API | 没有过程宏 |
+| derive API | `#[derive(Parser, Args, Subcommand, ValueEnum)]` | 相同（`std::cli` 里的派生宏，生成 builder 代码）：字段类型决定行为（`bool` 开关、`Option` 可省、`Vec` 多个、其余必填）、`///` 注释作帮助、`#[command(...)]`、`#[arg(...)]`、`#[value(name)]`；`#[command(version)]` 要写值（`version = "1.0"`，没有 Cargo 的包版本），没写 `name` 时用程序文件名；`ValueEnum` 同时生成 `FromStr` 和 `Display`（`get_one` 用 `FromStr` 取值） | 没有编译期的包信息 |
 | `value_parser!(u16).range(..)`、`["a", "b"]` | 宏和多种 `IntoResettable` | `ValueParser::i64_range(lo, hi)`、`u64_range`、`possible(&[..])`、`i64()`、`u64()`、`f64()`、`bool()`、`string()` | 没有宏 |
 | `get_one::<T>` | 返回 `Option<&T>`，值在解析时按 value_parser 转换；类型不符时 panic | 返回 `Option<T>`，取值时用 `FromStr` 转换，转换失败是 `None` | 简化（GC 语言里返回拷贝即可） |
 | `get_many::<T>` | `ValuesRef<T>` | `vec::IntoIter<T>` | 同上 |

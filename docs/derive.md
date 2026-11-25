@@ -104,7 +104,7 @@ t.impl_for("std::clone::Clone", body)
 
 ## 宏能看到什么：`std::derive`
 
-- `TypeInfo`：类型名、所在模块路径、可见性、类型上的属性（不含 `derive` 和文档注释）；泛型参数和它们的约束、where 子句（`generics()`，`self_type()` 用在 impl 头上）；`is_enum()`、`variants()`（结构体是一个变体）、`fields()`（结构体的）。
+- `TypeInfo`：类型名、所在模块路径、可见性、类型上的属性（不含 `derive`；`///` 注释作为 `#[doc(text = "...")]` 传来，`doc()` 取出，`TypeInfo`、`Variant`、`Field` 都有；`TypeInfo::of` 拿不到源码，没有）；泛型参数和它们的约束、where 子句（`generics()`，`self_type()` 用在 impl 头上）；`is_enum()`、`variants()`（结构体是一个变体）、`fields()`（结构体的）。
 - `Variant`：名字、种类（具名、元组、单元）、字段、属性、写出来的判别值、在声明里的序号。
 - `Field`：名字和 `ident()`（元组字段为 `0`、`1`……）、序号、可见性、类型、属性（`has_attr`、`parse_attrs`）、位置。
 - `Attr`：名字和参数（`key`、`key = 值`，值是字符串、整数、布尔或照写的文本），宏也可以不用 `FromAttrs` 自己看。
