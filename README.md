@@ -18,7 +18,7 @@ export PATH=$PWD/navi-v0.1.0-macos-arm64/bin:$PATH
 navi new hello && cd hello    # navi.toml、src/main.navi（同 cargo new）
 navi run                      # 构建到 target/hello 并运行
 navi test                     # 单元测试和 tests/ 里的集成测试
-NAVI_TARGET=linux-x64 navi build -o hello-linux   # 交叉编译
+navi build --target linux-x64 -o hello-linux   # 交叉编译
 navi run hello.navi           # 单个文件不需要项目（同 go run）
 ```
 
@@ -37,4 +37,4 @@ tools/test.sh build/stage2/navi
 
 ## 目标平台
 
-windows-x64、macos-x64、macos-arm64、linux-x64（glibc）、linux-arm64（glibc）；Android arm64 用 `NAVI_TARGET=linux-arm64 NAVI_ELF_LIBC=bionic`。
+windows-x64、macos-x64、macos-arm64、linux-x64（glibc）、linux-arm64（glibc）；Android arm64 用 `--target android-arm64`（linux-arm64 的代码，链接到 bionic）。

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# Sums the live heap samples a navi program prints with NAVI_MEMPROF=1
+# Sums the live heap samples a navi program prints with NAVI_DEBUG=memprof
 # (at the end of each mark: "MEMPROF cycle N mstart ADDR", then one
 # "M size pc..." line a live sample) for the cycle with the most, by the
 # functions that allocated them.
 #
-#   NAVI_MEMPROF=1 prog 2> prof.txt; tools/memprof.py prog < prof.txt [depth]
+#   NAVI_DEBUG=memprof prog 2> prof.txt; tools/memprof.py prog < prof.txt [depth]
 import bisect, collections, re, subprocess, sys
 
 RATE = 262144

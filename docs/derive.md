@@ -182,7 +182,7 @@ t.impl_for("std::clone::Clone", body)
 - `std::reflect`、`HashMap` 的 `ReflectMap`、`Vec` 里给反射用的辅助、`tests/run/reflect.navi` 删除。
 - `std::any::type_name::<T>()` 直接读 `type_desc::<T>()` 描述里的名字。
 - 编译器生成的类型描述从 12 个字减到 5 个（kind、大小、对齐、名字），也不再为各部分的类型（字段、变体、元素、map 的键和值）生成描述；`ReflectMap` 虚表去掉。描述只在用到 `type_name` 或 `std::unique` 的程序里生成，别的程序不受影响。实测：一个对含 `Vec<HashMap<String, (i32, f64)>>` 字段的结构体调用 `type_name` 的程序，1,149,760 → 1,125,312 字节（−2.1%）；编译器本身 13.50 → 13.44 MB。
-- 内置派生给只有一个变体的枚举生成 `PartialEq`、`Ord` 时不再带 `_` 分支（`NAVI_CHECK_STD` 下会报不可达的模式）。
+- 内置派生给只有一个变体的枚举生成 `PartialEq`、`Ord` 时不再带 `_` 分支（`-d checkstd` 下会报不可达的模式）。
 - `TypeInfo::of::<T>()`（宏的测试用）改成编译器内建函数，在编译期构造。
 - spec 和 `spec/std-diff.md` 里关于反射的部分改掉。
 

@@ -569,7 +569,7 @@ let s: String = p.to_string();
   - `#[link(name = "z")]`（`kind` 默认 `"dylib"`）：链接器只记下"这个块的函数来自这个库"，生成导入，不需要库文件本身（同 Go 的 `cgo_import_dynamic`、Rust 的 `kind = "raw-dylib"`）。名字到文件：macOS 是 `/usr/lib/libz.dylib`，Linux 是 `libz.so`，Windows 是 `z.dll`；`name` 里写了路径、`.so` 或 `.dll` 时原样使用（Linux 上没装开发包时要写带版本的 `"libz.so.1"`，macOS 上可以写 `"@rpath/libfoo.dylib"`）
   - `#[link(name = "CoreFoundation", kind = "framework")]`：macOS 的 framework
   - `name = "c"` 就是系统的 C 库
-  - `NAVI_LINKER=cc` 改用系统链接器时，这些库作为 `-l`、`-framework` 传给它
+  - `--linker cc` 改用系统链接器时，这些库作为 `-l`、`-framework` 传给它
 - `extern "C" fn` 函数指针类型（见 1.3）用于 C 回调；navi 的 `fn(A) -> B` 带着闭包环境，不能直接传给 C
 - **C 函数可能阻塞或运行很久**（读写、等待、长时间计算），所以对 `extern "C"` 块里声明的函数，每次直接调用期间，当前绿色线程都算作"阻塞"（同 Go 的 cgo 调用进入系统调用状态）：
   - GC 不等它返回；其他线程照常分配和收集

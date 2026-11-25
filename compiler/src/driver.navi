@@ -19,12 +19,38 @@ fn target_by_id(i: i64) -> &str {
     }
 }
 
-/// The target (an index of target_by_id): --target, else $NAVI_TARGET,
-/// else the host.
+/// The target (an index of target_by_id): --target, else the host.
 static mut TARGET_ID: i64 = -1;
+
+/// --target android-arm64: linux-arm64's code, linked for Android's bionic.
+static mut BIONIC: bool = false;
+
+/// --linker cc: the system linker instead of navi's own.
+static mut LINKER_CC: bool = false;
+
+pub fn bionic() -> bool { BIONIC }
+
+/// Selects the linker (--linker): navi's own or the system's (cc).
+fn set_linker(name: &str) -> bool {
+    match name {
+        "cc" => LINKER_CC = true,
+        "navi" => LINKER_CC = false,
+        _ => {
+            eprintln(`navi: unknown linker ${name} (navi, cc)`);
+            return false;
+        }
+    }
+    true
+}
+
+pub fn linker_cc() -> bool { LINKER_CC }
 
 /// Selects the target by name; false if there is no such target.
 pub fn set_target(name: &str) -> bool {
+    if name == "android-arm64" {
+        BIONIC = true;
+        return set_target("linux-arm64");
+    }
     let mut i = 0;
     while target_by_id(i).len() > 0 {
         if target_by_id(i) == name {
@@ -40,9 +66,8 @@ pub fn set_target(name: &str) -> bool {
 pub fn target_name() -> String {
     if TARGET_ID < 0 {
         let host = `${host_os()}-${if host_arch() == "aarch64" { "arm64" } else { "x64" }}`.to_string();
-        let want = match std::env::var("NAVI_TARGET") { Ok(t) => t, Err(_) => host };
-        if !set_target(want.as_str()) {
-            eprintln(`navi: unknown target ${want} (${known_targets()})`);
+        if !set_target(host.as_str()) {
+            eprintln(`navi: unknown target ${host} (${known_targets()})`);
             std::process::exit(2);
         }
     }
@@ -56,6 +81,7 @@ pub fn known_targets() -> String {
         out.push(target_by_id(i).to_string());
         i += 1;
     }
+    out.push("android-arm64".to_string());
     out.join(", ")
 }
 
@@ -273,12 +299,12 @@ static mut SPLIT_KEYS: std::collections::HashMap<String, String> = std::collecti
 // Each crate compiled alone gets its key, dependencies first; one whose
 // object and export data are in the cache (an editor needs the export data
 // only) is to be read from its export data (crate::navih) instead of its
-// source. (Not with NAVI_CHECK_STD=1, which checks every body.)
+// source. (Not with -d checkstd, which checks every body.)
 fn split_prepare(specs: &Vec<&CrateSpec>, editor: bool) {
     SPLIT_KEYS = std::collections::HashMap::new();
     crate::navih::clear();
     if specs.len() == 0 { return; }
-    let preload = std::env::var("NAVI_CHECK_STD").is_err();
+    let preload = !crate::dflags::on("checkstd");
     let mut by_name: std::collections::HashMap<String, &CrateSpec> = std::collections::HashMap::new();
     for s in specs.iter() { by_name.insert(s.name.clone(), *s); }
     let top = specs[specs.len() - 1];
@@ -387,8 +413,8 @@ fn backend(plan: &mut crate::codegen::Plan, dwarf: bool) -> Result<&mut crate::o
         code_unit: if arm { 4 } else { 1 },
     };
     if arm {
-        // NAVI_LLSC=1 tests linux-arm64's atomics on macOS.
-        if os == "macos" && std::env::var("NAVI_LLSC").is_err() {
+        // -d llsc tests linux-arm64's atomics on macOS.
+        if os == "macos" && !crate::dflags::on("llsc") {
             crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(true, os == "macos") }, tgt, dwarf)
         } else {
             crate::backend::lower::generate(plan, "arm64", || -> &mut dyn crate::backend::machine::Machine { crate::backend::arm64::new_machine(false, os == "macos") }, tgt, dwarf)
@@ -538,10 +564,10 @@ pub fn object(info: &mut types::collect::Info, entry: &Entry, dwarf: bool) -> Re
 }
 
 /// Compiles a checked program into the executable out with navi's own
-/// linker (NAVI_LINKER=cc, and targets it does not handle, use the system
+/// linker (--linker cc, and targets it does not handle, use the system
 /// linker instead).
 pub fn native(info: &mut types::collect::Info, entry: &Entry, out: &str, dwarf: bool) -> Result<(), String> {
-    let use_cc = match std::env::var("NAVI_LINKER") { Ok(v) => v == "cc", Err(_) => false };
+    let use_cc = LINKER_CC;
     let os = target_os();
     if !use_cc {
         let o = code(info, entry, dwarf)?;
@@ -655,7 +681,7 @@ fn build_flags(args: &Vec<String>, rest: &mut Vec<String>) -> Result<&mut BuildF
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-o" | "-p" | "--target" => {
+            "-o" | "-p" | "--target" | "--linker" => {
                 if i + 1 >= args.len() {
                     eprintln(`navi: ${args[i]} needs a value`);
                     return Err(2);
@@ -664,6 +690,7 @@ fn build_flags(args: &Vec<String>, rest: &mut Vec<String>) -> Result<&mut BuildF
                 match args[i].as_str() {
                     "-o" => f.out = v,
                     "-p" => f.package = v,
+                    "--linker" => if !set_linker(v.as_str()) { return Err(2); },
                     _ => {
                         if !set_target(v.as_str()) {
                             eprintln(`navi: unknown target ${v} (${known_targets()})`);
@@ -696,8 +723,8 @@ fn build_flags(args: &Vec<String>, rest: &mut Vec<String>) -> Result<&mut BuildF
     Ok(f)
 }
 
-/// navi build [-p name] [-o output] [-s] [--target os-arch] [-c] [-a]
-/// [-timings] [dir or file]
+/// navi build [-p name] [-o output] [-s] [--target os-arch] [--linker
+/// navi|cc] [-c] [-a] [-timings] [dir or file] (and main's -d)
 ///
 /// Builds the crate the directory (default .) is in, or every member of a
 /// workspace at its root (-p: the member called name), or one .navi file.
@@ -710,7 +737,7 @@ pub fn build_command(args: &Vec<String>) -> i32 {
     let mut rest: Vec<String> = Vec::new();
     let f = match build_flags(args, &mut rest) { Ok(f) => f, Err(c) => return c };
     if rest.len() > 1 {
-        eprintln("usage: navi build [-p name] [-o output] [-s] [--target os-arch] [-c] [-a] [-timings] [dir or file]");
+        eprintln("usage: navi build [-p name] [-o output] [-s] [--target os-arch] [--linker navi|cc] [-c] [-a] [-timings] [-d switches] [dir or file]");
         return 2;
     }
     let path = if rest.len() > 0 { rest[0].clone() } else { ".".to_string() };
@@ -941,6 +968,21 @@ pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
                 };
                 i += 1;
             }
+            "--target" if i + 1 < args.len() => {
+                if !set_target(args[i + 1].as_str()) {
+                    eprintln(`navi: unknown target ${args[i + 1]} (${known_targets()})`);
+                    return 2;
+                }
+                pass.push(args[i].clone());
+                pass.push(args[i + 1].clone());
+                i += 1;
+            }
+            "--linker" if i + 1 < args.len() => {
+                if !set_linker(args[i + 1].as_str()) { return 2; }
+                pass.push(args[i].clone());
+                pass.push(args[i + 1].clone());
+                i += 1;
+            }
             "-timeout" if i + 1 < args.len() => {
                 TIMEOUT_NS = match parse_duration(args[i + 1].as_str()) {
                     Some(n) => n,
@@ -1033,6 +1075,8 @@ fn test_parallel(paths: &Vec<String>, pass: &Vec<String>, jobs: usize) -> i32 {
                     Ok(f) => {
                         let mut cmd = std::process::Command::new(me.as_str());
                         cmd.arg("test").arg(paths[i].as_str());
+                        // (The -d switches main took out.)
+                        for a in crate::dflags::args().iter() { cmd.arg(a.as_str()); }
                         for a in pass.iter() { cmd.arg(a.as_str()); }
                         cmd.stdin(std::process::Stdio::null());
                         cmd.stdout(f);
@@ -1198,7 +1242,7 @@ fn run_harness(specs: Vec<&CrateSpec>, name: &str, label: &str, filter: &str, be
     // The tests can build programs with navi (as Cargo sets CARGO).
     for (k, v) in env.iter() { cmd.env(k.as_str(), v.as_str()); }
     // The program reports a timeout itself (what runs); killed if it hangs.
-    if TIMEOUT_NS > 0 { cmd.env("NAVI_TEST_TIMEOUT", `${TIMEOUT_NS}`.to_string().as_str()); }
+    if TIMEOUT_NS > 0 { cmd.arg(`--timeout=${TIMEOUT_NS}ns`.to_string().as_str()); }
     let code = run_timed(&mut cmd, label);
     let _ = std::fs::remove_file(exe.as_str());
     let _ = std::fs::remove_dir(dir.as_str());

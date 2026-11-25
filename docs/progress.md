@@ -448,6 +448,18 @@
   - 模板字符串的类型总是 `fmt::Arguments`（spec 1.13，相当于 Rust 的 `format_args!`），不再随上下文变成 `String`；要 `String` 时显式写 `` `...`.to_string() ``（相当于 `format!`），编译器对这个写法直接生成字符串，不经过 `Arguments`。惰性：`${}` 在创建时求值，写出时才格式化。编译器、std、测试里约一千处补上 `.to_string()`（这个写法 v0.0.1 也能编译，自举不受影响）。`tools/test.sh` 的前端用例在没有 `// error:` 标注时也能报出多余的错误（以前 awk 把空的期望文件跳过，错误被当成期望）；依赖测试失败时报 FAIL，不再因为 `set -e` 直接退出。
   - `assert_eq` / `assert_ne` 的两边可以是不同类型（`A: PartialEq<B>`，同 Rust 的宏），测试里比较字符串不再需要 `.as_str()`。std 的约束按 Rust std 的习惯写（spec 1.14 第 10 条）：多个约束或约束里引用另一个类型参数时用 `where`（78 处）。Windows 上编译器去掉规范路径的 `\\?\` 前缀（std 的 `canonicalize` 同 Rust 返回 `\\?\C:\dir`，再用 `/` 拼接就找不到文件：依赖的 navi.toml 读不到，release 的 navi.exe 也找不到旁边的 lib/std）。
 
+## 开关：命令行 `-d` 和 `NAVI_DEBUG`（2026-11-25）
+
+原来散在各处的 `NAVI_*` 环境变量分成三类（`navi help debug` 列出全部开关）：
+
+- 影响怎么编译的改成命令行参数：`--target`（去掉 `NAVI_TARGET`；Android 是 `--target android-arm64`，代码同 linux-arm64、链接到 bionic，去掉 `NAVI_ELF_LIBC`）、`--linker cc`（原 `NAVI_LINKER=cc`），`navi test` 也认这两个，并传给并行测试的子进程。
+- 编译器的调试开关并成 `-d name[=value],...`（同 Go 的 `-gcflags=-d=...`、rustc 的 `-Z`，`compiler/src/dflags.navi`），由 main 在分发子命令前取出：`noescape`、`noinline`、`noinline2`、`nocopyprop`、`nossaopt`、`nofold`、`nofuse`、`nopoll`、`llsc`、`checkstd`、`nostrip`、`ssacheck`、`ssadump=名字`、`ssatime`、`escdebug`、`fmtdebug`、`linkmap=文件`。改变生成代码的开关进缓存的键（以前 `NAVI_NOFOLD`、`NAVI_NOFUSE` 漏了）。
+- 运行时的调试开关并成 `NAVI_DEBUG=name[=value],...`（同 Go 的 `GODEBUG`，`rt::native::debug_var`，不分配内存）：`gctrace`、`gcstw`、`gcverify`、`gcpoison`、`gcconcstacks=0`、`gcminheap=字节`、`memprof`、`noslice`、`sliceus=n`、`stackmove`、`stackcheck`、`stackcons`、`stackprot`、`noaes`。
+- 测试框架不再读 `NAVI_TEST_THREADS`、`NAVI_TEST_NOCAPTURE`（用 `--test-threads=N`、`--nocapture`）；`navi test -timeout` 以 `--timeout=时长` 传给测试程序（原来是环境变量 `NAVI_TEST_TIMEOUT`）。
+- 留作环境变量的：`NAVI_STD`、`NAVI_CACHE`、`NAVI_PKG`（同 GOROOT、GOCACHE、CARGO_HOME），程序运行时的 `NAVI_MAXPROCS`、`NAVI_GC`、`NAVI_MEMLIMIT`、`NAVI_LOG`，以及工具自己设的 `NAVI_BIN_EXE_*`、`NAVI_BOOTSTRAP`。
+
+本文档前面的记录保留当时的环境变量名。
+
 ## 下一步
 
 1. 冷编译提速：剩下的串行部分（plan 的按序遍历、codegen 合并之后的 gen_data、链接）；GC 标记占约四分之一 CPU（保守扫描，生成的代码不做寄存器分配）；内存占用（GC 节奏）；std 的导出数据缓存；函数粒度的增量缓存。
