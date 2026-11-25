@@ -282,6 +282,221 @@ fe_sub:
     stp x4, x5, [x8, #16]
     ret
 
+// sc_mul(a, b): a * b / 2^256 mod N (the group order; a, b < N): fe_mul's
+// rounds with the quotient T[0] * -N^-1 and N's words from .n.
+sc_mul:
+    ldr x0, [sp]
+    ldr x1, [sp, #8]
+    ldp x2, x3, [x0]
+    ldp x4, x5, [x0, #16]
+    adr x6, .n
+    ldr x7, [x1]
+    mul x9, x2, x7
+    mul x10, x3, x7
+    mul x11, x4, x7
+    mul x12, x5, x7
+    umulh x15, x2, x7
+    adds x10, x10, x15
+    umulh x15, x3, x7
+    adcs x11, x11, x15
+    umulh x15, x4, x7
+    adcs x12, x12, x15
+    umulh x13, x5, x7
+    adc x13, x13, xzr
+    ldr x0, [x6, #32]
+    mul x17, x9, x0
+    ldr x0, [x6]
+    mul x15, x17, x0
+    adds x9, x9, x15
+    ldr x0, [x6, #8]
+    mul x15, x17, x0
+    adcs x10, x10, x15
+    ldr x0, [x6, #16]
+    mul x15, x17, x0
+    adcs x11, x11, x15
+    ldr x0, [x6, #24]
+    mul x15, x17, x0
+    adcs x12, x12, x15
+    adcs x13, x13, xzr
+    adc x14, xzr, xzr
+    ldr x0, [x6]
+    umulh x15, x17, x0
+    adds x10, x10, x15
+    ldr x0, [x6, #8]
+    umulh x15, x17, x0
+    adcs x11, x11, x15
+    ldr x0, [x6, #16]
+    umulh x15, x17, x0
+    adcs x12, x12, x15
+    ldr x0, [x6, #24]
+    umulh x15, x17, x0
+    adcs x13, x13, x15
+    adc x14, x14, xzr
+    ldr x7, [x1, #8]
+    mul x15, x2, x7
+    adds x10, x10, x15
+    mul x15, x3, x7
+    adcs x11, x11, x15
+    mul x15, x4, x7
+    adcs x12, x12, x15
+    mul x15, x5, x7
+    adcs x13, x13, x15
+    adcs x14, x14, xzr
+    adc x9, xzr, xzr
+    umulh x15, x2, x7
+    adds x11, x11, x15
+    umulh x15, x3, x7
+    adcs x12, x12, x15
+    umulh x15, x4, x7
+    adcs x13, x13, x15
+    umulh x15, x5, x7
+    adcs x14, x14, x15
+    adc x9, x9, xzr
+    ldr x0, [x6, #32]
+    mul x17, x10, x0
+    ldr x0, [x6]
+    mul x15, x17, x0
+    adds x10, x10, x15
+    ldr x0, [x6, #8]
+    mul x15, x17, x0
+    adcs x11, x11, x15
+    ldr x0, [x6, #16]
+    mul x15, x17, x0
+    adcs x12, x12, x15
+    ldr x0, [x6, #24]
+    mul x15, x17, x0
+    adcs x13, x13, x15
+    adcs x14, x14, xzr
+    adc x9, x9, xzr
+    ldr x0, [x6]
+    umulh x15, x17, x0
+    adds x11, x11, x15
+    ldr x0, [x6, #8]
+    umulh x15, x17, x0
+    adcs x12, x12, x15
+    ldr x0, [x6, #16]
+    umulh x15, x17, x0
+    adcs x13, x13, x15
+    ldr x0, [x6, #24]
+    umulh x15, x17, x0
+    adcs x14, x14, x15
+    adc x9, x9, xzr
+    ldr x7, [x1, #16]
+    mul x15, x2, x7
+    adds x11, x11, x15
+    mul x15, x3, x7
+    adcs x12, x12, x15
+    mul x15, x4, x7
+    adcs x13, x13, x15
+    mul x15, x5, x7
+    adcs x14, x14, x15
+    adcs x9, x9, xzr
+    adc x10, xzr, xzr
+    umulh x15, x2, x7
+    adds x12, x12, x15
+    umulh x15, x3, x7
+    adcs x13, x13, x15
+    umulh x15, x4, x7
+    adcs x14, x14, x15
+    umulh x15, x5, x7
+    adcs x9, x9, x15
+    adc x10, x10, xzr
+    ldr x0, [x6, #32]
+    mul x17, x11, x0
+    ldr x0, [x6]
+    mul x15, x17, x0
+    adds x11, x11, x15
+    ldr x0, [x6, #8]
+    mul x15, x17, x0
+    adcs x12, x12, x15
+    ldr x0, [x6, #16]
+    mul x15, x17, x0
+    adcs x13, x13, x15
+    ldr x0, [x6, #24]
+    mul x15, x17, x0
+    adcs x14, x14, x15
+    adcs x9, x9, xzr
+    adc x10, x10, xzr
+    ldr x0, [x6]
+    umulh x15, x17, x0
+    adds x12, x12, x15
+    ldr x0, [x6, #8]
+    umulh x15, x17, x0
+    adcs x13, x13, x15
+    ldr x0, [x6, #16]
+    umulh x15, x17, x0
+    adcs x14, x14, x15
+    ldr x0, [x6, #24]
+    umulh x15, x17, x0
+    adcs x9, x9, x15
+    adc x10, x10, xzr
+    ldr x7, [x1, #24]
+    mul x15, x2, x7
+    adds x12, x12, x15
+    mul x15, x3, x7
+    adcs x13, x13, x15
+    mul x15, x4, x7
+    adcs x14, x14, x15
+    mul x15, x5, x7
+    adcs x9, x9, x15
+    adcs x10, x10, xzr
+    adc x11, xzr, xzr
+    umulh x15, x2, x7
+    adds x13, x13, x15
+    umulh x15, x3, x7
+    adcs x14, x14, x15
+    umulh x15, x4, x7
+    adcs x9, x9, x15
+    umulh x15, x5, x7
+    adcs x10, x10, x15
+    adc x11, x11, xzr
+    ldr x0, [x6, #32]
+    mul x17, x12, x0
+    ldr x0, [x6]
+    mul x15, x17, x0
+    adds x12, x12, x15
+    ldr x0, [x6, #8]
+    mul x15, x17, x0
+    adcs x13, x13, x15
+    ldr x0, [x6, #16]
+    mul x15, x17, x0
+    adcs x14, x14, x15
+    ldr x0, [x6, #24]
+    mul x15, x17, x0
+    adcs x9, x9, x15
+    adcs x10, x10, xzr
+    adc x11, x11, xzr
+    ldr x0, [x6]
+    umulh x15, x17, x0
+    adds x13, x13, x15
+    ldr x0, [x6, #8]
+    umulh x15, x17, x0
+    adcs x14, x14, x15
+    ldr x0, [x6, #16]
+    umulh x15, x17, x0
+    adcs x9, x9, x15
+    ldr x0, [x6, #24]
+    umulh x15, x17, x0
+    adcs x10, x10, x15
+    adc x11, x11, xzr
+    ldp x15, x16, [x6]
+    ldp x17, x7, [x6, #16]
+    subs x2, x13, x15
+    sbcs x3, x14, x16
+    sbcs x4, x9, x17
+    sbcs x5, x10, x7
+    sbcs xzr, x11, xzr
+    csel x2, x13, x2, lo
+    csel x3, x14, x3, lo
+    csel x4, x9, x4, lo
+    csel x5, x10, x5, lo
+    stp x2, x3, [x8]
+    stp x4, x5, [x8, #16]
+    ret
+    .balign 8
+.n:
+    .quad 0xf3b9cac2fc632551, 0xbce6faada7179e84, 0xffffffffffffffff, 0xffffffff00000000, 0xccd1c8aaee00bc4f
+
 // select_point(table, n, idx): the point table[idx] (idx < n), every entry read
 // (constant time), as Go's p256Select: each masked by idx == j and or-ed.
 select_point:
@@ -320,4 +535,35 @@ select_point:
 .done:
     st1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x8], #64
     st1 {v4.16b, v5.16b}, [x8]
+    ret
+
+// select_affine(table, n, idx): the same for affine points (8 words).
+select_affine:
+    ldr x0, [sp]
+    ldr x1, [sp, #8]
+    ldr x2, [sp, #16]
+    movi v0.16b, #0
+    movi v1.16b, #0
+    movi v2.16b, #0
+    movi v3.16b, #0
+    mov x3, #0
+    cbz x1, .done
+.loop:
+    cmp x3, x2
+    csetm x4, eq
+    dup v31.2d, x4
+    ld1 {v16.16b, v17.16b, v18.16b, v19.16b}, [x0], #64
+    and v16.16b, v16.16b, v31.16b
+    and v17.16b, v17.16b, v31.16b
+    and v18.16b, v18.16b, v31.16b
+    and v19.16b, v19.16b, v31.16b
+    orr v0.16b, v0.16b, v16.16b
+    orr v1.16b, v1.16b, v17.16b
+    orr v2.16b, v2.16b, v18.16b
+    orr v3.16b, v3.16b, v19.16b
+    add x3, x3, #1
+    cmp x3, x1
+    b.ne .loop
+.done:
+    st1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x8]
     ret

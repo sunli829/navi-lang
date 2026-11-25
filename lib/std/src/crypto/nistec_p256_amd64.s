@@ -433,6 +433,283 @@ fe_sub:
     mov qword ptr [r13 + 24], r11
     ret
 
+// sc_mul(a, b): a * b / 2^256 mod N (the group order), as fe_mul with the
+// quotient T[0] * -N^-1 and N's words from .n0-.n3.
+sc_mul:
+    mov rsi, qword ptr [rsp + 8]
+    mov rdi, qword ptr [rsp + 16]
+    push rbx
+    push rbp
+    mov rcx, qword ptr [rdi]
+    mov rax, qword ptr [rsi]
+    mul rcx
+    mov r8, rax
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 8]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    mov r9, rax
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 16]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    mov r10, rax
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 24]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    mov r11, rax
+    mov r15, rdx
+    mov rbx, 0
+    mov rax, qword ptr [rip + .ninv]
+    mul r8
+    mov rcx, rax
+    mov rax, qword ptr [rip + .n0]
+    mul rcx
+    add r8, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n1]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r9, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n2]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r10, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n3]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r11, rax
+    adc rdx, 0
+    mov rbp, rdx
+    add r15, rbp
+    adc rbx, 0
+    mov rcx, qword ptr [rdi + 8]
+    mov rax, qword ptr [rsi]
+    mul rcx
+    add r9, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 8]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r10, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 16]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r11, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 24]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r15, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov r8, 0
+    add rbx, rbp
+    adc r8, 0
+    mov rax, qword ptr [rip + .ninv]
+    mul r9
+    mov rcx, rax
+    mov rax, qword ptr [rip + .n0]
+    mul rcx
+    add r9, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n1]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r10, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n2]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r11, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n3]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r15, rax
+    adc rdx, 0
+    mov rbp, rdx
+    add rbx, rbp
+    adc r8, 0
+    mov rcx, qword ptr [rdi + 16]
+    mov rax, qword ptr [rsi]
+    mul rcx
+    add r10, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 8]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r11, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 16]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r15, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 24]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add rbx, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov r9, 0
+    add r8, rbp
+    adc r9, 0
+    mov rax, qword ptr [rip + .ninv]
+    mul r10
+    mov rcx, rax
+    mov rax, qword ptr [rip + .n0]
+    mul rcx
+    add r10, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n1]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r11, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n2]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r15, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n3]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add rbx, rax
+    adc rdx, 0
+    mov rbp, rdx
+    add r8, rbp
+    adc r9, 0
+    mov rcx, qword ptr [rdi + 24]
+    mov rax, qword ptr [rsi]
+    mul rcx
+    add r11, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 8]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r15, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 16]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add rbx, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rsi + 24]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r8, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov r10, 0
+    add r9, rbp
+    adc r10, 0
+    mov rax, qword ptr [rip + .ninv]
+    mul r11
+    mov rcx, rax
+    mov rax, qword ptr [rip + .n0]
+    mul rcx
+    add r11, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n1]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r15, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n2]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add rbx, rax
+    adc rdx, 0
+    mov rbp, rdx
+    mov rax, qword ptr [rip + .n3]
+    mul rcx
+    add rax, rbp
+    adc rdx, 0
+    add r8, rax
+    adc rdx, 0
+    mov rbp, rdx
+    add r9, rbp
+    adc r10, 0
+    mov rax, r15
+    mov rcx, rbx
+    mov rdx, r8
+    mov rsi, r9
+    sub r15, qword ptr [rip + .n0]
+    sbb rbx, qword ptr [rip + .n1]
+    sbb r8, qword ptr [rip + .n2]
+    sbb r9, qword ptr [rip + .n3]
+    sbb r10, 0
+    cmovb r15, rax
+    cmovb rbx, rcx
+    cmovb r8, rdx
+    cmovb r9, rsi
+    mov qword ptr [r13], r15
+    mov qword ptr [r13 + 8], rbx
+    mov qword ptr [r13 + 16], r8
+    mov qword ptr [r13 + 24], r9
+    pop rbp
+    pop rbx
+    ret
+    .balign 8
+.n0:
+    .quad 0xf3b9cac2fc632551
+.n1:
+    .quad 0xbce6faada7179e84
+.n2:
+    .quad 0xffffffffffffffff
+.n3:
+    .quad 0xffffffff00000000
+.ninv:
+    .quad 0xccd1c8aaee00bc4f
+
 // select_point(table, n, idx): the point table[idx] (idx < n), every entry read
 // (constant time), as Go's p256Select: each masked by idx == j and or-ed.
 select_point:
@@ -487,4 +764,49 @@ select_point:
     movdqu xmmword ptr [r13 + 48], xmm3
     movdqu xmmword ptr [r13 + 64], xmm4
     movdqu xmmword ptr [r13 + 80], xmm5
+    ret
+
+// select_affine(table, n, idx): the same for affine points (8 words).
+select_affine:
+    mov rsi, qword ptr [rsp + 8]
+    mov rcx, qword ptr [rsp + 16]
+    mov rdx, qword ptr [rsp + 24]
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    pxor xmm3, xmm3
+    mov rax, 0
+    cmp rcx, 0
+    je .done
+.loop:
+    mov r8, rax
+    xor r8, rdx
+    mov r9, r8
+    neg r9
+    or r8, r9
+    shr r8, 63
+    sub r8, 1
+    movq xmm15, r8
+    pshufd xmm15, xmm15, 0x44
+    movdqu xmm8, xmmword ptr [rsi]
+    movdqu xmm9, xmmword ptr [rsi + 16]
+    movdqu xmm10, xmmword ptr [rsi + 32]
+    movdqu xmm11, xmmword ptr [rsi + 48]
+    pand xmm8, xmm15
+    pand xmm9, xmm15
+    pand xmm10, xmm15
+    pand xmm11, xmm15
+    por xmm0, xmm8
+    por xmm1, xmm9
+    por xmm2, xmm10
+    por xmm3, xmm11
+    add rsi, 64
+    inc rax
+    cmp rax, rcx
+    jne .loop
+.done:
+    movdqu xmmword ptr [r13], xmm0
+    movdqu xmmword ptr [r13 + 16], xmm1
+    movdqu xmmword ptr [r13 + 32], xmm2
+    movdqu xmmword ptr [r13 + 48], xmm3
     ret
