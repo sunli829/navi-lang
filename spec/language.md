@@ -395,7 +395,7 @@ select {
 - `select` 是 navi 新增的关键字（Rust std 没有对应的东西）
 - 没有 `Send` / `Sync`：不做 auto trait，数据竞争由用户负责（同 Go）
 - **线程里的 panic 只结束这个线程**（同 Rust，M9 起）：`join()` 返回 `Err(PanicPayload)`。早先的版本里它会结束整个进程（同 Go）
-- `Mutex`、`RwLock`、`Condvar`、原子操作和定时器这一版不做
+- 定时器是通道（同 Go）：`std::time::after(d)` 到时收到一个时刻，`tick(d)` 和 `Ticker` 每隔 d 一个，放进 `select` 做超时：`t = std::time::after(Duration::from_secs(1)).recv() => ...`
 - 不提供 `async` / `await`
 
 ## 1.12 错误处理与 panic

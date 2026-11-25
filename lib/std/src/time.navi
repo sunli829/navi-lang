@@ -209,3 +209,68 @@ impl Sub<Duration> for SystemTime {
     fn sub(self, d: Duration) -> SystemTime { SystemTime { nanos: self.nanos - d.nanos as i128 } }
 }
 
+
+// --- Timer channels (Go's time.After, time.Tick and Ticker; crossbeam's
+// after and tick), for timeouts and periodic work in select ---------------
+
+/// A channel that receives the instant once, d from now (Go's time.After):
+///
+///     select {
+///         v = rx.recv() => handle(v),
+///         t = std::time::after(Duration::from_secs(1)).recv() => println("timed out"),
+///     }
+pub fn after(d: Duration) -> crate::sync::mpmc::Receiver<Instant> {
+    let (tx, rx) = crate::sync::mpmc::sync_channel::<Instant>(1);
+    crate::thread::spawn(|| {
+        crate::thread::sleep(d);
+        let _ = tx.send(Instant::now());
+    });
+    rx
+}
+
+/// A channel that receives the instant every d (Go's time.Tick); a tick a
+/// slow receiver has not taken yet makes the next one dropped. It never
+/// stops: a Ticker can.
+pub fn tick(d: Duration) -> crate::sync::mpmc::Receiver<Instant> { Ticker::new(d).receiver() }
+
+/// Instants every period until stopped (Go's time.Ticker).
+#[derive(Clone)]
+pub struct Ticker {
+    rx: crate::sync::mpmc::Receiver<Instant>,
+    stopped: &crate::sync::atomic::AtomicBool,
+}
+
+impl Ticker {
+    /// Ticks every period, the first one period from now (on deadlines, so
+    /// they do not drift; missed ones are dropped).
+    pub fn new(period: Duration) -> Ticker {
+        if period.is_zero() { crate::panic::panic("Ticker::new: a zero period"); }
+        let (tx, rx) = crate::sync::mpmc::sync_channel::<Instant>(1);
+        let stopped = &crate::sync::atomic::AtomicBool::new(false);
+        crate::thread::spawn(|| {
+            let mut next = Instant::now() + period;
+            loop {
+                crate::thread::sleep_until(next);
+                if stopped.load(crate::sync::atomic::Ordering::SeqCst) { return; }
+                let now = Instant::now();
+                select {
+                    tx.send(now) => {},
+                    default => {},
+                }
+                next = next + period;
+                // (Behind by more than a period: from now on.)
+                if next < now { next = now + period; }
+            }
+        });
+        Ticker { rx, stopped }
+    }
+
+    /// The channel the ticks come on (for select; clones share it).
+    pub fn receiver(&self) -> crate::sync::mpmc::Receiver<Instant> { self.rx.clone() }
+
+    /// Waits for the next tick.
+    pub fn recv(&self) -> Instant { self.rx.recv().unwrap() }
+
+    /// No more ticks (the one waiting in the channel, if any, stays).
+    pub fn stop(&self) { self.stopped.store(true, crate::sync::atomic::Ordering::SeqCst); }
+}
