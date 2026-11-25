@@ -570,3 +570,554 @@ aes_ctr_xor:
     st1 {v31.16b}, [x5]
 .cdone:
     ret
+
+// gcm_crypt8(xk, rounds, ctr, src, dst, n, ht, y, dec): n times eight
+// blocks of counter mode (as aes_ctr_xor) and GHASH (as ghash_blocks) in
+// one loop, as Go's gcmAesEnc and gcmAesDec: the AES unit and PMULL work
+// on neighbouring groups at once. GHASH takes the ciphertext: dst after
+// the eight blocks are made, or with dec src before. ht: H^8, H^7, ...,
+// H (bit-reversed bytes) each followed by its halves xored (Karatsuba),
+// 32 bytes apiece. The counter and y are written back.
+gcm_crypt8:
+    ldr x0, [sp]                // xk
+    ldr x1, [sp, #8]            // rounds
+    ldr x5, [sp, #16]           // ctr
+    ldr x2, [sp, #24]           // src
+    ldr x3, [sp, #32]           // dst
+    ldr x4, [sp, #40]           // n
+    ldr x10, [sp, #48]          // ht
+    ldr x11, [sp, #56]          // y
+    ldr x12, [sp, #64]          // dec
+    cbz x4, .gdone
+    ld1 {v16.16b-v19.16b}, [x0], #64
+    ld1 {v20.16b-v23.16b}, [x0], #64
+    ld1 {v24.16b-v26.16b}, [x0], #48
+    cmp x1, #10
+    b.eq .gkeys
+    ld1 {v27.16b, v28.16b}, [x0], #32
+    cmp x1, #12
+    b.eq .gkeys
+    ld1 {v29.16b, v30.16b}, [x0], #32
+.gkeys:
+    ld1 {v31.16b}, [x5]
+    ldr w6, [x5, #12]
+    rev w6, w6
+    ld1 {v8.16b}, [x11]
+    rbit v8.16b, v8.16b                    // Y
+    mov x13, #0x87
+.g8:
+    cbz x4, .gend
+    cbz x12, .gaes
+    ld1 {v0.16b-v3.16b}, [x2]
+    add x14, x2, #64
+    ld1 {v4.16b-v7.16b}, [x14]
+    mov x9, x10
+    rbit v0.16b, v0.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    eor v0.16b, v0.16b, v8.16b
+    pmull v9.1q, v0.1d, v12.1d
+    pmull2 v10.1q, v0.2d, v12.2d
+    ext v14.16b, v0.16b, v0.16b, #8
+    eor v14.16b, v14.16b, v0.16b
+    pmull v11.1q, v14.1d, v13.1d
+    rbit v1.16b, v1.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v1.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v1.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v1.16b, v1.16b, #8
+    eor v14.16b, v14.16b, v1.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v2.16b, v2.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v2.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v2.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v2.16b, v2.16b, #8
+    eor v14.16b, v14.16b, v2.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v3.16b, v3.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v3.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v3.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v3.16b, v3.16b, #8
+    eor v14.16b, v14.16b, v3.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v4.16b, v4.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v4.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v4.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v4.16b, v4.16b, #8
+    eor v14.16b, v14.16b, v4.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v5.16b, v5.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v5.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v5.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v5.16b, v5.16b, #8
+    eor v14.16b, v14.16b, v5.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v6.16b, v6.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v6.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v6.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v6.16b, v6.16b, #8
+    eor v14.16b, v14.16b, v6.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v7.16b, v7.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v7.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v7.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v7.16b, v7.16b, #8
+    eor v14.16b, v14.16b, v7.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    movi v0.16b, #0
+    dup v1.2d, x13
+    eor v11.16b, v11.16b, v9.16b
+    eor v11.16b, v11.16b, v10.16b          // mid
+    ext v14.16b, v0.16b, v11.16b, #8
+    eor v9.16b, v9.16b, v14.16b            // lo ^= [0, m0]
+    ext v14.16b, v11.16b, v0.16b, #8
+    eor v10.16b, v10.16b, v14.16b          // hi ^= [m1, 0]
+    pmull2 v14.1q, v10.2d, v1.2d           // P3 * 0x87, at x^64
+    ext v15.16b, v0.16b, v14.16b, #8
+    eor v9.16b, v9.16b, v15.16b
+    ext v15.16b, v14.16b, v0.16b, #8
+    eor v10.16b, v10.16b, v15.16b
+    pmull v14.1q, v10.1d, v1.1d            // P2 * 0x87
+    eor v8.16b, v9.16b, v14.16b
+.gaes:
+    mov v0.16b, v31.16b
+    mov v1.16b, v31.16b
+    add w7, w6, #1
+    rev w7, w7
+    mov v1.s[3], w7
+    mov v2.16b, v31.16b
+    add w7, w6, #2
+    rev w7, w7
+    mov v2.s[3], w7
+    mov v3.16b, v31.16b
+    add w7, w6, #3
+    rev w7, w7
+    mov v3.s[3], w7
+    mov v4.16b, v31.16b
+    add w7, w6, #4
+    rev w7, w7
+    mov v4.s[3], w7
+    mov v5.16b, v31.16b
+    add w7, w6, #5
+    rev w7, w7
+    mov v5.s[3], w7
+    mov v6.16b, v31.16b
+    add w7, w6, #6
+    rev w7, w7
+    mov v6.s[3], w7
+    mov v7.16b, v31.16b
+    add w7, w6, #7
+    rev w7, w7
+    mov v7.s[3], w7
+    add w6, w6, #8
+    rev w7, w6
+    mov v31.s[3], w7
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v16.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v16.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v16.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v16.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v17.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v17.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v17.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v17.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v17.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v17.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v17.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v17.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v18.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v18.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v18.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v18.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v18.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v18.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v18.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v18.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v19.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v19.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v19.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v19.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v19.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v19.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v19.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v19.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v20.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v20.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v20.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v20.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v20.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v20.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v20.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v20.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v21.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v21.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v21.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v21.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v21.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v21.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v21.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v21.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v22.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v22.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v22.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v22.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v22.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v22.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v22.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v22.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v23.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v23.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v23.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v23.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v23.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v23.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v23.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v23.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v24.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v24.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v24.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v24.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v24.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v24.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v24.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v24.16b
+    aesmc v7.16b, v7.16b
+    cmp x1, #10
+    b.eq .gr10
+    aese v0.16b, v25.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v25.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v25.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v25.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v25.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v25.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v25.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v25.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v26.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v26.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v26.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v26.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v26.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v26.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v26.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v26.16b
+    aesmc v7.16b, v7.16b
+    cmp x1, #12
+    b.eq .gr12
+    aese v0.16b, v27.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v27.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v27.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v27.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v27.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v27.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v27.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v27.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v28.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v28.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v28.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v28.16b
+    aesmc v3.16b, v3.16b
+    aese v4.16b, v28.16b
+    aesmc v4.16b, v4.16b
+    aese v5.16b, v28.16b
+    aesmc v5.16b, v5.16b
+    aese v6.16b, v28.16b
+    aesmc v6.16b, v6.16b
+    aese v7.16b, v28.16b
+    aesmc v7.16b, v7.16b
+    aese v0.16b, v29.16b
+    aese v1.16b, v29.16b
+    aese v2.16b, v29.16b
+    aese v3.16b, v29.16b
+    aese v4.16b, v29.16b
+    aese v5.16b, v29.16b
+    aese v6.16b, v29.16b
+    aese v7.16b, v29.16b
+    eor v0.16b, v0.16b, v30.16b
+    eor v1.16b, v1.16b, v30.16b
+    eor v2.16b, v2.16b, v30.16b
+    eor v3.16b, v3.16b, v30.16b
+    eor v4.16b, v4.16b, v30.16b
+    eor v5.16b, v5.16b, v30.16b
+    eor v6.16b, v6.16b, v30.16b
+    eor v7.16b, v7.16b, v30.16b
+    b .gxor
+.gr12:
+    aese v0.16b, v27.16b
+    aese v1.16b, v27.16b
+    aese v2.16b, v27.16b
+    aese v3.16b, v27.16b
+    aese v4.16b, v27.16b
+    aese v5.16b, v27.16b
+    aese v6.16b, v27.16b
+    aese v7.16b, v27.16b
+    eor v0.16b, v0.16b, v28.16b
+    eor v1.16b, v1.16b, v28.16b
+    eor v2.16b, v2.16b, v28.16b
+    eor v3.16b, v3.16b, v28.16b
+    eor v4.16b, v4.16b, v28.16b
+    eor v5.16b, v5.16b, v28.16b
+    eor v6.16b, v6.16b, v28.16b
+    eor v7.16b, v7.16b, v28.16b
+    b .gxor
+.gr10:
+    aese v0.16b, v25.16b
+    aese v1.16b, v25.16b
+    aese v2.16b, v25.16b
+    aese v3.16b, v25.16b
+    aese v4.16b, v25.16b
+    aese v5.16b, v25.16b
+    aese v6.16b, v25.16b
+    aese v7.16b, v25.16b
+    eor v0.16b, v0.16b, v26.16b
+    eor v1.16b, v1.16b, v26.16b
+    eor v2.16b, v2.16b, v26.16b
+    eor v3.16b, v3.16b, v26.16b
+    eor v4.16b, v4.16b, v26.16b
+    eor v5.16b, v5.16b, v26.16b
+    eor v6.16b, v6.16b, v26.16b
+    eor v7.16b, v7.16b, v26.16b
+.gxor:
+    ld1 {v12.16b, v13.16b}, [x2], #32
+    eor v0.16b, v0.16b, v12.16b
+    eor v1.16b, v1.16b, v13.16b
+    ld1 {v12.16b, v13.16b}, [x2], #32
+    eor v2.16b, v2.16b, v12.16b
+    eor v3.16b, v3.16b, v13.16b
+    ld1 {v12.16b, v13.16b}, [x2], #32
+    eor v4.16b, v4.16b, v12.16b
+    eor v5.16b, v5.16b, v13.16b
+    ld1 {v12.16b, v13.16b}, [x2], #32
+    eor v6.16b, v6.16b, v12.16b
+    eor v7.16b, v7.16b, v13.16b
+    st1 {v0.16b-v3.16b}, [x3], #64
+    st1 {v4.16b-v7.16b}, [x3], #64
+    cbnz x12, .gnext
+    mov x9, x10
+    rbit v0.16b, v0.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    eor v0.16b, v0.16b, v8.16b
+    pmull v9.1q, v0.1d, v12.1d
+    pmull2 v10.1q, v0.2d, v12.2d
+    ext v14.16b, v0.16b, v0.16b, #8
+    eor v14.16b, v14.16b, v0.16b
+    pmull v11.1q, v14.1d, v13.1d
+    rbit v1.16b, v1.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v1.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v1.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v1.16b, v1.16b, #8
+    eor v14.16b, v14.16b, v1.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v2.16b, v2.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v2.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v2.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v2.16b, v2.16b, #8
+    eor v14.16b, v14.16b, v2.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v3.16b, v3.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v3.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v3.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v3.16b, v3.16b, #8
+    eor v14.16b, v14.16b, v3.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v4.16b, v4.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v4.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v4.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v4.16b, v4.16b, #8
+    eor v14.16b, v14.16b, v4.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v5.16b, v5.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v5.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v5.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v5.16b, v5.16b, #8
+    eor v14.16b, v14.16b, v5.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v6.16b, v6.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v6.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v6.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v6.16b, v6.16b, #8
+    eor v14.16b, v14.16b, v6.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    rbit v7.16b, v7.16b
+    ld1 {v12.16b, v13.16b}, [x9], #32
+    pmull v14.1q, v7.1d, v12.1d
+    eor v9.16b, v9.16b, v14.16b
+    pmull2 v14.1q, v7.2d, v12.2d
+    eor v10.16b, v10.16b, v14.16b
+    ext v14.16b, v7.16b, v7.16b, #8
+    eor v14.16b, v14.16b, v7.16b
+    pmull v14.1q, v14.1d, v13.1d
+    eor v11.16b, v11.16b, v14.16b
+    movi v0.16b, #0
+    dup v1.2d, x13
+    eor v11.16b, v11.16b, v9.16b
+    eor v11.16b, v11.16b, v10.16b          // mid
+    ext v14.16b, v0.16b, v11.16b, #8
+    eor v9.16b, v9.16b, v14.16b            // lo ^= [0, m0]
+    ext v14.16b, v11.16b, v0.16b, #8
+    eor v10.16b, v10.16b, v14.16b          // hi ^= [m1, 0]
+    pmull2 v14.1q, v10.2d, v1.2d           // P3 * 0x87, at x^64
+    ext v15.16b, v0.16b, v14.16b, #8
+    eor v9.16b, v9.16b, v15.16b
+    ext v15.16b, v14.16b, v0.16b, #8
+    eor v10.16b, v10.16b, v15.16b
+    pmull v14.1q, v10.1d, v1.1d            // P2 * 0x87
+    eor v8.16b, v9.16b, v14.16b
+.gnext:
+    sub x4, x4, #1
+    b .g8
+.gend:
+    rbit v8.16b, v8.16b
+    st1 {v8.16b}, [x11]
+    st1 {v31.16b}, [x5]
+.gdone:
+    ret

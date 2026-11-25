@@ -4,9 +4,9 @@
 //!
 //! With the CPU's AES and carry-less multiplication instructions, the
 //! counter mode and GHASH run in assembly (aes_gcm_arm64.s,
-//! aes_gcm_amd64.s); otherwise in software, constant-time (GHASH as
-//! BearSSL's ctmul64: carry-less products from integer multiplications, no
-//! table lookups).
+//! aes_gcm_amd64.s; on arm64 in one pass, eight blocks at a time, as Go's);
+//! otherwise in software, constant-time (GHASH as BearSSL's ctmul64:
+//! carry-less products from integer multiplications, no table lookups).
 
 use crate::crypto::aes::Key;
 use crate::crypto::aead::{AeadInPlace, KeyInit, Error, InvalidLength};
@@ -30,6 +30,25 @@ fn ghash_blocks(hp: *const u8, y: *mut u8, data: *const u8, n: usize);
 #[asm]
 fn aes_ctr_xor(xk: *const u8, rounds: usize, ctr: *mut u8, src: *const u8, dst: *mut u8, n: usize);
 
+// Counter mode and GHASH together, eight blocks at a time (arm64).
+#[cfg(target_arch = "aarch64")]
+#[asm]
+fn gcm_crypt8(xk: *const u8, rounds: usize, ctr: *mut u8, src: *const u8, dst: *mut u8, n: usize, ht: *const u8, y: *mut u8, dec: u64);
+
+#[cfg(target_arch = "aarch64")]
+const FUSED: bool = true;
+
+#[cfg(not(target_arch = "aarch64"))]
+const FUSED: bool = false;
+
+#[cfg(target_arch = "aarch64")]
+fn hw_crypt8(k: &Key, ht: &[u8], ctr: &mut [u8], buf: &mut [u8], n: usize, y: &mut [u8], dec: bool) {
+    gcm_crypt8(k.round_keys().as_ptr(), k.rounds(), ctr.as_mut_ptr(), buf.as_ptr(), buf.as_mut_ptr(), n, ht.as_ptr(), y.as_mut_ptr(), dec as u64);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn hw_crypt8(k: &Key, ht: &[u8], ctr: &mut [u8], buf: &mut [u8], n: usize, y: &mut [u8], dec: bool) {}
+
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn hw_ghash(hp: &[u8], y: &mut [u8], data: &[u8], n: usize) { ghash_blocks(hp.as_ptr(), y.as_mut_ptr(), data.as_ptr(), n); }
 
@@ -51,6 +70,8 @@ pub struct AesGcm {
     h0: u64,
     // H, H^2, ..., H^8 (for the assembly).
     hp: [u8; 128],
+    // gcm_crypt8's: H^8, ..., H bit-reversed, each with its halves xored.
+    ht: [u8; 256],
 }
 
 fn be64(b: &[u8], i: usize) -> u64 {
@@ -185,39 +206,84 @@ impl AesGcm {
                 i += 1;
             }
         }
-        Ok(AesGcm { key: k, h1, h0, hp })
+        let mut ht: [u8; 256] = [0; 256];
+        if k.hardware() {
+            let mut i = 0;
+            while i < 8 {
+                let src = 16 * (7 - i);
+                let mut j = 0;
+                while j < 16 {
+                    ht[32 * i + j] = hp[src + j].reverse_bits();
+                    j += 1;
+                }
+                j = 0;
+                while j < 16 {
+                    ht[32 * i + 16 + j] = ht[32 * i + j] ^ ht[32 * i + (j + 8) % 16];
+                    j += 1;
+                }
+                i += 1;
+            }
+        }
+        Ok(AesGcm { key: k, h1, h0, hp, ht })
     }
 
     /// The same with AES in software even with the CPU's instructions (to
     /// compare the two).
-    pub fn software(&self) -> AesGcm { AesGcm { key: self.key.software(), h1: self.h1, h0: self.h0, hp: self.hp } }
+    pub fn software(&self) -> AesGcm { AesGcm { key: self.key.software(), h1: self.h1, h0: self.h0, hp: self.hp, ht: self.ht } }
+
+    // The counter block nonce || c.
+    fn counter(nonce: &[u8], c: u32) -> [u8; 16] {
+        let mut cb: [u8; 16] = [0; 16];
+        let mut i = 0;
+        while i < 12 {
+            cb[i] = nonce[i];
+            i += 1;
+        }
+        cb[12] = (c >> 24) as u8;
+        cb[13] = (c >> 16) as u8;
+        cb[14] = (c >> 8) as u8;
+        cb[15] = c as u8;
+        cb
+    }
+
+    // buf ^= the key stream from the counter block cb on, on the CPU's
+    // instructions (cb advanced past the whole blocks).
+    fn hw_ctr_from(&self, cb: &mut [u8; 16], buf: &mut [u8]) {
+        let full = buf.len() / 16;
+        hw_ctr(&self.key, cb, buf, full);
+        let rest = buf.len() - 16 * full;
+        if rest > 0 {
+            let mut ks: [u8; 16] = [0; 16];
+            self.key.encrypt_blocks(cb, &mut ks);
+            let mut i = 0;
+            while i < rest {
+                buf[16 * full + i] = buf[16 * full + i] ^ ks[i];
+                i += 1;
+            }
+        }
+    }
+
+    // Sealing or opening buf in one pass over it (arm64): the groups of
+    // eight blocks through gcm_crypt8, the rest as before; the tag.
+    fn fused(&self, nonce: &[u8], aad: &[u8], buf: &mut [u8], dec: bool) -> Vec<u8> {
+        let mut y: [u8; 16] = [0; 16];
+        self.hw_update(&mut y, aad);
+        let mut cb = AesGcm::counter(nonce, 2);
+        let n8 = buf.len() / 128;
+        hw_crypt8(&self.key, &self.ht, &mut cb, buf, n8, &mut y, dec);
+        let rest = &mut buf[128 * n8..];
+        if dec { self.hw_update(&mut y, rest); }
+        self.hw_ctr_from(&mut cb, rest);
+        if !dec { self.hw_update(&mut y, rest); }
+        self.finish(nonce, &mut y, aad.len(), buf.len())
+    }
 
     // buf ^= the key stream of the counter blocks nonce || c, c from
     // first on (wrapping at 32 bits).
     fn ctr(&self, nonce: &[u8], first: u32, buf: &mut [u8]) {
         if self.key.hardware() {
-            let mut cb: [u8; 16] = [0; 16];
-            let mut i = 0;
-            while i < 12 {
-                cb[i] = nonce[i];
-                i += 1;
-            }
-            cb[12] = (first >> 24) as u8;
-            cb[13] = (first >> 16) as u8;
-            cb[14] = (first >> 8) as u8;
-            cb[15] = first as u8;
-            let full = buf.len() / 16;
-            hw_ctr(&self.key, &mut cb, buf, full);
-            let rest = buf.len() - 16 * full;
-            if rest > 0 {
-                let mut ks: [u8; 16] = [0; 16];
-                self.key.encrypt_blocks(&cb, &mut ks);
-                i = 0;
-                while i < rest {
-                    buf[16 * full + i] = buf[16 * full + i] ^ ks[i];
-                    i += 1;
-                }
-            }
+            let mut cb = AesGcm::counter(nonce, first);
+            self.hw_ctr_from(&mut cb, buf);
             return;
         }
         let chunk = 64;
@@ -270,22 +336,35 @@ impl AesGcm {
 
     // The tag of aad and ciphertext ct under nonce.
     fn tag(&self, nonce: &[u8], aad: &[u8], ct: &[u8]) -> Vec<u8> {
-        let mut lens: [u8; 16] = [0; 16];
-        put64(&mut lens, 0, (aad.len() as u64) * 8);
-        put64(&mut lens, 8, (ct.len() as u64) * 8);
         let mut t: [u8; 16] = [0; 16];
         if self.key.hardware() {
             self.hw_update(&mut t, aad);
             self.hw_update(&mut t, ct);
-            self.hw_update(&mut t, &lens);
-        } else {
-            let mut g = Ghash { y1: 0, y0: 0 };
-            g.update(self.h1, self.h0, aad);
-            g.update(self.h1, self.h0, ct);
-            g.update(self.h1, self.h0, &lens);
-            put64(&mut t, 0, g.y1);
-            put64(&mut t, 8, g.y0);
+            return self.finish(nonce, &mut t, aad.len(), ct.len());
         }
+        let mut lens: [u8; 16] = [0; 16];
+        put64(&mut lens, 0, (aad.len() as u64) * 8);
+        put64(&mut lens, 8, (ct.len() as u64) * 8);
+        let mut g = Ghash { y1: 0, y0: 0 };
+        g.update(self.h1, self.h0, aad);
+        g.update(self.h1, self.h0, ct);
+        g.update(self.h1, self.h0, &lens);
+        put64(&mut t, 0, g.y1);
+        put64(&mut t, 8, g.y0);
+        self.mask(nonce, &t)
+    }
+
+    // The tag from the GHASH state t of aad and the ciphertext (on the
+    // CPU's instructions): their lengths hashed in, then masked.
+    fn finish(&self, nonce: &[u8], t: &mut [u8; 16], alen: usize, clen: usize) -> Vec<u8> {
+        let mut lens: [u8; 16] = [0; 16];
+        put64(&mut lens, 0, (alen as u64) * 8);
+        put64(&mut lens, 8, (clen as u64) * 8);
+        self.hw_update(t, &lens);
+        self.mask(nonce, t)
+    }
+
+    fn mask(&self, nonce: &[u8], t: &[u8; 16]) -> Vec<u8> {
         // E(K, J0) ^ S, J0 = nonce || 1.
         let mut j0: Vec<u8> = nonce.to_vec();
         j0.extend_from_slice(&[0, 0, 0, 1]);
@@ -307,12 +386,22 @@ impl AeadInPlace for AesGcm {
 
     fn encrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> Result<Vec<u8>, Error> {
         if nonce.len() != 12 { return Err(Error); }
+        if FUSED && self.key.hardware() { return Ok(self.fused(nonce, aad, buffer, false)); }
         self.ctr(nonce, 2, buffer);
         Ok(self.tag(nonce, aad, buffer))
     }
 
     fn decrypt_in_place_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8], tag: &[u8]) -> Result<(), Error> {
         if nonce.len() != 12 || tag.len() != 16 { return Err(Error); }
+        if FUSED && self.key.hardware() {
+            // Decrypted while hashed: a wrong tag encrypts buffer back.
+            let want = self.fused(nonce, aad, buffer, true);
+            if !constant_time_eq(want.as_slice(), tag) {
+                self.ctr(nonce, 2, buffer);
+                return Err(Error);
+            }
+            return Ok(());
+        }
         let want = self.tag(nonce, aad, buffer);
         if !constant_time_eq(want.as_slice(), tag) { return Err(Error); }
         self.ctr(nonce, 2, buffer);
