@@ -180,7 +180,8 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | `Content-Type` | Go 用 `DetectContentType` 嗅探 | 有 body 又没设时一律 `text/plain; charset=utf-8` | 简化 |
 | 未读完的请求体 | Go 读掉最多 256 KiB 后复用连接 | 相同 | — |
 | 路由 | Go 1.22 `ServeMux` 模式 | 支持 `[METHOD ][HOST]/path`、`{name}`、`{name...}`、`{$}`、末尾 `/` 的子树、404/405（带 `Allow`）、子树根补斜杠的 301；不做路径清理（`//`、`..`）的重定向；冲突检查只查完全相同的模式 | 简化 |
-| HTTP/2、代理、Cookie jar、压缩 | reqwest 有 | 没有 | 暂不需要 |
+| HTTP/2 | reqwest 和 Go 都自动协商 | 同 Go：TLS 上 ALPN 选 h2；明文要服务端 `Protocols::set_unencrypted_http2(true)`（Go 1.24 的 `http.Protocols`）、客户端 `http2_prior_knowledge()`（reqwest 的名字）；`http1_only()` 关掉；不做服务端推送、优先级、trailers（收到的丢掉）、`Upgrade: h2c`（RFC 9113 已删） | — |
+| 代理、Cookie jar、压缩 | reqwest 有 | 没有 | 暂不需要 |
 
 ### std::tls（API 照 native-tls crate，实现照 Go 的 crypto/tls）
 

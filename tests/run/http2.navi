@@ -1,0 +1,304 @@
+// HTTP/2 in std::http: the client and the server over TLS (ALPN) and by
+// prior knowledge, many requests on one connection, flow control on big
+// bodies, timeouts; and frames written by hand to the server, which must
+// answer bad ones as RFC 9113 says. (Also checked by hand with curl
+// --http2 and Go's client and server.)
+
+use std::http::{self, Body, Client, Protocols, Request, Response, Server, StatusCode, Version};
+use std::http::hpack::{Decoder, Encoder, HeaderField};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::tls::{Certificate, Identity, TlsAcceptor};
+
+fn handler(req: &mut Request) -> Response {
+    let path = req.path().to_string();
+    if path == "/echo" {
+        // (Streamed back: a reader of unknown length.)
+        let b = req.bytes().unwrap();
+        let cur = &mut std::io::Cursor::new(b);
+        return Response::new(StatusCode::OK).with_body(Body::from_reader(cur, None));
+    }
+    if path == "/big" {
+        let n: usize = req.query().unwrap_or("0").parse().unwrap();
+        return Response::from_body("z".repeat(n));
+    }
+    if path == "/slow" { std::thread::sleep(Duration::from_millis(1500)); }
+    if path == "/empty" { return Response::new(StatusCode::NO_CONTENT); }
+    let body = req.text().unwrap();
+    Response::from_string(`${req.version():?} ${req.method()} ${req.path()} cookie=${req.header("cookie").unwrap_or("-")} x=${req.headers().get_all("x-many").join(",")} body=${body.len()}`.to_string())
+        .with_header("X-Seen", req.header("host").unwrap_or("-"))
+}
+
+// A server on a free port (TLS with acceptor if given), serving handler;
+// the ports of the connections it saw are in seen.
+fn start(server: Server, seen: &Mutex<Vec<u16>>) -> u16 {
+    let port = server.local_addr().port();
+    std::thread::spawn(|| {
+        let _ = server.serve(|req: &mut Request| -> Response {
+            let p = req.remote_addr().unwrap().port();
+            let v = seen.lock();
+            if !v.contains(&p) { v.push(p); }
+            seen.unlock();
+            handler(req)
+        });
+    });
+    port
+}
+
+fn tls_server() -> Server {
+    let id = Identity::from_pkcs8(EC256_PEM.as_bytes(), EC256_KEY.as_bytes()).unwrap();
+    Server::bind("127.0.0.1:0").unwrap().tls(TlsAcceptor::new(id).unwrap())
+}
+
+fn tls_client() -> std::http::ClientBuilder { Client::builder().add_root_certificate(Certificate::from_pem(ROOT.as_bytes()).unwrap()) }
+
+fn h2c_server() -> Server {
+    let mut p = Protocols::default();
+    p.set_unencrypted_http2(true);
+    Server::bind("127.0.0.1:0").unwrap().protocols(p)
+}
+
+#[test]
+fn over_tls_and_prior_knowledge() {
+    let seen = &Mutex::new(Vec::new());
+    let tls_port = start(tls_server(), seen);
+    let c = tls_client().build().unwrap();
+    let base = `https://localhost:${tls_port}`.to_string();
+    let r = c.get(`${base}/a`.to_string().as_str()).header("Cookie", "a=1").header("x-many", "1").send().unwrap();
+    assert_eq(r.version(), Version::HTTP_2);
+    assert_eq(r.header("x-seen"), Some(`localhost:${tls_port}`.to_string().as_str()));
+    assert_eq(r.text().unwrap(), "HTTP/2.0 GET /a cookie=a=1 x=1 body=0".to_string());
+    let r = c.post(`${base}/p`.to_string().as_str()).body("12345").send().unwrap();
+    assert_eq(r.text().unwrap(), "HTTP/2.0 POST /p cookie=- x= body=5".to_string());
+    // HEAD: the length, no body; 204.
+    let r = c.head(`${base}/big?777`.to_string().as_str()).send().unwrap();
+    assert_eq(r.content_length(), Some(777));
+    assert_eq(r.bytes().unwrap().len(), 0);
+    assert_eq(c.get(`${base}/empty`.to_string().as_str()).send().unwrap().status(), StatusCode::NO_CONTENT);
+    // Only HTTP/1.1 when asked.
+    let r = tls_client().http1_only().build().unwrap().get(`${base}/b`.to_string().as_str()).send().unwrap();
+    assert_eq(r.version(), Version::HTTP_11);
+    assert(r.text().unwrap().starts_with("HTTP/1.1 GET /b"));
+    // A server speaking HTTP/1.1 only: the client follows.
+    let mut p1 = Protocols::new();
+    p1.set_http1(true);
+    let h1_port = start(tls_server().protocols(p1), seen);
+    let r = c.get(`https://localhost:${h1_port}/c`.to_string().as_str()).send().unwrap();
+    assert_eq(r.version(), Version::HTTP_11);
+    // Prior knowledge without TLS; the same server answers HTTP/1.1 too.
+    let pk_port = start(h2c_server(), seen);
+    let pk = Client::builder().http2_prior_knowledge().build().unwrap();
+    let r = pk.get(`http://127.0.0.1:${pk_port}/d`.to_string().as_str()).send().unwrap();
+    assert_eq(r.version(), Version::HTTP_2);
+    assert_eq(r.text().unwrap(), "HTTP/2.0 GET /d cookie=- x= body=0".to_string());
+    let r = Client::new().get(`http://127.0.0.1:${pk_port}/e`.to_string().as_str()).send().unwrap();
+    assert_eq(r.version(), Version::HTTP_11);
+}
+
+#[test]
+fn many_streams_one_connection() {
+    let seen = &Mutex::new(Vec::new());
+    let port = start(tls_server(), seen);
+    let c = tls_client().build().unwrap();
+    // (The connection first: then every request finds it.)
+    assert_eq(c.get(`https://localhost:${port}/first`.to_string().as_str()).send().unwrap().version(), Version::HTTP_2);
+    let mut hs = Vec::new();
+    for i in 0..100 {
+        let c2 = c.clone();
+        let url = `https://localhost:${port}/s${i}`.to_string();
+        hs.push(std::thread::spawn(|| {
+            let r = c2.post(url.as_str()).body("q".repeat(i * 300)).send().unwrap();
+            r.version() == Version::HTTP_2 && r.text().unwrap().ends_with(`body=${i * 300}`.to_string().as_str())
+        }));
+    }
+    for h in hs { assert(h.join().unwrap()); }
+    assert_eq(seen.lock().len(), 1);
+    seen.unlock();
+}
+
+#[test]
+fn big_bodies_and_timeouts() {
+    let seen = &Mutex::new(Vec::new());
+    let port = start(h2c_server(), seen);
+    let c = Client::builder().http2_prior_knowledge().build().unwrap();
+    let base = `http://127.0.0.1:${port}`.to_string();
+    // Past every window both ways (streamed back without a length).
+    let up: Vec<u8> = (0..5000000).map(|i: i32| -> u8 { (i % 251) as u8 }).collect();
+    let r = c.post(`${base}/echo`.to_string().as_str()).body(up.clone()).send().unwrap();
+    assert_eq(r.content_length(), None);
+    assert(r.bytes().unwrap() == up);
+    let r = c.get(`${base}/big?5000000`.to_string().as_str()).send().unwrap();
+    assert_eq(r.bytes().unwrap().len(), 5000000);
+    // A request's timeout resets its stream; the connection goes on.
+    let e = c.get(`${base}/slow`.to_string().as_str()).timeout(Duration::from_millis(200)).send();
+    assert(e.is_err());
+    let r = c.get(`${base}/after`.to_string().as_str()).send().unwrap();
+    assert(r.text().unwrap().starts_with("HTTP/2.0 GET /after"));
+    assert_eq(seen.lock().len(), 1);
+    seen.unlock();
+}
+
+// --- Frames by hand ----------------------------------------------------------
+
+fn put_frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
+    let n = payload.len();
+    out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8, kind, flags]);
+    out.extend_from_slice(&stream.to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+// (kind, flags, stream, payload) of the next frame; None at the end.
+fn next_frame(s: &mut TcpStream) -> Option<(u8, u8, u32, Vec<u8>)> {
+    let mut h = [0u8; 9];
+    if s.read_exact(&mut h).is_err() { return None; }
+    let n = ((h[0] as usize) << 16) | ((h[1] as usize) << 8) | h[2] as usize;
+    let mut p: Vec<u8> = Vec::new();
+    p.resize(n, 0);
+    if s.read_exact(p.as_mut_slice()).is_err() { return None; }
+    Some((h[3], h[4], u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fffffff, p))
+}
+
+// A connection to port past the preface and settings.
+fn h2_conn(port: u16) -> TcpStream {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut out = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes().to_vec();
+    put_frame(&mut out, 4, 0, 0, &[]);
+    s.write_all(out.as_slice()).unwrap();
+    s
+}
+
+// The frames until one of kind (it returned) or the end.
+fn until(s: &mut TcpStream, kind: u8) -> Option<(u8, u8, u32, Vec<u8>)> {
+    loop {
+        let f = next_frame(s)?;
+        if f.0 == kind { return Some(f); }
+    }
+}
+
+fn goaway_code(port: u16, bad: &[u8]) -> u32 {
+    let mut s = h2_conn(port);
+    s.write_all(bad).unwrap();
+    let f = until(&mut s, 7).unwrap();
+    let p = f.3;
+    u32::from_be_bytes([p[4], p[5], p[6], p[7]])
+}
+
+fn block(fields: &[(&str, &str)]) -> Vec<u8> {
+    let mut e = Encoder::new();
+    let mut b: Vec<u8> = Vec::new();
+    for f in fields.iter() { e.write_field(&mut b, &HeaderField::new(f.0, f.1)); }
+    b
+}
+
+#[test]
+fn frames_by_hand() {
+    let seen = &Mutex::new(Vec::new());
+    let port = start(h2c_server(), seen);
+    let get = [(":method", "GET"), (":scheme", "http"), (":path", "/raw"), (":authority", "x")];
+    // A request: its response's HEADERS and DATA.
+    let mut s = h2_conn(port);
+    let mut out: Vec<u8> = Vec::new();
+    put_frame(&mut out, 1, 5, 1, block(&get).as_slice());
+    put_frame(&mut out, 6, 0, 0, b"pingpong");
+    s.write_all(out.as_slice()).unwrap();
+    let mut d = Decoder::new(4096);
+    let mut got_ping = false;
+    let mut status = String::new();
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        let (kind, flags, id, p) = next_frame(&mut s).unwrap();
+        if kind == 6 {
+            assert(flags & 1 == 1 && p.as_slice() == b"pingpong");
+            got_ping = true;
+        }
+        if kind == 1 && id == 1 { status = d.decode_full(p.as_slice()).unwrap()[0].value.clone(); }
+        if kind == 0 && id == 1 {
+            body.extend_from_slice(p.as_slice());
+            if flags & 1 == 1 { break; }
+        }
+    }
+    assert(got_ping);
+    assert_eq(status, "200".to_string());
+    assert_eq(String::from_utf8(body).unwrap(), "HTTP/2.0 GET /raw cookie=- x= body=0".to_string());
+    // Malformed requests: the stream reset (PROTOCOL_ERROR), the
+    // connection kept.
+    let bads: [&[(&str, &str)]; 4] = [
+        &[(":method", "GET"), (":scheme", "http"), (":path", "/"), ("Upper", "x")],
+        &[(":method", "GET"), (":scheme", "http"), ("a", "b"), (":path", "/")],
+        &[(":method", "GET"), (":scheme", "http"), (":path", "/"), ("connection", "close")],
+        &[(":method", "GET"), (":scheme", "http")],
+    ];
+    let mut id = 3;
+    for b in bads.iter() {
+        let mut out: Vec<u8> = Vec::new();
+        put_frame(&mut out, 1, 5, id, block(*b).as_slice());
+        s.write_all(out.as_slice()).unwrap();
+        let f = until(&mut s, 3).unwrap();
+        assert_eq(f.2, id);
+        assert_eq(u32::from_be_bytes([f.3[0], f.3[1], f.3[2], f.3[3]]), 1);
+        id += 2;
+    }
+    // Connection errors: GOAWAY with the code.
+    let mut f: Vec<u8> = Vec::new();
+    put_frame(&mut f, 0, 0, 0, b"x");
+    assert_eq(goaway_code(port, f.as_slice()), 1);
+    f.clear();
+    put_frame(&mut f, 1, 5, 1, &[0x80]);
+    assert_eq(goaway_code(port, f.as_slice()), 9);
+    f.clear();
+    put_frame(&mut f, 8, 0, 0, &[0x7f, 0xff, 0xff, 0xff]);
+    assert_eq(goaway_code(port, f.as_slice()), 3);
+    f.clear();
+    put_frame(&mut f, 0, 0, 1, "x".repeat(20000).as_bytes());
+    assert_eq(goaway_code(port, f.as_slice()), 6);
+    f.clear();
+    // (HEADERS not ended, then not CONTINUATION.)
+    put_frame(&mut f, 1, 1, 1, block(&get).as_slice());
+    put_frame(&mut f, 0, 0, 1, b"x");
+    assert_eq(goaway_code(port, f.as_slice()), 1);
+    // DATA after the request ended: that stream's error (STREAM_CLOSED).
+    let mut s = h2_conn(port);
+    f.clear();
+    put_frame(&mut f, 1, 5, 1, block(&get).as_slice());
+    put_frame(&mut f, 0, 0, 1, b"x");
+    s.write_all(f.as_slice()).unwrap();
+    let r = until(&mut s, 3).unwrap();
+    assert_eq(r.2, 1);
+    assert_eq(u32::from_be_bytes([r.3[0], r.3[1], r.3[2], r.3[3]]), 5);
+    f.clear();
+    put_frame(&mut f, 1, 5, 2, block(&get).as_slice());
+    assert_eq(goaway_code(port, f.as_slice()), 1);
+}
+
+const ROOT: &str = "-----BEGIN CERTIFICATE-----
+MIIBojCCASigAwIBAgIBATAKBggqhkjOPQQDAzAZMRcwFQYDVQQDEw5uYXZpIHRl
+c3Qgcm9vdDAgFw0yNjExMjQxNTM2MDFaGA8yMTI2MTAzMTE2MzYwMVowGTEXMBUG
+A1UEAxMObmF2aSB0ZXN0IHJvb3QwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAATvFeSS
+IJbf4zQN6hRvpLGrFl1hdfaNQtZs8bG9kYvfLUFedUG7IfuOPdUXTIsqK0Qt13Dc
+GEk/qDSK7tRW3raczmqc38gYQeZNr6DX4TaL1mFPjyNpkLZe3t9ffY74MTijQjBA
+MA4GA1UdDwEB/wQEAwICBDAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBRVe16e
+agLHMModiC5gUr2/Mzll1DAKBggqhkjOPQQDAwNoADBlAjEAozzJr8/tMHVgdJ91
+aFLsMhK2XOFFTKwKoAmS5JNJRs+8qgZ2a9nX/rBsIcobWkvTAjAjiUD6gXNbkVy2
+AkcvpsLze7angVcHRC8uu5IpKCMStdWD1sUmv5E9wCsKn+/etv0=
+-----END CERTIFICATE-----";
+
+const EC256_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBkjCCARigAwIBAgIBAjAKBggqhkjOPQQDAzAZMRcwFQYDVQQDEw5uYXZpIHRl
+c3Qgcm9vdDAgFw0yNjExMjQxNTM2MDFaGA8yMTI2MTAzMTE2MzYwMVowFDESMBAG
+A1UEAxMJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEicc7CVX5
+1ZlO1lqIMjXh1G+N/otazay0OVF/M+/nsY67OwCuE0pWKvJyLi6rQiwC+W13Nk1F
+TRs74+L93/a2Y6NUMFIwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHwYDVR0jBBgwFoAU
+VXtenmoCxzDKHYguYFK9vzM5ZdQwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAAB
+MAoGCCqGSM49BAMDA2gAMGUCMQDcEysx+rwTCL1rDAVl3zfFbpwPSeXxqWYeta7l
++6BJ7x7V4kg2hgh/s7N1hWA4hl4CMGDjD4zHPpIu3ACTGN1g7Ud+Yc3m18SJSfv2
+ZGL+Ul7+RB0Tc5okD1dcAsvZkqo9wg==
+-----END CERTIFICATE-----";
+
+const EC256_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTd8dIIjuW5S4KY+M
+f0aL+xEx0DcnkK+7ws/gwsXfoLihRANCAASJxzsJVfnVmU7WWogyNeHUb43+i1rN
+rLQ5UX8z7+exjrs7AK4TSlYq8nIuLqtCLAL5bXc2TUVNGzvj4v3f9rZj
+-----END PRIVATE KEY-----";

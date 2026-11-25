@@ -93,6 +93,8 @@ pub(crate) enum H2Error {
 
 fn conn_err(code: u32, msg: &str) -> H2Error { H2Error::Conn(code, msg.to_string()) }
 
+pub(crate) fn timed_out() -> io::Error { io::Error::new(io::ErrorKind::TimedOut, "http2: timed out") }
+
 pub(crate) struct Frame {
     pub kind: u8,
     pub flags: u8,
@@ -221,8 +223,10 @@ pub(crate) struct Stream {
     pub sent_end: bool,
     // RST_STREAM sent or received: its code.
     pub reset: Option<u32>,
-    // (Client) the response's head when it comes, and 1xx heads skipped.
+    // (Client) the response's head when it comes (1xx heads skipped).
     pub head: Option<Vec<HeaderField>>,
+    // (Client) when waiting on the stream ends (the request's timeout).
+    pub deadline: Option<Instant>,
 }
 
 /// A connection's state (one per connection, shared).
@@ -308,7 +312,7 @@ impl Core {
 
     pub fn new_stream(&mut self, id: u32) -> &mut Stream {
         let st = &mut Stream { id, buf: Vec::new(), pos: 0, recv_end: false, recv_window: self.my_stream_window, recv_unacked: 0, want_len: None, got_len: 0,
-            send_window: self.peer_stream_window, sent_end: false, reset: None, head: None };
+            send_window: self.peer_stream_window, sent_end: false, reset: None, head: None, deadline: None };
         self.streams.insert(id, st);
         st
     }
@@ -324,6 +328,57 @@ impl Core {
             st.pos = 0;
         }
         if self.streams.len() == 0 { self.idle_since = Instant::now(); }
+    }
+
+    // (Under mu.) Waits to be woken; false when st's deadline passed
+    // instead (st is then reset, CANCEL).
+    pub fn wait(&mut self, st: &mut Stream) -> bool {
+        match st.deadline {
+            None => {
+                self.cond.wait(&self.mu);
+                true
+            }
+            Some(d) => {
+                let now = Instant::now();
+                if now >= d {
+                    self.reset_locked(st, CANCEL, true);
+                    return false;
+                }
+                let _ = self.cond.wait_timeout(&self.mu, d.duration_since(now));
+                true
+            }
+        }
+    }
+
+    // (Client) Opens a stream with a header block: its id the next and its
+    // HEADERS queued in the same step, so ids go out in order. Err why the
+    // connection takes no new stream.
+    pub fn open_stream(&mut self, fields: &[HeaderField], end_stream: bool, deadline: Option<Instant>) -> Result<&mut Stream, String> {
+        self.hmu.lock();
+        self.mu.lock();
+        if let Some(why) = self.refuses() {
+            self.mu.unlock();
+            self.hmu.unlock();
+            return Err(why);
+        }
+        let id = if self.last_id == 0 { 1 } else { self.last_id + 2 };
+        self.last_id = id;
+        let st = self.new_stream(id);
+        st.deadline = deadline;
+        if end_stream { st.sent_end = true; }
+        self.mu.unlock();
+        self.write_headers_locked(id, fields, end_stream);
+        self.hmu.unlock();
+        Ok(st)
+    }
+
+    // (Under mu.) Why a new stream may not be opened (None: it may).
+    pub fn refuses(&self) -> Option<String> {
+        if let Some(d) = &self.dead { return Some(d.clone()); }
+        if self.goaway.is_some() || self.goaway_sent { return Some("connection going away".to_string()); }
+        if self.streams.len() as u32 >= self.peer_max_streams { return Some("too many streams".to_string()); }
+        if self.last_id >= 2147483645 { return Some("stream ids used up".to_string()); }
+        None
     }
 
     // (Under mu.) END_STREAM sent on st (with HEADERS).
@@ -390,6 +445,11 @@ impl Core {
     // frames, at most the peer's frame size each; all queued together.
     pub fn write_headers(&mut self, id: u32, fields: &[HeaderField], end_stream: bool) {
         self.hmu.lock();
+        self.write_headers_locked(id, fields, end_stream);
+        self.hmu.unlock();
+    }
+
+    fn write_headers_locked(&mut self, id: u32, fields: &[HeaderField], end_stream: bool) {
         let mut block: Vec<u8> = Vec::new();
         for f in fields.iter() { self.enc.write_field(&mut block, f); }
         let mut out: Vec<u8> = Vec::with_capacity(block.len() + 32);
@@ -406,7 +466,6 @@ impl Core {
             if at == block.len() { break; }
         }
         self.send(out);
-        self.hmu.unlock();
     }
 
     // Sends data on st within its window and the connection's, waiting
@@ -430,7 +489,10 @@ impl Core {
                     self.send_window -= n as i64;
                     break;
                 }
-                self.cond.wait(&self.mu);
+                if !self.wait(st) {
+                    self.mu.unlock();
+                    return Err(timed_out());
+                }
             }
             let last = end && at + n == data.len();
             self.send(frame(DATA, if last { END_STREAM } else { 0 }, st.id, &data[at..at + n]));
@@ -473,7 +535,10 @@ impl Core {
                 self.mu.unlock();
                 return Err(e);
             }
-            self.cond.wait(&self.mu);
+            if !self.wait(st) {
+                self.mu.unlock();
+                return Err(timed_out());
+            }
         }
         let n = crate::cmp::min(buf.len(), st.buf.len() - st.pos);
         buf[..n].copy_from_slice(&st.buf[st.pos..st.pos + n]);
@@ -651,17 +716,14 @@ impl Core {
         if f.has(ACK) { return Ok(()); }
         let p = f.payload.as_slice();
         let mut k = 0;
+        let mut table: Option<usize> = None;
         self.mu.lock();
         while k < p.len() {
             let id = ((p[k] as u16) << 8) | p[k + 1] as u16;
             let v = be32(&p[k + 2..k + 6]);
             k += 6;
             match id {
-                HEADER_TABLE_SIZE => {
-                    self.hmu.lock();
-                    self.enc.set_max_dynamic_table_size_limit(crate::cmp::min(v as usize, 4096));
-                    self.hmu.unlock();
-                }
+                HEADER_TABLE_SIZE => table = Some(crate::cmp::min(v as usize, 4096)),
                 ENABLE_PUSH => {
                     if v > 1 || (v == 1 && !self.server) {
                         self.mu.unlock();
@@ -696,6 +758,12 @@ impl Core {
         }
         self.cond.notify_all();
         self.mu.unlock();
+        // (hmu before mu where both are held: not under mu.)
+        if let Some(n) = table {
+            self.hmu.lock();
+            self.enc.set_max_dynamic_table_size_limit(n);
+            self.hmu.unlock();
+        }
         self.send(frame(SETTINGS, ACK, 0, &[]));
         Ok(())
     }
