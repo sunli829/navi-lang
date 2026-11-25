@@ -20,7 +20,7 @@ CURVES = {
         gx=0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296,
         gy=0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5,
         n=0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551,
-        limbs=4),
+        limbs=4, asm=['aarch64', 'x86_64']),
     'p384': dict(
         name='P-384',
         p=0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff,
@@ -42,6 +42,23 @@ def arr(x, n):
 
 def be_bytes(x, n):
     return '[' + ', '.join(f'{b:#04x}' for b in x.to_bytes(n, 'big')) + ']'
+
+
+# The comment of a field function, and its declaration in assembly on the
+# curve's asm architectures (nistec_<key>_<arch>.s, tools/genp256asm.py),
+# the code that follows for the others.
+def asm_or(w, key, c, sig, doc):
+    asm = c.get('asm', [])
+    if not asm:
+        w(f'// {doc}')
+        return
+    arches = ', '.join(f'target_arch = "{a}"' for a in asm)
+    w(f'// {doc} In assembly on {", ".join(asm)} (nistec_{key}_<arch>.s).')
+    w(f'#[cfg(any({arches}))]')
+    w('#[asm]')
+    w(f'{sig};')
+    w('')
+    w(f'#[cfg(not(any({arches})))]')
 
 
 def gen(key, c):
@@ -103,7 +120,7 @@ def gen(key, c):
     w('}')
     w('')
     # Montgomery multiplication (CIOS), unrolled.
-    w('// a * b / R mod p (CIOS, unrolled).')
+    asm_or(w, key, c, 'fn fe_mul(a: &Fe, b: &Fe) -> Fe', 'a * b / R mod p (CIOS, unrolled).')
     w('fn fe_mul(a: &Fe, b: &Fe) -> Fe {')
     for i in range(n + 2):
         w(f'    let mut t{i} = 0u64;')
@@ -131,8 +148,10 @@ def gen(key, c):
     w('    [' + ', '.join(f'(t{j} & mask) | (r{j} & !mask)' for j in range(n)) + ']')
     w('}')
     w('')
+    asm_or(w, key, c, 'fn fe_sqr(a: &Fe) -> Fe', 'a * a / R mod p.')
     w('fn fe_sqr(a: &Fe) -> Fe { fe_mul(a, a) }')
     w('')
+    asm_or(w, key, c, 'fn fe_add(a: &Fe, b: &Fe) -> Fe', 'a + b mod p.')
     w('fn fe_add(a: &Fe, b: &Fe) -> Fe {')
     w('    let (s0, c0) = adc(a[0], b[0], 0);')
     for j in range(1, n):
@@ -146,6 +165,7 @@ def gen(key, c):
     w('    [' + ', '.join(f'(s{j} & mask) | (d{j} & !mask)' for j in range(n)) + ']')
     w('}')
     w('')
+    asm_or(w, key, c, 'fn fe_sub(a: &Fe, b: &Fe) -> Fe', 'a - b mod p.')
     w('fn fe_sub(a: &Fe, b: &Fe) -> Fe {')
     w('    let (d0, w0) = sbb(a[0], b[0], 0);')
     for j in range(1, n):
@@ -322,7 +342,21 @@ Point { x: x3, y: y3, z: z3 }'''
         w('    ' + line)
     w('}')
     w('')
-    w('// table[idx] (idx < table.len()), every entry read.')
+    asm = c.get('asm', [])
+    if asm:
+        arches = ', '.join(f'target_arch = "{a}"' for a in asm)
+        w(f'// table[idx] (idx < table.len()), every entry read. In assembly on {", ".join(asm)}')
+        w(f'// (nistec_{key}_<arch>.s).')
+        w(f'#[cfg(any({arches}))]')
+        w('#[asm]')
+        w('fn select_point(table: *const Point, n: usize, idx: u64) -> Point;')
+        w('')
+        w(f'#[cfg(any({arches}))]')
+        w('fn lookup(table: &[Point], idx: u64) -> Point { select_point(table.as_ptr(), table.len(), idx) }')
+        w('')
+        w(f'#[cfg(not(any({arches})))]')
+    else:
+        w('// table[idx] (idx < table.len()), every entry read.')
     w('fn lookup(table: &[Point], idx: u64) -> Point {')
     w('    let mut r = identity();')
     w('    r.y = ZERO;')
