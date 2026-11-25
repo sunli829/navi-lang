@@ -1,9 +1,76 @@
 //! Arithmetic modulo an odd number (RSA's n, the NIST curves' p and n):
 //! numbers as little-endian 64-bit limbs, as many as the modulus has,
-//! multiplied in Montgomery form (CIOS; 64x64 -> 128-bit products with
-//! u64::widening_mul, carries by comparison: no u128). Constant-time but
+//! multiplied in Montgomery form (as Go's bigmod: two passes of
+//! z += x * y per limb, in assembly on arm64 and amd64; elsewhere CIOS
+//! with u64::widening_mul, carries by comparison). Constant-time but
 //! for `pow`, whose exponent's bits decide the steps (exponents are public
 //! here: RSA's e, p - 2, n - 2).
+
+// z += x * y over n limbs, returning the carry (nat_arm64.s, nat_amd64.s).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[asm]
+fn add_mul_vvw(z: *mut u64, x: *const u64, n: usize, y: u64) -> u64;
+
+// a * b * R^-1 mod m into out as Go's montgomeryMul: t (2n words, zeroed
+// here) += a * b[i] and then the multiple of m that clears t[i], so the
+// result is t[n..2n] plus the carry c (below 2m). False: not here.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn mont_mul_asm(md: &Modulus, a: &[u64], b: &[u64], out: &mut [u64], t: &mut [u64]) -> bool {
+    let n = md.m.len();
+    if a.len() != n || b.len() != n || out.len() != n || t.len() < 2 * n { return false; }
+    let mut i = 0;
+    while i < 2 * n {
+        t[i] = 0;
+        i += 1;
+    }
+    let mut c = 0u64;
+    i = 0;
+    while i < n {
+        let c1 = unsafe { add_mul_vvw(t.as_mut_ptr().add(i), a.as_ptr(), n, b[i]) };
+        let y = t[i].wrapping_mul(md.m0inv);
+        let c2 = unsafe { add_mul_vvw(t.as_mut_ptr().add(i), md.m.as_ptr(), n, y) };
+        let s = c1.wrapping_add(c2);
+        let s2 = s.wrapping_add(c);
+        c = ((s < c1) as u64) | ((s2 < s) as u64);
+        t[n + i] = s2;
+        i += 1;
+    }
+    let borrow = sub_limbs(&t[n..2 * n], &md.m, out);
+    // Keep t (no carry and t < m) or the difference.
+    let mask = 0u64.wrapping_sub(borrow & (c ^ 1));
+    i = 0;
+    while i < n {
+        out[i] = (t[n + i] & mask) | (out[i] & !mask);
+        i += 1;
+    }
+    true
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn mont_mul_asm(md: &Modulus, a: &[u64], b: &[u64], out: &mut [u64], t: &mut [u64]) -> bool { false }
+
+// out = entry idx (n limbs) of table, every entry read (masked).
+fn select_entry(table: &[u64], n: usize, idx: u64, out: &mut [u64]) {
+    let mut l = 0;
+    while l < n {
+        out[l] = 0;
+        l += 1;
+    }
+    let entries = table.len() / n;
+    let mut j = 0;
+    while j < entries {
+        let d = (j as u64) ^ idx;
+        // All ones when d == 0.
+        let mask = (((d | d.wrapping_neg()) >> 63) ^ 1).wrapping_neg();
+        let e = &table[j * n..(j + 1) * n];
+        l = 0;
+        while l < n {
+            out[l] = out[l] | (e[l] & mask);
+            l += 1;
+        }
+        j += 1;
+    }
+}
 
 /// An odd modulus and what Montgomery multiplication needs of it.
 #[derive(Clone)]
@@ -243,13 +310,29 @@ impl Modulus {
         out
     }
 
-    /// a * b * R^-1 mod m (CIOS).
+    /// a * b * R^-1 mod m.
     pub fn mont_mul(&self, a: &[u64], b: &[u64]) -> Vec<u64> {
         let n = self.m.len();
-        let m = &self.m;
+        let mut out: Vec<u64> = Vec::new();
+        out.resize(n, 0);
         let mut t: Vec<u64> = Vec::new();
-        t.resize(n + 2, 0);
+        t.resize(2 * n + 2, 0);
+        self.mont_mul_to(a, b, out.as_mut_slice(), t.as_mut_slice());
+        out
+    }
+
+    // a * b * R^-1 mod m into out (n limbs; not a or b), t scratch of
+    // 2n + 2 words (CIOS where there is no assembly).
+    fn mont_mul_to(&self, a: &[u64], b: &[u64], out: &mut [u64], t: &mut [u64]) {
+        if mont_mul_asm(self, a, b, out, t) { return; }
+        let n = self.m.len();
+        let m = &self.m;
         let mut i = 0;
+        while i < n + 2 {
+            t[i] = 0;
+            i += 1;
+        }
+        i = 0;
         while i < n {
             // t += a * b[i]
             let bi = b[i];
@@ -288,15 +371,15 @@ impl Modulus {
             i += 1;
         }
         // t < 2m: subtract m unless t < m.
-        let mut r: Vec<u64> = Vec::new();
-        r.resize(n, 0);
-        let borrow = sub_limbs(&t[..n], &self.m, &mut r);
-        let keep = borrow & ((t[n] != 0) as u64 ^ 1);
-        let mut out: Vec<u64> = Vec::new();
-        out.resize(n, 0);
-        pick(keep, &t[..n], &r, &mut out);
-        out
+        let borrow = sub_limbs(&t[..n], &self.m, out);
+        let mask = 0u64.wrapping_sub(borrow & ((t[n] != 0) as u64 ^ 1));
+        i = 0;
+        while i < n {
+            out[i] = (t[i] & mask) | (out[i] & !mask);
+            i += 1;
+        }
     }
+
 
     /// x * R mod m (into Montgomery form).
     pub fn to_mont(&self, x: &[u64]) -> Vec<u64> { self.mont_mul(x, &self.rr) }
@@ -320,13 +403,22 @@ impl Modulus {
     /// x^e (x in Montgomery form, e big-endian bytes; the result too).
     /// Variable-time in e.
     pub fn pow(&self, x: &[u64], e: &[u8]) -> Vec<u64> {
+        let n = self.m.len();
         let mut r = self.one();
+        let mut o: Vec<u64> = Vec::new();
+        o.resize(n, 0);
+        let mut t: Vec<u64> = Vec::new();
+        t.resize(2 * n + 2, 0);
         for byte in e.iter() {
             let mut k = 8;
             while k > 0 {
                 k -= 1;
-                r = self.mont_mul(&r, &r);
-                if ((*byte >> k as u8) & 1) != 0 { r = self.mont_mul(&r, x); }
+                self.mont_mul_to(&r, &r, o.as_mut_slice(), t.as_mut_slice());
+                crate::mem::swap(&mut r, &mut o);
+                if ((*byte >> k as u8) & 1) != 0 {
+                    self.mont_mul_to(&r, x, o.as_mut_slice(), t.as_mut_slice());
+                    crate::mem::swap(&mut r, &mut o);
+                }
             }
         }
         r
@@ -337,43 +429,39 @@ impl Modulus {
     /// table entries are read by masked selects (for secret exponents: RSA
     /// signing).
     pub fn pow_secret(&self, x: &[u64], e: &[u8]) -> Vec<u64> {
-        let mut table: Vec<Vec<u64>> = Vec::new();
-        table.push(self.one());
-        table.push(x.to_vec());
+        let n = self.m.len();
+        let mut t: Vec<u64> = Vec::new();
+        t.resize(2 * n + 2, 0);
+        // x^0 .. x^15, n limbs each.
+        let mut table: Vec<u64> = Vec::new();
+        table.extend_from_slice(&self.one());
+        table.extend_from_slice(x);
+        table.resize(16 * n, 0);
         let mut i = 2;
         while i < 16 {
-            let t = self.mont_mul(&table[i - 1], x);
-            table.push(t);
+            let (done, rest) = table.split_at_mut(i * n);
+            self.mont_mul_to(&done[(i - 1) * n..], x, &mut rest[..n], t.as_mut_slice());
             i += 1;
         }
-        let n = self.m.len();
         let mut r = self.one();
+        let mut o: Vec<u64> = Vec::new();
+        o.resize(n, 0);
+        let mut sel: Vec<u64> = Vec::new();
+        sel.resize(n, 0);
         for byte in e.iter() {
             let mut half = 0;
             while half < 2 {
                 let nib = if half == 0 { (*byte >> 4) as u64 } else { (*byte & 15) as u64 };
                 let mut k = 0;
                 while k < 4 {
-                    r = self.mont_mul(&r, &r);
+                    self.mont_mul_to(&r, &r, o.as_mut_slice(), t.as_mut_slice());
+                    crate::mem::swap(&mut r, &mut o);
                     k += 1;
                 }
-                // t = table[nib], every entry read.
-                let mut t: Vec<u64> = Vec::new();
-                t.resize(n, 0);
-                let mut j = 0;
-                while j < 16 {
-                    let d = (j as u64) ^ nib;
-                    // 1 when d == 0.
-                    let eq = ((d | d.wrapping_neg()) >> 63) ^ 1;
-                    let mask = 0u64.wrapping_sub(eq);
-                    let mut l = 0;
-                    while l < n {
-                        t[l] = t[l] | (table[j][l] & mask);
-                        l += 1;
-                    }
-                    j += 1;
-                }
-                r = self.mont_mul(&r, &t);
+                // sel = table[nib], every entry read.
+                select_entry(&table, n, nib, sel.as_mut_slice());
+                self.mont_mul_to(&r, &sel, o.as_mut_slice(), t.as_mut_slice());
+                crate::mem::swap(&mut r, &mut o);
                 half += 1;
             }
         }
