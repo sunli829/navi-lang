@@ -30,6 +30,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | Rust | navi | 说明 |
 |---|---|---|
 | channel 在所有 `Sender` 被 drop 后关闭 | `Sender::close()` | 新增 API |
+| 所有 `Receiver` 被 drop 后，发送方得到 `Disconnected`（`send`、`try_send`、`send_timeout` 失败，阻塞的发送方被叫醒） | `Receiver::close()`（新增 API：丢掉通道里剩下的值）；没调用时，GC 发现没有 `Receiver` 引用了，也同样关闭，只是要等到一次回收（最迟是每 2 分钟一次的强制回收） | 没有 Drop，GC 只能事后发现 |
 | `Mutex::lock()` 返回 guard，drop 时解锁 | `lock()` / `unlock()`，另有 `with_lock(\|v\| ..)`、`try_lock() -> bool`；没有锁中毒 | 共享时用 `&Mutex<T>` |
 | 文件、socket、管道在 drop 时关闭 | `File::close()`、`ChildStdin`/`ChildStdout`/`ChildStderr::close()`，配合 `defer` | 重复调用无害；`Child::wait`/`wait_with_output` 会先关掉仍留在 `Child` 里的 `stdin`（同 Rust），被 `take()` 走的要自己 `close()`，子进程才读到输入结束 |
 

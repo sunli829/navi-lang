@@ -88,18 +88,33 @@ impl<T> crate::fmt::Display for SendTimeoutError<T> {
 // Channels are shared and mutated through &self; the handles hold a raw
 // pointer to the runtime's channel (the GC traces raw pointers).
 pub struct Sender<T> { chan: *mut u8, marker: Option<T> }
-pub struct Receiver<T> { chan: *mut u8, marker: Option<T> }
+// (side: what every Receiver of a channel with senders refers to; when the
+// collector finds none, the channel closes from the receiving side, as
+// Rust's does when its last Receiver is dropped.)
+pub struct Receiver<T> { chan: *mut u8, marker: Option<T>, side: Option<&RecvSide> }
+
+// (A word: an object of its own, never shared with another's.)
+struct RecvSide { chan: *mut u8 }
+
+// The receiving side of channel c: when no Receiver refers to it any
+// more, c closes for its senders (some time after: a collection finds it;
+// rt::gc's channel sides).
+fn recv_side(c: *mut u8) -> Option<&RecvSide> {
+    let s = &RecvSide { chan: 0 as *mut u8 };
+    crate::rt::gc::add_chan_side(s as *const RecvSide as usize, c as usize);
+    Some(s)
+}
 
 /// An unbounded channel.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let c = crate::rt::chan_new::<T>(18446744073709551615);
-    (Sender { chan: c, marker: None }, Receiver { chan: c, marker: None })
+    (Sender { chan: c, marker: None }, Receiver { chan: c, marker: None, side: recv_side(c) })
 }
 
 /// A bounded channel; capacity 0 makes every send wait for a receiver.
 pub fn sync_channel<T>(bound: usize) -> (Sender<T>, Receiver<T>) {
     let c = crate::rt::chan_new::<T>(bound);
-    (Sender { chan: c, marker: None }, Receiver { chan: c, marker: None })
+    (Sender { chan: c, marker: None }, Receiver { chan: c, marker: None, side: recv_side(c) })
 }
 
 impl<T> Sender<T> {
@@ -199,10 +214,16 @@ impl<T> Receiver<T> {
         }
     }
 
-    pub fn iter(&self) -> Iter<T> { Iter { rx: Receiver { chan: self.chan, marker: None } } }
+    pub fn iter(&self) -> Iter<T> { Iter { rx: self.clone() } }
 
     /// The values there are now, without waiting.
-    pub fn try_iter(&self) -> TryIter<T> { TryIter { rx: Receiver { chan: self.chan, marker: None } } }
+    pub fn try_iter(&self) -> TryIter<T> { TryIter { rx: self.clone() } }
+
+    /// Closes the channel from the receiving side (as all of Rust's
+    /// Receivers dropped; navi has no Drop): its values are dropped,
+    /// senders get Disconnected, receivers Err. Without it, senders find
+    /// out once the collector finds no Receiver left.
+    pub fn close(&self) { crate::rt::sched::close_recv(self.chan as *mut crate::rt::sched::Chan); }
 
     pub fn len(&self) -> usize { chan_len(self.chan) }
 
@@ -219,14 +240,15 @@ impl<T> Receiver<T> {
     pub(crate) fn timer(when: u64, period: u64) -> Receiver<T> {
         let c = crate::rt::chan_new::<T>(1);
         crate::rt::sched::timer_set(c as *mut crate::rt::sched::Chan, when, period);
-        Receiver { chan: c, marker: None }
+        // (No senders: nothing to tell.)
+        Receiver { chan: c, marker: None, side: None }
     }
 
     pub(crate) fn timer_set(&self, when: u64, period: u64) { crate::rt::sched::timer_set(self.chan as *mut crate::rt::sched::Chan, when, period); }
 }
 
 impl<T> Clone for Receiver<T> {
-    fn clone(&self) -> Receiver<T> { Receiver { chan: self.chan, marker: None } }
+    fn clone(&self) -> Receiver<T> { Receiver { chan: self.chan, marker: None, side: self.side } }
 }
 
 pub struct Iter<T> { rx: Receiver<T> }

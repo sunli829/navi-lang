@@ -2587,13 +2587,70 @@ fn is_marked(addr: usize) -> bool {
 }
 
 // Cleanups: CL_N records of CL_REC bytes: [address, id, the function (a
-// closure value)]; address 0 once queued (to run) or stopped.
+// closure value)]. Those whose object died move to the queue (CLQ: the
+// functions, CLQ_HEAD..CLQ_N to run): taking one is O(1) (it was a scan of
+// every record, and a million short-lived channels' cleanups made that
+// quadratic).
 static mut CL: usize = 0;
 static mut CL_N: usize = 0;
 static mut CL_CAP: usize = 0;
 static mut CL_NEXT_ID: usize = 0;
 static mut CL_QUEUED: usize = 0;
 const CL_FN: usize = 16;
+static mut CLQ: usize = 0;
+static mut CLQ_N: usize = 0;
+static mut CLQ_CAP: usize = 0;
+static mut CLQ_HEAD: usize = 0;
+
+fn clq_size() -> usize { crate::intrinsics::size_of::<fn()>() }
+
+// Channels' receiving sides (std::sync::mpmc): CS_N pairs [side, channel],
+// neither a root. When a mark leaves the side (every Receiver's) dead and
+// the channel alive (a Sender has it), the channel goes to CSQ, a root, for
+// the cleanup G to close from the receiving side; both dead, the pair just
+// goes. (Lighter than a cleanup each: no closure, nothing to run for the
+// usual channel that dies whole.)
+static mut CS: usize = 0;
+static mut CS_N: usize = 0;
+static mut CS_CAP: usize = 0;
+static mut CSQ: usize = 0;
+static mut CSQ_N: usize = 0;
+static mut CSQ_CAP: usize = 0;
+static mut CSQ_HEAD: usize = 0;
+
+/// Registers side as channel chan's receiving side (both GC objects).
+pub fn add_chan_side(side: usize, chan: usize) {
+    crate::rt::sched::start_helpers();
+    special_lock();
+    if CS_N == CS_CAP {
+        let cap = if CS_CAP == 0 { 64 } else { CS_CAP * 2 };
+        let p = unsafe { realloc(CS as *mut u8, cap * 16) } as usize;
+        if p == 0 { out_of_memory(); }
+        CS = p;
+        CS_CAP = cap;
+    }
+    wset(CS + 16 * CS_N, side);
+    wset(CS + 16 * CS_N + 8, chan);
+    CS_N += 1;
+    special_unlock();
+}
+
+/// The next channel to close from the receiving side (the cleanup G).
+pub fn next_chan_close() -> usize {
+    special_lock();
+    if CSQ_HEAD == CSQ_N {
+        CSQ_HEAD = 0;
+        CSQ_N = 0;
+        special_unlock();
+        return 0;
+    }
+    let c = wget(CSQ + 8 * CSQ_HEAD);
+    wset(CSQ + 8 * CSQ_HEAD, 0);
+    CSQ_HEAD += 1;
+    CL_QUEUED -= 1;
+    special_unlock();
+    c
+}
 
 fn cl_rec() -> usize { CL_FN + crate::intrinsics::size_of::<fn()>() }
 
@@ -2649,7 +2706,7 @@ fn cl_remove(i: usize) {
     }
 }
 
-// The cleanups' functions are roots.
+// The cleanups' functions are roots (registered and queued).
 fn scan_cleanups() {
     let mut i = 0;
     while i < CL_N {
@@ -2657,6 +2714,13 @@ fn scan_cleanups() {
         scan_range(r + CL_FN, r + cl_rec());
         i += 1;
     }
+    i = CLQ_HEAD;
+    while i < CLQ_N {
+        let q = CLQ + i * clq_size();
+        scan_range(q, q + clq_size());
+        i += 1;
+    }
+    if CSQ_N > CSQ_HEAD { scan_range(CSQ + 8 * CSQ_HEAD, CSQ + 8 * CSQ_N); }
 }
 
 // At the end of a mark (the world stopped): clears the handles of dead
@@ -2683,10 +2747,50 @@ fn sweep_specials() {
         let r = CL + i * cl_rec();
         let a = wget(r);
         if a != 0 && !is_marked(a) {
-            wset(r, 0);
+            // To the queue (C memory: no collection here).
+            if CLQ_N == CLQ_CAP {
+                let cap = if CLQ_CAP == 0 { 64 } else { CLQ_CAP * 2 };
+                let p = unsafe { realloc(CLQ as *mut u8, cap * clq_size()) } as usize;
+                if p == 0 { out_of_memory(); }
+                CLQ = p;
+                CLQ_CAP = cap;
+            }
+            let mut k = 0;
+            while k < clq_size() {
+                wset(CLQ + CLQ_N * clq_size() + k, wget(r + CL_FN + k));
+                k += 8;
+            }
+            CLQ_N += 1;
             CL_QUEUED += 1;
+            cl_remove(i);
+            continue;
         }
         i += 1;
+    }
+    i = 0;
+    while i < CS_N {
+        let side = wget(CS + 16 * i);
+        if is_marked(side) {
+            i += 1;
+            continue;
+        }
+        let ch = wget(CS + 16 * i + 8);
+        if is_marked(ch) {
+            if CSQ_N == CSQ_CAP {
+                let cap = if CSQ_CAP == 0 { 64 } else { CSQ_CAP * 2 };
+                let p = unsafe { realloc(CSQ as *mut u8, cap * 8) } as usize;
+                if p == 0 { out_of_memory(); }
+                CSQ = p;
+                CSQ_CAP = cap;
+            }
+            wset(CSQ + 8 * CSQ_N, ch);
+            CSQ_N += 1;
+            CL_QUEUED += 1;
+        }
+        // (The last pair into its place.)
+        CS_N -= 1;
+        wset(CS + 16 * i, wget(CS + 16 * CS_N));
+        wset(CS + 16 * i + 8, wget(CS + 16 * CS_N + 8));
     }
 }
 
@@ -2698,18 +2802,22 @@ fn wake_cleanups() {
 /// The next queued cleanup (the cleanup G; None: none left), taken off.
 pub fn next_cleanup() -> Option<fn()> {
     special_lock();
-    let mut i = 0;
-    while i < CL_N {
-        let r = CL + i * cl_rec();
-        if wget(r) == 0 {
-            let f = unsafe { *((r + CL_FN) as *const fn()) };
-            cl_remove(i);
-            CL_QUEUED -= 1;
-            special_unlock();
-            return Some(f);
-        }
-        i += 1;
+    if CLQ_HEAD == CLQ_N {
+        CLQ_HEAD = 0;
+        CLQ_N = 0;
+        special_unlock();
+        return None;
     }
+    let q = CLQ + CLQ_HEAD * clq_size();
+    let f = unsafe { *(q as *const fn()) };
+    // (No longer a root here: f is the caller's.)
+    let mut k = 0;
+    while k < clq_size() {
+        wset(q + k, 0);
+        k += 8;
+    }
+    CLQ_HEAD += 1;
+    CL_QUEUED -= 1;
     special_unlock();
-    None
+    Some(f)
 }
