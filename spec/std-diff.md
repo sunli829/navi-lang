@@ -287,7 +287,7 @@ DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）�
 
 | 项目 | Rust / Go | navi | 原因 |
 |---|---|---|---|
-| 包的元数据 | `env!("CARGO_PKG_NAME")`、`env!("CARGO_PKG_VERSION")`、`env!("CARGO_PKG_DESCRIPTION")` | `std::build::package_name()`、`package_version()`、`package_description()`，编译时就是常量，来自调用所在 crate 的 `navi.toml` | 没有宏；函数比环境变量名直接 |
+| 包的元数据 | `env!("CARGO_PKG_NAME")`、`env!("CARGO_PKG_VERSION")`、`env!("CARGO_PKG_DESCRIPTION")`、`env!("CARGO_PKG_AUTHORS")`（以 `:` 连接）、`LICENSE`、`REPOSITORY`、`HOMEPAGE` | `std::build::package_name()`、`package_version()`、`package_description()`、`package_authors()`（以 `, ` 连接）、`package_license()`、`package_repository()`、`package_homepage()`，编译时就是常量，来自调用所在 crate 的 `navi.toml` | 没有宏；函数比环境变量名直接 |
 | 构建时从外面传值 | Rust：`option_env!("X")` 读环境变量；Go：`-ldflags "-X main.x=..."` | `navi build --var x=...`，`std::build::var("x") -> Option<&str>`（名字是字面量） | 构建依赖什么写在命令行上，不悄悄依赖环境；源码里出现 `std::build` 的 crate 才把 `--var` 算进缓存的键 |
 
 ### std::cli（clap 4 的 builder API 和 derive）
@@ -296,7 +296,7 @@ DEFLATE、zlib、gzip 都是 std 自己实现的（没有用 miniz 或 zlib）�
 
 | 项目 | clap | navi | 原因 |
 |---|---|---|---|
-| derive API | `#[derive(Parser, Args, Subcommand, ValueEnum)]` | 相同（`std::cli` 里的派生宏，生成 builder 代码）：字段类型决定行为（`bool` 开关、`Option` 可省、`Vec` 多个、其余必填）、`///` 注释作帮助、`#[command(...)]`、`#[arg(...)]`、`#[value(name)]`；`#[command(version)]`、`#[command(about)]` 不写值时取包的（`std::build`，同 clap 从 Cargo 取），没写 `name` 时用包名；`ValueEnum` 同时生成 `FromStr` 和 `Display`（`get_one` 用 `FromStr` 取值） | — |
+| derive API | `#[derive(Parser, Args, Subcommand, ValueEnum)]` | 相同（`std::cli` 里的派生宏，生成 builder 代码）：字段类型决定行为（`bool` 开关、`Option` 可省、`Vec` 多个、其余必填）、`///` 注释作帮助、`#[command(...)]`、`#[arg(...)]`、`#[value(name)]`；`#[command(version)]`、`#[command(about)]`、`#[command(author)]` 不写值时取包的（`std::build`，同 clap 从 Cargo 取），没写 `name` 时用包名；`ValueEnum` 同时生成 `FromStr` 和 `Display`（`get_one` 用 `FromStr` 取值） | — |
 | `value_parser!(u16).range(..)`、`["a", "b"]` | 宏和多种 `IntoResettable` | `ValueParser::i64_range(lo, hi)`、`u64_range`、`possible(&[..])`、`i64()`、`u64()`、`f64()`、`bool()`、`string()` | 没有宏 |
 | `get_one::<T>` | 返回 `Option<&T>`，值在解析时按 value_parser 转换；类型不符时 panic | 返回 `Option<T>`，取值时用 `FromStr` 转换，转换失败是 `None` | 简化（GC 语言里返回拷贝即可） |
 | `get_many::<T>` | `ValuesRef<T>` | `vec::IntoIter<T>` | 同上 |

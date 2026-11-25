@@ -263,14 +263,14 @@ d=$tmp/buildinfo
 mkdir -p "$d/lib/src" "$d/app/src"
 printf '[package]\nname = "lib"\nversion = "0.3.0"\n' > "$d/lib/navi.toml"
 printf 'pub fn v() -> &str { std::build::package_version() }\n' > "$d/lib/src/lib.navi"
-printf '[package]\nname = "app"\nversion = "1.2.0"\ndescription = "Demo"\n\n[dependencies]\nlib = { path = "../lib" }\n' > "$d/app/navi.toml"
-printf 'use std::cli::Parser;\n#[derive(Parser)]\n#[command(version, about)]\nstruct Cli {}\nfn main() {\n    if std::env::args().count() > 1 { Cli::parse(); }\n    println(`${std::build::package_name()} ${std::build::package_version()} ${std::build::package_description()} ${lib::v()} ${std::build::var("commit").unwrap_or("-")}`);\n}\n' > "$d/app/src/main.navi"
+printf '[package]\nname = "app"\nversion = "1.2.0"\ndescription = "Demo"\nauthors = ["A", "B"]\nlicense = "MIT"\n\n[dependencies]\nlib = { path = "../lib" }\n' > "$d/app/navi.toml"
+printf 'use std::cli::Parser;\n#[derive(Parser)]\n#[command(version, about)]\nstruct Cli {}\nfn main() {\n    if std::env::args().count() > 1 { Cli::parse(); }\n    println(`${std::build::package_name()} ${std::build::package_version()} ${std::build::package_description()} ${lib::v()} ${std::build::var("commit").unwrap_or("-")} ${std::build::package_authors()} ${std::build::package_license()}`);\n}\n' > "$d/app/src/main.navi"
 b1=$(cd "$d/app" && "$navi" run 2>&1 | tail -1) || true
 b2=$(cd "$d/app" && "$navi" run --var commit=abc 2>&1 | tail -1) || true
 printf '[package]\nname = "lib"\nversion = "0.4.0"\n' > "$d/lib/navi.toml"
 b3=$(cd "$d/app" && "$navi" run 2>&1 | tail -1) || true
 b4=$(cd "$d/app" && "$navi" run -- --version 2>&1 | tail -1) || true
-if [ "$b1" = "app 1.2.0 Demo 0.3.0 -" ] && [ "$b2" = "app 1.2.0 Demo 0.3.0 abc" ] && [ "$b3" = "app 1.2.0 Demo 0.4.0 -" ] && [ "$b4" = "app 1.2.0" ]; then
+if [ "$b1" = "app 1.2.0 Demo 0.3.0 - A, B MIT" ] && [ "$b2" = "app 1.2.0 Demo 0.3.0 abc A, B MIT" ] && [ "$b3" = "app 1.2.0 Demo 0.4.0 - A, B MIT" ] && [ "$b4" = "app 1.2.0" ]; then
 	echo "ok   std::build"
 else
 	echo "FAIL std::build"; printf '%s\n' "$b1" "$b2" "$b3" "$b4"; fail=1
