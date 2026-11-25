@@ -682,3 +682,73 @@ pub fn licm(f: &mut Func) {
         }
     }
 }
+
+/// Stores to locals nothing reads (Go's deadstore, for whole locals):
+/// first a Move between locals from one its memory has just zeroed (the
+/// Zero of the same size right before) becomes a Zero of the destination;
+/// then the
+/// Zero, Store and Move into a local of quiet (no pointers to keep set for
+/// the collector) whose every LocalAddr is only such a destination go,
+/// their memory passed on. An inlined constructor's temporary is then
+/// neither filled nor copied.
+pub fn dead_stores(f: &mut Func, quiet: &Vec<bool>) {
+    copyelim(f);
+    let is_local = |a: &Value| -> bool { a.op == OP_LOCALADDR };
+    for bb in f.blocks.iter() {
+        for vv in bb.values.iter() {
+            let v = *vv;
+            if v.op != OP_MOVE { continue; }
+            let src = v.args[1];
+            let z = v.args[2];
+            if z.op == OP_ZERO && z.aux_int == v.aux_int && is_local(v.args[0]) && is_local(src) && is_local(z.args[0]) && z.args[0].aux_int == src.aux_int {
+                // Move dst src mem -> Zero dst mem.
+                let dst = v.args[0];
+                for x in v.args.iter() {
+                    let a = *x;
+                    a.uses -= 1;
+                }
+                v.args.clear();
+                v.op = OP_ZERO;
+                v.aux = Aux::None;
+                v.add_arg(dst);
+                v.add_arg(z);
+            }
+        }
+    }
+    let mut read: Vec<bool> = Vec::new();
+    read.resize(quiet.len(), false);
+    let mut mark = |a: &Value| {
+        if a.op == OP_LOCALADDR && (a.aux_int as usize) < read.len() { read[a.aux_int as usize] = true; }
+    };
+    for bb in f.blocks.iter() {
+        if let Some(c) = bb.control { mark(c); }
+        for vv in bb.values.iter() {
+            let v = *vv;
+            // (Copies are read through: copyelim has their users take the
+            // source.)
+            if v.op == OP_COPY { continue; }
+            let store = v.op == OP_ZERO || v.op == OP_STORE || v.op == OP_MOVE;
+            let mut i = 0;
+            while i < v.args.len() {
+                if !(store && i == 0) { mark(v.args[i]); }
+                i += 1;
+            }
+        }
+    }
+    let mut any = false;
+    for bb in f.blocks.iter() {
+        for vv in bb.values.iter() {
+            let v = *vv;
+            if v.op != OP_ZERO && v.op != OP_STORE && v.op != OP_MOVE { continue; }
+            let d = v.args[0];
+            if d.op != OP_LOCALADDR { continue; }
+            let l = d.aux_int as usize;
+            if l < quiet.len() && quiet[l] && !read[l] {
+                let mem = v.args[v.args.len() - 1];
+                v.become_copy(mem);
+                any = true;
+            }
+        }
+    }
+    if any { copyelim(f); }
+}

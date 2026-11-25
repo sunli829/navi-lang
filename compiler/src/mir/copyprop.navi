@@ -267,7 +267,118 @@ pub fn propagate(f: &mut Func) {
         let rw = &mut Rw { to_local, to_const, changed: false };
         rewrite(f, rw);
     }
+    forward_dest(f);
     remove_dead(f);
+}
+
+// Whether rv reads only constants and its own locals' storage, none of
+// them l.
+fn reads_own_except(rv: &Rvalue, l: usize) -> bool {
+    let pl = |p: &Place| -> bool { p.local != l && own_storage(p) };
+    let op = |o: &Operand| -> bool { o.kind != OP_COPY || pl(&o.place) };
+    match rv {
+        Rvalue::Use(x) | Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => op(x),
+        Rvalue::Bin { x, y, .. } => op(x) && op(y),
+        Rvalue::Aggregate { ops, .. } => ops.iter().all(|o| op(o)),
+        Rvalue::Discr(p) | Rvalue::Len(p) => pl(p),
+        Rvalue::Ref { .. } => false,
+    }
+}
+
+fn mentions(rv: &Rvalue, l: usize) -> bool {
+    let pl = |p: &Place| -> bool {
+        if p.local == l { return true; }
+        for pr in p.proj.iter() {
+            if pr.kind == P_INDEX && pr.index == l { return true; }
+        }
+        false
+    };
+    let op = |o: &Operand| -> bool { o.kind == OP_COPY && pl(&o.place) };
+    match rv {
+        Rvalue::Use(x) | Rvalue::Un { x, .. } | Rvalue::Cast { x, .. } | Rvalue::Unsize { x, .. } | Rvalue::MakeDyn { x, .. } => op(x),
+        Rvalue::Bin { x, y, .. } => op(x) || op(y),
+        Rvalue::Aggregate { ops, .. } => ops.iter().any(|o| op(o)),
+        Rvalue::Discr(p) | Rvalue::Len(p) | Rvalue::Ref { place: p, .. } => pl(p),
+    }
+}
+
+// `t = rv; p = t` (t assigned and read only there, the statements between
+// at most StorageLive of other locals) becomes `p = rv` when rv reads
+// nothing p could be: only constants and locals' own storage, not p's
+// local. The value is made where it goes (an inlined constructor's
+// result, an aggregate's temporary, no longer copied).
+fn forward_dest(f: &mut Func) {
+    let info = scan(f);
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        let n = b.stmts.len();
+        // (index of t = rv, index of p = t) pairs, in order.
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        let mut si = 0;
+        while si < n {
+            if let Stmt::Assign { place: tp, rv } = &b.stmts[si] {
+                let t = tp.local;
+                if tp.proj.len() == 0 && t > f.nargs && info.defs[t] == 1 && info.uses[t] == 1 && !info.pinned[t] {
+                    let mut j = si + 1;
+                    let mut ok = true;
+                    while j < n {
+                        match &b.stmts[j] {
+                            Stmt::StorageLive(l) => {
+                                if *l == t || mentions(rv, *l) { ok = false; }
+                            }
+                            _ => break,
+                        }
+                        if !ok { break; }
+                        j += 1;
+                    }
+                    if ok && j < n {
+                        if let Stmt::Assign { place: p, rv: Rvalue::Use(x) } = &b.stmts[j] {
+                            if x.kind == OP_COPY && x.place.local == t && x.place.proj.len() == 0 && own_storage(p) && p.local != t
+                                && reads_own_except(rv, p.local) {
+                                let mut idx_ok = true;
+                                for pr in p.proj.iter() {
+                                    if pr.kind == P_INDEX && pr.index == t { idx_ok = false; }
+                                }
+                                if idx_ok {
+                                    pairs.push((si, j));
+                                    si = j + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            si += 1;
+        }
+        if pairs.len() > 0 {
+            let mut stmts: Vec<Stmt> = Vec::new();
+            let mut k = 0;
+            si = 0;
+            while si < n {
+                if k < pairs.len() && si == pairs[k].0 {
+                    si += 1;
+                    continue;
+                }
+                if k < pairs.len() && si == pairs[k].1 {
+                    if let Stmt::Assign { rv, .. } = &b.stmts[pairs[k].0] {
+                        if let Stmt::Assign { place, .. } = &b.stmts[si] {
+                            stmts.push(Stmt::Assign { place: Place { local: place.local, proj: place.proj }, rv: rv.clone() });
+                        }
+                    }
+                    k += 1;
+                    si += 1;
+                    continue;
+                }
+                stmts.push(b.stmts[si].clone());
+                si += 1;
+            }
+            // Blocks may be shared with other functions: a new one.
+            f.blocks[bi] = &mut Block { stmts, term: b.term.clone() };
+        }
+        bi += 1;
+    }
 }
 
 // Whether the block reads or writes a replaced local.
