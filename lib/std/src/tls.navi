@@ -320,11 +320,14 @@ impl<S: Read + Write> TlsStream<S> {
     /// Sends close_notify: the server sees the end of the data. Reading
     /// may go on until the server closes too.
     pub fn shutdown(&mut self) -> io::Result<()> {
+        self.conn.out.lock();
+        let mut r = Ok(());
         if !self.conn.closed_write {
             self.conn.closed_write = true;
-            self.conn.write_record(&mut self.stream, ALERT, &[1, 0])?;
+            r = self.conn.write_record(&mut self.stream, ALERT, &[1, 0]);
         }
-        Ok(())
+        self.conn.out.unlock();
+        r
     }
 }
 
@@ -342,8 +345,8 @@ impl<S: Read + Write> Read for TlsStream<S> {
     }
 }
 
-impl<S: Read + Write> Write for TlsStream<S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+impl<S: Read + Write> TlsStream<S> {
+    fn write_locked(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.conn.closed_write { return Err(io::Error::new(io::ErrorKind::BrokenPipe, "tls: write after shutdown")); }
         let mut at = 0;
         while at < buf.len() {
@@ -352,6 +355,15 @@ impl<S: Read + Write> Write for TlsStream<S> {
             at = end;
         }
         Ok(buf.len())
+    }
+}
+
+impl<S: Read + Write> Write for TlsStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.conn.out.lock();
+        let r = self.write_locked(buf);
+        self.conn.out.unlock();
+        r
     }
 
     fn flush(&mut self) -> io::Result<()> { self.stream.flush() }
@@ -465,6 +477,9 @@ struct Conn {
     cache_key: String,
     /// Whether the handshake resumed a session.
     resumed: bool,
+    /// Held by a write after the handshake (as Go's Conn.out): a reader
+    /// answering a key update writes too, while another thread may.
+    out: crate::sync::Mutex<u8>,
 }
 
 fn alert_name(code: u8) -> &str {
@@ -499,7 +514,7 @@ fn alert_name(code: u8) -> &str {
 impl Conn {
     fn new() -> Conn {
         Conn { read: HalfConn::plain(), write: HalfConn::plain(), suite: Suite::Aes128GcmSha256, hs_buf: Vec::new(), app: Vec::new(), app_pos: 0, eof: false, closed_write: false, alpn: None, peer_certs: Vec::new(), v12: false, pending_read: None, server: false, sni: None, rand: None,
-            res_master: Vec::new(), cache: None, cache_key: String::new(), resumed: false }
+            res_master: Vec::new(), cache: None, cache_key: String::new(), resumed: false, out: crate::sync::Mutex::new(0) }
     }
 
     // Writes one record of content type kind (encrypted when there are
@@ -733,7 +748,9 @@ impl Conn {
         // (TLS 1.2: a HelloRequest asks for renegotiation, which Go and this
         // refuse.)
         if self.v12 {
+            self.out.lock();
             let _ = self.write_record(s, ALERT, &[1, 100]);
+            self.out.unlock();
             return Err(Error::new("tls: server requested renegotiation, which is not supported").into());
         }
         // Post-handshake messages: tickets (ignored), key updates.
@@ -748,10 +765,16 @@ impl Conn {
                 if n != 1 || msg[4] > 1 { return Err(Error::new("tls: malformed key update").into()); }
                 let next = self.suite.expand_label(self.read.secret.as_slice(), "traffic upd", &[], self.suite.hash_len());
                 self.read = self.suite.half(next.as_slice());
-                if msg[4] == 1 && !self.closed_write {
-                    self.write_record(s, HANDSHAKE, &[24, 0, 0, 1, 0])?;
-                    let wn = self.suite.expand_label(self.write.secret.as_slice(), "traffic upd", &[], self.suite.hash_len());
-                    self.write = self.suite.half(wn.as_slice());
+                if msg[4] == 1 {
+                    self.out.lock();
+                    let mut r = Ok(());
+                    if !self.closed_write {
+                        r = self.write_record(s, HANDSHAKE, &[24, 0, 0, 1, 0]);
+                        let wn = self.suite.expand_label(self.write.secret.as_slice(), "traffic upd", &[], self.suite.hash_len());
+                        self.write = self.suite.half(wn.as_slice());
+                    }
+                    self.out.unlock();
+                    r?;
                 }
             } else if msg[0] == 4 {
                 if !self.server { self.new_session_ticket(&msg[4..])?; }
@@ -2422,6 +2445,15 @@ impl TlsAcceptor {
 
     pub fn builder(identity: Identity) -> TlsAcceptorBuilder {
         TlsAcceptorBuilder { identity, min: None, max: None, alpn: Vec::new(), client_auth: ClientAuth::NoClientCert, client_cas: Vec::new() }
+    }
+
+    // (std::http) The acceptor offering protocols by ALPN if it was given
+    // none (as Go's server fills an empty NextProtos).
+    pub(crate) fn with_default_alpn(&self, protocols: &[&str]) -> TlsAcceptor {
+        if self.b.alpn.len() > 0 { return self.clone(); }
+        let mut a = self.clone();
+        a.b.alpn = protocols.iter().map(|p: &&str| -> String { p.to_string() }).collect();
+        a
     }
 
     /// Runs the server's handshake over stream (connected to a client) and

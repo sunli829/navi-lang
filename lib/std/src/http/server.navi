@@ -8,6 +8,7 @@ use crate::time::Duration;
 use crate::url::Url;
 use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
 use crate::http::wire::{self, NetStream};
+use crate::http::h2;
 use crate::tls::{Identity, TlsAcceptor};
 
 /// Listens for HTTP connections and answers each request with a handler.
@@ -21,6 +22,46 @@ pub struct Server {
     idle_timeout: Option<Duration>,
     max_header_bytes: usize,
     tls: Option<TlsAcceptor>,
+    protocols: Protocols,
+}
+
+/// The protocols a server speaks (Go's http.Protocols): by default
+/// HTTP/1.1 and, over TLS, HTTP/2 (chosen by ALPN). HTTP/2 without TLS
+/// (unencrypted_http2) is spoken to clients that start with its preface
+/// (prior knowledge; RFC 9113 dropped Upgrade: h2c).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Protocols {
+    bits: u8,
+}
+
+impl Protocols {
+    /// None: set those to speak.
+    pub fn new() -> Protocols { Protocols { bits: 0 } }
+
+    pub fn http1(&self) -> bool { self.bits & 1 != 0 }
+    pub fn http2(&self) -> bool { self.bits & 2 != 0 }
+    pub fn unencrypted_http2(&self) -> bool { self.bits & 4 != 0 }
+
+    pub fn set_http1(&mut self, on: bool) { self.set(1, on); }
+    pub fn set_http2(&mut self, on: bool) { self.set(2, on); }
+    pub fn set_unencrypted_http2(&mut self, on: bool) { self.set(4, on); }
+
+    fn set(&mut self, bit: u8, on: bool) { if on { self.bits |= bit; } else { self.bits &= !bit; } }
+}
+
+impl Default for Protocols {
+    /// HTTP/1.1 and HTTP/2 (over TLS).
+    fn default() -> Protocols { Protocols { bits: 3 } }
+}
+
+impl crate::fmt::Debug for Protocols {
+    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+        let mut v: Vec<&str> = Vec::new();
+        if self.http1() { v.push("HTTP1"); }
+        if self.http2() { v.push("HTTP2"); }
+        if self.unencrypted_http2() { v.push("UnencryptedHTTP2"); }
+        f.write_fmt(`{${v.join(", ")}}`)
+    }
 }
 
 /// Serves handler on addr (as Go's http.ListenAndServe).
@@ -32,16 +73,14 @@ pub fn serve<A: ToSocketAddrs>(addr: A, handler: fn(&mut Request) -> Response) -
 /// of two PEM files (as Go's http.ListenAndServeTLS).
 pub fn serve_tls<A: ToSocketAddrs>(addr: A, cert_file: &str, key_file: &str, handler: fn(&mut Request) -> Response) -> io::Result<()> {
     let id = Identity::from_pkcs8(crate::fs::read(cert_file)?.as_slice(), crate::fs::read(key_file)?.as_slice())?;
-    let mut b = TlsAcceptor::builder(id);
-    b.alpn_protocols(&["http/1.1"]);
-    Server::bind(addr)?.tls(b.build()?).serve(handler)
+    Server::bind(addr)?.tls(TlsAcceptor::new(id)?).serve(handler)
 }
 
 impl Server {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Server> {
         let l = TcpListener::bind(addr)?;
         let a = l.local_addr()?;
-        Ok(Server { listener: l, addr: a, closed: &AtomicBool::new(false), read_timeout: None, write_timeout: None, idle_timeout: Some(Duration::from_secs(120)), max_header_bytes: 1 << 20, tls: None })
+        Ok(Server { listener: l, addr: a, closed: &AtomicBool::new(false), read_timeout: None, write_timeout: None, idle_timeout: Some(Duration::from_secs(120)), max_header_bytes: 1 << 20, tls: None, protocols: Protocols::default() })
     }
 
     /// The address it listens on (the port, after binding port 0).
@@ -69,8 +108,16 @@ impl Server {
         s
     }
 
+    /// The protocols to speak (Protocols::default() by default).
+    pub fn protocols(&self, p: Protocols) -> Server {
+        let mut s = self.clone();
+        s.protocols = p;
+        s
+    }
+
     /// Serves https: each connection's TLS handshake with acceptor (on the
-    /// connection's thread, within read_timeout).
+    /// connection's thread, within read_timeout). An acceptor without ALPN
+    /// protocols offers h2 and http/1.1 (those the server speaks).
     pub fn tls(&self, acceptor: TlsAcceptor) -> Server {
         let mut s = self.clone();
         s.tls = Some(acceptor);
@@ -87,10 +134,17 @@ impl Server {
     /// handler (called on the connection's thread; a panic in it ends the
     /// program).
     pub fn serve(&self, handler: fn(&mut Request) -> Response) -> io::Result<()> {
+        let mut me0 = self.clone();
+        if let Some(a) = &self.tls {
+            let mut alpn: Vec<&str> = Vec::new();
+            if self.protocols.http2() { alpn.push("h2"); }
+            if self.protocols.http1() { alpn.push("http/1.1"); }
+            me0.tls = Some(a.with_default_alpn(alpn.as_slice()));
+        }
         loop {
             match self.listener.accept() {
                 Ok((stream, remote)) => {
-                    let me = self.clone();
+                    let me = me0.clone();
                     crate::thread::spawn(|| me.conn(stream, remote, handler));
                 }
                 Err(e) => {
@@ -128,11 +182,22 @@ impl Server {
         };
         let scheme = if self.tls.is_some() { "https" } else { "http" };
         let r = &mut BufReader::new(net.clone());
+        let h2cfg = &h2::server::Config { max_header_bytes: self.max_header_bytes, idle_timeout: self.idle_timeout, scheme, addr: self.addr.to_string() };
+        if self.tls.is_some() {
+            let is_h2 = match net.alpn() { Some(p) => p.as_slice() == b"h2", None => false };
+            if is_h2 && self.protocols.http2() {
+                h2::server::serve(net, r, false, h2cfg, remote, handler);
+                return;
+            }
+            if !self.protocols.http1() {
+                net.close();
+                return;
+            }
+        }
         let mut w = net.clone();
         let mut first = true;
         loop {
             let _ = stream.set_read_timeout(if first { self.read_timeout } else { self.idle_timeout });
-            first = false;
             let line = match wire::read_line(r, self.max_header_bytes) {
                 Ok(Some(l)) => l,
                 Ok(None) => break,
@@ -141,6 +206,17 @@ impl Server {
                     break;
                 }
             };
+            // HTTP/2 by prior knowledge: its preface's first line.
+            if first && self.tls.is_none() && line.as_str() == "PRI * HTTP/2.0" && self.protocols.unencrypted_http2() {
+                let mut rest = [0u8; 8];
+                if r.read_exact(&mut rest).is_ok() && &rest[..] == b"\r\nSM\r\n\r\n" {
+                    h2::server::serve(net, r, true, h2cfg, remote, handler);
+                    return;
+                }
+                break;
+            }
+            if first && !self.protocols.http1() { break; }
+            first = false;
             // Empty lines before a request are ignored (RFC 9112 2.2).
             if line.len() == 0 { continue; }
             let _ = stream.set_read_timeout(self.read_timeout);

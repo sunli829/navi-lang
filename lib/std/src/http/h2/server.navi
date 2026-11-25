@@ -1,0 +1,212 @@
+// An HTTP/2 connection served (as Go's http2 serverConn): requests come as
+// streams, each answered by the handler on a thread of its own.
+
+use crate::io::{self, Read, BufReader};
+use crate::net::SocketAddr;
+use crate::time::Duration;
+use crate::url::Url;
+use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
+use crate::http::hpack::HeaderField;
+use crate::http::wire::{self, NetStream};
+use crate::http::h2::{self, Core, Stream, BodyReader, H2Error, Settings};
+
+pub(crate) struct Config {
+    pub max_header_bytes: usize,
+    pub idle_timeout: Option<Duration>,
+    pub scheme: &str,
+    // (Requests without :authority or Host.)
+    pub addr: String,
+}
+
+// The most streams a client may have open at once (Go's default).
+const MAX_STREAMS: u32 = 250;
+// The receive windows: a stream's and the connection's (Go's 1 MiB).
+const WINDOW: u32 = 1048576;
+
+/// Serves HTTP/2 on a connection whose reader r is past the client's
+/// preface if preface_read; returns when the connection ends.
+pub(crate) fn serve(net: NetStream, r: &mut BufReader<NetStream>, preface_read: bool, cfg: &Config, remote: SocketAddr, handler: fn(&mut Request) -> Response) {
+    if !preface_read {
+        let mut p = [0u8; 24];
+        if r.read_exact(&mut p).is_err() || &p[..] != h2::PREFACE.as_bytes() {
+            net.close();
+            return;
+        }
+    }
+    let c = Core::new(net.clone(), true, &Settings { stream_window: WINDOW, conn_window: WINDOW, max_streams: MAX_STREAMS, max_header_bytes: cfg.max_header_bytes });
+    if let Some(d) = cfg.idle_timeout { c.idle_timeout(d); }
+    let _ = net.set_read_timeout(None);
+    c.read_loop(r, |id: u32, fields: Vec<HeaderField>, end: bool| -> Result<(), H2Error> { on_headers(c, cfg, remote.clone(), handler, id, fields, end) });
+}
+
+fn on_headers(c: &mut Core, cfg: &Config, remote: SocketAddr, handler: fn(&mut Request) -> Response, id: u32, fields: Vec<HeaderField>, end: bool) -> Result<(), H2Error> {
+    c.mu.lock();
+    if let Some(s) = c.streams.get(&id) {
+        // Trailers: they end the stream (and are dropped).
+        let st = *s;
+        if !end || st.recv_end {
+            c.mu.unlock();
+            return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR));
+        }
+        let ok = c.recv_end_locked(st);
+        c.mu.unlock();
+        if !ok { return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR)); }
+        return Ok(());
+    }
+    if id % 2 == 0 || id <= c.last_id {
+        c.mu.unlock();
+        return Err(H2Error::Conn(h2::PROTOCOL_ERROR, "HEADERS on a closed or server stream".to_string()));
+    }
+    c.last_id = id;
+    if c.goaway_sent {
+        c.mu.unlock();
+        return Ok(());
+    }
+    if c.streams.len() as u32 >= MAX_STREAMS {
+        c.mu.unlock();
+        return Err(H2Error::Stream(id, h2::REFUSED_STREAM));
+    }
+    let st = c.new_stream(id);
+    st.recv_end = end;
+    c.mu.unlock();
+    let mut req = match request(c, st, cfg, fields, end) {
+        Ok(r) => r,
+        Err(Some(code)) => {
+            // (Too large: answered.)
+            let resp = Response::error(code, "request header fields too large");
+            let me = c;
+            crate::thread::spawn(|| answer(me, st, &mut resp.clone(), false));
+            return Ok(());
+        }
+        Err(None) => return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR)),
+    };
+    req.remote = Some(remote);
+    if !end && req.headers.has_token("expect", "100-continue") {
+        c.write_headers(id, &[HeaderField::new(":status", "100")], false);
+    }
+    let me = c;
+    crate::thread::spawn(|| {
+        let mut resp = handler(&mut req);
+        let is_head = req.method == Method::HEAD;
+        answer(me, st, &mut resp, is_head);
+        // (A request body not read to its end: the client may stop.)
+        me.mu.lock();
+        let open = !st.recv_end && st.reset.is_none();
+        me.mu.unlock();
+        if open { me.reset(st, h2::NO_ERROR); }
+    });
+    Ok(())
+}
+
+// The request of a header block: Err(None) if it is malformed (RFC 9113
+// 8.1.1, 8.3), Err(Some(status)) to answer with that.
+fn request(c: &mut Core, st: &mut Stream, cfg: &Config, fields: Vec<HeaderField>, end: bool) -> Result<Request, Option<StatusCode>> {
+    let mut method: Option<String> = None;
+    let mut scheme: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut authority: Option<String> = None;
+    let mut headers = HeaderMap::new();
+    let mut cookies: Vec<String> = Vec::new();
+    let mut regular = false;
+    let mut size = 0;
+    for f in fields.iter() {
+        size += f.size();
+        if !h2::valid_field(f) { return Err(None); }
+        if f.is_pseudo() {
+            if regular { return Err(None); }
+            let slot = match f.name.as_str() {
+                ":method" => &mut method,
+                ":scheme" => &mut scheme,
+                ":path" => &mut path,
+                ":authority" => &mut authority,
+                _ => return Err(None),
+            };
+            if slot.is_some() { return Err(None); }
+            *slot = Some(f.value.clone());
+            continue;
+        }
+        regular = true;
+        let name = f.name.as_str();
+        if h2::connection_specific(name) || (name == "te" && f.value.as_str() != "trailers") { return Err(None); }
+        if name == "cookie" { cookies.push(f.value.clone()); } else { headers.append(name, f.value.as_str()); }
+    }
+    if size > cfg.max_header_bytes { return Err(Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)); }
+    // (Cookies split over fields are one again, RFC 9113 8.2.3.)
+    if cookies.len() > 0 { headers.append("cookie", cookies.join("; ").as_str()); }
+    let method = match method {
+        Some(m) => match Method::from_bytes(m.as_bytes()) { Ok(m) => m, Err(_) => return Err(None) },
+        None => return Err(None),
+    };
+    if method == Method::CONNECT { return Err(Some(StatusCode::NOT_IMPLEMENTED)); }
+    let (scheme, target) = match (scheme, path) {
+        (Some(s), Some(p)) => if p.len() == 0 { return Err(None); } else { (s, p) },
+        _ => return Err(None),
+    };
+    let host = match authority {
+        Some(a) => {
+            if !headers.contains_key("host") { headers.insert("host", a.as_str()); }
+            a
+        }
+        None => match headers.get("host") { Some(h) => h.to_string(), None => cfg.addr.clone() },
+    };
+    let want = match headers.get("content-length") {
+        Some(v) => match v.trim().parse::<u64>() { Ok(n) => Some(n), Err(_) => return Err(None) },
+        None => None,
+    };
+    if end && want.is_some_and(|n| n != 0) { return Err(None); }
+    let full = if target.starts_with("/") { `${cfg.scheme}://${host}${target}`.to_string() } else if target == "*" { `${cfg.scheme}://${host}/`.to_string() } else { return Err(None) };
+    let _ = scheme;
+    let url = match Url::parse(full.as_str()) { Ok(u) => u, Err(_) => return Err(None) };
+    let mut req = Request::new(method, url);
+    req.target = target;
+    req.version = Version::HTTP_2;
+    req.headers = headers;
+    c.mu.lock();
+    st.want_len = want;
+    c.mu.unlock();
+    req.body = if end { Body::empty() } else { Body::from_reader(BodyReader::new(c, st), want) };
+    Ok(req)
+}
+
+// Writes resp on st: HEADERS (the head as on HTTP/1.1, without the
+// connection's fields), then the body as DATA.
+fn answer(c: &mut Core, st: &mut Stream, resp: &mut Response, is_head: bool) {
+    let code = resp.status.as_u16();
+    let mut fields: Vec<HeaderField> = Vec::new();
+    fields.push(HeaderField::new(":status", code.to_string().as_str()));
+    let no_body = code == 204 || code == 304 || (code >= 100 && code < 200);
+    if !resp.headers.contains_key("date") { fields.push(HeaderField::new("date", wire::now_date().as_str())); }
+    if !no_body && !resp.headers.contains_key("content-length") {
+        if let Some(n) = resp.body.len() { fields.push(HeaderField::new("content-length", n.to_string().as_str())); }
+    }
+    if resp.body.len().is_some() && !resp.body.len().is_some_and(|n| n == 0) && !resp.headers.contains_key("content-type") {
+        fields.push(HeaderField::new("content-type", "text/plain; charset=utf-8"));
+    }
+    for (k, v) in resp.headers.iter() {
+        if h2::connection_specific(k.as_str()) { continue; }
+        fields.push(HeaderField::new(k.as_str(), v.as_str()));
+    }
+    let empty = is_head || no_body || resp.body.len().is_some_and(|n| n == 0);
+    c.write_headers(st.id, fields.as_slice(), empty);
+    if empty {
+        c.mu.lock();
+        c.sent_end_locked(st);
+        c.mu.unlock();
+        return;
+    }
+    let r = match resp.body.as_bytes() {
+        Some(b) => c.write_data(st, b, true),
+        None => send_body(c, st, &mut resp.body),
+    };
+    if r.is_err() { c.reset(st, h2::INTERNAL_ERROR); }
+}
+
+fn send_body(c: &mut Core, st: &mut Stream, body: &mut Body) -> io::Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.resize(16384, 0);
+    loop {
+        let n = body.read(buf.as_mut_slice())?;
+        if n == 0 { return c.end_stream(st); }
+        c.write_data(st, &buf[..n], false)?;
+    }
+}
