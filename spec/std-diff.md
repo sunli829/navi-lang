@@ -185,12 +185,12 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | 项目 | native-tls | navi | 原因 |
 |---|---|---|---|
 | 实现 | 调系统的 TLS 库（OpenSSL、Secure Transport、SChannel） | 纯 navi 实现（同 Go），证书验证用 `crypto::x509`（macOS、Windows 上是系统的验证器） | 用户选择照 Go 自己实现 |
-| 版本 | 系统支持的都行 | TLS 1.3 和 1.2 的客户端和服务端（同 Go 的默认）：1.2 是 ECDHE 加 AES-GCM、ChaCha20-Poly1305 或 AES-CBC-SHA；不支持重协商、会话恢复，不支持 1.1 及更早 | 同 Go |
+| 版本 | 系统支持的都行 | TLS 1.3 和 1.2 的客户端和服务端（同 Go 的默认）：1.2 是 ECDHE 加 AES-GCM、ChaCha20-Poly1305 或 AES-CBC-SHA；不支持重协商，不支持 1.1 及更早 | 同 Go |
 | `connect` | 返回 `Result<TlsStream<S>, HandshakeError<S>>`（可能 `WouldBlock`） | 返回 `Result<TlsStream<S>, Error>`；流都是阻塞的 | 没有非阻塞流 |
 | `Certificate` | `native_tls::Certificate` | 就是 `crypto::x509::Certificate` | 不需要两个类型 |
 | `Identity`、`TlsAcceptor` | `Identity::from_pkcs8`、`from_pkcs12` | `Identity::from_pkcs8`（私钥也可以是 PKCS#1、SEC 1 的 PEM）、`from_parts`；没有 PKCS#12；`TlsAcceptorBuilder::alpn_protocols` 是新增的（同 Go 的 NextProtos） | 不需要 PKCS#12 |
 | 客户端证书 | `TlsConnectorBuilder::identity`；服务端没有 | 客户端同 native-tls；服务端照 Go：`TlsAcceptorBuilder::client_auth(ClientAuth::…)`（Go 的五种 ClientAuthType）和 `add_client_ca`，`TlsStream::peer_certificate` 取客户端证书 | native-tls 服务端不支持 |
-| 会话恢复、0-RTT | 有 | 没有 | 暂不需要 |
+| 会话恢复、0-RTT | 有（由平台决定） | 同 Go：服务端默认发 ticket（会话状态用每个 `TlsAcceptor` 随机的密钥 AES-GCM 加密，7 天有效，带客户端证书）；客户端默认不缓存，`TlsConnectorBuilder::session_cache(n)` 开启（Go 的 ClientSessionCache，按服务器名的 LRU，同一个 connector 的克隆共享）；`TlsStream::did_resume()`（Go 的 DidResume）。TLS 1.3 用 PSK 加 (EC)DHE；没有 0-RTT | 0-RTT 不做（同 Go 的默认） |
 | 没有 close_notify 就断开 | 视实现而定 | 记录边界上的断开当作数据结束（同 Go） | 很多服务器这样关连接 |
 
 ### std::regex（regex crate）

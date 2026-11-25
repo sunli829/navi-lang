@@ -127,9 +127,20 @@ pub struct TlsConnectorBuilder {
     test_rand: Option<Vec<u8>>,
     test_suites: Option<Vec<u16>>,
     identity: Option<Identity>,
+    cache: Option<&SessionCache>,
 }
 
 impl TlsConnectorBuilder {
+    /// Keeps up to capacity sessions (by server name) from the servers'
+    /// tickets and resumes them, skipping the certificates and their
+    /// signatures (Go's ClientSessionCache with an LRU of capacity; off by
+    /// default as Go's: tickets let servers link a client's connections).
+    /// Clones of the connector share the cache.
+    pub fn session_cache(&mut self, capacity: usize) -> &mut TlsConnectorBuilder {
+        self.cache = if capacity == 0 { None } else { Some(&SessionCache { cap: capacity, m: crate::sync::Mutex::new(Vec::new()) }) };
+        self
+    }
+
     /// The client certificate (and key) to send when the server asks.
     pub fn identity(&mut self, identity: Identity) -> &mut TlsConnectorBuilder {
         self.identity = Some(identity);
@@ -253,7 +264,8 @@ impl TlsConnector {
     pub fn new() -> Result<TlsConnector, Error> { TlsConnector::builder().build() }
 
     pub fn builder() -> TlsConnectorBuilder {
-        TlsConnectorBuilder { roots: Vec::new(), builtin_roots: true, invalid_certs: false, invalid_hostnames: false, sni: true, alpn: Vec::new(), min: None, max: None, test_hello: None, test_rand: None, test_suites: None, identity: None }
+        TlsConnectorBuilder { roots: Vec::new(), builtin_roots: true, invalid_certs: false, invalid_hostnames: false, sni: true, alpn: Vec::new(), min: None, max: None, test_hello: None, test_rand: None, test_suites: None, identity: None,
+            cache: None }
     }
 
     /// Runs the handshake over stream (connected to domain's server) and
@@ -300,6 +312,10 @@ impl<S: Read + Write> TlsStream<S> {
 
     /// The server's certificates as it sent them (the leaf first).
     pub fn peer_certificates(&self) -> &[Certificate] { self.conn.peer_certs.as_slice() }
+
+    /// Whether the handshake resumed an earlier session (Go's
+    /// ConnectionState.DidResume; native-tls has none).
+    pub fn did_resume(&self) -> bool { self.conn.resumed }
 
     /// Sends close_notify: the server sees the end of the data. Reading
     /// may go on until the server closes too.
@@ -442,6 +458,13 @@ struct Conn {
     sni: Option<String>,
     /// (Tests: what is left of the fixed randomness, for CBC's IVs.)
     rand: Option<Vec<u8>>,
+    /// (Clients with a session cache) the resumption master secret, the
+    /// cache and the server's name, for the tickets that follow.
+    res_master: Vec<u8>,
+    cache: Option<&SessionCache>,
+    cache_key: String,
+    /// Whether the handshake resumed a session.
+    resumed: bool,
 }
 
 fn alert_name(code: u8) -> &str {
@@ -475,7 +498,8 @@ fn alert_name(code: u8) -> &str {
 
 impl Conn {
     fn new() -> Conn {
-        Conn { read: HalfConn::plain(), write: HalfConn::plain(), suite: Suite::Aes128GcmSha256, hs_buf: Vec::new(), app: Vec::new(), app_pos: 0, eof: false, closed_write: false, alpn: None, peer_certs: Vec::new(), v12: false, pending_read: None, server: false, sni: None, rand: None }
+        Conn { read: HalfConn::plain(), write: HalfConn::plain(), suite: Suite::Aes128GcmSha256, hs_buf: Vec::new(), app: Vec::new(), app_pos: 0, eof: false, closed_write: false, alpn: None, peer_certs: Vec::new(), v12: false, pending_read: None, server: false, sni: None, rand: None,
+            res_master: Vec::new(), cache: None, cache_key: String::new(), resumed: false }
     }
 
     // Writes one record of content type kind (encrypted when there are
@@ -729,10 +753,39 @@ impl Conn {
                     let wn = self.suite.expand_label(self.write.secret.as_slice(), "traffic upd", &[], self.suite.hash_len());
                     self.write = self.suite.half(wn.as_slice());
                 }
-            } else if msg[0] != 4 {
+            } else if msg[0] == 4 {
+                if !self.server { self.new_session_ticket(&msg[4..])?; }
+            } else {
                 return Err(Error::new("tls: unexpected handshake message after the handshake").into());
             }
         }
+        Ok(())
+    }
+}
+
+impl Conn {
+    // A NewSessionTicket: kept in the session cache, if any (as Go's
+    // handleNewSessionTicket; lifetime 0 drops the session).
+    fn new_session_ticket(&mut self, body: &[u8]) -> Result<(), Error> {
+        let cache = match self.cache {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let mut m = Msg::new(body);
+        let lifetime = read_be(m.bytes(4)?.as_slice());
+        let age_add = read_be(m.bytes(4)?.as_slice()) as u32;
+        let nonce = m.vec8()?;
+        let ticket = m.vec16()?;
+        m.vec16()?;
+        if m.left() != 0 || ticket.len() == 0 { return Err(Error::new("tls: invalid NewSessionTicket message")); }
+        if lifetime == 0 {
+            cache.remove(self.cache_key.as_str());
+            return Ok(());
+        }
+        let lifetime = if lifetime > TICKET_LIFETIME { TICKET_LIFETIME } else { lifetime };
+        let psk = self.suite.expand_label(self.res_master.as_slice(), "resumption", nonce.as_slice(), self.suite.hash_len());
+        let sess = ClientSession { suite: self.suite.id(), psk, ticket, age_add, received_ms: now_ms(), lifetime, certs: self.peer_certs.clone() };
+        cache.put(self.cache_key.as_str(), sess);
         Ok(())
     }
 }
@@ -1092,6 +1145,139 @@ fn random_bytes(n: usize) -> Vec<u8> {
     b
 }
 
+// --- Session resumption (TLS 1.3 tickets) ------------------------------------
+
+// A ticket's lifetime (Go's maxSessionTicketLifetime: 7 days).
+const TICKET_LIFETIME: u64 = 604800;
+
+// A session a client can resume: the server's ticket and what it stands for.
+#[derive(Clone)]
+struct ClientSession {
+    suite: u16,
+    /// The resumption PSK.
+    psk: Vec<u8>,
+    ticket: Vec<u8>,
+    age_add: u32,
+    /// When it was received, and for how long it may be used (seconds).
+    received_ms: u64,
+    lifetime: u64,
+    certs: Vec<Certificate>,
+}
+
+// The sessions by server name, least recently used first.
+struct SessionCache {
+    cap: usize,
+    m: crate::sync::Mutex<Vec<(String, ClientSession)>>,
+}
+
+impl SessionCache {
+    fn get(&self, key: &str) -> Option<ClientSession> {
+        let v = self.m.lock();
+        let mut found: Option<ClientSession> = None;
+        for e in v.iter() { if e.0 == key { found = Some(e.1.clone()); } }
+        self.m.unlock();
+        found
+    }
+
+    fn put(&self, key: &str, sess: ClientSession) {
+        let v = self.m.lock();
+        let mut i = 0;
+        while i < v.len() {
+            if v[i].0 == key { v.remove(i); } else { i += 1; }
+        }
+        v.push((key.to_string(), sess));
+        while v.len() > self.cap { v.remove(0); }
+        self.m.unlock();
+    }
+
+    fn remove(&self, key: &str) {
+        let v = self.m.lock();
+        let mut i = 0;
+        while i < v.len() {
+            if v[i].0 == key { v.remove(i); } else { i += 1; }
+        }
+        self.m.unlock();
+    }
+}
+
+fn now_ms() -> u64 {
+    match crate::time::SystemTime::now().duration_since(crate::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    }
+}
+
+fn be32(v: u32) -> Vec<u8> { vec_of(&[(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8]) }
+
+fn read_be(b: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for x in b.iter() { v = (v << 8) | (*x as u64); }
+    v
+}
+
+// The PSK binder of a ClientHello truncated before its binders, after the
+// transcript prefix (RFC 8446 4.2.11.2).
+fn psk_binder(suite: &Suite, psk: &[u8], prefix: &[u8], truncated: &[u8]) -> Vec<u8> {
+    let zeros = vec_zero(suite.hash_len());
+    let early = suite.extract(zeros.as_slice(), psk);
+    let binder_key = suite.derive(early.as_slice(), "res binder", &[]);
+    let fk = suite.expand_label(binder_key.as_slice(), "finished", &[], suite.hash_len());
+    let mut t = prefix.to_vec();
+    t.extend_from_slice(truncated);
+    suite.hmac(fk.as_slice(), suite.hash(t.as_slice()).as_slice())
+}
+
+// A session a server resumes: what its ticket holds.
+struct ServerSession {
+    suite: u16,
+    created: u64,
+    psk: Vec<u8>,
+    certs: Vec<Certificate>,
+}
+
+// A ticket: the session sealed with key (AES-256-GCM: nonce, ciphertext,
+// tag). The plaintext: version, suite, creation time, PSK, the client's
+// certificates.
+fn seal_ticket(key: &[u8], sess: &ServerSession) -> Vec<u8> {
+    let mut pt: Vec<u8> = vec_of(&[3, 4]);
+    push16(&mut pt, sess.suite as usize);
+    pt.extend_from_slice(be64(sess.created).as_slice());
+    pt.push(sess.psk.len() as u8);
+    pt.extend_from_slice(sess.psk.as_slice());
+    push16(&mut pt, sess.certs.len());
+    for c in sess.certs.iter() {
+        push24(&mut pt, c.raw().len());
+        pt.extend_from_slice(c.raw());
+    }
+    let nonce = random_bytes(12);
+    let tag = Aes256Gcm::new_from_slice(key).unwrap().encrypt_in_place_detached(nonce.as_slice(), &[], pt.as_mut_slice()).unwrap();
+    let mut out = nonce;
+    out.extend_from_slice(pt.as_slice());
+    out.extend_from_slice(tag.as_slice());
+    out
+}
+
+// The session of a ticket sealed with key, if it opens and parses.
+fn open_ticket(key: &[u8], t: &[u8]) -> Option<ServerSession> {
+    if t.len() < 12 + 16 { return None; }
+    let mut pt = t[12..t.len() - 16].to_vec();
+    if Aes256Gcm::new_from_slice(key).unwrap().decrypt_in_place_detached(&t[..12], &[], pt.as_mut_slice(), &t[t.len() - 16..]).is_err() { return None; }
+    let mut m = Msg::new(pt.as_slice());
+    if m.u16().ok()? != 0x0304 { return None; }
+    let suite = m.u16().ok()? as u16;
+    let created = read_be(m.bytes(8).ok()?.as_slice());
+    let psk = m.vec8().ok()?;
+    let n = m.u16().ok()?;
+    let mut certs: Vec<Certificate> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        certs.push(Certificate::from_der(m.vec24().ok()?.as_slice()).ok()?);
+        i += 1;
+    }
+    if m.left() != 0 || Suite::of(suite).is_none() { return None; }
+    Some(ServerSession { suite, created, psk, certs })
+}
+
 struct Handshake {
     c: TlsConnector,
     domain: String,
@@ -1107,6 +1293,8 @@ struct Handshake {
     /// (Tests: the randomness and how much is taken.)
     rand: Option<Vec<u8>>,
     rand_at: usize,
+    /// The session offered for resumption.
+    resume: Option<ClientSession>,
 }
 
 impl Handshake {
@@ -1131,7 +1319,16 @@ impl Handshake {
             suites12 = suites12.iter().filter(|x: &&Suite12| -> bool { only.contains(&x.id) }).map(|x: &Suite12| -> Suite12 { x.clone() }).collect();
         }
         let mut h = Handshake { c: c.clone(), domain: domain.to_string(), random: Vec::new(), session_id: Vec::new(), suites, share: KeyShare::X25519(Vec::new()),
-            transcript: Vec::new(), hello: Vec::new(), suites12, rand: c.b.test_rand.clone(), rand_at: 0 };
+            transcript: Vec::new(), hello: Vec::new(), suites12, rand: c.b.test_rand.clone(), rand_at: 0, resume: None };
+        // A cached session for this name, if TLS 1.3, its suite offered
+        // and not expired.
+        if let Some(cache) = c.b.cache {
+            if let Some(sess) = cache.get(domain) {
+                let mut offered = false;
+                for x in h.suites.iter() { if x.id() == sess.suite { offered = true; } }
+                if offered && now_ms() < sess.received_ms + 1000 * sess.lifetime { h.resume = Some(sess); } else { cache.remove(domain); }
+            }
+        }
         h.random = h.random_bytes(32);
         h.session_id = h.random_bytes(32);
         h.share = h.new_share(X25519);
@@ -1259,12 +1456,38 @@ impl Handshake {
         push16(&mut ext, self.share.group() as usize);
         push16(&mut ext, public.len());
         ext.extend_from_slice(public.as_slice());
+        // pre_shared_key (last): the ticket, its obfuscated age, and a
+        // binder filled in below.
+        let mut psk_suite: Option<Suite> = None;
+        if let Some(sess) = &self.resume {
+            let suite = Suite::of(sess.suite).unwrap();
+            let age = ((now_ms() - sess.received_ms) as u32).wrapping_add(sess.age_add);
+            let hl = suite.hash_len();
+            push16(&mut ext, 41);
+            push16(&mut ext, 2 + 2 + sess.ticket.len() + 4 + 2 + 1 + hl);
+            push16(&mut ext, 2 + sess.ticket.len() + 4);
+            push16(&mut ext, sess.ticket.len());
+            ext.extend_from_slice(sess.ticket.as_slice());
+            ext.extend_from_slice(be32(age).as_slice());
+            push16(&mut ext, 1 + hl);
+            ext.push(hl as u8);
+            ext.resize(ext.len() + hl, 0);
+            psk_suite = Some(suite);
+        }
         push16(&mut b, ext.len());
         b.extend_from_slice(ext.as_slice());
         let mut msg: Vec<u8> = Vec::new();
         msg.push(1);
         push24(&mut msg, b.len());
         msg.extend_from_slice(b.as_slice());
+        if let Some(suite) = psk_suite {
+            // (After a HelloRetryRequest the transcript so far precedes it.)
+            let prefix: Vec<u8> = if cookie.is_some() || self.transcript.len() > 0 { self.transcript.clone() } else { Vec::new() };
+            let cut = msg.len() - (3 + suite.hash_len());
+            let binder = psk_binder(&suite, self.resume.as_ref().unwrap().psk.as_slice(), prefix.as_slice(), &msg[..cut]);
+            let n = msg.len();
+            msg[n - binder.len()..].copy_from_slice(binder.as_slice());
+        }
         msg
     }
 
@@ -1292,7 +1515,11 @@ impl Handshake {
             // HelloRetryRequest: the transcript starts with the first
             // ClientHello's hash; then a ClientHello for the group asked for.
             let (group, cookie) = self.retry_request(&sh)?;
-            let h = Suite::of(self.selected_suite(&sh)?).unwrap().hash(self.transcript.as_slice());
+            let hrr_suite = Suite::of(self.selected_suite(&sh)?).unwrap();
+            if let Some(sess) = &self.resume {
+                if Suite::of(sess.suite).unwrap().hash_len() != hrr_suite.hash_len() { self.resume = None; }
+            }
+            let h = hrr_suite.hash(self.transcript.as_slice());
             let mut t2: Vec<u8> = vec_of(&[254, 0, 0, h.len() as u8]);
             t2.extend_from_slice(h.as_slice());
             t2.extend_from_slice(sh.as_slice());
@@ -1317,11 +1544,18 @@ impl Handshake {
         if !self.c.v13 { return Err(Error::with_alert("tls: server selected an unsupported protocol version", 70)); }
         let shared = self.server_hello(&sh)?;
         let suite = Suite::of(self.selected_suite(&sh)?).unwrap();
+        // Resumed: the server took the PSK (with a suite of its hash).
+        let resumed = psk_selected(&sh)?;
+        if resumed {
+            let sess = self.resume.as_ref().unwrap();
+            if Suite::of(sess.suite).unwrap().hash_len() != suite.hash_len() { return Err(Error::with_alert("tls: server selected an invalid PSK and cipher suite pair", 47)); }
+        }
         self.transcript.extend_from_slice(sh.as_slice());
         conn.suite = suite.clone();
         // The key schedule.
         let zeros: Vec<u8> = vec_zero(suite.hash_len());
-        let early = suite.extract(zeros.as_slice(), zeros.as_slice());
+        let psk: Vec<u8> = if resumed { self.resume.as_ref().unwrap().psk.clone() } else { zeros.clone() };
+        let early = suite.extract(zeros.as_slice(), psk.as_slice());
         let derived = suite.derive(early.as_slice(), "derived", &[]);
         let hs_secret = suite.extract(derived.as_slice(), shared.as_slice());
         let c_hs = suite.derive(hs_secret.as_slice(), "c hs traffic", self.transcript.as_slice());
@@ -1349,6 +1583,12 @@ impl Handshake {
             for o in self.c.b.alpn.iter() { if o.as_bytes() == p.as_slice() { offered = true; } }
             if !offered { return Err(Error::new("tls: server selected unadvertised ALPN protocol")); }
             conn.alpn = Some(p);
+        }
+        if resumed {
+            // No certificates: the session's stand.
+            conn.peer_certs = self.resume.as_ref().unwrap().certs.clone();
+            conn.resumed = true;
+            return self.finish13(conn, s, &suite, s_hs.as_slice(), c_hs.as_slice(), master.as_slice(), false, Vec::new(), Vec::new());
         }
         // CertificateRequest, Certificate.
         let (mut t, mut msg) = conn.read_handshake(s)?;
@@ -1389,16 +1629,24 @@ impl Handshake {
         signed.extend_from_slice(suite.hash(self.transcript.as_slice()).as_slice());
         check_certificate_verify(&certs[0], scheme as u16, signed.as_slice(), sig.as_slice())?;
         self.transcript.extend_from_slice(cv.as_slice());
+        self.finish13(conn, s, &suite, s_hs.as_slice(), c_hs.as_slice(), master.as_slice(), cert_requested, request_context, request_schemes)
+    }
+
+    // The server's Finished, the client's flight, the traffic keys; the
+    // resumption secret kept for the server's tickets.
+    fn finish13<S: Read + Write>(&mut self, conn: &mut Conn, s: &mut S, suite: &Suite, s_hs: &[u8], c_hs: &[u8], master: &[u8], cert_requested: bool,
+        request_context: Vec<u8>, request_schemes: Vec<u16>) -> Result<(), Error> {
+        let suite = suite.clone();
         // The server's Finished.
         let (t, fin) = conn.read_handshake(s)?;
         if t != 20 { return Err(Error::new("tls: received unexpected handshake message instead of Finished")); }
-        let s_key = suite.expand_label(s_hs.as_slice(), "finished", &[], suite.hash_len());
+        let s_key = suite.expand_label(s_hs, "finished", &[], suite.hash_len());
         let want = suite.hmac(s_key.as_slice(), suite.hash(self.transcript.as_slice()).as_slice());
         if !crate::crypto::subtle::constant_time_eq(&fin[4..], want.as_slice()) { return Err(Error::with_alert("tls: invalid server finished hash", 51)); }
         self.transcript.extend_from_slice(fin.as_slice());
         if conn.hs_buf.len() != 0 { return Err(Error::new("tls: handshake data after the server's Finished in one record")); }
-        let c_ap = suite.derive(master.as_slice(), "c ap traffic", self.transcript.as_slice());
-        let s_ap = suite.derive(master.as_slice(), "s ap traffic", self.transcript.as_slice());
+        let c_ap = suite.derive(master, "c ap traffic", self.transcript.as_slice());
+        let s_ap = suite.derive(master, "s ap traffic", self.transcript.as_slice());
         // The client's flight: if asked, its Certificate (empty without an
         // identity the server's schemes fit) and CertificateVerify;
         // Finished.
@@ -1419,7 +1667,7 @@ impl Handshake {
                 self.transcript.extend_from_slice(cv.as_slice());
             }
         }
-        let c_key = suite.expand_label(c_hs.as_slice(), "finished", &[], suite.hash_len());
+        let c_key = suite.expand_label(c_hs, "finished", &[], suite.hash_len());
         let verify = suite.hmac(c_key.as_slice(), suite.hash(self.transcript.as_slice()).as_slice());
         let mut fm: Vec<u8> = vec_of(&[20]);
         push24(&mut fm, verify.len());
@@ -1428,6 +1676,13 @@ impl Handshake {
         s.flush().map_err(io_err)?;
         conn.read = suite.half(s_ap.as_slice());
         conn.write = suite.half(c_ap.as_slice());
+        // For tickets: the resumption master secret.
+        if let Some(cache) = self.c.b.cache {
+            self.transcript.extend_from_slice(fm.as_slice());
+            conn.res_master = suite.derive(master, "res master", self.transcript.as_slice());
+            conn.cache = Some(cache);
+            conn.cache_key = self.domain.clone();
+        }
         Ok(())
     }
 
@@ -1488,7 +1743,10 @@ impl Handshake {
         if version != 0x0303 || sv.len() != 2 || sv[0] != 3 || sv[1] != 4 { return Err(Error::new("tls: server selected an invalid version")); }
         if echo != self.session_id { return Err(Error::new("tls: server did not echo the legacy session ID")); }
         if compression != 0 { return Err(Error::new("tls: server selected unsupported compression format")); }
-        if ext_of(&exts, 41).is_some() { return Err(Error::new("tls: server selected unadvertised PSK")); }
+        if let Some(p) = ext_of(&exts, 41) {
+            if self.resume.is_none() { return Err(Error::new("tls: server selected unadvertised PSK")); }
+            if p.len() != 2 || p[0] != 0 || p[1] != 0 { return Err(Error::new("tls: server selected an invalid PSK")); }
+        }
         let ks = match ext_of(&exts, 51) {
             Some(k) => k,
             None => return Err(Error::new("tls: server did not send a key share")),
@@ -1554,6 +1812,17 @@ impl Handshake {
 const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
 
 // Whether a ServerHello chose TLS 1.3 (by supported_versions).
+// Whether a (TLS 1.3) ServerHello has a pre_shared_key extension.
+fn psk_selected(sh: &[u8]) -> Result<bool, Error> {
+    let mut m = Msg::new(&sh[4..]);
+    m.bytes(34)?;
+    m.vec8()?;
+    m.u16()?;
+    m.u8()?;
+    let exts = extensions(m.vec16()?.as_slice())?;
+    Ok(ext_of(&exts, 41).is_some())
+}
+
 fn is_tls13(sh: &[u8]) -> Result<bool, Error> {
     let mut m = Msg::new(&sh[4..]);
     m.u16()?;
@@ -2034,7 +2303,7 @@ impl TlsAcceptorBuilder {
             _ => true,
         };
         if !v13 && !v12 { return Err(Error::new("tls: no protocol version between the minimum and the maximum")); }
-        Ok(TlsAcceptor { b: self.clone(), v12, v13 })
+        Ok(TlsAcceptor { b: self.clone(), v12, v13, ticket_key: random_bytes(32) })
     }
 }
 
@@ -2044,6 +2313,9 @@ pub struct TlsAcceptor {
     b: TlsAcceptorBuilder,
     v12: bool,
     v13: bool,
+    /// The key the session tickets are sealed with (AES-256-GCM; random
+    /// per acceptor and its clones, as Go's per-Config keys).
+    ticket_key: Vec<u8>,
 }
 
 impl TlsAcceptor {
@@ -2098,6 +2370,12 @@ struct ClientHello {
     reneg: bool,
     point_formats: Option<Vec<u8>>,
     cookie: Option<Vec<u8>>,
+    /// pre_shared_key: the tickets and their obfuscated ages, the binders,
+    /// and the binders' length at the message's end.
+    psk_ids: Vec<(Vec<u8>, u32)>,
+    binders: Vec<Vec<u8>>,
+    binders_len: usize,
+    psk_modes: Vec<u8>,
 }
 
 fn u16s(b: &[u8]) -> Result<Vec<u16>, Error> {
@@ -2122,8 +2400,11 @@ fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, Error> {
     let exts = if m.left() > 0 { extensions(m.vec16()?.as_slice())? } else { Vec::new() };
     if m.left() != 0 { return Err(decode_error()); }
     let mut ch = ClientHello { version, random, session_id, suites, compression, server_name: None, groups: Vec::new(), sig_algs: Vec::new(), alpn: Vec::new(),
-        versions: Vec::new(), shares: Vec::new(), ems: false, reneg: false, point_formats: None, cookie: None };
+        versions: Vec::new(), shares: Vec::new(), ems: false, reneg: false, point_formats: None, cookie: None, psk_ids: Vec::new(), binders: Vec::new(), binders_len: 0,
+        psk_modes: Vec::new() };
+    let mut ei = 0;
     for e in exts.iter() {
+        ei += 1;
         let mut x = Msg::new(e.1.as_slice());
         if e.0 == 0 {
             let mut list = Msg::new(x.vec16()?.as_slice());
@@ -2154,6 +2435,22 @@ fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, Error> {
                 let k = list.vec16()?;
                 ch.shares.push((g, k));
             }
+        } else if e.0 == 41 {
+            // (RFC 8446 4.2.11: the last extension.)
+            if ei != exts.len() { return Err(Error::with_alert("tls: invalid ClientHello: pre_shared_key is not the last extension", 47)); }
+            let mut ids = Msg::new(x.vec16()?.as_slice());
+            while ids.left() > 0 {
+                let t = ids.vec16()?;
+                let age = read_be(ids.bytes(4)?.as_slice()) as u32;
+                ch.psk_ids.push((t, age));
+            }
+            let bl = x.vec16()?;
+            ch.binders_len = 2 + bl.len();
+            let mut bm = Msg::new(bl.as_slice());
+            while bm.left() > 0 { ch.binders.push(bm.vec8()?); }
+            if x.left() != 0 || ch.binders.len() != ch.psk_ids.len() || ch.psk_ids.len() == 0 { return Err(decode_error()); }
+        } else if e.0 == 45 {
+            ch.psk_modes = x.vec8()?;
         } else if e.0 == 0xff01 {
             ch.reneg = true;
             if e.1.len() != 1 || e.1[0] != 0 { return Err(Error::with_alert("tls: initial handshake had non-empty renegotiation extension", 40)); }
@@ -2280,6 +2577,10 @@ impl ServerHandshake {
             }
         }
         let mut sent_ccs = false;
+        // The final ClientHello and the transcript before it (the PSK
+        // binders' input).
+        let mut hello = first_msg.clone();
+        let mut prefix: Vec<u8> = Vec::new();
         if group.is_none() {
             let mut g2: Option<u16> = None;
             for g in SERVER_GROUPS.iter() { if g2.is_none() && ch.groups.contains(g) { g2 = Some(*g); } }
@@ -2311,9 +2612,34 @@ impl ServerHandshake {
             let ch2 = parse_client_hello(&msg2)?;
             if ch2.shares.len() != 1 || ch2.shares[0].0 != g { return Err(Error::with_alert("tls: client sent invalid key share in second ClientHello", 47)); }
             if ch2.session_id != ch.session_id || ch2.suites != ch.suites { return Err(Error::with_alert("tls: client illegally modified second ClientHello", 47)); }
+            prefix = self.transcript.clone();
             self.transcript.extend_from_slice(msg2.as_slice());
+            hello = msg2.clone();
             ch = ch2;
             group = Some(g);
+        }
+        // Resumption: the first ticket that opens, of a suite with this
+        // hash, not expired and fitting the client certificate mode (Go's
+        // checkForResumption); its binder must verify.
+        let mut resumed: Option<ServerSession> = None;
+        let mut psk_index = 0usize;
+        if ch.psk_ids.len() > 0 && ch.psk_modes.contains(&1) {
+            let now = now_ms() / 1000;
+            let need_certs = self.a.b.client_auth == ClientAuth::RequireAnyClientCert || self.a.b.client_auth == ClientAuth::RequireAndVerifyClientCert;
+            let mut i = 0;
+            while i < ch.psk_ids.len() && resumed.is_none() {
+                if let Some(sess) = open_ticket(self.a.ticket_key.as_slice(), ch.psk_ids[i].0.as_slice()) {
+                    let fits = Suite::of(sess.suite).unwrap().hash_len() == suite.hash_len() && now < sess.created + TICKET_LIFETIME
+                        && !(need_certs && sess.certs.len() == 0) && !(sess.certs.len() > 0 && now as i64 > sess.certs[0].not_after());
+                    if fits {
+                        let want = psk_binder(&suite, sess.psk.as_slice(), prefix.as_slice(), &hello[..hello.len() - ch.binders_len]);
+                        if !constant_time_eq(ch.binders[i].as_slice(), want.as_slice()) { return Err(Error::with_alert("tls: invalid PSK binder", 51)); }
+                        psk_index = i;
+                        resumed = Some(sess);
+                    }
+                }
+                i += 1;
+            }
         }
         let group = group.unwrap();
         let mut peer: Vec<u8> = Vec::new();
@@ -2330,12 +2656,18 @@ impl ServerHandshake {
         push16(&mut ext, group as usize);
         push16(&mut ext, public.len());
         ext.extend_from_slice(public.as_slice());
+        if resumed.is_some() {
+            push16(&mut ext, 41);
+            push16(&mut ext, 2);
+            push16(&mut ext, psk_index);
+        }
         let sh = server_hello_msg(server_random().as_slice(), &ch.session_id, suite.id(), ext.as_slice());
         self.write_msg(conn, s, sh.as_slice())?;
         if !sent_ccs && ch.session_id.len() > 0 { conn.write_record(s, CHANGE_CIPHER_SPEC, &[1]).map_err(io_err)?; }
         conn.suite = suite.clone();
         let zeros: Vec<u8> = vec_zero(suite.hash_len());
-        let early = suite.extract(zeros.as_slice(), zeros.as_slice());
+        let psk: Vec<u8> = match &resumed { Some(x) => x.psk.clone(), None => zeros.clone() };
+        let early = suite.extract(zeros.as_slice(), psk.as_slice());
         let derived = suite.derive(early.as_slice(), "derived", &[]);
         let hs_secret = suite.extract(derived.as_slice(), shared.as_slice());
         let c_hs = suite.derive(hs_secret.as_slice(), "c hs traffic", self.transcript.as_slice());
@@ -2344,6 +2676,11 @@ impl ServerHandshake {
         let master = suite.extract(derived2.as_slice(), zeros.as_slice());
         conn.write = suite.half(s_hs.as_slice());
         conn.read = suite.half(c_hs.as_slice());
+        let full = resumed.is_none();
+        if let Some(x) = &resumed {
+            conn.peer_certs = x.certs.clone();
+            conn.resumed = true;
+        }
         // EncryptedExtensions, Certificate, CertificateVerify, Finished.
         let mut ee_ext: Vec<u8> = Vec::new();
         if let Some(p) = &alpn {
@@ -2360,7 +2697,7 @@ impl ServerHandshake {
         ee.extend_from_slice(ee_ext.as_slice());
         self.write_msg(conn, s, ee.as_slice())?;
         // CertificateRequest: no context, the schemes accepted.
-        if self.asks_cert() {
+        if full && self.asks_cert() {
             let mut sa: Vec<u8> = Vec::new();
             push16(&mut sa, 2 * SIG_SCHEMES.len());
             for x in SIG_SCHEMES.iter() { push16(&mut sa, *x as usize); }
@@ -2373,12 +2710,14 @@ impl ServerHandshake {
             cr.extend_from_slice(sa.as_slice());
             self.write_msg(conn, s, cr.as_slice())?;
         }
-        let cm = certificate_msg(self.a.b.identity.certs.as_slice(), Some(&[]));
-        self.write_msg(conn, s, cm.as_slice())?;
-        let signed = verify_content(true, suite.hash(self.transcript.as_slice()).as_slice());
-        let sig = self.sign(scheme, signed.as_slice())?;
-        let cv = certificate_verify_msg(scheme, sig.as_slice());
-        self.write_msg(conn, s, cv.as_slice())?;
+        if full {
+            let cm = certificate_msg(self.a.b.identity.certs.as_slice(), Some(&[]));
+            self.write_msg(conn, s, cm.as_slice())?;
+            let signed = verify_content(true, suite.hash(self.transcript.as_slice()).as_slice());
+            let sig = self.sign(scheme, signed.as_slice())?;
+            let cv = certificate_verify_msg(scheme, sig.as_slice());
+            self.write_msg(conn, s, cv.as_slice())?;
+        }
         let s_key = suite.expand_label(s_hs.as_slice(), "finished", &[], suite.hash_len());
         let verify = suite.hmac(s_key.as_slice(), suite.hash(self.transcript.as_slice()).as_slice());
         let mut fin: Vec<u8> = vec_of(&[20]);
@@ -2390,7 +2729,7 @@ impl ServerHandshake {
         let s_ap = suite.derive(master.as_slice(), "s ap traffic", self.transcript.as_slice());
         conn.write = suite.half(s_ap.as_slice());
         // The client's Certificate and CertificateVerify, if asked.
-        if self.asks_cert() {
+        if full && self.asks_cert() {
             let (t, cm) = conn.read_handshake(s)?;
             if t != 11 { return Err(Error::with_alert("tls: unexpected message instead of the client's Certificate", 10)); }
             let mut m = Msg::new(&cm[4..]);
@@ -2428,6 +2767,26 @@ impl ServerHandshake {
         if !constant_time_eq(&cf[4..], want.as_slice()) { return Err(Error::with_alert("tls: invalid client finished hash", 51)); }
         if conn.hs_buf.len() != 0 { return Err(Error::new("tls: handshake data after the client's Finished in one record")); }
         conn.read = suite.half(c_ap.as_slice());
+        // A ticket (as Go, one after each handshake): the resumption PSK
+        // (empty nonce), the client's certificates.
+        self.transcript.extend_from_slice(cf.as_slice());
+        let res_master = suite.derive(master.as_slice(), "res master", self.transcript.as_slice());
+        let psk = suite.expand_label(res_master.as_slice(), "resumption", &[], suite.hash_len());
+        let created = match &resumed { Some(x) => x.created, None => now_ms() / 1000 };
+        let ticket = seal_ticket(self.a.ticket_key.as_slice(), &ServerSession { suite: suite.id(), created, psk, certs: conn.peer_certs.clone() });
+        let mut body: Vec<u8> = Vec::new();
+        let left = created + TICKET_LIFETIME - now_ms() / 1000;
+        body.extend_from_slice(be32(left as u32).as_slice());
+        body.extend_from_slice(random_bytes(4).as_slice());
+        body.push(0);
+        push16(&mut body, ticket.len());
+        body.extend_from_slice(ticket.as_slice());
+        push16(&mut body, 0);
+        let mut nst: Vec<u8> = vec_of(&[4]);
+        push24(&mut nst, body.len());
+        nst.extend_from_slice(body.as_slice());
+        conn.write_record(s, HANDSHAKE, nst.as_slice()).map_err(io_err)?;
+        s.flush().map_err(io_err)?;
         Ok(())
     }
 
