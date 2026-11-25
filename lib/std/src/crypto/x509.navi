@@ -32,7 +32,7 @@ use crate::crypto::der::{self, Reader};
 use crate::crypto::Digest;
 use crate::crypto::sha2::{Sha256, Sha384, Sha512};
 use crate::crypto::rsa::{RsaPublicKey, Pkcs1v15Sign, Pss};
-use crate::crypto::{p256, p384};
+use crate::crypto::{ed25519, p256, p384};
 use crate::fmt::{self, Display, Formatter};
 use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::sync::LazyLock;
@@ -165,7 +165,8 @@ pub enum PublicKey {
     Rsa(RsaPublicKey),
     P256(p256::ecdsa::VerifyingKey),
     P384(p384::ecdsa::VerifyingKey),
-    /// Another algorithm (Ed25519, P-521, DSA...), or a key this rejects:
+    Ed25519(ed25519::VerifyingKey),
+    /// Another algorithm (P-521, DSA...), or a key this rejects:
     /// the algorithm's OID.
     Unsupported(String),
 }
@@ -178,6 +179,7 @@ enum KeyAlg {
     Rsa,
     P256,
     P384,
+    Ed25519,
     Other(String),
 }
 
@@ -417,6 +419,15 @@ impl Certificate {
                 Ok(k) => PublicKey::P384(k),
                 Err(_) => PublicKey::Unsupported("1.2.840.10045.2.1".to_string()),
             },
+            KeyAlg::Ed25519 => {
+                let mut b: [u8; 32] = [0; 32];
+                if self.key.len() != 32 { return PublicKey::Unsupported("1.3.101.112".to_string()); }
+                b.copy_from_slice(self.key.as_slice());
+                match ed25519::VerifyingKey::from_bytes(&b) {
+                    Ok(k) => PublicKey::Ed25519(k),
+                    Err(_) => PublicKey::Unsupported("1.3.101.112".to_string()),
+                }
+            }
             KeyAlg::Other(oid) => PublicKey::Unsupported(oid.clone()),
         }
     }
@@ -585,6 +596,7 @@ pub enum PrivateKey {
     Rsa(crate::crypto::rsa::RsaPrivateKey),
     P256(p256::ecdsa::SigningKey),
     P384(p384::ecdsa::SigningKey),
+    Ed25519(ed25519::SigningKey),
 }
 
 impl PrivateKey {
@@ -594,6 +606,7 @@ impl PrivateKey {
             PrivateKey::Rsa(k) => PublicKey::Rsa(k.to_public_key()),
             PrivateKey::P256(k) => PublicKey::P256(k.verifying_key()),
             PrivateKey::P384(k) => PublicKey::P384(k.verifying_key()),
+            PrivateKey::Ed25519(k) => PublicKey::Ed25519(k.verifying_key()),
         }
     }
 
@@ -603,6 +616,7 @@ impl PrivateKey {
             (PrivateKey::Rsa(k), PublicKey::Rsa(p)) => k.to_public_key().n() == p.n() && k.to_public_key().e() == p.e(),
             (PrivateKey::P256(k), PublicKey::P256(p)) => k.verifying_key().to_sec1_bytes() == p.to_sec1_bytes(),
             (PrivateKey::P384(k), PublicKey::P384(p)) => k.verifying_key().to_sec1_bytes() == p.to_sec1_bytes(),
+            (PrivateKey::Ed25519(k), PublicKey::Ed25519(p)) => k.verifying_key() == p,
             _ => false,
         }
     }
@@ -610,7 +624,7 @@ impl PrivateKey {
 
 fn key_err(what: &str) -> Error { Error::Parse(what.to_string()) }
 
-/// A PKCS#8 PrivateKeyInfo's key (RSA, or ECDSA on P-256 or P-384).
+/// A PKCS#8 PrivateKeyInfo's key (RSA, ECDSA on P-256 or P-384, Ed25519).
 pub fn parse_pkcs8_private_key(der_bytes: &[u8]) -> Result<PrivateKey, Error> {
     let mut top = Reader::new(der_bytes);
     let mut r = top.read_nested(der::SEQUENCE).ok_or(key_err("malformed PKCS#8 private key"))?;
@@ -622,6 +636,16 @@ pub fn parse_pkcs8_private_key(der_bytes: &[u8]) -> Result<PrivateKey, Error> {
     if oid == "1.2.840.10045.2.1" {
         let curve = match alg.read_oid() { Some(o) => der::oid_string(o), None => return Err(key_err("PKCS#8 EC key without a named curve")) };
         return ec_key(inner, curve.as_str());
+    }
+    if oid == "1.3.101.112" {
+        // RFC 8410: no parameters; the seed as an OCTET STRING inside.
+        if !alg.is_empty() { return Err(key_err("x509: invalid Ed25519 private key parameters")); }
+        let mut ir = Reader::new(inner);
+        let seed = ir.read(der::OCTET_STRING).ok_or(key_err("x509: invalid Ed25519 private key: malformed"))?;
+        if seed.len() != 32 { return Err(Error::Parse(`x509: invalid Ed25519 private key length: ${seed.len()}`.to_string())); }
+        let mut b: [u8; 32] = [0; 32];
+        b.copy_from_slice(seed);
+        return Ok(PrivateKey::Ed25519(ed25519::SigningKey::from_bytes(&b)));
     }
     Err(Error::Parse(`PKCS#8 wrapping contained private key with unknown algorithm: ${oid}`.to_string()))
 }
@@ -789,6 +813,9 @@ fn parse_spki(raw: &[u8]) -> Option<(KeyAlg, Vec<u8>)> {
         } else {
             KeyAlg::Other(`${oid} ${curve}`.to_string())
         }
+    } else if oid == "1.3.101.112" && alg.is_empty() {
+        // (RFC 8410: no parameters.)
+        KeyAlg::Ed25519
     } else {
         KeyAlg::Other(oid)
     };
@@ -1002,7 +1029,17 @@ fn parse_name_constraints(value: &[u8]) -> Option<(NameConstraints, bool)> {
 fn check_signature(alg: SignatureAlgorithm, signed: &[u8], sig: &[u8], key: &PublicKey) -> Result<(), Error> {
     match alg {
         SignatureAlgorithm::Sha1WithRsa | SignatureAlgorithm::EcdsaWithSha1 => return Err(Error::InsecureAlgorithm(alg)),
-        SignatureAlgorithm::Ed25519 | SignatureAlgorithm::Unknown => return Err(Error::UnsupportedAlgorithm),
+        SignatureAlgorithm::Unknown => return Err(Error::UnsupportedAlgorithm),
+        SignatureAlgorithm::Ed25519 => {
+            // (Go: the key must be Ed25519, the signature over the data.)
+            return match key {
+                PublicKey::Ed25519(k) => {
+                    let ok = match ed25519::Signature::from_slice(sig) { Ok(s) => k.verify(signed, &s).is_ok(), Err(_) => false };
+                    if ok { Ok(()) } else { Err(Error::Signature("x509: Ed25519 verification failure".to_string())) }
+                }
+                _ => Err(Error::UnsupportedAlgorithm),
+            };
+        }
         _ => {}
     }
     match key {
@@ -1028,7 +1065,7 @@ fn check_signature(alg: SignatureAlgorithm, signed: &[u8], sig: &[u8], key: &Pub
             let s = p384::ecdsa::Signature::from_der(sig).map_err(|_e: crate::crypto::ec::Error| -> Error { ecdsa_failure() })?;
             k.verify_prehash(ecdsa_hash(&alg, signed)?.as_slice(), &s).map_err(|_e: crate::crypto::ec::Error| -> Error { ecdsa_failure() })
         }
-        PublicKey::Unsupported(_) => Err(Error::UnsupportedAlgorithm),
+        PublicKey::Ed25519(_) | PublicKey::Unsupported(_) => Err(Error::UnsupportedAlgorithm),
     }
 }
 
