@@ -1325,7 +1325,7 @@ impl Gen {
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
             res_off: 0, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), preg2: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
             frame: 0, buf_top: 0, ssa_alloc: crate::ssa::regalloc::empty(), ssa_slots: 0, ptr_slots: Vec::new(), ssa_masks: Vec::new(),
-            ssa_var0: false, ssa_bridge: 0, ssa_pr: Vec::new() };
+            ssa_var0: false, ssa_defers: false, ssa_bridge: 0, ssa_pr: Vec::new() };
         fg.gen();
         fg.stack_meta();
         if c_entry(f.def) { fg.gen_c_entry(); }
@@ -1404,12 +1404,14 @@ pub struct FnGen {
     buf_top: i64,
     /// The SSA backend's state: whether it made this function, its
     /// allocation, where the spill slots start, the pointer slots, the
-    /// calls' masks and whether the result is a variable.
+    /// calls' masks, whether the result is a variable and whether the
+    /// function defers calls.
     ssa_alloc: &mut crate::ssa::regalloc::Alloc,
     ssa_slots: i64,
     ptr_slots: Vec<i64>,
     ssa_masks: Vec<u16>,
     ssa_var0: bool,
+    ssa_defers: bool,
     /// The area where operands for the old helpers are put (bridge).
     ssa_bridge: i64,
     /// By local: the first argument register its parameter comes in (-1:
@@ -1462,6 +1464,12 @@ impl FnGen {
         }
         crate::backend::ssagen::count(true);
         self.ssa_var0 = sf.is_var[0];
+        self.ssa_defers = false;
+        for b in sf.blocks.iter() {
+            for v in b.values.iter() {
+                if v.op == crate::ssa::OP_DEFER { self.ssa_defers = true; }
+            }
+        }
         self.gen_ssa(sf);
         crate::ssa::recycle(sf);
         true
@@ -3910,9 +3918,9 @@ impl FnGen {
                     self.ssa_out(v, d);
                     return;
                 }
-                if t.op == crate::ssa::OP_INTRINSIC || t.op == crate::ssa::OP_CLOSURE {
-                    // Intrinsics leave their words in V1, V2; closures their
-                    // environment in V2.
+                if t.op == crate::ssa::OP_INTRINSIC || t.op == crate::ssa::OP_CLOSURE || t.op == crate::ssa::OP_CALL {
+                    // Intrinsics and calls leave their words in V1, V2;
+                    // closures their environment in V2.
                     let src = if t.op == crate::ssa::OP_CLOSURE || v.aux_int == 1 { V2 } else { V1 };
                     let d = self.ssa_dst(v, V1);
                     if crate::ssa::is_float(v.ty) { m.fmov_to(d, src, v.ty == crate::ssa::T_F64); } else if d != src { m.mov(d, src); }
@@ -3992,6 +4000,11 @@ impl FnGen {
             }
             crate::ssa::OP_RETURN => {
                 let size = self.size(self.ltypes[0]);
+                let rw = if size > 0 { self.ssa_words(self.ltypes[0]) } else { 0 };
+                if rw > 0 {
+                    self.ssa_return_regs(v, rw, size);
+                    return;
+                }
                 // The result's words go to the caller's slot first (the
                 // defers cannot change a variable).
                 if nargs > 1 && size > 0 {
@@ -4003,11 +4016,7 @@ impl FnGen {
                         self.ssa_store_word(v.args[1], w1, 8, BASE, 8);
                     }
                 }
-                m.load(8, CTX, FP, SLOT_DEFERS);
-                let skip = m.new_label();
-                m.branch_zero(CTX, skip);
-                m.call(&self.g.sym_rundefers);
-                m.bind(skip);
+                self.ssa_run_defers();
                 if nargs == 1 && size > 0 && !self.ssa_var0 {
                     m.load(8, BASE, FP, SLOT_RET);
                     self.local_addr(RA, 0);
@@ -4018,6 +4027,59 @@ impl FnGen {
             }
             _ => self.g.errorf(`${self.f.name}: SSA op ${crate::ssa::op_name(op)} not generated`.to_string()),
         }
+    }
+
+    /// Runs the frame's deferred calls (only a function that defers any
+    /// has them).
+    fn ssa_run_defers(&mut self) {
+        if !self.ssa_defers { return; }
+        let m = self.m;
+        m.load(8, CTX, FP, SLOT_DEFERS);
+        let skip = m.new_label();
+        m.branch_zero(CTX, skip);
+        m.call(&self.g.sym_rundefers);
+        m.bind(skip);
+    }
+
+    /// Returns a result of rw words (size bytes) in V1, V2, as direct
+    /// calls take it, and at the caller's slot unless that is 0 (callers
+    /// through the stack entry give one).
+    fn ssa_return_regs(&mut self, v: &crate::ssa::Value, rw: i64, size: i64) {
+        let m = self.m;
+        let nargs = v.args.len();
+        let ws = if rw == 1 { size } else { 8 };
+        if nargs > 1 {
+            // Variables: the words are final before the defers.
+            let mut w = 0;
+            while w < rw {
+                let a = v.args[w as usize];
+                let dst = if w == 0 { V1 } else { V2 };
+                let r = self.ssa_in(a, dst);
+                if crate::ssa::is_float(a.ty) { m.fmov_from(dst, r, a.ty == crate::ssa::T_F64); } else if r != dst { m.mov(dst, r); }
+                w += 1;
+            }
+            if self.ssa_defers {
+                m.store(8, V1, FP, self.tmp_off);
+                if rw == 2 { m.store(8, V2, FP, self.tmp_off + 8); }
+                self.ssa_run_defers();
+                m.load(8, V1, FP, self.tmp_off);
+                if rw == 2 { m.load(8, V2, FP, self.tmp_off + 8); }
+            }
+        } else {
+            // In memory: read after the defers.
+            self.ssa_run_defers();
+            self.local_addr(RA, 0);
+            m.load(ws, V1, RA, 0);
+            if rw == 2 { m.load(8, V2, RA, 8); }
+        }
+        m.load(8, BASE, FP, SLOT_RET);
+        let skip = m.new_label();
+        m.branch_zero(BASE, skip);
+        m.store(ws, V1, BASE, 0);
+        if rw == 2 { m.store(8, V2, BASE, 8); }
+        m.bind(skip);
+        for sv in self.saved.iter() { m.load(8, sv.0, FP, sv.1); }
+        m.ret();
     }
 
     /// Whether an Arg value is a word of a two-word variable.
@@ -4273,7 +4335,8 @@ impl FnGen {
                     m.call_reg(BASE);
                 } else {
                     self.pass_loc(pos);
-                    m.addr_of(RET, FP, self.res_off);
+                    // A result in registers: no buffer (RET 0, see OP_RETURN).
+                    if v.ty == crate::ssa::T_TUPLE { m.mov_imm(RET, 0); } else { m.addr_of(RET, FP, self.res_off); }
                     let ins = tt.inst.unwrap();
                     m.adr_sym(CTX, &ins.dict);
                     // Register arguments enter at .r, stack ones at the stub.
