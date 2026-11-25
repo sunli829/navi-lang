@@ -1027,6 +1027,10 @@ pub fn test_command(args: &Vec<String>, bench: bool) -> i32 {
                 no_run = true;
                 pass.push(args[i].clone());
             }
+            "--doc" => {
+                DOC_ONLY = true;
+                pass.push(args[i].clone());
+            }
             "-p" if i + 1 < args.len() => {
                 package = args[i + 1].clone();
                 pass.push(args[i].clone());
@@ -1208,6 +1212,9 @@ fn test_parallel(paths: &Vec<String>, pass: &Vec<String>, jobs: usize) -> i32 {
 }
 
 // navi test on one path (a file or a project's directory).
+// navi test --doc: only the doctests.
+static mut DOC_ONLY: bool = false;
+
 fn test_path(path_s: &str, package: &str, filter_s: &str, bench: bool, no_run: bool) -> i32 {
     let path = path_s.to_string();
     let filter = filter_s.to_string();
@@ -1220,12 +1227,21 @@ fn test_path(path_s: &str, package: &str, filter_s: &str, bench: bool, no_run: b
         let mut env: Vec<(String, String)> = Vec::new();
         if let Some(p) = exe_path() { env.push(("NAVI".to_string(), p)); }
         let label = match u.member { Some(m) => `unit tests ${util::path_join(u.rel.as_str(), m.root.as_str())}`.to_string(), None => u.root.clone() };
-        let c = run_harness(u.specs.clone(), u.name.as_str(), label.as_str(), filter.as_str(), bench, &env, u.member.is_some(), no_run);
-        if c != 0 { code = c; }
+        if !DOC_ONLY {
+            let c = run_harness(u.specs.clone(), u.name.as_str(), label.as_str(), filter.as_str(), bench, &env, u.member.is_some(), no_run);
+            if c != 0 { code = c; }
+        }
         if bench { continue; }
         let m = match u.member { Some(m) => m, None => continue };
-        let files = test_files(m.dir.as_str());
-        if files.len() == 0 { continue; }
+        let files = if DOC_ONLY { Vec::new() } else { test_files(m.dir.as_str()) };
+        // (A library's doctests, after its other tests.)
+        if files.len() == 0 {
+            if !m.is_bin() {
+                let c = run_doctests(*u, m, filter.as_str(), &env, no_run);
+                if c != 0 { code = c; }
+            }
+            continue;
+        }
         // The program for NAVI_BIN_EXE_name.
         if m.is_bin() {
             let f = &BuildFlags { out: String::new(), package: String::new(), strip: false, obj_only: false, force: false };
@@ -1259,8 +1275,88 @@ fn test_path(path_s: &str, package: &str, filter_s: &str, bench: bool, no_run: b
             let c = run_harness(specs, name.as_str(), util::path_join(u.rel.as_str(), `tests/${stem}`.to_string().as_str()).as_str(), filter.as_str(), false, &env, true, no_run);
             if c != 0 { code = c; }
         }
+        if !m.is_bin() {
+            let c = run_doctests(*u, m, filter.as_str(), &env, no_run);
+            if c != 0 { code = c; }
+        }
     }
     code
+}
+
+// A library's doctests (docs/doc.md): one program depending on it, built
+// in target/doctest/<name>, run as its tests are; each compile_fail block
+// built alone, which must fail.
+fn run_doctests(u: &Unit, m: &crate::project::Member, filter: &str, env: &Vec<(String, String)>, no_run: bool) -> i32 {
+    let root = util::path_join(m.dir.as_str(), m.root.as_str());
+    let src_dir = util::path_dir(root.as_str());
+    let rel = util::path_dir(m.root.as_str());
+    let tests = crate::doc::doctest::collect(src_dir.as_str(), rel.as_str());
+    let runnable = tests.iter().filter(|t: &&crate::doc::doctest::DocTest| -> bool { !t.ignore && !t.compile_fail }).count();
+    let fails: Vec<&crate::doc::doctest::DocTest> = tests.iter().filter(|t: &&crate::doc::doctest::DocTest| -> bool { !t.ignore && t.compile_fail && (filter.len() == 0 || t.title().contains(filter) || t.ident().contains(filter)) }).collect();
+    if runnable == 0 && fails.len() == 0 { return 0; }
+    let name = `${u.name}_doctests`.to_string();
+    let dir = util::path_join(u.out_dir.as_str(), `doctest/${u.name}`.to_string().as_str());
+    // The program's crates: the library's, then the program's.
+    let mk_specs = |fs_root: &str| -> Vec<&CrateSpec> {
+        let mut specs: Vec<&CrateSpec> = Vec::new();
+        let mut deps: Vec<String> = Vec::new();
+        for s in u.specs.iter() {
+            if s.name == u.name {
+                deps.push(`${u.name}=${u.name}`.to_string());
+                for d in s.deps.iter() { deps.push(d.clone()); }
+            }
+            specs.push(*s);
+        }
+        note_package(name.as_str(), m.manifest);
+        specs.push(&CrateSpec { name: name.clone(), fs_root: fs_root.to_string(), root: "src/main.navi".to_string(), deps, dir: fs_root.to_string() });
+        specs
+    };
+    let mut code = 0;
+    if runnable > 0 {
+        let text = crate::doc::doctest::program(&tests);
+        if let Err(e) = write_source(dir.as_str(), text.as_str()) {
+            eprintln(e);
+            return 1;
+        }
+        let label = `Doc-tests ${u.name}`.to_string();
+        code = run_harness(mk_specs(dir.as_str()), name.as_str(), label.as_str(), filter, false, env, true, no_run);
+    }
+    if no_run { return code; }
+    for (k, t) in fails.iter().enumerate() {
+        let d = util::path_join(dir.as_str(), `compile_fail_${k}`.to_string().as_str());
+        if let Err(e) = write_source(d.as_str(), crate::doc::doctest::compile_fail_program(*t).as_str()) {
+            eprintln(e);
+            return 1;
+        }
+        let mut cfg = host_config();
+        cfg.test = false;
+        let specs = mk_specs(d.as_str());
+        let (_, errs) = check_prepared(cfg, &specs);
+        let mut failed = false;
+        for e in errs.iter() { if !e.warning { failed = true; } }
+        if failed {
+            println(`ok   ${t.title()} - compile fail`.to_string());
+        } else {
+            println(`--- FAIL: ${t.title()} - compile fail\n    note: the code compiled`.to_string());
+            code = 1;
+        }
+    }
+    code
+}
+
+// dir/src/main.navi with text (written only when it differs: the build
+// cache keys on its time too).
+fn write_source(dir: &str, text: &str) -> Result<(), String> {
+    let src = util::path_join(dir, "src");
+    if let Err(e) = std::fs::create_dir_all(src.as_str()) { return Err(`${src}: ${e}`.to_string()); }
+    let f = util::path_join(src.as_str(), "main.navi");
+    if let Ok(old) = std::fs::read_to_string(f.as_str()) {
+        if old == text { return Ok(()); }
+    }
+    match std::fs::write(f.as_str(), text.as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(`${f}: ${e}`.to_string()),
+    }
 }
 
 // The .navi files of dir/tests (integration tests), sorted.

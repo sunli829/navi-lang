@@ -333,4 +333,32 @@ pr ws/crates/old build > /dev/null || p_fail "an excluded crate builds alone"
 mkdir -p "$pj/ws/stray/src" && printf '[package]\nname = "stray"\n' > "$pj/ws/stray/navi.toml" && printf 'fn main() {}\n' > "$pj/ws/stray/src/main.navi"
 case "$(pr ws/stray build)" in *"not one of its members"*) ;; *) p_fail "a crate below a workspace, not a member" ;; esac
 [ "$p_ok" = 1 ] && echo "ok   projects"
+# navi doc (docs/doc.md): a library's pages and std's, links in them, a
+# warning for a link naming nothing; its doctests (run, should_panic,
+# no_run, compile_fail, fn main).
+dd=$tmp/doc
+rm -rf "$dd" && cp -R "$root/tests/doc/geo" "$dd"
+d_ok=1
+d_fail() { echo "FAIL navi doc: $*"; d_ok=0; fail=1; }
+set +e
+r=$(cd "$dd" && "$navi" doc 2>&1); c=$?
+set -e
+[ "$c" = 0 ] || d_fail "exit $c: $r"
+case "$r" in *'unresolved link to `missing`'*) ;; *) d_fail "no warning for [missing]: $r" ;; esac
+case "$r" in *'unresolved link to `u8`'*) d_fail "warned about std: $r" ;; esac
+for f in index.html search-index.js static/main.js geo/index.html geo/struct.Point.html geo/enum.Shape.html geo/trait.Area.html geo/fn.origin.html geo/util/index.html geo/util/fn.helper.html std/index.html std/vec/struct.Vec.html std/primitive.str.html; do
+	[ -f "$dd/target/doc/$f" ] || d_fail "no $f"
+done
+grep -q 'href="../geo/struct.Point.html#method.new"' "$dd/target/doc/geo/struct.Point.html" || d_fail "intra-doc link to Point::new"
+grep -q 'href="../geo/fn.origin.html"' "$dd/target/doc/geo/struct.Point.html" || d_fail "intra-doc link to origin"
+grep -q 'href="../std/vec/struct.Vec.html"' "$dd/target/doc/geo/type.Points.html" || d_fail "a std type in a declaration"
+grep -q 'impl.*Area.*for.*Shape' "$dd/target/doc/geo/trait.Area.html" || d_fail "implementors"
+grep -q '/\* private fields \*/' "$dd/target/doc/geo/struct.Point.html" || d_fail "private fields"
+grep -q '"dist","method","geo::Point"' "$dd/target/doc/search-index.js" || d_fail "search index"
+set +e
+r=$(cd "$dd" && "$navi" test 2>&1); c=$?
+set -e
+[ "$c" = 0 ] || d_fail "doctests: exit $c: $r"
+case "$r" in *"Doc-tests geo"*"4 passed, 0 failed"*"Point::new (line 38) - compile fail"*) ;; *) d_fail "doctests: $r" ;; esac
+[ "$d_ok" = 1 ] && echo "ok   navi doc"
 exit $fail

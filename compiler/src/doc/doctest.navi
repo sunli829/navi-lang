@@ -1,0 +1,360 @@
+//! Doctests (as rustdoc's): the code blocks in a library's documentation,
+//! each a #[test] of a program that depends on the library (docs/doc.md).
+
+use crate::doc::markdown;
+use crate::util;
+
+/// A code block of the documentation that is a test.
+#[derive(Clone)]
+pub struct DocTest {
+    /// The file (from the crate's directory) and the line of the fence.
+    pub file: String,
+    pub line: usize,
+    /// What the documentation is of: Point::new, the module's name.
+    pub item: String,
+    /// The code with hidden lines shown (as compiled).
+    pub code: String,
+    pub ignore: bool,
+    pub no_run: bool,
+    pub should_panic: bool,
+    pub compile_fail: bool,
+}
+
+impl DocTest {
+    /// Its name as rustdoc's: src/lib.navi - Point::new (line 12).
+    pub fn title(&self) -> String { `${self.file} - ${self.item} (line ${self.line})`.to_string() }
+
+    /// Its test's name in the program: src_lib_navi::line_12_point_new.
+    pub fn ident(&self) -> String {
+        let mut s = `line_${self.line}_`.to_string();
+        s.push_str(ident_of(self.item.as_str()).to_lowercase().as_str());
+        s.trim_end_matches('_').to_string()
+    }
+
+    pub fn module(&self) -> String { ident_of(self.file.as_str()).to_lowercase() }
+}
+
+fn ident_of(s: &str) -> String {
+    let mut out = String::new();
+    let mut under = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            under = false;
+        } else if !under {
+            out.push('_');
+            under = true;
+        }
+    }
+    out
+}
+
+/// The doctests of the .navi files under dir (rel: dir from the crate's
+/// directory, as names show it).
+pub fn collect(dir: &str, rel: &str) -> Vec<DocTest> {
+    let mut files: Vec<String> = Vec::new();
+    walk(dir, &mut files);
+    files.sort();
+    let mut out: Vec<DocTest> = Vec::new();
+    for f in files.iter() {
+        let src = match std::fs::read_to_string(f.as_str()) { Ok(s) => s, Err(_) => continue };
+        let name = util::path_join(rel, &f[dir.len() + 1..]);
+        file_tests(name.as_str(), src.as_str(), &mut out);
+    }
+    out
+}
+
+fn walk(dir: &str, out: &mut Vec<String>) {
+    let rd = match std::fs::read_dir(dir) { Ok(r) => r, Err(_) => return };
+    for e in rd {
+        if let Ok(e) = e {
+            let n = e.file_name();
+            let p = util::path_join(dir, n.as_str());
+            if std::path::Path::new(p.as_str()).is_dir() {
+                walk(p.as_str(), out);
+            } else if n.ends_with(".navi") {
+                out.push(p);
+            }
+        }
+    }
+}
+
+// The tests of one file: each run of /// or //! lines is documentation;
+// /// documents the item after it (in an impl or trait: Type::item).
+fn file_tests(name: &str, src: &str, out: &mut Vec<DocTest>) {
+    let lines: Vec<&str> = src.split('\n').collect();
+    let module = module_name(name);
+    let mut owner = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        let inner = t.starts_with("//!");
+        let outer = t.starts_with("///") && !t.starts_with("////");
+        if !inner && !outer {
+            // An impl or trait at the left margin: the owner of the items in it.
+            let l = lines[i];
+            if !l.starts_with(" ") && !l.starts_with("\t") {
+                if let Some(o) = impl_owner(l) { owner = o; } else if l.starts_with("}") { owner = String::new(); }
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut text: Vec<String> = Vec::new();
+        while i < lines.len() {
+            let t = lines[i].trim_start();
+            let ok = if inner { t.starts_with("//!") } else { t.starts_with("///") && !t.starts_with("////") };
+            if !ok { break; }
+            let x = &t[3..];
+            text.push((if x.starts_with(" ") { &x[1..] } else { x }).to_string());
+            i += 1;
+        }
+        let item = if inner {
+            module.clone()
+        } else {
+            let mut j = i;
+            while j < lines.len() && (lines[j].trim().starts_with("#[") || lines[j].trim().len() == 0) { j += 1; }
+            let n = if j < lines.len() { decl_name(lines[j]) } else { String::new() };
+            let indented = j < lines.len() && (lines[j].starts_with(" ") || lines[j].starts_with("\t"));
+            if indented && owner.len() > 0 && n.len() > 0 { `${owner}::${n}`.to_string() } else if n.len() > 0 { n } else { module.clone() }
+        };
+        for b in markdown::code_blocks(text.join("\n").as_str()).iter() {
+            if !markdown::is_navi(b.info.as_str()) { continue; }
+            let words: Vec<&str> = b.info.split(|c: char| -> bool { c == ',' || c == ' ' }).collect();
+            let has = |w: &str| -> bool { words.contains(&w) };
+            out.push(DocTest { file: name.to_string(), line: start + b.line, item: item.clone(), code: shown_code(b.code.as_str()), ignore: has("ignore"),
+                no_run: has("no_run"), should_panic: has("should_panic"), compile_fail: has("compile_fail") });
+        }
+    }
+}
+
+// src/lib.navi: the crate's root ("lib"); src/a/b.navi: "a::b".
+fn module_name(file: &str) -> String {
+    let f = file.trim_start_matches("src/");
+    let f = f.trim_end_matches(".navi");
+    let f = f.trim_end_matches("/mod");
+    if f == "lib" || f == "main" { return "crate".to_string(); }
+    f.replace("/", "::")
+}
+
+// "impl<T> Trait for Name<T> {" or "trait Name" -> Name.
+fn impl_owner(l: &str) -> Option<String> {
+    let t = l.trim_start_matches("pub ").trim_start_matches("unsafe ");
+    if t.starts_with("trait ") { return Some(first_ident(&t[6..])); }
+    if !t.starts_with("impl") { return None; }
+    let mut rest = &t[4..];
+    // (Generics.)
+    if rest.starts_with("<") {
+        let mut depth = 0;
+        let mut k = 0;
+        for (n, c) in rest.char_indices() {
+            if c == '<' { depth += 1; }
+            if c == '>' {
+                depth -= 1;
+                if depth == 0 { k = n + 1; break; }
+            }
+        }
+        rest = &rest[k..];
+    }
+    let rest = match rest.find(" for ") { Some(k) => &rest[k + 5..], None => rest };
+    let n = first_ident(rest.trim_start().trim_start_matches('&'));
+    if n.len() == 0 { None } else { Some(n) }
+}
+
+// The name an item's first line declares.
+fn decl_name(l: &str) -> String {
+    let mut t = l.trim();
+    for p in ["pub(crate) ", "pub ", "const ", "unsafe ", "extern \"C\" "].iter() {
+        while t.starts_with(*p) { t = t[p.len()..].trim_start(); }
+    }
+    for kw in ["fn ", "struct ", "enum ", "trait ", "type ", "const ", "static mut ", "static ", "mod "].iter() {
+        if t.starts_with(*kw) { return first_ident(&t[kw.len()..]); }
+    }
+    if t.starts_with("impl") { return impl_owner(t).unwrap_or(String::new()); }
+    // (A field or variant.)
+    first_ident(t)
+}
+
+fn first_ident(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.trim_start().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' { out.push(c); } else { break; }
+    }
+    out
+}
+
+// The code as compiled: "# x" is x, "#" alone an empty line, "##" a "#".
+fn shown_code(code: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for l in code.split('\n') {
+        let t = l.trim_start();
+        let ind = &l[..l.len() - t.len()];
+        if t == "#" {
+            out.push(String::new());
+        } else if t.starts_with("# ") {
+            out.push(`${ind}${&t[2..]}`.to_string());
+        } else if t.starts_with("##") {
+            out.push(`${ind}${&t[1..]}`.to_string());
+        } else {
+            out.push(l.to_string());
+        }
+    }
+    out.join("\n")
+}
+
+/// A test's code split into items (fn, struct, use, ...) and statements:
+/// the items go in its module, the statements in the function that runs.
+pub fn split(code: &str) -> (String, String) {
+    let lines: Vec<&str> = code.split('\n').collect();
+    let mut items = String::new();
+    let mut body = String::new();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    let mut in_item = false;
+    while i < lines.len() {
+        let l = lines[i];
+        let t = l.trim_start();
+        if depth == 0 && !in_item {
+            in_item = is_item_start(t);
+        }
+        if in_item { items.push_str(l); items.push('\n'); } else { body.push_str(l); body.push('\n'); }
+        depth += brace_delta(l);
+        // An item ends at depth 0 with } or ;
+        if in_item && depth <= 0 {
+            let e = t.trim_end();
+            if e.ends_with("}") || e.ends_with(";") || (e.len() == 0 && depth == 0 && !t.starts_with("#[")) {
+                if !t.starts_with("#[") { in_item = false; }
+            }
+            if depth < 0 { depth = 0; }
+        }
+        i += 1;
+    }
+    (items, body)
+}
+
+fn is_item_start(t: &str) -> bool {
+    let mut x = t;
+    if x.starts_with("#[") || x.starts_with("#![") { return true; }
+    for p in ["pub(crate) ", "pub "].iter() { if x.starts_with(*p) { x = &x[p.len()..]; } }
+    for kw in ["fn ", "struct ", "enum ", "trait ", "type ", "use ", "mod ", "impl ", "impl<", "static ", "extern ", "unsafe fn ", "unsafe impl", "const fn "].iter() {
+        if x.starts_with(*kw) { return true; }
+    }
+    // (const NAME: T = ..; at the top: an item.)
+    if x.starts_with("const ") { return true; }
+    false
+}
+
+// The braces a line opens minus those it closes (strings and comments
+// skipped).
+fn brace_delta(l: &str) -> i32 {
+    let b = l.as_bytes();
+    let mut d: i32 = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' { break; }
+        if c == b'"' || c == b'`' {
+            i += 1;
+            while i < b.len() && b[i] != c {
+                if b[i] == b'\\' { i += 1; }
+                i += 1;
+            }
+        } else if c == b'\'' && i + 2 < b.len() && (b[i + 2] == b'\'' || b[i + 1] == b'\\') {
+            i += 1;
+            while i < b.len() && b[i] != b'\'' {
+                if b[i] == b'\\' { i += 1; }
+                i += 1;
+            }
+        } else if c == b'{' {
+            d += 1;
+        } else if c == b'}' {
+            d -= 1;
+        }
+        i += 1;
+    }
+    d
+}
+
+/// The program of a library's doctests (those not ignored): a module per
+/// file, in it a module per test with its items and run(), and the #[test]
+/// calling it. compile_fail tests are left out (each is built alone).
+pub fn program(tests: &Vec<DocTest>) -> String {
+    let mut out = "// Doctests (made by navi test).\n".to_string();
+    let mut cur = String::new();
+    for t in tests.iter() {
+        if t.ignore || t.compile_fail { continue; }
+        let m = t.module();
+        if m != cur {
+            if cur.len() > 0 { out.push_str("}\n\n"); }
+            out.push_str(`mod ${m} {\n`.to_string().as_str());
+            cur = m;
+        }
+        out.push_str(test_text(t).as_str());
+    }
+    if cur.len() > 0 { out.push_str("}\n"); }
+    out.push_str("\nfn main() {}\n");
+    out
+}
+
+// One test: its module and its #[test] (no_run: built, not a test).
+fn test_text(t: &DocTest) -> String {
+    let id = t.ident();
+    let (items, body) = split(t.code.as_str());
+    let has_main = items.contains("fn main(");
+    let main_result = has_main && {
+        let k = items.find("fn main(").unwrap();
+        let rest = &items[k..];
+        let end = rest.find('{').unwrap_or(rest.len());
+        rest[..end].contains("->")
+    };
+    let call = if has_main { if main_result { "main().unwrap();" } else { "main();" } } else { "" };
+    let mut s = `    // ${t.title()}\n    mod m_${id} {\n`.to_string();
+    for l in items.lines() { s.push_str(`        ${l}\n`.to_string().as_str()); }
+    s.push_str("        pub fn run() {\n");
+    for l in body.lines() { s.push_str(`            ${l}\n`.to_string().as_str()); }
+    if call.len() > 0 { s.push_str(`            ${call}\n`.to_string().as_str()); }
+    s.push_str("        }\n    }\n");
+    if t.no_run {
+        s.push_str(`    #[allow(dead_code)]\n    fn ${id}() { m_${id}::run(); }\n\n`.to_string().as_str());
+    } else {
+        let sp = if t.should_panic { "    #[should_panic]\n" } else { "" };
+        s.push_str(`    #[test]\n${sp}    fn ${id}() { m_${id}::run(); }\n\n`.to_string().as_str());
+    }
+    s
+}
+
+/// A compile_fail test's program (built alone; it must not compile).
+pub fn compile_fail_program(t: &DocTest) -> String {
+    let (items, body) = split(t.code.as_str());
+    let has_main = items.contains("fn main(");
+    if has_main { return `${items}\n${body}`.to_string(); }
+    `${items}\nfn main() {\n${body}}\n`.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_and_names() {
+        let src = "//! Top.\n//!\n//! ```\n//! let a = 1;\n//! ```\n\n/// A point.\n///\n/// ```no_run\n/// # use geo::Point;\n/// let p = Point::new();\n/// ```\npub struct Point {}\n\nimpl Point {\n    /// New.\n    ///\n    /// ```should_panic\n    /// panic(\"x\");\n    /// ```\n    ///\n    /// ```text\n    /// not code\n    /// ```\n    pub fn new() -> Point { Point {} }\n}\n";
+        let mut out: Vec<DocTest> = Vec::new();
+        file_tests("src/lib.navi", src, &mut out);
+        assert_eq(out.len(), 3);
+        assert_eq(out[0].title(), "src/lib.navi - crate (line 3)".to_string());
+        assert_eq(out[1].title(), "src/lib.navi - Point (line 9)".to_string());
+        assert(out[1].no_run && out[1].code.starts_with("use geo::Point;"));
+        assert_eq(out[2].title(), "src/lib.navi - Point::new (line 18)".to_string());
+        assert(out[2].should_panic);
+        assert_eq(out[2].ident(), "line_18_point_new".to_string());
+        assert_eq(out[0].module(), "src_lib_navi".to_string());
+    }
+
+    #[test]
+    fn splitting() {
+        let (items, body) = split("use a::B;\n#[derive(Debug)]\nstruct S {\n    x: i32,\n}\nlet s = S { x: 1 };\nfn f() -> i32 {\n    if true { 1 } else { 2 }\n}\nassert(f() == \"}\".len() as i32);");
+        assert_eq(items, "use a::B;\n#[derive(Debug)]\nstruct S {\n    x: i32,\n}\nfn f() -> i32 {\n    if true { 1 } else { 2 }\n}\n".to_string());
+        assert_eq(body, "let s = S { x: 1 };\nassert(f() == \"}\".len() as i32);\n".to_string());
+        assert_eq(shown_code("# use x;\n#\nlet a = 1;\n## not hidden"), "use x;\n\nlet a = 1;\n# not hidden".to_string());
+    }
+}

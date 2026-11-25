@@ -12,9 +12,10 @@ HTML documentation of a crate, its dependencies and std, as rustdoc's
   dependency and std into `target/doc/` (`-o` another directory);
   `--no-deps` only the crate (links into the others are left out).
 - `--open` opens `target/doc/<crate>/index.html` (open, xdg-open, start).
-- std's pages depend only on std's source: they are made once per std
-  and kept in NAVI_CACHE, then copied.
-- Warnings, as rustdoc's: intra-doc links that name nothing.
+- std's pages are made every time (with a crate: about 1200 pages in
+  0.6s on an M4; caching them is left for when it matters).
+- Warnings, as rustdoc's: intra-doc links that name nothing (in the
+  documented crates, not std).
 
 ## What is documented
 
@@ -90,8 +91,13 @@ a library crate (its `src/lib.navi` tree), as rustdoc's:
   its code is the body of the test unless it has `fn main`, then its items
   are in a module of their own and the test calls its main. The crate is
   named by its name (`use mycrate::Thing;`).
-- Names as rustdoc's: `src/lib.navi - Thing::new (line 12)`; `navi test
-  name` filters them with the others; `navi test --doc` runs only them.
+- A test is named by its file, line and item: `src_lib_navi::line_12_thing_new`
+  (rustdoc's `src/lib.rs - Thing::new (line 12)`; the harness prints test
+  functions' paths); `navi test . name` filters them with the others;
+  `navi test --doc` runs only them. The program is written to
+  `target/doctest/<crate>/src/main.navi` (an error points into it).
+- Only a library's (as rustdoc's: a program's items cannot be named from
+  another crate).
 
 ## Layout
 
