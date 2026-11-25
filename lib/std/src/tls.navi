@@ -784,7 +784,7 @@ impl Conn {
         }
         let lifetime = if lifetime > TICKET_LIFETIME { TICKET_LIFETIME } else { lifetime };
         let psk = self.suite.expand_label(self.res_master.as_slice(), "resumption", nonce.as_slice(), self.suite.hash_len());
-        let sess = ClientSession { suite: self.suite.id(), psk, ticket, age_add, received_ms: now_ms(), lifetime, certs: self.peer_certs.clone() };
+        let sess = ClientSession { version: 0x0304, ems: false, suite: self.suite.id(), psk, ticket, age_add, received_ms: now_ms(), lifetime, certs: self.peer_certs.clone() };
         cache.put(self.cache_key.as_str(), sess);
         Ok(())
     }
@@ -1153,8 +1153,12 @@ const TICKET_LIFETIME: u64 = 604800;
 // A session a client can resume: the server's ticket and what it stands for.
 #[derive(Clone)]
 struct ClientSession {
+    /// 0x0304 (a PSK) or 0x0303 (a master secret, and whether it is an
+    /// extended one).
+    version: u16,
+    ems: bool,
     suite: u16,
-    /// The resumption PSK.
+    /// The resumption PSK, or TLS 1.2's master secret.
     psk: Vec<u8>,
     ticket: Vec<u8>,
     age_add: u32,
@@ -1227,8 +1231,11 @@ fn psk_binder(suite: &Suite, psk: &[u8], prefix: &[u8], truncated: &[u8]) -> Vec
     suite.hmac(fk.as_slice(), suite.hash(t.as_slice()).as_slice())
 }
 
-// A session a server resumes: what its ticket holds.
+// A session a server resumes: what its ticket holds (TLS 1.2: the master
+// secret as the psk, and whether it is an extended one).
 struct ServerSession {
+    version: u16,
+    ems: bool,
     suite: u16,
     created: u64,
     psk: Vec<u8>,
@@ -1239,11 +1246,13 @@ struct ServerSession {
 // tag). The plaintext: version, suite, creation time, PSK, the client's
 // certificates.
 fn seal_ticket(key: &[u8], sess: &ServerSession) -> Vec<u8> {
-    let mut pt: Vec<u8> = vec_of(&[3, 4]);
+    let mut pt: Vec<u8> = Vec::new();
+    push16(&mut pt, sess.version as usize);
     push16(&mut pt, sess.suite as usize);
     pt.extend_from_slice(be64(sess.created).as_slice());
     pt.push(sess.psk.len() as u8);
     pt.extend_from_slice(sess.psk.as_slice());
+    if sess.version == 0x0303 { pt.push(sess.ems as u8); }
     push16(&mut pt, sess.certs.len());
     for c in sess.certs.iter() {
         push24(&mut pt, c.raw().len());
@@ -1263,10 +1272,12 @@ fn open_ticket(key: &[u8], t: &[u8]) -> Option<ServerSession> {
     let mut pt = t[12..t.len() - 16].to_vec();
     if Aes256Gcm::new_from_slice(key).unwrap().decrypt_in_place_detached(&t[..12], &[], pt.as_mut_slice(), &t[t.len() - 16..]).is_err() { return None; }
     let mut m = Msg::new(pt.as_slice());
-    if m.u16().ok()? != 0x0304 { return None; }
+    let version = m.u16().ok()? as u16;
+    if version != 0x0304 && version != 0x0303 { return None; }
     let suite = m.u16().ok()? as u16;
     let created = read_be(m.bytes(8).ok()?.as_slice());
     let psk = m.vec8().ok()?;
+    let ems = if version == 0x0303 { m.u8().ok()? == 1 } else { false };
     let n = m.u16().ok()?;
     let mut certs: Vec<Certificate> = Vec::new();
     let mut i = 0;
@@ -1274,8 +1285,9 @@ fn open_ticket(key: &[u8], t: &[u8]) -> Option<ServerSession> {
         certs.push(Certificate::from_der(m.vec24().ok()?.as_slice()).ok()?);
         i += 1;
     }
-    if m.left() != 0 || Suite::of(suite).is_none() { return None; }
-    Some(ServerSession { suite, created, psk, certs })
+    if m.left() != 0 { return None; }
+    if version == 0x0304 && Suite::of(suite).is_none() { return None; }
+    Some(ServerSession { version, ems, suite, created, psk, certs })
 }
 
 struct Handshake {
@@ -1325,7 +1337,11 @@ impl Handshake {
         if let Some(cache) = c.b.cache {
             if let Some(sess) = cache.get(domain) {
                 let mut offered = false;
-                for x in h.suites.iter() { if x.id() == sess.suite { offered = true; } }
+                if sess.version == 0x0304 {
+                    for x in h.suites.iter() { if x.id() == sess.suite { offered = true; } }
+                } else {
+                    for x in h.suites12.iter() { if x.id == sess.suite { offered = true; } }
+                }
                 if offered && now_ms() < sess.received_ms + 1000 * sess.lifetime { h.resume = Some(sess); } else { cache.remove(domain); }
             }
         }
@@ -1415,6 +1431,15 @@ impl Handshake {
             push16(&mut ext, 0xff01);
             push16(&mut ext, 1);
             ext.push(0);
+            // session_ticket, with a cache: a TLS 1.2 session's ticket, else
+            // empty (asking for one).
+            if self.c.b.cache.is_some() {
+                let empty: Vec<u8> = Vec::new();
+                let t = match &self.resume { Some(x) => if x.version == 0x0303 { x.ticket.clone() } else { empty }, None => empty };
+                push16(&mut ext, 35);
+                push16(&mut ext, t.len());
+                ext.extend_from_slice(t.as_slice());
+            }
         }
         if !self.c.v13 {
             push16(&mut b, ext.len());
@@ -1459,7 +1484,7 @@ impl Handshake {
         // pre_shared_key (last): the ticket, its obfuscated age, and a
         // binder filled in below.
         let mut psk_suite: Option<Suite> = None;
-        if let Some(sess) = &self.resume {
+        if let Some(sess) = &self.resume.as_ref().filter(|x: &&ClientSession| -> bool { x.version == 0x0304 }) {
             let suite = Suite::of(sess.suite).unwrap();
             let age = ((now_ms() - sess.received_ms) as u32).wrapping_add(sess.age_add);
             let hl = suite.hash_len();
@@ -1517,7 +1542,7 @@ impl Handshake {
             let (group, cookie) = self.retry_request(&sh)?;
             let hrr_suite = Suite::of(self.selected_suite(&sh)?).unwrap();
             if let Some(sess) = &self.resume {
-                if Suite::of(sess.suite).unwrap().hash_len() != hrr_suite.hash_len() { self.resume = None; }
+                if sess.version != 0x0304 || Suite::of(sess.suite).unwrap().hash_len() != hrr_suite.hash_len() { self.resume = None; }
             }
             let h = hrr_suite.hash(self.transcript.as_slice());
             let mut t2: Vec<u8> = vec_of(&[254, 0, 0, h.len() as u8]);
@@ -1744,7 +1769,8 @@ impl Handshake {
         if echo != self.session_id { return Err(Error::new("tls: server did not echo the legacy session ID")); }
         if compression != 0 { return Err(Error::new("tls: server selected unsupported compression format")); }
         if let Some(p) = ext_of(&exts, 41) {
-            if self.resume.is_none() { return Err(Error::new("tls: server selected unadvertised PSK")); }
+            let offered = match &self.resume { Some(x) => x.version == 0x0304, None => false };
+            if !offered { return Err(Error::new("tls: server selected unadvertised PSK")); }
             if p.len() != 2 || p[0] != 0 || p[1] != 0 { return Err(Error::new("tls: server selected an invalid PSK")); }
         }
         let ks = match ext_of(&exts, 51) {
@@ -1964,7 +1990,7 @@ impl Handshake {
         let mut m = Msg::new(&sh[4..]);
         let version = m.u16()?;
         let server_random = m.bytes(32)?;
-        m.vec8()?;
+        let echo = m.vec8()?;
         let id = m.u16()? as u16;
         let compression = m.u8()?;
         let exts = if m.left() > 0 { extensions(m.vec16()?.as_slice())? } else { Vec::new() };
@@ -1989,6 +2015,14 @@ impl Handshake {
         if let Some(a) = ext_of(&exts, 16) { conn.alpn = Some(alpn_choice(&a, &self.c.b.alpn)?); }
         conn.v12 = true;
         self.transcript.extend_from_slice(sh.as_slice());
+        // A ticket follows the client's Finished (or, resumed, the
+        // ServerHello) when the server answered session_ticket.
+        let ticket_coming = ext_of(&exts, 35).is_some();
+        // Resumed: the server echoed the session ID of our ticket (Go).
+        let sent_ticket = match &self.resume { Some(x) => x.version == 0x0303, None => false };
+        if sent_ticket && echo == self.session_id {
+            return self.resume12(conn, s, &suite, server_random, ems, ticket_coming);
+        }
         // Certificate.
         let (t, msg) = conn.read_handshake(s)?;
         if t != 11 { return Err(Error::with_alert("tls: received unexpected handshake message instead of Certificate", 10)); }
@@ -2101,13 +2135,78 @@ impl Handshake {
         conn.write_record(s, HANDSHAKE, fin.as_slice()).map_err(io_err)?;
         self.transcript.extend_from_slice(fin.as_slice());
         s.flush().map_err(io_err)?;
-        // The server's change_cipher_spec and Finished.
-        let (t, sf) = conn.read_handshake(s)?;
+        // The server's NewSessionTicket, change_cipher_spec and Finished.
+        let (mut t, mut sf) = conn.read_handshake(s)?;
+        if ticket_coming {
+            if t != 4 { return Err(Error::with_alert("tls: received unexpected handshake message instead of NewSessionTicket", 10)); }
+            self.transcript.extend_from_slice(sf.as_slice());
+            self.keep_ticket12(conn, &sf, suite.id, master.as_slice(), ems)?;
+            let (t2, sf2) = conn.read_handshake(s)?;
+            t = t2;
+            sf = sf2;
+        }
         if t != 20 { return Err(Error::with_alert("tls: received unexpected handshake message instead of Finished", 10)); }
         if conn.read.cipher.is_none() { return Err(Error::with_alert("tls: server's Finished before its change_cipher_spec", 10)); }
         let want = suite.prf(master.as_slice(), "server finished", suite.hash(self.transcript.as_slice()).as_slice(), 12);
         if !crate::crypto::subtle::constant_time_eq(&sf[4..], want.as_slice()) { return Err(Error::with_alert("tls: server's Finished message was incorrect", 51)); }
         if conn.hs_buf.len() != 0 { return Err(Error::new("tls: handshake data after the server's Finished in one record")); }
+        Ok(())
+    }
+
+    // TLS 1.2's abbreviated handshake (RFC 5077 3.1): the session's master
+    // secret; the server's (NewSessionTicket), change_cipher_spec and
+    // Finished first, then the client's.
+    fn resume12<S: Read + Write>(&mut self, conn: &mut Conn, s: &mut S, suite: &Suite12, server_random: Vec<u8>, ems: bool, ticket_coming: bool) -> Result<(), Error> {
+        let sess = self.resume.clone().unwrap();
+        if sess.suite != suite.id { return Err(Error::with_alert("tls: server resumed a session with a different cipher suite", 47)); }
+        if sess.ems != ems { return Err(Error::with_alert("tls: server resumed a session with a different EMS extension", 47)); }
+        let master = sess.psk.clone();
+        conn.peer_certs = sess.certs.clone();
+        let (client_half, server_half) = suite.halves(master.as_slice(), self.random.as_slice(), server_random.as_slice());
+        conn.pending_read = Some(server_half);
+        let (mut t, mut sf) = conn.read_handshake(s)?;
+        if ticket_coming {
+            if t != 4 { return Err(Error::with_alert("tls: received unexpected handshake message instead of NewSessionTicket", 10)); }
+            self.transcript.extend_from_slice(sf.as_slice());
+            self.keep_ticket12(conn, &sf, suite.id, master.as_slice(), ems)?;
+            let (t2, sf2) = conn.read_handshake(s)?;
+            t = t2;
+            sf = sf2;
+        }
+        if t != 20 { return Err(Error::with_alert("tls: received unexpected handshake message instead of Finished", 10)); }
+        if conn.read.cipher.is_none() { return Err(Error::with_alert("tls: server's Finished before its change_cipher_spec", 10)); }
+        let want = suite.prf(master.as_slice(), "server finished", suite.hash(self.transcript.as_slice()).as_slice(), 12);
+        if !crate::crypto::subtle::constant_time_eq(&sf[4..], want.as_slice()) { return Err(Error::with_alert("tls: server's Finished message was incorrect", 51)); }
+        self.transcript.extend_from_slice(sf.as_slice());
+        if let Some(t) = &self.rand {
+            conn.rand = Some(t[self.rand_at..].to_vec());
+            self.rand_at = t.len();
+        }
+        conn.write_record(s, CHANGE_CIPHER_SPEC, &[1]).map_err(io_err)?;
+        conn.write = client_half;
+        let verify = suite.prf(master.as_slice(), "client finished", suite.hash(self.transcript.as_slice()).as_slice(), 12);
+        let mut fin: Vec<u8> = vec_of(&[20, 0, 0, 12]);
+        fin.extend_from_slice(verify.as_slice());
+        conn.write_record(s, HANDSHAKE, fin.as_slice()).map_err(io_err)?;
+        s.flush().map_err(io_err)?;
+        if conn.hs_buf.len() != 0 { return Err(Error::new("tls: handshake data after the server's Finished in one record")); }
+        conn.resumed = true;
+        Ok(())
+    }
+
+    // A TLS 1.2 NewSessionTicket (lifetime hint, ticket) kept in the cache
+    // with the session it resumes.
+    fn keep_ticket12(&self, conn: &Conn, msg: &[u8], suite: u16, master: &[u8], ems: bool) -> Result<(), Error> {
+        let mut m = Msg::new(&msg[4..]);
+        let hint = read_be(m.bytes(4)?.as_slice());
+        let ticket = m.vec16()?;
+        if m.left() != 0 { return Err(decode_error()); }
+        if let Some(cache) = self.c.b.cache {
+            if ticket.len() == 0 { return Ok(()); }
+            let lifetime = if hint == 0 || hint > TICKET_LIFETIME { TICKET_LIFETIME } else { hint };
+            cache.put(self.domain.as_str(), ClientSession { version: 0x0303, ems, suite, psk: master.to_vec(), ticket, age_add: 0, received_ms: now_ms(), lifetime,
+                certs: conn.peer_certs.clone() });
+        }
         Ok(())
     }
 }
@@ -2376,6 +2475,8 @@ struct ClientHello {
     binders: Vec<Vec<u8>>,
     binders_len: usize,
     psk_modes: Vec<u8>,
+    /// session_ticket (TLS 1.2): Some (maybe empty) when sent.
+    ticket: Option<Vec<u8>>,
 }
 
 fn u16s(b: &[u8]) -> Result<Vec<u16>, Error> {
@@ -2401,7 +2502,7 @@ fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, Error> {
     if m.left() != 0 { return Err(decode_error()); }
     let mut ch = ClientHello { version, random, session_id, suites, compression, server_name: None, groups: Vec::new(), sig_algs: Vec::new(), alpn: Vec::new(),
         versions: Vec::new(), shares: Vec::new(), ems: false, reneg: false, point_formats: None, cookie: None, psk_ids: Vec::new(), binders: Vec::new(), binders_len: 0,
-        psk_modes: Vec::new() };
+        psk_modes: Vec::new(), ticket: None };
     let mut ei = 0;
     for e in exts.iter() {
         ei += 1;
@@ -2451,6 +2552,8 @@ fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, Error> {
             if x.left() != 0 || ch.binders.len() != ch.psk_ids.len() || ch.psk_ids.len() == 0 { return Err(decode_error()); }
         } else if e.0 == 45 {
             ch.psk_modes = x.vec8()?;
+        } else if e.0 == 35 {
+            ch.ticket = Some(e.1.clone());
         } else if e.0 == 0xff01 {
             ch.reneg = true;
             if e.1.len() != 1 || e.1[0] != 0 { return Err(Error::with_alert("tls: initial handshake had non-empty renegotiation extension", 40)); }
@@ -2485,6 +2588,25 @@ impl ServerHandshake {
     fn sign(&self, scheme: u16, signed: &[u8]) -> Result<Vec<u8>, Error> { sign_with(self.key(), scheme, signed) }
 
     fn asks_cert(&self) -> bool { self.a.b.client_auth != ClientAuth::NoClientCert }
+
+    // Whether a session may be resumed now: not expired, and the client
+    // certificate mode met (Go's checkForResumption).
+    fn session_ok(&self, sess: &ServerSession) -> bool {
+        let now = now_ms() / 1000;
+        let need_certs = self.a.b.client_auth == ClientAuth::RequireAnyClientCert || self.a.b.client_auth == ClientAuth::RequireAndVerifyClientCert;
+        now < sess.created + TICKET_LIFETIME && !(need_certs && sess.certs.len() == 0) && !(sess.certs.len() > 0 && now as i64 > sess.certs[0].not_after())
+    }
+
+    // A TLS 1.2 NewSessionTicket for the session (master secret).
+    fn ticket12_msg(&self, suite: u16, master: &[u8], ems: bool, created: u64, certs: &[Certificate]) -> Vec<u8> {
+        let ticket = seal_ticket(self.a.ticket_key.as_slice(), &ServerSession { version: 0x0303, ems, suite, created, psk: master.to_vec(), certs: certs.to_vec() });
+        let mut nst: Vec<u8> = vec_of(&[4]);
+        push24(&mut nst, 4 + 2 + ticket.len());
+        nst.extend_from_slice(be32(TICKET_LIFETIME as u32).as_slice());
+        push16(&mut nst, ticket.len());
+        nst.extend_from_slice(ticket.as_slice());
+        nst
+    }
 
     // The client's certificates checked as the mode says (Go's
     // processCertsFromClient); certificate_required is TLS 1.3's alert.
@@ -2624,13 +2746,10 @@ impl ServerHandshake {
         let mut resumed: Option<ServerSession> = None;
         let mut psk_index = 0usize;
         if ch.psk_ids.len() > 0 && ch.psk_modes.contains(&1) {
-            let now = now_ms() / 1000;
-            let need_certs = self.a.b.client_auth == ClientAuth::RequireAnyClientCert || self.a.b.client_auth == ClientAuth::RequireAndVerifyClientCert;
             let mut i = 0;
             while i < ch.psk_ids.len() && resumed.is_none() {
                 if let Some(sess) = open_ticket(self.a.ticket_key.as_slice(), ch.psk_ids[i].0.as_slice()) {
-                    let fits = Suite::of(sess.suite).unwrap().hash_len() == suite.hash_len() && now < sess.created + TICKET_LIFETIME
-                        && !(need_certs && sess.certs.len() == 0) && !(sess.certs.len() > 0 && now as i64 > sess.certs[0].not_after());
+                    let fits = sess.version == 0x0304 && Suite::of(sess.suite).unwrap().hash_len() == suite.hash_len() && self.session_ok(&sess);
                     if fits {
                         let want = psk_binder(&suite, sess.psk.as_slice(), prefix.as_slice(), &hello[..hello.len() - ch.binders_len]);
                         if !constant_time_eq(ch.binders[i].as_slice(), want.as_slice()) { return Err(Error::with_alert("tls: invalid PSK binder", 51)); }
@@ -2773,7 +2892,7 @@ impl ServerHandshake {
         let res_master = suite.derive(master.as_slice(), "res master", self.transcript.as_slice());
         let psk = suite.expand_label(res_master.as_slice(), "resumption", &[], suite.hash_len());
         let created = match &resumed { Some(x) => x.created, None => now_ms() / 1000 };
-        let ticket = seal_ticket(self.a.ticket_key.as_slice(), &ServerSession { suite: suite.id(), created, psk, certs: conn.peer_certs.clone() });
+        let ticket = seal_ticket(self.a.ticket_key.as_slice(), &ServerSession { version: 0x0304, ems: false, suite: suite.id(), created, psk, certs: conn.peer_certs.clone() });
         let mut body: Vec<u8> = Vec::new();
         let left = created + TICKET_LIFETIME - now_ms() / 1000;
         body.extend_from_slice(be32(left as u32).as_slice());
@@ -2821,9 +2940,22 @@ impl ServerHandshake {
             Some(g) => g,
             None => return Err(Error::with_alert("tls: no ECDHE curve supported by both client and server", 40)),
         };
-        let scheme = self.scheme(&ch.sig_algs, false)?;
         let alpn = self.alpn(&ch.alpn)?;
         conn.alpn = alpn.clone();
+        // Resumption (RFC 5077): a TLS 1.2 ticket of ours, its suite one the
+        // client offers and our key takes, the extended master secret as
+        // before (Go: a session that had one needs it).
+        if let Some(t) = &ch.ticket {
+            if let Some(sess) = open_ticket(self.a.ticket_key.as_slice(), t.as_slice()) {
+                let mut s12: Option<Suite12> = None;
+                for x in suites12(true).iter() { if x.id == sess.suite && x.ecdsa == ecdsa && ch.suites.contains(&x.id) { s12 = Some(x.clone()); } }
+                if sess.version == 0x0303 && s12.is_some() && self.session_ok(&sess) && !(!sess.ems && ch.ems) {
+                    if sess.ems && !ch.ems { return Err(Error::with_alert("tls: session supported extended_master_secret but client does not", 40)); }
+                    return self.resume12(conn, s, &ch, s12.unwrap(), sess, alpn);
+                }
+            }
+        }
+        let scheme = self.scheme(&ch.sig_algs, false)?;
         // ServerHello (the downgrade sentinel when TLS 1.3 was possible).
         let mut random = server_random();
         if self.a.v13 {
@@ -2854,6 +2986,10 @@ impl ServerHandshake {
         push16(&mut ext, 2);
         ext.push(1);
         ext.push(0);
+        if ch.ticket.is_some() {
+            push16(&mut ext, 35);
+            push16(&mut ext, 0);
+        }
         let sh = server_hello_msg(random.as_slice(), &Vec::new(), suite.id, ext.as_slice());
         self.write_msg(conn, s, sh.as_slice())?;
         conn.v12 = true;
@@ -2958,6 +3094,11 @@ impl ServerHandshake {
         if !constant_time_eq(&cf[4..], want.as_slice()) { return Err(Error::with_alert("tls: client's Finished message is incorrect", 51)); }
         if conn.hs_buf.len() != 0 { return Err(Error::new("tls: handshake data after the client's Finished in one record")); }
         self.transcript.extend_from_slice(cf.as_slice());
+        // A ticket, if the client asked (before change_cipher_spec).
+        if ch.ticket.is_some() {
+            let nst = self.ticket12_msg(suite.id, master.as_slice(), ch.ems, now_ms() / 1000, conn.peer_certs.as_slice());
+            self.write_msg(conn, s, nst.as_slice())?;
+        }
         conn.write_record(s, CHANGE_CIPHER_SPEC, &[1]).map_err(io_err)?;
         conn.write = server_half;
         let verify = suite.prf(master.as_slice(), "server finished", suite.hash(self.transcript.as_slice()).as_slice(), 12);
@@ -2965,6 +3106,64 @@ impl ServerHandshake {
         fin.extend_from_slice(verify.as_slice());
         conn.write_record(s, HANDSHAKE, fin.as_slice()).map_err(io_err)?;
         s.flush().map_err(io_err)?;
+        Ok(())
+    }
+}
+
+impl ServerHandshake {
+    // TLS 1.2's abbreviated handshake: ServerHello echoing the session ID,
+    // (a new ticket), change_cipher_spec and Finished; then the client's.
+    fn resume12<S: Read + Write>(&mut self, conn: &mut Conn, s: &mut S, ch: &ClientHello, suite: Suite12, sess: ServerSession, alpn: Option<Vec<u8>>) -> Result<(), Error> {
+        let mut random = server_random();
+        if self.a.v13 {
+            let mut i = 0;
+            while i < 8 {
+                random[24 + i] = DOWNGRADE_TLS12[i];
+                i += 1;
+            }
+        }
+        let mut ext: Vec<u8> = Vec::new();
+        if ch.reneg {
+            push16(&mut ext, 0xff01);
+            push16(&mut ext, 1);
+            ext.push(0);
+        }
+        if sess.ems {
+            push16(&mut ext, 23);
+            push16(&mut ext, 0);
+        }
+        if let Some(p) = &alpn {
+            push16(&mut ext, 16);
+            push16(&mut ext, p.len() + 3);
+            push16(&mut ext, p.len() + 1);
+            ext.push(p.len() as u8);
+            ext.extend_from_slice(p.as_slice());
+        }
+        push16(&mut ext, 35);
+        push16(&mut ext, 0);
+        let sh = server_hello_msg(random.as_slice(), &ch.session_id, suite.id, ext.as_slice());
+        self.write_msg(conn, s, sh.as_slice())?;
+        conn.v12 = true;
+        conn.peer_certs = sess.certs.clone();
+        conn.resumed = true;
+        let master = sess.psk.clone();
+        let nst = self.ticket12_msg(suite.id, master.as_slice(), sess.ems, sess.created, sess.certs.as_slice());
+        self.write_msg(conn, s, nst.as_slice())?;
+        let (client_half, server_half) = suite.halves(master.as_slice(), ch.random.as_slice(), random.as_slice());
+        conn.write_record(s, CHANGE_CIPHER_SPEC, &[1]).map_err(io_err)?;
+        conn.write = server_half;
+        let verify = suite.prf(master.as_slice(), "server finished", suite.hash(self.transcript.as_slice()).as_slice(), 12);
+        let mut fin: Vec<u8> = vec_of(&[20, 0, 0, 12]);
+        fin.extend_from_slice(verify.as_slice());
+        self.write_msg(conn, s, fin.as_slice())?;
+        s.flush().map_err(io_err)?;
+        conn.pending_read = Some(client_half);
+        let (t, cf) = conn.read_handshake(s)?;
+        if t != 20 { return Err(Error::with_alert("tls: unexpected message instead of the client's Finished", 10)); }
+        if conn.read.cipher.is_none() { return Err(Error::with_alert("tls: client's Finished before its change_cipher_spec", 10)); }
+        let want = suite.prf(master.as_slice(), "client finished", suite.hash(self.transcript.as_slice()).as_slice(), 12);
+        if !constant_time_eq(&cf[4..], want.as_slice()) { return Err(Error::with_alert("tls: client's Finished message is incorrect", 51)); }
+        if conn.hs_buf.len() != 0 { return Err(Error::new("tls: handshake data after the client's Finished in one record")); }
         Ok(())
     }
 }
