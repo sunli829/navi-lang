@@ -103,8 +103,10 @@ ghash_blocks:
 
 // aes_ctr_xor(xk, rounds, ctr, src, dst, n): dst = src ^ E(ctr) for n
 // blocks, the counter (the big-endian last word of the 16 bytes at ctr)
-// incremented each block and written back. The round keys k1.. are in
-// xmm2.., k0 is loaded each block (AES-256 needs all the registers).
+// incremented each block and written back. Eight blocks at a time through
+// the rounds (the AES unit's latency hidden), then one at a time; the
+// round keys read each round (sixteen xmm registers). The counter block is
+// kept byte-reversed in xmm13 (the counter its first dword, paddd adds 1).
 aes_ctr_xor:
     mov rax, qword ptr [rsp + 8]        // xk
     mov r8, qword ptr [rsp + 16]        // rounds
@@ -114,69 +116,263 @@ aes_ctr_xor:
     mov rdx, qword ptr [rsp + 48]       // n
     test rdx, rdx
     jz .done
-    movdqu xmm2, xmmword ptr [rax + 16]
-    movdqu xmm3, xmmword ptr [rax + 32]
-    movdqu xmm4, xmmword ptr [rax + 48]
-    movdqu xmm5, xmmword ptr [rax + 64]
-    movdqu xmm6, xmmword ptr [rax + 80]
-    movdqu xmm7, xmmword ptr [rax + 96]
-    movdqu xmm8, xmmword ptr [rax + 112]
-    movdqu xmm9, xmmword ptr [rax + 128]
-    movdqu xmm10, xmmword ptr [rax + 144]
-    movdqu xmm11, xmmword ptr [rax + 160]
-    cmp r8, 10
-    je .keys
-    movdqu xmm12, xmmword ptr [rax + 176]
-    movdqu xmm13, xmmword ptr [rax + 192]
-    cmp r8, 12
-    je .keys
-    movdqu xmm14, xmmword ptr [rax + 208]
-    movdqu xmm15, xmmword ptr [rax + 224]
-.keys:
-    mov r10d, dword ptr [r9 + 12]
-    bswap r10d
-.loop:
-    mov r11d, r10d
-    bswap r11d
-    mov dword ptr [r9 + 12], r11d
-    movdqu xmm0, xmmword ptr [r9]
-    movdqu xmm1, xmmword ptr [rax]
-    pxor xmm0, xmm1
-    aesenc xmm0, xmm2
-    aesenc xmm0, xmm3
-    aesenc xmm0, xmm4
-    aesenc xmm0, xmm5
-    aesenc xmm0, xmm6
-    aesenc xmm0, xmm7
+    movdqu xmm15, xmmword ptr [rip + .bswap]
+    movdqu xmm14, xmmword ptr [rip + .one]
+    movdqu xmm13, xmmword ptr [r9]
+    pshufb xmm13, xmm15
+    // The last round key's offset
+    mov r10, r8
+    shl r10, 4
+.c8:
+    cmp rdx, 8
+    jb .c1
+    movdqa xmm0, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm0, xmm15
+    movdqa xmm1, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm1, xmm15
+    movdqa xmm2, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm2, xmm15
+    movdqa xmm3, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm3, xmm15
+    movdqa xmm4, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm4, xmm15
+    movdqa xmm5, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm5, xmm15
+    movdqa xmm6, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm6, xmm15
+    movdqa xmm7, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm7, xmm15
+    movdqu xmm8, xmmword ptr [rax]
+    pxor xmm0, xmm8
+    pxor xmm1, xmm8
+    pxor xmm2, xmm8
+    pxor xmm3, xmm8
+    pxor xmm4, xmm8
+    pxor xmm5, xmm8
+    pxor xmm6, xmm8
+    pxor xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 16]
     aesenc xmm0, xmm8
-    aesenc xmm0, xmm9
-    aesenc xmm0, xmm10
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 32]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 48]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 64]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 80]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 96]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 112]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 128]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 144]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
     cmp r8, 10
-    je .last10
-    aesenc xmm0, xmm11
-    aesenc xmm0, xmm12
+    je .c8last
+    movdqu xmm8, xmmword ptr [rax + 160]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 176]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
     cmp r8, 12
-    je .last12
-    aesenc xmm0, xmm13
-    aesenc xmm0, xmm14
-    aesenclast xmm0, xmm15
-    jmp .xor
-.last12:
-    aesenclast xmm0, xmm13
-    jmp .xor
-.last10:
-    aesenclast xmm0, xmm11
-.xor:
-    movdqu xmm1, xmmword ptr [rsi]
-    pxor xmm0, xmm1
+    je .c8last
+    movdqu xmm8, xmmword ptr [rax + 192]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+    movdqu xmm8, xmmword ptr [rax + 208]
+    aesenc xmm0, xmm8
+    aesenc xmm1, xmm8
+    aesenc xmm2, xmm8
+    aesenc xmm3, xmm8
+    aesenc xmm4, xmm8
+    aesenc xmm5, xmm8
+    aesenc xmm6, xmm8
+    aesenc xmm7, xmm8
+.c8last:
+    movdqu xmm8, xmmword ptr [rax + r10]
+    aesenclast xmm0, xmm8
+    aesenclast xmm1, xmm8
+    aesenclast xmm2, xmm8
+    aesenclast xmm3, xmm8
+    aesenclast xmm4, xmm8
+    aesenclast xmm5, xmm8
+    aesenclast xmm6, xmm8
+    aesenclast xmm7, xmm8
+    movdqu xmm9, xmmword ptr [rsi]
+    pxor xmm0, xmm9
     movdqu xmmword ptr [rdi], xmm0
-    inc r10d
+    movdqu xmm9, xmmword ptr [rsi + 16]
+    pxor xmm1, xmm9
+    movdqu xmmword ptr [rdi + 16], xmm1
+    movdqu xmm9, xmmword ptr [rsi + 32]
+    pxor xmm2, xmm9
+    movdqu xmmword ptr [rdi + 32], xmm2
+    movdqu xmm9, xmmword ptr [rsi + 48]
+    pxor xmm3, xmm9
+    movdqu xmmword ptr [rdi + 48], xmm3
+    movdqu xmm9, xmmword ptr [rsi + 64]
+    pxor xmm4, xmm9
+    movdqu xmmword ptr [rdi + 64], xmm4
+    movdqu xmm9, xmmword ptr [rsi + 80]
+    pxor xmm5, xmm9
+    movdqu xmmword ptr [rdi + 80], xmm5
+    movdqu xmm9, xmmword ptr [rsi + 96]
+    pxor xmm6, xmm9
+    movdqu xmmword ptr [rdi + 96], xmm6
+    movdqu xmm9, xmmword ptr [rsi + 112]
+    pxor xmm7, xmm9
+    movdqu xmmword ptr [rdi + 112], xmm7
+    add rsi, 128
+    add rdi, 128
+    sub rdx, 8
+    jmp .c8
+.c1:
+    test rdx, rdx
+    jz .end
+    movdqa xmm0, xmm13
+    paddd xmm13, xmm14
+    pshufb xmm0, xmm15
+    movdqu xmm8, xmmword ptr [rax]
+    pxor xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 16]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 32]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 48]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 64]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 80]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 96]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 112]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 128]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 144]
+    aesenc xmm0, xmm8
+    cmp r8, 10
+    je .c1last
+    movdqu xmm8, xmmword ptr [rax + 160]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 176]
+    aesenc xmm0, xmm8
+    cmp r8, 12
+    je .c1last
+    movdqu xmm8, xmmword ptr [rax + 192]
+    aesenc xmm0, xmm8
+    movdqu xmm8, xmmword ptr [rax + 208]
+    aesenc xmm0, xmm8
+.c1last:
+    movdqu xmm8, xmmword ptr [rax + r10]
+    aesenclast xmm0, xmm8
+    movdqu xmm9, xmmword ptr [rsi]
+    pxor xmm0, xmm9
+    movdqu xmmword ptr [rdi], xmm0
     add rsi, 16
     add rdi, 16
     dec rdx
-    jnz .loop
-    mov r11d, r10d
-    bswap r11d
-    mov dword ptr [r9 + 12], r11d
+    jmp .c1
+.end:
+    pshufb xmm13, xmm15
+    movdqu xmmword ptr [r9], xmm13
 .done:
     ret
+    .balign 16
+.bswap:
+    .byte 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+.one:
+    .quad 1, 0
