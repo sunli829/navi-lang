@@ -8,7 +8,10 @@
 //!   alone has every function a program might call). -d nostrip keeps
 //!   them all.
 //!   A static's initialization in a crate's initializer counts as reached
-//!   only if the static is.
+//!   only if the static is. A vtable's slot (obj::DYN_SLOT) reaches its
+//!   method's code only if a function reached calls that method through
+//!   dyn (obj::DYN_USE), as Go's linker keeps an itab's methods: the other
+//!   slots are left 0.
 //! - A part's numbered symbols (strings, locations: their names say
 //!   nothing about what they are) are its own: renamed with the part's
 //!   number. Every other name means the same thing in every part (stable
@@ -252,6 +255,15 @@ fn reached(cuts: &Vec<&mut Part>, defs: &Vec<(i64, usize, usize)>, id: usize) ->
     d.0 >= 0 && cuts[d.0 as usize].live[d.1][d.2]
 }
 
+// The method of the vtable slot whose code or context word is at off.
+fn slot_of(slots: &HashMap<u64, u32>, off: u64) -> Option<u32> {
+    if let Some(k) = slots.get(&off) { return Some(*k); }
+    if off >= 8 {
+        if let Some(k) = slots.get(&(off - 8)) { return Some(*k); }
+    }
+    None
+}
+
 // Whether a relocation kept refers to name.
 fn is_used(g: &Names, used: &Vec<bool>, n: &String) -> bool {
     match g.ids.get(n) { Some(i) => used[*i as usize], None => false }
@@ -330,6 +342,25 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
     // lower::INIT_NOP instead.
     let nop = match g.ids.get(&INIT_NOP.to_string()) { Some(i) => *i as i64, None => -1 };
     if nop >= 0 { work.push(defs[nop as usize]); }
+    // Each part's vtable slots: the offset of a slot (in DATA_CONST) and
+    // its method's name.
+    let mut slots: Vec<HashMap<u64, u32>> = Vec::new();
+    for (k, p) in parts.iter().enumerate() {
+        let mut m: HashMap<u64, u32> = HashMap::new();
+        for r in p.relocs.iter() {
+            if r.kind == obj::DYN_SLOT { m.insert(r.off as u64, cuts[k].gid[r.sym as usize]); }
+        }
+        slots.push(m);
+    }
+    // The dyn methods called (by name), and the slots' code waiting for
+    // their method to be.
+    let mut called: Vec<bool> = Vec::with_capacity(ng);
+    k2 = 0;
+    while k2 < ng {
+        called.push(false);
+        k2 += 1;
+    }
+    let mut pending: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut weak: Vec<u32> = Vec::new();
     loop {
         while let Some((wp, ws, wa)) = work.pop() {
@@ -343,9 +374,29 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
             let rl = c.rels[ws];
             let mut i = f[wa];
             while i < f[wa + 1] {
-                let id = c.gid[p.relocs[rl[i as usize] as usize].sym as usize];
-                if init_of[id as usize] >= 0 { weak.push(id); } else { work.push(defs[id as usize]); }
+                let r = p.relocs[rl[i as usize] as usize];
+                let id = c.gid[r.sym as usize];
                 i += 1;
+                if r.kind == obj::DYN_SLOT { continue; }
+                if r.kind == obj::DYN_USE {
+                    if !called[id as usize] {
+                        called[id as usize] = true;
+                        if let Some(ts) = pending.remove(&id) {
+                            for t in ts.iter() { work.push(defs[*t as usize]); }
+                        }
+                    }
+                    continue;
+                }
+                if !all && ws == obj::DATA_CONST {
+                    if let Some(key) = slot_of(&slots[wp as usize], r.off as u64) {
+                        if !called[key as usize] {
+                            if !pending.contains_key(&key) { pending.insert(key, Vec::new()); }
+                            pending.get_mut(&key).unwrap().push(id);
+                            continue;
+                        }
+                    }
+                }
+                if init_of[id as usize] >= 0 { weak.push(id); } else { work.push(defs[id as usize]); }
             }
         }
         // (Those whose static is not reached yet wait for the next round.)
@@ -486,13 +537,20 @@ pub fn merge(parts: &Vec<&mut Object>) -> Result<&mut Object, String> {
                     while i < f[a + 1] {
                         let r = p.relocs[rl[i as usize] as usize];
                         let mut id = c.gid[r.sym as usize] as usize;
+                        i += 1;
+                        if r.kind == obj::DYN_USE || r.kind == obj::DYN_SLOT { continue; }
+                        // (A slot of a method nothing calls: left 0.)
+                        if s == obj::DATA_CONST && !reached(&cuts, &defs, id) {
+                            if let Some(key) = slot_of(&slots[pi], r.off as u64) {
+                                if !called[key as usize] { continue; }
+                            }
+                        }
                         if init_of[id] >= 0 && !reached(&cuts, &defs, id) { id = nop as usize; }
                         used[id] = true;
                         if oid[id] < 0 { oid[id] = o.id_s(&g.names[id]) as i64; }
                         let off = r.off as i64 + delta;
                         if off > 0xffffffff { return Err("merge: a section exceeds 4 GiB".to_string()); }
                         o.reloc_id(r.sec, off as u32, r.kind, oid[id] as u32);
-                        i += 1;
                     }
                 }
                 a += 1;

@@ -333,6 +333,19 @@ pr ws/crates/old build > /dev/null || p_fail "an excluded crate builds alone"
 mkdir -p "$pj/ws/stray/src" && printf '[package]\nname = "stray"\n' > "$pj/ws/stray/navi.toml" && printf 'fn main() {}\n' > "$pj/ws/stray/src/main.navi"
 case "$(pr ws/stray build)" in *"not one of its members"*) ;; *) p_fail "a crate below a workspace, not a member" ;; esac
 [ "$p_ok" = 1 ] && echo "ok   projects"
+# The linker keeps a vtable's method only if something calls it through
+# dyn (crate::merge, as Go's): the string only the uncalled method uses is
+# left out (and kept with -d nostrip); the called one works.
+dy=$tmp/dyn
+mkdir -p "$dy"
+printf 'trait T { fn used(&self) -> i32; fn unused(&self) -> String; }\nstruct S;\nimpl T for S {\n    fn used(&self) -> i32 { 42 }\n    fn unused(&self) -> String { "navi-unused-dyn-method".to_string() }\n}\nfn main() {\n    let t: &dyn T = &S;\n    println(`${t.used()}`);\n}\n' > "$dy/d.navi"
+case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) dx=.exe ;; *) dx= ;; esac
+(cd "$dy" && "$navi" build -o d$dx d.navi 2>/dev/null && "$navi" build -d nostrip -o dk$dx d.navi 2>/dev/null)
+if [ "$("$dy/d$dx" | tr -d '\r')" = 42 ] && ! grep -q navi-unused-dyn-method "$dy/d$dx" && grep -q navi-unused-dyn-method "$dy/dk$dx"; then
+	echo "ok   dyn methods nothing calls left out"
+else
+	echo "FAIL dyn methods nothing calls left out"; fail=1
+fi
 # navi doc (docs/doc.md): a library's pages and std's, links in them, a
 # warning for a link naming nothing; its doctests (run, should_panic,
 # no_run, compile_fail, fn main).
