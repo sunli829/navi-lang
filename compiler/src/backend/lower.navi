@@ -1325,7 +1325,7 @@ impl Gen {
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
             res_off: 0, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), preg2: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
             frame: 0, buf_top: 0, ssa_alloc: crate::ssa::regalloc::empty(), ssa_slots: 0, ptr_slots: Vec::new(), ssa_masks: Vec::new(),
-            ssa_var0: false, ssa_defers: false, ssa_bridge: 0, ssa_pr: Vec::new() };
+            ssa_var0: false, ssa_defers: false, ssa_sel0: Vec::new(), ssa_sel1: Vec::new(), ssa_func: None, ssa_chained: Vec::new(), ssa_need_carry: Vec::new(), ssa_bridge: 0, ssa_pr: Vec::new() };
         fg.gen();
         fg.stack_meta();
         if c_entry(f.def) { fg.gen_c_entry(); }
@@ -1412,6 +1412,14 @@ pub struct FnGen {
     ssa_masks: Vec<u16>,
     ssa_var0: bool,
     ssa_defers: bool,
+    /// The carry plan (ssa_carry_plan), by value id: an AddC/SubB's
+    /// selects (-1: none), whether its carry comes in the flags and
+    /// whether its carry out is read as a value.
+    ssa_sel0: Vec<i64>,
+    ssa_sel1: Vec<i64>,
+    ssa_func: Option<&mut crate::ssa::Func>,
+    ssa_chained: Vec<bool>,
+    ssa_need_carry: Vec<bool>,
     /// The area where operands for the old helpers are put (bridge).
     ssa_bridge: i64,
     /// By local: the first argument register its parameter comes in (-1:
@@ -3294,6 +3302,7 @@ impl FnGen {
         m.store(8, RET, FP, SLOT_RET);
         m.store(8, LOC, FP, SLOT_LOC);
         m.store_zero(8, FP, SLOT_DEFERS);
+        self.ssa_carry_plan(sf, &fused);
         // The calls' tags and masks.
         let mut masks = self.g.cur_masks;
         masks.clear();
@@ -3737,6 +3746,31 @@ impl FnGen {
             }
             crate::ssa::OP_ADD | crate::ssa::OP_SUB | crate::ssa::OP_MUL | crate::ssa::OP_DIV | crate::ssa::OP_REM | crate::ssa::OP_AND
                 | crate::ssa::OP_OR | crate::ssa::OP_XOR | crate::ssa::OP_SHL | crate::ssa::OP_SHR => self.ssa_arith(v),
+            crate::ssa::OP_ADDC | crate::ssa::OP_SUBB => {
+                // The sum and the carry made straight in the selects'
+                // places (see ssa_carry_plan).
+                let sub = op == crate::ssa::OP_SUBB;
+                let c = v.args[2];
+                let zero = c.op == crate::ssa::OP_CONST && c.aux_int == 0;
+                let id = v.id as usize;
+                let a = self.ssa_in(v.args[0], V1);
+                let b = self.ssa_in(v.args[1], V2);
+                if !zero && !self.ssa_chained[id] {
+                    let cr = self.ssa_in(c, RA);
+                    m.carry_in(cr, sub);
+                }
+                let s0 = self.ssa_sel0[id];
+                let d = if s0 >= 0 { self.ssa_dst(self.f_values(s0), V1) } else { V1 };
+                m.add_carry(d, a, b, !zero, sub);
+                if s0 >= 0 { self.ssa_out(self.f_values(s0), d); }
+                if self.ssa_need_carry[id] {
+                    let s1 = self.ssa_sel1[id];
+                    let d1 = self.ssa_dst(self.f_values(s1), V2);
+                    m.carry_out(d1, sub);
+                    self.ssa_out(self.f_values(s1), d1);
+                }
+                return;
+            }
             crate::ssa::OP_MULHI => {
                 let a = self.ssa_in(v.args[0], V1);
                 let b = self.ssa_in(v.args[1], V2);
@@ -3918,6 +3952,8 @@ impl FnGen {
                     self.ssa_out(v, d);
                     return;
                 }
+                // (An AddC/SubB made its selects.)
+                if t.op == crate::ssa::OP_ADDC || t.op == crate::ssa::OP_SUBB { return; }
                 if t.op == crate::ssa::OP_INTRINSIC || t.op == crate::ssa::OP_CLOSURE || t.op == crate::ssa::OP_CALL {
                     // Intrinsics and calls leave their words in V1, V2;
                     // closures their environment in V2.
@@ -4082,6 +4118,86 @@ impl FnGen {
         m.bind(skip);
         for sv in self.saved.iter() { m.load(8, sv.0, FP, sv.1); }
         m.ret();
+    }
+
+    fn f_values(&self, id: i64) -> &mut crate::ssa::Value { self.ssa_func.unwrap().values[id as usize] }
+
+    /// Plans the AddC/SubB of sf (Go's carry chains): its selects; whether
+    /// its carry in is the previous one's still in the flags (nothing in
+    /// between sets them: on arm64 loads, stores, moves and unchecked
+    /// integer ops do not; on x64 only the selects, and making a constant
+    /// operand may xor); whether its carry out is read other than so.
+    fn ssa_carry_plan(&mut self, sf: &mut crate::ssa::Func, fused: &Vec<bool>) {
+        self.ssa_func = Some(sf);
+        let n = sf.values.len();
+        let mut sel0 = self.ssa_sel0;
+        let mut sel1 = self.ssa_sel1;
+        let mut chained = self.ssa_chained;
+        let mut need = self.ssa_need_carry;
+        sel0.clear();
+        sel1.clear();
+        chained.clear();
+        need.clear();
+        sel0.resize(n, -1);
+        sel1.resize(n, -1);
+        chained.resize(n, false);
+        need.resize(n, false);
+        let mut any = false;
+        for b in sf.blocks.iter() {
+            for v in b.values.iter() {
+                if v.op == crate::ssa::OP_SELECT && (v.args[0].op == crate::ssa::OP_ADDC || v.args[0].op == crate::ssa::OP_SUBB) {
+                    let t = v.args[0].id as usize;
+                    if v.aux_int == 0 { sel0[t] = v.id as i64; } else if v.aux_int == 1 { sel1[t] = v.id as i64; }
+                    any = true;
+                }
+            }
+        }
+        if !any { return; }
+        let mut uses: Vec<i32> = Vec::new();
+        uses.resize(n, 0);
+        let mut chained_uses: Vec<i32> = Vec::new();
+        chained_uses.resize(n, 0);
+        for b in sf.blocks.iter() {
+            for v in b.values.iter() {
+                for a in v.args.iter() { uses[a.id as usize] += 1; }
+            }
+            if let Some(c) = b.control { uses[c.id as usize] += 1; }
+        }
+        let x64 = self.g.tgt.code_unit != 4;
+        for b in sf.blocks.iter() {
+            let mut flags = -1i64;
+            for vv in b.values.iter() {
+                let v = *vv;
+                if fused[v.id as usize] { continue; }
+                if v.op == crate::ssa::OP_ADDC || v.op == crate::ssa::OP_SUBB {
+                    let c = v.args[2];
+                    let zero = c.op == crate::ssa::OP_CONST && c.aux_int == 0;
+                    let ch = !zero && c.op == crate::ssa::OP_SELECT && c.aux_int == 1 && flags == c.args[0].id as i64
+                        && !(x64 && (self.ssa_remade(v.args[0]) || self.ssa_remade(v.args[1])));
+                    chained[v.id as usize] = ch;
+                    if ch { chained_uses[c.id as usize] += 1; }
+                    flags = v.id as i64;
+                } else if !(v.op == crate::ssa::OP_SELECT && v.args[0].id as i64 == flags) && !(!x64 && keeps_flags_arm64(v)) {
+                    flags = -1;
+                }
+            }
+        }
+        let mut t = 0;
+        while t < n {
+            let s1 = sel1[t];
+            if s1 >= 0 && uses[s1 as usize] > chained_uses[s1 as usize] { need[t] = true; }
+            t += 1;
+        }
+        self.ssa_sel0 = sel0;
+        self.ssa_sel1 = sel1;
+        self.ssa_chained = chained;
+        self.ssa_need_carry = need;
+    }
+
+    /// Whether v is made where used (no register or slot of its own).
+    fn ssa_remade(&self, v: &crate::ssa::Value) -> bool {
+        let id = v.id as usize;
+        self.ssa_alloc.reg[id] < 0 && self.ssa_alloc.slot[id] < 0
     }
 
     /// Whether an Arg value is a word of a two-word variable.
@@ -4414,6 +4530,19 @@ impl FnGen {
             }
             k += 1;
         }
+    }
+}
+
+/// Whether arm64 code for v leaves the flags alone (no compares, checks or
+/// calls): loads, stores, addresses, moves and unchecked integer ops.
+fn keeps_flags_arm64(v: &crate::ssa::Value) -> bool {
+    match v.op {
+        crate::ssa::OP_LOAD | crate::ssa::OP_STORE | crate::ssa::OP_OFFPTR | crate::ssa::OP_INDEXPTR | crate::ssa::OP_CONST
+            | crate::ssa::OP_LOCALADDR | crate::ssa::OP_CONSTSYM | crate::ssa::OP_COPY | crate::ssa::OP_RETYPE | crate::ssa::OP_ZEXT
+            | crate::ssa::OP_SEXT | crate::ssa::OP_TRUNC | crate::ssa::OP_MULHI | crate::ssa::OP_AND | crate::ssa::OP_OR
+            | crate::ssa::OP_XOR => !crate::ssa::is_float(v.ty),
+        crate::ssa::OP_ADD | crate::ssa::OP_SUB | crate::ssa::OP_MUL => v.aux_int & 1 == 0 && !crate::ssa::is_float(v.ty),
+        _ => false,
     }
 }
 
