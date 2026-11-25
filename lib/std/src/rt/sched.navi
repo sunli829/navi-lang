@@ -881,13 +881,88 @@ pub struct Chan {
     ackq: WaitList,
     // Writes Result<T, RecvError> for select: (slot, value or null).
     write_result: fn(*mut u8, *const u8),
+    // A timer channel (std::time::after, tick, Ticker; as Go 1.23's): the
+    // monotonic time of its next value (0: none) and the period between
+    // values (0: one). The value is put in when a receiver looks after
+    // that time (timer_fill); a receiver waiting for it waits on the timer
+    // heap too. Nothing else holds the channel: one nobody refers to is
+    // collected, stopped or not.
+    when: usize,
+    period: usize,
 }
 
 pub fn new_chan(elem: usize, cap: usize, write_result: fn(*mut u8, *const u8)) -> *mut Chan {
     &mut Chan { lk: 0, elem, cap, buf: 0 as *mut u8, head: 0, len: 0, slots: 0, closed: false, send_seq: 0,
         recv_seq: 0, recv_waiter: 0, recvq: new_wait_list(), sendq: new_wait_list(),
-        ackq: new_wait_list(), write_result } as *mut Chan
+        ackq: new_wait_list(), write_result, when: 0, period: 0 } as *mut Chan
 }
+
+// A timer channel's value, if its time has come and none waits in it: the
+// time now (an Instant's nanoseconds); then the next time, the period's
+// next multiple from the first (missed ones dropped), or none (its lock
+// held).
+fn timer_fill(c: *mut Chan) {
+    unsafe {
+        if (*c).when == 0 || (*c).len > 0 || (*c).elem != 8 { return; }
+        let now = crate::rt::native::monotonic_nanos() as usize;
+        if now < (*c).when { return; }
+        let v = now as u64;
+        push(c, &v as *const u64 as *const u8);
+        if (*c).period == 0 {
+            (*c).when = 0;
+        } else {
+            let k = (now - (*c).when) / (*c).period + 1;
+            (*c).when = (*c).when + k * (*c).period;
+        }
+    }
+}
+
+/// Makes c a timer channel with its next value at when (monotonic
+/// nanoseconds; 0: stopped) and then every period (0: once); receivers
+/// waiting wake to wait for the new time.
+pub fn timer_set(c: *mut Chan, when: u64, period: u64) {
+    obj_lock(lk(c));
+    unsafe {
+        (*c).when = when as usize;
+        (*c).period = period as usize;
+    }
+    broadcast(recvq(c));
+    obj_unlock(lk(c));
+}
+
+/// c's values waiting, and its capacity (usize::MAX: unbounded).
+pub fn chan_len(c: *mut Chan) -> usize {
+    obj_lock(lk(c));
+    timer_fill(c);
+    let n = unsafe { (*c).len };
+    obj_unlock(lk(c));
+    n
+}
+
+pub fn chan_cap(c: *mut Chan) -> usize { unsafe { (*c).cap } }
+
+// Waits on w (lk held, and held again on return) until woken, or until
+// deadline (monotonic nanoseconds; 0: none): whether the deadline woke it.
+fn wait_until(w: *mut WaitList, lk: *mut usize, deadline: usize) -> bool {
+    if deadline == 0 {
+        wait(w, lk);
+        return false;
+    }
+    enlist(w);
+    obj_lock(&mut TIMER_LK as *mut usize);
+    let t = add_timer(deadline);
+    let two = [lk as usize, &mut TIMER_LK as *mut usize as usize];
+    park_on(&two as *const [usize; 2] as *const usize, 2);
+    obj_unlock(&mut TIMER_LK as *mut usize);
+    unsafe { (*t).fired }
+}
+
+// The earlier of two deadlines (0: none).
+fn earlier(a: usize, b: usize) -> usize {
+    if a == 0 { b } else if b == 0 { a } else if a < b { a } else { b }
+}
+
+fn past(deadline: usize) -> bool { deadline != 0 && crate::rt::native::monotonic_nanos() as usize >= deadline }
 
 fn recvq(c: *mut Chan) -> *mut WaitList { unsafe { &mut (*c).recvq as *mut WaitList } }
 fn sendq(c: *mut Chan) -> *mut WaitList { unsafe { &mut (*c).sendq as *mut WaitList } }
@@ -965,17 +1040,35 @@ fn pop(c: *mut Chan, dst: *mut u8) {
 /// Sends the elem bytes at src; false if the channel is closed.
 pub fn send(c: *mut Chan, src: *const u8) -> bool {
     obj_lock(lk(c));
-    let ok = send_locked(c, src);
+    let r = send_locked(c, src, 0);
     obj_unlock(lk(c));
-    ok
+    r == SENT
 }
 
-fn send_locked(c: *mut Chan, src: *const u8) -> bool {
+pub const SENT: usize = 0;
+pub const CLOSED: usize = 1;
+pub const TIMED_OUT: usize = 2;
+
+/// send, waiting until deadline (monotonic nanoseconds) at most for room
+/// (in an unbuffered channel, for a receiver): SENT, CLOSED or TIMED_OUT.
+pub fn send_until(c: *mut Chan, src: *const u8, deadline: u64) -> usize {
+    obj_lock(lk(c));
+    let r = send_locked(c, src, deadline as usize);
+    obj_unlock(lk(c));
+    r
+}
+
+fn send_locked(c: *mut Chan, src: *const u8, deadline: usize) -> usize {
     unsafe {
         loop {
-            if (*c).closed { return false; }
-            if (*c).cap == UNBOUNDED || (*c).len < (*c).cap || (*c).cap == 0 { break; }
-            wait(sendq(c), lk(c));
+            if (*c).closed { return CLOSED; }
+            if (*c).cap == UNBOUNDED || (*c).len < (*c).cap { break; }
+            // Unbuffered: without a deadline the element goes in and the
+            // sender waits for it to be taken; with one, it goes in once a
+            // receiver waits.
+            if (*c).cap == 0 && (deadline == 0 || (*c).recv_waiter > (*c).len) { break; }
+            if past(deadline) { return TIMED_OUT; }
+            wait_until(sendq(c), lk(c), deadline);
         }
         push(c, src);
         (*c).send_seq += 1;
@@ -985,33 +1078,53 @@ fn send_locked(c: *mut Chan, src: *const u8) -> bool {
             while (*c).recv_seq < seq && !(*c).closed { wait_key(ackq(c), lk(c), seq); }
         }
     }
-    true
+    SENT
 }
 
 /// Receives into dst; false if the channel is closed and empty (or, when
 /// not blocking, empty).
 pub fn recv(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
     obj_lock(lk(c));
-    let ok = recv_locked(c, dst, block);
+    let r = recv_locked(c, dst, block, 0);
     obj_unlock(lk(c));
-    ok
+    r == SENT
 }
 
-fn recv_locked(c: *mut Chan, dst: *mut u8, block: bool) -> bool {
+/// recv, waiting until deadline (monotonic nanoseconds) at most: SENT (a
+/// value), CLOSED (closed and empty) or TIMED_OUT.
+pub fn recv_until(c: *mut Chan, dst: *mut u8, deadline: u64) -> usize {
+    obj_lock(lk(c));
+    let r = recv_locked(c, dst, true, deadline as usize);
+    obj_unlock(lk(c));
+    r
+}
+
+fn recv_locked(c: *mut Chan, dst: *mut u8, block: bool, deadline: usize) -> usize {
     unsafe {
         (*c).recv_waiter += 1;
         // A select may send to an unbuffered channel once a receiver waits.
         if (*c).cap == 0 { signal(sendq(c)); }
-        while (*c).len == 0 && !(*c).closed && block { wait(recvq(c), lk(c)); }
+        let mut timed_out = false;
+        loop {
+            timer_fill(c);
+            if (*c).len > 0 || (*c).closed || !block { break; }
+            if past(deadline) {
+                timed_out = true;
+                break;
+            }
+            // (A timer channel's next value wakes it too.)
+            wait_until(recvq(c), lk(c), earlier(deadline, (*c).when));
+        }
         (*c).recv_waiter -= 1;
         if (*c).len > 0 {
             pop(c, dst);
             (*c).recv_seq += 1;
             taken(c);
-            return true;
+            return SENT;
         }
+        if timed_out { return TIMED_OUT; }
     }
-    false
+    CLOSED
 }
 
 pub fn close(c: *mut Chan) {
@@ -1063,6 +1176,8 @@ fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool, loc
         while i < n {
             let c = case_chan(&cases[i]);
             let slot = case_slot(&cases[i]);
+            // (A timer channel's value, if its time has come.)
+            if !case_send(&cases[i]) { timer_fill(c); }
             unsafe {
                 if case_send(&cases[i]) {
                     let ready = (*c).cap == UNBOUNDED || (*c).len < (*c).cap
@@ -1093,12 +1208,25 @@ fn select_locked(cases: &[crate::sync::mpmc::SelectCase], has_default: bool, loc
         }
         if has_default { return n; }
         let mut j = 0;
+        // (The earliest next value of the timer channels received from.)
+        let mut next = 0usize;
         while j < n {
             let cj = case_chan(&cases[j]);
             if case_send(&cases[j]) { enlist(sendq(cj)); } else { enlist(recvq(cj)); }
+            if !case_send(&cases[j]) { next = earlier(next, unsafe { (*cj).when }); }
             j += 1;
         }
-        park_on(locks.as_ptr(), locks.len());
+        if next == 0 {
+            park_on(locks.as_ptr(), locks.len());
+        } else {
+            obj_lock(&mut TIMER_LK as *mut usize);
+            add_timer(next);
+            let mut all: Vec<usize> = Vec::new();
+            for l in locks.iter() { all.push(*l); }
+            all.push(&mut TIMER_LK as *mut usize as usize);
+            park_on(all.as_ptr(), all.len());
+            obj_unlock(&mut TIMER_LK as *mut usize);
+        }
         waited = true;
     }
 }

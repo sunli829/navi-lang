@@ -54,6 +54,9 @@ pub struct Instant {
 impl Instant {
     #[inline]
     pub fn now() -> Instant { Instant { nanos: crate::rt::monotonic_nanos() } }
+
+    // The monotonic clock's nanoseconds (the runtime's deadlines).
+    pub(crate) fn mono_nanos(&self) -> u64 { self.nanos }
     #[inline]
     pub fn elapsed(&self) -> Duration { Instant::now().duration_since(self.clone()) }
     pub fn duration_since(&self, earlier: Instant) -> Duration {
@@ -210,8 +213,11 @@ impl Sub<Duration> for SystemTime {
 }
 
 
-// --- Timer channels (Go's time.After, time.Tick and Ticker; crossbeam's
-// after and tick), for timeouts and periodic work in select ---------------
+// --- Timer channels (Go's time.After, time.Tick and Ticker as of Go 1.23;
+// crossbeam's after and tick), for timeouts and periodic work in select.
+// They are the runtime's (rt::sched timer channels): no thread each, a
+// value made when a receiver looks after its time, and one nobody refers
+// to is collected, stopped or not. ----------------------------------------
 
 /// A channel that receives the instant once, d from now (Go's time.After):
 ///
@@ -220,24 +226,17 @@ impl Sub<Duration> for SystemTime {
 ///         t = std::time::after(Duration::from_secs(1)).recv() => println("timed out"),
 ///     }
 pub fn after(d: Duration) -> crate::sync::mpmc::Receiver<Instant> {
-    let (tx, rx) = crate::sync::mpmc::sync_channel::<Instant>(1);
-    crate::thread::spawn(|| {
-        crate::thread::sleep(d);
-        let _ = tx.send(Instant::now());
-    });
-    rx
+    crate::sync::mpmc::Receiver::<Instant>::timer(Instant::now().nanos + d.nanos, 0)
 }
 
-/// A channel that receives the instant every d (Go's time.Tick); a tick a
-/// slow receiver has not taken yet makes the next one dropped. It never
-/// stops: a Ticker can.
+/// A channel that receives the instant every d (Go's time.Tick); a tick
+/// not received before the next is dropped.
 pub fn tick(d: Duration) -> crate::sync::mpmc::Receiver<Instant> { Ticker::new(d).receiver() }
 
 /// Instants every period until stopped (Go's time.Ticker).
 #[derive(Clone)]
 pub struct Ticker {
     rx: crate::sync::mpmc::Receiver<Instant>,
-    stopped: &crate::sync::atomic::AtomicBool,
 }
 
 impl Ticker {
@@ -245,21 +244,7 @@ impl Ticker {
     /// they do not drift; missed ones are dropped).
     pub fn new(period: Duration) -> Ticker {
         if period.is_zero() { crate::panic::panic("Ticker::new: a zero period"); }
-        let (tx, rx) = crate::sync::mpmc::sync_channel::<Instant>(1);
-        let stopped = &crate::sync::atomic::AtomicBool::new(false);
-        crate::thread::spawn(|| {
-            let mut next = Instant::now() + period;
-            loop {
-                crate::thread::sleep_until(next);
-                if stopped.load(crate::sync::atomic::Ordering::SeqCst) { return; }
-                let now = Instant::now();
-                let _ = tx.try_send(now);
-                next = next + period;
-                // (Behind by more than a period: from now on.)
-                if next < now { next = now + period; }
-            }
-        });
-        Ticker { rx, stopped }
+        Ticker { rx: crate::sync::mpmc::Receiver::<Instant>::timer(Instant::now().nanos + period.nanos, period.nanos) }
     }
 
     /// The channel the ticks come on (for select; clones share it).
@@ -268,6 +253,12 @@ impl Ticker {
     /// Waits for the next tick.
     pub fn recv(&self) -> Instant { self.rx.recv().unwrap() }
 
-    /// No more ticks (the one waiting in the channel, if any, stays).
-    pub fn stop(&self) { self.stopped.store(true, crate::sync::atomic::Ordering::SeqCst); }
+    /// No more ticks (not needed for it to be collected).
+    pub fn stop(&self) { self.rx.timer_set(0, 0); }
+
+    /// Ticks every period from now on (Go's Ticker.Reset).
+    pub fn reset(&self, period: Duration) {
+        if period.is_zero() { crate::panic::panic("Ticker::reset: a zero period"); }
+        self.rx.timer_set(Instant::now().nanos + period.nanos, period.nanos);
+    }
 }

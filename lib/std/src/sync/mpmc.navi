@@ -45,6 +45,46 @@ impl<T> crate::fmt::Display for TrySendError<T> {
     }
 }
 
+/// Why recv_timeout or recv_deadline gave no value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecvTimeoutError {
+    Timeout,
+    /// Closed and empty.
+    Disconnected,
+}
+
+impl crate::fmt::Display for RecvTimeoutError {
+    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+        f.write_str(if *self == RecvTimeoutError::Timeout { "timed out waiting on channel" } else { "channel is empty and sending half is closed" })
+    }
+}
+
+/// Why send_timeout or send_deadline did not send (the value back).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendTimeoutError<T> {
+    Timeout(T),
+    Disconnected(T),
+}
+
+impl<T> SendTimeoutError<T> {
+    /// The value that was not sent.
+    pub fn into_inner(self) -> T {
+        match self {
+            SendTimeoutError::Timeout(v) => v,
+            SendTimeoutError::Disconnected(v) => v,
+        }
+    }
+}
+
+impl<T> crate::fmt::Display for SendTimeoutError<T> {
+    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+        match self {
+            SendTimeoutError::Timeout(_) => f.write_str("timed out waiting on send operation"),
+            SendTimeoutError::Disconnected(_) => f.write_str("sending on a closed channel"),
+        }
+    }
+}
+
 // Channels are shared and mutated through &self; the handles hold a raw
 // pointer to the runtime's channel (the GC traces raw pointers).
 pub struct Sender<T> { chan: *mut u8, marker: Option<T> }
@@ -80,8 +120,50 @@ impl<T> Sender<T> {
         if crate::rt::sched::close_called(self.chan as *mut crate::rt::sched::Chan) { Err(TrySendError::Disconnected(value)) } else { Err(TrySendError::Full(value)) }
     }
 
+    /// send, waiting at most timeout for room (in an unbuffered channel, for
+    /// a receiver).
+    pub fn send_timeout(&self, value: T, timeout: crate::time::Duration) -> Result<(), SendTimeoutError<T>> {
+        self.send_deadline(value, crate::time::Instant::now() + timeout)
+    }
+
+    /// send, waiting until deadline at most.
+    pub fn send_deadline(&self, value: T, deadline: crate::time::Instant) -> Result<(), SendTimeoutError<T>> {
+        // (A deadline now or past still sends if there is room.)
+        let d = if deadline.mono_nanos() == 0 { 1 } else { deadline.mono_nanos() };
+        let r = crate::rt::native::chan_send_until::<T>(self.chan, value, d);
+        if r == crate::rt::sched::SENT { Ok(()) } else if r == crate::rt::sched::CLOSED { Err(SendTimeoutError::Disconnected(value)) } else { Err(SendTimeoutError::Timeout(value)) }
+    }
+
     /// Closes the channel: receivers get Err once it is empty.
     pub fn close(&self) { crate::rt::chan_close(self.chan); }
+
+    /// The values in the channel.
+    pub fn len(&self) -> usize { chan_len(self.chan) }
+
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Whether a bounded channel has no room (an unbuffered one always).
+    pub fn is_full(&self) -> bool { chan_full(self.chan) }
+
+    /// The bound (None: unbounded).
+    pub fn capacity(&self) -> Option<usize> { chan_capacity(self.chan) }
+
+    /// Whether other is a handle of the same channel.
+    pub fn same_channel(&self, other: &Sender<T>) -> bool { self.chan as usize == other.chan as usize }
+}
+
+fn chan_len(c: *mut u8) -> usize { crate::rt::sched::chan_len(c as *mut crate::rt::sched::Chan) }
+
+fn chan_capacity(c: *mut u8) -> Option<usize> {
+    let n = crate::rt::sched::chan_cap(c as *mut crate::rt::sched::Chan);
+    if n == 18446744073709551615 { None } else { Some(n) }
+}
+
+fn chan_full(c: *mut u8) -> bool {
+    match chan_capacity(c) {
+        Some(n) => chan_len(c) >= n,
+        None => false,
+    }
 }
 
 impl<T> Clone for Sender<T> {
@@ -103,7 +185,44 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// recv, waiting at most timeout.
+    pub fn recv_timeout(&self, timeout: crate::time::Duration) -> Result<T, RecvTimeoutError> {
+        self.recv_deadline(crate::time::Instant::now() + timeout)
+    }
+
+    /// recv, waiting until deadline at most.
+    pub fn recv_deadline(&self, deadline: crate::time::Instant) -> Result<T, RecvTimeoutError> {
+        let d = if deadline.mono_nanos() == 0 { 1 } else { deadline.mono_nanos() };
+        match crate::rt::native::chan_recv_until::<T>(self.chan, d) {
+            Ok(v) => Ok(v),
+            Err(r) => if r == crate::rt::sched::CLOSED { Err(RecvTimeoutError::Disconnected) } else { Err(RecvTimeoutError::Timeout) },
+        }
+    }
+
     pub fn iter(&self) -> Iter<T> { Iter { rx: Receiver { chan: self.chan, marker: None } } }
+
+    /// The values there are now, without waiting.
+    pub fn try_iter(&self) -> TryIter<T> { TryIter { rx: Receiver { chan: self.chan, marker: None } } }
+
+    pub fn len(&self) -> usize { chan_len(self.chan) }
+
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    pub fn is_full(&self) -> bool { chan_full(self.chan) }
+
+    pub fn capacity(&self) -> Option<usize> { chan_capacity(self.chan) }
+
+    pub fn same_channel(&self, other: &Receiver<T>) -> bool { self.chan as usize == other.chan as usize }
+
+    // A timer channel (std::time): its next value at when (monotonic
+    // nanoseconds; 0: none), then every period (0: once).
+    pub(crate) fn timer(when: u64, period: u64) -> Receiver<T> {
+        let c = crate::rt::chan_new::<T>(1);
+        crate::rt::sched::timer_set(c as *mut crate::rt::sched::Chan, when, period);
+        Receiver { chan: c, marker: None }
+    }
+
+    pub(crate) fn timer_set(&self, when: u64, period: u64) { crate::rt::sched::timer_set(self.chan as *mut crate::rt::sched::Chan, when, period); }
 }
 
 impl<T> Clone for Receiver<T> {
@@ -114,6 +233,12 @@ pub struct Iter<T> { rx: Receiver<T> }
 impl<T> Iterator for Iter<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> { self.rx.recv().ok() }
+}
+
+pub struct TryIter<T> { rx: Receiver<T> }
+impl<T> Iterator for TryIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> { self.rx.try_recv().ok() }
 }
 
 /// One case of a select statement (built by the compiler).

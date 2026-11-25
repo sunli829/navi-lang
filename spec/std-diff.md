@@ -40,7 +40,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | 集合（`Vec`、`String`、`HashMap` …）的赋值 | move | 拷贝句柄，两者共享同一个容器；要独立副本用 `.clone()` |
 | channel 模块 | 常用 `std::sync::mpsc`（单消费者） | `std::sync::mpmc`（`Receiver` 可以被多个线程共享） |
 | `thread::spawn` | 操作系统线程 | 绿色线程（M:N 调度） |
-| 定时器通道 | 没有（crossbeam-channel 的 `after`、`tick`；tokio 的 `select!` 加 `sleep`） | `std::time::after(d)`、`tick(d)`、`Ticker`（`stop()`），同 Go 的 `time.After`、`time.Tick`、`time.Ticker`，用在 `select` 里做超时和定时；接收方没取走的那拍丢掉（同 Go） |
+| 定时器通道 | 没有（crossbeam-channel 的 `after`、`tick`；tokio 的 `select!` 加 `sleep`） | `std::time::after(d)`、`tick(d)`、`Ticker`（`stop()`、`reset(d)`），同 Go 1.23 的 `time.After`、`time.Tick`、`time.Ticker`，用在 `select` 里做超时和定时：运行时的定时器通道，不占线程，接收方来取时才产生值，没人引用的被 GC 回收（不必 `stop`），接收方没取走的那拍丢掉 |
 | `thread::available_parallelism` | `io::Result<NonZero<usize>>` | `io::Result<usize>`（调度器同时使用的 OS 线程数：`NAVI_MAXPROCS`，否则 CPU 数） |
 | —（navi 新增） | — | `thread::cpu_count() -> usize`：CPU 数，不受 `NAVI_MAXPROCS` 影响（同 Go 的 `runtime.NumCPU`） |
 | `thread::current()` | `Thread` 有 name、unpark 等 | 只有 `id() -> ThreadId` |
