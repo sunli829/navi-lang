@@ -59,7 +59,7 @@ match_diags() {
 # tests/run: files of #[test] functions; navi test runs them (in parallel,
 # each file's output printed when it ends), all must pass. A hung test
 # fails after 5 minutes.
-"$navi" test -timeout 5m tests/run/*.navi || fail=1
+"$navi" test --timeout 5m tests/run/*.navi || fail=1
 # tests/ui: navi build reports exactly the annotated errors and warnings;
 # a file without ERROR annotations builds.
 for f in tests/ui/*.navi; do

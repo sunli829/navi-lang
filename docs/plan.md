@@ -739,7 +739,7 @@ runtime 是 std 的私有模块 `std::rt`，一开始就用 navi（`unsafe` + `s
 - 指标：冷编译耗时、无改动时的重编译耗时、改一个函数体后的重编译耗时、峰值内存
 - 目标：M5 时冷编译耗时不超过 `go build` 的 1.5 倍，M9 时与 `go build` 持平
 - 从 M1 起每个里程碑都跑基准并记录，退化超过 10% 就当作 bug 处理
-- 内置 `navi build -timings`，输出各阶段耗时
+- 内置 `navi build --timings`，输出各阶段耗时
 
 ---
 
