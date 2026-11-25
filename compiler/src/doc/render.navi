@@ -1,0 +1,400 @@
+//! Declarations as HTML (as rustdoc prints them): signatures from the AST,
+//! each type a link to its page when it has one.
+
+use crate::syntax::ast::*;
+use crate::resolve::{self, Def, RES_DEF, RES_PRIM};
+use crate::doc::model::{Model, ImplRef};
+use crate::doc::markdown::escape;
+
+/// Renders for a page in directory dir (links are relative to it).
+pub struct R {
+    pub m: &Model,
+    pub dir: String,
+}
+
+/// The way from directory dir to the documentation's root ("../..").
+pub fn up(dir: &str) -> String {
+    let n = dir.split('/').count();
+    let mut s = String::new();
+    let mut i = 0;
+    while i < n {
+        if i > 0 { s.push('/'); }
+        s.push_str("..");
+        i += 1;
+    }
+    s
+}
+
+pub fn kind_class(d: &Def) -> &str {
+    match d.kind {
+        resolve::DEF_STRUCT => "struct",
+        resolve::DEF_ENUM => "enum",
+        resolve::DEF_TRAIT => "trait",
+        resolve::DEF_TYPE_ALIAS => "type",
+        resolve::DEF_FN => "fn",
+        resolve::DEF_EXTERN_FN => "fn",
+        resolve::DEF_MOD => "mod",
+        resolve::DEF_CONST => "constant",
+        resolve::DEF_STATIC => "static",
+        resolve::DEF_VARIANT => "variant",
+        resolve::DEF_ASSOC_FN => "fn",
+        resolve::DEF_ASSOC_TYPE => "associatedtype",
+        _ => "",
+    }
+}
+
+impl R {
+    /// A URL from the root, relative to this page.
+    pub fn rel(&self, url: &str) -> String { `${up(self.dir.as_str())}/${url}`.to_string() }
+
+    /// A link to d's page (its name as text), or the name.
+    pub fn def_link(&self, d: &Def, text: &str) -> String {
+        match self.m.url_of(d) {
+            Some(u) => `<a class="${kind_class(d)}" href="${self.rel(u.as_str())}" title="${kind_class(d)} ${escape(full_name(d).as_str())}">${escape(text)}</a>`.to_string(),
+            None => escape(text),
+        }
+    }
+
+    pub fn ty(&self, t: &Type) -> String {
+        match &t.kind {
+            TypeKind::Path(p) => self.path(p),
+            TypeKind::Ref { is_mut, elem, .. } => `&amp;${if *is_mut { "mut " } else { "" }}${self.ty(elem)}`.to_string(),
+            TypeKind::Ptr { is_mut, elem, .. } => `*${if *is_mut { "mut" } else { "const" }} ${self.ty(elem)}`.to_string(),
+            TypeKind::Slice { elem, .. } => `[${self.ty(elem)}]`.to_string(),
+            TypeKind::Array { elem, len, .. } => `[${self.ty(elem)}; ${self.expr(len)}]`.to_string(),
+            TypeKind::Tuple { elems, .. } => {
+                let v: Vec<String> = elems.iter().map(|e: &&Type| -> String { self.ty(*e) }).collect();
+                if v.len() == 1 { `(${v[0]},)`.to_string() } else { `(${v.join(", ")})`.to_string() }
+            }
+            TypeKind::Fn { abi, params, result, .. } => {
+                let v: Vec<String> = params.iter().map(|e: &&Type| -> String { self.ty(*e) }).collect();
+                let ext = if abi.len() > 0 { `<span class="kw">extern</span> "${escape(abi.as_str())}" `.to_string() } else { String::new() };
+                let r = match result { Some(r) => ` -&gt; ${self.ty(r)}`.to_string(), None => String::new() };
+                `${ext}<span class="kw">fn</span>(${v.join(", ")})${r}`.to_string()
+            }
+            TypeKind::Dyn { bounds, .. } => `<span class="kw">dyn</span> ${self.bounds(bounds)}`.to_string(),
+            TypeKind::Impl { bounds, .. } => `<span class="kw">impl</span> ${self.bounds(bounds)}`.to_string(),
+            TypeKind::Never(_) => "!".to_string(),
+            TypeKind::Infer(_) => "_".to_string(),
+            TypeKind::Const(e) => self.expr(e),
+        }
+    }
+
+    pub fn bounds(&self, bs: &Vec<&Path>) -> String {
+        let v: Vec<String> = bs.iter().map(|p: &&Path| -> String { self.path(*p) }).collect();
+        v.join(" + ")
+    }
+
+    /// A path: its last segment linked when it names a documented item
+    /// (with the segments before it when they name what is not a module).
+    pub fn path(&self, p: &Path) -> String {
+        let mut out = String::new();
+        if let Some(q) = p.qself {
+            out.push_str("&lt;");
+            out.push_str(self.ty(q.ty).as_str());
+            if let Some(tp) = q.trait_path {
+                out.push_str(" <span class=\"kw\">as</span> ");
+                out.push_str(self.path(tp).as_str());
+            }
+            out.push_str("&gt;::");
+            let v: Vec<String> = p.segments.iter().map(|s: &&PathSegment| -> String { self.segment(*s, None) }).collect();
+            out.push_str(v.join("::").as_str());
+            return out;
+        }
+        let res = self.m.info.paths.get(&p.id);
+        let (def, rest, prim) = match res {
+            Some(r) => (if r.kind == RES_DEF { r.def } else { None }, r.rest.len(), r.kind == RES_PRIM),
+            None => (None, 0, false),
+        };
+        let n = p.segments.len();
+        match def {
+            Some(d) if d.kind != resolve::DEF_TYPE_PARAM && n > rest => {
+                // The segment naming d, the ones after it as written.
+                let k = n - rest - 1;
+                out.push_str(self.segment(p.segments[k], Some(d)).as_str());
+                let mut i = k + 1;
+                while i < n {
+                    out.push_str("::");
+                    out.push_str(self.segment(p.segments[i], None).as_str());
+                    i += 1;
+                }
+                out
+            }
+            _ => {
+                let v: Vec<String> = p.segments.iter().enumerate().map(|(i, s): (usize, &&PathSegment)| -> String {
+                    if prim && i + 1 == n { `<span class="primitive">${self.segment(*s, None)}</span>`.to_string() } else { self.segment(*s, None) }
+                }).collect();
+                v.join("::")
+            }
+        }
+    }
+
+    fn segment(&self, s: &PathSegment, d: Option<&mut Def>) -> String {
+        let name = s.name.value.as_str();
+        let mut out = match d {
+            Some(d) => self.def_link(d, name),
+            None => if name == "Self" || name == "self" || name == "crate" || name == "super" { `<span class="kw">${name}</span>`.to_string() } else { escape(name) },
+        };
+        if let Some(a) = s.args {
+            let mut v: Vec<String> = a.args.iter().map(|t: &&Type| -> String { self.ty(*t) }).collect();
+            for b in a.bindings.iter() { v.push(`${escape(b.name.value.as_str())} = ${self.ty(b.ty)}`.to_string()); }
+            out.push_str(`&lt;${v.join(", ")}&gt;`.to_string().as_str());
+        }
+        out
+    }
+
+    /// Simple expressions (constants' values, arrays' lengths); others as
+    /// "_".
+    pub fn expr(&self, e: &Expr) -> String {
+        match &e.kind {
+            ExprKind::Lit { kind, value, .. } => {
+                if *kind == LitKind::Str || *kind == LitKind::ByteStr || *kind == LitKind::Char || *kind == LitKind::Byte {
+                    `<span class="string">${escape(value.as_str())}</span>`.to_string()
+                } else {
+                    escape(value.as_str())
+                }
+            }
+            ExprKind::Path(p) => self.path(p),
+            ExprKind::Unary { x, .. } => `-${self.expr(x)}`.to_string(),
+            ExprKind::Paren { x, .. } => `(${self.expr(x)})`.to_string(),
+            ExprKind::Block(b) => if b.stmts.len() == 0 { match b.tail { Some(t) => `{ ${self.expr(t)} }`.to_string(), None => "{ }".to_string() } } else { "_".to_string() },
+            _ => "_".to_string(),
+        }
+    }
+
+    /// <T: Bound, const N: usize>
+    pub fn generics(&self, g: &Generics) -> String {
+        if g.params.len() == 0 { return String::new(); }
+        let v: Vec<String> = g.params.iter().map(|p: &&GenericParam| -> String {
+            let mut s = String::new();
+            match p.ty {
+                Some(t) => s.push_str(`<span class="kw">const</span> ${escape(p.name.value.as_str())}: ${self.ty(t)}`.to_string().as_str()),
+                None => {
+                    s.push_str(escape(p.name.value.as_str()).as_str());
+                    if p.bounds.len() > 0 { s.push_str(`: ${self.bounds(&p.bounds)}`.to_string().as_str()); }
+                }
+            }
+            if let Some(d) = p.default { s.push_str(` = ${self.ty(d)}`.to_string().as_str()); }
+            s
+        }).collect();
+        `&lt;${v.join(", ")}&gt;`.to_string()
+    }
+
+    /// " where T: A" (on a line of its own when long).
+    pub fn wheres(&self, g: &Generics, indent: &str) -> String {
+        if g.wheres.len() == 0 { return String::new(); }
+        let v: Vec<String> = g.wheres.iter().map(|w: &&WherePredicate| -> String { `${self.ty(w.ty)}: ${self.bounds(&w.bounds)}`.to_string() }).collect();
+        `\n${indent}<span class="where">where\n${indent}    ${v.join(`,\n${indent}    `.to_string().as_str())}</span>`.to_string()
+    }
+
+    /// pub fn name<T>(&self, x: T) -> R where ... (the name a link to href
+    /// when given).
+    pub fn fn_sig(&self, f: &FnDecl, vis: &str, href: Option<String>, indent: &str) -> String {
+        let mut s = String::new();
+        s.push_str(vis);
+        if f.is_const { s.push_str("<span class=\"kw\">const</span> "); }
+        if f.is_unsafe { s.push_str("<span class=\"kw\">unsafe</span> "); }
+        if f.abi.len() > 0 { s.push_str(`<span class="kw">extern</span> "${escape(f.abi.as_str())}" `.to_string().as_str()); }
+        s.push_str("<span class=\"kw\">fn</span> ");
+        let name = escape(f.name.value.as_str());
+        match href {
+            Some(a) => s.push_str(`<a class="fn" href="${a}">${name}</a>`.to_string().as_str()),
+            None => s.push_str(`<span class="fn">${name}</span>`.to_string().as_str()),
+        }
+        s.push_str(self.generics(f.generics).as_str());
+        let mut ps: Vec<String> = Vec::new();
+        if let Some(sp) = f.self_param {
+            ps.push((if sp.is_ref { if sp.is_mut { "&amp;mut <span class=\"kw\">self</span>" } else { "&amp;<span class=\"kw\">self</span>" } } else if sp.is_mut { "<span class=\"kw\">mut</span> <span class=\"kw\">self</span>" } else { "<span class=\"kw\">self</span>" }).to_string());
+        }
+        for p in f.params.iter() {
+            let t = match p.ty { Some(t) => self.ty(t), None => "_".to_string() };
+            ps.push(`${pat(p.pat)}: ${t}`.to_string());
+        }
+        if f.variadic { ps.push("...".to_string()); }
+        let one = ps.join(", ");
+        // (Long: one parameter a line, as rustdoc.)
+        if strip_tags(one.as_str()).len() + strip_tags(s.as_str()).len() > 90 && ps.len() > 1 {
+            s.push_str("(\n");
+            for p in ps.iter() { s.push_str(`${indent}    ${p},\n`.to_string().as_str()); }
+            s.push_str(`${indent})`.to_string().as_str());
+        } else {
+            s.push_str(`(${one})`.to_string().as_str());
+        }
+        if let Some(r) = f.result { s.push_str(` -&gt; ${self.ty(r)}`.to_string().as_str()); }
+        s.push_str(self.wheres(f.generics, indent).as_str());
+        s
+    }
+
+    /// The declaration block of a page's item.
+    pub fn decl(&self, it: &Item, name: &str) -> String {
+        let vis = "<span class=\"kw\">pub</span> ";
+        match it {
+            Item::Fn(f) => self.fn_sig(f, vis, None, ""),
+            Item::Struct(s) => {
+                let mut out = `${vis}<span class="kw">struct</span> <span class="struct">${escape(name)}</span>${self.generics(s.generics)}`.to_string();
+                match s.kind {
+                    StructKind::Unit => {
+                        out.push_str(self.wheres(s.generics, "").as_str());
+                        out.push(';');
+                    }
+                    StructKind::Tuple => {
+                        let v: Vec<String> = s.fields.iter().map(|f: &&Field| -> String { if f.vis == Vis::Pub { `<span class="kw">pub</span> ${self.ty(f.ty)}`.to_string() } else { "<span class=\"comment\">/* private field */</span>".to_string() } }).collect();
+                        out.push_str(`(${v.join(", ")})`.to_string().as_str());
+                        out.push_str(self.wheres(s.generics, "").as_str());
+                        out.push(';');
+                    }
+                    StructKind::Named => {
+                        out.push_str(self.wheres(s.generics, "").as_str());
+                        let mut private = false;
+                        let mut body = String::new();
+                        for f in s.fields.iter() {
+                            if f.vis != Vis::Pub || crate::doc::model::hidden(&f.attrs) {
+                                private = true;
+                                continue;
+                            }
+                            let n = match f.name { Some(n) => n.value.clone(), None => String::new() };
+                            body.push_str(`    <span class="kw">pub</span> <a class="structfield" href="#structfield.${n}">${escape(n.as_str())}</a>: ${self.ty(f.ty)},\n`.to_string().as_str());
+                        }
+                        if private { body.push_str("    <span class=\"comment\">/* private fields */</span>\n"); }
+                        if body.len() == 0 { out.push_str(" {}"); } else { out.push_str(` {\n${body}}`.to_string().as_str()); }
+                    }
+                }
+                out
+            }
+            Item::Enum(e) => {
+                let mut out = `${vis}<span class="kw">enum</span> <span class="enum">${escape(name)}</span>${self.generics(e.generics)}${self.wheres(e.generics, "")}`.to_string();
+                if e.variants.len() == 0 { out.push_str(" {}"); return out; }
+                out.push_str(" {\n");
+                for v in e.variants.iter() {
+                    if crate::doc::model::hidden(&v.attrs) { continue; }
+                    out.push_str(`    ${self.variant(v)},\n`.to_string().as_str());
+                }
+                out.push('}');
+                out
+            }
+            Item::Trait(t) => {
+                let mut out = `${vis}${if t.is_unsafe { "<span class=\"kw\">unsafe</span> " } else { "" }}<span class="kw">trait</span> <span class="trait">${escape(name)}</span>${self.generics(t.generics)}`.to_string();
+                if t.supers.len() > 0 { out.push_str(`: ${self.bounds(&t.supers)}`.to_string().as_str()); }
+                out.push_str(self.wheres(t.generics, "").as_str());
+                if t.items.len() == 0 { out.push_str(" {}"); return out; }
+                out.push_str(" {\n");
+                let mut kinds = 0;
+                for pass in 0..3 {
+                    let mut any = false;
+                    for x in t.items.iter() {
+                        if crate::doc::model::hidden(&x.base().attrs) { continue; }
+                        let line = match (pass, x) {
+                            (0, Item::TypeAlias(a)) => {
+                                let b = if a.bounds.len() > 0 { `: ${self.bounds(&a.bounds)}`.to_string() } else { String::new() };
+                                let d = match a.ty { Some(t) => ` = ${self.ty(t)}`.to_string(), None => String::new() };
+                                `    <span class="kw">type</span> <a class="associatedtype" href="#associatedtype.${a.name.value}">${escape(a.name.value.as_str())}</a>${b}${d};\n`.to_string()
+                            }
+                            (1, Item::Const(c)) => {
+                                let d = match c.value { Some(v) => ` = ${self.expr(v)}`.to_string(), None => String::new() };
+                                `    <span class="kw">const</span> <a class="constant" href="#associatedconstant.${c.name.value}">${escape(c.name.value.as_str())}</a>: ${self.ty(c.ty)}${d};\n`.to_string()
+                            }
+                            (2, Item::Fn(f)) => {
+                                let body = if f.body.is_some() { " { ... }" } else { ";" };
+                                let a = if f.body.is_some() { "method" } else { "tymethod" };
+                                `    ${self.fn_sig(f, "", Some(`#${a}.${f.name.value}`.to_string()), "    ")}${body}\n`.to_string()
+                            }
+                            _ => String::new(),
+                        };
+                        if line.len() > 0 {
+                            if !any && kinds > 0 { out.push('\n'); }
+                            any = true;
+                            out.push_str(line.as_str());
+                        }
+                    }
+                    if any { kinds += 1; }
+                }
+                out.push('}');
+                out
+            }
+            Item::TypeAlias(a) => {
+                let t = match a.ty { Some(t) => ` = ${self.ty(t)}`.to_string(), None => String::new() };
+                `${vis}<span class="kw">type</span> <span class="type">${escape(name)}</span>${self.generics(a.generics)}${self.wheres(a.generics, "")}${t};`.to_string()
+            }
+            Item::Const(c) => {
+                let v = match c.value { Some(e) => { let x = self.expr(e); if x == "_" { String::new() } else { ` = ${x}`.to_string() } } None => String::new() };
+                `${vis}<span class="kw">const</span> <span class="constant">${escape(name)}</span>: ${self.ty(c.ty)}${v};`.to_string()
+            }
+            Item::Static(s) => `${vis}<span class="kw">static</span> ${if s.is_mut { "<span class=\"kw\">mut</span> " } else { "" }}<span class="static">${escape(name)}</span>: ${self.ty(s.ty)};`.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    pub fn variant(&self, v: &Variant) -> String {
+        let name = `<a class="variant" href="#variant.${v.name.value}">${escape(v.name.value.as_str())}</a>`.to_string();
+        match v.kind {
+            StructKind::Unit => {
+                match v.discriminant { Some(d) => `${name} = ${self.expr(d)}`.to_string(), None => name }
+            }
+            StructKind::Tuple => {
+                let fs: Vec<String> = v.fields.iter().map(|f: &&Field| -> String { self.ty(f.ty) }).collect();
+                `${name}(${fs.join(", ")})`.to_string()
+            }
+            StructKind::Named => {
+                let fs: Vec<String> = v.fields.iter().map(|f: &&Field| -> String { `${escape(f.name.unwrap().value.as_str())}: ${self.ty(f.ty)}`.to_string() }).collect();
+                `${name} { ${fs.join(", ")} }`.to_string()
+            }
+        }
+    }
+
+    /// impl<T> Trait for Type<T>
+    pub fn impl_header(&self, r: &ImplRef) -> String {
+        let d = r.decl;
+        let mut s = String::new();
+        if d.is_unsafe { s.push_str("<span class=\"kw\">unsafe</span> "); }
+        s.push_str("<span class=\"kw\">impl</span>");
+        s.push_str(self.generics(d.generics).as_str());
+        s.push(' ');
+        if let Some(tp) = d.trait_path {
+            s.push_str(self.path(tp).as_str());
+            s.push_str(" <span class=\"kw\">for</span> ");
+        }
+        s.push_str(self.ty(d.ty).as_str());
+        s.push_str(self.wheres(d.generics, "").as_str());
+        s
+    }
+}
+
+// A parameter's pattern (a name, mut name, or _ / a tuple of those).
+pub fn pat(p: &Pat) -> String {
+    match &p.kind {
+        PatKind::Ident { is_mut, name, .. } => `${if *is_mut { "<span class=\"kw\">mut</span> " } else { "" }}${escape(name.value.as_str())}`.to_string(),
+        PatKind::Tuple { elems, .. } => {
+            let v: Vec<String> = elems.iter().map(|e: &&Pat| -> String { pat(*e) }).collect();
+            `(${v.join(", ")})`.to_string()
+        }
+        PatKind::Ref { pat: q, .. } => `&amp;${pat(q)}`.to_string(),
+        _ => "_".to_string(),
+    }
+}
+
+/// d's path from its crate (std::vec::Vec).
+pub fn full_name(d: &Def) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(d.name.clone());
+    let mut x = d.parent;
+    while let Some(p) = x {
+        if p.kind == resolve::DEF_IMPL { break; }
+        parts.push(p.name.clone());
+        x = p.parent;
+    }
+    parts.push(d.krate.name.clone());
+    parts.reverse();
+    parts.join("::")
+}
+
+/// HTML without its tags and entities decoded (lengths, search summaries).
+pub fn strip_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in s.chars() {
+        if c == '<' { in_tag = true; continue; }
+        if c == '>' && in_tag { in_tag = false; continue; }
+        if !in_tag { out.push(c); }
+    }
+    out.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&amp;", "&")
+}

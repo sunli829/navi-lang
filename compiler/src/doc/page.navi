@@ -1,0 +1,661 @@
+//! The pages (as rustdoc's): a module's lists, an item's declaration,
+//! documentation and impls, the sidebar, the search index, CSS and JS.
+
+use std::collections::HashMap;
+use crate::syntax::ast::*;
+use crate::syntax::source::{File, Pos};
+use crate::resolve::{self, Def, Module};
+use crate::doc::model::{Model, Page, ImplRef, docs_at, module_docs, hidden};
+use crate::doc::render::{R, up, strip_tags, kind_class};
+use crate::doc::markdown::{self, escape, Opts};
+
+/// Links in documentation that named nothing: (file, line, text).
+pub static mut BROKEN: Vec<(String, usize, String)> = Vec::new();
+
+const SECTIONS: [(&str, &str, &str); 10] = [
+    ("mod", "modules", "Modules"),
+    ("struct", "structs", "Structs"),
+    ("enum", "enums", "Enums"),
+    ("trait", "traits", "Traits"),
+    ("fn", "functions", "Functions"),
+    ("type", "types", "Type Aliases"),
+    ("constant", "constants", "Constants"),
+    ("static", "statics", "Statics"),
+    ("derive", "derives", "Derive Macros"),
+    ("primitive", "primitives", "Primitive Types"),
+];
+
+fn kind_title(kind: &str) -> &str {
+    match kind {
+        "mod" => "Module",
+        "struct" => "Struct",
+        "enum" => "Enum",
+        "trait" => "Trait",
+        "fn" => "Function",
+        "type" => "Type Alias",
+        "constant" => "Constant",
+        "static" => "Static",
+        "derive" => "Derive Macro",
+        "primitive" => "Primitive Type",
+        _ => "",
+    }
+}
+
+/// Documentation as HTML for a page in dir: links resolved from scope
+/// (Self: self_def); those naming nothing are noted for user crates.
+pub fn docs_html(m: &Model, text: &str, scope: Option<&mut Module>, self_def: Option<&mut Def>, dir: &str, whence: (Option<&File>, Pos), summary: bool) -> String {
+    if text.trim().len() == 0 { return String::new(); }
+    let r = &R { m, dir: dir.to_string() };
+    let o = &Opts {
+        link: |s: &str| -> Option<String> {
+            match m.link(scope, self_def, s) {
+                Some(u) => Some(r.rel(u.as_str())),
+                None => {
+                    if !summary {
+                        if let Some(f) = whence.0 {
+                            if !is_std_file(m, f) { BROKEN.push((f.name.clone(), f.line_of(whence.1) as usize, s.to_string())); }
+                        }
+                    }
+                    None
+                }
+            }
+        },
+        shift: 1,
+    };
+    if summary { markdown::summary(text, o) } else { markdown::to_html(text, o) }
+}
+
+fn is_std_file(m: &Model, f: &File) -> bool {
+    for c in m.info.crates.iter() {
+        if c.is_std && f.name.starts_with(c.dir.as_str()) { return true; }
+    }
+    false
+}
+
+/// Writes every page, the search index, the static files and the root's
+/// index under out; the number of pages.
+pub fn write_all(m: &Model, out: &str) -> Result<usize, String> {
+    mkdirs(out)?;
+    mkdirs(`${out}/static`.to_string().as_str())?;
+    write(`${out}/static/style.css`.to_string().as_str(), CSS)?;
+    write(`${out}/static/main.js`.to_string().as_str(), JS)?;
+    let mut n = 0;
+    let mut dirs: HashMap<String, bool> = HashMap::new();
+    for p in m.pages.iter() {
+        if !dirs.contains_key(&p.dir) {
+            mkdirs(`${out}/${p.dir}`.to_string().as_str())?;
+            dirs.insert(p.dir.clone(), true);
+        }
+        let html = page_html(m, p);
+        write(`${out}/${p.url()}`.to_string().as_str(), html.as_str())?;
+        n += 1;
+    }
+    write(`${out}/search-index.js`.to_string().as_str(), search_index(m).as_str())?;
+    write(`${out}/index.html`.to_string().as_str(), root_index(m).as_str())?;
+    Ok(n)
+}
+
+fn mkdirs(d: &str) -> Result<(), String> {
+    match std::fs::create_dir_all(d) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(`${d}: ${e}`.to_string()),
+    }
+}
+
+fn write(path: &str, s: &str) -> Result<(), String> {
+    match std::fs::write(path, s.as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(`${path}: ${e}`.to_string()),
+    }
+}
+
+fn shell(root: &str, title: &str, krate: &str, sidebar: &str, body: &str) -> String {
+    `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escape(title)}</title>
+<link rel="stylesheet" href="${root}/static/style.css">
+<script>var ROOT = "${root}";</script>
+<script defer src="${root}/search-index.js"></script>
+<script defer src="${root}/static/main.js"></script>
+</head><body>
+<nav class="sidebar"><h2 class="crate"><a href="${root}/${krate}/index.html">${escape(krate)}</a></h2>
+${sidebar}</nav>
+<main>
+<form class="search" onsubmit="return false"><input id="search" type="search" placeholder="Search (press S or /)" autocomplete="off" spellcheck="false"></form>
+<section id="results" hidden></section>
+<section id="content">
+${body}</section>
+</main>
+</body></html>
+`.to_string()
+}
+
+// The title's path, each module in it a link.
+fn breadcrumbs(m: &Model, p: &Page, root: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut x = p.parent;
+    while let Some(q) = x {
+        parts.push(`<a href="${root}/${q.url()}">${escape(q.name.as_str())}</a>`.to_string());
+        x = q.parent;
+    }
+    parts.reverse();
+    let _ = m;
+    let mut s = parts.join("::");
+    if s.len() > 0 { s.push_str("::"); }
+    s.push_str(`<span class="${p.kind}">${escape(p.name.as_str())}</span>`.to_string().as_str());
+    s
+}
+
+fn page_html(m: &Model, p: &Page) -> String {
+    let root = up(p.dir.as_str());
+    // (A module's page is in its own directory; its links are from there.)
+    let r = &R { m, dir: p.dir.clone() };
+    let title_kind = if p.kind == "mod" && p.parent.is_none() { "Crate" } else { kind_title(p.kind.as_str()) };
+    let mut body = `<h1 class="title">${title_kind} ${breadcrumbs(m, p, root.as_str())}</h1>\n`.to_string();
+    let (b, side) = if p.kind == "mod" { module_body(m, r, p) } else { item_body(m, r, p) };
+    body.push_str(b.as_str());
+    let title = if p.kind == "mod" { `${p.path} - navi`.to_string() } else { `${p.name} in ${parent_path(p)} - navi`.to_string() };
+    shell(root.as_str(), title.as_str(), p.krate.as_str(), side.as_str(), body.as_str())
+}
+
+fn parent_path(p: &Page) -> String {
+    match p.parent { Some(q) => q.path.clone(), None => p.krate.clone() }
+}
+
+fn module_body(m: &Model, r: &R, p: &Page) -> (String, String) {
+    let mut body = String::new();
+    let docs = module_docs(p);
+    let file = match p.def { Some(d) => d.file, None => match p.module { Some(rm) => rm.file, None => None } };
+    let d = docs_html(m, docs.as_str(), p.module, None, p.dir.as_str(), (file, 0), false);
+    if d.len() > 0 { body.push_str(`<div class="docblock">${d}</div>\n`.to_string().as_str()); }
+    let mut side = String::new();
+    if p.parent.is_some() { side.push_str(`<h3 class="location">Module ${escape(p.name.as_str())}</h3>\n`.to_string().as_str()); }
+    side.push_str("<ul class=\"block\">\n");
+    if p.reexports.len() > 0 {
+        body.push_str("<h2 id=\"reexports\" class=\"section\">Re-exports</h2>\n<ul class=\"reexports\">\n");
+        side.push_str("<li><a href=\"#reexports\">Re-exports</a></li>\n");
+        for (b, name) in p.reexports.iter() {
+            let d = b.res.def.unwrap();
+            let path = match b.import {
+                Some(imp) => {
+                    let mut segs: Vec<String> = imp.segs.iter().map(|s: &&Name| -> String { s.value.clone() }).collect();
+                    if imp.glob { segs.push("*".to_string()); }
+                    segs
+                }
+                None => Vec::new(),
+            };
+            let shown = if path.len() > 0 { path[..path.len() - 1].join("::") } else { String::new() };
+            let last = r.def_link(d, d.name.as_str());
+            let alias = if *name != d.name { ` <span class="kw">as</span> ${escape(name.as_str())}`.to_string() } else { String::new() };
+            let pre = if shown.len() > 0 { `${escape(shown.as_str())}::`.to_string() } else { String::new() };
+            body.push_str(`<li><code><span class="kw">pub use</span> ${pre}${last}${alias};</code></li>\n`.to_string().as_str());
+        }
+        body.push_str("</ul>\n");
+    }
+    for (kind, id, title) in SECTIONS.iter() {
+        let mut items: Vec<&Page> = Vec::new();
+        for c in p.children.iter() { if c.kind == *kind { items.push(*c); } }
+        if items.len() == 0 { continue; }
+        items.sort_by(|a: &&Page, b: &&Page| -> std::cmp::Ordering { a.name.cmp(&b.name) });
+        body.push_str(`<h2 id="${id}" class="section">${title}</h2>\n<dl class="items">\n`.to_string().as_str());
+        side.push_str(`<li><a href="#${id}">${title}</a></li>\n`.to_string().as_str());
+        for c in items.iter() {
+            let href = relative_child(p, c);
+            let sum = page_summary(m, c, p.dir.as_str());
+            body.push_str(`<dt><a class="${c.kind}" href="${href}">${escape(c.name.as_str())}</a></dt><dd>${sum}</dd>\n`.to_string().as_str());
+        }
+        body.push_str("</dl>\n");
+    }
+    side.push_str("</ul>\n");
+    // The crate's other modules (the parent's list, as rustdoc's sidebar).
+    if let Some(q) = p.parent {
+        side.push_str(`<h3><a href="${up(p.dir.as_str())}/${q.url()}">In ${escape(q.path.as_str())}</a></h3>\n`.to_string().as_str());
+    }
+    (body, side)
+}
+
+// The link from module page p to its child c.
+fn relative_child(p: &Page, c: &Page) -> String {
+    let _ = p;
+    if c.kind == "mod" { return `${last_dir(c.dir.as_str())}/index.html`.to_string(); }
+    `${c.kind}.${c.name}.html`.to_string()
+}
+
+fn last_dir(d: &str) -> String {
+    match d.rfind('/') { Some(k) => d[k + 1..].to_string(), None => d.to_string() }
+}
+
+// The first paragraph of a page's documentation (inline HTML).
+fn page_summary(m: &Model, c: &Page, dir: &str) -> String {
+    let text = if c.kind == "mod" {
+        module_docs(c)
+    } else {
+        match (&c.item, c.def) { (Some(it), Some(d)) => docs_at(d.file, it.pos()), _ => String::new() }
+    };
+    docs_html(m, text.as_str(), c.module, c.def, dir, (None, 0), true)
+}
+
+fn item_body(m: &Model, r: &R, p: &Page) -> (String, String) {
+    let mut body = String::new();
+    let mut side = String::new();
+    let rm = p.module;
+    if let Some(it) = &p.item {
+        body.push_str(`<pre class="navi item-decl"><code>${r.decl(it, p.name.as_str())}</code></pre>\n`.to_string().as_str());
+        let text = match p.def { Some(d) => docs_at(d.file, it.pos()), None => String::new() };
+        let file = match p.def { Some(d) => d.file, None => None };
+        let d = docs_html(m, text.as_str(), rm, p.def, p.dir.as_str(), (file, it.pos()), false);
+        if d.len() > 0 { body.push_str(`<div class="docblock">${d}</div>\n`.to_string().as_str()); }
+        match it {
+            Item::Struct(s) => {
+                let mut fields = String::new();
+                let mut names: Vec<String> = Vec::new();
+                for (k, f) in s.fields.iter().enumerate() {
+                    if f.vis != Vis::Pub || hidden(&f.attrs) { continue; }
+                    let n = match f.name { Some(n) => n.value.clone(), None => k.to_string() };
+                    let fd = docs_html(m, docs_at(file, f.ty.pos()).as_str(), rm, p.def, p.dir.as_str(), (file, f.ty.pos()), false);
+                    let fd = if f.name.is_some() { docs_html(m, docs_at(file, f.name.unwrap().pos).as_str(), rm, p.def, p.dir.as_str(), (file, f.name.unwrap().pos), false) } else { fd };
+                    fields.push_str(`<span id="structfield.${n}" class="structfield"><a href="#structfield.${n}" class="anchor">§</a><code>${escape(n.as_str())}: ${r.ty(f.ty)}</code></span>\n`.to_string().as_str());
+                    if fd.len() > 0 { fields.push_str(`<div class="docblock">${fd}</div>\n`.to_string().as_str()); }
+                    names.push(n);
+                }
+                if fields.len() > 0 && s.kind != StructKind::Unit {
+                    body.push_str(`<h2 id="fields" class="section">Fields</h2>\n${fields}`.to_string().as_str());
+                    side.push_str(`<h3><a href="#fields">Fields</a></h3>\n<ul class="block">${links(&names, "structfield")}</ul>\n`.to_string().as_str());
+                }
+            }
+            Item::Enum(e) => {
+                let mut names: Vec<String> = Vec::new();
+                body.push_str("<h2 id=\"variants\" class=\"section\">Variants</h2>\n");
+                for v in e.variants.iter() {
+                    if hidden(&v.attrs) { continue; }
+                    let n = v.name.value.clone();
+                    body.push_str(`<section id="variant.${n}" class="variant"><a href="#variant.${n}" class="anchor">§</a><h3 class="code-header">${r.variant(v)}</h3></section>\n`.to_string().as_str());
+                    let vd = docs_html(m, docs_at(file, v.name.pos).as_str(), rm, p.def, p.dir.as_str(), (file, v.name.pos), false);
+                    if vd.len() > 0 { body.push_str(`<div class="docblock">${vd}</div>\n`.to_string().as_str()); }
+                    names.push(n);
+                }
+                side.push_str(`<h3><a href="#variants">Variants</a></h3>\n<ul class="block">${links(&names, "variant")}</ul>\n`.to_string().as_str());
+            }
+            Item::Trait(t) => {
+                let (b, s) = trait_items(m, r, p, t, file);
+                body.push_str(b.as_str());
+                side.push_str(s.as_str());
+            }
+            _ => {}
+        }
+    }
+    // Impls (types and primitives), implementors (traits).
+    let empty: Vec<ImplRef> = Vec::new();
+    let impls = if p.kind == "primitive" {
+        match m.prim_impls.get(&p.name) { Some(v) => v, None => &empty }
+    } else {
+        match p.def { Some(d) => match m.impls.get(&d.id) { Some(v) => v, None => &empty }, None => &empty }
+    };
+    if p.kind == "struct" || p.kind == "enum" || p.kind == "primitive" || (p.kind == "type" && impls.len() > 0) {
+        let (b, s) = impls_html(m, r, p, impls);
+        body.push_str(b.as_str());
+        side.push_str(s.as_str());
+    }
+    if p.kind == "trait" {
+        if let Some(d) = p.def {
+            if let Some(v) = m.implementors.get(&d.id) {
+                body.push_str("<h2 id=\"implementors\" class=\"section\">Implementors</h2>\n<div class=\"implementors\">\n");
+                let mut hs: Vec<String> = v.iter().map(|ir: &ImplRef| -> String { r.impl_header(ir) }).collect();
+                hs.sort_by(|a: &String, b: &String| -> std::cmp::Ordering { strip_tags(a.as_str()).cmp(&strip_tags(b.as_str())) });
+                hs.dedup();
+                for h in hs.iter() { body.push_str(`<h3 class="code-header impl">${h}</h3>\n`.to_string().as_str()); }
+                body.push_str("</div>\n");
+                side.push_str("<h3><a href=\"#implementors\">Implementors</a></h3>\n");
+            }
+        }
+    }
+    if let Some(q) = p.parent {
+        side.push_str(`<h3><a href="${r.rel(q.url().as_str())}">In ${escape(q.path.as_str())}</a></h3>\n`.to_string().as_str());
+    }
+    (body, side)
+}
+
+fn links(names: &Vec<String>, prefix: &str) -> String {
+    let mut s = String::new();
+    for n in names.iter() { s.push_str(`<li><a href="#${prefix}.${n}">${escape(n.as_str())}</a></li>`.to_string().as_str()); }
+    s
+}
+
+// A trait's associated types and constants, required and provided
+// methods.
+fn trait_items(m: &Model, r: &R, p: &Page, t: &TraitDecl, file: Option<&File>) -> (String, String) {
+    let mut body = String::new();
+    let mut side = String::new();
+    let groups = [("associated-types", "Associated Types", 0), ("associated-consts", "Associated Constants", 1), ("required-methods", "Required Methods", 2), ("provided-methods", "Provided Methods", 3)];
+    for (id, title, g) in groups.iter() {
+        let mut part = String::new();
+        let mut names: Vec<String> = Vec::new();
+        for x in t.items.iter() {
+            if hidden(&x.base().attrs) { continue; }
+            let (anchor, head, name) = match (*g, x) {
+                (0, Item::TypeAlias(a)) => (`associatedtype.${a.name.value}`.to_string(), {
+                    let b = if a.bounds.len() > 0 { `: ${r.bounds(&a.bounds)}`.to_string() } else { String::new() };
+                    `<span class="kw">type</span> <a class="associatedtype" href="#associatedtype.${a.name.value}">${escape(a.name.value.as_str())}</a>${b}`.to_string()
+                }, a.name.value.clone()),
+                (1, Item::Const(c)) => (`associatedconstant.${c.name.value}`.to_string(), `<span class="kw">const</span> <a class="constant" href="#associatedconstant.${c.name.value}">${escape(c.name.value.as_str())}</a>: ${r.ty(c.ty)}`.to_string(), c.name.value.clone()),
+                (2, Item::Fn(f)) if f.body.is_none() => (`tymethod.${f.name.value}`.to_string(), r.fn_sig(f, "", Some(`#tymethod.${f.name.value}`.to_string()), ""), f.name.value.clone()),
+                (3, Item::Fn(f)) if f.body.is_some() => (`method.${f.name.value}`.to_string(), r.fn_sig(f, "", Some(`#method.${f.name.value}`.to_string()), ""), f.name.value.clone()),
+                _ => continue,
+            };
+            part.push_str(`<section id="${anchor}" class="method"><a href="#${anchor}" class="anchor">§</a><h4 class="code-header">${head}</h4></section>\n`.to_string().as_str());
+            let dd = docs_html(m, docs_at(file, x.pos()).as_str(), p.module, p.def, p.dir.as_str(), (file, x.pos()), false);
+            if dd.len() > 0 { part.push_str(`<div class="docblock">${dd}</div>\n`.to_string().as_str()); }
+            names.push(name);
+        }
+        if part.len() == 0 { continue; }
+        body.push_str(`<h2 id="${id}" class="section">${title}</h2>\n<div class="methods">${part}</div>\n`.to_string().as_str());
+        let pre = if *g == 0 { "associatedtype" } else if *g == 1 { "associatedconstant" } else if *g == 2 { "tymethod" } else { "method" };
+        side.push_str(`<h3><a href="#${id}">${title}</a></h3>\n<ul class="block">${links(&names, pre)}</ul>\n`.to_string().as_str());
+    }
+    (body, side)
+}
+
+// A type's inherent impls (their pub items) and trait impls.
+fn impls_html(m: &Model, r: &R, p: &Page, impls: &Vec<ImplRef>) -> (String, String) {
+    let mut body = String::new();
+    let mut side = String::new();
+    let mut methods: Vec<String> = Vec::new();
+    let mut inherent = String::new();
+    let mut traits: Vec<(String, String)> = Vec::new();
+    let mut trait_names: Vec<String> = Vec::new();
+    for ir0 in impls.iter() {
+        let ir = ir0.clone();
+        let header = r.impl_header(&ir);
+        let is_trait = ir.decl.trait_path.is_some();
+        let mut items = String::new();
+        // (A trait impl's items link to the trait's, as rustdoc's.)
+        let trait_page = match ir.trait_def { Some(td) => match m.url_of(td) { Some(u) => Some((r.rel(u.as_str()), td)), None => None }, None => None };
+        for x in ir.decl.items.iter() {
+            if hidden(&x.base().attrs) { continue; }
+            if !is_trait && x.base().vis != Vis::Pub { continue; }
+            let href = |kind: &str, name: &str| -> Option<String> {
+                if !is_trait { return Some(`#${kind}.${name}`.to_string()); }
+                match trait_page {
+                    Some((u, td)) => {
+                        let k = if kind == "method" && trait_requires(td, name) { "tymethod" } else { kind };
+                        Some(`${u}#${k}.${name}`.to_string())
+                    }
+                    None => None,
+                }
+            };
+            let link = |cls: &str, kind: &str, name: &str| -> String {
+                match href(kind, name) {
+                    Some(h) => `<a class="${cls}" href="${h}">${escape(name)}</a>`.to_string(),
+                    None => escape(name),
+                }
+            };
+            let (anchor, head, name) = match x {
+                Item::Fn(f) => (`method.${f.name.value}`.to_string(), r.fn_sig(f, if is_trait { "" } else { "<span class=\"kw\">pub</span> " }, href("method", f.name.value.as_str()), ""), f.name.value.clone()),
+                Item::Const(c) => (`associatedconstant.${c.name.value}`.to_string(), `${if is_trait { "" } else { "<span class=\"kw\">pub</span> " }}<span class="kw">const</span> ${link("constant", "associatedconstant", c.name.value.as_str())}: ${r.ty(c.ty)}`.to_string(), c.name.value.clone()),
+                Item::TypeAlias(a) => (`associatedtype.${a.name.value}`.to_string(), `<span class="kw">type</span> ${link("associatedtype", "associatedtype", a.name.value.as_str())}${match a.ty { Some(t) => ` = ${r.ty(t)}`.to_string(), None => String::new() }}`.to_string(), a.name.value.clone()),
+                _ => continue,
+            };
+            let is_fn = match x { Item::Fn(_) => true, _ => false };
+            // (Anchors of trait impls' items are not unique: none.)
+            let id = if is_trait { String::new() } else { ` id="${anchor}"`.to_string() };
+            items.push_str(`<section${id} class="method"><h4 class="code-header">${head}</h4></section>\n`.to_string().as_str());
+            let mut text = docs_at(Some(ir.file), x.pos());
+            if text.len() == 0 && is_trait { text = trait_item_docs(&ir, name.as_str()); }
+            // (Trait impls' methods: the first paragraph, as rustdoc folds them.)
+            let dd = docs_html(m, text.as_str(), Some(ir.module), ir.self_def, p.dir.as_str(), (Some(ir.file), x.pos()), is_trait);
+            if dd.len() > 0 { items.push_str(`<div class="docblock">${dd}</div>\n`.to_string().as_str()); }
+            if !is_trait && is_fn { methods.push(name); }
+        }
+        if is_trait {
+            let tn = match ir.trait_def { Some(td) => td.name.clone(), None => "?".to_string() };
+            trait_names.push(tn.clone());
+            traits.push((strip_tags(header.as_str()), `<details class="impl"><summary><h3 class="code-header">${header}</h3></summary>\n<div class="impl-items">${items}</div></details>\n`.to_string()));
+        } else {
+            let docs = docs_html(m, docs_at(Some(ir.file), ir.decl.base.start).as_str(), Some(ir.module), ir.self_def, p.dir.as_str(), (Some(ir.file), ir.decl.base.start), false);
+            let docs = if docs.len() > 0 { `<div class="docblock">${docs}</div>`.to_string() } else { String::new() };
+            inherent.push_str(`<details class="impl" open><summary><h3 class="code-header">${header}</h3></summary>\n${docs}<div class="impl-items">${items}</div></details>\n`.to_string().as_str());
+        }
+    }
+    if inherent.len() > 0 {
+        body.push_str(`<h2 id="implementations" class="section">Implementations</h2>\n${inherent}`.to_string().as_str());
+        methods.sort();
+        methods.dedup();
+        side.push_str(`<h3><a href="#implementations">Methods</a></h3>\n<ul class="block">${links(&methods, "method")}</ul>\n`.to_string().as_str());
+    }
+    if traits.len() > 0 {
+        traits.sort_by(|a: &(String, String), b: &(String, String)| -> std::cmp::Ordering { a.0.cmp(&b.0) });
+        body.push_str("<h2 id=\"trait-implementations\" class=\"section\">Trait Implementations</h2>\n");
+        for (_, h) in traits.iter() { body.push_str(h.as_str()); }
+        trait_names.sort();
+        trait_names.dedup();
+        let mut s = String::new();
+        for n in trait_names.iter() { s.push_str(`<li>${escape(n.as_str())}</li>`.to_string().as_str()); }
+        side.push_str(`<h3><a href="#trait-implementations">Trait Implementations</a></h3>\n<ul class="block">${s}</ul>\n`.to_string().as_str());
+    }
+    (body, side)
+}
+
+// The docs of the trait's item name (for an impl's item without its own).
+fn trait_item_docs(ir: &ImplRef, name: &str) -> String {
+    let td = match ir.trait_def { Some(d) => d, None => return String::new() };
+    if let resolve::Node::Item(Item::Trait(t)) = &td.node {
+        for x in t.items.iter() {
+            let n = match x { Item::Fn(f) => f.name.value.as_str(), Item::Const(c) => c.name.value.as_str(), Item::TypeAlias(a) => a.name.value.as_str(), _ => "" };
+            if n == name { return docs_at(td.file, x.pos()); }
+        }
+    }
+    String::new()
+}
+
+// --- Search -----------------------------------------------------------------------------
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            '\t' => out.push(' '),
+            '<' => out.push_str("\\u003c"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+// SEARCH_INDEX: [name, kind, path of its parent, summary, url] for every
+// page and every inherent method.
+fn search_index(m: &Model) -> String {
+    let mut out = "var SEARCH_INDEX = [\n".to_string();
+    for p in m.pages.iter() {
+        let sum = plain_summary(m, p);
+        let parent = parent_path(p);
+        out.push_str(`[${json_str(p.name.as_str())},${json_str(p.kind.as_str())},${json_str(if p.parent.is_none() { "" } else { parent.as_str() })},${json_str(sum.as_str())},${json_str(p.url().as_str())}],\n`.to_string().as_str());
+        let empty: Vec<ImplRef> = Vec::new();
+        let impls = match p.def { Some(d) => match m.impls.get(&d.id) { Some(v) => v, None => &empty }, None => if p.kind == "primitive" { match m.prim_impls.get(&p.name) { Some(v) => v, None => &empty } } else { &empty } };
+        if p.kind != "struct" && p.kind != "enum" && p.kind != "primitive" && p.kind != "trait" { continue; }
+        let mut seen: HashMap<String, bool> = HashMap::new();
+        for ir in impls.iter() {
+            if ir.decl.trait_path.is_some() { continue; }
+            for x in ir.decl.items.iter() {
+                if let Item::Fn(f) = x {
+                    if f.base.vis != Vis::Pub || hidden(&f.base.attrs) || seen.contains_key(&f.name.value) { continue; }
+                    seen.insert(f.name.value.clone(), true);
+                    let s = first_sentence(docs_at(Some(ir.file), x.pos()).as_str());
+                    out.push_str(`[${json_str(f.name.value.as_str())},"method",${json_str(p.path.as_str())},${json_str(s.as_str())},${json_str(`${p.url()}#method.${f.name.value}`.to_string().as_str())}],\n`.to_string().as_str());
+                }
+            }
+        }
+        if let Some(Item::Trait(t)) = &p.item {
+            for x in t.items.iter() {
+                if let Item::Fn(f) = x {
+                    if hidden(&f.base.attrs) { continue; }
+                    let a = if f.body.is_some() { "method" } else { "tymethod" };
+                    let s = first_sentence(docs_at(match p.def { Some(d) => d.file, None => None }, x.pos()).as_str());
+                    out.push_str(`[${json_str(f.name.value.as_str())},"method",${json_str(p.path.as_str())},${json_str(s.as_str())},${json_str(`${p.url()}#${a}.${f.name.value}`.to_string().as_str())}],\n`.to_string().as_str());
+                }
+            }
+        }
+    }
+    out.push_str("];\n");
+    out
+}
+
+fn plain_summary(m: &Model, p: &Page) -> String {
+    let text = if p.kind == "mod" { module_docs(p) } else { match (&p.item, p.def) { (Some(it), Some(d)) => docs_at(d.file, it.pos()), _ => String::new() } };
+    let _ = m;
+    first_sentence(text.as_str())
+}
+
+// The first paragraph as plain text, at most 160 characters.
+fn first_sentence(text: &str) -> String {
+    let mut s = String::new();
+    for l in text.split('\n') {
+        let t = l.trim();
+        if t.len() == 0 { if s.len() > 0 { break; } continue; }
+        if t.starts_with("#") || t.starts_with("```") { if s.len() > 0 { break; } continue; }
+        if s.len() > 0 { s.push(' '); }
+        s.push_str(t);
+    }
+    let s = s.replace("`", "").replace("[", "").replace("]", "").replace("**", "");
+    if s.chars().count() > 160 {
+        let mut t: String = s.chars().take(157).collect();
+        t.push_str("...");
+        return t;
+    }
+    s
+}
+
+fn root_index(m: &Model) -> String {
+    let mut body = "<h1 class=\"title\">Crates</h1>\n<dl class=\"items\">\n".to_string();
+    let mut names: Vec<String> = Vec::new();
+    for r in m.roots.iter() { names.push(r.krate.clone()); }
+    names.sort();
+    for n in names.iter() { body.push_str(`<dt><a class="mod" href="${n}/index.html">${escape(n.as_str())}</a></dt><dd></dd>\n`.to_string().as_str()); }
+    body.push_str("</dl>\n");
+    let first = if names.len() > 0 { names[0].clone() } else { String::new() };
+    shell(".", "Crates - navi", first.as_str(), "", body.as_str())
+}
+
+const CSS: &str = r#":root { --bg: #fff; --fg: #000; --side: #f5f5f5; --border: #e0e0e0; --code-bg: #f5f5f5; --link: #3873ad;
+  --struct: #ad378a; --enum: #ad378a; --trait: #6e4fc9; --fn: #ad7c37; --mod: #3873ad; --type: #ad378a; --constant: #3873ad; --macro: #068000;
+  --kw: #8959a8; --string: #718c00; --comment: #8e908c; --number: #c82829; --attr: #c82829; --primitive: #ad378a; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.5 "Source Serif 4", "Georgia", serif; color: var(--fg); background: var(--bg); display: flex; }
+code, pre, .code-header, .sidebar, .search, h1, h2, h3, h4, .items dt { font-family: "Source Code Pro", "SFMono-Regular", Menlo, Consolas, monospace; }
+h1, h2, h3, h4, .sidebar, .search { font-family: "Fira Sans", "Helvetica Neue", Arial, sans-serif; }
+code, pre { font-family: "Source Code Pro", "SFMono-Regular", Menlo, Consolas, monospace; font-size: 0.875em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.sidebar { width: 250px; min-height: 100vh; background: var(--side); padding: 12px 16px; position: sticky; top: 0; height: 100vh; overflow-y: auto; flex: none; font-size: 0.9em; }
+.sidebar h2.crate { font-size: 1.4em; margin: 8px 0 16px; word-break: break-all; }
+.sidebar h3 { font-size: 1em; margin: 16px 0 4px; }
+.sidebar ul.block { list-style: none; padding: 0; margin: 0; }
+.sidebar ul.block li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+main { flex: 1; min-width: 0; padding: 12px 32px 64px; max-width: 1000px; }
+.search input { width: 100%; padding: 8px 12px; font-size: 1em; border: 1px solid var(--border); border-radius: 6px; }
+h1.title { font-size: 1.6em; margin: 24px 0 16px; font-weight: 500; word-break: break-all; }
+h1.title .struct, h1.title .enum, h1.title .type, h1.title .primitive { color: var(--struct); }
+h1.title .trait { color: var(--trait); } h1.title .fn { color: var(--fn); } h1.title .mod { color: var(--mod); }
+h2.section { font-size: 1.3em; border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-top: 32px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 6px; overflow-x: auto; line-height: 1.4; }
+pre.item-decl { white-space: pre-wrap; }
+:not(pre) > code { background: var(--code-bg); padding: 1px 4px; border-radius: 4px; }
+.docblock { margin: 4px 0 16px 0; }
+.impl-items .docblock, .methods .docblock, .structfield + .docblock, .variant + .docblock { margin-left: 24px; }
+.docblock h2 { font-size: 1.2em; } .docblock h3 { font-size: 1.1em; } .docblock h4 { font-size: 1em; }
+.docblock table { border-collapse: collapse; } .docblock td, .docblock th { border: 1px solid var(--border); padding: 4px 8px; }
+.docblock blockquote { border-left: 3px solid var(--border); margin: 0; padding-left: 12px; color: #555; }
+dl.items { display: grid; grid-template-columns: minmax(150px, max-content) 1fr; gap: 4px 16px; }
+dl.items dt { margin: 0; word-break: break-all; } dl.items dd { margin: 0; }
+.code-header { font-weight: 600; font-size: 0.95em; margin: 8px 0; font-family: "Source Code Pro", "SFMono-Regular", Menlo, Consolas, monospace; }
+details.impl > summary { cursor: pointer; list-style-position: outside; margin-left: 12px; }
+details.impl > summary > h3 { display: inline; }
+.impl-items { margin-left: 24px; }
+section.method, section.variant, .structfield { position: relative; display: block; margin-top: 12px; }
+a.anchor { position: absolute; left: -16px; color: var(--comment); visibility: hidden; text-decoration: none; }
+section:hover > a.anchor, h2:hover > a.anchor, h3:hover > a.anchor, .structfield:hover > a.anchor { visibility: visible; }
+.docblock h1 a.anchor, .docblock h2 a.anchor, .docblock h3 a.anchor, .docblock h4 a.anchor { position: static; margin-right: 4px; }
+a.struct, a.enum, a.type, a.primitive, span.primitive { color: var(--struct); } a.trait { color: var(--trait); } a.fn, span.fn { color: var(--fn); }
+a.mod { color: var(--mod); } a.constant, a.static { color: var(--constant); } a.derive { color: var(--macro); }
+.kw { color: var(--kw); } .kw-2 { color: var(--number); } .string { color: var(--string); } .comment, .doccomment { color: var(--comment); }
+.number { color: var(--number); } .attr { color: var(--attr); } .lifetime { color: var(--fn); } .macro { color: var(--macro); }
+.where { font-size: 0.95em; }
+pre.ignore { border-left: 3px solid #ff9800; } pre.should-panic, pre.compile-fail { border-left: 3px solid #f44336; }
+#results table { border-collapse: collapse; width: 100%; } #results td { padding: 4px 8px; vertical-align: top; border-bottom: 1px solid var(--border); }
+#results .path { color: #666; }
+ul.reexports { list-style: none; padding: 0; }
+@media (max-width: 700px) { body { display: block; } .sidebar { position: static; width: auto; height: auto; min-height: 0; } main { padding: 8px 12px; } }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #1e1e1e; --fg: #ddd; --side: #2a2a2a; --border: #444; --code-bg: #2a2a2a; --link: #79aee8;
+    --struct: #e57fc7; --enum: #e57fc7; --trait: #b78cf2; --fn: #e5c07b; --mod: #79aee8; --type: #e57fc7; --constant: #79aee8;
+    --kw: #c792ea; --string: #b5d07a; --comment: #8a8a8a; --number: #f78c6c; --attr: #f78c6c; }
+  .docblock blockquote { color: #aaa; } #results .path { color: #999; }
+}
+"#;
+
+const JS: &str = r#"(function () {
+  var input = document.getElementById("search");
+  var results = document.getElementById("results");
+  var content = document.getElementById("content");
+  if (!input) return;
+  var KINDS = { mod: "mod", struct: "struct", enum: "enum", trait: "trait", fn: "fn", type: "type", constant: "constant", static: "static", derive: "derive", primitive: "primitive", method: "method" };
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+  function run(q) {
+    q = q.trim().toLowerCase();
+    if (!q || typeof SEARCH_INDEX === "undefined") { results.hidden = true; content.hidden = false; return; }
+    var parts = q.split("::");
+    var last = parts[parts.length - 1];
+    var found = [];
+    for (var i = 0; i < SEARCH_INDEX.length; i++) {
+      var e = SEARCH_INDEX[i], name = e[0].toLowerCase();
+      var full = (e[2] ? e[2] + "::" : "") + name;
+      var s = -1;
+      if (name === last) s = 0; else if (name.indexOf(last) === 0) s = 1; else if (name.indexOf(last) > 0) s = 2;
+      else if (e[3].toLowerCase().indexOf(q) >= 0) s = 3;
+      if (s >= 0 && parts.length > 1 && full.toLowerCase().indexOf(q) < 0) s = -1;
+      if (s >= 0) found.push([s, e[1] === "method" ? 1 : 0, name.length, full, e]);
+    }
+    found.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1] || a[2] - b[2] || (a[3] < b[3] ? -1 : 1); });
+    var html = "<h1 class=\"title\">Results for " + esc(q) + "</h1>";
+    if (!found.length) html += "<p>No results.</p>";
+    html += "<table>";
+    for (var j = 0; j < found.length && j < 200; j++) {
+      var e = found[j][4];
+      html += "<tr><td><a class=\"" + (KINDS[e[1]] || "") + "\" href=\"" + ROOT + "/" + e[4] + "\"><span class=\"path\">" + esc(e[2] ? e[2] + "::" : "") + "</span>" + esc(e[0]) + "</a></td><td>" + esc(e[3]) + "</td></tr>";
+    }
+    html += "</table>";
+    results.innerHTML = html;
+    results.hidden = false;
+    content.hidden = true;
+  }
+  input.addEventListener("input", function () {
+    run(input.value);
+    var u = new URL(location.href);
+    if (input.value) u.searchParams.set("search", input.value); else u.searchParams.delete("search");
+    history.replaceState(null, "", u.toString());
+  });
+  document.addEventListener("keydown", function (ev) {
+    if (document.activeElement !== input && (ev.key === "s" || ev.key === "S" || ev.key === "/")) { ev.preventDefault(); input.focus(); }
+    else if (ev.key === "Escape" && document.activeElement === input) { input.value = ""; run(""); input.blur(); }
+  });
+  var q = new URL(location.href).searchParams.get("search");
+  if (q) { input.value = q; window.addEventListener("load", function () { run(q); }); }
+})();
+"#;
+
+// Whether the trait's method name has no default body.
+fn trait_requires(td: &Def, name: &str) -> bool {
+    if let resolve::Node::Item(Item::Trait(t)) = &td.node {
+        for x in t.items.iter() {
+            if let Item::Fn(f) = x {
+                if f.name.value == name { return f.body.is_none(); }
+            }
+        }
+    }
+    false
+}
