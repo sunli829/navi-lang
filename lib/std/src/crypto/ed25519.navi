@@ -9,10 +9,13 @@
 //!
 //! As Go's crypto/ed25519: the field is crypto::x25519's (five 51-bit
 //! limbs), points in extended coordinates with the complete formulas
-//! (Hisil et al. 2008, a = -1), the generator's multiples per 4-bit window a
-//! table built on first use (constant-time lookups), the scalars mod L
-//! crypto::nat's. Verification is Go's: S below L, [S]B - [k]A encoded equal
-//! to R (non-canonical encodings of A and R accepted as Go does).
+//! (Hisil et al. 2008, a = -1) and Go's completed and projective forms
+//! between them, k * B on signed 4-bit digits over the generator's affine
+//! multiples (a table built on first use; constant-time lookups, in
+//! assembly on aarch64 and x86_64), verification's [k](-A) + [S]B with the
+//! doublings shared on width-5 and width-8 non-adjacent forms, the scalars
+//! mod L crypto::nat's. Verification is Go's: S below L, the sum encoded
+//! equal to R (non-canonical encodings of A and R accepted as Go does).
 
 use crate::crypto::x25519::Fe;
 use crate::crypto::sha2::Sha512;
@@ -59,74 +62,171 @@ fn generator() -> Point {
     }
 }
 
-// r = p + q (add-2008-hwcd-3, a = -1): complete, no special cases; r may
-// be p or q (the field operations in place, as Go's).
-fn add_to(r: &mut Point, p: &Point, q: &Point) {
-    let mut a = Fe::zero();
-    let mut b = Fe::zero();
-    let mut c = Fe::zero();
-    let mut d = Fe::zero();
-    let mut t = Fe::zero();
-    a.set_sub(&p.y, &p.x);
-    t.set_sub(&q.y, &q.x);
-    a.set_mul(&a, &t);
-    b.set_add(&p.y, &p.x);
-    t.set_add(&q.y, &q.x);
-    b.set_mul(&b, &t);
-    c.set_mul(&p.t, &D2);
-    c.set_mul(&c, &q.t);
-    d.set_mul(&p.z, &q.z);
-    d.set_add(&d, &d);
-    // e = b - a, f = d - c, g = d + c, h = b + a
-    t.set_sub(&b, &a);
-    b.set_add(&b, &a);
-    a.set_sub(&d, &c);
-    d.set_add(&d, &c);
-    r.x.set_mul(&t, &a);
-    r.y.set_mul(&d, &b);
-    r.z.set_mul(&a, &d);
-    r.t.set_mul(&t, &b);
+// Go's other representations (edwards25519/edwards25519.go): the
+// completed point an addition or doubling gives (x = X/Z, y = Y/T), the
+// projective point a doubling takes (x = X/Z, y = Y/Z), and the addends
+// with y + x, y - x and 2dT ready (cached: Z kept; affine: Z = 1).
+struct P1xP1 {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+    t: Fe,
+}
+
+struct P2 {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+}
+
+#[derive(Clone)]
+struct Cached {
+    yplusx: Fe,
+    yminusx: Fe,
+    z: Fe,
+    t2d: Fe,
+}
+
+#[derive(Clone)]
+struct Affine {
+    yplusx: Fe,
+    yminusx: Fe,
+    t2d: Fe,
+}
+
+fn p1_zero() -> P1xP1 { P1xP1 { x: Fe::zero(), y: Fe::zero(), z: Fe::zero(), t: Fe::zero() } }
+
+fn cached_zero() -> Cached { Cached { yplusx: Fe::one(), yminusx: Fe::one(), z: Fe::one(), t2d: Fe::zero() } }
+
+fn affine_zero() -> Affine { Affine { yplusx: Fe::one(), yminusx: Fe::one(), t2d: Fe::zero() } }
+
+fn p3_from_p1(v: &mut Point, p: &P1xP1) {
+    v.x.set_mul(&p.x, &p.t);
+    v.y.set_mul(&p.y, &p.z);
+    v.z.set_mul(&p.z, &p.t);
+    v.t.set_mul(&p.x, &p.y);
+}
+
+fn p2_from_p1(v: &mut P2, p: &P1xP1) {
+    v.x.set_mul(&p.x, &p.t);
+    v.y.set_mul(&p.y, &p.z);
+    v.z.set_mul(&p.z, &p.t);
+}
+
+fn cached_from(v: &mut Cached, p: &Point) {
+    v.yplusx.set_add(&p.y, &p.x);
+    v.yminusx.set_sub(&p.y, &p.x);
+    v.z = p.z;
+    v.t2d.set_mul(&p.t, &D2);
+}
+
+fn affine_from(p: &Point) -> Affine {
+    let zi = p.z.invert();
+    let mut v = affine_zero();
+    v.yplusx.set_add(&p.y, &p.x);
+    v.yminusx.set_sub(&p.y, &p.x);
+    v.t2d.set_mul(&p.t, &D2);
+    v.yplusx.set_mul(&v.yplusx, &zi);
+    v.yminusx.set_mul(&v.yminusx, &zi);
+    v.t2d.set_mul(&v.t2d, &zi);
+    v
+}
+
+// v = p + q, or p - q with neg (q's y + x and y - x swapped, 2dT negated):
+// add-2008-hwcd-3 (a = -1), complete.
+fn p1_add(v: &mut P1xP1, p: &Point, q: &Cached, neg: bool) {
+    let mut pp = Fe::zero();
+    let mut mm = Fe::zero();
+    let mut tt = Fe::zero();
+    let mut zz = Fe::zero();
+    pp.set_add(&p.y, &p.x);
+    mm.set_sub(&p.y, &p.x);
+    if neg {
+        pp.set_mul(&pp, &q.yminusx);
+        mm.set_mul(&mm, &q.yplusx);
+    } else {
+        pp.set_mul(&pp, &q.yplusx);
+        mm.set_mul(&mm, &q.yminusx);
+    }
+    tt.set_mul(&p.t, &q.t2d);
+    zz.set_mul(&p.z, &q.z);
+    zz.set_add(&zz, &zz);
+    v.x.set_sub(&pp, &mm);
+    v.y.set_add(&pp, &mm);
+    if neg {
+        v.z.set_sub(&zz, &tt);
+        v.t.set_add(&zz, &tt);
+    } else {
+        v.z.set_add(&zz, &tt);
+        v.t.set_sub(&zz, &tt);
+    }
+}
+
+// The same with q's Z = 1 (madd-2008-hwcd-3).
+fn p1_add_affine(v: &mut P1xP1, p: &Point, q: &Affine, neg: bool) {
+    let mut pp = Fe::zero();
+    let mut mm = Fe::zero();
+    let mut tt = Fe::zero();
+    let mut zz = Fe::zero();
+    pp.set_add(&p.y, &p.x);
+    mm.set_sub(&p.y, &p.x);
+    if neg {
+        pp.set_mul(&pp, &q.yminusx);
+        mm.set_mul(&mm, &q.yplusx);
+    } else {
+        pp.set_mul(&pp, &q.yplusx);
+        mm.set_mul(&mm, &q.yminusx);
+    }
+    tt.set_mul(&p.t, &q.t2d);
+    zz.set_add(&p.z, &p.z);
+    v.x.set_sub(&pp, &mm);
+    v.y.set_add(&pp, &mm);
+    if neg {
+        v.z.set_sub(&zz, &tt);
+        v.t.set_add(&zz, &tt);
+    } else {
+        v.z.set_add(&zz, &tt);
+        v.t.set_sub(&zz, &tt);
+    }
+}
+
+// v = 2p (dbl-2008-hwcd, a = -1).
+fn p1_double(v: &mut P1xP1, p: &P2) {
+    let mut xx = Fe::zero();
+    let mut yy = Fe::zero();
+    let mut zz = Fe::zero();
+    let mut s = Fe::zero();
+    xx.set_square(&p.x);
+    yy.set_square(&p.y);
+    zz.set_square(&p.z);
+    zz.set_add(&zz, &zz);
+    s.set_add(&p.x, &p.y);
+    s.set_square(&s);
+    v.y.set_add(&yy, &xx);
+    v.z.set_sub(&yy, &xx);
+    v.x.set_sub(&s, &v.y);
+    v.t.set_sub(&zz, &v.z);
 }
 
 fn add(p: &Point, q: &Point) -> Point {
+    let mut c = cached_zero();
+    cached_from(&mut c, q);
+    let mut t = p1_zero();
+    p1_add(&mut t, p, &c, false);
     let mut r = identity();
-    add_to(&mut r, p, q);
+    p3_from_p1(&mut r, &t);
     r
-}
-
-// r = p + p (dbl-2008-hwcd, a = -1); r may be p.
-fn double_to(r: &mut Point, p: &Point) {
-    let mut a = Fe::zero();
-    let mut b = Fe::zero();
-    let mut c = Fe::zero();
-    let mut e = Fe::zero();
-    a.set_square(&p.x);
-    b.set_square(&p.y);
-    c.set_square(&p.z);
-    c.set_add(&c, &c);
-    e.set_add(&p.x, &p.y);
-    e.set_square(&e);
-    e.set_sub(&e, &a);
-    e.set_sub(&e, &b);
-    // D = -A: G = B - A, F = G - C, H = -A - B
-    let mut g = Fe::zero();
-    g.set_sub(&b, &a);
-    c.set_sub(&g, &c);
-    a.set_add(&a, &b);
-    b.set_sub(&Fe::zero(), &a);
-    r.x.set_mul(&e, &c);
-    r.y.set_mul(&g, &b);
-    r.z.set_mul(&c, &g);
-    r.t.set_mul(&e, &b);
 }
 
 fn double(p: &Point) -> Point {
+    let mut t = p1_zero();
+    p1_double(&mut t, &P2 { x: p.x, y: p.y, z: p.z });
     let mut r = identity();
-    double_to(&mut r, p);
+    p3_from_p1(&mut r, &t);
     r
 }
 
-fn neg(p: &Point) -> Point { Point { x: p.x.neg(), y: p.y.clone(), z: p.z.clone(), t: p.t.neg() } }
+fn neg(p: &Point) -> Point { Point { x: p.x.neg(), y: p.y, z: p.z, t: p.t.neg() } }
 
 // The 32-byte encoding: y, the sign of x in the top bit.
 fn encode(p: &Point) -> [u8; 32] {
@@ -153,93 +253,225 @@ fn decode(b: &[u8]) -> Option<Point> {
     Some(Point { x, y, z: Fe::one(), t })
 }
 
-// The generator's multiples: for window w (of 64, least significant
-// first), j * 16^w * B at 16 * w + j.
-static BASE: LazyLock<Vec<Point>> = LazyLock::new(base_table);
+// The generator's multiples (Go's basepointTable): for i of 32, j of 8,
+// (j + 1) * 256^i * B at 8 * i + j.
+static BASE: LazyLock<Vec<Affine>> = LazyLock::new(base_table);
 
-fn base_table() -> Vec<Point> {
-    let mut out: Vec<Point> = Vec::with_capacity(1024);
+fn base_table() -> Vec<Affine> {
+    let mut out: Vec<Affine> = Vec::with_capacity(256);
     let mut g = generator();
-    let mut w = 0;
-    while w < 64 {
-        let mut acc = identity();
+    let mut i = 0;
+    while i < 32 {
+        let mut acc = g;
         let mut j = 0;
-        while j < 16 {
-            out.push(acc.clone());
+        while j < 8 {
+            out.push(affine_from(&acc));
             acc = add(&acc, &g);
             j += 1;
         }
-        g = double(&double(&double(&double(&g))));
-        w += 1;
+        j = 0;
+        while j < 8 {
+            g = double(&g);
+            j += 1;
+        }
+        i += 1;
     }
     out
 }
 
-// r = table[idx], every entry read (masked limbs, in place).
-fn lookup_to(r: &mut Point, table: &[Point], idx: u64) {
-    let mut i = 0;
-    while i < 5 {
-        r.x.l[i] = 0;
-        r.y.l[i] = 0;
-        r.z.l[i] = 0;
-        r.t.l[i] = 0;
-        i += 1;
-    }
+// The odd multiples B, 3B, ..., 127B (Go's basepointNafTable).
+static BASE_NAF: LazyLock<Vec<Affine>> = LazyLock::new(base_naf_table);
+
+fn base_naf_table() -> Vec<Affine> {
+    let mut out: Vec<Affine> = Vec::with_capacity(64);
+    let g = generator();
+    let g2 = double(&g);
+    let mut acc = g;
     let mut j = 0;
-    while j < table.len() {
-        let d = (j as u64) ^ idx;
+    while j < 64 {
+        out.push(affine_from(&acc));
+        acc = add(&acc, &g2);
+        j += 1;
+    }
+    out
+}
+
+// table[idx - 1] (idx 0: the identity), negated with neg 1, every entry
+// read. In assembly on aarch64, x86_64 (ed25519_<arch>.s).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[asm]
+fn lookup_affine(table: *const Affine, idx: u64, neg: u64) -> Affine;
+
+// v = x * table's point (x in -8..=8; table the 8 multiples), in constant
+// time (Go's affineLookupTable.SelectInto).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn select_affine(v: &mut Affine, table: &[Affine], x: i64) {
+    let xm = x >> 63;
+    *v = lookup_affine(table.as_ptr(), ((x + xm) ^ xm) as u64, (xm & 1) as u64);
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn select_affine(v: &mut Affine, table: &[Affine], x: i64) {
+    let xm = x >> 63;
+    let xabs = ((x + xm) ^ xm) as u64;
+    *v = affine_zero();
+    let mut j = 0;
+    while j < 8 {
+        let d = (j + 1) as u64 ^ xabs;
         let m = (((d | d.wrapping_neg()) >> 63) ^ 1).wrapping_neg();
         let e = &table[j];
-        i = 0;
+        let mut i = 0;
         while i < 5 {
-            r.x.l[i] = r.x.l[i] | (e.x.l[i] & m);
-            r.y.l[i] = r.y.l[i] | (e.y.l[i] & m);
-            r.z.l[i] = r.z.l[i] | (e.z.l[i] & m);
-            r.t.l[i] = r.t.l[i] | (e.t.l[i] & m);
+            v.yplusx.l[i] = v.yplusx.l[i] ^ ((v.yplusx.l[i] ^ e.yplusx.l[i]) & m);
+            v.yminusx.l[i] = v.yminusx.l[i] ^ ((v.yminusx.l[i] ^ e.yminusx.l[i]) & m);
+            v.t2d.l[i] = v.t2d.l[i] ^ ((v.t2d.l[i] ^ e.t2d.l[i]) & m);
             i += 1;
         }
         j += 1;
     }
+    // Negated: y + x and y - x swapped, 2dT negated.
+    let m = xm as u64;
+    let nt = v.t2d.neg();
+    let mut i = 0;
+    while i < 5 {
+        let s = (v.yplusx.l[i] ^ v.yminusx.l[i]) & m;
+        v.yplusx.l[i] = v.yplusx.l[i] ^ s;
+        v.yminusx.l[i] = v.yminusx.l[i] ^ s;
+        v.t2d.l[i] = v.t2d.l[i] ^ ((v.t2d.l[i] ^ nt.l[i]) & m);
+        i += 1;
+    }
 }
 
-// k * B (k 32 little-endian bytes), in constant time: a lookup and an
-// addition per 4-bit window.
+// k * B (k 32 little-endian bytes, below 2^255), in constant time (Go's
+// ScalarBaseMult): signed 4-bit digits, the odd ones' multiples added,
+// times 16, the even ones'.
 fn base_mult(k: &[u8]) -> Point {
     let t = LazyLock::force(&BASE);
-    let mut q = identity();
-    let mut e = identity();
-    let mut w = 0;
-    while w < 64 {
-        let nib = ((k[w / 2] >> (4 * (w % 2)) as u8) & 15) as u64;
-        lookup_to(&mut e, &t[16 * w..16 * w + 16], nib);
-        add_to(&mut q, &q, &e);
-        w += 1;
+    let mut digits: [i64; 64] = [0; 64];
+    let mut i = 0;
+    while i < 32 {
+        digits[2 * i] = (k[i] & 15) as i64;
+        digits[2 * i + 1] = (k[i] >> 4) as i64;
+        i += 1;
     }
-    q
+    i = 0;
+    while i < 63 {
+        let c = (digits[i] + 8) >> 4;
+        digits[i] -= c << 4;
+        digits[i + 1] += c;
+        i += 1;
+    }
+    let mut v = identity();
+    let mut m = affine_zero();
+    let mut p1 = p1_zero();
+    i = 1;
+    while i < 64 {
+        select_affine(&mut m, &t[8 * (i / 2)..8 * (i / 2) + 8], digits[i]);
+        p1_add_affine(&mut p1, &v, &m, false);
+        p3_from_p1(&mut v, &p1);
+        i += 2;
+    }
+    let mut p2 = P2 { x: v.x, y: v.y, z: v.z };
+    i = 0;
+    while i < 4 {
+        p1_double(&mut p1, &p2);
+        if i < 3 { p2_from_p1(&mut p2, &p1); }
+        i += 1;
+    }
+    p3_from_p1(&mut v, &p1);
+    i = 0;
+    while i < 64 {
+        select_affine(&mut m, &t[8 * (i / 2)..8 * (i / 2) + 8], digits[i]);
+        p1_add_affine(&mut p1, &v, &m, false);
+        p3_from_p1(&mut v, &p1);
+        i += 2;
+    }
+    v
 }
 
-// k * p (k 32 little-endian bytes), in variable time (public scalars).
-fn var_mult(p: &Point, k: &[u8]) -> Point {
-    let mut table: Vec<Point> = Vec::with_capacity(16);
-    table.push(identity());
+// The width-w non-adjacent form of k (32 little-endian bytes, below
+// 2^255): odd digits below 2^(w-1) in magnitude, w - 1 zeros after each
+// (Go's Scalar.nonAdjacentForm).
+fn naf(k: &[u8], w: u64) -> [i64; 256] {
+    let mut d: [u64; 5] = [0; 5];
+    let mut i = 0;
+    while i < 32 {
+        d[i / 8] = d[i / 8] | ((k[i] as u64) << (8 * (i % 8)) as u64);
+        i += 1;
+    }
+    let mut out: [i64; 256] = [0; 256];
+    let width = 1u64 << w;
+    let mut pos = 0u64;
+    let mut carry = 0u64;
+    while pos < 256 {
+        let iu = (pos / 64) as usize;
+        let ib = pos % 64;
+        let bits = if ib < 64 - w { d[iu] >> ib } else { (d[iu] >> ib) | (d[iu + 1] << (64 - ib)) };
+        let window = carry + (bits & (width - 1));
+        if window & 1 == 0 {
+            pos += 1;
+            continue;
+        }
+        if window < width / 2 {
+            carry = 0;
+            out[pos as usize] = window as i64;
+        } else {
+            carry = 1;
+            out[pos as usize] = window as i64 - width as i64;
+        }
+        pos += w;
+    }
+    out
+}
+
+// a * p + b * B in variable time (public scalars; Go's
+// VarTimeDoubleScalarBaseMult): the doublings shared, a's width-5 and b's
+// width-8 non-adjacent forms, p's odd multiples to 15p made here.
+fn double_mult(a: &[u8], p: &Point, b: &[u8]) -> Point {
+    let bt = LazyLock::force(&BASE_NAF);
+    let mut at: Vec<Cached> = Vec::with_capacity(8);
+    let mut c = cached_zero();
+    cached_from(&mut c, p);
+    at.push(c.clone());
+    let p2 = double(p);
+    let mut acc = *p;
+    let mut t = p1_zero();
     let mut j = 1;
-    while j < 16 {
-        let t = add(&table[j - 1], p);
-        table.push(t);
+    while j < 8 {
+        p1_add(&mut t, &p2, &at[j - 1], false);
+        p3_from_p1(&mut acc, &t);
+        cached_from(&mut c, &acc);
+        at.push(c.clone());
         j += 1;
     }
-    let mut q = identity();
-    let mut w = 64;
-    while w > 0 {
-        w -= 1;
-        double_to(&mut q, &q);
-        double_to(&mut q, &q);
-        double_to(&mut q, &q);
-        double_to(&mut q, &q);
-        let nib = ((k[w / 2] >> (4 * (w % 2)) as u8) & 15) as usize;
-        if nib != 0 { add_to(&mut q, &q, &table[nib]); }
+    let an = naf(a, 5);
+    let bn = naf(b, 8);
+    let mut i = 255;
+    while i > 0 && an[i] == 0 && bn[i] == 0 { i -= 1; }
+    let mut v = identity();
+    let mut q = P2 { x: Fe::zero(), y: Fe::one(), z: Fe::one() };
+    loop {
+        p1_double(&mut t, &q);
+        let x = an[i];
+        if x != 0 {
+            p3_from_p1(&mut v, &t);
+            if x > 0 { p1_add(&mut t, &v, &at[(x / 2) as usize], false); } else { p1_add(&mut t, &v, &at[(-x / 2) as usize], true); }
+        }
+        let y = bn[i];
+        if y != 0 {
+            p3_from_p1(&mut v, &t);
+            if y > 0 { p1_add_affine(&mut t, &v, &bt[(y / 2) as usize], false); } else { p1_add_affine(&mut t, &v, &bt[(-y / 2) as usize], true); }
+        }
+        p2_from_p1(&mut q, &t);
+        if i == 0 { break; }
+        i -= 1;
     }
-    q
+    // From P2: (XZ, YZ, Z^2, XY).
+    v.x.set_mul(&q.x, &q.z);
+    v.y.set_mul(&q.y, &q.z);
+    v.z.set_square(&q.z);
+    v.t.set_mul(&q.x, &q.y);
+    v
 }
 
 // --- Scalars mod L (as little-endian bytes outside, nat limbs inside) ---
@@ -364,8 +596,8 @@ impl VerifyingKey {
         sbe.reverse();
         if l.from_be(&sbe).is_none() { return Err(SignatureError); }
         let k = limbs_le(&reduce64(&sha512(&[r, &self.b, msg])));
-        // [S]B + [k](-A) == R
-        let rp = add(&base_mult(s), &var_mult(&neg(&a), &k));
+        // [k](-A) + [S]B == R
+        let rp = double_mult(&k, &neg(&a), s);
         if encode(&rp)[..] != *r { return Err(SignatureError); }
         Ok(())
     }
