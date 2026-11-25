@@ -86,7 +86,7 @@ t.impl_for("::std::clone::Clone", body)
 
 **语法提前检查**：编译宏所在的 crate 时，编译器检查每个 `quote` 模板本身能否分成记号、括号是否配对，错误在写宏时就报，不用等展开。
 
-**名字解析**：生成的代码放在类型所在的模块里解析。宏里引用外部 crate 的条目**必须**从 crate 的根写起：`::myjson::Serialize`、`::std::fmt::Debug`（`::名字` 只认外部 crate 和本 crate 自己，不认任何局部名字），这样类型所在的模块里不管有没有叫 `std`、`myjson` 的东西，生成的代码都指向同一个条目。Rust 里这只是写过程宏的惯例，navi 里是规则：编译器检查宏自己写的代码（用户写在属性里、宏原样插入的部分不算，它们本来就按用户的模块解析），路径以某个 crate 的名字（`std` 或依赖）开头而前面没有 `::` 就报错（`derive X generated a path starting with the crate std: ...`）。引用本 crate 用 `crate::`。（std 的 `FromAttrs` 暂时例外：自举用的发布版还不认 `::std`，等 tools/bootstrap-version 换成认它的版本再改。）内置派生同样写 `::std::...`。局部变量名的卫生（生成代码里的 `__d`、`m` 不和用户的名字冲突）还没有做，宏里用 `__` 开头的名字。
+**名字解析**：生成的代码放在类型所在的模块里解析。宏里引用外部 crate 的条目**必须**从 crate 的根写起：`::myjson::Serialize`、`::std::fmt::Debug`（`::名字` 只认外部 crate 和本 crate 自己，不认任何局部名字），这样类型所在的模块里不管有没有叫 `std`、`myjson` 的东西，生成的代码都指向同一个条目。Rust 里这只是写过程宏的惯例，navi 里是规则：编译器检查宏自己写的代码（用户写在属性里、宏原样插入的部分不算，它们本来就按用户的模块解析），路径以某个 crate 的名字（`std` 或依赖）开头而前面没有 `::` 就报错（`derive X generated a path starting with the crate std: ...`）。引用本 crate 用 `crate::`。内置派生同样写 `::std::...`。局部变量名的卫生（生成代码里的 `__d`、`m` 不和用户的名字冲突）还没有做，宏里用 `__` 开头的名字。
 
 ## 写宏的辅助
 
