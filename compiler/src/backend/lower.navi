@@ -1323,7 +1323,7 @@ impl Gen {
             if let Some(d) = f.def { self.cur_lines.push((0, d.pos)); }
         }
         let fg = &mut FnGen { g: self, m: self.m, grp, inst: grp.rep, f, ltypes: Vec::new(), loff: Vec::new(), blocks: Vec::new(),
-            res_off: 0, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), preg2: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
+            res_off: 0, asm_ret: -1, nfixed: -1, tmp_off: 0, stubs: HashMap::new(), stub_list: Vec::new(), preg: Vec::new(), preg2: Vec::new(), saved: Vec::new(), concs: HashMap::new(),
             frame: 0, buf_top: 0, ssa_alloc: crate::ssa::regalloc::empty(), ssa_slots: 0, ptr_slots: Vec::new(), ssa_masks: Vec::new(),
             ssa_var0: false, ssa_defers: false, ssa_sel0: Vec::new(), ssa_sel1: Vec::new(), ssa_func: None, ssa_chained: Vec::new(), ssa_need_carry: Vec::new(), ssa_bridge: 0, ssa_pr: Vec::new() };
         fg.gen();
@@ -1382,6 +1382,9 @@ pub struct FnGen {
     blocks: Vec<Label>,
     /// The call result buffer.
     res_off: i64,
+    /// The local an #[asm] call being made writes its result to (-1: the
+    /// result buffer).
+    asm_ret: i64,
     /// The named parameters of the variadic C function being called (-1:
     /// not variadic).
     nfixed: i64,
@@ -2439,8 +2442,11 @@ impl FnGen {
         let targ0: Option<&Type> = if t.type_args.len() > 0 { Some(t.type_args[0]) } else { None };
         match name {
             "asm" => {
-                // navi's convention: the arguments at sp, 8 bytes each,
-                // the result to the result buffer (RET).
+                // navi's convention: the arguments at sp, 8 bytes each
+                // (already there when args is empty: the SSA backend's),
+                // the result to the result buffer (RET), or to the local
+                // asm_ret (the function writes it after reading its
+                // arguments).
                 let mut off = 0i64;
                 for a in args.iter() {
                     let at = self.operand_type(a);
@@ -2448,7 +2454,7 @@ impl FnGen {
                     self.store_operand(a, SP, off);
                     off += (sz + 7) / 8 * 8;
                 }
-                m.addr_of(RET, FP, self.res_off);
+                if self.asm_ret >= 0 { self.local_addr(RET, self.asm_ret as usize); } else { m.addr_of(RET, FP, self.res_off); }
                 m.call(&asm_sym(t.def));
                 if size == 1 || size == 2 || size == 4 || size == 8 {
                     m.load(size, V1, FP, self.res_off);
@@ -3052,6 +3058,38 @@ impl FnGen {
 
     /// How many SSA arguments the builder made for a constant operand (its
     /// words; one for one in memory).
+    /// An #[asm] call's arguments stored at sp as its convention has them
+    /// (8 bytes each), from their SSA words; false (nothing stored) when
+    /// one is in memory.
+    fn ssa_asm_args(&mut self, v: &crate::ssa::Value, ops: &Vec<Operand>) -> bool {
+        for op in ops.iter() {
+            if op.kind == mir::OP_CONST { continue; }
+            let t = self.operand_type(op);
+            if self.size(t) > 0 && self.ssa_words(t) == 0 { return false; }
+        }
+        let mut ai = 0usize;
+        let mut off = 0i64;
+        for op in ops.iter() {
+            let t = self.operand_type(op);
+            let size = self.size(t);
+            if op.kind == mir::OP_CONST {
+                ai += self.ssa_const_args(op);
+                self.store_operand(op, SP, off);
+            } else if size > 0 {
+                let words = self.ssa_words(t);
+                let w0 = self.ssa_in(v.args[ai], V1);
+                self.ssa_store_word(v.args[ai], w0, if words == 1 { size } else { 8 }, SP, off);
+                if words == 2 {
+                    let w1 = self.ssa_in(v.args[ai + 1], V1);
+                    self.ssa_store_word(v.args[ai + 1], w1, 8, SP, off + 8);
+                }
+                ai += words as usize;
+            }
+            off += round8(size);
+        }
+        true
+    }
+
     fn ssa_const_args(&mut self, op: &Operand) -> usize {
         let c = op.cnst.unwrap();
         let t = match c.ty {
@@ -3985,11 +4023,22 @@ impl FnGen {
                     m.load(8, V1, V1, 16 * slot);
                     return;
                 }
+                let dt = self.place_type(dest);
+                if tg.intrinsic == "asm" {
+                    // The arguments' words straight to the outgoing area.
+                    if self.ssa_asm_args(v, args) {
+                        self.asm_ret = v.aux_int - 1;
+                        self.intrinsic_body(tg, &Vec::new(), target, pos, dt);
+                        self.asm_ret = -1;
+                        return;
+                    }
+                    self.asm_ret = v.aux_int - 1;
+                }
                 let mut ai = 0usize;
                 let mut off = 0i64;
                 let bargs = self.ssa_bridged(v, args, &mut ai, &mut off);
-                let dt = self.place_type(dest);
                 self.intrinsic_body(tg, &bargs, target, pos, dt);
+                self.asm_ret = -1;
             }
             crate::ssa::OP_CLOSURE => {
                 let rv = match &v.aux { crate::ssa::Aux::Rv(rv) => *rv, _ => return };
