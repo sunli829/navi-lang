@@ -21,14 +21,14 @@
 
 use std::collections::HashMap;
 use crate::syntax::ast::*;
-use crate::syntax::source::{File, Pos};
+use crate::syntax::source::{File, Origin, Pos};
 use crate::syntax::token::{Token, Kind};
 use crate::syntax::astcodec::{Seen, new_seen, Codec};
 use crate::syntax::walk::{self, Visit};
 use crate::sha256;
 use crate::util;
 
-const MAGIC: &str = "navih2\n";
+const MAGIC: &str = "navih3\n";
 
 /// The writing of trees.
 pub struct Enc {
@@ -332,6 +332,9 @@ pub fn encode_with(files: &HashMap<String, &SourceFile>, all: bool) -> Vec<u8> {
         keep_items(&sf.items, all, &mut keep);
     }
     paths.sort();
+    // (A generated file's origin by its path here.)
+    let mut by_name: HashMap<String, String> = HashMap::new();
+    for (p, sf) in files.iter() { by_name.insert(sf.file.name.clone(), p.clone()); }
     let out = &mut Enc { b: Vec::new(), seen: HashMap::new(), counts: Vec::new(), keep: HashMap::new(), inside: 0, ids: 0 };
     out.u(paths.len() as u32);
     for p in paths.iter() {
@@ -343,6 +346,25 @@ pub fn encode_with(files: &HashMap<String, &SourceFile>, all: bool) -> Vec<u8> {
         for l in lines.iter() {
             e.u((*l - prev) as u32);
             prev = *l;
+        }
+        // Derived code: the file it comes from and its spans (positions
+        // there are the user's, as when compiled from source).
+        let origin_path = match sf.file.origin { Some(o) => by_name.get(&o.file.name), None => None };
+        match origin_path {
+            Some(op) => {
+                let o = sf.file.origin.unwrap();
+                e.u(1);
+                e.s_str(op.as_str());
+                e.u(o.at as u32);
+                e.s_str(o.what.as_str());
+                e.u(o.spans.len() as u32);
+                for (a, b, c) in o.spans.iter() {
+                    e.u(*a as u32);
+                    e.u(*b as u32);
+                    e.u(*c as u32);
+                }
+            }
+            None => e.u(0),
         }
         e.u(sf.attrs.len() as u32);
         for a in sf.attrs.iter() { a.codec_enc(e); }
@@ -393,25 +415,44 @@ pub fn decode(data: Vec<u8>, dir: &str) -> Option<HashMap<String, &SourceFile>> 
         bases.push(b);
         b += *ids;
     }
-    let mut outs: Vec<Option<&SourceFile>> = Vec::new();
+    let mut outs: Vec<Option<(&SourceFile, Option<&FileOrigin>)>> = Vec::new();
     for _ in parts.iter() { outs.push(None); }
     let all = d.b;
     crate::util::par_for(parts.len(), 1, |i| {
         let (p, ids, from, to) = parts[i];
         let fd = &mut Dec { b: all[from..to].to_vec(), at: 0, bad: false, seen: new_seen(), next: bases[i], end: bases[i] + ids };
-        if let Some(sf) = decode_file(fd, util::path_join(dir, p.as_str()).as_str()) { outs[i] = Some(sf); }
+        if let Some(x) = decode_file(fd, util::path_join(dir, p.as_str()).as_str()) { outs[i] = Some(x); }
     });
     let mut out: HashMap<String, &SourceFile> = HashMap::new();
     let mut i = 0;
     while i < parts.len() {
-        match outs[i] { Some(sf) => { out.insert(parts[i].0.clone(), sf); } None => return None }
+        match outs[i] { Some((sf, _)) => { out.insert(parts[i].0.clone(), sf); } None => return None }
+        i += 1;
+    }
+    // Derived code's files mapped to the files they come from.
+    i = 0;
+    while i < parts.len() {
+        if let Some((sf, Some(fo))) = outs[i] {
+            let src = match out.get(&fo.path) { Some(s) => *s, None => return None };
+            let o = &Origin { file: src.file, at: fo.at, spans: fo.spans.clone(), what: fo.what.clone() };
+            let file = File::with_lines_origin(sf.file.name.as_str(), sf.file.line_starts().clone(), o);
+            out.insert(parts[i].0.clone(), &SourceFile { file, attrs: sf.attrs.clone(), items: sf.items.clone() });
+        }
         i += 1;
     }
     Some(out)
 }
 
-// One file's part (see decode).
-fn decode_file(d: &mut Dec, name: &str) -> Option<&SourceFile> {
+// Where a derived code's file comes from (see encode).
+struct FileOrigin {
+    path: String,
+    at: Pos,
+    what: String,
+    spans: Vec<(Pos, Pos, Pos)>,
+}
+
+// One file's part (see decode), and its origin if it is derived code.
+fn decode_file(d: &mut Dec, name: &str) -> Option<(&SourceFile, Option<&FileOrigin>)> {
     let nl = d.u() as usize;
     let mut lines: Vec<Pos> = Vec::with_capacity(nl);
     let mut prev = 0;
@@ -422,6 +463,23 @@ fn decode_file(d: &mut Dec, name: &str) -> Option<&SourceFile> {
         i += 1;
     }
     let file = File::with_lines(name, lines);
+    let mut fo: Option<&FileOrigin> = None;
+    if d.u() == 1 {
+        let path = d.s();
+        let at = d.u() as Pos;
+        let what = d.s();
+        let ns = d.u() as usize;
+        let mut spans: Vec<(Pos, Pos, Pos)> = Vec::new();
+        let mut k = 0;
+        while k < ns && !d.bad {
+            let a = d.u() as Pos;
+            let b = d.u() as Pos;
+            let c = d.u() as Pos;
+            spans.push((a, b, c));
+            k += 1;
+        }
+        fo = Some(&FileOrigin { path, at, what, spans });
+    }
     let na = d.u() as usize;
     let mut attrs: Vec<&Attr> = Vec::with_capacity(na);
     i = 0;
@@ -437,7 +495,7 @@ fn decode_file(d: &mut Dec, name: &str) -> Option<&SourceFile> {
         i += 1;
     }
     if d.bad || d.at != d.b.len() || d.next != d.end { return None; }
-    Some(&SourceFile { file, attrs, items })
+    Some((&SourceFile { file, attrs, items }, fo))
 }
 
 // The crates whose files come from their export data, by name (set before

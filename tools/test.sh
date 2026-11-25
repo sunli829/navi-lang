@@ -275,6 +275,16 @@ if [ "$b1" = "app 1.2.0 Demo 0.3.0 - A, B MIT" ] && [ "$b2" = "app 1.2.0 Demo 0.
 else
 	echo "FAIL std::build"; printf '%s\n' "$b1" "$b2" "$b3" "$b4"; fail=1
 fi
+# The same program with std compiled here and with std read from its
+# export data (the cache): derived code's positions are the user's file's
+# either way (from export data they were the generated file's).
+d=$tmp/warmcold
+mkdir -p "$d/a" "$d/b" "$d/c"
+printf '#[derive(Clone, Debug, PartialEq)]\nstruct P { a: Vec<i32>, b: Option<String> }\nfn main() {\n    let p = P { a: Vec::from([1]), b: Some("x".to_string()) };\n    println(`${p.clone() == p} ${p:?} ${Some(3).clone():?}`);\n}\n' > "$d/m.navi"
+NAVI_CACHE=off "$navi" build -o "$d/a/m" "$d/m.navi" > /dev/null 2>&1
+NAVI_CACHE="$d/cache" "$navi" build -o "$d/b/m" "$d/m.navi" > /dev/null 2>&1
+NAVI_CACHE="$d/cache" "$navi" build -a -o "$d/c/m" "$d/m.navi" > /dev/null 2>&1
+if cmp -s "$d/a/m" "$d/b/m" && cmp -s "$d/a/m" "$d/c/m"; then echo "ok   the same program with std from source and from the cache"; else echo "FAIL the same program with std from source and from the cache"; fail=1; fi
 for f in tests/types/*/*.navi tests/check/*/*.navi; do front types-dump "$f"; done
 # The compiler's own unit tests (#[cfg(test)] modules).
 set +e
