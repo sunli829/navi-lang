@@ -453,6 +453,7 @@ impl Resolver {
         let f = File::generated(name.as_str(), code, origin);
         let (sf, errs) = parser::parse_file(f);
         for d in errs.diags.iter() { self.errorf(Some(sf.file), d.pos, d.msg.clone()); }
+        self.check_absolute(r, sf);
         self.keep_generated(p.m, name.as_str(), sf);
         self.cfg.test = self.test_crate == p.krate;
         let mut files: HashMap<String, &SourceFile> = HashMap::new();
@@ -463,6 +464,45 @@ impl Resolver {
                 }
                 _ => self.collect_item(p.m, sf.file, gi, &mut files),
             }
+        }
+    }
+
+    // Derived code names other crates from their roots (::std::fmt::Debug,
+    // ::serde::Serialize, docs/derive.md): a crate's name starting a path
+    // is an error, since the type's module may mean something else by it.
+    fn check_absolute(&mut self, r: &Req, sf: &SourceFile) {
+        // (std's FromAttrs is compiled by the bootstrap compiler too, which
+        // does not read ::std yet: allowed until tools/bootstrap-version
+        // does.)
+        if r.name == "FromAttrs" {
+            if let Some(d) = r.def {
+                if let Some(m) = module_of(d) { if m.krate.is_std { return; } }
+            }
+        }
+        let m = r.p.m;
+        let errs = crate::syntax::source::Errors::new(sf.file);
+        let toks = crate::syntax::lexer::tokenize(sf.file.src.as_str(), errs);
+        // (Code the user wrote, as attribute values, is read where they
+        // wrote it: not checked.)
+        let spans = match sf.file.origin { Some(o) => o.spans.clone(), None => Vec::new() };
+        let mut i = 0;
+        while i + 1 < toks.len() {
+            let t = toks[i];
+            let mut users = false;
+            for (a, b, _) in spans.iter() { if t.pos >= *a && t.pos < *b { users = true; } }
+            if users {
+                i += 1;
+                continue;
+            }
+            if t.kind == crate::syntax::token::IDENT && toks[i + 1].kind == crate::syntax::token::PATH_SEP
+                && (i == 0 || (toks[i - 1].kind != crate::syntax::token::PATH_SEP && toks[i - 1].kind != crate::syntax::token::DOT)) {
+                let n = t.text;
+                if n == "std" || m.krate.deps.contains_key(&n.to_string()) {
+                    self.errorf(Some(sf.file), t.pos, `derive ${r.name} generated a path starting with the crate ${n}: derived code writes ::${n}::..., which means the crate whatever the type's module calls ${n}`.to_string());
+                    return;
+                }
+            }
+            i += 1;
         }
     }
 

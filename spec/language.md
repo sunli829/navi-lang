@@ -319,7 +319,7 @@ pub use crate::parser::Ast;                 // 重新导出
 
 - **crate 是编译单位**，也是孤儿规则和 `pub(crate)` 的边界；crate 之间不能循环依赖，crate 内的模块可以互相引用
 - 文件查找规则同 Rust：`mod foo;` 加载 `foo.navi` 或 `foo/mod.navi`
-- 路径以 `crate::`、`self::`、`super::`、外部 crate 名或 `std::` 开头
+- 路径以 `crate::`、`self::`、`super::`、外部 crate 名或 `std::` 开头；`::名字::...`（同 Rust 2018）从 crate `名字`（依赖、std，或本 crate 自己）的根找起，不受同名的局部模块和导入影响，派生宏生成的代码必须这样引用外部 crate（docs/derive.md）
 - **条件编译**：`#[cfg(target_os = "windows")]` 可以加在条目和 `mod` 声明上，`#![cfg(...)]` 写在文件开头作用于整个模块。可用的条件有 `target_os`、`target_arch`、`test`（`feature = "..."` 目前恒为假；只有一种构建模式，所以没有 `debug_assertions`，见 1.2）
 - **依赖**写在 `navi.toml` 的 `[dependencies]` 里（写法同 Cargo），可以是本地路径，也可以是 git 仓库的某个 tag（或 `rev = "完整 commit"`，都不写就是默认分支）：
 
