@@ -256,6 +256,25 @@ printf '[package]\nname = "app"\n\n[dependencies]\nlib = { path = "../lib" }\n' 
 printf 'fn main() {\n    let mut big: Vec<[u64; 4]> = Vec::new();\n    big.push([7, 0, 0, 0]);\n    big.push([8, 0, 0, 0]);\n    let s: Vec<String> = big.iter().map(|b: &[u64; 4]| -> String { b[0].to_string() }).collect();\n    let mut v: Vec<u16> = Vec::new();\n    v.push(1);\n    v.push(2);\n    v.push(3);\n    println(`${s.join(",")} ${lib::texts(&v)}`);\n}\n' > "$d/app/src/main.navi"
 r=$(cd "$d/app" && "$navi" run 2>&1 | tail -1) || true
 if [ "$r" = "7,8 1,2,3" ]; then echo "ok   generic code in two crates"; else echo "FAIL generic code in two crates: $r"; fail=1; fi
+# std::build: each crate's package (navi.toml) and --var, as constants;
+# a new version or --var value is a new build, a dependency keeps its own
+# package; clap's derive takes the version from it.
+d=$tmp/buildinfo
+mkdir -p "$d/lib/src" "$d/app/src"
+printf '[package]\nname = "lib"\nversion = "0.3.0"\n' > "$d/lib/navi.toml"
+printf 'pub fn v() -> &str { std::build::package_version() }\n' > "$d/lib/src/lib.navi"
+printf '[package]\nname = "app"\nversion = "1.2.0"\ndescription = "Demo"\n\n[dependencies]\nlib = { path = "../lib" }\n' > "$d/app/navi.toml"
+printf 'use std::cli::Parser;\n#[derive(Parser)]\n#[command(version, about)]\nstruct Cli {}\nfn main() {\n    if std::env::args().count() > 1 { Cli::parse(); }\n    println(`${std::build::package_name()} ${std::build::package_version()} ${std::build::package_description()} ${lib::v()} ${std::build::var("commit").unwrap_or("-")}`);\n}\n' > "$d/app/src/main.navi"
+b1=$(cd "$d/app" && "$navi" run 2>&1 | tail -1) || true
+b2=$(cd "$d/app" && "$navi" run --var commit=abc 2>&1 | tail -1) || true
+printf '[package]\nname = "lib"\nversion = "0.4.0"\n' > "$d/lib/navi.toml"
+b3=$(cd "$d/app" && "$navi" run 2>&1 | tail -1) || true
+b4=$(cd "$d/app" && "$navi" run -- --version 2>&1 | tail -1) || true
+if [ "$b1" = "app 1.2.0 Demo 0.3.0 -" ] && [ "$b2" = "app 1.2.0 Demo 0.3.0 abc" ] && [ "$b3" = "app 1.2.0 Demo 0.4.0 -" ] && [ "$b4" = "app 1.2.0" ]; then
+	echo "ok   std::build"
+else
+	echo "FAIL std::build"; printf '%s\n' "$b1" "$b2" "$b3" "$b4"; fail=1
+fi
 for f in tests/types/*/*.navi tests/check/*/*.navi; do front types-dump "$f"; done
 # The compiler's own unit tests (#[cfg(test)] modules).
 set +e
