@@ -1,0 +1,397 @@
+//! HPACK, HTTP/2's header compression (RFC 7541), as Go's
+//! golang.org/x/net/http2/hpack: an Encoder and a Decoder, each with its
+//! dynamic table (one per direction of a connection).
+//!
+//!     let mut e = Encoder::new();
+//!     let mut block: Vec<u8> = Vec::new();
+//!     e.write_field(&mut block, &HeaderField::new(":method", "GET"));
+//!     let mut d = Decoder::new(4096);
+//!     let fields = d.decode_full(block.as_slice())?;
+
+mod huffman;
+
+use crate::fmt::{self, Display, Debug, Formatter};
+
+/// A name-value pair; a sensitive one is never put in a table (sent
+/// "never indexed", RFC 7541 6.2.3).
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct HeaderField {
+    pub name: String,
+    pub value: String,
+    pub sensitive: bool,
+}
+
+impl HeaderField {
+    pub fn new(name: &str, value: &str) -> HeaderField { HeaderField { name: name.to_string(), value: value.to_string(), sensitive: false } }
+
+    /// Its size in a table: the lengths of name and value, plus 32.
+    pub fn size(&self) -> usize { self.name.len() + self.value.len() + 32 }
+
+    /// Whether it is a pseudo-header (a name starting with ':').
+    pub fn is_pseudo(&self) -> bool { self.name.starts_with(":") }
+}
+
+impl Debug for HeaderField {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        if self.sensitive { f.write_fmt(`header field ${self.name:?} = ${self.value:?} (sensitive)`) } else { f.write_fmt(`header field ${self.name:?} = ${self.value:?}`) }
+    }
+}
+
+/// Why a header block could not be decoded (for HTTP/2 a connection
+/// error, COMPRESSION_ERROR).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DecodingError {
+    msg: &str,
+}
+
+impl Display for DecodingError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { f.write_fmt(`hpack: ${self.msg}`) }
+}
+
+fn bad(msg: &str) -> DecodingError { DecodingError { msg } }
+
+// The static table (RFC 7541 Appendix A): index 1 is the first.
+const STATIC: [(&str, &str); 61] = [
+    (":authority", ""),
+    (":method", "GET"),
+    (":method", "POST"),
+    (":path", "/"),
+    (":path", "/index.html"),
+    (":scheme", "http"),
+    (":scheme", "https"),
+    (":status", "200"),
+    (":status", "204"),
+    (":status", "206"),
+    (":status", "304"),
+    (":status", "400"),
+    (":status", "404"),
+    (":status", "500"),
+    ("accept-charset", ""),
+    ("accept-encoding", "gzip, deflate"),
+    ("accept-language", ""),
+    ("accept-ranges", ""),
+    ("accept", ""),
+    ("access-control-allow-origin", ""),
+    ("age", ""),
+    ("allow", ""),
+    ("authorization", ""),
+    ("cache-control", ""),
+    ("content-disposition", ""),
+    ("content-encoding", ""),
+    ("content-language", ""),
+    ("content-length", ""),
+    ("content-location", ""),
+    ("content-range", ""),
+    ("content-type", ""),
+    ("cookie", ""),
+    ("date", ""),
+    ("etag", ""),
+    ("expect", ""),
+    ("expires", ""),
+    ("from", ""),
+    ("host", ""),
+    ("if-match", ""),
+    ("if-modified-since", ""),
+    ("if-none-match", ""),
+    ("if-range", ""),
+    ("if-unmodified-since", ""),
+    ("last-modified", ""),
+    ("link", ""),
+    ("location", ""),
+    ("max-forwards", ""),
+    ("proxy-authenticate", ""),
+    ("proxy-authorization", ""),
+    ("range", ""),
+    ("referer", ""),
+    ("refresh", ""),
+    ("retry-after", ""),
+    ("server", ""),
+    ("set-cookie", ""),
+    ("strict-transport-security", ""),
+    ("transfer-encoding", ""),
+    ("user-agent", ""),
+    ("vary", ""),
+    ("via", ""),
+    ("www-authenticate", ""),
+];
+
+// A dynamic table: the newest entry last (index 62 of the whole).
+#[derive(Clone, Default)]
+struct Table {
+    ents: Vec<HeaderField>,
+    size: usize,
+    max: usize,
+}
+
+impl Table {
+    fn len(&self) -> usize { self.ents.len() }
+
+    // Entry k (0: the newest).
+    fn get(&self, k: usize) -> &HeaderField { &self.ents[self.ents.len() - 1 - k] }
+
+    fn evict_to(&mut self, max: usize) {
+        let mut n = 0;
+        while self.size > max {
+            self.size -= self.ents[n].size();
+            n += 1;
+        }
+        if n > 0 { self.ents.drain(0..n); }
+    }
+
+    fn set_max(&mut self, max: usize) {
+        self.max = max;
+        self.evict_to(max);
+    }
+
+    // (An entry bigger than the table empties it, RFC 7541 4.4.)
+    fn add(&mut self, f: HeaderField) {
+        let s = f.size();
+        if s > self.max {
+            self.evict_to(0);
+            return;
+        }
+        self.evict_to(self.max - s);
+        self.size += s;
+        self.ents.push(f);
+    }
+}
+
+// Appends integer i with an n-bit prefix (RFC 7541 5.1), the prefix's
+// byte starting with flags.
+fn put_int(out: &mut Vec<u8>, flags: u8, n: u32, i: u64) {
+    let max = (1u64 << n) - 1;
+    if i < max {
+        out.push(flags | i as u8);
+        return;
+    }
+    out.push(flags | max as u8);
+    let mut r = i - max;
+    while r >= 128 {
+        out.push((r & 127) as u8 | 128);
+        r >>= 7;
+    }
+    out.push(r as u8);
+}
+
+// The integer at b[*pos] with an n-bit prefix; Err past the block's end
+// or past 2^32 (no header needs more).
+fn read_int(b: &[u8], pos: &mut usize, n: u32) -> Result<u64, DecodingError> {
+    if *pos >= b.len() { return Err(bad("truncated header block")); }
+    let max = (1u64 << n) - 1;
+    let mut i = b[*pos] as u64 & max;
+    *pos += 1;
+    if i < max { return Ok(i); }
+    let mut shift = 0;
+    loop {
+        if *pos >= b.len() { return Err(bad("truncated header block")); }
+        let c = b[*pos] as u64;
+        *pos += 1;
+        i += (c & 127) << shift;
+        if c & 128 == 0 { break; }
+        shift += 7;
+        if shift > 28 { return Err(bad("integer too large")); }
+    }
+    if i > 0xffffffff { return Err(bad("integer too large")); }
+    Ok(i)
+}
+
+// Appends s as a string literal (RFC 7541 5.2), Huffman-coded unless that
+// is longer (as RFC 7541's examples).
+fn put_string(out: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    let h = huffman::encoded_len(b);
+    if h <= b.len() {
+        put_int(out, 128, 7, h as u64);
+        huffman::encode(b, out);
+    } else {
+        put_int(out, 0, 7, b.len() as u64);
+        out.extend_from_slice(b);
+    }
+}
+
+/// Writes header fields as header blocks, keeping its dynamic table as
+/// the peer's decoder will.
+#[derive(Clone)]
+pub struct Encoder {
+    table: Table,
+    // The most the peer allows (its SETTINGS_HEADER_TABLE_SIZE), and the
+    // most used even so (4096 as Go's).
+    limit: usize,
+    // Size updates to send first in the next block: the smallest since the
+    // last block, then the size now.
+    update: bool,
+    min_size: usize,
+}
+
+impl Encoder {
+    /// An encoder with a 4096-byte table (the size a peer allows unless it
+    /// says otherwise).
+    pub fn new() -> Encoder { Encoder { table: Table { ents: Vec::new(), size: 0, max: 4096 }, limit: 4096, update: false, min_size: 4096 } }
+
+    /// The table's size from now on: at most the limit (sent as a size
+    /// update at the start of the next block).
+    pub fn set_max_dynamic_table_size(&mut self, v: usize) {
+        let v = if v > self.limit { self.limit } else { v };
+        if v < self.min_size { self.min_size = v; }
+        self.update = true;
+        self.table.set_max(v);
+    }
+
+    /// The most set_max_dynamic_table_size takes (the peer's
+    /// SETTINGS_HEADER_TABLE_SIZE).
+    pub fn set_max_dynamic_table_size_limit(&mut self, v: usize) {
+        self.limit = v;
+        if self.table.max > v {
+            self.update = true;
+            if v < self.min_size { self.min_size = v; }
+            self.table.set_max(v);
+        }
+    }
+
+    /// The table's size now.
+    pub fn max_dynamic_table_size(&self) -> usize { self.table.max }
+
+    /// Appends f to the header block in out: as an index if the tables
+    /// have it, else a literal (put in the dynamic table unless it is
+    /// sensitive or bigger than the table).
+    pub fn write_field(&mut self, out: &mut Vec<u8>, f: &HeaderField) {
+        if self.update {
+            self.update = false;
+            if self.min_size < self.table.max { put_int(out, 32, 5, self.min_size as u64); }
+            put_int(out, 32, 5, self.table.max as u64);
+            self.min_size = self.table.max;
+        }
+        let (idx, both) = self.search(f);
+        if both {
+            put_int(out, 128, 7, idx as u64);
+            return;
+        }
+        let indexing = !f.sensitive && f.size() <= self.table.max;
+        let (flags, n) = if indexing { (64u8, 6u32) } else if f.sensitive { (16u8, 4u32) } else { (0u8, 4u32) };
+        put_int(out, flags, n, idx as u64);
+        if idx == 0 { put_string(out, f.name.as_str()); }
+        put_string(out, f.value.as_str());
+        if indexing { self.table.add(f.clone()); }
+    }
+
+    // The index of f's name and value in the tables (both: true), else
+    // of its name, else 0. (A sensitive field: its name only.)
+    fn search(&self, f: &HeaderField) -> (usize, bool) {
+        let mut name_idx = 0;
+        for (k, e) in STATIC.iter().enumerate() {
+            if e.0 == f.name.as_str() {
+                if !f.sensitive && e.1 == f.value.as_str() { return (k + 1, true); }
+                if name_idx == 0 { name_idx = k + 1; }
+            }
+        }
+        let mut k = 0;
+        while k < self.table.len() {
+            let e = self.table.get(k);
+            if e.name == f.name {
+                if !f.sensitive && e.value == f.value { return (STATIC.len() + 1 + k, true); }
+                if name_idx == 0 { name_idx = STATIC.len() + 1 + k; }
+            }
+            k += 1;
+        }
+        (name_idx, false)
+    }
+}
+
+impl Default for Encoder {
+    fn default() -> Encoder { Encoder::new() }
+}
+
+/// Reads header blocks, keeping its dynamic table as the peer's encoder
+/// does.
+#[derive(Clone)]
+pub struct Decoder {
+    table: Table,
+    // The most a size update may set (what this side said in
+    // SETTINGS_HEADER_TABLE_SIZE).
+    allowed: usize,
+    max_string: usize,
+}
+
+impl Decoder {
+    /// A decoder whose table holds at most max bytes (and peers may not set
+    /// more).
+    pub fn new(max: usize) -> Decoder { Decoder { table: Table { ents: Vec::new(), size: 0, max }, allowed: max, max_string: 0 } }
+
+    /// The most a size update in a block may set from now on.
+    pub fn set_allowed_max_dynamic_table_size(&mut self, v: usize) { self.allowed = v; }
+
+    /// Sets the table's size without a size update (as when the
+    /// connection's settings change it).
+    pub fn set_max_dynamic_table_size(&mut self, v: usize) { self.table.set_max(v); }
+
+    /// The longest name or value accepted (0: any); longer ones are an
+    /// error.
+    pub fn set_max_string_length(&mut self, n: usize) { self.max_string = n; }
+
+    /// The fields of a whole header block, in order.
+    pub fn decode_full(&mut self, b: &[u8]) -> Result<Vec<HeaderField>, DecodingError> {
+        let mut out: Vec<HeaderField> = Vec::new();
+        let mut pos = 0;
+        while pos < b.len() {
+            let c = b[pos];
+            if c & 128 != 0 {
+                // Indexed (6.1).
+                let i = read_int(b, &mut pos, 7)?;
+                out.push(self.at(i)?);
+            } else if c & 192 == 64 {
+                // Literal with incremental indexing (6.2.1).
+                let f = self.literal(b, &mut pos, 6, false)?;
+                self.table.add(f.clone());
+                out.push(f);
+            } else if c & 224 == 32 {
+                // Dynamic table size update (6.3): only before the fields.
+                if out.len() > 0 { return Err(bad("dynamic table size update after a header field")); }
+                let v = read_int(b, &mut pos, 5)? as usize;
+                if v > self.allowed { return Err(bad("dynamic table size update too large")); }
+                self.table.set_max(v);
+            } else {
+                // Without indexing (6.2.2), never indexed (6.2.3).
+                let never = c & 16 != 0;
+                out.push(self.literal(b, &mut pos, 4, never)?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn at(&self, i: u64) -> Result<HeaderField, DecodingError> {
+        let i = i as usize;
+        if i == 0 { return Err(bad("index 0")); }
+        if i <= STATIC.len() {
+            let e = STATIC[i - 1];
+            return Ok(HeaderField::new(e.0, e.1));
+        }
+        let k = i - STATIC.len() - 1;
+        if k >= self.table.len() { return Err(bad("index out of the table")); }
+        Ok(self.table.get(k).clone())
+    }
+
+    fn literal(&self, b: &[u8], pos: &mut usize, n: u32, sensitive: bool) -> Result<HeaderField, DecodingError> {
+        let i = read_int(b, pos, n)?;
+        let name = if i == 0 { self.string(b, pos)? } else { self.at(i)?.name };
+        let value = self.string(b, pos)?;
+        Ok(HeaderField { name, value, sensitive })
+    }
+
+    fn string(&self, b: &[u8], pos: &mut usize) -> Result<String, DecodingError> {
+        if *pos >= b.len() { return Err(bad("truncated header block")); }
+        let h = b[*pos] & 128 != 0;
+        let n = read_int(b, pos, 7)? as usize;
+        if n > b.len() - *pos { return Err(bad("truncated header block")); }
+        let raw = &b[*pos..*pos + n];
+        *pos += n;
+        let bytes = if h {
+            let mut v: Vec<u8> = Vec::with_capacity(n * 8 / 5 + 1);
+            if huffman::decode(raw, &mut v).is_err() { return Err(bad("invalid Huffman-encoded data")); }
+            v
+        } else {
+            raw.to_vec()
+        };
+        if self.max_string > 0 && bytes.len() > self.max_string { return Err(bad("string too long")); }
+        Ok(String::from_utf8_lossy(bytes.as_slice()).to_string())
+    }
+}
