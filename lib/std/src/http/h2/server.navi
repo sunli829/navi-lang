@@ -1,14 +1,14 @@
 // An HTTP/2 connection served (as Go's http2 serverConn): requests come as
 // streams, each answered by the handler on a thread of its own.
 
-use crate::io::{self, Read, BufReader};
+use crate::http::h2::{self, BodyReader, Core, H2Error, Settings, Stream};
+use crate::http::hpack::HeaderField;
+use crate::http::wire::{self, NetStream};
+use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
+use crate::io::{self, BufReader, Read};
 use crate::net::SocketAddr;
 use crate::time::Duration;
 use crate::url::Url;
-use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
-use crate::http::hpack::HeaderField;
-use crate::http::wire::{self, NetStream};
-use crate::http::h2::{self, Core, Stream, BodyReader, H2Error, Settings};
 
 pub(crate) struct Config {
     pub max_header_bytes: usize,
@@ -25,7 +25,14 @@ const WINDOW: u32 = 1048576;
 
 /// Serves HTTP/2 on a connection whose reader r is past the client's
 /// preface if preface_read; returns when the connection ends.
-pub(crate) fn serve(net: NetStream, r: &mut BufReader<NetStream>, preface_read: bool, cfg: &Config, remote: SocketAddr, handler: fn(&mut Request) -> Response) {
+pub(crate) fn serve(
+    net: NetStream,
+    r: &mut BufReader<NetStream>,
+    preface_read: bool,
+    cfg: &Config,
+    remote: SocketAddr,
+    handler: fn(&mut Request) -> Response,
+) {
     if !preface_read {
         let mut p = [0u8; 24];
         if r.read_exact(&mut p).is_err() || &p[..] != h2::PREFACE.as_bytes() {
@@ -33,13 +40,37 @@ pub(crate) fn serve(net: NetStream, r: &mut BufReader<NetStream>, preface_read: 
             return;
         }
     }
-    let c = Core::new(net.clone(), true, &Settings { stream_window: WINDOW, conn_window: WINDOW, max_streams: MAX_STREAMS, max_header_bytes: cfg.max_header_bytes });
-    if let Some(d) = cfg.idle_timeout { c.idle_timeout(d); }
+    let c = Core::new(
+        net.clone(),
+        true,
+        &Settings {
+            stream_window: WINDOW,
+            conn_window: WINDOW,
+            max_streams: MAX_STREAMS,
+            max_header_bytes: cfg.max_header_bytes,
+        },
+    );
+    if let Some(d) = cfg.idle_timeout {
+        c.idle_timeout(d);
+    }
     let _ = net.set_read_timeout(None);
-    c.read_loop(r, |id: u32, fields: Vec<HeaderField>, end: bool| -> Result<(), H2Error> { on_headers(c, cfg, remote.clone(), handler, id, fields, end) });
+    c.read_loop(
+        r,
+        |id: u32, fields: Vec<HeaderField>, end: bool| -> Result<(), H2Error> {
+            on_headers(c, cfg, remote.clone(), handler, id, fields, end)
+        },
+    );
 }
 
-fn on_headers(c: &mut Core, cfg: &Config, remote: SocketAddr, handler: fn(&mut Request) -> Response, id: u32, fields: Vec<HeaderField>, end: bool) -> Result<(), H2Error> {
+fn on_headers(
+    c: &mut Core,
+    cfg: &Config,
+    remote: SocketAddr,
+    handler: fn(&mut Request) -> Response,
+    id: u32,
+    fields: Vec<HeaderField>,
+    end: bool,
+) -> Result<(), H2Error> {
     c.mu.lock();
     if let Some(s) = c.streams.get(&id) {
         // Trailers: they end the stream (and are dropped).
@@ -50,12 +81,17 @@ fn on_headers(c: &mut Core, cfg: &Config, remote: SocketAddr, handler: fn(&mut R
         }
         let ok = c.recv_end_locked(st);
         c.mu.unlock();
-        if !ok { return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR)); }
+        if !ok {
+            return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR));
+        }
         return Ok(());
     }
     if id % 2 == 0 || id <= c.last_id {
         c.mu.unlock();
-        return Err(H2Error::Conn(h2::PROTOCOL_ERROR, "HEADERS on a closed or server stream".to_string()));
+        return Err(H2Error::Conn(
+            h2::PROTOCOL_ERROR,
+            "HEADERS on a closed or server stream".to_string(),
+        ));
     }
     c.last_id = id;
     if c.goaway_sent {
@@ -93,14 +129,22 @@ fn on_headers(c: &mut Core, cfg: &Config, remote: SocketAddr, handler: fn(&mut R
         me.mu.lock();
         let open = !st.recv_end && st.reset.is_none();
         me.mu.unlock();
-        if open { me.reset(st, h2::NO_ERROR); }
+        if open {
+            me.reset(st, h2::NO_ERROR);
+        }
     });
     Ok(())
 }
 
 // The request of a header block: Err(None) if it is malformed (RFC 9113
 // 8.1.1, 8.3), Err(Some(status)) to answer with that.
-fn request(c: &mut Core, st: &mut Stream, cfg: &Config, fields: Vec<HeaderField>, end: bool) -> Result<Request, Option<StatusCode>> {
+fn request(
+    c: &mut Core,
+    st: &mut Stream,
+    cfg: &Config,
+    fields: Vec<HeaderField>,
+    end: bool,
+) -> Result<Request, Option<StatusCode>> {
     let mut method: Option<String> = None;
     let mut scheme: Option<String> = None;
     let mut path: Option<String> = None;
@@ -111,9 +155,13 @@ fn request(c: &mut Core, st: &mut Stream, cfg: &Config, fields: Vec<HeaderField>
     let mut size = 0;
     for f in fields.iter() {
         size += f.size();
-        if !h2::valid_field(f) { return Err(None); }
+        if !h2::valid_field(f) {
+            return Err(None);
+        }
         if f.is_pseudo() {
-            if regular { return Err(None); }
+            if regular {
+                return Err(None);
+            }
             let slot = match f.name.as_str() {
                 ":method" => &mut method,
                 ":scheme" => &mut scheme,
@@ -121,42 +169,84 @@ fn request(c: &mut Core, st: &mut Stream, cfg: &Config, fields: Vec<HeaderField>
                 ":authority" => &mut authority,
                 _ => return Err(None),
             };
-            if slot.is_some() { return Err(None); }
+            if slot.is_some() {
+                return Err(None);
+            }
             *slot = Some(f.value.clone());
             continue;
         }
         regular = true;
         let name = f.name.as_str();
-        if h2::connection_specific(name) || (name == "te" && f.value.as_str() != "trailers") { return Err(None); }
-        if name == "cookie" { cookies.push(f.value.clone()); } else { headers.append(name, f.value.as_str()); }
+        if h2::connection_specific(name) || (name == "te" && f.value.as_str() != "trailers") {
+            return Err(None);
+        }
+        if name == "cookie" {
+            cookies.push(f.value.clone());
+        } else {
+            headers.append(name, f.value.as_str());
+        }
     }
-    if size > cfg.max_header_bytes { return Err(Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)); }
+    if size > cfg.max_header_bytes {
+        return Err(Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE));
+    }
     // (Cookies split over fields are one again, RFC 9113 8.2.3.)
-    if cookies.len() > 0 { headers.append("cookie", cookies.join("; ").as_str()); }
+    if cookies.len() > 0 {
+        headers.append("cookie", cookies.join("; ").as_str());
+    }
     let method = match method {
-        Some(m) => match Method::from_bytes(m.as_bytes()) { Ok(m) => m, Err(_) => return Err(None) },
+        Some(m) => match Method::from_bytes(m.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => return Err(None),
+        },
         None => return Err(None),
     };
-    if method == Method::CONNECT { return Err(Some(StatusCode::NOT_IMPLEMENTED)); }
+    if method == Method::CONNECT {
+        return Err(Some(StatusCode::NOT_IMPLEMENTED));
+    }
     let (scheme, target) = match (scheme, path) {
-        (Some(s), Some(p)) => if p.len() == 0 { return Err(None); } else { (s, p) },
+        (Some(s), Some(p)) => {
+            if p.len() == 0 {
+                return Err(None);
+            } else {
+                (s, p)
+            }
+        }
         _ => return Err(None),
     };
     let host = match authority {
         Some(a) => {
-            if !headers.contains_key("host") { headers.insert("host", a.as_str()); }
+            if !headers.contains_key("host") {
+                headers.insert("host", a.as_str());
+            }
             a
         }
-        None => match headers.get("host") { Some(h) => h.to_string(), None => cfg.addr.clone() },
+        None => match headers.get("host") {
+            Some(h) => h.to_string(),
+            None => cfg.addr.clone(),
+        },
     };
     let want = match headers.get("content-length") {
-        Some(v) => match v.trim().parse::<u64>() { Ok(n) => Some(n), Err(_) => return Err(None) },
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return Err(None),
+        },
         None => None,
     };
-    if end && want.is_some_and(|n| n != 0) { return Err(None); }
-    let full = if target.starts_with("/") { `${cfg.scheme}://${host}${target}`.to_string() } else if target == "*" { `${cfg.scheme}://${host}/`.to_string() } else { return Err(None) };
+    if end && want.is_some_and(|n| n != 0) {
+        return Err(None);
+    }
+    let full = if target.starts_with("/") {
+        `${cfg.scheme}://${host}${target}`.to_string()
+    } else if target == "*" {
+        `${cfg.scheme}://${host}/`.to_string()
+    } else {
+        return Err(None);
+    };
     let _ = scheme;
-    let url = match Url::parse(full.as_str()) { Ok(u) => u, Err(_) => return Err(None) };
+    let url = match Url::parse(full.as_str()) {
+        Ok(u) => u,
+        Err(_) => return Err(None),
+    };
     let mut req = Request::new(method, url);
     req.target = target;
     req.version = Version::HTTP_2;
@@ -164,7 +254,11 @@ fn request(c: &mut Core, st: &mut Stream, cfg: &Config, fields: Vec<HeaderField>
     c.mu.lock();
     st.want_len = want;
     c.mu.unlock();
-    req.body = if end { Body::empty() } else { Body::from_reader(BodyReader::new(c, st), want) };
+    req.body = if end {
+        Body::empty()
+    } else {
+        Body::from_reader(BodyReader::new(c, st), want)
+    };
     Ok(req)
 }
 
@@ -175,15 +269,27 @@ fn answer(c: &mut Core, st: &mut Stream, resp: &mut Response, is_head: bool) {
     let mut fields: Vec<HeaderField> = Vec::new();
     fields.push(HeaderField::new(":status", code.to_string().as_str()));
     let no_body = code == 204 || code == 304 || (code >= 100 && code < 200);
-    if !resp.headers.contains_key("date") { fields.push(HeaderField::new("date", wire::now_date().as_str())); }
-    if !no_body && !resp.headers.contains_key("content-length") {
-        if let Some(n) = resp.body.len() { fields.push(HeaderField::new("content-length", n.to_string().as_str())); }
+    if !resp.headers.contains_key("date") {
+        fields.push(HeaderField::new("date", wire::now_date().as_str()));
     }
-    if resp.body.len().is_some() && !resp.body.len().is_some_and(|n| n == 0) && !resp.headers.contains_key("content-type") {
-        fields.push(HeaderField::new("content-type", "text/plain; charset=utf-8"));
+    if !no_body && !resp.headers.contains_key("content-length") {
+        if let Some(n) = resp.body.len() {
+            fields.push(HeaderField::new("content-length", n.to_string().as_str()));
+        }
+    }
+    if resp.body.len().is_some()
+        && !resp.body.len().is_some_and(|n| n == 0)
+        && !resp.headers.contains_key("content-type")
+    {
+        fields.push(HeaderField::new(
+            "content-type",
+            "text/plain; charset=utf-8",
+        ));
     }
     for (k, v) in resp.headers.iter() {
-        if h2::connection_specific(k.as_str()) { continue; }
+        if h2::connection_specific(k.as_str()) {
+            continue;
+        }
         fields.push(HeaderField::new(k.as_str(), v.as_str()));
     }
     let empty = is_head || no_body || resp.body.len().is_some_and(|n| n == 0);
@@ -198,7 +304,9 @@ fn answer(c: &mut Core, st: &mut Stream, resp: &mut Response, is_head: bool) {
         Some(b) => c.write_data(st, b, true),
         None => send_body(c, st, &mut resp.body),
     };
-    if r.is_err() { c.reset(st, h2::INTERNAL_ERROR); }
+    if r.is_err() {
+        c.reset(st, h2::INTERNAL_ERROR);
+    }
 }
 
 fn send_body(c: &mut Core, st: &mut Stream, body: &mut Body) -> io::Result<()> {
@@ -206,7 +314,9 @@ fn send_body(c: &mut Core, st: &mut Stream, body: &mut Body) -> io::Result<()> {
     buf.resize(16384, 0);
     loop {
         let n = body.read(buf.as_mut_slice())?;
-        if n == 0 { return c.end_stream(st); }
+        if n == 0 {
+            return c.end_stream(st);
+        }
         c.write_data(st, &buf[..n], false)?;
     }
 }

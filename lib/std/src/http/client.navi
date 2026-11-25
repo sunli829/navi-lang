@@ -3,15 +3,17 @@
 // speaks HTTP/2 when the server chooses it by ALPN (as Go's and reqwest's):
 // one connection per host then carries every request at once.
 
-use crate::io::{self, Read, Write, BufReader};
+use crate::http::h2::client::{self as h2c, ClientConn, TripError};
+use crate::http::wire::{self, NetStream};
+use crate::http::{
+    Body, Error, ErrorKind, HeaderMap, Method, Request, Response, StatusCode, Version,
+};
+use crate::io::{self, BufReader, Read, Write};
 use crate::net::{TcpStream, ToSocketAddrs};
 use crate::sync::Mutex;
 use crate::time::{Duration, Instant};
-use crate::url::Url;
-use crate::http::{Body, Error, ErrorKind, HeaderMap, Method, Request, Response, StatusCode, Version};
-use crate::http::wire::{self, NetStream};
-use crate::http::h2::client::{self as h2c, ClientConn, TripError};
 use crate::tls::{Certificate, TlsConnector};
+use crate::url::Url;
 
 /// What can be turned into a URL (&str, String, Url).
 pub trait IntoUrl {
@@ -19,26 +21,38 @@ pub trait IntoUrl {
 }
 
 impl IntoUrl for &str {
-    fn into_url(&self) -> Result<Url, Error> { Ok(Url::parse(*self)?) }
+    fn into_url(&self) -> Result<Url, Error> {
+        Ok(Url::parse(*self)?)
+    }
 }
 
 impl IntoUrl for String {
-    fn into_url(&self) -> Result<Url, Error> { Ok(Url::parse(self.as_str())?) }
+    fn into_url(&self) -> Result<Url, Error> {
+        Ok(Url::parse(self.as_str())?)
+    }
 }
 
 impl IntoUrl for Url {
-    fn into_url(&self) -> Result<Url, Error> { Ok(self.clone()) }
+    fn into_url(&self) -> Result<Url, Error> {
+        Ok(self.clone())
+    }
 }
 
 impl IntoUrl for &Url {
-    fn into_url(&self) -> Result<Url, Error> { Ok((*self).clone()) }
+    fn into_url(&self) -> Result<Url, Error> {
+        Ok((*self).clone())
+    }
 }
 
 /// GETs url with a new Client.
-pub fn get<U: IntoUrl>(url: U) -> Result<Response, Error> { Client::new().get(url).send() }
+pub fn get<U: IntoUrl>(url: U) -> Result<Response, Error> {
+    Client::new().get(url).send()
+}
 
 /// POSTs body to url with a new Client.
-pub fn post<U: IntoUrl, B: Into<Body>>(url: U, body: B) -> Result<Response, Error> { Client::new().post(url).body(body).send() }
+pub fn post<U: IntoUrl, B: Into<Body>>(url: U, body: B) -> Result<Response, Error> {
+    Client::new().post(url).body(body).send()
+}
 
 // An idle connection.
 #[derive(Clone)]
@@ -159,37 +173,81 @@ impl ClientBuilder {
         b
     }
 
-    pub fn build(&self) -> Result<Client, Error> { Ok(self.c.clone()) }
+    pub fn build(&self) -> Result<Client, Error> {
+        Ok(self.c.clone())
+    }
 }
 
 impl Default for Client {
-    fn default() -> Client { Client::new() }
+    fn default() -> Client {
+        Client::new()
+    }
 }
 
 impl Client {
     pub fn new() -> Client {
-        Client { timeout: None, connect_timeout: None, max_redirects: 10, user_agent: "navi-http/1.0".to_string(), headers: HeaderMap::new(), pool_max_idle: 32, pool: &Mutex::new(Vec::new()),
-            tls_roots: Vec::new(), tls_built_in_roots: true, tls_invalid_certs: false, tls_invalid_hostnames: false, h2: &Mutex::new(Vec::new()), http1_only: false, h2_prior: false }
+        Client {
+            timeout: None,
+            connect_timeout: None,
+            max_redirects: 10,
+            user_agent: "navi-http/1.0".to_string(),
+            headers: HeaderMap::new(),
+            pool_max_idle: 32,
+            pool: &Mutex::new(Vec::new()),
+            tls_roots: Vec::new(),
+            tls_built_in_roots: true,
+            tls_invalid_certs: false,
+            tls_invalid_hostnames: false,
+            h2: &Mutex::new(Vec::new()),
+            http1_only: false,
+            h2_prior: false,
+        }
     }
 
-    pub fn builder() -> ClientBuilder { ClientBuilder { c: Client::new() } }
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder { c: Client::new() }
+    }
 
-    pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::GET, url) }
-    pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::POST, url) }
-    pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::PUT, url) }
-    pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::PATCH, url) }
-    pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::DELETE, url) }
-    pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder { self.request(Method::HEAD, url) }
+    pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.request(Method::GET, url)
+    }
+    pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.request(Method::POST, url)
+    }
+    pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.request(Method::PUT, url)
+    }
+    pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.request(Method::PATCH, url)
+    }
+    pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.request(Method::DELETE, url)
+    }
+    pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.request(Method::HEAD, url)
+    }
 
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
         match url.into_url() {
-            Ok(u) => RequestBuilder { client: self.clone(), req: Request::new(method, u), err: None, timeout: None },
-            Err(e) => RequestBuilder { client: self.clone(), req: Request::new(method, Url::parse("http://invalid/").unwrap()), err: Some(e), timeout: None },
+            Ok(u) => RequestBuilder {
+                client: self.clone(),
+                req: Request::new(method, u),
+                err: None,
+                timeout: None,
+            },
+            Err(e) => RequestBuilder {
+                client: self.clone(),
+                req: Request::new(method, Url::parse("http://invalid/").unwrap()),
+                err: Some(e),
+                timeout: None,
+            },
         }
     }
 
     /// Sends req, following redirects.
-    pub fn execute(&self, req: Request) -> Result<Response, Error> { self.execute_timeout(req, self.timeout) }
+    pub fn execute(&self, req: Request) -> Result<Response, Error> {
+        self.execute_timeout(req, self.timeout)
+    }
 
     fn execute_timeout(&self, req: Request, timeout: Option<Duration>) -> Result<Response, Error> {
         let mut req = req;
@@ -198,7 +256,10 @@ impl Client {
             let resp = self.send_once(&mut req, timeout)?;
             let code = resp.status.as_u16();
             let location = resp.headers.get("location");
-            if !(code == 301 || code == 302 || code == 303 || code == 307 || code == 308) || location.is_none() || self.max_redirects == 0 {
+            if !(code == 301 || code == 302 || code == 303 || code == 307 || code == 308)
+                || location.is_none()
+                || self.max_redirects == 0
+            {
                 return Ok(resp);
             }
             let next = match req.url.join(location.unwrap()) {
@@ -212,12 +273,18 @@ impl Client {
             }
             redirects += 1;
             let keep_body = code == 307 || code == 308;
-            if keep_body && req.body.as_bytes().is_none() { return Ok(resp); }
+            if keep_body && req.body.as_bytes().is_none() {
+                return Ok(resp);
+            }
             // Frees the connection when the body is short.
             let mut r = resp;
-            if r.content_length().unwrap_or(1 << 20) < 65536 { let _ = r.clone().bytes(); }
+            if r.content_length().unwrap_or(1 << 20) < 65536 {
+                let _ = r.clone().bytes();
+            }
             if !keep_body {
-                if req.method != Method::HEAD { req.method = Method::GET; }
+                if req.method != Method::HEAD {
+                    req.method = Method::GET;
+                }
                 req.body = Body::empty();
                 req.headers.remove("content-length");
                 req.headers.remove("content-type");
@@ -227,7 +294,9 @@ impl Client {
                 let b = req.body.as_bytes().unwrap().to_vec();
                 req.body = Body::from(b);
             }
-            if next.host_str() != req.url.host_str() || next.port_or_known_default() != req.url.port_or_known_default() {
+            if next.host_str() != req.url.host_str()
+                || next.port_or_known_default() != req.url.port_or_known_default()
+            {
                 req.headers.remove("authorization");
                 req.headers.remove("cookie");
             }
@@ -241,7 +310,10 @@ impl Client {
         let url = req.url.clone();
         let https = url.scheme() == "https";
         if url.scheme() != "http" && !https {
-            let mut e = Error::new(ErrorKind::Builder, `unsupported URL scheme ${url.scheme()}`.to_string());
+            let mut e = Error::new(
+                ErrorKind::Builder,
+                `unsupported URL scheme ${url.scheme()}`.to_string(),
+            );
             e.url = Some(url);
             return Err(e);
         }
@@ -249,11 +321,16 @@ impl Client {
             Some(h) => h.to_string(),
             None => return Err(Error::new(ErrorKind::Builder, "URL without a host")),
         };
-        let port = url.port_or_known_default().unwrap_or(if https { 443 } else { 80 });
+        let port = url
+            .port_or_known_default()
+            .unwrap_or(if https { 443 } else { 80 });
         // (Pooled by scheme too: http and https to one port differ.)
         let key = `${url.scheme()}://${host}:${port}`.to_string();
         let h2_ok = (https && !self.http1_only) || (!https && self.h2_prior);
-        let deadline = match timeout { Some(d) => Some(Instant::now() + d), None => None };
+        let deadline = match timeout {
+            Some(d) => Some(Instant::now() + d),
+            None => None,
+        };
         // An HTTP/2 connection to the host: the request on it. (Refused, as
         // when the server is going away: again on a new connection.)
         let resendable = req.body.as_bytes().is_some();
@@ -262,7 +339,11 @@ impl Client {
                 match self.h2_trip(cc, req, &url, deadline) {
                     Ok(r) => return Ok(r),
                     Err(Some(e)) => return Err(e),
-                    Err(None) => if !resendable { return Err(Error::new(ErrorKind::Connect, "http2: stream refused")); },
+                    Err(None) => {
+                        if !resendable {
+                            return Err(Error::new(ErrorKind::Connect, "http2: stream refused"));
+                        }
+                    }
                 }
             }
         }
@@ -273,9 +354,17 @@ impl Client {
         loop {
             let (mut conn, reused) = match self.take_idle(key.as_str()) {
                 Some(c) => (c, true),
-                None => (self.connect(key.as_str(), url.host(), port, timeout, &url)?, false),
+                None => (
+                    self.connect(key.as_str(), url.host(), port, timeout, &url)?,
+                    false,
+                ),
             };
-            let is_h2 = h2_ok && (!https || match conn.stream.alpn() { Some(p) => p.as_slice() == b"h2", None => false });
+            let is_h2 = h2_ok
+                && (!https
+                    || match conn.stream.alpn() {
+                        Some(p) => p.as_slice() == b"h2",
+                        None => false,
+                    });
             if is_h2 {
                 let cc = h2c::start(conn.stream.clone(), key.as_str());
                 self.h2.lock().push(cc);
@@ -295,7 +384,13 @@ impl Client {
                 Err(e) => {
                     stream.close();
                     attempt += 1;
-                    if !reused || attempt > 1 || req.body.as_bytes().is_none() || e.kind == ErrorKind::Timeout { return Err(e); }
+                    if !reused
+                        || attempt > 1
+                        || req.body.as_bytes().is_none()
+                        || e.kind == ErrorKind::Timeout
+                    {
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -319,16 +414,35 @@ impl Client {
 
     // req on an HTTP/2 connection: Err(None) if it was refused (sent
     // nowhere: it may go again).
-    fn h2_trip(&self, cc: &mut ClientConn, req: &mut Request, url: &Url, deadline: Option<Instant>) -> Result<Response, Option<Error>> {
+    fn h2_trip(
+        &self,
+        cc: &mut ClientConn,
+        req: &mut Request,
+        url: &Url,
+        deadline: Option<Instant>,
+    ) -> Result<Response, Option<Error>> {
         let mut defaults = HeaderMap::new();
-        if !req.headers.contains_key("user-agent") && !self.headers.contains_key("user-agent") && self.user_agent.len() > 0 { defaults.append("user-agent", self.user_agent.as_str()); }
-        if !req.headers.contains_key("accept") && !self.headers.contains_key("accept") { defaults.append("accept", "*/*"); }
-        for (k, v) in self.headers.iter() { defaults.append(k.as_str(), v.as_str()); }
+        if !req.headers.contains_key("user-agent")
+            && !self.headers.contains_key("user-agent")
+            && self.user_agent.len() > 0
+        {
+            defaults.append("user-agent", self.user_agent.as_str());
+        }
+        if !req.headers.contains_key("accept") && !self.headers.contains_key("accept") {
+            defaults.append("accept", "*/*");
+        }
+        for (k, v) in self.headers.iter() {
+            defaults.append(k.as_str(), v.as_str());
+        }
         match cc.round_trip(req, url, &defaults, deadline) {
             Ok(r) => Ok(r),
             Err(TripError::Refused(_)) => Err(None),
             Err(TripError::Io(e)) => {
-                let mut x = if e.kind() == io::ErrorKind::TimedOut { Error::new(ErrorKind::Timeout, "request timed out") } else { Error::from(e) };
+                let mut x = if e.kind() == io::ErrorKind::TimedOut {
+                    Error::new(ErrorKind::Timeout, "request timed out")
+                } else {
+                    Error::from(e)
+                };
                 x.url = Some(url.clone());
                 Err(Some(x))
             }
@@ -344,22 +458,37 @@ impl Client {
         if !req.headers.contains_key("host") {
             h.push_str("Host: ");
             h.push_str(host);
-            if explicit_port { h.push_str(`:${port}`.to_string().as_str()); }
+            if explicit_port {
+                h.push_str(`:${port}`.to_string().as_str());
+            }
             h.push_str("\r\n");
         }
-        if !req.headers.contains_key("user-agent") && !self.headers.contains_key("user-agent") && self.user_agent.len() > 0 {
+        if !req.headers.contains_key("user-agent")
+            && !self.headers.contains_key("user-agent")
+            && self.user_agent.len() > 0
+        {
             h.push_str(`User-Agent: ${self.user_agent}\r\n`.to_string().as_str());
         }
-        if !req.headers.contains_key("accept") && !self.headers.contains_key("accept") { h.push_str("Accept: */*\r\n"); }
+        if !req.headers.contains_key("accept") && !self.headers.contains_key("accept") {
+            h.push_str("Accept: */*\r\n");
+        }
         let mut defaults = HeaderMap::new();
         for (k, v) in self.headers.iter() {
-            if !req.headers.contains_key(k.as_str()) { defaults.append(k.as_str(), v.as_str()); }
+            if !req.headers.contains_key(k.as_str()) {
+                defaults.append(k.as_str(), v.as_str());
+            }
         }
         wire::put_headers(&mut h, &defaults);
         wire::put_headers(&mut h, &req.headers);
-        if !req.headers.contains_key("content-length") && !req.headers.contains_key("transfer-encoding") {
+        if !req.headers.contains_key("content-length")
+            && !req.headers.contains_key("transfer-encoding")
+        {
             match req.body.len() {
-                Some(n) => if n > 0 || !(req.method == Method::GET || req.method == Method::HEAD) { h.push_str(`Content-Length: ${n}\r\n`.to_string().as_str()); },
+                Some(n) => {
+                    if n > 0 || !(req.method == Method::GET || req.method == Method::HEAD) {
+                        h.push_str(`Content-Length: ${n}\r\n`.to_string().as_str());
+                    }
+                }
                 None => h.push_str("Transfer-Encoding: chunked\r\n"),
             }
         }
@@ -393,17 +522,31 @@ impl Client {
         }
     }
 
-    fn connect(&self, key: &str, host: Option<crate::url::Host>, port: u16, timeout: Option<Duration>, url: &Url) -> Result<Conn, Error> {
+    fn connect(
+        &self,
+        key: &str,
+        host: Option<crate::url::Host>,
+        port: u16,
+        timeout: Option<Duration>,
+        url: &Url,
+    ) -> Result<Conn, Error> {
         let addrs = match host {
             Some(crate::url::Host::Domain(d)) => (d.as_str(), port).to_socket_addrs(),
-            Some(crate::url::Host::Ipv4(a)) => crate::net::SocketAddr::new(crate::net::IpAddr::V4(a), port).to_socket_addrs(),
-            Some(crate::url::Host::Ipv6(a)) => crate::net::SocketAddr::new(crate::net::IpAddr::V6(a), port).to_socket_addrs(),
+            Some(crate::url::Host::Ipv4(a)) => {
+                crate::net::SocketAddr::new(crate::net::IpAddr::V4(a), port).to_socket_addrs()
+            }
+            Some(crate::url::Host::Ipv6(a)) => {
+                crate::net::SocketAddr::new(crate::net::IpAddr::V6(a), port).to_socket_addrs()
+            }
             None => return Err(Error::new(ErrorKind::Builder, "URL without a host")),
         };
         let addrs = match addrs {
             Ok(a) => a,
             Err(e) => {
-                let mut x = Error::new(ErrorKind::Connect, `cannot resolve ${key}: ${e}`.to_string());
+                let mut x = Error::new(
+                    ErrorKind::Connect,
+                    `cannot resolve ${key}: ${e}`.to_string(),
+                );
                 x.url = Some(url.clone());
                 return Err(x);
             }
@@ -421,8 +564,16 @@ impl Client {
             match r {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
-                    let stream = if url.scheme() == "https" { self.tls_handshake(s, url, timeout)? } else { NetStream::plain(s) };
-                    return Ok(Conn { key: key.to_string(), stream: stream.clone(), r: &mut BufReader::new(stream) });
+                    let stream = if url.scheme() == "https" {
+                        self.tls_handshake(s, url, timeout)?
+                    } else {
+                        NetStream::plain(s)
+                    };
+                    return Ok(Conn {
+                        key: key.to_string(),
+                        stream: stream.clone(),
+                        r: &mut BufReader::new(stream),
+                    });
                 }
                 Err(e) => last = Some(e),
             }
@@ -430,7 +581,10 @@ impl Client {
         let msg = match last {
             Some(e) => {
                 if e.kind() == io::ErrorKind::TimedOut {
-                    let mut x = Error::new(ErrorKind::Timeout, `connect to ${key} timed out`.to_string());
+                    let mut x = Error::new(
+                        ErrorKind::Timeout,
+                        `connect to ${key} timed out`.to_string(),
+                    );
                     x.url = Some(url.clone());
                     return Err(x);
                 }
@@ -444,13 +598,24 @@ impl Client {
     }
 
     // The TLS handshake over s for url's host.
-    fn tls_handshake(&self, s: TcpStream, url: &Url, timeout: Option<Duration>) -> Result<NetStream, Error> {
+    fn tls_handshake(
+        &self,
+        s: TcpStream,
+        url: &Url,
+        timeout: Option<Duration>,
+    ) -> Result<NetStream, Error> {
         let mut b = TlsConnector::builder();
-        for c in self.tls_roots.iter() { b.add_root_certificate(c.clone()); }
+        for c in self.tls_roots.iter() {
+            b.add_root_certificate(c.clone());
+        }
         b.disable_built_in_roots(!self.tls_built_in_roots);
         b.danger_accept_invalid_certs(self.tls_invalid_certs);
         b.danger_accept_invalid_hostnames(self.tls_invalid_hostnames);
-        if self.http1_only { b.request_alpns(&["http/1.1"]); } else { b.request_alpns(&["h2", "http/1.1"]); }
+        if self.http1_only {
+            b.request_alpns(&["http/1.1"]);
+        } else {
+            b.request_alpns(&["h2", "http/1.1"]);
+        }
         let fail = |msg: String| -> Error {
             let mut x = Error::new(ErrorKind::Connect, msg);
             x.url = Some(url.clone());
@@ -477,7 +642,13 @@ impl Client {
         }
     }
 
-    fn round_trip(&self, conn: &mut Conn, req: &mut Request, head: &str, url: &Url) -> Result<Response, Error> {
+    fn round_trip(
+        &self,
+        conn: &mut Conn,
+        req: &mut Request,
+        head: &str,
+        url: &Url,
+    ) -> Result<Response, Error> {
         let mut w = conn.stream.clone();
         let with_err_url = |e: Error| -> Error {
             let mut x = e;
@@ -491,32 +662,51 @@ impl Client {
                 let mut all: Vec<u8> = Vec::with_capacity(head.len() + b.len());
                 all.extend_from_slice(head.as_bytes());
                 all.extend_from_slice(b);
-                if let Err(e) = w.write_all(all.as_slice()) { return Err(with_err_url(Error::from(e))); }
+                if let Err(e) = w.write_all(all.as_slice()) {
+                    return Err(with_err_url(Error::from(e)));
+                }
             }
             _ => {
-                if let Err(e) = w.write_all(head.as_bytes()) { return Err(with_err_url(Error::from(e))); }
-                if let Err(e) = wire::write_body(&mut w, &mut req.body, chunked) { return Err(with_err_url(Error::from(e))); }
+                if let Err(e) = w.write_all(head.as_bytes()) {
+                    return Err(with_err_url(Error::from(e)));
+                }
+                if let Err(e) = wire::write_body(&mut w, &mut req.body, chunked) {
+                    return Err(with_err_url(Error::from(e)));
+                }
             }
         }
         // The status line, skipping 1xx responses.
         let (version, code, headers) = loop {
             let line = match wire::read_line(conn.r, 65536) {
                 Ok(Some(l)) => l,
-                Ok(None) => return Err(with_err_url(Error::new(ErrorKind::Connect, "connection closed before the response"))),
+                Ok(None) => {
+                    return Err(with_err_url(Error::new(
+                        ErrorKind::Connect,
+                        "connection closed before the response",
+                    )));
+                }
                 Err(e) => return Err(with_err_url(Error::from(e))),
             };
             let (v, c) = match parse_status_line(line.as_str()) {
                 Some(x) => x,
-                None => return Err(with_err_url(Error::new(ErrorKind::Protocol, `malformed status line ${line:?}`.to_string()))),
+                None => {
+                    return Err(with_err_url(Error::new(
+                        ErrorKind::Protocol,
+                        `malformed status line ${line:?}`.to_string(),
+                    )));
+                }
             };
             let h = match wire::read_headers(conn.r, 1 << 20) {
                 Ok(h) => h,
                 Err(e) => return Err(with_err_url(Error::new(ErrorKind::Protocol, e.to_string()))),
             };
-            if c >= 100 && c < 200 && c != 101 { continue; }
+            if c >= 100 && c < 200 && c != 101 {
+                continue;
+            }
             break (v, c, h);
         };
-        let no_body = req.method == Method::HEAD || code == 204 || code == 304 || (code >= 100 && code < 200);
+        let no_body =
+            req.method == Method::HEAD || code == 204 || code == 304 || (code >= 100 && code < 200);
         let (mode, len) = if no_body {
             (wire::LEN, 0u64)
         } else {
@@ -525,7 +715,9 @@ impl Client {
                 Err(e) => return Err(with_err_url(Error::new(ErrorKind::Protocol, e.to_string()))),
             }
         };
-        let keep = mode != wire::TO_CLOSE && !headers.has_token("connection", "close") && !req.headers.has_token("connection", "close")
+        let keep = mode != wire::TO_CLOSE
+            && !headers.has_token("connection", "close")
+            && !req.headers.has_token("connection", "close")
             && (version == Version::HTTP_11 || headers.has_token("connection", "keep-alive"));
         let inc = wire::incoming(conn.r, mode, len);
         let me = self.clone();
@@ -553,12 +745,16 @@ fn parse_status_line(line: &str) -> Option<(Version, u16)> {
         return None;
     };
     let rest = &line[9..];
-    if rest.len() < 3 { return None; }
+    if rest.len() < 3 {
+        return None;
+    }
     let code = match rest[0..3].parse::<u16>() {
         Ok(c) => c,
         Err(_) => return None,
     };
-    if code < 100 || (rest.len() > 3 && rest.as_bytes()[3] != b' ') { return None; }
+    if code < 100 || (rest.len() > 3 && rest.as_bytes()[3] != b' ') {
+        return None;
+    }
     Some((version, code))
 }
 
@@ -582,7 +778,9 @@ impl RequestBuilder {
     /// Adds the headers' values.
     pub fn headers(&self, h: HeaderMap) -> RequestBuilder {
         let mut b = self.clone();
-        for (k, v) in h.iter() { b.req.headers.append(k.as_str(), v.as_str()); }
+        for (k, v) in h.iter() {
+            b.req.headers.append(k.as_str(), v.as_str());
+        }
         b
     }
 
@@ -591,7 +789,9 @@ impl RequestBuilder {
         let mut b = self.clone();
         {
             let mut q = b.req.url.query_pairs_mut();
-            for (k, v) in pairs.iter() { q.append_pair(*k, *v); }
+            for (k, v) in pairs.iter() {
+                q.append_pair(*k, *v);
+            }
         }
         b.req.target = wire::target_of(&b.req.url);
         b
@@ -602,10 +802,15 @@ impl RequestBuilder {
             Some(p) => `${user}:${p}`.to_string(),
             None => `${user}:`.to_string(),
         };
-        self.header("Authorization", `Basic ${base64(cred.as_bytes())}`.to_string().as_str())
+        self.header(
+            "Authorization",
+            `Basic ${base64(cred.as_bytes())}`.to_string().as_str(),
+        )
     }
 
-    pub fn bearer_auth(&self, token: &str) -> RequestBuilder { self.header("Authorization", `Bearer ${token}`.to_string().as_str()) }
+    pub fn bearer_auth(&self, token: &str) -> RequestBuilder {
+        self.header("Authorization", `Bearer ${token}`.to_string().as_str())
+    }
 
     pub fn body<B: Into<Body>>(&self, body: B) -> RequestBuilder {
         let mut b = self.clone();
@@ -616,9 +821,13 @@ impl RequestBuilder {
     /// An application/x-www-form-urlencoded body of the pairs.
     pub fn form(&self, pairs: &[(&str, &str)]) -> RequestBuilder {
         let mut s = crate::url::form_urlencoded::Serializer::new(String::new());
-        for (k, v) in pairs.iter() { s.append_pair(*k, *v); }
+        for (k, v) in pairs.iter() {
+            s.append_pair(*k, *v);
+        }
         let mut b = self.body(s.finish());
-        b.req.headers.insert("Content-Type", "application/x-www-form-urlencoded");
+        b.req
+            .headers
+            .insert("Content-Type", "application/x-www-form-urlencoded");
         b
     }
 
@@ -628,7 +837,9 @@ impl RequestBuilder {
         match crate::json::to_string(x) {
             Ok(s) => {
                 b.req.body = Body::from(s);
-                if !b.req.headers.contains_key("content-type") { b.req.headers.insert("Content-Type", "application/json"); }
+                if !b.req.headers.contains_key("content-type") {
+                    b.req.headers.insert("Content-Type", "application/json");
+                }
             }
             Err(e) => b.err = Some(Error::new(ErrorKind::Builder, e.to_string())),
         }
@@ -671,11 +882,21 @@ fn base64(b: &[u8]) -> String {
     let mut i = 0;
     while i < b.len() {
         let n = b.len() - i;
-        let x = (b[i] as u32) << 16 | (if n > 1 { b[i + 1] as u32 } else { 0 }) << 8 | (if n > 2 { b[i + 2] as u32 } else { 0 });
+        let x = (b[i] as u32) << 16
+            | (if n > 1 { b[i + 1] as u32 } else { 0 }) << 8
+            | (if n > 2 { b[i + 2] as u32 } else { 0 });
         s.push(t[(x >> 18 & 63) as usize] as char);
         s.push(t[(x >> 12 & 63) as usize] as char);
-        s.push(if n > 1 { t[(x >> 6 & 63) as usize] as char } else { '=' });
-        s.push(if n > 2 { t[(x & 63) as usize] as char } else { '=' });
+        s.push(if n > 1 {
+            t[(x >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        s.push(if n > 2 {
+            t[(x & 63) as usize] as char
+        } else {
+            '='
+        });
         i += 3;
     }
     s

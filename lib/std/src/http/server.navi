@@ -1,15 +1,15 @@
 // The server (as Go's http.Server): a green thread per connection,
 // requests on a connection one after another (keep-alive).
 
-use crate::io::{self, Read, Write, BufReader};
-use crate::net::{TcpListener, TcpStream, SocketAddr, ToSocketAddrs};
+use crate::http::h2;
+use crate::http::wire::{self, NetStream};
+use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
+use crate::io::{self, BufReader, Read, Write};
+use crate::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::time::Duration;
-use crate::url::Url;
-use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
-use crate::http::wire::{self, NetStream};
-use crate::http::h2;
 use crate::tls::{Identity, TlsAcceptor};
+use crate::url::Url;
 
 /// Listens for HTTP connections and answers each request with a handler.
 #[derive(Clone)]
@@ -36,30 +36,58 @@ pub struct Protocols {
 
 impl Protocols {
     /// None: set those to speak.
-    pub fn new() -> Protocols { Protocols { bits: 0 } }
+    pub fn new() -> Protocols {
+        Protocols { bits: 0 }
+    }
 
-    pub fn http1(&self) -> bool { self.bits & 1 != 0 }
-    pub fn http2(&self) -> bool { self.bits & 2 != 0 }
-    pub fn unencrypted_http2(&self) -> bool { self.bits & 4 != 0 }
+    pub fn http1(&self) -> bool {
+        self.bits & 1 != 0
+    }
+    pub fn http2(&self) -> bool {
+        self.bits & 2 != 0
+    }
+    pub fn unencrypted_http2(&self) -> bool {
+        self.bits & 4 != 0
+    }
 
-    pub fn set_http1(&mut self, on: bool) { self.set(1, on); }
-    pub fn set_http2(&mut self, on: bool) { self.set(2, on); }
-    pub fn set_unencrypted_http2(&mut self, on: bool) { self.set(4, on); }
+    pub fn set_http1(&mut self, on: bool) {
+        self.set(1, on);
+    }
+    pub fn set_http2(&mut self, on: bool) {
+        self.set(2, on);
+    }
+    pub fn set_unencrypted_http2(&mut self, on: bool) {
+        self.set(4, on);
+    }
 
-    fn set(&mut self, bit: u8, on: bool) { if on { self.bits |= bit; } else { self.bits &= !bit; } }
+    fn set(&mut self, bit: u8, on: bool) {
+        if on {
+            self.bits |= bit;
+        } else {
+            self.bits &= !bit;
+        }
+    }
 }
 
 impl Default for Protocols {
     /// HTTP/1.1 and HTTP/2 (over TLS).
-    fn default() -> Protocols { Protocols { bits: 3 } }
+    fn default() -> Protocols {
+        Protocols { bits: 3 }
+    }
 }
 
 impl crate::fmt::Debug for Protocols {
     fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
         let mut v: Vec<&str> = Vec::new();
-        if self.http1() { v.push("HTTP1"); }
-        if self.http2() { v.push("HTTP2"); }
-        if self.unencrypted_http2() { v.push("UnencryptedHTTP2"); }
+        if self.http1() {
+            v.push("HTTP1");
+        }
+        if self.http2() {
+            v.push("HTTP2");
+        }
+        if self.unencrypted_http2() {
+            v.push("UnencryptedHTTP2");
+        }
         f.write_fmt(`{${v.join(", ")}}`)
     }
 }
@@ -71,20 +99,42 @@ pub fn serve<A: ToSocketAddrs>(addr: A, handler: fn(&mut Request) -> Response) -
 
 /// Serves handler over https on addr with the certificate chain and key
 /// of two PEM files (as Go's http.ListenAndServeTLS).
-pub fn serve_tls<A: ToSocketAddrs>(addr: A, cert_file: &str, key_file: &str, handler: fn(&mut Request) -> Response) -> io::Result<()> {
-    let id = Identity::from_pkcs8(crate::fs::read(cert_file)?.as_slice(), crate::fs::read(key_file)?.as_slice())?;
-    Server::bind(addr)?.tls(TlsAcceptor::new(id)?).serve(handler)
+pub fn serve_tls<A: ToSocketAddrs>(
+    addr: A,
+    cert_file: &str,
+    key_file: &str,
+    handler: fn(&mut Request) -> Response,
+) -> io::Result<()> {
+    let id = Identity::from_pkcs8(
+        crate::fs::read(cert_file)?.as_slice(),
+        crate::fs::read(key_file)?.as_slice(),
+    )?;
+    Server::bind(addr)?
+        .tls(TlsAcceptor::new(id)?)
+        .serve(handler)
 }
 
 impl Server {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Server> {
         let l = TcpListener::bind(addr)?;
         let a = l.local_addr()?;
-        Ok(Server { listener: l, addr: a, closed: &AtomicBool::new(false), read_timeout: None, write_timeout: None, idle_timeout: Some(Duration::from_secs(120)), max_header_bytes: 1 << 20, tls: None, protocols: Protocols::default() })
+        Ok(Server {
+            listener: l,
+            addr: a,
+            closed: &AtomicBool::new(false),
+            read_timeout: None,
+            write_timeout: None,
+            idle_timeout: Some(Duration::from_secs(120)),
+            max_header_bytes: 1 << 20,
+            tls: None,
+            protocols: Protocols::default(),
+        })
     }
 
     /// The address it listens on (the port, after binding port 0).
-    pub fn local_addr(&self) -> SocketAddr { self.addr.clone() }
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr.clone()
+    }
 
     /// The time to read a request's head (none by default).
     pub fn read_timeout(&self, d: Option<Duration>) -> Server {
@@ -137,8 +187,12 @@ impl Server {
         let mut me0 = self.clone();
         if let Some(a) = &self.tls {
             let mut alpn: Vec<&str> = Vec::new();
-            if self.protocols.http2() { alpn.push("h2"); }
-            if self.protocols.http1() { alpn.push("http/1.1"); }
+            if self.protocols.http2() {
+                alpn.push("h2");
+            }
+            if self.protocols.http1() {
+                alpn.push("http/1.1");
+            }
             me0.tls = Some(a.with_default_alpn(alpn.as_slice()));
         }
         loop {
@@ -148,7 +202,9 @@ impl Server {
                     crate::thread::spawn(|| me.conn(stream, remote, handler));
                 }
                 Err(e) => {
-                    if self.closed.load(Ordering::SeqCst) { return Ok(()); }
+                    if self.closed.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
                     // Out of descriptors and the like: try again a bit later.
                     crate::thread::sleep(Duration::from_millis(5));
                     let _ = e;
@@ -182,9 +238,17 @@ impl Server {
         };
         let scheme = if self.tls.is_some() { "https" } else { "http" };
         let r = &mut BufReader::new(net.clone());
-        let h2cfg = &h2::server::Config { max_header_bytes: self.max_header_bytes, idle_timeout: self.idle_timeout, scheme, addr: self.addr.to_string() };
+        let h2cfg = &h2::server::Config {
+            max_header_bytes: self.max_header_bytes,
+            idle_timeout: self.idle_timeout,
+            scheme,
+            addr: self.addr.to_string(),
+        };
         if self.tls.is_some() {
-            let is_h2 = match net.alpn() { Some(p) => p.as_slice() == b"h2", None => false };
+            let is_h2 = match net.alpn() {
+                Some(p) => p.as_slice() == b"h2",
+                None => false,
+            };
             if is_h2 && self.protocols.http2() {
                 h2::server::serve(net, r, false, h2cfg, remote, handler);
                 return;
@@ -197,17 +261,31 @@ impl Server {
         let mut w = net.clone();
         let mut first = true;
         loop {
-            let _ = stream.set_read_timeout(if first { self.read_timeout } else { self.idle_timeout });
+            let _ = stream.set_read_timeout(if first {
+                self.read_timeout
+            } else {
+                self.idle_timeout
+            });
             let line = match wire::read_line(r, self.max_header_bytes) {
                 Ok(Some(l)) => l,
                 Ok(None) => break,
                 Err(e) => {
-                    if e.kind() == io::ErrorKind::InvalidData { reply_error(&mut w, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "request line too long"); }
+                    if e.kind() == io::ErrorKind::InvalidData {
+                        reply_error(
+                            &mut w,
+                            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                            "request line too long",
+                        );
+                    }
                     break;
                 }
             };
             // HTTP/2 by prior knowledge: its preface's first line.
-            if first && self.tls.is_none() && line.as_str() == "PRI * HTTP/2.0" && self.protocols.unencrypted_http2() {
+            if first
+                && self.tls.is_none()
+                && line.as_str() == "PRI * HTTP/2.0"
+                && self.protocols.unencrypted_http2()
+            {
                 let mut rest = [0u8; 8];
                 if r.read_exact(&mut rest).is_ok() && &rest[..] == b"\r\nSM\r\n\r\n" {
                     h2::server::serve(net, r, true, h2cfg, remote, handler);
@@ -215,15 +293,27 @@ impl Server {
                 }
                 break;
             }
-            if first && !self.protocols.http1() { break; }
+            if first && !self.protocols.http1() {
+                break;
+            }
             first = false;
             // Empty lines before a request are ignored (RFC 9112 2.2).
-            if line.len() == 0 { continue; }
+            if line.len() == 0 {
+                continue;
+            }
             let _ = stream.set_read_timeout(self.read_timeout);
             let (method, target, version) = match parse_request_line(line.as_str()) {
                 Ok(x) => x,
                 Err(code) => {
-                    reply_error(&mut w, code, if code == StatusCode::HTTP_VERSION_NOT_SUPPORTED { "unsupported HTTP version" } else { "malformed request line" });
+                    reply_error(
+                        &mut w,
+                        code,
+                        if code == StatusCode::HTTP_VERSION_NOT_SUPPORTED {
+                            "unsupported HTTP version"
+                        } else {
+                            "malformed request line"
+                        },
+                    );
                     break;
                 }
             };
@@ -231,7 +321,15 @@ impl Server {
                 Ok(h) => h,
                 Err(e) => {
                     let too_large = e.to_string().contains("too large");
-                    reply_error(&mut w, if too_large { StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE } else { StatusCode::BAD_REQUEST }, e.to_string().as_str());
+                    reply_error(
+                        &mut w,
+                        if too_large {
+                            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        },
+                        e.to_string().as_str(),
+                    );
                     break;
                 }
             };
@@ -239,7 +337,11 @@ impl Server {
                 Some(h) => h.to_string(),
                 None => {
                     if version == Version::HTTP_11 {
-                        reply_error(&mut w, StatusCode::BAD_REQUEST, "missing required Host header");
+                        reply_error(
+                            &mut w,
+                            StatusCode::BAD_REQUEST,
+                            "missing required Host header",
+                        );
                         break;
                     }
                     self.addr.to_string()
@@ -249,7 +351,15 @@ impl Server {
                 Ok((wire::TO_CLOSE, _)) => (wire::LEN, 0u64),
                 Ok(f) => f,
                 Err(e) => {
-                    reply_error(&mut w, if e.to_string().contains("coding") { StatusCode::NOT_IMPLEMENTED } else { StatusCode::BAD_REQUEST }, e.to_string().as_str());
+                    reply_error(
+                        &mut w,
+                        if e.to_string().contains("coding") {
+                            StatusCode::NOT_IMPLEMENTED
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        },
+                        e.to_string().as_str(),
+                    );
                     break;
                 }
             };
@@ -268,10 +378,19 @@ impl Server {
                 }
             };
             let inc = wire::incoming(r, mode, len);
-            if headers.has_token("expect", "100-continue") && !inc.done && version == Version::HTTP_11 {
-                if w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_err() { break; }
+            if headers.has_token("expect", "100-continue")
+                && !inc.done
+                && version == Version::HTTP_11
+            {
+                if w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_err() {
+                    break;
+                }
             }
-            let mut keep = if version == Version::HTTP_11 { !headers.has_token("connection", "close") } else { headers.has_token("connection", "keep-alive") };
+            let mut keep = if version == Version::HTTP_11 {
+                !headers.has_token("connection", "close")
+            } else {
+                headers.has_token("connection", "keep-alive")
+            };
             let is_head = method == Method::HEAD;
             let mut req = Request::new(method, url);
             req.target = target;
@@ -282,11 +401,19 @@ impl Server {
             let mut resp = handler(&mut req);
             // What the handler did not read (when short) so that the next
             // request can be read.
-            if !inc.done && !inc.drain(256 * 1024) { keep = false; }
-            if resp.headers.has_token("connection", "close") { keep = false; }
+            if !inc.done && !inc.drain(256 * 1024) {
+                keep = false;
+            }
+            if resp.headers.has_token("connection", "close") {
+                keep = false;
+            }
             let _ = stream.set_write_timeout(self.write_timeout);
-            if write_response(&mut w, &mut resp, version, is_head, &mut keep).is_err() { break; }
-            if !keep { break; }
+            if write_response(&mut w, &mut resp, version, is_head, &mut keep).is_err() {
+                break;
+            }
+            if !keep {
+                break;
+            }
         }
         net.close();
     }
@@ -299,7 +426,9 @@ fn parse_request_line(line: &str) -> Result<(Method, String, Version), StatusCod
     let m = parts.next().unwrap_or("");
     let t = parts.next().unwrap_or("");
     let v = parts.next().unwrap_or("");
-    if parts.next().is_some() || t.len() == 0 { return Err(StatusCode::BAD_REQUEST); }
+    if parts.next().is_some() || t.len() == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let method = match Method::from_bytes(m.as_bytes()) {
         Ok(x) => x,
         Err(_) => return Err(StatusCode::BAD_REQUEST),
@@ -307,7 +436,13 @@ fn parse_request_line(line: &str) -> Result<(Method, String, Version), StatusCod
     let version = match v {
         "HTTP/1.1" => Version::HTTP_11,
         "HTTP/1.0" => Version::HTTP_10,
-        _ => return Err(if v.starts_with("HTTP/") { StatusCode::HTTP_VERSION_NOT_SUPPORTED } else { StatusCode::BAD_REQUEST }),
+        _ => {
+            return Err(if v.starts_with("HTTP/") {
+                StatusCode::HTTP_VERSION_NOT_SUPPORTED
+            } else {
+                StatusCode::BAD_REQUEST
+            });
+        }
     };
     Ok((method, t.to_string(), version))
 }
@@ -319,19 +454,36 @@ fn reply_error(w: &mut NetStream, code: StatusCode, msg: &str) {
     let _ = w.write_all(s.as_bytes());
 }
 
-fn write_response(w: &mut NetStream, resp: &mut Response, version: Version, is_head: bool, keep: &mut bool) -> io::Result<()> {
+fn write_response(
+    w: &mut NetStream,
+    resp: &mut Response,
+    version: Version,
+    is_head: bool,
+    keep: &mut bool,
+) -> io::Result<()> {
     let code = resp.status.as_u16();
     let mut h = String::with_capacity(256);
-    h.push_str(`HTTP/1.1 ${code} ${resp.status.canonical_reason().unwrap_or("")}\r\n`.to_string().as_str());
-    if !resp.headers.contains_key("date") { h.push_str(`Date: ${wire::now_date()}\r\n`.to_string().as_str()); }
+    h.push_str(
+        `HTTP/1.1 ${code} ${resp.status.canonical_reason().unwrap_or("")}\r\n`
+            .to_string()
+            .as_str(),
+    );
+    if !resp.headers.contains_key("date") {
+        h.push_str(`Date: ${wire::now_date()}\r\n`.to_string().as_str());
+    }
     let no_body = code == 204 || code == 304 || (code >= 100 && code < 200);
     let mut chunked = false;
-    if !no_body && !resp.headers.contains_key("content-length") && !resp.headers.contains_key("transfer-encoding") {
+    if !no_body
+        && !resp.headers.contains_key("content-length")
+        && !resp.headers.contains_key("transfer-encoding")
+    {
         match resp.body.len() {
             Some(n) => h.push_str(`Content-Length: ${n}\r\n`.to_string().as_str()),
             None => {
                 if version == Version::HTTP_11 {
-                    if !is_head { h.push_str("Transfer-Encoding: chunked\r\n"); }
+                    if !is_head {
+                        h.push_str("Transfer-Encoding: chunked\r\n");
+                    }
                     chunked = true;
                 } else {
                     *keep = false;
@@ -339,8 +491,13 @@ fn write_response(w: &mut NetStream, resp: &mut Response, version: Version, is_h
             }
         }
     }
-    if resp.headers.contains_key("transfer-encoding") { chunked = true; }
-    if resp.body.len().is_some() && !resp.body.len().is_some_and(|n| n == 0) && !resp.headers.contains_key("content-type") {
+    if resp.headers.contains_key("transfer-encoding") {
+        chunked = true;
+    }
+    if resp.body.len().is_some()
+        && !resp.body.len().is_some_and(|n| n == 0)
+        && !resp.headers.contains_key("content-type")
+    {
         h.push_str("Content-Type: text/plain; charset=utf-8\r\n");
     }
     wire::put_headers(&mut h, &resp.headers);
@@ -350,7 +507,9 @@ fn write_response(w: &mut NetStream, resp: &mut Response, version: Version, is_h
         h.push_str("Connection: keep-alive\r\n");
     }
     h.push_str("\r\n");
-    if is_head || no_body { return w.write_all(h.as_bytes()); }
+    if is_head || no_body {
+        return w.write_all(h.as_bytes());
+    }
     match resp.body.as_bytes() {
         Some(b) if b.len() <= 16384 && !chunked => {
             let mut all: Vec<u8> = Vec::with_capacity(h.len() + b.len());

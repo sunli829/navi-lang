@@ -1,13 +1,13 @@
 // An HTTP/2 client connection (as Go's http2 ClientConn): requests as
 // streams on it, from any thread, at once.
 
-use crate::io::{self, Read, BufReader};
-use crate::time::{Duration, Instant};
-use crate::url::Url;
-use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
+use crate::http::h2::{self, BodyReader, Core, H2Error, Settings, Stream};
 use crate::http::hpack::HeaderField;
 use crate::http::wire::NetStream;
-use crate::http::h2::{self, Core, Stream, BodyReader, H2Error, Settings};
+use crate::http::{Body, HeaderMap, Method, Request, Response, StatusCode, Version};
+use crate::io::{self, BufReader, Read};
+use crate::time::{Duration, Instant};
+use crate::url::Url;
 
 // A response's receive windows: a stream's (Go's transport: 4 MiB) and
 // the connection's (1 GiB as Go's, so streams wait only on their own).
@@ -25,13 +25,32 @@ pub(crate) struct ClientConn {
 /// A connection's HTTP/2 side: the preface and settings sent, its reader
 /// started.
 pub(crate) fn start(net: NetStream, key: &str) -> &mut ClientConn {
-    let c = Core::new(net.clone(), false, &Settings { stream_window: STREAM_WINDOW, conn_window: CONN_WINDOW, max_streams: 0, max_header_bytes: 1 << 20 });
-    let cc = &mut ClientConn { key: key.to_string(), c };
+    let c = Core::new(
+        net.clone(),
+        false,
+        &Settings {
+            stream_window: STREAM_WINDOW,
+            conn_window: CONN_WINDOW,
+            max_streams: 0,
+            max_header_bytes: 1 << 20,
+        },
+    );
+    let cc = &mut ClientConn {
+        key: key.to_string(),
+        c,
+    };
     let _ = net.set_read_timeout(None);
     let _ = net.set_write_timeout(None);
     c.idle_timeout(Duration::from_secs(IDLE));
     let r = &mut BufReader::with_capacity(65536, net);
-    crate::thread::spawn(|| { c.read_loop(r, |id: u32, fields: Vec<HeaderField>, end: bool| -> Result<(), H2Error> { on_headers(c, id, fields, end) }); });
+    crate::thread::spawn(|| {
+        c.read_loop(
+            r,
+            |id: u32, fields: Vec<HeaderField>, end: bool| -> Result<(), H2Error> {
+                on_headers(c, id, fields, end)
+            },
+        );
+    });
     cc
 }
 
@@ -43,8 +62,13 @@ fn on_headers(c: &mut Core, id: u32, fields: Vec<HeaderField>, end: bool) -> Res
         None => {
             let known = c.known(id);
             c.mu.unlock();
-            if known { return Err(H2Error::Stream(id, h2::STREAM_CLOSED)); }
-            return Err(H2Error::Conn(h2::PROTOCOL_ERROR, "HEADERS on a stream not opened".to_string()));
+            if known {
+                return Err(H2Error::Stream(id, h2::STREAM_CLOSED));
+            }
+            return Err(H2Error::Conn(
+                h2::PROTOCOL_ERROR,
+                "HEADERS on a stream not opened".to_string(),
+            ));
         }
     };
     if st.head.is_some() {
@@ -55,20 +79,27 @@ fn on_headers(c: &mut Core, id: u32, fields: Vec<HeaderField>, end: bool) -> Res
         }
         let ok = c.recv_end_locked(st);
         c.mu.unlock();
-        if !ok { return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR)); }
+        if !ok {
+            return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR));
+        }
         return Ok(());
     }
     let mut status: Option<u16> = None;
     let mut regular = false;
     let mut want: Option<u64> = None;
     for f in fields.iter() {
-        let bad = !h2::valid_field(f) || (f.is_pseudo() && (regular || f.name.as_str() != ":status" || status.is_some())) || h2::connection_specific(f.name.as_str());
+        let bad = !h2::valid_field(f)
+            || (f.is_pseudo() && (regular || f.name.as_str() != ":status" || status.is_some()))
+            || h2::connection_specific(f.name.as_str());
         if bad {
             c.mu.unlock();
             return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR));
         }
         if f.is_pseudo() {
-            status = match f.value.parse::<u16>() { Ok(n) => Some(n), Err(_) => None };
+            status = match f.value.parse::<u16>() {
+                Ok(n) => Some(n),
+                Err(_) => None,
+            };
             if status.is_none() {
                 c.mu.unlock();
                 return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR));
@@ -76,7 +107,10 @@ fn on_headers(c: &mut Core, id: u32, fields: Vec<HeaderField>, end: bool) -> Res
         } else {
             regular = true;
             if f.name.as_str() == "content-length" {
-                want = match f.value.trim().parse::<u64>() { Ok(n) => Some(n), Err(_) => None };
+                want = match f.value.trim().parse::<u64>() {
+                    Ok(n) => Some(n),
+                    Err(_) => None,
+                };
                 if want.is_none() {
                     c.mu.unlock();
                     return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR));
@@ -94,7 +128,9 @@ fn on_headers(c: &mut Core, id: u32, fields: Vec<HeaderField>, end: bool) -> Res
     if code >= 100 && code < 200 {
         // (1xx: another head follows.)
         c.mu.unlock();
-        if end { return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR)); }
+        if end {
+            return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR));
+        }
         return Ok(());
     }
     st.head = Some(fields);
@@ -102,7 +138,9 @@ fn on_headers(c: &mut Core, id: u32, fields: Vec<HeaderField>, end: bool) -> Res
     if end {
         let ok = c.recv_end_locked(st);
         c.mu.unlock();
-        if !ok { return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR)); }
+        if !ok {
+            return Err(H2Error::Stream(id, h2::PROTOCOL_ERROR));
+        }
         return Ok(());
     }
     c.cond.notify_all();
@@ -136,7 +174,13 @@ impl ClientConn {
 
     /// Sends req (its head made from fields: the defaults and the
     /// request's) and returns the response once its head comes.
-    pub fn round_trip(&mut self, req: &mut Request, url: &Url, defaults: &HeaderMap, deadline: Option<Instant>) -> Result<Response, TripError> {
+    pub fn round_trip(
+        &mut self,
+        req: &mut Request,
+        url: &Url,
+        defaults: &HeaderMap,
+        deadline: Option<Instant>,
+    ) -> Result<Response, TripError> {
         let c = self.c;
         let authority = match req.headers.get("host") {
             Some(h) => h.to_string(),
@@ -146,15 +190,23 @@ impl ClientConn {
         fields.push(HeaderField::new(":method", req.method.as_str()));
         fields.push(HeaderField::new(":scheme", url.scheme()));
         fields.push(HeaderField::new(":authority", authority.as_str()));
-        if req.method != Method::CONNECT { fields.push(HeaderField::new(":path", req.target.as_str())); }
-        for (k, v) in defaults.iter() {
-            if !req.headers.contains_key(k.as_str()) { push_field(&mut fields, k.as_str(), v.as_str()); }
+        if req.method != Method::CONNECT {
+            fields.push(HeaderField::new(":path", req.target.as_str()));
         }
-        for (k, v) in req.headers.iter() { push_field(&mut fields, k.as_str(), v.as_str()); }
+        for (k, v) in defaults.iter() {
+            if !req.headers.contains_key(k.as_str()) {
+                push_field(&mut fields, k.as_str(), v.as_str());
+            }
+        }
+        for (k, v) in req.headers.iter() {
+            push_field(&mut fields, k.as_str(), v.as_str());
+        }
         let body_len = req.body.len();
         if !req.headers.contains_key("content-length") {
             if let Some(n) = body_len {
-                if n > 0 || !(req.method == Method::GET || req.method == Method::HEAD) { fields.push(HeaderField::new("content-length", n.to_string().as_str())); }
+                if n > 0 || !(req.method == Method::GET || req.method == Method::HEAD) {
+                    fields.push(HeaderField::new("content-length", n.to_string().as_str()));
+                }
             }
         }
         let no_body = body_len.is_some_and(|n| n == 0);
@@ -169,7 +221,9 @@ impl ClientConn {
             };
             if let Err(e) = r {
                 // (Refused: the server never saw it.)
-                if refused(c, st) { return Err(TripError::Refused(e.to_string())); }
+                if refused(c, st) {
+                    return Err(TripError::Refused(e.to_string()));
+                }
                 c.reset(st, h2::CANCEL);
                 return Err(TripError::Io(e));
             }
@@ -177,17 +231,29 @@ impl ClientConn {
         // The head.
         c.mu.lock();
         loop {
-            if st.head.is_some() { break; }
+            if st.head.is_some() {
+                break;
+            }
             if st.reset.is_some() || c.dead.is_some() {
                 let r = st.reset;
-                let why = match &c.dead { Some(d) => d.clone(), None => "".to_string() };
+                let why = match &c.dead {
+                    Some(d) => d.clone(),
+                    None => "".to_string(),
+                };
                 c.mu.unlock();
-                if r == Some(h2::REFUSED_STREAM) { return Err(TripError::Refused("stream refused".to_string())); }
+                if r == Some(h2::REFUSED_STREAM) {
+                    return Err(TripError::Refused("stream refused".to_string()));
+                }
                 let msg = match r {
-                    Some(code) => `http2: stream reset by the server (${h2::code_name(code)})`.to_string(),
+                    Some(code) => {
+                        `http2: stream reset by the server (${h2::code_name(code)})`.to_string()
+                    }
                     None => `http2: ${why}`.to_string(),
                 };
-                return Err(TripError::Io(io::Error::new(io::ErrorKind::ConnectionReset, msg.as_str())));
+                return Err(TripError::Io(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    msg.as_str(),
+                )));
             }
             if !c.wait(st) {
                 c.mu.unlock();
@@ -201,15 +267,26 @@ impl ClientConn {
         let mut code = 200;
         let mut headers = HeaderMap::new();
         for f in head.iter() {
-            if f.name.as_str() == ":status" { code = f.value.parse::<u16>().unwrap_or(200); } else { headers.append(f.name.as_str(), f.value.as_str()); }
+            if f.name.as_str() == ":status" {
+                code = f.value.parse::<u16>().unwrap_or(200);
+            } else {
+                headers.append(f.name.as_str(), f.value.as_str());
+            }
         }
         let mut resp = Response::new(StatusCode(code));
         resp.version = Version::HTTP_2;
         resp.headers = headers;
         // (Ended already: what came is in the stream's buffer.)
-        let empty = req.method == Method::HEAD || code == 204 || code == 304 || (ended && want == Some(0));
-        resp.body = if empty { Body::from(Vec::new()) } else { Body::from_reader(BodyReader::new(c, st), want) };
-        if req.method == Method::HEAD { resp.body.len = want; }
+        let empty =
+            req.method == Method::HEAD || code == 204 || code == 304 || (ended && want == Some(0));
+        resp.body = if empty {
+            Body::from(Vec::new())
+        } else {
+            Body::from_reader(BodyReader::new(c, st), want)
+        };
+        if req.method == Method::HEAD {
+            resp.body.len = want;
+        }
         resp.url = Some(url.clone());
         Ok(resp)
     }
@@ -224,8 +301,12 @@ fn refused(c: &mut Core, st: &mut Stream) -> bool {
 
 // (Fields HTTP/2 does not carry are left out; the host is :authority.)
 fn push_field(fields: &mut Vec<HeaderField>, k: &str, v: &str) {
-    if h2::connection_specific(k) || k == "host" { return; }
-    if k == "te" && v != "trailers" { return; }
+    if h2::connection_specific(k) || k == "host" {
+        return;
+    }
+    if k == "te" && v != "trailers" {
+        return;
+    }
     fields.push(HeaderField::new(k, v));
 }
 
@@ -247,7 +328,9 @@ fn send_body(c: &mut Core, st: &mut Stream, body: &mut Body) -> io::Result<()> {
     buf.resize(16384, 0);
     loop {
         let n = body.read(buf.as_mut_slice())?;
-        if n == 0 { return c.end_stream(st); }
+        if n == 0 {
+            return c.end_stream(st);
+        }
         c.write_data(st, &buf[..n], false)?;
     }
 }

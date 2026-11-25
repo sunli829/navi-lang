@@ -129,6 +129,8 @@ if [ "$("$navi" bench tests/harness 2>&1 | grep -c ' ns/iter ')" = 2 ]; then
 else
 	echo "FAIL navi bench tests/harness"; fail=1
 fi
+# std stays formatted (navi fmt).
+if "$navi" fmt --check lib/std > "$tmp/stdfmt.out" 2>&1; then echo "ok   navi fmt --check lib/std"; else echo "FAIL navi fmt --check lib/std"; head -20 "$tmp/stdfmt.out"; fail=1; fi
 # navi fmt: tests/fmt/x.navi formats to x.out, which stays as it is;
 # --check reports a file that would change and passes one that would not.
 for f in tests/fmt/*.navi; do
