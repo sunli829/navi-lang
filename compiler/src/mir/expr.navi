@@ -83,6 +83,8 @@ fn assign_base(op: token::Kind) -> token::Kind {
     }
 }
 
+fn is_unsized(t: &Type) -> bool { t.kind == types::K_SLICE || t.kind == types::K_STR || t.kind == types::K_DYN }
+
 fn is_place_expr(x: &Expr) -> bool {
     match &x.kind {
         ExprKind::Path(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Paren { .. } | ExprKind::Unary { .. } => true,
@@ -610,25 +612,25 @@ impl Builder {
         }
         let lt = self.type_of(xl);
         let rt = self.type_of(xr);
+        let is_cmp = op == token::EQ_EQ || op == token::NE || op == token::LT || op == token::LE || op == token::GT || op == token::GE;
+        if is_cmp && (is_unsized(lt) || is_unsized(rt)) {
+            // An unsized side ([T], str, dyn) is compared through a reference
+            // to its place (Rust's autoref): it has no value to copy.
+            let lref = self.cmp_ref(xl, lt);
+            let rref = self.cmp_ref(xr, rt);
+            self.compare_call(op, op_pos, lt, rt, lref, rref, dest);
+            return;
+        }
         let l = self.operand(xl);
         let r = self.operand(xr);
-        if op == token::EQ_EQ || op == token::NE || op == token::LT || op == token::LE || op == token::GT || op == token::GE {
+        if is_cmp {
             if is_prim(lt) || lt.kind == types::K_PTR {
                 self.assign(dest, Rvalue::Bin { op: bin_op_of(op), x: l, y: r, ty: lt, pos: 0 });
                 return;
             }
-            let (trait_name, method) = if op == token::NE { ("PartialEq", "ne") } else if op == token::LT { ("PartialOrd", "lt") }
-                else if op == token::LE { ("PartialOrd", "le") } else if op == token::GT { ("PartialOrd", "gt") }
-                else if op == token::GE { ("PartialOrd", "ge") } else { ("PartialEq", "eq") };
             let lref = self.ref_to(l, lt);
             let rref = self.ref_to(r, rt);
-            let m = self.info.trait_item(trait_name, method).unwrap();
-            let mut targs = Vec::new();
-            targs.push(rt);
-            let mut args = Vec::new();
-            args.push(lref);
-            args.push(rref);
-            self.call(self.trait_fn(m, lt, targs), args, dest, op_pos);
+            self.compare_call(op, op_pos, lt, rt, lref, rref, dest);
             return;
         }
         if is_prim(lt) && is_prim(rt) {
@@ -642,6 +644,31 @@ impl Builder {
         let mut args = Vec::new();
         args.push(l);
         args.push(r);
+        self.call(self.trait_fn(m, lt, targs), args, dest, op_pos);
+    }
+
+    // A reference to x for a comparison: to its place, else to a
+    // temporary holding its value.
+    fn cmp_ref(&mut self, x: &Expr, t: &Type) -> Operand {
+        if !is_unsized(t) { return self.ref_to(self.operand(x), t); }
+        let p = self.place(x, false);
+        let rt = self.ctx().reference(false, t);
+        let r = self.temp(rt);
+        self.assign(r.clone(), Rvalue::Ref { is_mut: false, place: p });
+        copy(r)
+    }
+
+    // dest = PartialEq/PartialOrd's method for op on the two references.
+    fn compare_call(&mut self, op: token::Kind, op_pos: Pos, lt: &Type, rt: &Type, lref: Operand, rref: Operand, dest: Place) {
+        let (trait_name, method) = if op == token::NE { ("PartialEq", "ne") } else if op == token::LT { ("PartialOrd", "lt") }
+            else if op == token::LE { ("PartialOrd", "le") } else if op == token::GT { ("PartialOrd", "gt") }
+            else if op == token::GE { ("PartialOrd", "ge") } else { ("PartialEq", "eq") };
+        let m = self.info.trait_item(trait_name, method).unwrap();
+        let mut targs = Vec::new();
+        targs.push(rt);
+        let mut args = Vec::new();
+        args.push(lref);
+        args.push(rref);
         self.call(self.trait_fn(m, lt, targs), args, dest, op_pos);
     }
 
