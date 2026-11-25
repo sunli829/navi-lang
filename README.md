@@ -10,11 +10,22 @@ navi 是一门语法和 Rust 高度相似、带 GC 的编程语言，AOT 编译�
 
 ## 安装
 
-从 [Releases](https://github.com/sunli829/navi-lang/releases) 下载对应平台的包，解开后是 `bin/navi` 和 `lib/std`（navi 在自己旁边找 std，也可以用 `NAVI_STD` 指定）：
+macOS、Linux：
 
 ```sh
-tar xzf navi-v0.1.0-macos-arm64.tar.gz
-export PATH=$PWD/navi-v0.1.0-macos-arm64/bin:$PATH
+curl -fsSL https://raw.githubusercontent.com/sunli829/navi-lang/main/install.sh | sh
+export PATH="$HOME/.navi/bin:$PATH"     # 写进 ~/.zshrc、~/.bashrc 或 ~/.profile
+```
+
+Windows（PowerShell）：
+
+```powershell
+irm https://raw.githubusercontent.com/sunli829/navi-lang/main/install.ps1 | iex
+```
+
+脚本下载最新 release 里对应平台的包，按 `SHA256SUMS` 校验后装到 `~/.navi`（`%USERPROFILE%\.navi`；`NAVI_HOME` 可以改），里面是 `bin/navi` 和 `lib/std`（navi 在自己旁边找 std，也可以用 `NAVI_STD` 指定）；Windows 上把 `bin` 加进用户的 PATH。**升级**就是再运行一次；装指定版本：`curl -fsSL .../install.sh | sh -s -- v0.0.5`，PowerShell 里 `& ([scriptblock]::Create((irm .../install.ps1))) v0.0.5`。也可以从 [Releases](https://github.com/sunli829/navi-lang/releases) 手动下载解开。
+
+```sh
 navi new hello && cd hello    # navi.toml、src/main.navi（同 cargo new）
 navi run                      # 构建到 target/hello 并运行
 navi test                     # 单元测试和 tests/ 里的集成测试
@@ -22,7 +33,7 @@ navi build --target linux-x64 -o hello-linux   # 交叉编译
 navi run hello.navi           # 单个文件不需要项目（同 go run）
 ```
 
-macOS 上用浏览器下载的包带隔离标记，第一次运行前执行 `xattr -dr com.apple.quarantine navi-*`（navi 只有 ad-hoc 签名）。
+macOS 上用浏览器手动下载的包带隔离标记（脚本安装的没有），第一次运行前执行 `xattr -dr com.apple.quarantine navi-*`（navi 只有 ad-hoc 签名）。
 
 ## 从源码构建
 
