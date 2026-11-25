@@ -385,9 +385,12 @@ for v in rx.iter() { ... }                  // 一直接收到 channel 关闭为
 select {
     v = rx.recv()  => println(`got ${v:?}`),   // v: Result<T, RecvError>
     tx2.send(s)    => {},
+    w = rx3.recv() if !paused => {},        // 守卫：条件为假时这个分支不参加
     default        => {},                   // 可选；有 default 就不阻塞
 }
 ```
+
+- **分支守卫**（写法同 `match` 的守卫）：`if 条件` 为假的分支本次不参加选择，相当于 Go 里把通道设成 `nil`、tokio `select!` 的前置条件。所有守卫先按顺序求值，再求各分支的通道和要发送的值（被关掉的分支也照常求值，只是不选）；所有分支都被关掉又没有 `default` 时一直阻塞
 
 - **为什么用 `mpmc` 而不是 Rust 常用的 `mpsc`**：Rust 的 `Receiver` 只能有一个，靠的是它不能被拷贝；navi 的值都能拷贝，所以 Receiver 天然可以被多个线程共享，`mpmc`（Rust std 里也有这个模块）的语义正好对得上
 - **显式 `close()`**：Rust 靠"所有 `Sender` 都被 drop"来关闭 channel，navi 没有 Drop，所以加一个 `Sender::close()`。这是相对 Rust std 的少数新增 API 之一
