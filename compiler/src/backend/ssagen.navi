@@ -1555,10 +1555,11 @@ impl Builder {
             self.finish_plain(self.blocks[target as usize]);
             return;
         }
-        // A direct call returns a result of one or two words in registers
-        // (as Go's register ABI): a tuple of the words and the memory.
+        // A direct call returns a result of up to two words in registers
+        // (as Go's register ABI, lower's reg_words): a tuple of the words
+        // and the memory.
         let direct = match site { Some(tg) => site_slot < 0 && tg.kind == codegen::T_INST, None => false };
-        let nw = if !direct { 0 } else if dc.kind == C_ONE { 1 } else if dc.kind == C_TWO { 2 } else { 0 };
+        let nw = if direct { self.fg.reg_words(dt) } else { 0 };
         let v = self.f.new_value(ssa::OP_CALL, if nw > 0 { ssa::T_TUPLE } else { ssa::T_MEM }, 0);
         v.aux = ssa::Aux::Call(t, site, site_slot);
         v.pos = pos;
@@ -1573,11 +1574,15 @@ impl Builder {
                 self.finish_exit(ssa::B_EXIT, m2);
                 return;
             }
-            let w0 = self.value1(ssa::OP_SELECT, dc.t0, 0, v);
-            let w1 = if nw == 2 { Some(self.value1(ssa::OP_SELECT, dc.t1, 1, v)) } else { None };
-            self.barrier(dest);
-            self.assign_words(dest, &dc, w0, w1);
-            self.barrier(dest);
+            if dc.kind != C_MEM {
+                let w0 = self.value1(ssa::OP_SELECT, dc.t0, 0, v);
+                let w1 = if nw == 2 { Some(self.value1(ssa::OP_SELECT, dc.t1, 1, v)) } else { None };
+                self.barrier(dest);
+                self.assign_words(dest, &dc, w0, w1);
+                self.barrier(dest);
+            } else {
+                self.words_to(dest, dt, v, nw);
+            }
             self.finish_plain(self.blocks[target as usize]);
             return;
         }
@@ -1657,6 +1662,38 @@ impl Builder {
         let _ = dt;
         self.barrier(dest);
         true
+    }
+
+    /// Stores the nw words an aggregate result came in (the tuple call) at
+    /// dest, or splits them into its variables through the result buffer.
+    fn words_to(&mut self, dest: &Place, dt: &Type, call: &mut Value, nw: i64) {
+        let size = self.fg.size(dt);
+        let (mask, _) = self.fg.ptr_mask(dt);
+        let mut ws: Vec<&mut Value> = Vec::new();
+        let mut k = 0;
+        while k < nw {
+            let n = if size - 8 * k < 8 { size - 8 * k } else { 8 };
+            let ty = if mask & (1i64 << k as u32) != 0 { ssa::T_PTR } else { int_ty(n) };
+            ws.push(self.value1(ssa::OP_SELECT, ty, k, call));
+            k += 1;
+        }
+        let split = dest.proj.len() == 0 && self.agg_of[dest.local] >= 0;
+        self.barrier(dest);
+        let p = if split { self.value0(ssa::OP_RESADDR, ssa::T_PTR, 0) } else {
+            let (a, _, _) = self.addr(dest);
+            a
+        };
+        k = 0;
+        while k < nw {
+            let q = self.off_ptr(p, 8 * k);
+            self.store(q, ws[k as usize]);
+            k += 1;
+        }
+        if split {
+            self.load_agg(dest.local, p);
+            return;
+        }
+        self.barrier(dest);
     }
 
     /// Copies the call result buffer to dest.
