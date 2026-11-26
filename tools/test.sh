@@ -362,6 +362,11 @@ if [ "$("$dy/d$dx" | tr -d '\r')" = 42 ] && ! grep -q navi-unused-dyn-method "$d
 else
 	echo "FAIL dyn methods nothing calls left out"; fail=1
 fi
+# std's doctests: the examples in its documentation, each a test.
+set +e
+r=$("$navi" test --doc lib/std 2>&1); c=$?
+set -e
+if [ "$c" = 0 ]; then echo "ok   std doctests ($(echo "$r" | grep -E '^[0-9]+ passed' | tail -1))"; else echo "FAIL std doctests"; echo "$r" | grep -v '^ok ' | grep -v '^warning' | tail -30; fail=1; fi
 # navi doc (docs/doc.md): a library's pages and std's, links in them, a
 # warning for a link naming nothing; its doctests (run, should_panic,
 # no_run, compile_fail, fn main).
