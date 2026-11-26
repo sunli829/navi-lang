@@ -1,4 +1,10 @@
-//! TcpListener, TcpStream and UdpSocket (as Rust's).
+//! TCP and UDP sockets: [`TcpListener`], [`TcpStream`] and [`UdpSocket`], as
+//! Rust's.
+//!
+//! Without Drop, a socket is closed by calling `close()`; copies share the
+//! socket. Blocking operations park only the green thread (the runtime's
+//! network poller wakes it), and timeouts give
+//! [`ErrorKind::TimedOut`](crate::io::ErrorKind::TimedOut).
 
 use crate::io::{self, Read, Write};
 use crate::net::sys::{self, Socket};
@@ -28,14 +34,84 @@ fn duration(n: u64) -> Option<Duration> {
     }
 }
 
-/// A TCP socket listening for connections.
+/// A TCP socket server, listening for connections.
+///
+/// After creating a `TcpListener` by [`bind`]ing it to a socket address, it
+/// listens for incoming TCP connections. These can be accepted by calling
+/// [`accept`] or by iterating over the [`Incoming`] iterator returned by
+/// [`incoming`].
+///
+/// Unlike Rust's, the socket is not closed when the listener goes away: call
+/// [`close`]. Copies of a `TcpListener` share the socket. Waiting in
+/// [`accept`] parks only the calling green thread.
+///
+/// [`bind`]: TcpListener::bind
+/// [`accept`]: TcpListener::accept
+/// [`incoming`]: TcpListener::incoming
+/// [`close`]: TcpListener::close
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Read, Write};
+/// use std::net::{TcpListener, TcpStream};
+/// use std::thread;
+///
+/// fn main() -> std::io::Result<()> {
+///     let listener = TcpListener::bind("127.0.0.1:0")?;
+///     let addr = listener.local_addr()?;
+///     let client = thread::spawn(|| -> std::io::Result<String> {
+///         let mut stream = TcpStream::connect(addr.clone())?;
+///         let mut reply = String::new();
+///         stream.read_to_string(&mut reply)?;
+///         Ok(reply)
+///     });
+///
+///     let (mut stream, _) = listener.accept()?;
+///     stream.write_all(b"hello")?;
+///     stream.close();
+///     listener.close();
+///     assert_eq(client.join().unwrap()?, "hello");
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct TcpListener {
     s: &mut Socket,
 }
 
 impl TcpListener {
-    /// Listens on the first of addr's addresses that works.
+    /// Creates a new `TcpListener` which will be bound to the specified
+    /// address.
+    ///
+    /// The returned listener is ready for accepting connections.
+    ///
+    /// Binding with a port number of 0 will request that the OS assigns a port
+    /// to this listener. The port allocated can be queried via the
+    /// [`TcpListener::local_addr`] method.
+    ///
+    /// The address type can be any implementor of the [`ToSocketAddrs`] trait.
+    /// If `addr` yields multiple addresses, `bind` will be attempted with each
+    /// of the addresses until one succeeds and returns the listener. If none of
+    /// the addresses succeed in creating a listener, the error returned from
+    /// the last attempt (the last address) is returned. On Unix the socket has
+    /// `SO_REUSEADDR` set, as Rust's, and a backlog of 128.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addr` cannot be resolved, or if no address can be
+    /// bound (for example
+    /// [`ErrorKind::AddrInUse`](crate::io::ErrorKind::AddrInUse)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::TcpListener;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// assert_ne(listener.local_addr().unwrap().port(), 0);
+    /// listener.close();
+    /// ```
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
         each_addr(&addr, |a| {
             let s = sys::new_socket(a, sys::SOCK_STREAM)?;
@@ -51,32 +127,162 @@ impl TcpListener {
         })
     }
 
+    /// Returns the local socket address of this listener.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{IpAddr, Ipv4Addr, TcpListener};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let addr = listener.local_addr().unwrap();
+    /// assert_eq(addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    /// listener.close();
+    /// ```
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.s.local_addr()
     }
 
-    /// Waits for a connection.
+    /// Accepts a new incoming connection from this listener.
+    ///
+    /// This function will block the calling thread until a new TCP connection
+    /// is established. When established, the corresponding [`TcpStream`] and
+    /// the remote peer's address will be returned. Only the green thread waits:
+    /// its OS thread runs others meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if accepting fails, or if the listener is closed (also
+    /// while a thread waits here).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    /// use std::thread;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let addr = listener.local_addr().unwrap();
+    /// let h = thread::spawn(|| TcpStream::connect(addr.clone()).unwrap());
+    /// match listener.accept() {
+    ///     Ok((socket, peer)) => {
+    ///         assert_eq(peer, h.join().unwrap().local_addr().unwrap());
+    ///         socket.close();
+    ///     }
+    ///     Err(e) => println(`couldn't get client: ${e:?}`),
+    /// }
+    /// listener.close();
+    /// ```
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (s, a) = self.s.accept()?;
         Ok((TcpStream { s }, a))
     }
 
-    /// The connections, as they come.
+    /// Returns an iterator over the connections being received on this
+    /// listener.
+    ///
+    /// The returned iterator will never return [`None`] and will also not yield
+    /// the peer's [`SocketAddr`] structure. Iterating over it is equivalent to
+    /// calling [`TcpListener::accept`] in a loop. Unlike Rust's, the iterator
+    /// holds a copy of the listener (there are no lifetimes); once the listener
+    /// is closed, every item is an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Read, Write};
+    /// use std::net::{TcpListener, TcpStream};
+    /// use std::thread;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let addr = listener.local_addr().unwrap();
+    /// let clients = thread::spawn(|| {
+    ///     for i in 0..3 {
+    ///         let mut s = TcpStream::connect(addr.clone()).unwrap();
+    ///         s.write_all(`client ${i}`.to_string().as_bytes()).unwrap();
+    ///         s.close();
+    ///     }
+    /// });
+    /// let mut got = Vec::new();
+    /// for stream in listener.incoming().take(3) {
+    ///     let mut stream = stream.unwrap();
+    ///     let mut text = String::new();
+    ///     stream.read_to_string(&mut text).unwrap();
+    ///     got.push(text);
+    ///     stream.close();
+    /// }
+    /// clients.join().unwrap();
+    /// assert_eq(got.join(", "), "client 0, client 1, client 2");
+    /// listener.close();
+    /// ```
     pub fn incoming(&self) -> Incoming {
         Incoming { l: self.clone() }
     }
 
+    /// Sets the value for the `IP_TTL` option on this socket.
+    ///
+    /// This value sets the time-to-live field that is used in every packet sent
+    /// from this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `setsockopt`, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::TcpListener;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// listener.set_ttl(100).expect("could not set TTL");
+    /// listener.close();
+    /// ```
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         sys::set_int(self.s.fd, sys::IPPROTO_IP, sys::IP_TTL, ttl as i32)
     }
 
-    /// Stops listening (a G waiting in accept gets an error).
+    /// Closes the listener (navi's replacement for Rust's drop).
+    ///
+    /// A thread waiting in [`accept`](TcpListener::accept) gets an error.
+    /// Copies of the listener share the socket, so it is closed for all of
+    /// them. Calling it again does nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::TcpListener;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// listener.close();
+    /// assert(listener.accept().is_err());
+    /// ```
     pub fn close(&self) {
         self.s.close();
     }
 }
 
-/// TcpListener::incoming.
+/// An iterator that infinitely [`accept`]s connections on a [`TcpListener`].
+///
+/// This `struct` is created by the [`TcpListener::incoming`] method. See its
+/// documentation for more.
+///
+/// [`accept`]: TcpListener::accept
+///
+/// # Examples
+///
+/// ```
+/// use std::net::{TcpListener, TcpStream};
+/// use std::thread;
+///
+/// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+/// let addr = listener.local_addr().unwrap();
+/// let h = thread::spawn(|| TcpStream::connect(addr.clone()).unwrap());
+/// let mut incoming = listener.incoming();
+/// let stream = incoming.next().unwrap().unwrap();
+/// stream.close();
+/// h.join().unwrap().close();
+/// listener.close();
+/// ```
 pub struct Incoming {
     l: TcpListener,
 }
@@ -91,18 +297,110 @@ impl Iterator for Incoming {
     }
 }
 
-/// A TCP connection.
+/// A TCP stream between a local and a remote socket.
+///
+/// After creating a `TcpStream` by either [`connect`]ing to a remote host or
+/// [`accept`]ing a connection on a [`TcpListener`], data can be transmitted by
+/// [reading] and [writing] to it.
+///
+/// Unlike Rust's, the connection is not closed when the stream goes away: call
+/// [`close`] (or [`shutdown`] for one direction). Copies of a `TcpStream`
+/// (and [`try_clone`]) share the socket and its timeouts. Reading and writing
+/// park only the calling green thread.
+///
+/// [`accept`]: TcpListener::accept
+/// [`connect`]: TcpStream::connect
+/// [`close`]: TcpStream::close
+/// [`shutdown`]: TcpStream::shutdown
+/// [`try_clone`]: TcpStream::try_clone
+/// [reading]: crate::io::Read
+/// [writing]: crate::io::Write
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::io::prelude::*;
+/// use std::net::TcpStream;
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut stream = TcpStream::connect("127.0.0.1:34254")?;
+///     defer stream.close();
+///
+///     stream.write(&[1])?;
+///     stream.read(&mut [0; 128])?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct TcpStream {
     s: &mut Socket,
 }
 
 impl TcpStream {
-    /// Connects to the first of addr's addresses that accepts.
+    /// Opens a TCP connection to a remote host.
+    ///
+    /// `addr` is an address of the remote host. Anything which implements the
+    /// [`ToSocketAddrs`] trait can be supplied for the address; see this trait
+    /// documentation for concrete examples.
+    ///
+    /// If `addr` yields multiple addresses, `connect` will be attempted with
+    /// each of the addresses until a connection is successful. If none of the
+    /// addresses result in a successful connection, the error returned from the
+    /// last connection attempt (the last address) is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addr` cannot be resolved or no address accepts the
+    /// connection (for example
+    /// [`ErrorKind::ConnectionRefused`](crate::io::ErrorKind::ConnectionRefused)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let port = listener.local_addr().unwrap().port();
+    /// // The connection completes in the listener's backlog before `accept`.
+    /// let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    /// assert_eq(stream.peer_addr().unwrap().port(), port);
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
         each_addr(&addr, |a| TcpStream::connect_timeout_nanos(a, 0))
     }
 
+    /// Opens a TCP connection to a remote host with a timeout.
+    ///
+    /// Unlike [`connect`](TcpStream::connect), `connect_timeout` takes a single
+    /// [`SocketAddr`] since a timeout must be applied to individual addresses.
+    ///
+    /// # Errors
+    ///
+    /// It is an error to pass a zero `Duration` to this function (an error of
+    /// kind [`ErrorKind::InvalidInput`](crate::io::ErrorKind::InvalidInput)).
+    /// If the connection is not made in time, the error is of kind
+    /// [`ErrorKind::TimedOut`](crate::io::ErrorKind::TimedOut).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::ErrorKind;
+    /// use std::net::{TcpListener, TcpStream};
+    /// use std::time::Duration;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let addr = listener.local_addr().unwrap();
+    /// let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+    /// stream.close();
+    ///
+    /// match TcpStream::connect_timeout(&addr, Duration::ZERO) {
+    ///     Ok(_) => panic("a zero timeout is an error"),
+    ///     Err(e) => assert_eq(e.kind(), ErrorKind::InvalidInput),
+    /// }
+    /// listener.close();
+    /// ```
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         TcpStream::connect_timeout_nanos(addr, nanos(Some(timeout))?)
     }
@@ -116,13 +414,82 @@ impl TcpStream {
         Ok(TcpStream { s })
     }
 
+    /// Returns the socket address of the remote peer of this TCP connection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let addr = listener.local_addr().unwrap();
+    /// let stream = TcpStream::connect(addr.clone()).unwrap();
+    /// assert_eq(stream.peer_addr().unwrap(), addr);
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.s.peer_addr()
     }
+    /// Returns the socket address of the local half of this TCP connection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// let (accepted, peer) = listener.accept().unwrap();
+    /// assert_eq(stream.local_addr().unwrap(), peer);
+    /// accepted.close();
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.s.local_addr()
     }
 
+    /// Shuts down the read, write, or both halves of this connection.
+    ///
+    /// This function will cause all pending and future I/O on the specified
+    /// portions to return immediately with an appropriate value (see the
+    /// documentation of [`Shutdown`]). Shutting down the write half sends the
+    /// peer an end of stream while this side can still read its answer. The
+    /// socket stays open until [`close`](TcpStream::close).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the `shutdown` system call (for example
+    /// [`ErrorKind::NotConnected`](crate::io::ErrorKind::NotConnected)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Read, Write};
+    /// use std::net::{Shutdown, TcpListener, TcpStream};
+    /// use std::thread;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let addr = listener.local_addr().unwrap();
+    /// // An echo server: it answers once the client has finished sending.
+    /// let server = thread::spawn(|| {
+    ///     let (mut s, _) = listener.accept().unwrap();
+    ///     let mut req = String::new();
+    ///     s.read_to_string(&mut req).unwrap();
+    ///     s.write_all(req.to_uppercase().as_bytes()).unwrap();
+    ///     s.close();
+    /// });
+    /// let mut stream = TcpStream::connect(addr).unwrap();
+    /// stream.write_all(b"ping").unwrap();
+    /// stream.shutdown(Shutdown::Write).unwrap();
+    /// let mut reply = String::new();
+    /// stream.read_to_string(&mut reply).unwrap();
+    /// assert_eq(reply, "PING");
+    /// stream.close();
+    /// server.join().unwrap();
+    /// listener.close();
+    /// ```
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.s.shutdown(match how {
             Shutdown::Read => 0,
@@ -131,23 +498,139 @@ impl TcpStream {
         })
     }
 
+    /// Sets the read timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then [`read`](crate::io::Read::read)
+    /// calls will block indefinitely. A read that waits longer gives an error
+    /// of kind [`ErrorKind::TimedOut`](crate::io::ErrorKind::TimedOut) (Rust
+    /// gives `WouldBlock` on Unix): the timeout is kept by the runtime's
+    /// poller, not by the kernel's `SO_RCVTIMEO`. Copies of the stream share
+    /// the setting.
+    ///
+    /// # Errors
+    ///
+    /// An [`Err`] of kind
+    /// [`ErrorKind::InvalidInput`](crate::io::ErrorKind::InvalidInput) is
+    /// returned if the zero [`Duration`] is passed to this method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{ErrorKind, Read};
+    /// use std::net::{TcpListener, TcpStream};
+    /// use std::time::Duration;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let mut stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// stream.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+    /// // Nothing is ever sent, so the read times out.
+    /// let err = stream.read(&mut [0u8; 16]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::TimedOut);
+    ///
+    /// let result = stream.set_read_timeout(Some(Duration::ZERO));
+    /// assert_eq(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         self.s.set_rto(nanos(d)?);
         Ok(())
     }
 
+    /// Sets the write timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then
+    /// [`write`](crate::io::Write::write) calls will block indefinitely. A
+    /// write that waits longer (the peer does not read and the buffers are
+    /// full) gives an error of kind
+    /// [`ErrorKind::TimedOut`](crate::io::ErrorKind::TimedOut).
+    ///
+    /// # Errors
+    ///
+    /// An [`Err`] of kind
+    /// [`ErrorKind::InvalidInput`](crate::io::ErrorKind::InvalidInput) is
+    /// returned if the zero [`Duration`] is passed to this method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    /// use std::time::Duration;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+    /// assert_eq(stream.write_timeout().unwrap(), Some(Duration::from_secs(1)));
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         self.s.set_wto(nanos(d)?);
         Ok(())
     }
 
+    /// Returns the read timeout of this socket.
+    ///
+    /// If the timeout is [`None`], then [`read`](crate::io::Read::read) calls
+    /// will block indefinitely.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    /// use std::time::Duration;
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// assert_eq(stream.read_timeout().unwrap(), None);
+    /// stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    /// assert_eq(stream.read_timeout().unwrap(), Some(Duration::from_secs(1)));
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
         Ok(duration(self.s.rto))
     }
+    /// Returns the write timeout of this socket.
+    ///
+    /// If the timeout is [`None`], then [`write`](crate::io::Write::write)
+    /// calls will block indefinitely.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// assert_eq(stream.write_timeout().unwrap(), None);
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
         Ok(duration(self.s.wto))
     }
 
+    /// Sets the value of the `TCP_NODELAY` option on this socket.
+    ///
+    /// If set, this option disables the Nagle algorithm. This means that
+    /// segments are always sent as soon as possible, even if there is only a
+    /// small amount of data. When not set, data is buffered until there is a
+    /// sufficient amount to send out, thereby avoiding the frequent sending of
+    /// small packets.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// stream.set_nodelay(true).expect("set_nodelay call failed");
+    /// assert_eq(stream.nodelay().unwrap(), true);
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn set_nodelay(&self, on: bool) -> io::Result<()> {
         sys::set_int(
             self.s.fd,
@@ -156,17 +639,79 @@ impl TcpStream {
             if on { 1 } else { 0 },
         )
     }
+    /// Gets the value of the `TCP_NODELAY` option on this socket.
+    ///
+    /// For more information about this option, see
+    /// [`TcpStream::set_nodelay`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{TcpListener, TcpStream};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// stream.set_nodelay(false).unwrap();
+    /// assert_eq(stream.nodelay().unwrap(), false);
+    /// stream.close();
+    /// listener.close();
+    /// ```
     pub fn nodelay(&self) -> io::Result<bool> {
         Ok(sys::get_int(self.s.fd, sys::IPPROTO_TCP, sys::TCP_NODELAY)? != 0)
     }
 
-    /// Another handle to the same connection (it shares the socket and
-    /// its timeouts).
+    /// Creates a new handle for the same connection.
+    ///
+    /// Unlike Rust's, which duplicates the file descriptor, the returned stream
+    /// shares the socket (and its timeouts) with this one: closing either
+    /// closes both. It never fails. Typically one handle reads on one thread
+    /// while another writes on another.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Read, Write};
+    /// use std::net::{TcpListener, TcpStream};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let mut stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// let (mut server, _) = listener.accept().unwrap();
+    /// let mut writer = stream.try_clone().expect("clone failed...");
+    /// writer.write_all(b"hi").unwrap();
+    /// let mut buf = [0u8; 2];
+    /// server.read_exact(&mut buf).unwrap();
+    /// assert_eq(&buf[..], b"hi");
+    /// writer.close(); // closes `stream` too
+    /// assert(stream.write(b"more").is_err());
+    /// server.close();
+    /// listener.close();
+    /// ```
     pub fn try_clone(&self) -> io::Result<TcpStream> {
         Ok(self.clone())
     }
 
-    /// Closes the connection (a G waiting on it gets an error).
+    /// Closes the connection (navi's replacement for Rust's drop).
+    ///
+    /// A thread waiting to read or write on it gets an error. Copies of the
+    /// stream share the socket, so it is closed for all of them. Calling it
+    /// again does nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Read;
+    /// use std::net::{TcpListener, TcpStream};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// let (mut server, _) = listener.accept().unwrap();
+    /// client.close();
+    /// // The peer sees the end of the stream.
+    /// let mut buf = Vec::new();
+    /// assert_eq(server.read_to_end(&mut buf).unwrap(), 0);
+    /// server.close();
+    /// listener.close();
+    /// ```
     pub fn close(&self) {
         self.s.close();
     }
@@ -188,6 +733,53 @@ impl Write for TcpStream {
 }
 
 /// A UDP socket.
+///
+/// After creating a `UdpSocket` by [`bind`]ing it to a socket address, data
+/// can be [sent to] and [received from] any other socket address.
+///
+/// Although UDP is a connectionless protocol, this implementation provides an
+/// interface to set an address where data should be sent and received from.
+/// After setting a remote address with [`connect`], data can be sent to and
+/// received from that address with [`send`] and [`recv`].
+///
+/// As UDP is a datagram protocol, every message sent is delivered whole or
+/// not at all (and maybe out of order). Unlike Rust's, the socket is closed
+/// by calling [`close`]; copies share it.
+///
+/// [`bind`]: UdpSocket::bind
+/// [`connect`]: UdpSocket::connect
+/// [`close`]: UdpSocket::close
+/// [received from]: UdpSocket::recv_from
+/// [`recv`]: UdpSocket::recv
+/// [`send`]: UdpSocket::send
+/// [sent to]: UdpSocket::send_to
+///
+/// # Examples
+///
+/// ```
+/// use std::net::UdpSocket;
+///
+/// fn main() -> std::io::Result<()> {
+///     let socket = UdpSocket::bind("127.0.0.1:0")?;
+///     let other = UdpSocket::bind("127.0.0.1:0")?;
+///
+///     socket.send_to(b"hello", other.local_addr()?)?;
+///     let mut buf = [0u8; 10];
+///     let (amt, src) = other.recv_from(&mut buf)?;
+///     assert_eq(&buf[..amt], b"hello");
+///     assert_eq(src, socket.local_addr()?);
+///
+///     // Send the data back, reversed.
+///     let buf = &mut buf[..amt];
+///     buf.reverse();
+///     other.send_to(buf, src)?;
+///     let (amt, _) = socket.recv_from(&mut [0u8; 10])?;
+///     assert_eq(amt, 5);
+///     socket.close();
+///     other.close();
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct UdpSocket {
     s: &mut Socket,
@@ -195,6 +787,29 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
+    /// Creates a UDP socket from the given address.
+    ///
+    /// The address type can be any implementor of the [`ToSocketAddrs`] trait.
+    /// If `addr` yields multiple addresses, `bind` will be attempted with each
+    /// of the addresses until one succeeds and returns the socket. If none of
+    /// the addresses succeed in creating a socket, the error returned from the
+    /// last attempt (the last address) is returned. A port of 0 asks the OS for
+    /// a free one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addr` cannot be resolved, or if no address can be
+    /// bound.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").expect("couldn't bind to address");
+    /// assert_ne(socket.local_addr().unwrap().port(), 0);
+    /// socket.close();
+    /// ```
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
         each_addr(&addr, |a| {
             let s = sys::new_socket(a, sys::SOCK_DGRAM)?;
@@ -206,10 +821,64 @@ impl UdpSocket {
         })
     }
 
+    /// Receives a single datagram message on the socket. On success, returns
+    /// the number of bytes read and the origin.
+    ///
+    /// The function must be called with valid byte array `buf` of sufficient
+    /// size to hold the message bytes. If a message is too long to fit in the
+    /// supplied buffer, excess bytes may be discarded. It waits (parking the
+    /// green thread) until a message comes, or until the read timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if receiving fails, the socket is closed, or the read
+    /// timeout passes
+    /// ([`ErrorKind::TimedOut`](crate::io::ErrorKind::TimedOut)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// sender.send_to(b"abc", socket.local_addr().unwrap()).unwrap();
+    /// let mut buf = [0u8; 10];
+    /// let (number_of_bytes, src_addr) = socket.recv_from(&mut buf).expect("Didn't receive data");
+    /// assert_eq(&buf[..number_of_bytes], b"abc");
+    /// assert_eq(src_addr, sender.local_addr().unwrap());
+    /// socket.close();
+    /// sender.close();
+    /// ```
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.s.recv_from(buf)
     }
 
+    /// Sends data on the socket to the given address. On success, returns the
+    /// number of bytes written.
+    ///
+    /// Address type can be any implementor of [`ToSocketAddrs`] trait. See its
+    /// documentation for concrete examples. Only the first address `addr`
+    /// yields is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addr` cannot be resolved or yields no address
+    /// ([`ErrorKind::InvalidInput`](crate::io::ErrorKind::InvalidInput)), or if
+    /// sending fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").expect("couldn't bind to address");
+    /// let target = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// let sent = socket.send_to(&[0, 1, 2], target.local_addr().unwrap()).expect("couldn't send data");
+    /// assert_eq(sent, 3);
+    /// socket.close();
+    /// target.close();
+    /// ```
     pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
         match addr.to_socket_addrs()?.next() {
             Some(a) => self.s.send_to(buf, &a),
@@ -220,7 +889,34 @@ impl UdpSocket {
         }
     }
 
-    /// Sends to and receives from addr only (send, recv).
+    /// Connects this UDP socket to a remote address, allowing the [`send`] and
+    /// [`recv`] methods to be used to send data and also applies filters to
+    /// only receive data from the specified address.
+    ///
+    /// Only the first address `addr` yields is used (Rust tries each until one
+    /// works).
+    ///
+    /// [`send`]: UdpSocket::send
+    /// [`recv`]: UdpSocket::recv
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addr` cannot be resolved or yields no address
+    /// ([`ErrorKind::InvalidInput`](crate::io::ErrorKind::InvalidInput)), or if
+    /// the `connect` system call fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    ///
+    /// let mut socket = UdpSocket::bind("127.0.0.1:0").expect("couldn't bind to address");
+    /// let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// socket.connect(peer.local_addr().unwrap()).expect("connect function failed");
+    /// assert_eq(socket.peer_addr().unwrap(), peer.local_addr().unwrap());
+    /// socket.close();
+    /// peer.close();
+    /// ```
     pub fn connect<A: ToSocketAddrs>(&mut self, addr: A) -> io::Result<()> {
         match addr.to_socket_addrs()?.next() {
             Some(a) => {
@@ -235,33 +931,189 @@ impl UdpSocket {
         }
     }
 
+    /// Sends data on the socket to the remote address to which it is connected.
+    /// On success, returns the number of bytes written.
+    ///
+    /// [`UdpSocket::connect`] will connect this socket to a remote address.
+    /// This method will fail if the socket is not connected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    ///
+    /// let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// socket.connect(peer.local_addr().unwrap()).unwrap();
+    /// socket.send(&[0, 1, 2]).expect("couldn't send message");
+    /// let mut buf = [0u8; 3];
+    /// assert_eq(peer.recv(&mut buf).unwrap(), 3);
+    /// assert_eq(buf, [0, 1, 2]);
+    /// socket.close();
+    /// peer.close();
+    /// ```
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.s.write(buf)
     }
+    /// Receives a single datagram message on the socket from the remote address
+    /// to which it is connected. On success, returns the number of bytes read.
+    ///
+    /// The function must be called with valid byte array `buf` of sufficient
+    /// size to hold the message bytes. If a message is too long to fit in the
+    /// supplied buffer, excess bytes may be discarded. On a socket that is not
+    /// connected, it receives from anyone (as [`UdpSocket::recv_from`] without
+    /// the address).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    ///
+    /// let mut socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// socket.connect(peer.local_addr().unwrap()).unwrap();
+    /// peer.send_to(b"pong", socket.local_addr().unwrap()).unwrap();
+    /// let mut buf = [0u8; 10];
+    /// match socket.recv(&mut buf) {
+    ///     Ok(received) => assert_eq(&buf[..received], b"pong"),
+    ///     Err(e) => println(`recv function failed: ${e:?}`),
+    /// }
+    /// socket.close();
+    /// peer.close();
+    /// ```
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.s.read(buf)
     }
+    /// Returns the socket address of the remote peer this socket was connected
+    /// to.
+    ///
+    /// # Errors
+    ///
+    /// If the socket isn't connected, it will return a
+    /// [`NotConnected`](crate::io::ErrorKind::NotConnected) error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::ErrorKind;
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// assert_eq(socket.peer_addr().unwrap_err().kind(), ErrorKind::NotConnected);
+    /// socket.close();
+    /// ```
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.s.peer_addr()
     }
+    /// Returns the socket address that this socket was created from.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").expect("couldn't bind to address");
+    /// assert_eq(socket.local_addr().unwrap().ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    /// socket.close();
+    /// ```
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.s.local_addr()
     }
 
+    /// Sets the read timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then [`recv`](UdpSocket::recv) and
+    /// [`recv_from`](UdpSocket::recv_from) calls will block indefinitely. A
+    /// receive that waits longer gives an error of kind
+    /// [`ErrorKind::TimedOut`](crate::io::ErrorKind::TimedOut) (Rust gives
+    /// `WouldBlock` on Unix).
+    ///
+    /// # Errors
+    ///
+    /// An [`Err`] of kind
+    /// [`ErrorKind::InvalidInput`](crate::io::ErrorKind::InvalidInput) is
+    /// returned if the zero [`Duration`] is passed to this method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::ErrorKind;
+    /// use std::net::UdpSocket;
+    /// use std::time::Duration;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+    /// let err = socket.recv_from(&mut [0u8; 8]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::TimedOut);
+    /// socket.close();
+    /// ```
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         self.s.set_rto(nanos(d)?);
         Ok(())
     }
 
+    /// Sets the write timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then [`send`](UdpSocket::send) and
+    /// [`send_to`](UdpSocket::send_to) calls will block indefinitely. A send
+    /// that waits longer gives an error of kind
+    /// [`ErrorKind::TimedOut`](crate::io::ErrorKind::TimedOut).
+    ///
+    /// # Errors
+    ///
+    /// An [`Err`] of kind
+    /// [`ErrorKind::InvalidInput`](crate::io::ErrorKind::InvalidInput) is
+    /// returned if the zero [`Duration`] is passed to this method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    /// use std::time::Duration;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// socket.set_write_timeout(Some(Duration::from_secs(1))).expect("set_write_timeout call failed");
+    /// assert(socket.set_write_timeout(Some(Duration::ZERO)).is_err());
+    /// socket.close();
+    /// ```
     pub fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         self.s.set_wto(nanos(d)?);
         Ok(())
     }
 
+    /// Sets the value of the `SO_BROADCAST` option for this socket.
+    ///
+    /// When enabled, this socket is allowed to send packets to a broadcast
+    /// address.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").expect("couldn't bind to address");
+    /// socket.set_broadcast(false).expect("set_broadcast call failed");
+    /// socket.close();
+    /// ```
     pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
         sys::set_int(self.s.fd, 0xffff, sys::SO_BROADCAST, if on { 1 } else { 0 })
     }
 
+    /// Closes the socket (navi's replacement for Rust's drop).
+    ///
+    /// A thread waiting to receive on it gets an error. Copies of the socket
+    /// share it, so it is closed for all of them. Calling it again does
+    /// nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// socket.close();
+    /// assert(socket.recv(&mut [0u8; 4]).is_err());
+    /// ```
     pub fn close(&self) {
         self.s.close();
     }

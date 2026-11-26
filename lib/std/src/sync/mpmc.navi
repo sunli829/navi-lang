@@ -1,30 +1,193 @@
-//! Multi-producer, multi-consumer channels with Rust's std::sync::mpmc API,
-//! plus Sender::close() because navi has no Drop.
+//! Multi-producer, multi-consumer FIFO queue communication primitives.
+//!
+//! This module provides message-based communication over channels, with the API
+//! of Rust's `std::sync::mpmc`. A channel is made by one of two functions, each
+//! returning a [`Sender`] and a [`Receiver`]:
+//!
+//! - [`channel`] makes an unbounded (asynchronous) channel: [`Sender::send`]
+//!   never blocks.
+//! - [`sync_channel`] makes a bounded channel: `send` waits while the buffer is
+//!   full, and with a bound of 0 every send waits until a receiver takes the
+//!   value (a rendezvous).
+//!
+//! Both halves can be cloned and shared between any number of threads (navi
+//! uses `mpmc`, not Rust's usual single-consumer `mpsc`: values are copyable
+//! handles, so a `Receiver` can be shared too). Every value sent is received
+//! once, by one of the receivers.
+//!
+//! navi has no Drop, so a channel does not close when its last `Sender` goes
+//! away: [`Sender::close`] closes it, after which receivers get the values
+//! still in it and then an error (so [`Receiver::iter`] ends).
+//! [`Receiver::close`] closes it from the receiving side (Rust's dropping every
+//! `Receiver`): senders get an error. When no `Receiver` is referenced any
+//! more, the garbage collector closes the channel for its senders, some time
+//! later.
+//!
+//! The `select` statement (a navi keyword, as Go's) waits on several channel
+//! operations at once and runs the first that is ready; with a `default` case
+//! it does not wait. Timer channels from [`crate::time::after`] and
+//! [`crate::time::tick`] give it timeouts.
+//!
+//! # Examples
+//!
+//! Many producers and many consumers:
+//!
+//! ```
+//! use std::sync::mpmc::sync_channel;
+//! use std::thread;
+//!
+//! let (tx, rx) = sync_channel(4);
+//! let mut consumers = Vec::new();
+//! for _ in 0..3 {
+//!     consumers.push(thread::spawn(|| {
+//!         let mut sum = 0;
+//!         for v in rx.iter() {
+//!             sum += v;
+//!         }
+//!         sum
+//!     }));
+//! }
+//! let mut producers = Vec::new();
+//! for p in 0..2 {
+//!     producers.push(thread::spawn(|| {
+//!         for i in 0..50 {
+//!             tx.send(p * 50 + i + 1).unwrap();
+//!         }
+//!     }));
+//! }
+//! for p in producers {
+//!     p.join().unwrap();
+//! }
+//! // Every producer is done: close the channel so the consumers' loops end.
+//! tx.close();
+//! let mut total = 0;
+//! for c in consumers {
+//!     total += c.join().unwrap();
+//! }
+//! assert_eq(total, 5050);
+//! ```
+//!
+//! Waiting on several channels with `select`, and a timeout:
+//!
+//! ```
+//! use std::sync::mpmc::channel;
+//! use std::time::{after, Duration};
+//!
+//! let (num_tx, num_rx) = channel::<i32>();
+//! let (text_tx, text_rx) = channel::<String>();
+//! text_tx.send(String::from("hi")).unwrap();
+//!
+//! let got = select {
+//!     n = num_rx.recv() => `number ${n.unwrap()}`.to_string(),
+//!     s = text_rx.recv() => `text ${s.unwrap()}`.to_string(),
+//! };
+//! assert_eq(got, "text hi");
+//!
+//! // Nothing is ready: the timer fires first.
+//! let got = select {
+//!     n = num_rx.recv() => Some(n.unwrap()),
+//!     _ = after(Duration::from_millis(10)).recv() => None,
+//! };
+//! assert_eq(got, None);
+//! # num_tx.close();
+//! ```
 
+/// An error returned from [`Sender::send`] when the channel is closed.
+///
+/// The channel is closed by [`Sender::close`], [`Receiver::close`], or the
+/// garbage collector once no `Receiver` is left. The error contains the value
+/// that could not be sent, as its public field `0`.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::{channel, SendError};
+///
+/// let (tx, rx) = channel();
+/// rx.close();
+/// let err = tx.send(String::from("lost")).unwrap_err();
+/// assert_eq(err, SendError(String::from("lost")));
+/// assert_eq(err.0, "lost");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendError<T>(pub T);
 
+/// An error returned from [`Receiver::recv`] when the channel is closed and
+/// empty.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::{channel, RecvError};
+///
+/// let (tx, rx) = channel();
+/// tx.send(1).unwrap();
+/// tx.close();
+/// assert_eq(rx.recv(), Ok(1));
+/// assert_eq(rx.recv(), Err(RecvError));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecvError;
 
+/// This enumeration is the list of the possible reasons that
+/// [`Receiver::try_recv`] could not return data when called.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::{channel, TryRecvError};
+///
+/// let (tx, rx) = channel::<i32>();
+/// assert_eq(rx.try_recv(), Err(TryRecvError::Empty));
+/// tx.close();
+/// assert_eq(rx.try_recv(), Err(TryRecvError::Disconnected));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TryRecvError {
+    /// This channel is currently empty, but it is not closed, so data may yet
+    /// become available.
     Empty,
+    /// The channel is closed and empty: no data will ever arrive.
     Disconnected,
 }
 
-/// Why try_send did not send (the value back).
+/// This enumeration is the list of the possible error outcomes for
+/// [`Sender::try_send`].
+///
+/// Both variants give back the value that was not sent.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::{sync_channel, TrySendError};
+///
+/// let (tx, rx) = sync_channel(1);
+/// tx.try_send(1).unwrap();
+/// assert_eq(tx.try_send(2), Err(TrySendError::Full(2)));
+/// rx.close();
+/// assert_eq(tx.try_send(3), Err(TrySendError::Disconnected(3)));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrySendError<T> {
-    /// A bounded channel with no room (an unbuffered one: no receiver
-    /// waiting).
+    /// The data could not be sent because a bounded channel has no room for it
+    /// (or, in an unbuffered one, no receiver is waiting for it).
     Full(T),
-    /// The channel is closed.
+    /// The channel is closed, so the data could not be sent.
     Disconnected(T),
 }
 
 impl<T> TrySendError<T> {
-    /// The value that was not sent.
+    /// Returns the value that was not sent.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::sync_channel;
+    ///
+    /// let (tx, _rx) = sync_channel(0);
+    /// let err = tx.try_send(String::from("hello")).unwrap_err();
+    /// assert_eq(err.into_inner(), "hello");
+    /// ```
     pub fn into_inner(self) -> T {
         match self {
             TrySendError::Full(v) => v,
@@ -32,6 +195,20 @@ impl<T> TrySendError<T> {
         }
     }
 
+    /// Returns `true` if this error is [`TrySendError::Full`]: the channel had
+    /// no room.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::sync_channel;
+    ///
+    /// let (tx, rx) = sync_channel(1);
+    /// tx.send(1).unwrap();
+    /// assert(tx.try_send(2).unwrap_err().is_full());
+    /// rx.close();
+    /// assert(!tx.try_send(3).unwrap_err().is_full());
+    /// ```
     pub fn is_full(&self) -> bool {
         match self {
             TrySendError::Full(_) => true,
@@ -39,6 +216,20 @@ impl<T> TrySendError<T> {
         }
     }
 
+    /// Returns `true` if this error is [`TrySendError::Disconnected`]: the
+    /// channel is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, _rx) = channel();
+    /// tx.close();
+    /// let err = tx.try_send(1).unwrap_err();
+    /// assert(err.is_disconnected());
+    /// assert_eq(err.to_string(), "sending on a closed channel");
+    /// ```
     pub fn is_disconnected(&self) -> bool {
         !self.is_full()
     }
@@ -54,11 +245,27 @@ impl<T> crate::fmt::Display for TrySendError<T> {
     }
 }
 
-/// Why recv_timeout or recv_deadline gave no value.
+/// This enumeration is the list of possible errors that made
+/// [`Receiver::recv_timeout`] or [`Receiver::recv_deadline`] unable to return
+/// data when called.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::{channel, RecvTimeoutError};
+/// use std::time::Duration;
+///
+/// let (tx, rx) = channel::<i32>();
+/// let wait = Duration::from_millis(1);
+/// assert_eq(rx.recv_timeout(wait), Err(RecvTimeoutError::Timeout));
+/// tx.close();
+/// assert_eq(rx.recv_timeout(wait), Err(RecvTimeoutError::Disconnected));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecvTimeoutError {
+    /// No value came before the timeout or deadline; the channel is still open.
     Timeout,
-    /// Closed and empty.
+    /// The channel is closed and empty: no data will ever arrive.
     Disconnected,
 }
 
@@ -72,15 +279,46 @@ impl crate::fmt::Display for RecvTimeoutError {
     }
 }
 
-/// Why send_timeout or send_deadline did not send (the value back).
+/// An error returned from [`Sender::send_timeout`] or
+/// [`Sender::send_deadline`].
+///
+/// Both variants give back the value that was not sent.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::{sync_channel, SendTimeoutError};
+/// use std::time::Duration;
+///
+/// let (tx, rx) = sync_channel(1);
+/// tx.send(1).unwrap();
+/// let wait = Duration::from_millis(1);
+/// assert_eq(tx.send_timeout(2, wait), Err(SendTimeoutError::Timeout(2)));
+/// rx.close();
+/// assert_eq(tx.send_timeout(3, wait), Err(SendTimeoutError::Disconnected(3)));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendTimeoutError<T> {
+    /// The channel had no room (or, unbuffered, no receiver) before the timeout
+    /// or deadline.
     Timeout(T),
+    /// The channel is closed, so the data could not be sent.
     Disconnected(T),
 }
 
 impl<T> SendTimeoutError<T> {
-    /// The value that was not sent.
+    /// Returns the value that was not sent.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::sync_channel;
+    /// use std::time::Duration;
+    ///
+    /// let (tx, _rx) = sync_channel(0);
+    /// let err = tx.send_timeout(7, Duration::from_millis(1)).unwrap_err();
+    /// assert_eq(err.into_inner(), 7);
+    /// ```
     pub fn into_inner(self) -> T {
         match self {
             SendTimeoutError::Timeout(v) => v,
@@ -100,6 +338,34 @@ impl<T> crate::fmt::Display for SendTimeoutError<T> {
 
 // Channels are shared and mutated through &self; the handles hold a raw
 // pointer to the runtime's channel (the GC traces raw pointers).
+/// The sending half of a channel, made by [`channel`] or [`sync_channel`].
+///
+/// Values are sent with [`Sender::send`] and its variants. A `Sender` is a
+/// handle: its copies and clones refer to the same channel, and threads can
+/// share it (or a `&Sender<T>`).
+///
+/// Unlike Rust's, the channel does not close when the senders go away (navi has
+/// no Drop): call [`Sender::close`] once every value is sent, so that receivers
+/// stop waiting.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::channel;
+/// use std::thread;
+///
+/// let (tx, rx) = channel();
+/// let tx2 = tx.clone();
+/// let a = thread::spawn(|| tx.send(1).unwrap());
+/// let b = thread::spawn(|| tx2.send(2).unwrap());
+/// a.join().unwrap();
+/// b.join().unwrap();
+/// tx.close();
+///
+/// let mut got: Vec<i32> = rx.iter().collect();
+/// got.sort();
+/// assert_eq(got, Vec::from([1, 2]));
+/// ```
 pub struct Sender<T> {
     chan: *mut u8,
     marker: Option<T>,
@@ -107,6 +373,37 @@ pub struct Sender<T> {
 // (side: what every Receiver of a channel with senders refers to; when the
 // collector finds none, the channel closes from the receiving side, as
 // Rust's does when its last Receiver is dropped.)
+/// The receiving half of a channel, made by [`channel`] or [`sync_channel`].
+///
+/// Values are received with [`Receiver::recv`] and its variants, or iterated
+/// with [`Receiver::iter`]. A `Receiver` is a handle: its copies and clones
+/// refer to the same channel, and several threads can receive from it at once,
+/// each value going to one of them.
+///
+/// When no `Receiver` of a channel is referenced any more, the garbage
+/// collector closes the channel, and its senders get errors; that happens at
+/// the next collection, so call [`Receiver::close`] to close it at once.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::channel;
+/// use std::thread;
+///
+/// let (tx, rx) = channel();
+/// let worker = thread::spawn(|| {
+///     let mut n = 0;
+///     while let Ok(v) = rx.recv() {
+///         n += v;
+///     }
+///     n
+/// });
+/// for i in 1..=10 {
+///     tx.send(i).unwrap();
+/// }
+/// tx.close();
+/// assert_eq(worker.join().unwrap(), 55);
+/// ```
 pub struct Receiver<T> {
     chan: *mut u8,
     marker: Option<T>,
@@ -127,7 +424,35 @@ fn recv_side(c: *mut u8) -> Option<&RecvSide> {
     Some(s)
 }
 
-/// An unbounded channel.
+/// Creates a new unbounded channel, returning the sender/receiver halves.
+///
+/// All data sent on the [`Sender`] will become available on the [`Receiver`] in
+/// the same order as it was sent, and no [`Sender::send`] will block the
+/// calling thread (this channel has an "infinite buffer"). [`Receiver::recv`]
+/// will block until a message is available while the channel is open.
+///
+/// Both halves can be cloned and shared between threads. The channel stays open
+/// until [`Sender::close`] or [`Receiver::close`] is called (or no `Receiver`
+/// is left).
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::channel;
+/// use std::thread;
+///
+/// let (sender, receiver) = channel();
+///
+/// // Spawn off an expensive computation
+/// thread::spawn(|| {
+///     sender.send(6 * 7).unwrap();
+/// });
+///
+/// // Do some useful work for a while
+///
+/// // Let's see what that answer was
+/// assert_eq(receiver.recv().unwrap(), 42);
+/// ```
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let c = crate::rt::chan_new::<T>(18446744073709551615);
     (
@@ -143,7 +468,35 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     )
 }
 
-/// A bounded channel; capacity 0 makes every send wait for a receiver.
+/// Creates a new bounded (synchronous) channel, returning the sender/receiver
+/// halves.
+///
+/// All data sent on the [`Sender`] will become available on the [`Receiver`] in
+/// the same order as it was sent. The channel holds up to `bound` values:
+/// [`Sender::send`] blocks while it is full. A `bound` of 0 makes the channel a
+/// "rendezvous" channel: every send waits until a receiver takes the value.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::sync_channel;
+/// use std::thread;
+///
+/// let (sender, receiver) = sync_channel(1);
+///
+/// // this returns immediately
+/// sender.send(1).unwrap();
+///
+/// thread::spawn(|| {
+///     // this will block until the previous message has been received
+///     sender.send(2).unwrap();
+///     sender.close();
+/// });
+///
+/// assert_eq(receiver.recv().unwrap(), 1);
+/// assert_eq(receiver.recv().unwrap(), 2);
+/// assert(receiver.recv().is_err());
+/// ```
 pub fn sync_channel<T>(bound: usize) -> (Sender<T>, Receiver<T>) {
     let c = crate::rt::chan_new::<T>(bound);
     (
@@ -160,6 +513,32 @@ pub fn sync_channel<T>(bound: usize) -> (Sender<T>, Receiver<T>) {
 }
 
 impl<T> Sender<T> {
+    /// Sends a value on this channel.
+    ///
+    /// On an unbounded channel this never blocks. On a bounded one it waits
+    /// while the channel is full, and on an unbuffered one (a bound of 0) until
+    /// a receiver takes the value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SendError(value))`, giving the value back, if the channel
+    /// is closed: by [`Sender::close`] (Go panics there), by
+    /// [`Receiver::close`], or because no `Receiver` was left. A successful
+    /// send does not mean the value will be received: the channel may be closed
+    /// from the receiving side before that.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, SendError};
+    ///
+    /// let (tx, rx) = channel();
+    /// assert_eq(tx.send(1), Ok(()));
+    /// assert_eq(rx.recv(), Ok(1));
+    ///
+    /// rx.close();
+    /// assert_eq(tx.send(2), Err(SendError(2)));
+    /// ```
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         if crate::rt::chan_send(self.chan, value) {
             Ok(())
@@ -168,9 +547,32 @@ impl<T> Sender<T> {
         }
     }
 
-    /// Sends value if that does not wait (as Go's select with a default
-    /// case): Err(Full) if there is no room (in an unbuffered channel no
-    /// receiver waiting), Err(Disconnected) if the channel is closed.
+    /// Attempts to send a value on this channel without blocking.
+    ///
+    /// This is Go's `select` with a default case: the value is sent if there is
+    /// room in the channel (or, in an unbuffered one, a receiver waiting for
+    /// it).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrySendError::Full`] if the channel has no room (in an
+    /// unbuffered channel, no receiver waiting) and
+    /// [`TrySendError::Disconnected`] if it is closed; both give back the
+    /// value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{sync_channel, TrySendError};
+    ///
+    /// let (tx, rx) = sync_channel(1);
+    /// assert_eq(tx.try_send(1), Ok(()));
+    /// assert_eq(tx.try_send(2), Err(TrySendError::Full(2)));
+    /// assert_eq(rx.recv(), Ok(1));
+    /// assert_eq(tx.try_send(3), Ok(()));
+    /// tx.close();
+    /// assert_eq(tx.try_send(4), Err(TrySendError::Disconnected(4)));
+    /// ```
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         let mut sent = false;
         select {
@@ -187,8 +589,34 @@ impl<T> Sender<T> {
         }
     }
 
-    /// send, waiting at most timeout for room (in an unbuffered channel, for
-    /// a receiver).
+    /// Waits for room in the channel (in an unbuffered one, for a receiver), at
+    /// most `timeout`, and sends the value.
+    ///
+    /// If there is room already, the value is sent at once, even with a zero
+    /// timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendTimeoutError::Timeout`] if there was no room in time and
+    /// [`SendTimeoutError::Disconnected`] if the channel is closed; both give
+    /// back the value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{sync_channel, SendTimeoutError};
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// let (tx, rx) = sync_channel(0);
+    /// // Nobody receives:
+    /// let r = tx.send_timeout(1, Duration::from_millis(10));
+    /// assert_eq(r, Err(SendTimeoutError::Timeout(1)));
+    ///
+    /// let receiver = thread::spawn(|| rx.recv().unwrap());
+    /// assert_eq(tx.send_timeout(2, Duration::from_secs(3600)), Ok(()));
+    /// assert_eq(receiver.join().unwrap(), 2);
+    /// ```
     pub fn send_timeout(
         &self,
         value: T,
@@ -197,7 +625,31 @@ impl<T> Sender<T> {
         self.send_deadline(value, crate::time::Instant::now() + timeout)
     }
 
-    /// send, waiting until deadline at most.
+    /// Waits for room in the channel (in an unbuffered one, for a receiver)
+    /// until `deadline` at most, and sends the value.
+    ///
+    /// If there is room already, the value is sent at once, even if the
+    /// deadline has passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendTimeoutError::Timeout`] if there was no room by the
+    /// deadline and [`SendTimeoutError::Disconnected`] if the channel is
+    /// closed; both give back the value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{sync_channel, SendTimeoutError};
+    /// use std::time::{Duration, Instant};
+    ///
+    /// let (tx, rx) = sync_channel(1);
+    /// let deadline = Instant::now() + Duration::from_millis(10);
+    /// assert_eq(tx.send_deadline(1, deadline), Ok(()));
+    /// // The channel is full until the deadline:
+    /// assert_eq(tx.send_deadline(2, deadline), Err(SendTimeoutError::Timeout(2)));
+    /// assert_eq(rx.recv(), Ok(1));
+    /// ```
     pub fn send_deadline(
         &self,
         value: T,
@@ -219,31 +671,120 @@ impl<T> Sender<T> {
         }
     }
 
-    /// Closes the channel: receivers get Err once it is empty.
+    /// Closes the channel: no more values can be sent.
+    ///
+    /// This is navi's replacement for dropping every `Sender` (there is no
+    /// Drop). It closes the channel for all of its senders, not only this one:
+    /// when several threads send, close it once they are all done. Receivers
+    /// still get the values already in the channel; after that
+    /// [`Receiver::recv`] returns `Err` and [`Receiver::iter`] ends, and
+    /// waiting receivers are woken. Sending on a closed channel returns an
+    /// error. Closing it again does nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel();
+    /// tx.send(1).unwrap();
+    /// tx.send(2).unwrap();
+    /// tx.close();
+    /// assert(tx.send(3).is_err());
+    /// let got: Vec<i32> = rx.iter().collect();
+    /// assert_eq(got, Vec::from([1, 2]));
+    /// ```
     pub fn close(&self) {
         crate::rt::chan_close(self.chan);
     }
 
-    /// The values in the channel.
+    /// Returns the number of values in the channel (sent and not yet received).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel();
+    /// tx.send(1).unwrap();
+    /// tx.send(2).unwrap();
+    /// assert_eq(tx.len(), 2);
+    /// rx.recv().unwrap();
+    /// assert_eq(tx.len(), 1);
+    /// ```
     pub fn len(&self) -> usize {
         chan_len(self.chan)
     }
 
+    /// Returns `true` if the channel holds no value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, _rx) = channel();
+    /// assert(tx.is_empty());
+    /// tx.send(0).unwrap();
+    /// assert(!tx.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Whether a bounded channel has no room (an unbuffered one always).
+    /// Returns `true` if the channel has no room: a bounded channel holding as
+    /// many values as its bound.
+    ///
+    /// An unbuffered channel (a bound of 0) is always full; an unbounded one
+    /// never is.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, sync_channel};
+    ///
+    /// let (tx, _rx) = sync_channel(1);
+    /// assert(!tx.is_full());
+    /// tx.send(0).unwrap();
+    /// assert(tx.is_full());
+    ///
+    /// let (tx, _rx) = channel();
+    /// tx.send(0).unwrap();
+    /// assert(!tx.is_full());
+    /// ```
     pub fn is_full(&self) -> bool {
         chan_full(self.chan)
     }
 
-    /// The bound (None: unbounded).
+    /// Returns the channel's bound: `Some(bound)` for a channel made by
+    /// [`sync_channel`], `None` for an unbounded one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, sync_channel};
+    ///
+    /// let (tx, _rx) = sync_channel::<i32>(8);
+    /// assert_eq(tx.capacity(), Some(8));
+    /// let (tx, _rx) = channel::<i32>();
+    /// assert_eq(tx.capacity(), None);
+    /// ```
     pub fn capacity(&self) -> Option<usize> {
         chan_capacity(self.chan)
     }
 
-    /// Whether other is a handle of the same channel.
+    /// Returns `true` if `other` is a sender of the same channel.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx1, _) = channel::<i32>();
+    /// let (tx2, _) = channel::<i32>();
+    /// assert(tx1.same_channel(&tx1.clone()));
+    /// assert(!tx1.same_channel(&tx2));
+    /// ```
     pub fn same_channel(&self, other: &Sender<T>) -> bool {
         self.chan as usize == other.chan as usize
     }
@@ -279,6 +820,35 @@ impl<T> Clone for Sender<T> {
 }
 
 impl<T> Receiver<T> {
+    /// Attempts to wait for a value on this channel, returning an error if the
+    /// channel is closed and empty.
+    ///
+    /// This function will always block the current thread if there is no data
+    /// available and the channel is open. Once a value is sent, one of the
+    /// waiting receivers gets it. After the channel is closed
+    /// ([`Sender::close`] or [`Receiver::close`]), the values still in it are
+    /// received first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecvError`] if the channel is closed and empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, RecvError};
+    /// use std::thread;
+    ///
+    /// let (tx, rx) = channel();
+    /// let handle = thread::spawn(|| {
+    ///     tx.send(1).unwrap();
+    ///     tx.close();
+    /// });
+    /// handle.join().unwrap();
+    ///
+    /// assert_eq(rx.recv(), Ok(1));
+    /// assert_eq(rx.recv(), Err(RecvError));
+    /// ```
     pub fn recv(&self) -> Result<T, RecvError> {
         match crate::rt::chan_recv::<T>(self.chan) {
             Some(v) => Ok(v),
@@ -286,6 +856,25 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// Attempts to return a pending value on this receiver without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryRecvError::Empty`] if there is no value now but the channel
+    /// is open, and [`TryRecvError::Disconnected`] if it is closed and empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, TryRecvError};
+    ///
+    /// let (tx, rx) = channel();
+    /// assert_eq(rx.try_recv(), Err(TryRecvError::Empty));
+    /// tx.send(1).unwrap();
+    /// tx.close();
+    /// assert_eq(rx.try_recv(), Ok(1));
+    /// assert_eq(rx.try_recv(), Err(TryRecvError::Disconnected));
+    /// ```
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         match crate::rt::chan_try_recv::<T>(self.chan) {
             Some(v) => Ok(v),
@@ -299,12 +888,60 @@ impl<T> Receiver<T> {
         }
     }
 
-    /// recv, waiting at most timeout.
+    /// Attempts to wait for a value on this receiver, returning an error if the
+    /// channel is closed and empty or if it waits more than `timeout`.
+    ///
+    /// A value already in the channel is returned at once, even with a zero
+    /// timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecvTimeoutError::Timeout`] if no value came in time and
+    /// [`RecvTimeoutError::Disconnected`] if the channel is closed and empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, RecvTimeoutError};
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// let (tx, rx) = channel();
+    /// assert_eq(rx.recv_timeout(Duration::from_millis(10)), Err(RecvTimeoutError::Timeout));
+    ///
+    /// thread::spawn(|| tx.send('a').unwrap());
+    /// assert_eq(rx.recv_timeout(Duration::from_secs(3600)), Ok('a'));
+    /// ```
     pub fn recv_timeout(&self, timeout: crate::time::Duration) -> Result<T, RecvTimeoutError> {
         self.recv_deadline(crate::time::Instant::now() + timeout)
     }
 
-    /// recv, waiting until deadline at most.
+    /// Attempts to wait for a value on this receiver, returning an error if the
+    /// channel is closed and empty or if `deadline` is reached.
+    ///
+    /// A value already in the channel is returned at once, even if the deadline
+    /// has passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecvTimeoutError::Timeout`] if no value came by the deadline
+    /// and [`RecvTimeoutError::Disconnected`] if the channel is closed and
+    /// empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, RecvTimeoutError};
+    /// use std::time::{Duration, Instant};
+    ///
+    /// let (tx, rx) = channel();
+    /// let deadline = Instant::now() + Duration::from_millis(10);
+    /// assert_eq(rx.recv_deadline(deadline), Err(RecvTimeoutError::Timeout));
+    ///
+    /// tx.send(5).unwrap();
+    /// // The deadline has passed, but a value is there.
+    /// assert_eq(rx.recv_deadline(deadline), Ok(5));
+    /// ```
     pub fn recv_deadline(&self, deadline: crate::time::Instant) -> Result<T, RecvTimeoutError> {
         let d = if deadline.mono_nanos() == 0 {
             1
@@ -323,39 +960,159 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// Returns an iterator that will block waiting for values, ending when the
+    /// channel is closed and empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    /// use std::thread;
+    ///
+    /// let (send, recv) = channel();
+    /// thread::spawn(|| {
+    ///     send.send(1).unwrap();
+    ///     send.send(2).unwrap();
+    ///     send.send(3).unwrap();
+    ///     send.close();
+    /// });
+    ///
+    /// let got: Vec<i32> = recv.iter().collect();
+    /// assert_eq(got, Vec::from([1, 2, 3]));
+    /// ```
     pub fn iter(&self) -> Iter<T> {
         Iter { rx: self.clone() }
     }
 
-    /// The values there are now, without waiting.
+    /// Returns an iterator over the values in the channel now, without waiting.
+    ///
+    /// It ends at the first [`Receiver::try_recv`] that fails: once the channel
+    /// is empty (or closed and empty).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel();
+    /// tx.send(1).unwrap();
+    /// tx.send(2).unwrap();
+    /// let got: Vec<i32> = rx.try_iter().collect();
+    /// assert_eq(got, Vec::from([1, 2]));
+    /// // The channel is open but empty: the iterator ends at once.
+    /// assert_eq(rx.try_iter().count(), 0);
+    /// ```
     pub fn try_iter(&self) -> TryIter<T> {
         TryIter { rx: self.clone() }
     }
 
-    /// Closes the channel from the receiving side (as all of Rust's
-    /// Receivers dropped; navi has no Drop): its values are dropped,
-    /// senders get Disconnected, receivers Err. Without it, senders find
-    /// out once the collector finds no Receiver left.
+    /// Closes the channel from the receiving side.
+    ///
+    /// This is navi's replacement for dropping every `Receiver` (there is no
+    /// Drop). The values still in the channel are dropped; senders get errors
+    /// (`Disconnected`, and waiting senders are woken), and receivers get
+    /// `Err`. Without it, the senders find out only once the garbage collector
+    /// finds that no `Receiver` is left.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, TryRecvError};
+    ///
+    /// let (tx, rx) = channel();
+    /// tx.send(1).unwrap();
+    /// rx.close();
+    /// assert(tx.send(2).is_err());
+    /// assert_eq(rx.try_recv(), Err(TryRecvError::Disconnected));
+    /// ```
     pub fn close(&self) {
         crate::rt::sched::close_recv(self.chan as *mut crate::rt::sched::Chan);
     }
 
+    /// Returns the number of values in the channel (sent and not yet received).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel();
+    /// tx.send(1).unwrap();
+    /// tx.send(2).unwrap();
+    /// assert_eq(rx.len(), 2);
+    /// rx.recv().unwrap();
+    /// assert_eq(rx.len(), 1);
+    /// ```
     pub fn len(&self) -> usize {
         chan_len(self.chan)
     }
 
+    /// Returns `true` if the channel holds no value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel();
+    /// assert(rx.is_empty());
+    /// tx.send(0).unwrap();
+    /// assert(!rx.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns `true` if the channel has no room: a bounded channel holding as
+    /// many values as its bound.
+    ///
+    /// An unbuffered channel (a bound of 0) is always full; an unbounded one
+    /// never is.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::sync_channel;
+    ///
+    /// let (tx, rx) = sync_channel(2);
+    /// tx.send(1).unwrap();
+    /// assert(!rx.is_full());
+    /// tx.send(2).unwrap();
+    /// assert(rx.is_full());
+    /// ```
     pub fn is_full(&self) -> bool {
         chan_full(self.chan)
     }
 
+    /// Returns the channel's bound: `Some(bound)` for a channel made by
+    /// [`sync_channel`], `None` for an unbounded one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::{channel, sync_channel};
+    ///
+    /// let (_tx, rx) = sync_channel::<i32>(0);
+    /// assert_eq(rx.capacity(), Some(0));
+    /// let (_tx, rx) = channel::<i32>();
+    /// assert_eq(rx.capacity(), None);
+    /// ```
     pub fn capacity(&self) -> Option<usize> {
         chan_capacity(self.chan)
     }
 
+    /// Returns `true` if `other` is a receiver of the same channel.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (_, rx1) = channel::<i32>();
+    /// let (_, rx2) = channel::<i32>();
+    /// assert(rx1.same_channel(&rx1.clone()));
+    /// assert(!rx1.same_channel(&rx2));
+    /// ```
     pub fn same_channel(&self, other: &Receiver<T>) -> bool {
         self.chan as usize == other.chan as usize
     }
@@ -388,6 +1145,27 @@ impl<T> Clone for Receiver<T> {
     }
 }
 
+/// An iterator over values on a [`Receiver`], created by [`Receiver::iter`].
+///
+/// Each call to `next` waits for a value; the iterator ends when the channel is
+/// closed and empty.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::channel;
+///
+/// let (tx, rx) = channel();
+/// for i in 0..3 {
+///     tx.send(i).unwrap();
+/// }
+/// tx.close();
+/// let mut sum = 0;
+/// for v in rx.iter() {
+///     sum += v;
+/// }
+/// assert_eq(sum, 3);
+/// ```
 pub struct Iter<T> {
     rx: Receiver<T>,
 }
@@ -398,6 +1176,22 @@ impl<T> Iterator for Iter<T> {
     }
 }
 
+/// An iterator that takes the values available on a [`Receiver`] without
+/// waiting, created by [`Receiver::try_iter`].
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::channel;
+///
+/// let (tx, rx) = channel();
+/// tx.send(10).unwrap();
+/// tx.send(20).unwrap();
+/// let mut it = rx.try_iter();
+/// assert_eq(it.next(), Some(10));
+/// assert_eq(it.next(), Some(20));
+/// assert_eq(it.next(), None);
+/// ```
 pub struct TryIter<T> {
     rx: Receiver<T>,
 }
@@ -408,7 +1202,11 @@ impl<T> Iterator for TryIter<T> {
     }
 }
 
-/// One case of a select statement (built by the compiler).
+/// One case of a `select` statement, built by the compiler.
+///
+/// It is an implementation detail of `select`, public because the code the
+/// compiler generates uses it: write a `select` statement instead (see
+/// [`crate::sync::mpmc`]).
 pub struct SelectCase {
     send: bool,
     chan: *mut u8,
@@ -426,8 +1224,29 @@ pub(crate) fn select_case_send(c: &SelectCase) -> bool {
     c.send
 }
 
-/// Runs a select statement; returns the index of the case that ran
-/// (cases.len() for the default case).
+/// Runs a `select` statement: waits until one of `cases` can proceed, runs it,
+/// and returns its index (`cases.len()` for the default case, when
+/// `has_default` is true and no case is ready).
+///
+/// It is called by the code the compiler generates for `select`; write a
+/// `select` statement instead.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpmc::sync_channel;
+///
+/// let (tx, rx) = sync_channel::<i32>(1);
+/// let mut log = Vec::new();
+/// for i in 0..3 {
+///     // Sends while there is room, receives otherwise.
+///     select {
+///         tx.send(i) => log.push(`sent ${i}`.to_string()),
+///         v = rx.recv() => log.push(`received ${v.unwrap()}`.to_string()),
+///     }
+/// }
+/// assert_eq(log.join(", "), "sent 0, received 0, sent 2");
+/// ```
 pub fn select_cases(cases: &[SelectCase], has_default: bool) -> usize {
     crate::rt::select_cases(cases, has_default)
 }

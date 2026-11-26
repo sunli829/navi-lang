@@ -2,9 +2,47 @@
 
 use crate::io::{self, BufRead, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 
-/// Bytes in memory (a Vec<u8>, a &[u8], ...) with a position. A Vec is a
-/// reference type in navi: a Cursor<Vec<u8>> writes into the Vec it was
-/// made from.
+/// A `Cursor` wraps an in-memory buffer and provides it with a [`Seek`]
+/// implementation.
+///
+/// Cursors are used with in-memory buffers, anything implementing `AsRef<[u8]>`
+/// (a `Vec<u8>`, a `&[u8]`, a byte string `&[u8; N]`, ...), to allow them to
+/// implement [`Read`] and [`BufRead`], and, for `Vec<u8>`, `&mut Vec<u8>` and
+/// `&mut [u8]`, [`Write`]. The cursor keeps a position, which reads and writes
+/// advance and [`Seek`] moves.
+///
+/// A common use of cursors is to test code that does I/O: a function generic
+/// over `Read` or `Write` can be given a cursor instead of a file or a socket.
+///
+/// A `Vec` is a reference type in navi (copies of it share the same contents):
+/// a `Cursor<Vec<u8>>` writes into the very `Vec` it was made from, where
+/// Rust's cursor owns its own.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+///
+/// // A function that writes a header to any seekable writer: a file, or a cursor in a test.
+/// fn write_header<W: Write + Seek>(w: &mut W) -> std::io::Result<()> {
+///     w.seek(SeekFrom::Start(2))?;
+///     w.write_all(b"HDR")?;
+///     Ok(())
+/// }
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut buff = Cursor::new(Vec::new());
+///     write_header(&mut buff)?;
+///     // Writing past the end filled the gap with zeros.
+///     assert_eq(buff.get_ref().clone(), Vec::from([0u8, 0, b'H', b'D', b'R']));
+///
+///     buff.set_position(2);
+///     let mut text = String::new();
+///     buff.read_to_string(&mut text)?;
+///     assert_eq(text, "HDR");
+///     Ok(())
+/// }
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct Cursor<T> {
     inner: T,
@@ -12,28 +50,147 @@ pub struct Cursor<T> {
 }
 
 impl<T> Cursor<T> {
+    /// Creates a new cursor wrapping the provided underlying in-memory buffer.
+    ///
+    /// The cursor's position starts at 0. A `Cursor<Vec<u8>>` shares the `Vec`
+    /// it is given: what is written through the cursor shows in it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let data: Vec<u8> = Vec::new();
+    ///     let mut cursor = Cursor::new(data);
+    ///     cursor.write_all(b"shared")?;
+    ///     // The Vec is a shared handle: it sees the write.
+    ///     assert_eq(data, b"shared".to_vec());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn new(inner: T) -> Cursor<T> {
         Cursor { inner, pos: 0 }
     }
+    /// Consumes this cursor, returning the underlying value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut cursor = Cursor::new(Vec::new());
+    ///     cursor.write_all(b"done")?;
+    ///     let vec = cursor.into_inner();
+    ///     assert_eq(vec, b"done".to_vec());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn into_inner(self) -> T {
         self.inner
     }
+    /// Gets a reference to the underlying value in this cursor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    ///
+    /// let cursor = Cursor::new(Vec::from([1u8, 2, 3]));
+    /// assert_eq(cursor.get_ref().len(), 3);
+    /// ```
     pub fn get_ref(&self) -> &T {
         &self.inner
     }
+    /// Gets a mutable reference to the underlying value in this cursor.
+    ///
+    /// Care should be taken to avoid modifying the internal I/O state of the
+    /// underlying value as it may corrupt this cursor's position.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Read};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut cursor = Cursor::new(Vec::from([1u8, 2]));
+    ///     cursor.get_mut().push(3);
+    ///     let mut all = Vec::new();
+    ///     cursor.read_to_end(&mut all)?;
+    ///     assert_eq(all, Vec::from([1u8, 2, 3]));
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
     }
+    /// Returns the current position of this cursor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Seek, SeekFrom};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut buff = Cursor::new(Vec::from([1u8, 2, 3, 4, 5]));
+    ///     assert_eq(buff.position(), 0);
+    ///
+    ///     buff.seek(SeekFrom::Current(2))?;
+    ///     assert_eq(buff.position(), 2);
+    ///
+    ///     buff.seek(SeekFrom::Current(-1))?;
+    ///     assert_eq(buff.position(), 1);
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn position(&self) -> u64 {
         self.pos
     }
+    /// Sets the position of this cursor.
+    ///
+    /// The position may be past the end of the data: reads there return
+    /// nothing, and a write to a `Vec` there fills the gap with zeros.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    ///
+    /// let mut buff = Cursor::new(Vec::from([1u8, 2, 3, 4, 5]));
+    /// assert_eq(buff.position(), 0);
+    ///
+    /// buff.set_position(2);
+    /// assert_eq(buff.position(), 2);
+    ///
+    /// buff.set_position(4);
+    /// assert_eq(buff.position(), 4);
+    /// ```
     pub fn set_position(&mut self, pos: u64) {
         self.pos = pos;
     }
 }
 
 impl<T: AsRef<[u8]>> Cursor<T> {
-    /// The bytes from the position on.
+    /// Returns the remaining slice: the bytes from the position on.
+    ///
+    /// It is empty when the position is at or past the end. (Rust's is
+    /// unstable.)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    ///
+    /// let mut buff = Cursor::new(Vec::from([1u8, 2, 3, 4, 5]));
+    /// assert_eq(buff.remaining_slice(), [1u8, 2, 3, 4, 5].as_slice());
+    ///
+    /// buff.set_position(2);
+    /// assert_eq(buff.remaining_slice(), [3u8, 4, 5].as_slice());
+    ///
+    /// buff.set_position(10);
+    /// assert(buff.remaining_slice().is_empty());
+    /// ```
     pub fn remaining_slice(&self) -> &[u8] {
         let data = self.inner.as_ref();
         let start = if self.pos > data.len() as u64 {
@@ -44,6 +201,25 @@ impl<T: AsRef<[u8]>> Cursor<T> {
         &data[start..]
     }
 
+    /// Returns `true` if the remaining slice is empty: the position is at or
+    /// past the end.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    ///
+    /// let mut buff = Cursor::new(Vec::from([1u8, 2, 3, 4, 5]));
+    ///
+    /// buff.set_position(2);
+    /// assert(!buff.is_empty());
+    ///
+    /// buff.set_position(5);
+    /// assert(buff.is_empty());
+    ///
+    /// buff.set_position(10);
+    /// assert(buff.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.pos >= self.inner.as_ref().len() as u64
     }
@@ -72,6 +248,9 @@ impl<T: AsRef<[u8]>> BufRead for Cursor<T> {
     }
 }
 
+/// Seeking a cursor only moves its position: [`SeekFrom::Start`] never fails,
+/// and a position past the end is allowed; a position before 0 is an
+/// [`ErrorKind::InvalidInput`] error.
 impl<T: AsRef<[u8]>> Seek for Cursor<T> {
     fn seek(&mut self, style: SeekFrom) -> io::Result<u64> {
         let (base, off) = match style {
@@ -113,6 +292,9 @@ fn vec_write(v: &mut Vec<u8>, pos: &mut u64, buf: &[u8]) -> usize {
     buf.len()
 }
 
+/// Writing overwrites the bytes at the position and grows the `Vec` as needed
+/// (zero-filled if the position is past its end). The `Vec` is shared with the
+/// one the cursor was made from.
 impl Write for Cursor<Vec<u8>> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         Ok(vec_write(&mut self.inner, &mut self.pos, buf))
@@ -122,6 +304,8 @@ impl Write for Cursor<Vec<u8>> {
     }
 }
 
+/// Writing overwrites the bytes at the position and grows the `Vec` as needed
+/// (zero-filled if the position is past its end).
 impl Write for Cursor<&mut Vec<u8>> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         Ok(vec_write(self.inner, &mut self.pos, buf))
@@ -131,8 +315,28 @@ impl Write for Cursor<&mut Vec<u8>> {
     }
 }
 
+/// Writing overwrites the bytes of the slice at the position; the slice does
+/// not grow.
 impl Write for Cursor<&mut [u8]> {
     /// Writes what fits before the end of the slice.
+    ///
+    /// Returns how many bytes were written: `Ok(0)` once the slice is full, so
+    /// that [`Write::write_all`] fails with [`ErrorKind::WriteZero`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut storage = [0u8; 4];
+    ///     let mut cursor = Cursor::new(&mut storage[..]);
+    ///     assert_eq(cursor.write(b"abcdef")?, 4);
+    ///     assert_eq(cursor.write(b"gh")?, 0);
+    ///     assert_eq(storage, [b'a', b'b', b'c', b'd']);
+    ///     Ok(())
+    /// }
+    /// ```
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let len = self.inner.len();
         let at = if self.pos > len as u64 {

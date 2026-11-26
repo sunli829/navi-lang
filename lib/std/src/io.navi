@@ -1,5 +1,54 @@
-//! Input and output: printing, the Read, Write, BufRead and Seek traits,
-//! errors, buffering, cursors, standard streams and adapters.
+//! Traits, helpers, and type definitions for core I/O functionality.
+//!
+//! The `std::io` module contains a number of common things you'll need when
+//! doing input and output. The most core part of this module is the [`Read`]
+//! and [`Write`] traits, which provide the most general interface for reading
+//! and writing input and output; [`BufRead`] adds line-oriented reading on top
+//! of a buffer, and [`Seek`] moves the position of a stream.
+//!
+//! The module also has:
+//!
+//! - printing without macros: [`print`], [`println`], [`eprint`] and
+//!   [`eprintln`] (navi has no `println!`; these are in the prelude);
+//! - errors: [`Error`], [`ErrorKind`] and the [`Result`] alias;
+//! - buffering: [`BufReader`], [`BufWriter`] and [`LineWriter`];
+//! - [`Cursor`], which gives bytes in memory a position;
+//! - the standard streams: [`stdin`], [`stdout`] and [`stderr`];
+//! - adapters and helpers: [`copy`], [`read_to_string`], [`empty`], [`repeat`],
+//!   [`sink`], [`Read::take`], [`Read::chain`] and [`Read::bytes`].
+//!
+//! `use std::io::prelude::*;` imports the four traits.
+//!
+//! # Examples
+//!
+//! ```
+//! use std::io::prelude::*;
+//! use std::io::{BufReader, Cursor};
+//!
+//! fn main() -> std::io::Result<()> {
+//!     let input = Cursor::new(b"first line\nsecond line\n");
+//!     let mut lines = Vec::new();
+//!     for line in BufReader::new(input).lines() {
+//!         lines.push(line?);
+//!     }
+//!     assert_eq(lines, Vec::from(["first line".to_string(), "second line".to_string()]));
+//!
+//!     let mut out: Vec<u8> = Vec::new();
+//!     out.write_all(b"written")?;
+//!     assert_eq(out, b"written".to_vec());
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Differences from Rust
+//!
+//! navi has no Drop, so a [`BufWriter`] or [`LineWriter`] must be flushed by
+//! hand (with [`Write::flush`] or `into_inner`). [`Stdout`] is not buffered.
+//! [`Error`] carries a message (a string) rather than any error value, and
+//! [`ErrorKind`] is not `Copy`. A `Vec` is a shared handle, so a
+//! `Cursor<Vec<u8>>` writes into the very `Vec` it was made from. There is no
+//! `read_vectored`, `read_buf`, `IoSlice` or `Seek::stream_len`. See
+//! spec/std-diff.md.
 
 use crate::fmt::{self, Debug, Display, Formatter};
 use crate::string::String;
@@ -41,71 +90,248 @@ fn emit(fd: i32, value: impl Display, newline: bool) {
     crate::rt::native::write_out(fd, crate::rt::slice_ptr(b), b.len());
 }
 
+/// Prints a value to the standard output.
+///
+/// This is navi's `print!`: navi has no macros, so it takes one value that
+/// implements [`Display`], usually a template string. Nothing is added after
+/// the text; use [`println`] for a line. The text is formatted first and then
+/// written at once. Standard output is not buffered, so the text appears right
+/// away. Under `navi test`, the output of a test is captured.
+///
+/// Errors writing to the standard output are ignored (Rust's `print!` panics).
+///
+/// # Examples
+///
+/// ```
+/// let name = "world";
+/// std::io::print(`hello, ${name}`);
+/// std::io::print("!\n");
+/// ```
 pub fn print(value: impl Display) {
     emit(1, value, false);
 }
+/// Prints a value to the standard output, followed by a newline.
+///
+/// This is navi's `println!` (it is in the prelude): it takes one value that
+/// implements [`Display`], usually a template string, and writes it with a `\n`
+/// after it. Under `navi test`, the output of a test is captured.
+///
+/// Errors writing to the standard output are ignored (Rust's `println!`
+/// panics).
+///
+/// # Examples
+///
+/// ```
+/// let x = 5;
+/// println("hello");
+/// println(`x = ${x}, x + 1 = ${x + 1}`);
+/// ```
 pub fn println(value: impl Display) {
     emit(1, value, true);
 }
+/// Prints a value to the standard error.
+///
+/// This is navi's `eprint!`: as [`print`], but to the standard error. Nothing
+/// is added after the text; use [`eprintln`] for a line.
+///
+/// # Examples
+///
+/// ```
+/// std::io::eprint("warning: ");
+/// std::io::eprint("disk almost full\n");
+/// ```
 pub fn eprint(value: impl Display) {
     emit(2, value, false);
 }
+/// Prints a value to the standard error, followed by a newline.
+///
+/// This is navi's `eprintln!` (it is in the prelude): as [`println`], but to
+/// the standard error. Use it for errors and progress messages, so that they
+/// don't mix with the program's output.
+///
+/// # Examples
+///
+/// ```
+/// let path = "config.toml";
+/// eprintln(`error: could not read ${path}`);
+/// ```
 pub fn eprintln(value: impl Display) {
     emit(2, value, true);
 }
 
 // --- Errors -------------------------------------------------------------------------
 
-/// The category of an I/O error (Rust's list; Uncategorized stands for the
-/// OS errors no other kind fits).
+/// A list specifying general categories of I/O error.
+///
+/// This list is intended to grow over time and it is not recommended to
+/// exhaustively match against it. It is used with the [`Error`] type: see
+/// [`Error::kind`].
+///
+/// The list is Rust's. Unlike Rust's, navi's `ErrorKind` is not `Copy` (use
+/// `clone()`), its [`ErrorKind::as_str`] is public, and so is
+/// [`ErrorKind::Uncategorized`], which stands for the OS errors no other kind
+/// fits.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Error, ErrorKind};
+///
+/// let err = Error::new(ErrorKind::InvalidInput, "port out of range");
+/// match err.kind() {
+///     ErrorKind::NotFound => panic("not this one"),
+///     ErrorKind::InvalidInput => println(`bad input: ${err}`),
+///     _ => panic("nor this one"),
+/// }
+/// assert_eq(`${ErrorKind::NotFound}`.to_string(), "entity not found");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
+    /// An entity was not found, often a file.
     NotFound,
+    /// The operation lacked the necessary privileges to complete.
     PermissionDenied,
+    /// The connection was refused by the remote server.
     ConnectionRefused,
+    /// The connection was reset by the remote server.
     ConnectionReset,
+    /// The remote host is not reachable.
     HostUnreachable,
+    /// The network containing the remote host is not reachable.
     NetworkUnreachable,
+    /// The connection was aborted (terminated) by the remote server.
     ConnectionAborted,
+    /// The network operation failed because it was not connected yet.
     NotConnected,
+    /// A socket address could not be bound because the address is already in
+    /// use elsewhere.
     AddrInUse,
+    /// A nonexistent interface was requested or the requested address was not
+    /// local.
     AddrNotAvailable,
+    /// The system's networking is down.
     NetworkDown,
+    /// The operation failed because a pipe was closed.
     BrokenPipe,
+    /// An entity already exists, often a file.
     AlreadyExists,
+    /// The operation needs to block to complete, but the blocking operation was
+    /// requested to not occur.
     WouldBlock,
+    /// A filesystem object is, unexpectedly, not a directory.
+    ///
+    /// For example, a filesystem path was specified where one of the
+    /// intermediate directory components was, in fact, a plain file.
     NotADirectory,
+    /// The filesystem object is, unexpectedly, a directory.
+    ///
+    /// A directory was specified when a non-directory was expected.
     IsADirectory,
+    /// A non-empty directory was specified where an empty directory was
+    /// expected.
     DirectoryNotEmpty,
+    /// The filesystem or storage medium is read-only, but a write operation was
+    /// attempted.
     ReadOnlyFilesystem,
+    /// Loop in the filesystem or I/O subsystem; often, too many levels of
+    /// symbolic links.
     FilesystemLoop,
+    /// Stale network file handle.
+    ///
+    /// With some network filesystems, notably NFS, an open file (or directory)
+    /// can be invalidated by problems with the network or server.
     StaleNetworkFileHandle,
+    /// A parameter was incorrect.
     InvalidInput,
+    /// Data not valid for the operation were encountered.
+    ///
+    /// Unlike [`ErrorKind::InvalidInput`], this typically means that the
+    /// operation parameters were valid, but the data it worked on was not: for
+    /// example, [`Read::read_to_string`] gives this error when the input is not
+    /// valid UTF-8.
     InvalidData,
+    /// The I/O operation's timeout expired, causing it to be canceled.
+    ///
+    /// In navi, a socket's read or write timeout gives this kind on every
+    /// platform (Rust gives [`ErrorKind::WouldBlock`] on Unix).
     TimedOut,
+    /// An operation could not be completed because a call to [`Write::write`]
+    /// returned `Ok(0)`.
+    ///
+    /// [`Write::write_all`] gives this error when the writer stops taking
+    /// bytes.
     WriteZero,
+    /// The underlying storage (typically, a filesystem) is full.
     StorageFull,
+    /// Seek on unseekable file.
+    ///
+    /// Seeking was attempted on an open file handle which is not suitable for
+    /// seeking, for example a pipe or a terminal.
     NotSeekable,
+    /// Filesystem quota or some other kind of quota was exceeded.
     QuotaExceeded,
+    /// File larger than allowed or supported.
     FileTooLarge,
+    /// Resource is busy.
     ResourceBusy,
+    /// Executable file is busy: an attempt was made to write to a file which is
+    /// also in use as a running program.
     ExecutableFileBusy,
+    /// Deadlock (avoided): a file locking operation would have deadlocked.
     Deadlock,
+    /// Cross-device or cross-filesystem (hard) link or rename.
     CrossesDevices,
+    /// Too many (hard) links to the same filesystem object.
     TooManyLinks,
+    /// A filename was invalid: it was too long, or contained characters the
+    /// filesystem does not allow.
     InvalidFilename,
+    /// Program argument list too long.
     ArgumentListTooLong,
+    /// This operation was interrupted.
+    ///
+    /// Interrupted operations can typically be retried; [`Read::read_exact`]
+    /// and [`copy`] retry them.
     Interrupted,
+    /// This operation is unsupported on this platform.
     Unsupported,
+    /// An operation could not be completed because an "end of file" was reached
+    /// prematurely.
+    ///
+    /// This typically means that an operation could only succeed if it read a
+    /// particular number of bytes but only a smaller number of bytes could be
+    /// read: see [`Read::read_exact`].
     UnexpectedEof,
+    /// An operation could not be completed, because it failed to allocate
+    /// enough memory.
     OutOfMemory,
+    /// The operation was partially successful and needs to be checked later on
+    /// due to not blocking.
     InProgress,
+    /// A custom error that does not fall under any other I/O error kind.
+    ///
+    /// [`Error::other`] makes errors of this kind. The standard library does
+    /// not give it to the errors of the OS (those no other kind fits are
+    /// [`ErrorKind::Uncategorized`]).
     Other,
+    /// An error from the OS that no other kind fits.
+    ///
+    /// Rust hides this kind; navi makes it public. Don't match on it: a later
+    /// version may give such errors a kind of their own.
     Uncategorized,
 }
 
 impl ErrorKind {
-    /// The kind's description (what Display shows).
+    /// Returns a short description of the kind, the text [`Display`] shows.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::ErrorKind;
+    ///
+    /// assert_eq(ErrorKind::NotFound.as_str(), "entity not found");
+    /// assert_eq(ErrorKind::UnexpectedEof.as_str(), "unexpected end of file");
+    /// ```
     pub fn as_str(&self) -> &str {
         match self {
             ErrorKind::NotFound => "entity not found",
@@ -165,8 +391,39 @@ const REPR_SIMPLE: u8 = 0;
 const REPR_CUSTOM: u8 = 1;
 const REPR_OS: u8 = 2;
 
-/// An I/O error: a kind alone, a kind and a message, or an OS error code
-/// (errno; a Windows error code on Windows) with the system's message.
+/// The error type for I/O operations of the [`Read`], [`Write`], [`Seek`], and
+/// associated traits.
+///
+/// An error is one of three things:
+///
+/// - a kind alone, made from an [`ErrorKind`] with `Error::from` (it displays
+///   as the kind's description);
+/// - a kind and a message, made with [`Error::new`] or [`Error::other`];
+/// - an OS error code (errno; a Windows error code on Windows) with the
+///   system's message for it, from [`Error::from_raw_os_error`] or
+///   [`Error::last_os_error`].
+///
+/// Unlike Rust's, navi's error carries a message (a string), not any error
+/// value: there is no `dyn Error` boxing, `source` or `downcast`. Errors are
+/// `Clone`.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Error, ErrorKind};
+///
+/// let simple = Error::from(ErrorKind::NotFound);
+/// assert_eq(`${simple}`.to_string(), "entity not found");
+/// assert_eq(`${simple:?}`.to_string(), "Kind(NotFound)");
+///
+/// let custom = Error::new(ErrorKind::InvalidData, "bad header");
+/// assert_eq(`${custom}`.to_string(), "bad header");
+/// assert_eq(`${custom:?}`.to_string(), "Custom { kind: InvalidData, error: \"bad header\" }");
+///
+/// let os = Error::from_raw_os_error(2);
+/// assert_eq(os.kind(), ErrorKind::NotFound);
+/// assert(`${os}`.to_string().ends_with("(os error 2)"));
+/// ```
 #[derive(Clone)]
 pub struct Error {
     kind: ErrorKind,
@@ -176,10 +433,36 @@ pub struct Error {
 }
 
 impl Error {
+    /// Returns the corresponding [`ErrorKind`] for this error.
+    ///
+    /// The kind is cloned ([`ErrorKind`] is not `Copy` in navi). An OS error's
+    /// kind comes from its code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// let err = Error::new(ErrorKind::TimedOut, "no answer");
+    /// assert_eq(err.kind(), ErrorKind::TimedOut);
+    /// assert_eq(Error::other("oh no").kind(), ErrorKind::Other);
+    /// ```
     pub fn kind(&self) -> ErrorKind {
         self.kind.clone()
     }
-    /// The OS error code of an error that came from the OS.
+    /// Returns the OS error code this error came from, if it came from the OS.
+    ///
+    /// The code is an errno value (a Windows error code on Windows). Errors
+    /// made with [`Error::new`] or from an [`ErrorKind`] return `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// assert_eq(Error::from_raw_os_error(2).raw_os_error(), Some(2));
+    /// assert_eq(Error::new(ErrorKind::Other, "custom").raw_os_error(), None);
+    /// ```
     pub fn raw_os_error(&self) -> Option<i32> {
         if self.repr == REPR_OS {
             Some(self.code)
@@ -189,6 +472,8 @@ impl Error {
     }
 }
 
+/// Makes an error of a kind alone, without a message; it displays as the kind's
+/// description.
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Error {
         Error {
@@ -234,8 +519,24 @@ impl Debug for Error {
 }
 
 impl Error {
-    /// An error of a kind with a message (a &str or a String: Rust takes
-    /// any error value).
+    /// Creates a new I/O error from a known kind of error and a message.
+    ///
+    /// The message is a `&str` or a `String` (anything that is `AsRef<str>`);
+    /// Rust takes any error value here. The error displays as the message, and
+    /// [`Error::get_ref`] returns it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// let err = Error::new(ErrorKind::Other, "oh no!");
+    /// assert_eq(`${err}`.to_string(), "oh no!");
+    ///
+    /// let line = 7;
+    /// let err = Error::new(ErrorKind::InvalidData, `bad record on line ${line}`.to_string());
+    /// assert_eq(err.get_ref(), Some("bad record on line 7"));
+    /// ```
     pub fn new<M: AsRef<str>>(kind: ErrorKind, msg: M) -> Error {
         Error {
             kind,
@@ -245,12 +546,39 @@ impl Error {
         }
     }
 
+    /// Creates a new I/O error of kind [`ErrorKind::Other`] with a message.
+    ///
+    /// This is a shortcut for `Error::new(ErrorKind::Other, msg)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// let err = Error::other("something went wrong");
+    /// assert_eq(err.kind(), ErrorKind::Other);
+    /// assert_eq(`${err}`.to_string(), "something went wrong");
+    /// ```
     pub fn other<M: AsRef<str>>(msg: M) -> Error {
         Error::new(ErrorKind::Other, msg)
     }
 
-    /// The error for an OS error code (errno; a Windows error code on
-    /// Windows), with the system's message for it.
+    /// Creates a new instance of an [`Error`] from a particular OS error code.
+    ///
+    /// The code is an errno value (a Windows error code on Windows). The
+    /// error's kind is decoded from the code, and it displays as the system's
+    /// message for the code followed by `(os error <code>)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// // 2 is ENOENT on Unix and ERROR_FILE_NOT_FOUND on Windows.
+    /// let err = Error::from_raw_os_error(2);
+    /// assert_eq(err.kind(), ErrorKind::NotFound);
+    /// assert_eq(err.raw_os_error(), Some(2));
+    /// ```
     pub fn from_raw_os_error(code: i32) -> Error {
         Error {
             kind: crate::sys::decode_error_kind(code),
@@ -260,12 +588,40 @@ impl Error {
         }
     }
 
-    /// The error of this thread's last failed OS call.
+    /// Returns an error representing the last OS error which occurred.
+    ///
+    /// This reads the current thread's errno (`GetLastError` on Windows) and
+    /// makes an error from it, as [`Error::from_raw_os_error`] does. It is
+    /// meant to be called right after an OS call failed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Error;
+    ///
+    /// let os_error = Error::last_os_error();
+    /// println(`last OS error: ${os_error:?}`);
+    /// assert(os_error.raw_os_error().is_some());
+    /// ```
     pub fn last_os_error() -> Error {
         Error::from_raw_os_error(crate::sys::errno())
     }
 
-    /// The message of a custom error (Rust's get_ref, as a string).
+    /// Returns the message of an error made with [`Error::new`] or
+    /// [`Error::other`].
+    ///
+    /// This is Rust's `get_ref`, giving the message as a string; errors made
+    /// from a kind alone or from an OS error return `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// assert_eq(Error::other("oh no!").get_ref(), Some("oh no!"));
+    /// assert_eq(Error::from(ErrorKind::NotFound).get_ref(), None);
+    /// assert_eq(Error::from_raw_os_error(2).get_ref(), None);
+    /// ```
     pub fn get_ref(&self) -> Option<&str> {
         if self.repr == REPR_CUSTOM {
             Some(self.msg.as_str())
@@ -274,7 +630,21 @@ impl Error {
         }
     }
 
-    /// The message of a custom error (Rust's into_inner, as a string).
+    /// Consumes the error, returning the message of an error made with
+    /// [`Error::new`] or [`Error::other`].
+    ///
+    /// This is Rust's `into_inner`, giving the message as a `String`; errors
+    /// made from a kind alone or from an OS error return `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// let err = Error::new(ErrorKind::InvalidInput, "empty name");
+    /// assert_eq(err.into_inner(), Some("empty name".to_string()));
+    /// assert_eq(Error::from(ErrorKind::Other).into_inner(), None);
+    /// ```
     pub fn into_inner(self) -> Option<String> {
         if self.repr == REPR_CUSTOM {
             Some(self.msg)
@@ -284,13 +654,133 @@ impl Error {
     }
 }
 
+/// A specialized [`Result`](crate::result::Result) type for I/O operations,
+/// with [`Error`] as its error.
+///
+/// This is used throughout `std::io` and the modules built on it (files,
+/// processes, sockets) for any operation which may produce an error. It is
+/// common to write `io::Result<T>`.
+///
+/// # Examples
+///
+/// ```
+/// use std::io;
+/// use std::io::BufRead;
+///
+/// fn first_line(input: &[u8]) -> io::Result<String> {
+///     let mut line = String::new();
+///     let mut reader = input;
+///     reader.read_line(&mut line)?;
+///     Ok(line)
+/// }
+///
+/// assert_eq(first_line(b"one\ntwo\n").unwrap(), "one\n");
+/// ```
 pub type Result<T> = crate::result::Result<T, Error>;
 
 // --- Read, Write and Seek ----------------------------------------------------------------
 
+/// The `Read` trait allows for reading bytes from a source.
+///
+/// Implementors of the `Read` trait are called "readers". Readers are defined
+/// by one required method, [`Read::read`]. Each call to `read` will attempt to
+/// pull bytes from this source into a provided buffer. A number of other
+/// methods are implemented in terms of `read`, giving implementors a number of
+/// ways to read bytes while only needing to implement a single method.
+///
+/// Readers are intended to be composable with one another: [`Read::take`],
+/// [`Read::chain`] and [`BufReader`] wrap a reader into another one. Files,
+/// sockets, child process pipes, [`Stdin`], [`Cursor`] and byte slices
+/// (`&[u8]`) are readers.
+///
+/// Every call to `read` on an unbuffered reader may be a system call: wrap such
+/// a reader in a [`BufReader`] to read it in small pieces.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Read;
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut reader: &[u8] = b"hello world";
+///     let mut buffer = [0u8; 5];
+///
+///     // read up to 5 bytes
+///     let n = reader.read(&mut buffer)?;
+///     assert_eq(n, 5);
+///     assert_eq(&buffer[..n], "hello".as_bytes());
+///
+///     // read the rest
+///     let mut rest = String::new();
+///     reader.read_to_string(&mut rest)?;
+///     assert_eq(rest, " world");
+///     Ok(())
+/// }
+/// ```
 pub trait Read {
+    /// Pulls some bytes from this source into the specified buffer, returning
+    /// how many bytes were read.
+    ///
+    /// This function does not provide any guarantees about whether it blocks
+    /// waiting for data (in navi, blocking parks the green thread, not its OS
+    /// thread). If `Ok(n)` is returned, then `0 <= n <= buf.len()` and the
+    /// first `n` bytes of `buf` were filled.
+    ///
+    /// `Ok(0)` means the reader has reached its "end of file" and will likely
+    /// not be able to produce bytes anymore, or that `buf` was 0 bytes long. A
+    /// short read (`n < buf.len()`) is not an error: fewer bytes may simply be
+    /// available right now.
+    ///
+    /// # Errors
+    ///
+    /// If this function encounters any form of I/O or other error, an error
+    /// variant will be returned. An error of the [`ErrorKind::Interrupted`]
+    /// kind is non-fatal and the read operation should be retried if there is
+    /// nothing else to do.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Read};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut cursor = Cursor::new(b"abcdef");
+    ///     let mut buf = [0u8; 4];
+    ///     assert_eq(cursor.read(&mut buf)?, 4);
+    ///     assert_eq(buf, [b'a', b'b', b'c', b'd']);
+    ///     assert_eq(cursor.read(&mut buf)?, 2);
+    ///     assert_eq(&buf[..2], "ef".as_bytes());
+    ///     assert_eq(cursor.read(&mut buf)?, 0);
+    ///     Ok(())
+    /// }
+    /// ```
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 
+    /// Reads all bytes until the end of the source, appending them to `buf`.
+    ///
+    /// It calls [`Read::read`] repeatedly until it returns `Ok(0)`, and returns
+    /// the number of bytes appended.
+    ///
+    /// # Errors
+    ///
+    /// The first error of `read` is returned (the bytes read before it stay in
+    /// `buf`); unlike [`Read::read_exact`], this does not retry
+    /// [`ErrorKind::Interrupted`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Read;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut reader: &[u8] = b"some bytes";
+    ///     let mut buffer = Vec::new();
+    ///     let n = reader.read_to_end(&mut buffer)?;
+    ///     assert_eq(n, 10);
+    ///     assert_eq(buffer, b"some bytes".to_vec());
+    ///     Ok(())
+    /// }
+    /// ```
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
         let mut chunk = [0u8; 8192];
         let mut total = 0;
@@ -304,6 +794,37 @@ pub trait Read {
         }
     }
 
+    /// Reads all bytes until the end of the source, appending them to `buf` as
+    /// text.
+    ///
+    /// Returns the number of bytes appended. See also
+    /// [`read_to_string`](crate::io::read_to_string), which returns a new
+    /// `String`.
+    ///
+    /// # Errors
+    ///
+    /// If the data is not valid UTF-8, an error of kind
+    /// [`ErrorKind::InvalidData`] is returned and `buf` is left unchanged.
+    /// Errors of [`Read::read_to_end`] are returned as well.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{ErrorKind, Read};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut reader: &[u8] = "héllo".as_bytes();
+    ///     let mut text = String::from("say: ");
+    ///     assert_eq(reader.read_to_string(&mut text)?, 6);
+    ///     assert_eq(text, "say: héllo");
+    ///
+    ///     let mut bad: &[u8] = &[0xff, 0xfe];
+    ///     let err = bad.read_to_string(&mut text).unwrap_err();
+    ///     assert_eq(err.kind(), ErrorKind::InvalidData);
+    ///     assert_eq(text, "say: héllo");
+    ///     Ok(())
+    /// }
+    /// ```
     fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
         let mut bytes = Vec::new();
         let n = self.read_to_end(&mut bytes)?;
@@ -319,7 +840,33 @@ pub trait Read {
         }
     }
 
-    /// Reads exactly buf.len() bytes (UnexpectedEof if the input ends first).
+    /// Reads the exact number of bytes required to fill `buf`.
+    ///
+    /// It calls [`Read::read`] until `buf` is full, retrying reads that fail
+    /// with [`ErrorKind::Interrupted`].
+    ///
+    /// # Errors
+    ///
+    /// If the input ends before `buf` is full, an error of kind
+    /// [`ErrorKind::UnexpectedEof`] is returned, and the contents of `buf` are
+    /// unspecified. Any other error of `read` is returned right away.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{ErrorKind, Read};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut reader: &[u8] = b"\x00\x01\x02";
+    ///     let mut header = [0u8; 2];
+    ///     reader.read_exact(&mut header)?;
+    ///     assert_eq(header, [0u8, 1]);
+    ///
+    ///     let err = reader.read_exact(&mut header).unwrap_err();
+    ///     assert_eq(err.kind(), ErrorKind::UnexpectedEof);
+    ///     Ok(())
+    /// }
+    /// ```
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
         let mut done = 0;
         while done < buf.len() {
@@ -343,16 +890,76 @@ pub trait Read {
         Ok(())
     }
 
+    /// Creates a "by reference" adapter for this instance of `Read`.
+    ///
+    /// The returned `&mut Self` is a reader too, so adapters that take the
+    /// reader by value (such as [`Read::take`]) can be used without giving the
+    /// reader away.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Read;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut reader: &[u8] = b"hello world";
+    ///     let mut first = String::new();
+    ///     reader.by_ref().take(5).read_to_string(&mut first)?;
+    ///     assert_eq(first, "hello");
+    ///
+    ///     // `reader` is still usable, and continues after what was read.
+    ///     let mut rest = String::new();
+    ///     reader.read_to_string(&mut rest)?;
+    ///     assert_eq(rest, " world");
+    ///     Ok(())
+    /// }
+    /// ```
     fn by_ref(&mut self) -> &mut Self {
         self
     }
 
-    /// The bytes of the input, one at a time.
+    /// Transforms this `Read` instance into an iterator over its bytes.
+    ///
+    /// The iterator yields `Result<u8>`: `Ok(byte)` for each byte, or the error
+    /// of a read ([`ErrorKind::Interrupted`] is retried). It ends at the end of
+    /// the input.
+    ///
+    /// Each byte is one call to [`Read::read`]: for an unbuffered reader such
+    /// as a file, wrap it in a [`BufReader`] first.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Read;
+    ///
+    /// let reader: &[u8] = b"hi!";
+    /// let bytes: Vec<u8> = reader.bytes().map(|b| b.unwrap()).collect();
+    /// assert_eq(bytes, Vec::from([b'h', b'i', b'!']));
+    /// ```
     fn bytes(self) -> Bytes<Self> {
         Bytes { inner: self }
     }
 
-    /// This input followed by next.
+    /// Creates an adapter which will read all the bytes of this reader, then
+    /// the bytes of `next`.
+    ///
+    /// The returned reader reads from `self` until it reaches its end, then
+    /// from `next`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Read;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let head: &[u8] = b"Hello, ";
+    ///     let tail: &[u8] = b"world!";
+    ///     let mut text = String::new();
+    ///     head.chain(tail).read_to_string(&mut text)?;
+    ///     assert_eq(text, "Hello, world!");
+    ///     Ok(())
+    /// }
+    /// ```
     fn chain<R: Read>(self, next: R) -> Chain<Self, R> {
         Chain {
             first: self,
@@ -361,16 +968,149 @@ pub trait Read {
         }
     }
 
-    /// At most limit bytes of the input.
+    /// Creates an adapter which will read at most `limit` bytes from it.
+    ///
+    /// The returned reader ends (reads `Ok(0)`) once `limit` bytes were read,
+    /// or when this reader ends, whichever comes first. [`Take::limit`] tells
+    /// how many bytes are left.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Read;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let reader: &[u8] = b"0123456789";
+    ///     let mut first_five = Vec::new();
+    ///     let mut handle = reader.take(5);
+    ///     handle.read_to_end(&mut first_five)?;
+    ///     assert_eq(first_five, b"01234".to_vec());
+    ///     assert_eq(handle.limit(), 0);
+    ///     Ok(())
+    /// }
+    /// ```
     fn take(self, limit: u64) -> Take<Self> {
         Take { inner: self, limit }
     }
 }
 
+/// A trait for objects which are byte-oriented sinks.
+///
+/// Implementors of the `Write` trait are sometimes called "writers". Writers
+/// are defined by two required methods, [`Write::write`] and [`Write::flush`]:
+/// `write` will attempt to write some data into the object, returning how many
+/// bytes were successfully written; `flush` makes sure all intermediately
+/// buffered contents reach their destination.
+///
+/// Files, sockets, child process pipes, [`Stdout`], [`Stderr`], `Vec<u8>`
+/// (writing appends), [`Cursor`], [`BufWriter`] and [`LineWriter`] are writers.
+///
+/// Rust's `write!(w, ...)` is `w.write_fmt(`...`)` in navi, with a template
+/// string.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write;
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut out: Vec<u8> = Vec::new();
+///     let n = 42;
+///     out.write_all(b"answer: ")?;
+///     out.write_fmt(`${n}\n`)?;
+///     out.flush()?;
+///     assert_eq(String::from_utf8(out).unwrap(), "answer: 42\n");
+///     Ok(())
+/// }
+/// ```
 pub trait Write {
+    /// Writes a buffer into this writer, returning how many bytes were written.
+    ///
+    /// This function will attempt to write the entire contents of `buf`, but
+    /// the entire write might not succeed: `Ok(n)` means the first `n` bytes of
+    /// `buf` were written, with `n <= buf.len()`. `Ok(0)` typically means the
+    /// writer can no longer accept bytes. Use [`Write::write_all`] to write the
+    /// whole buffer.
+    ///
+    /// # Errors
+    ///
+    /// Each call to `write` may generate an I/O error indicating that the
+    /// operation could not be completed; nothing was written then. An error of
+    /// kind [`ErrorKind::Interrupted`] is non-fatal, and the write may be
+    /// retried.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut out: Vec<u8> = Vec::new();
+    ///     let n = out.write(b"some bytes")?;
+    ///     assert_eq(n, 10);
+    ///     assert_eq(out, b"some bytes".to_vec());
+    ///     Ok(())
+    /// }
+    /// ```
     fn write(&mut self, buf: &[u8]) -> Result<usize>;
+    /// Flushes this output stream, ensuring that all intermediately buffered
+    /// contents reach their destination.
+    ///
+    /// navi has no Drop: a buffering writer such as [`BufWriter`] passes its
+    /// bytes on only when flushed (or when its buffer is full), so call `flush`
+    /// when you are done writing.
+    ///
+    /// # Errors
+    ///
+    /// It is considered an error if not all bytes could be written due to I/O
+    /// errors or EOF being reached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{BufWriter, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut writer = BufWriter::new(Vec::new());
+    ///     writer.write_all(b"buffered")?;
+    ///     assert(writer.get_ref().is_empty());
+    ///     writer.flush()?;
+    ///     assert_eq(writer.get_ref().clone(), b"buffered".to_vec());
+    ///     Ok(())
+    /// }
+    /// ```
     fn flush(&mut self) -> Result<()>;
 
+    /// Attempts to write an entire buffer into this writer.
+    ///
+    /// This method will continuously call [`Write::write`] until there is no
+    /// more data to be written or an error is returned.
+    ///
+    /// # Errors
+    ///
+    /// The first error of `write` is returned; some of the bytes may have been
+    /// written. If `write` returns `Ok(0)`, this fails with
+    /// [`ErrorKind::WriteZero`]. Unlike Rust's, it does not retry
+    /// [`ErrorKind::Interrupted`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, ErrorKind, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut out: Vec<u8> = Vec::new();
+    ///     out.write_all(b"some bytes")?;
+    ///     assert_eq(out, b"some bytes".to_vec());
+    ///
+    ///     // A fixed-size buffer runs out of room.
+    ///     let mut storage = [0u8; 4];
+    ///     let mut small = Cursor::new(&mut storage[..]);
+    ///     let err = small.write_all(b"too long").unwrap_err();
+    ///     assert_eq(err.kind(), ErrorKind::WriteZero);
+    ///     Ok(())
+    /// }
+    /// ```
     fn write_all(&mut self, buf: &[u8]) -> Result<()> {
         let mut done = 0;
         while done < buf.len() {
@@ -386,61 +1126,336 @@ pub trait Write {
         Ok(())
     }
 
+    /// Writes a string slice into this writer (its UTF-8 bytes, with
+    /// [`Write::write_all`]).
+    ///
+    /// Rust's `io::Write` has no such method; navi has it as a shortcut for
+    /// `write_all(s.as_bytes())`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Write::write_all`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut out: Vec<u8> = Vec::new();
+    ///     out.write_str("héllo")?;
+    ///     assert_eq(out, "héllo".as_bytes().to_vec());
+    ///     Ok(())
+    /// }
+    /// ```
     fn write_str(&mut self, s: &str) -> Result<()> {
         self.write_all(s.as_bytes())
     }
 
-    /// Writes a template string (Rust's write! macro calls this).
+    /// Writes a formatted string into this writer.
+    ///
+    /// navi has no `write!` macro: pass a template string instead,
+    /// `w.write_fmt(`x = ${x}`)`. The text is formatted first, then written
+    /// with [`Write::write_all`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Write::write_all`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut out: Vec<u8> = Vec::new();
+    ///     let (x, y) = (1, "two");
+    ///     out.write_fmt(`x=${x} y=${y:?}`)?;
+    ///     assert_eq(String::from_utf8(out).unwrap(), "x=1 y=\"two\"");
+    ///     Ok(())
+    /// }
+    /// ```
     fn write_fmt(&mut self, args: fmt::Arguments) -> Result<()> {
         let s = fmt::format(args);
         self.write_all(s.as_bytes())
     }
 
+    /// Creates a "by reference" adapter for this instance of `Write`.
+    ///
+    /// The returned `&mut Self` is a writer too, so it can be passed to code
+    /// that takes a writer by value without giving this one away.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{BufWriter, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut out: Vec<u8> = Vec::new();
+    ///     let mut buffered = BufWriter::new(out.by_ref());
+    ///     buffered.write_all(b"through a reference")?;
+    ///     buffered.flush()?;
+    ///     out.write_all(b"!")?;
+    ///     assert_eq(String::from_utf8(out).unwrap(), "through a reference!");
+    ///     Ok(())
+    /// }
+    /// ```
     fn by_ref(&mut self) -> &mut Self {
         self
     }
 }
 
-/// Where a seek goes from.
+/// Enumeration of possible methods to seek within an I/O object.
+///
+/// It is used by the [`Seek`] trait.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Cursor, Seek, SeekFrom};
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut cursor = Cursor::new(b"0123456789");
+///     assert_eq(cursor.seek(SeekFrom::Start(3))?, 3);
+///     assert_eq(cursor.seek(SeekFrom::Current(2))?, 5);
+///     assert_eq(cursor.seek(SeekFrom::End(-1))?, 9);
+///     Ok(())
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeekFrom {
+    /// Sets the offset to the provided number of bytes.
     Start(u64),
+    /// Sets the offset to the size of this object plus the specified number of
+    /// bytes.
+    ///
+    /// It is possible to seek beyond the end of an object, but it's an error to
+    /// seek before byte 0.
     End(i64),
+    /// Sets the offset to the current position plus the specified number of
+    /// bytes.
+    ///
+    /// It is possible to seek beyond the end of an object, but it's an error to
+    /// seek before byte 0.
     Current(i64),
 }
 
-/// A stream with a position that can move.
+/// The `Seek` trait provides a cursor which can be moved within a stream of
+/// bytes.
+///
+/// The stream typically has a fixed size, allowing seeking relative to either
+/// end or the current offset. Files, [`Cursor`], [`BufReader`] and
+/// [`BufWriter`] (of seekable streams) implement it.
+///
+/// Rust's `Seek::stream_len` is not in navi.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Cursor, Read, Seek, SeekFrom};
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut cursor = Cursor::new(b"hello world");
+///     cursor.seek(SeekFrom::Start(6))?;
+///     let mut word = String::new();
+///     cursor.read_to_string(&mut word)?;
+///     assert_eq(word, "world");
+///     Ok(())
+/// }
+/// ```
 pub trait Seek {
-    /// Moves the position; returns the new position from the start.
+    /// Seeks to an offset, in bytes, in a stream.
+    ///
+    /// A seek beyond the end of a stream is allowed, but behavior is defined by
+    /// the implementation (a [`Cursor`] then reads nothing; a write there fills
+    /// the gap with zeros). Returns the new position from the start of the
+    /// stream.
+    ///
+    /// # Errors
+    ///
+    /// Seeking can fail, for example because it might involve flushing a
+    /// buffer. Seeking to a negative offset is an error
+    /// ([`ErrorKind::InvalidInput`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, ErrorKind, Seek, SeekFrom};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut cursor = Cursor::new(b"abcdef");
+    ///     assert_eq(cursor.seek(SeekFrom::End(-2))?, 4);
+    ///     assert_eq(cursor.seek(SeekFrom::Current(-3))?, 1);
+    ///     let err = cursor.seek(SeekFrom::Current(-5)).unwrap_err();
+    ///     assert_eq(err.kind(), ErrorKind::InvalidInput);
+    ///     Ok(())
+    /// }
+    /// ```
     fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
 
+    /// Rewinds to the beginning of a stream.
+    ///
+    /// This is a convenience method, equivalent to `seek(SeekFrom::Start(0))`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Seek::seek`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Read, Seek};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut cursor = Cursor::new(b"again");
+    ///     let mut first = String::new();
+    ///     cursor.read_to_string(&mut first)?;
+    ///     cursor.rewind()?;
+    ///     let mut second = String::new();
+    ///     cursor.read_to_string(&mut second)?;
+    ///     assert_eq(first, second);
+    ///     Ok(())
+    /// }
+    /// ```
     fn rewind(&mut self) -> Result<()> {
         self.seek(SeekFrom::Start(0))?;
         Ok(())
     }
 
+    /// Returns the current seek position from the start of the stream.
+    ///
+    /// This is equivalent to `seek(SeekFrom::Current(0))`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Seek::seek`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Read, Seek};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut cursor = Cursor::new(b"hello");
+    ///     let mut two = [0u8; 2];
+    ///     cursor.read_exact(&mut two)?;
+    ///     assert_eq(cursor.stream_position()?, 2);
+    ///     Ok(())
+    /// }
+    /// ```
     fn stream_position(&mut self) -> Result<u64> {
         self.seek(SeekFrom::Current(0))
     }
 
+    /// Seeks relative to the current position.
+    ///
+    /// This is equivalent to `seek(SeekFrom::Current(offset))` but doesn't
+    /// return the new position, which can allow some implementations such as
+    /// [`BufReader`] to perform more efficient seeks.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Seek::seek`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Seek};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut cursor = Cursor::new(b"0123456789");
+    ///     cursor.seek_relative(7)?;
+    ///     cursor.seek_relative(-3)?;
+    ///     assert_eq(cursor.position(), 4);
+    ///     Ok(())
+    /// }
+    /// ```
     fn seek_relative(&mut self, offset: i64) -> Result<()> {
         self.seek(SeekFrom::Current(offset))?;
         Ok(())
     }
 }
 
-/// The standard output stream (unbuffered).
+/// A handle to the standard output stream of a process.
+///
+/// Created by the [`stdout`] function. Unlike Rust's, navi's `Stdout` is not
+/// buffered (Rust's is line-buffered): each [`Write::write`] goes straight to
+/// the standard output, and [`Write::flush`] does nothing. Wrap it in a
+/// [`BufWriter`] (and flush that) when writing many small pieces.
+/// [`Stdout::lock`] returns a [`StdoutLock`], which only forwards the writes
+/// (there is no lock).
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write;
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut out = std::io::stdout();
+///     out.write_all(b"hello from stdout\n")?;
+///     out.flush()?;
+///     Ok(())
+/// }
+/// ```
 pub struct Stdout {
     fd: i32,
 }
-/// The standard error stream.
+/// A handle to the standard error stream of a process.
+///
+/// Created by the [`stderr`] function. It is not buffered: each
+/// [`Write::write`] goes straight to the standard error, and [`Write::flush`]
+/// does nothing. [`Stderr::lock`] returns a [`StderrLock`], which only forwards
+/// the writes.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write;
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut err = std::io::stderr();
+///     err.write_all(b"something to stderr\n")?;
+///     Ok(())
+/// }
+/// ```
 pub struct Stderr {
     fd: i32,
 }
 
+/// Constructs a new handle to the standard output of the current process.
+///
+/// The handle is not buffered (see [`Stdout`]). To print text, [`print`] and
+/// [`println`] are usually simpler.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write;
+///
+/// fn main() -> std::io::Result<()> {
+///     let name = "navi";
+///     std::io::stdout().write_fmt(`hello, ${name}\n`)?;
+///     Ok(())
+/// }
+/// ```
 pub fn stdout() -> Stdout {
     Stdout { fd: 1 }
 }
+/// Constructs a new handle to the standard error of the current process.
+///
+/// The handle is not buffered (see [`Stderr`]). To print text, [`eprint`] and
+/// [`eprintln`] are usually simpler.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write;
+///
+/// fn main() -> std::io::Result<()> {
+///     std::io::stderr().write_all(b"error: something happened\n")?;
+///     Ok(())
+/// }
+/// ```
 pub fn stderr() -> Stderr {
     Stderr { fd: 2 }
 }
@@ -465,8 +1480,35 @@ impl Write for Stderr {
     }
 }
 
-/// Buffers writes to an inner writer. navi has no Drop: call flush()
-/// (or into_inner) before the writer goes away.
+/// Wraps a writer and buffers its output.
+///
+/// It can be excessively inefficient to work directly with something that
+/// implements [`Write`]: every call to `write` on a file or a socket is a
+/// system call. A `BufWriter` keeps an in-memory buffer of data (8 KiB by
+/// default) and writes it to the inner writer in large, infrequent batches.
+/// Writes as large as the buffer go straight to the inner writer.
+///
+/// Unlike Rust's, navi's `BufWriter` is not flushed when it goes away (navi has
+/// no Drop): call [`Write::flush`] or [`BufWriter::into_inner`] when you are
+/// done writing, or the buffered bytes are lost.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{BufWriter, Write};
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut writer = BufWriter::new(Vec::new());
+///     for i in 0..5 {
+///         writer.write_fmt(`${i} `)?;
+///     }
+///     // Nothing reached the Vec yet.
+///     assert_eq(writer.get_ref().len(), 0);
+///     let out = writer.into_inner()?;
+///     assert_eq(String::from_utf8(out).unwrap(), "0 1 2 3 4 ");
+///     Ok(())
+/// }
+/// ```
 pub struct BufWriter<W: Write> {
     inner: W,
     buf: Vec<u8>,
@@ -474,6 +1516,16 @@ pub struct BufWriter<W: Write> {
 }
 
 impl<W: Write> BufWriter<W> {
+    /// Creates a new `BufWriter<W>` with a default buffer capacity (8 KiB).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::BufWriter;
+    ///
+    /// let writer = BufWriter::new(Vec::new());
+    /// assert_eq(writer.capacity(), 8192);
+    /// ```
     pub fn new(inner: W) -> BufWriter<W> {
         BufWriter {
             inner,
@@ -481,9 +1533,50 @@ impl<W: Write> BufWriter<W> {
             cap: 8192,
         }
     }
+    /// Gets a reference to the underlying writer.
+    ///
+    /// Bytes still in the buffer are not in it yet.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{BufWriter, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut writer = BufWriter::new(Vec::new());
+    ///     writer.write_all(b"abc")?;
+    ///     assert_eq(writer.get_ref().len(), 0);
+    ///     writer.flush()?;
+    ///     assert_eq(writer.get_ref().len(), 3);
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn get_ref(&self) -> &W {
         &self.inner
     }
+    /// Unwraps this `BufWriter<W>`, returning the underlying writer.
+    ///
+    /// The buffer is written out (and the inner writer flushed) before
+    /// returning the writer.
+    ///
+    /// # Errors
+    ///
+    /// An error of writing the buffer or of flushing; the writer is lost then.
+    /// Use [`BufWriter::into_parts`] to get it back without writing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{BufWriter, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut writer = BufWriter::new(Vec::new());
+    ///     writer.write_all(b"data")?;
+    ///     let inner: Vec<u8> = writer.into_inner()?;
+    ///     assert_eq(inner, b"data".to_vec());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn into_inner(mut self) -> Result<W> {
         self.flush()?;
         Ok(self.inner)
@@ -520,6 +1613,27 @@ impl<W: Write> BufWriter<W> {
 }
 
 impl<W: Write> BufWriter<W> {
+    /// Creates a new `BufWriter<W>` with at least the specified buffer
+    /// capacity.
+    ///
+    /// A capacity of 0 is taken as 1.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{BufWriter, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut writer = BufWriter::with_capacity(4, Vec::new());
+    ///     assert_eq(writer.capacity(), 4);
+    ///     writer.write_all(b"ab")?;
+    ///     // This write does not fit: the buffer is written out first.
+    ///     writer.write_all(b"cde")?;
+    ///     assert_eq(writer.get_ref().clone(), b"ab".to_vec());
+    ///     assert_eq(writer.buffer(), "cde".as_bytes());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn with_capacity(capacity: usize, inner: W) -> BufWriter<W> {
         let cap = if capacity == 0 { 1 } else { capacity };
         BufWriter {
@@ -528,17 +1642,74 @@ impl<W: Write> BufWriter<W> {
             cap,
         }
     }
+    /// Gets a mutable reference to the underlying writer.
+    ///
+    /// It is inadvisable to directly write to the underlying writer while bytes
+    /// are still buffered: they would come after what is written directly.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::BufWriter;
+    ///
+    /// let mut writer = BufWriter::new(Vec::new());
+    /// writer.get_mut().reserve(100);
+    /// assert(writer.get_ref().capacity() >= 100);
+    /// ```
     pub fn get_mut(&mut self) -> &mut W {
         &mut self.inner
     }
-    /// The bytes written but not yet passed on.
+    /// Returns a reference to the internally buffered data: the bytes written
+    /// but not yet passed on to the inner writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{BufWriter, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut writer = BufWriter::new(Vec::new());
+    ///     writer.write_all(b"pending")?;
+    ///     assert_eq(writer.buffer(), "pending".as_bytes());
+    ///     writer.flush()?;
+    ///     assert(writer.buffer().is_empty());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn buffer(&self) -> &[u8] {
         self.buf.as_slice()
     }
+    /// Returns the number of bytes the internal buffer can hold without
+    /// flushing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::BufWriter;
+    ///
+    /// let writer = BufWriter::with_capacity(100, Vec::new());
+    /// assert_eq(writer.capacity(), 100);
+    /// ```
     pub fn capacity(&self) -> usize {
         self.cap
     }
-    /// The inner writer and the unwritten bytes, without flushing.
+    /// Disassembles this `BufWriter<W>`, returning the underlying writer and
+    /// the buffered but unwritten data, without flushing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{BufWriter, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut writer = BufWriter::new(Vec::new());
+    ///     writer.write_all(b"unwritten")?;
+    ///     let (inner, buffered) = writer.into_parts();
+    ///     assert(inner.is_empty());
+    ///     assert_eq(buffered, b"unwritten".to_vec());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn into_parts(self) -> (W, Vec<u8>) {
         (self.inner, self.buf)
     }
@@ -549,6 +1720,8 @@ where
     W: Write + Seek,
 {
     /// Flushes the buffer, then seeks the inner writer.
+    ///
+    /// Only the buffer is written out; the inner writer is not flushed.
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         self.flush_buf()?;
         self.inner.seek(pos)

@@ -16,8 +16,46 @@ fn qp(q: &WaitList) -> *mut WaitList {
 
 // --- RwLock ------------------------------------------------------------------------
 
-/// A reader-writer lock: many readers or one writer. Writers go first (a
-/// waiting writer holds new readers back, as Go's RWMutex).
+/// A reader-writer lock.
+///
+/// This type of lock allows a number of readers or at most one writer at any
+/// point in time. The write portion of this lock typically allows modification
+/// of the underlying data (exclusive access) and the read portion of this lock
+/// typically allows for read-only access (shared access).
+///
+/// Writers go first: once a writer waits for the lock, new readers wait too
+/// until it has had its turn (as with Go's `RWMutex`), so a stream of readers
+/// cannot starve writers. A thread that already holds a read lock and calls
+/// [`RwLock::read`] again can therefore deadlock if a writer is waiting.
+///
+/// As with [`Mutex`] there are no guards (navi has no Drop): [`RwLock::read`]
+/// and [`RwLock::write`] return the data, and [`RwLock::read_unlock`] and
+/// [`RwLock::write_unlock`] end the access; or [`RwLock::with_read`] and
+/// [`RwLock::with_write`] run a function holding the lock. There is no
+/// poisoning. Waiting parks the green thread, not its OS thread. Share the lock
+/// between threads as a `&RwLock<T>` (Rust's `Arc<RwLock<T>>`).
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::RwLock;
+///
+/// let lock = RwLock::new(5);
+///
+/// // many reader locks can be held at once
+/// let r1 = lock.read();
+/// let r2 = lock.read();
+/// assert_eq(*r1, 5);
+/// assert_eq(*r2, 5);
+/// lock.read_unlock();
+/// lock.read_unlock();
+///
+/// // only one write lock may be held, however
+/// let w = lock.write();
+/// *w += 1;
+/// assert_eq(*w, 6);
+/// lock.write_unlock();
+/// ```
 pub struct RwLock<T> {
     lk: usize,
     readers: usize,
@@ -29,6 +67,16 @@ pub struct RwLock<T> {
 }
 
 impl<T> RwLock<T> {
+    /// Creates a new instance of an `RwLock<T>` which is unlocked.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let lock = RwLock::new(5);
+    /// assert_eq(lock.with_read(|v| *v), 5);
+    /// ```
     pub fn new(t: T) -> RwLock<T> {
         RwLock {
             lk: 0,
@@ -45,7 +93,30 @@ impl<T> RwLock<T> {
         unsafe { &mut *(self as *const RwLock<T> as *mut RwLock<T>) }
     }
 
-    /// Waits for shared access; returns the data (until read_unlock).
+    /// Locks this `RwLock` with shared read access, blocking the current thread
+    /// until it can be acquired, and returns the data.
+    ///
+    /// The calling thread waits while a writer holds the lock or waits for it.
+    /// Other readers may hold the lock at the same time. The returned reference
+    /// may be used until [`RwLock::read_unlock`] is called.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    /// use std::thread;
+    ///
+    /// let lock = &RwLock::new(1);
+    /// let n = lock.read();
+    /// assert_eq(*n, 1);
+    /// let other = thread::spawn(|| {
+    ///     let v = *lock.read();
+    ///     lock.read_unlock();
+    ///     v
+    /// });
+    /// assert_eq(other.join().unwrap(), 1);
+    /// lock.read_unlock();
+    /// ```
     pub fn read(&self) -> &T {
         let s = self.me();
         sched::obj_lock(lkp(&s.lk));
@@ -57,6 +128,27 @@ impl<T> RwLock<T> {
         &self.data
     }
 
+    /// Attempts to acquire this `RwLock` with shared read access, without
+    /// blocking.
+    ///
+    /// Returns the data if the lock was taken (the caller must then call
+    /// [`RwLock::read_unlock`]), or `None` if a writer holds the lock or waits
+    /// for it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let lock = RwLock::new(1);
+    /// let n = lock.try_read().unwrap();
+    /// assert_eq(*n, 1);
+    /// lock.read_unlock();
+    ///
+    /// lock.write();
+    /// assert(lock.try_read().is_none());
+    /// lock.write_unlock();
+    /// ```
     pub fn try_read(&self) -> Option<&T> {
         let s = self.me();
         sched::obj_lock(lkp(&s.lk));
@@ -68,6 +160,23 @@ impl<T> RwLock<T> {
         if ok { Some(&self.data) } else { None }
     }
 
+    /// Releases a shared read access taken by [`RwLock::read`] or
+    /// [`RwLock::try_read`].
+    ///
+    /// When the last reader leaves, a waiting writer is woken.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let lock = RwLock::new(0);
+    /// lock.read();
+    /// assert(lock.try_write().is_none());
+    /// lock.read_unlock();
+    /// assert(lock.try_write().is_some());
+    /// lock.write_unlock();
+    /// ```
     pub fn read_unlock(&self) {
         let s = self.me();
         sched::obj_lock(lkp(&s.lk));
@@ -78,7 +187,25 @@ impl<T> RwLock<T> {
         sched::obj_unlock(lkp(&s.lk));
     }
 
-    /// Waits for exclusive access; returns the data (until write_unlock).
+    /// Locks this `RwLock` with exclusive write access, blocking the current
+    /// thread until it can be acquired, and returns the data.
+    ///
+    /// The calling thread waits while readers or another writer hold the lock;
+    /// meanwhile no new reader gets in. The returned reference may be used
+    /// until [`RwLock::write_unlock`] is called.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let lock = RwLock::new(1);
+    /// let n = lock.write();
+    /// *n = 2;
+    /// assert(lock.try_read().is_none());
+    /// lock.write_unlock();
+    /// assert_eq(lock.with_read(|v| *v), 2);
+    /// ```
     pub fn write(&self) -> &mut T {
         let s = self.me();
         sched::obj_lock(lkp(&s.lk));
@@ -92,6 +219,28 @@ impl<T> RwLock<T> {
         &mut s.data
     }
 
+    /// Attempts to lock this `RwLock` with exclusive write access, without
+    /// blocking.
+    ///
+    /// Returns the data if the lock was taken (the caller must then call
+    /// [`RwLock::write_unlock`]), or `None` if readers or another writer hold
+    /// it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let lock = RwLock::new(1);
+    /// lock.read();
+    /// assert(lock.try_write().is_none());
+    /// lock.read_unlock();
+    ///
+    /// let n = lock.try_write().unwrap();
+    /// *n += 1;
+    /// lock.write_unlock();
+    /// assert_eq(lock.into_inner(), 2);
+    /// ```
     pub fn try_write(&self) -> Option<&mut T> {
         let s = self.me();
         sched::obj_lock(lkp(&s.lk));
@@ -103,6 +252,22 @@ impl<T> RwLock<T> {
         if ok { Some(&mut s.data) } else { None }
     }
 
+    /// Releases the exclusive write access taken by [`RwLock::write`] or
+    /// [`RwLock::try_write`].
+    ///
+    /// Wakes one waiting writer if there is one, else all waiting readers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let lock = RwLock::new(String::new());
+    /// lock.write().push_str("hi");
+    /// lock.write_unlock();
+    /// assert_eq(*lock.read(), "hi");
+    /// lock.read_unlock();
+    /// ```
     pub fn write_unlock(&self) {
         let s = self.me();
         sched::obj_lock(lkp(&s.lk));
@@ -115,7 +280,21 @@ impl<T> RwLock<T> {
         sched::obj_unlock(lkp(&s.lk));
     }
 
-    /// Runs f with shared access.
+    /// Runs `f` on the data with shared read access, and returns what it
+    /// returns.
+    ///
+    /// This is the guard-free way to read: the read lock is taken before `f`
+    /// runs and released after it returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let lock = RwLock::new(Vec::from([1, 2, 3]));
+    /// let sum: i32 = lock.with_read(|v| v.iter().sum());
+    /// assert_eq(sum, 6);
+    /// ```
     pub fn with_read<R>(&self, f: fn(&T) -> R) -> R {
         let d = self.read();
         let r = f(d);
@@ -123,7 +302,28 @@ impl<T> RwLock<T> {
         r
     }
 
-    /// Runs f with exclusive access.
+    /// Runs `f` on the data with exclusive write access, and returns what it
+    /// returns.
+    ///
+    /// This is the guard-free way to write: the write lock is taken before `f`
+    /// runs and released after it returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    /// use std::thread;
+    ///
+    /// let lock = &RwLock::new(0);
+    /// let mut handles = Vec::new();
+    /// for _ in 0..4 {
+    ///     handles.push(thread::spawn(|| lock.with_write(|n| *n += 1)));
+    /// }
+    /// for h in handles {
+    ///     h.join().unwrap();
+    /// }
+    /// assert_eq(lock.with_read(|n| *n), 4);
+    /// ```
     pub fn with_write<R>(&self, f: fn(&mut T) -> R) -> R {
         let d = self.write();
         let r = f(d);
@@ -131,9 +331,34 @@ impl<T> RwLock<T> {
         r
     }
 
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// Since this call borrows the `RwLock` mutably, no locking needs to take
+    /// place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let mut lock = RwLock::new(0);
+    /// *lock.get_mut() = 10;
+    /// assert_eq(*lock.read(), 10);
+    /// lock.read_unlock();
+    /// ```
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.data
     }
+    /// Consumes this `RwLock`, returning the underlying data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    ///
+    /// let lock = RwLock::new(String::from("hello"));
+    /// assert_eq(lock.into_inner(), "hello");
+    /// ```
     pub fn into_inner(self) -> T {
         self.data
     }
@@ -141,13 +366,59 @@ impl<T> RwLock<T> {
 
 // --- Condvar -----------------------------------------------------------------------
 
-/// A condition variable: waits release a Mutex and take it again.
+/// A condition variable.
+///
+/// Condition variables represent the ability to block a thread such that it
+/// consumes no CPU time while waiting for an event to occur. A condition
+/// variable is used with a [`Mutex`] and a condition on the data it protects: a
+/// thread holding the mutex checks the condition and, while it does not hold,
+/// calls [`Condvar::wait`], which releases the mutex while it waits and takes
+/// it again before returning. Another thread changes the data under the mutex
+/// and calls [`Condvar::notify_one`] or [`Condvar::notify_all`].
+///
+/// Unlike Rust's, the methods take the `&Mutex<T>` (which the caller must hold)
+/// instead of a guard. Waiting parks the green thread, not its OS thread.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::{Condvar, Mutex};
+/// use std::thread;
+///
+/// let started = &Mutex::new(false);
+/// let cvar = &Condvar::new();
+///
+/// thread::spawn(|| {
+///     *started.lock() = true;
+///     started.unlock();
+///     // We notify the condvar that the value has changed.
+///     cvar.notify_one();
+/// });
+///
+/// // Wait for the thread to start up.
+/// let s = started.lock();
+/// while !*s {
+///     cvar.wait(started);
+/// }
+/// started.unlock();
+/// ```
 pub struct Condvar {
     lk: usize,
     q: WaitList,
 }
 
 impl Condvar {
+    /// Creates a new condition variable which is ready to be waited on and
+    /// notified.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Condvar;
+    ///
+    /// let condvar = Condvar::new();
+    /// condvar.notify_all();
+    /// ```
     pub fn new() -> Condvar {
         Condvar {
             lk: 0,
@@ -155,8 +426,41 @@ impl Condvar {
         }
     }
 
-    /// Releases m (which the caller holds), waits for a notification and
-    /// takes m again.
+    /// Blocks the current thread until this condition variable receives a
+    /// notification.
+    ///
+    /// The caller must hold `m` (locked with [`Mutex::lock`]): this function
+    /// atomically unlocks it and parks the current thread, so that any
+    /// notification after the unlock wakes it. When it returns, `m` is locked
+    /// again.
+    ///
+    /// Since another thread may change the data between the notification and
+    /// the moment this thread holds the mutex again, check the condition in a
+    /// loop (or use [`Condvar::wait_while`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::{Condvar, Mutex};
+    /// use std::thread;
+    ///
+    /// let queue = &Mutex::new(Vec::new());
+    /// let cvar = &Condvar::new();
+    ///
+    /// let consumer = thread::spawn(|| {
+    ///     let q = queue.lock();
+    ///     while q.is_empty() {
+    ///         cvar.wait(queue);
+    ///     }
+    ///     let v = q.remove(0);
+    ///     queue.unlock();
+    ///     v
+    /// });
+    ///
+    /// queue.with_lock(|q| q.push(7));
+    /// cvar.notify_one();
+    /// assert_eq(consumer.join().unwrap(), 7);
+    /// ```
     pub fn wait<T>(&self, m: &Mutex<T>) {
         // Registered before m is released: a notification after that
         // finds this G.
@@ -167,7 +471,30 @@ impl Condvar {
         m.lock();
     }
 
-    /// wait, for at most dur.
+    /// Waits on this condition variable for a notification, timing out after
+    /// the specified duration.
+    ///
+    /// As [`Condvar::wait`], it releases `m` (which the caller must hold) while
+    /// it waits and locks it again before returning. The returned
+    /// [`WaitTimeoutResult`] tells whether the time ran out without a
+    /// notification. Rust's returns the guard too; here the mutex is simply
+    /// held again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::{Condvar, Mutex};
+    /// use std::time::Duration;
+    ///
+    /// let m = Mutex::new(0);
+    /// let cvar = Condvar::new();
+    ///
+    /// m.lock();
+    /// // Nobody notifies: the wait times out.
+    /// let r = cvar.wait_timeout(&m, Duration::from_millis(10));
+    /// assert(r.timed_out());
+    /// m.unlock();
+    /// ```
     pub fn wait_timeout<T>(&self, m: &Mutex<T>, dur: crate::time::Duration) -> WaitTimeoutResult {
         sched::obj_lock(lkp(&self.lk));
         m.unlock();
@@ -177,19 +504,99 @@ impl Condvar {
         WaitTimeoutResult { timed_out }
     }
 
-    /// Waits while condition holds of m's data (m is held on return).
+    /// Blocks the current thread while `condition` returns `true` for the data
+    /// `m` protects.
+    ///
+    /// The caller must hold `m`. This is [`Condvar::wait`] in a loop:
+    /// `condition` is called on the data (with the mutex held) first and after
+    /// every wakeup, and this returns once it returns `false`, with `m` held.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::{Condvar, Mutex};
+    /// use std::thread;
+    ///
+    /// let pending = &Mutex::new(true);
+    /// let cvar = &Condvar::new();
+    ///
+    /// thread::spawn(|| {
+    ///     *pending.lock() = false;
+    ///     pending.unlock();
+    ///     cvar.notify_one();
+    /// });
+    ///
+    /// pending.lock();
+    /// // Wait as long as the value inside the mutex is `true`.
+    /// cvar.wait_while(pending, |p: &mut bool| *p);
+    /// pending.unlock();
+    /// ```
     pub fn wait_while<T>(&self, m: &Mutex<T>, condition: fn(&mut T) -> bool) {
         while condition(m.data_mut()) {
             self.wait(m);
         }
     }
 
+    /// Wakes up one thread blocked on this condition variable.
+    ///
+    /// If there is a thread waiting, it is woken. Notifications are not
+    /// remembered: if no thread is waiting, this does nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::{Condvar, Mutex};
+    /// use std::thread;
+    ///
+    /// let ready = &Mutex::new(false);
+    /// let cvar = &Condvar::new();
+    ///
+    /// let waiter = thread::spawn(|| {
+    ///     ready.lock();
+    ///     cvar.wait_while(ready, |r: &mut bool| !*r);
+    ///     ready.unlock();
+    ///     "woken"
+    /// });
+    ///
+    /// ready.with_lock(|r| *r = true);
+    /// cvar.notify_one();
+    /// assert_eq(waiter.join().unwrap(), "woken");
+    /// ```
     pub fn notify_one(&self) {
         sched::obj_lock(lkp(&self.lk));
         sched::signal(qp(&self.q));
         sched::obj_unlock(lkp(&self.lk));
     }
 
+    /// Wakes up all threads blocked on this condition variable.
+    ///
+    /// Notifications are not remembered: threads that wait later are not woken
+    /// by this call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::{Condvar, Mutex};
+    /// use std::thread;
+    ///
+    /// let go = &Mutex::new(false);
+    /// let cvar = &Condvar::new();
+    ///
+    /// let mut handles = Vec::new();
+    /// for _ in 0..3 {
+    ///     handles.push(thread::spawn(|| {
+    ///         go.lock();
+    ///         cvar.wait_while(go, |g: &mut bool| !*g);
+    ///         go.unlock();
+    ///     }));
+    /// }
+    ///
+    /// go.with_lock(|g| *g = true);
+    /// cvar.notify_all();
+    /// for h in handles {
+    ///     h.join().unwrap();
+    /// }
+    /// ```
     pub fn notify_all(&self) {
         sched::obj_lock(lkp(&self.lk));
         sched::broadcast(qp(&self.q));
@@ -203,12 +610,53 @@ impl Default for Condvar {
     }
 }
 
-/// Whether Condvar::wait_timeout timed out.
+/// A type indicating whether a timed wait on a condition variable returned due
+/// to a time out or not.
+///
+/// It is returned by [`Condvar::wait_timeout`].
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::{Condvar, Mutex};
+/// use std::time::Duration;
+///
+/// let m = Mutex::new(());
+/// let cvar = Condvar::new();
+/// m.lock();
+/// let result = cvar.wait_timeout(&m, Duration::from_millis(1));
+/// m.unlock();
+/// assert(result.timed_out());
+/// ```
 pub struct WaitTimeoutResult {
     timed_out: bool,
 }
 
 impl WaitTimeoutResult {
+    /// Returns `true` if the wait was known to have timed out.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::{Condvar, Mutex};
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// let done = &Mutex::new(false);
+    /// let cvar = &Condvar::new();
+    ///
+    /// let d = done.lock();
+    /// thread::spawn(|| {
+    ///     *done.lock() = true;
+    ///     done.unlock();
+    ///     cvar.notify_one();
+    /// });
+    /// // Wait until notified (or for an hour at most).
+    /// let r = cvar.wait_timeout(done, Duration::from_secs(3600));
+    /// assert(!r.timed_out());
+    /// assert(*d);
+    /// done.unlock();
+    /// ```
     pub fn timed_out(&self) -> bool {
         self.timed_out
     }
@@ -220,7 +668,26 @@ const ONCE_NEW: usize = 0;
 const ONCE_RUNNING: usize = 1;
 const ONCE_DONE: usize = 2;
 
-/// Runs a function once; other callers wait until it has run.
+/// A synchronization primitive which can be used to run a one-time global
+/// initialization.
+///
+/// Useful for one-time initialization for FFI or related functionality.
+/// [`Once::call_once`] runs its function only the first time; other threads
+/// calling it meanwhile wait until that first call has returned. For a value
+/// initialized once, see [`OnceLock`] and [`LazyLock`].
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Once;
+///
+/// static START: Once = Once::new();
+///
+/// let mut runs = 0;
+/// START.call_once(|| runs += 1);
+/// START.call_once(|| runs += 1);
+/// assert_eq(runs, 1);
+/// ```
 pub struct Once {
     state: usize,
     lk: usize,
@@ -228,6 +695,16 @@ pub struct Once {
 }
 
 impl Once {
+    /// Creates a new `Once` value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Once;
+    ///
+    /// let once = Once::new();
+    /// assert(!once.is_completed());
+    /// ```
     pub fn new() -> Once {
         Once {
             state: ONCE_NEW,
@@ -236,10 +713,66 @@ impl Once {
         }
     }
 
+    /// Returns `true` if some [`Once::call_once`] call has completed
+    /// successfully.
+    ///
+    /// It is `false` while the first call's function is still running.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Once;
+    ///
+    /// let once = Once::new();
+    /// assert_eq(once.is_completed(), false);
+    /// once.call_once(|| {
+    ///     assert_eq(once.is_completed(), false);
+    /// });
+    /// assert_eq(once.is_completed(), true);
+    /// ```
     pub fn is_completed(&self) -> bool {
         sched::word_load(lkp(&self.state)) == ONCE_DONE
     }
 
+    /// Performs an initialization routine once and only once.
+    ///
+    /// The given function is executed if this is the first time `call_once` has
+    /// been called, and otherwise the routine is not invoked. If another thread
+    /// is running the routine, this waits until it has completed: when
+    /// `call_once` returns, the initialization has run (by this thread or
+    /// another one).
+    ///
+    /// # Panics
+    ///
+    /// navi's `Once` has no poisoning: if `f` panics, the panic propagates to
+    /// the caller and the `Once` stays in its running state, so every later
+    /// `call_once` blocks forever (Rust's panics instead). Calling `call_once`
+    /// from inside `f` on the same `Once` deadlocks.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Once;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// use std::thread;
+    ///
+    /// let init = &Once::new();
+    /// let runs = &AtomicUsize::new(0);
+    /// let mut handles = Vec::new();
+    /// for _ in 0..4 {
+    ///     handles.push(thread::spawn(|| {
+    ///         init.call_once(|| {
+    ///             runs.fetch_add(1, Ordering::SeqCst);
+    ///         });
+    ///         // The initialization has run when call_once returns.
+    ///         assert_eq(runs.load(Ordering::SeqCst), 1);
+    ///     }));
+    /// }
+    /// for h in handles {
+    ///     h.join().unwrap();
+    /// }
+    /// assert_eq(runs.load(Ordering::SeqCst), 1);
+    /// ```
     pub fn call_once(&self, f: fn()) {
         if self.is_completed() {
             return;
@@ -268,13 +801,42 @@ impl Default for Once {
     }
 }
 
-/// A value set at most once.
+/// A synchronization primitive which can nominally be written to only once.
+///
+/// This type is a thread-safe cell: [`OnceLock::set`] or
+/// [`OnceLock::get_or_init`] store its value the first time, and then
+/// [`OnceLock::get`] returns it. When several threads try at once, one of them
+/// stores the value and the others wait for it.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::OnceLock;
+/// use std::thread;
+///
+/// let cell = &OnceLock::new();
+/// assert(cell.get().is_none());
+///
+/// let value = thread::spawn(|| *cell.get_or_init(|| 12345)).join().unwrap();
+/// assert_eq(value, 12345);
+/// assert_eq(cell.get(), Some(&12345));
+/// ```
 pub struct OnceLock<T> {
     once: Once,
     value: Option<T>,
 }
 
 impl<T> OnceLock<T> {
+    /// Creates a new uninitialized cell.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::OnceLock;
+    ///
+    /// let cell: OnceLock<String> = OnceLock::new();
+    /// assert(cell.get().is_none());
+    /// ```
     pub fn new() -> OnceLock<T> {
         OnceLock {
             once: Once::new(),
@@ -286,6 +848,21 @@ impl<T> OnceLock<T> {
         unsafe { &mut *(self as *const OnceLock<T> as *mut OnceLock<T>) }
     }
 
+    /// Gets the reference to the underlying value.
+    ///
+    /// Returns `None` if the cell is uninitialized, or being initialized: this
+    /// method never blocks.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::OnceLock;
+    ///
+    /// let cell = OnceLock::new();
+    /// assert_eq(cell.get(), None);
+    /// cell.set(1).unwrap();
+    /// assert_eq(cell.get(), Some(&1));
+    /// ```
     pub fn get(&self) -> Option<&T> {
         if !self.once.is_completed() {
             return None;
@@ -296,7 +873,26 @@ impl<T> OnceLock<T> {
         }
     }
 
-    /// Sets the value unless it is set (Err gives v back).
+    /// Initializes the contents of the cell to `v`.
+    ///
+    /// If the cell is being initialized by another thread, this waits until it
+    /// is done.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(())` if the cell was uninitialized and `Err(v)` (the value
+    /// given back) if it was already initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::OnceLock;
+    ///
+    /// let cell = OnceLock::new();
+    /// assert_eq(cell.set(92), Ok(()));
+    /// assert_eq(cell.set(62), Err(62));
+    /// assert_eq(cell.get(), Some(&92));
+    /// ```
     pub fn set(&self, v: T) -> Result<(), T> {
         let s = self.me();
         let mut stored = false;
@@ -307,7 +903,31 @@ impl<T> OnceLock<T> {
         if stored { Ok(()) } else { Err(v) }
     }
 
-    /// The value, set by f the first time.
+    /// Gets the contents of the cell, initializing it to `f()` if the cell was
+    /// uninitialized.
+    ///
+    /// Many threads may call `get_or_init` concurrently with different
+    /// initializing functions, but it is guaranteed that only one function will
+    /// be executed; the other threads wait for its value.
+    ///
+    /// # Panics
+    ///
+    /// If `f` panics, the panic is propagated to the caller, and the cell
+    /// remains uninitialized; as with [`Once::call_once`] there is no
+    /// poisoning, and later calls that would initialize it block forever.
+    /// Initializing the cell from inside `f` deadlocks.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::OnceLock;
+    ///
+    /// let cell = OnceLock::new();
+    /// let value = cell.get_or_init(|| 92);
+    /// assert_eq(*value, 92);
+    /// let value = cell.get_or_init(|| unreachable());
+    /// assert_eq(*value, 92);
+    /// ```
     pub fn get_or_init(&self, f: fn() -> T) -> &T {
         let s = self.me();
         s.once.call_once(|| {
@@ -316,6 +936,21 @@ impl<T> OnceLock<T> {
         self.get().unwrap()
     }
 
+    /// Consumes the `OnceLock`, returning the wrapped value. Returns `None` if
+    /// the cell was uninitialized.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::OnceLock;
+    ///
+    /// let cell: OnceLock<String> = OnceLock::new();
+    /// assert_eq(cell.into_inner(), None);
+    ///
+    /// let cell = OnceLock::new();
+    /// cell.set(String::from("hello")).unwrap();
+    /// assert_eq(cell.into_inner(), Some(String::from("hello")));
+    /// ```
     pub fn into_inner(self) -> Option<T> {
         self.value
     }
@@ -327,13 +962,47 @@ impl<T> Default for OnceLock<T> {
     }
 }
 
-/// A value computed by init the first time it is used.
+/// A value which is initialized on the first access.
+///
+/// The initialization function given to [`LazyLock::new`] runs the first time
+/// the value is used (through [`Deref`](crate::ops::Deref), or
+/// [`LazyLock::force`]), once, even if several threads use it at the same time;
+/// the value is then kept. It can be the value of a `static`.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// use std::sync::LazyLock;
+///
+/// static PRIMES: LazyLock<HashMap<i32, &str>> = LazyLock::new(|| {
+///     let mut m = HashMap::new();
+///     m.insert(2, "two");
+///     m.insert(3, "three");
+///     m
+/// });
+///
+/// // The map is built the first time it is used.
+/// assert_eq(PRIMES.get(&2), Some(&"two"));
+/// assert_eq(PRIMES.len(), 2);
+/// ```
 pub struct LazyLock<T> {
     cell: OnceLock<T>,
     init: fn() -> T,
 }
 
 impl<T> LazyLock<T> {
+    /// Creates a new lazy value with the given initializing function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::LazyLock;
+    ///
+    /// let hello = String::from("hello, world");
+    /// let lazy = LazyLock::new(|| hello.to_uppercase());
+    /// assert_eq(*lazy, "HELLO, WORLD");
+    /// ```
     pub fn new(init: fn() -> T) -> LazyLock<T> {
         LazyLock {
             cell: OnceLock::new(),
@@ -341,7 +1010,27 @@ impl<T> LazyLock<T> {
         }
     }
 
-    /// The value (computing it the first time).
+    /// Forces the evaluation of this lazy value and returns a reference to the
+    /// result.
+    ///
+    /// This is equivalent to the `Deref` impl, but is explicit. It is an
+    /// associated function: call it as `LazyLock::force(&lazy)`.
+    ///
+    /// # Panics
+    ///
+    /// If the initialization function panics, the panic is propagated to the
+    /// caller; there is no poisoning, and later uses of the value block
+    /// forever.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::LazyLock;
+    ///
+    /// let lazy = LazyLock::new(|| 92);
+    /// assert_eq(*LazyLock::force(&lazy), 92);
+    /// assert_eq(*lazy, 92);
+    /// ```
     pub fn force(this: &LazyLock<T>) -> &T {
         this.cell.get_or_init(this.init)
     }
@@ -356,7 +1045,37 @@ impl<T> crate::ops::Deref for LazyLock<T> {
 
 // --- Barrier -----------------------------------------------------------------------
 
-/// Makes n threads wait until all have reached it.
+/// A barrier enables multiple threads to synchronize the beginning of some
+/// computation.
+///
+/// A barrier made with `Barrier::new(n)` makes the threads calling
+/// [`Barrier::wait`] wait until `n` of them have called it; then they all
+/// continue, and the barrier can be used again. Waiting parks the green thread,
+/// not its OS thread.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Barrier;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use std::thread;
+///
+/// let n = 4;
+/// let barrier = &Barrier::new(n);
+/// let arrived = &AtomicUsize::new(0);
+/// let mut handles = Vec::new();
+/// for _ in 0..n {
+///     handles.push(thread::spawn(|| {
+///         arrived.fetch_add(1, Ordering::SeqCst);
+///         barrier.wait();
+///         // Everyone has arrived once any thread is past the barrier.
+///         assert_eq(arrived.load(Ordering::SeqCst), n);
+///     }));
+/// }
+/// for h in handles {
+///     h.join().unwrap();
+/// }
+/// ```
 pub struct Barrier {
     n: usize,
     count: usize,
@@ -365,18 +1084,72 @@ pub struct Barrier {
     q: WaitList,
 }
 
-/// What Barrier::wait returns: one of the threads is the leader.
+/// A `BarrierWaitResult` is returned by [`Barrier::wait`] when all threads in
+/// the [`Barrier`] have rendezvoused.
+///
+/// One of the threads is the leader: see [`BarrierWaitResult::is_leader`].
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Barrier;
+///
+/// let barrier = Barrier::new(1);
+/// let result = barrier.wait();
+/// assert(result.is_leader());
+/// ```
 pub struct BarrierWaitResult {
     leader: bool,
 }
 
 impl BarrierWaitResult {
+    /// Returns `true` if this thread is the "leader thread" for the call to
+    /// [`Barrier::wait`].
+    ///
+    /// Only one thread will have `true` returned from its result in each round
+    /// (the last one to arrive); all other threads will have `false` returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Barrier;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// use std::thread;
+    ///
+    /// let barrier = &Barrier::new(3);
+    /// let leaders = &AtomicUsize::new(0);
+    /// let mut handles = Vec::new();
+    /// for _ in 0..3 {
+    ///     handles.push(thread::spawn(|| {
+    ///         if barrier.wait().is_leader() {
+    ///             leaders.fetch_add(1, Ordering::SeqCst);
+    ///         }
+    ///     }));
+    /// }
+    /// for h in handles {
+    ///     h.join().unwrap();
+    /// }
+    /// assert_eq(leaders.load(Ordering::SeqCst), 1);
+    /// ```
     pub fn is_leader(&self) -> bool {
         self.leader
     }
 }
 
 impl Barrier {
+    /// Creates a new barrier that can block a given number of threads.
+    ///
+    /// A barrier will block `n`-1 threads which call [`Barrier::wait`] and then
+    /// wake up all threads at once when the `n`th thread calls `wait`. A
+    /// barrier of 0 or 1 never blocks.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Barrier;
+    ///
+    /// let barrier = Barrier::new(10);
+    /// ```
     pub fn new(n: usize) -> Barrier {
         Barrier {
             n,
@@ -387,6 +1160,36 @@ impl Barrier {
         }
     }
 
+    /// Blocks the current thread until all threads have rendezvoused here.
+    ///
+    /// Barriers are re-usable after all threads have rendezvoused once, and can
+    /// be used continuously. A single thread (the last to arrive) receives a
+    /// [`BarrierWaitResult`] that returns `true` from
+    /// [`BarrierWaitResult::is_leader`] when returning from this function, and
+    /// all other threads receive a result that returns `false`. Waiting parks
+    /// the green thread, not its OS thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::{Barrier, Mutex};
+    /// use std::thread;
+    ///
+    /// let barrier = &Barrier::new(2);
+    /// let log = &Mutex::new(Vec::new());
+    /// let other = thread::spawn(|| {
+    ///     log.with_lock(|l| l.push("other: before"));
+    ///     barrier.wait();
+    ///     barrier.wait();
+    ///     log.with_lock(|l| l.push("other: after"));
+    /// });
+    /// barrier.wait();
+    /// // Both threads are between the two waits: "other: after" is not there yet.
+    /// assert_eq(log.with_lock(|l| l.len()), 1);
+    /// barrier.wait();
+    /// other.join().unwrap();
+    /// assert_eq(log.with_lock(|l| l.len()), 2);
+    /// ```
     pub fn wait(&self) -> BarrierWaitResult {
         let s = unsafe { &mut *(self as *const Barrier as *mut Barrier) };
         sched::obj_lock(lkp(&s.lk));

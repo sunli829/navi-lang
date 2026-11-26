@@ -1,6 +1,6 @@
-//! std::fs on the OS layer: File, OpenOptions, Metadata, directories and
-//! the path functions. navi has no Drop: a File is closed by close() (the
-//! whole-file functions close theirs).
+//! The implementation of [`crate::fs`] on the OS layer (`std::sys`): File,
+//! OpenOptions, Metadata, directories and the path functions. The module's
+//! documentation is in fs.navi.
 
 use crate::convert::AsRef;
 use crate::fmt::{self, Debug, Formatter};
@@ -12,8 +12,46 @@ use crate::time::SystemTime;
 
 // --- File --------------------------------------------------------------------------
 
-/// An open file. Copies of a File share its descriptor; close() closes it
-/// (navi has no Drop).
+/// An object providing access to an open file on the filesystem.
+///
+/// An instance of a `File` can be read and/or written depending on what options
+/// it was opened with ([`File::open`] opens for reading, [`File::create`] for
+/// writing, [`OpenOptions`] for anything else). Files also implement [`Seek`]
+/// to alter the logical cursor that the file contains internally.
+///
+/// Unlike Rust's, a navi `File` is not closed when it goes out of scope (there
+/// is no Drop): call [`File::close`], usually with `defer`. A `File` is a plain
+/// value holding the descriptor: copies of it share the same descriptor (and
+/// its cursor), and closing one closes them all. There is no `try_clone`, no
+/// file locking, and `Read`/`Write` are implemented on `File`, not on `&File`.
+///
+/// Writes are not buffered: each [`Write::write`] is one system call, and
+/// [`Write::flush`] does nothing. Wrap the file in a [`crate::io::BufWriter`]
+/// (or [`crate::io::BufReader`]) to batch small writes or reads.
+///
+/// # Examples
+///
+/// Creates a new file and writes bytes to it, then reads it back:
+///
+/// ```
+/// use std::fs::File;
+/// use std::io::prelude::*;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-file-type.txt");
+///     let mut file = File::create(&path)?;
+///     file.write_all(b"Hello, world!")?;
+///     file.close();
+///
+///     let mut file = File::open(&path)?;
+///     defer file.close();
+///     let mut contents = String::new();
+///     file.read_to_string(&mut contents)?;
+///     assert_eq(contents, "Hello, world!");
+///     std::fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 pub struct File {
     pub(crate) fd: i64,
 }
@@ -25,12 +63,68 @@ impl Debug for File {
 }
 
 impl File {
-    /// Opens a file for reading.
+    /// Attempts to open a file in read-only mode.
+    ///
+    /// See the [`OpenOptions::open`] method for more details.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if `path` does not already exist
+    /// (with [`ErrorKind::NotFound`]). Other errors may also be returned
+    /// according to [`OpenOptions::open`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::io::Read;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-open.txt");
+    ///     fs::write(&path, "abc")?;
+    ///
+    ///     let mut f = File::open(&path)?;
+    ///     let mut data = Vec::new();
+    ///     f.read_to_end(&mut data)?;
+    ///     f.close();
+    ///     assert_eq(data, b"abc".to_vec());
+    ///
+    ///     fs::remove_file(&path)?;
+    ///     assert(File::open(&path).is_err());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
         OpenOptions::new().read(true).open(path)
     }
 
-    /// Opens a file for writing, creating it or truncating it.
+    /// Opens a file in write-only mode.
+    ///
+    /// This function will create a file if it does not exist, and will truncate
+    /// it if it does. See the [`OpenOptions::open`] function for more details,
+    /// and [`File::create_new`] to fail if the file exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be created or opened, for example
+    /// when its directory does not exist or the process lacks permission.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-create.txt");
+    ///     let mut f = File::create(&path)?;
+    ///     f.write_all(b"1234")?;
+    ///     f.close();
+    ///     assert_eq(fs::read_to_string(&path)?, "1234");
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
         OpenOptions::new()
             .write(true)
@@ -39,8 +133,40 @@ impl File {
             .open(path)
     }
 
-    /// Creates a new file for reading and writing (AlreadyExists if it
-    /// exists).
+    /// Creates a new file in read-write mode; error if the file exists.
+    ///
+    /// This function will create a file if it does not exist, or return an
+    /// error with [`ErrorKind::AlreadyExists`] if it does. This way, if the
+    /// call succeeds, the file returned is guaranteed to be new. The check for
+    /// existence and the creation are one atomic operation.
+    ///
+    /// This is equivalent to
+    /// `OpenOptions::new().read(true).write(true).create_new(true).open(path)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::AlreadyExists`] if the file exists, and other
+    /// errors as [`OpenOptions::open`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::io::{ErrorKind, Write};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-create-new.txt");
+    ///     let _ = fs::remove_file(&path);
+    ///     let mut f = File::create_new(&path)?;
+    ///     f.write_all(b"new")?;
+    ///     f.close();
+    ///
+    ///     let e = File::create_new(&path).unwrap_err();
+    ///     assert_eq(e.kind(), ErrorKind::AlreadyExists);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn create_new<P: AsRef<Path>>(path: P) -> io::Result<File> {
         OpenOptions::new()
             .read(true)
@@ -49,11 +175,59 @@ impl File {
             .open(path)
     }
 
+    /// Returns a new [`OpenOptions`] object.
+    ///
+    /// This function returns a new `OpenOptions` object that you can use to
+    /// open or create a file with specific options if `open()` or `create()`
+    /// are not appropriate. It is equivalent to [`OpenOptions::new`], but
+    /// allows you to write more readable code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-options.txt");
+    ///     fs::write(&path, "a")?;
+    ///     let mut f = File::options().append(true).open(&path)?;
+    ///     f.write_all(b"b")?;
+    ///     f.close();
+    ///     assert_eq(fs::read_to_string(&path)?, "ab");
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
 
-    /// Closes the file (once: later calls do nothing).
+    /// Closes the file.
+    ///
+    /// navi has no Drop, so a file stays open until this is called; pair every
+    /// open with a `close`, usually with `defer`. Calling it again (on this
+    /// value) does nothing. Copies of a `File` share its descriptor, so closing
+    /// one closes the file for all of them. Errors from the underlying `close`
+    /// are ignored; call [`File::sync_all`] first to learn about write errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-close.txt");
+    ///     let mut f = File::create(&path)?;
+    ///     defer f.close();
+    ///     f.write_all(b"data")?;
+    ///     f.close();
+    ///     // A second close (here, the deferred one) does nothing.
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn close(&mut self) {
         if self.fd >= 0 {
             let _ = sys::close(self.fd);
@@ -61,31 +235,191 @@ impl File {
         }
     }
 
-    /// Writes the file's data and metadata to the device.
+    /// Attempts to sync all OS-internal file content and metadata to disk.
+    ///
+    /// This function will attempt to ensure that all in-memory data reaches the
+    /// filesystem before returning (`fsync` on Unix, `FlushFileBuffers` on
+    /// Windows).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the OS reports, for example an I/O error writing
+    /// earlier data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-sync-all.txt");
+    ///     let mut f = File::create(&path)?;
+    ///     f.write_all(b"Hello, world!")?;
+    ///     f.sync_all()?;
+    ///     f.close();
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn sync_all(&self) -> io::Result<()> {
         sys::sync(self.fd)
     }
 
-    /// Writes the file's data to the device.
+    /// Similar to [`File::sync_all`], except that it might not synchronize file
+    /// metadata.
+    ///
+    /// In Rust this is intended for when only the content needs to reach the
+    /// disk. navi currently performs the same full sync as [`File::sync_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the OS reports.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-sync-data.txt");
+    ///     let mut f = File::create(&path)?;
+    ///     f.write_all(b"Hello, world!")?;
+    ///     f.sync_data()?;
+    ///     f.close();
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn sync_data(&self) -> io::Result<()> {
         sys::sync(self.fd)
     }
 
-    /// Truncates or extends (with zeros) the file to size bytes.
+    /// Truncates or extends the underlying file, updating the size of this file
+    /// to become `size`.
+    ///
+    /// If `size` is less than the current file's size, the file will be shrunk.
+    /// If it is greater, the file will be extended to `size` and the extended
+    /// part filled with zeros. The file's cursor is not changed.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the file is not opened for
+    /// writing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-set-len.txt");
+    ///     fs::write(&path, "Hello, world!")?;
+    ///     let mut f = File::options().write(true).open(&path)?;
+    ///     f.set_len(5)?;
+    ///     f.close();
+    ///     assert_eq(fs::read_to_string(&path)?, "Hello");
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn set_len(&self, size: u64) -> io::Result<()> {
         sys::truncate(self.fd, size)
     }
 
+    /// Queries metadata about the underlying file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the OS reports (`fstat` failing).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-metadata.txt");
+    ///     fs::write(&path, "12345")?;
+    ///     let mut f = File::open(&path)?;
+    ///     let metadata = f.metadata()?;
+    ///     f.close();
+    ///     assert(metadata.is_file());
+    ///     assert_eq(metadata.len(), 5);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn metadata(&self) -> io::Result<Metadata> {
         Ok(Metadata {
             attr: sys::fstat(self.fd)?,
         })
     }
 
+    /// Changes the permissions on the underlying file.
+    ///
+    /// On Unix this sets the mode bits (`fchmod`); see [`set_permissions`] for
+    /// the function that takes a path.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the user lacks permission to
+    /// change attributes on the underlying file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-set-permissions.txt");
+    ///     fs::write(&path, "x")?;
+    ///     let mut f = File::open(&path)?;
+    ///     let mut perms = f.metadata()?.permissions();
+    ///     perms.set_readonly(true);
+    ///     f.set_permissions(perms)?;
+    ///     assert(f.metadata()?.permissions().readonly());
+    ///     f.close();
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
         sys::fchmod(self.fd, perm.mode)
     }
 
+    /// Changes the timestamps of the underlying file.
+    ///
+    /// Only the times set in `times` (with [`FileTimes::set_accessed`] and
+    /// [`FileTimes::set_modified`]) are changed; the others are left as they
+    /// are.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the user lacks permission to change timestamps on
+    /// the file, or if a time is out of the range the platform supports.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File, FileTimes};
+    /// use std::time::{Duration, UNIX_EPOCH};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-set-times.txt");
+    ///     fs::write(&path, "x")?;
+    ///     let t = UNIX_EPOCH + Duration::from_secs(1000000000);
+    ///     let mut f = File::options().write(true).open(&path)?;
+    ///     f.set_times(FileTimes::new().set_accessed(t).set_modified(t))?;
+    ///     f.close();
+    ///     let m = fs::metadata(&path)?;
+    ///     assert(m.modified()? == t);
+    ///     assert(m.accessed()? == t);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
         let a = match times.accessed {
             Some(t) => Some(t.unix_nanos()),
@@ -98,6 +432,32 @@ impl File {
         sys::set_times(self.fd, a, m)
     }
 
+    /// Changes the modification time of the underlying file.
+    ///
+    /// This is an alias for `set_times(FileTimes::new().set_modified(time))`.
+    ///
+    /// # Errors
+    ///
+    /// As [`File::set_times`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::time::{Duration, UNIX_EPOCH};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-set-modified.txt");
+    ///     fs::write(&path, "x")?;
+    ///     let mut f = File::options().write(true).open(&path)?;
+    ///     f.set_modified(UNIX_EPOCH + Duration::from_secs(1500000000))?;
+    ///     f.close();
+    ///     let mtime = fs::metadata(&path)?.modified()?;
+    ///     assert_eq(mtime.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1500000000);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn set_modified(&self, time: SystemTime) -> io::Result<()> {
         self.set_times(FileTimes::new().set_modified(time))
     }
@@ -159,7 +519,21 @@ impl IsTerminal for File {
     }
 }
 
-/// Access and modification times to set (File::set_times).
+/// Representation of the various timestamps on a file, to set with
+/// [`File::set_times`].
+///
+/// A time left unset is not changed.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs::FileTimes;
+/// use std::time::SystemTime;
+///
+/// let now = SystemTime::now();
+/// let times = FileTimes::new().set_accessed(now).set_modified(now);
+/// # let _ = times;
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct FileTimes {
     accessed: Option<SystemTime>,
@@ -167,18 +541,53 @@ pub struct FileTimes {
 }
 
 impl FileTimes {
+    /// Creates a new `FileTimes` with no times set.
+    ///
+    /// Using the resulting `FileTimes` in [`File::set_times`] will not modify
+    /// any timestamps.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::FileTimes;
+    ///
+    /// let times = FileTimes::new();
+    /// # let _ = times;
+    /// ```
     pub fn new() -> FileTimes {
         FileTimes {
             accessed: None,
             modified: None,
         }
     }
+    /// Sets the last access time of a file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::FileTimes;
+    /// use std::time::{Duration, UNIX_EPOCH};
+    ///
+    /// let times = FileTimes::new().set_accessed(UNIX_EPOCH + Duration::from_secs(60));
+    /// # let _ = times;
+    /// ```
     pub fn set_accessed(self, t: SystemTime) -> FileTimes {
         FileTimes {
             accessed: Some(t),
             modified: self.modified,
         }
     }
+    /// Sets the last modified time of a file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::FileTimes;
+    /// use std::time::{Duration, UNIX_EPOCH};
+    ///
+    /// let times = FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(60));
+    /// # let _ = times;
+    /// ```
     pub fn set_modified(self, t: SystemTime) -> FileTimes {
         FileTimes {
             accessed: self.accessed,
@@ -189,7 +598,48 @@ impl FileTimes {
 
 // --- OpenOptions -------------------------------------------------------------------
 
-/// How to open a file (File::options()).
+/// Options and flags which can be used to configure how a file is opened.
+///
+/// This builder exposes the ability to configure how a [`File`] is opened and
+/// what operations are permitted on the open file. The [`File::open`] and
+/// [`File::create`] methods are aliases for commonly used options using this
+/// builder.
+///
+/// Generally speaking, when using `OpenOptions`, you'll first call
+/// [`OpenOptions::new`], then chain calls to methods to set each option, then
+/// call [`OpenOptions::open`], passing the path of the file you're trying to
+/// open. This will give you a [`crate::io::Result`] with a [`File`] inside that
+/// you can further operate on. On Unix,
+/// [`crate::os::unix::fs::OpenOptionsExt::mode`] sets the permissions of a file
+/// it creates.
+///
+/// # Examples
+///
+/// Opening a file for both reading and writing, creating it if it doesn't
+/// exist:
+///
+/// ```
+/// use std::fs::OpenOptions;
+/// use std::io::{Read, Seek, SeekFrom, Write};
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-open-options.txt");
+///     let mut file = OpenOptions::new()
+///         .read(true)
+///         .write(true)
+///         .create(true)
+///         .truncate(true)
+///         .open(&path)?;
+///     file.write_all(b"abc")?;
+///     file.seek(SeekFrom::Start(0))?;
+///     let mut s = String::new();
+///     file.read_to_string(&mut s)?;
+///     file.close();
+///     assert_eq(s, "abc");
+///     std::fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     read: bool,
@@ -206,6 +656,21 @@ fn einval() -> Error {
 }
 
 impl OpenOptions {
+    /// Creates a blank new set of options ready for configuration.
+    ///
+    /// All options are initially set to `false`, so at least one of `read`,
+    /// `write` or `append` must be set before [`OpenOptions::open`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::OpenOptions;
+    /// use std::io::ErrorKind;
+    ///
+    /// let mut options = OpenOptions::new();
+    /// // Nothing to do: an error.
+    /// assert_eq(options.open("foo.txt").unwrap_err().kind(), ErrorKind::InvalidInput);
+    /// ```
     pub fn new() -> OpenOptions {
         OpenOptions {
             read: false,
@@ -217,33 +682,214 @@ impl OpenOptions {
             mode: 0o666,
         }
     }
+    /// Sets the option for read access.
+    ///
+    /// This option, when true, will indicate that the file should be
+    /// `read`-able if opened.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, OpenOptions};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-open-options-read.txt");
+    ///     fs::write(&path, "x")?;
+    ///     let mut file = OpenOptions::new().read(true).open(&path)?;
+    ///     file.close();
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn read(&mut self, read: bool) -> &mut OpenOptions {
         self.read = read;
         self
     }
+    /// Sets the option for write access.
+    ///
+    /// This option, when true, will indicate that the file should be
+    /// `write`-able if opened. If the file already exists, any write calls on
+    /// it will overwrite its contents, without truncating it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, OpenOptions};
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-open-options-write.txt");
+    ///     fs::write(&path, "abcdef")?;
+    ///     let mut file = OpenOptions::new().write(true).open(&path)?;
+    ///     file.write_all(b"XY")?;
+    ///     file.close();
+    ///     assert_eq(fs::read_to_string(&path)?, "XYcdef");
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn write(&mut self, write: bool) -> &mut OpenOptions {
         self.write = write;
         self
     }
+    /// Sets the option for the append mode.
+    ///
+    /// This option, when true, means that writes will append to a file instead
+    /// of overwriting previous contents. Note that setting
+    /// `.write(true).append(true)` has the same effect as setting only
+    /// `.append(true)`.
+    ///
+    /// Append mode guarantees that writes will be positioned at the current end
+    /// of file, even when there are other processes or file handles appending
+    /// to the same file. Combining it with `truncate` is an error (unless
+    /// `create_new` is set).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, OpenOptions};
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-open-options-append.txt");
+    ///     fs::write(&path, "line 1\n")?;
+    ///     let mut file = OpenOptions::new().append(true).open(&path)?;
+    ///     file.write_all(b"line 2\n")?;
+    ///     file.close();
+    ///     assert_eq(fs::read_to_string(&path)?, "line 1\nline 2\n");
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn append(&mut self, append: bool) -> &mut OpenOptions {
         self.append = append;
         self
     }
+    /// Sets the option for truncating a previous file.
+    ///
+    /// If a file is successfully opened with this option set to true, it will
+    /// truncate the file to 0 length if it already exists. The file must be
+    /// opened with write access for truncate to work.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, OpenOptions};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-open-options-truncate.txt");
+    ///     fs::write(&path, "old contents")?;
+    ///     let mut file = OpenOptions::new().write(true).truncate(true).open(&path)?;
+    ///     file.close();
+    ///     assert_eq(fs::metadata(&path)?.len(), 0);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn truncate(&mut self, truncate: bool) -> &mut OpenOptions {
         self.truncate = truncate;
         self
     }
+    /// Sets the option to create a new file, or open it if it already exists.
+    ///
+    /// In order for the file to be created, [`OpenOptions::write`] or
+    /// [`OpenOptions::append`] access must be used. See also [`write`] for a
+    /// simple function to create a file with some given data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, OpenOptions};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-open-options-create.txt");
+    ///     let _ = fs::remove_file(&path);
+    ///     let mut file = OpenOptions::new().write(true).create(true).open(&path)?;
+    ///     file.close();
+    ///     assert(path.exists());
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn create(&mut self, create: bool) -> &mut OpenOptions {
         self.create = create;
         self
     }
+    /// Sets the option to create a new file, failing if it already exists.
+    ///
+    /// No file is allowed to exist at the target location, also no (dangling)
+    /// symlink. In this way, if the call succeeds, the file returned is
+    /// guaranteed to be new. If a file exists at the target location, creating
+    /// a new file will fail with [`ErrorKind::AlreadyExists`].
+    ///
+    /// This option is useful because it is atomic. Otherwise between checking
+    /// whether a file exists and creating a new one, the file may have been
+    /// created by another process (a TOCTOU race condition).
+    ///
+    /// If `.create_new(true)` is set, [`.create()`](OpenOptions::create) and
+    /// [`.truncate()`](OpenOptions::truncate) are ignored. The file must be
+    /// opened with write or append access in order to create a new file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, OpenOptions};
+    /// use std::io::ErrorKind;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-open-options-create-new.txt");
+    ///     let _ = fs::remove_file(&path);
+    ///     let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+    ///     file.close();
+    ///     let again = OpenOptions::new().write(true).create_new(true).open(&path);
+    ///     assert_eq(again.unwrap_err().kind(), ErrorKind::AlreadyExists);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn create_new(&mut self, create_new: bool) -> &mut OpenOptions {
         self.create_new = create_new;
         self
     }
 
-    /// Opens path with these options (InvalidInput for a combination that
-    /// makes no sense, as in Rust).
+    /// Opens a file at `path` with the options specified by `self`.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error under a number of different
+    /// circumstances. Some of these error conditions are listed here, together
+    /// with their [`ErrorKind`]. The mapping to `ErrorKind`s is not part of the
+    /// compatibility contract of the function.
+    ///
+    /// * [`ErrorKind::NotFound`]: the specified file does not exist and neither
+    ///   `create` nor `create_new` is set.
+    /// * [`ErrorKind::NotFound`]: one of the directory components of the file
+    ///   path does not exist.
+    /// * [`ErrorKind::PermissionDenied`]: the user lacks permission to get the
+    ///   specified access rights for the file, or to open one of the directory
+    ///   components of the specified path.
+    /// * [`ErrorKind::AlreadyExists`]: `create_new` was specified and the file
+    ///   already exists.
+    /// * [`ErrorKind::InvalidInput`]: invalid combinations of open options
+    ///   (truncate without write access, no access mode set, etc.), as in Rust.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::OpenOptions;
+    /// use std::io::ErrorKind;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-open-options-open.txt");
+    ///     let mut file = OpenOptions::new().write(true).create(true).open(&path)?;
+    ///     file.close();
+    ///
+    ///     let e = OpenOptions::new().read(true).truncate(true).open(&path).unwrap_err();
+    ///     assert_eq(e.kind(), ErrorKind::InvalidInput);
+    ///     std::fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
         let access: u8 = if self.append {
             if self.read { 2 } else { 1 }
@@ -285,7 +931,29 @@ impl OpenOptions {
 
 // --- Metadata ----------------------------------------------------------------------
 
-/// What a file is and its size, times and permissions.
+/// Metadata information about a file.
+///
+/// This structure is returned from the [`metadata`] or [`symlink_metadata`]
+/// function or method and represents known metadata about a file such as its
+/// permissions, size, modification times, etc. On Unix,
+/// [`crate::os::unix::fs::MetadataExt`] gives the raw `stat` fields.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-metadata-type.txt");
+///     fs::write(&path, "hello")?;
+///     let metadata = fs::metadata(&path)?;
+///     assert(metadata.is_file());
+///     assert_eq(metadata.len(), 5);
+///     assert(!metadata.permissions().readonly());
+///     fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct Metadata {
     pub(crate) attr: sys::FileAttr,
@@ -296,34 +964,221 @@ fn system_time(n: i128) -> SystemTime {
 }
 
 impl Metadata {
+    /// Returns the file type for this metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let metadata = fs::metadata(std::env::temp_dir())?;
+    ///     let file_type = metadata.file_type();
+    ///     assert(file_type.is_dir());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn file_type(&self) -> FileType {
         FileType {
             mode: self.attr.mode,
         }
     }
+    /// Returns `true` if this metadata is for a directory.
+    ///
+    /// The result is mutually exclusive to the result of [`Metadata::is_file`],
+    /// and will be false for symlink metadata obtained from
+    /// [`symlink_metadata`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     assert(fs::metadata(std::env::temp_dir())?.is_dir());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn is_dir(&self) -> bool {
         self.file_type().is_dir()
     }
+    /// Returns `true` if this metadata is for a regular file.
+    ///
+    /// The result is mutually exclusive to the result of [`Metadata::is_dir`],
+    /// and will be false for symlink metadata obtained from
+    /// [`symlink_metadata`]. When the goal is simply to read from (or write to)
+    /// the source, the most reliable way to test the source can be read (or
+    /// written to) is to open it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-metadata-is-file.txt");
+    ///     fs::write(&path, "")?;
+    ///     assert(fs::metadata(&path)?.is_file());
+    ///     assert(!fs::metadata(std::env::temp_dir())?.is_file());
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn is_file(&self) -> bool {
         self.file_type().is_file()
     }
+    /// Returns `true` if this metadata is for a symbolic link.
+    ///
+    /// Only metadata from [`symlink_metadata`] (or [`DirEntry::metadata`]) can
+    /// be for a symbolic link; [`metadata`] follows links.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    /// use std::os::unix::fs::symlink;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let dir = std::env::temp_dir().join("navi-doc-metadata-is-symlink");
+    ///     let _ = fs::remove_dir_all(&dir);
+    ///     fs::create_dir(&dir)?;
+    ///     fs::write(dir.join("file.txt"), "x")?;
+    ///     symlink("file.txt", dir.join("link"))?;
+    ///     assert(fs::symlink_metadata(dir.join("link"))?.is_symlink());
+    ///     assert(!fs::metadata(dir.join("link"))?.is_symlink());
+    ///     fs::remove_dir_all(&dir)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn is_symlink(&self) -> bool {
         self.file_type().is_symlink()
     }
+    /// Returns the size of the file, in bytes, this metadata is for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-metadata-len.txt");
+    ///     fs::write(&path, "0123456789")?;
+    ///     assert_eq(fs::metadata(&path)?.len(), 10);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn len(&self) -> u64 {
         self.attr.size
     }
+    /// Returns the permissions of the file this metadata is for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-metadata-permissions.txt");
+    ///     fs::write(&path, "x")?;
+    ///     assert(!fs::metadata(&path)?.permissions().readonly());
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn permissions(&self) -> Permissions {
         Permissions {
             mode: self.attr.mode & 0o7777,
         }
     }
+    /// Returns the last modification time listed in this metadata.
+    ///
+    /// The returned value corresponds to the `mtime` field of `stat` on Unix
+    /// platforms and the `ftLastWriteTime` field on Windows platforms. In navi
+    /// this does not fail: the time is read with the rest of the metadata.
+    ///
+    /// # Errors
+    ///
+    /// Rust returns an error on platforms where this field is not available;
+    /// navi's platforms all have it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    /// use std::time::SystemTime;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-metadata-modified.txt");
+    ///     fs::write(&path, "x")?;
+    ///     let mtime = fs::metadata(&path)?.modified()?;
+    ///     assert(mtime <= SystemTime::now());
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn modified(&self) -> io::Result<SystemTime> {
         Ok(system_time(self.attr.mtime))
     }
+    /// Returns the last access time of this metadata.
+    ///
+    /// The returned value corresponds to the `atime` field of `stat` on Unix
+    /// platforms and the `ftLastAccessTime` field on Windows platforms. Note
+    /// that not all platforms will keep this field updated in a file's
+    /// metadata, for example Linux mounts with `noatime` or `relatime`.
+    ///
+    /// # Errors
+    ///
+    /// Rust returns an error on platforms where this field is not available;
+    /// navi's platforms all have it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    /// use std::time::UNIX_EPOCH;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-metadata-accessed.txt");
+    ///     fs::write(&path, "x")?;
+    ///     let atime = fs::metadata(&path)?.accessed()?;
+    ///     assert(atime > UNIX_EPOCH);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn accessed(&self) -> io::Result<SystemTime> {
         Ok(system_time(self.attr.atime))
     }
+    /// Returns the creation time listed in this metadata.
+    ///
+    /// The returned value corresponds to the `btime` field of `statx` on Linux,
+    /// the `birthtime` field of `stat` on other Unix platforms, and the
+    /// `ftCreationTime` field on Windows.
+    ///
+    /// # Errors
+    ///
+    /// This will return an error with [`ErrorKind::Unsupported`] if the
+    /// platform or filesystem does not record a creation time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    /// use std::io::ErrorKind;
+    /// use std::time::UNIX_EPOCH;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-metadata-created.txt");
+    ///     fs::write(&path, "x")?;
+    ///     match fs::metadata(&path)?.created() {
+    ///         Ok(t) => assert(t > UNIX_EPOCH),
+    ///         Err(e) => assert_eq(e.kind(), ErrorKind::Unsupported),
+    ///     }
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn created(&self) -> io::Result<SystemTime> {
         if self.attr.has_btime {
             return Ok(system_time(self.attr.btime));
@@ -345,19 +1200,97 @@ impl Debug for Metadata {
     }
 }
 
-/// The type of a file.
+/// A structure representing a type of file with accessors for each file type.
+///
+/// It is returned by [`Metadata::file_type`] and [`DirEntry::file_type`]. On
+/// Unix, [`crate::os::unix::fs::FileTypeExt`] tells the other kinds (devices,
+/// FIFOs, sockets).
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-file-type-type.txt");
+///     fs::write(&path, "x")?;
+///     let file_type = fs::metadata(&path)?.file_type();
+///     assert(file_type.is_file());
+///     assert(!file_type.is_dir());
+///     assert(!file_type.is_symlink());
+///     fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct FileType {
     pub(crate) mode: u32,
 }
 
 impl FileType {
+    /// Tests whether this file type represents a directory.
+    ///
+    /// The result is mutually exclusive to the results of [`FileType::is_file`]
+    /// and [`FileType::is_symlink`]; only zero or one of these tests may pass.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     assert(fs::metadata(std::env::temp_dir())?.file_type().is_dir());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn is_dir(&self) -> bool {
         self.mode & sys::S_IFMT == sys::S_IFDIR
     }
+    /// Tests whether this file type represents a regular file.
+    ///
+    /// The result is mutually exclusive to the results of [`FileType::is_dir`]
+    /// and [`FileType::is_symlink`]; only zero or one of these tests may pass.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-file-type-is-file.txt");
+    ///     fs::write(&path, "x")?;
+    ///     assert(fs::metadata(&path)?.file_type().is_file());
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn is_file(&self) -> bool {
         self.mode & sys::S_IFMT == sys::S_IFREG
     }
+    /// Tests whether this file type represents a symbolic link.
+    ///
+    /// The result is mutually exclusive to the results of [`FileType::is_dir`]
+    /// and [`FileType::is_file`]; only zero or one of these tests may pass.
+    ///
+    /// The underlying [`Metadata`] struct needs to be retrieved with
+    /// [`symlink_metadata`] (or [`DirEntry::file_type`]) and not the
+    /// [`metadata`] function, which follows links.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    /// use std::os::unix::fs::symlink;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let link = std::env::temp_dir().join("navi-doc-file-type-is-symlink");
+    ///     let _ = fs::remove_file(&link);
+    ///     symlink("nowhere", &link)?;
+    ///     assert(fs::symlink_metadata(&link)?.file_type().is_symlink());
+    ///     fs::remove_file(&link)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn is_symlink(&self) -> bool {
         self.mode & sys::S_IFMT == sys::S_IFLNK
     }
@@ -373,20 +1306,88 @@ impl Debug for FileType {
     }
 }
 
-/// Permission bits (the mode's low 12 bits; on Windows only the
-/// read-only attribute counts).
+/// Representation of the various permissions on a file.
+///
+/// This holds the permission bits of the file's mode (its low 12 bits) on Unix;
+/// on Windows only the read-only attribute counts. It is returned by
+/// [`Metadata::permissions`] and set with [`set_permissions`] or
+/// [`File::set_permissions`]. On Unix, [`crate::os::unix::fs::PermissionsExt`]
+/// gives the mode bits.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-permissions-type.txt");
+///     fs::write(&path, "x")?;
+///     let mut perms = fs::metadata(&path)?.permissions();
+///     perms.set_readonly(true);
+///     fs::set_permissions(&path, perms)?;
+///     assert(fs::metadata(&path)?.permissions().readonly());
+///     fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Permissions {
     pub(crate) mode: u32,
 }
 
 impl Permissions {
-    /// Whether nobody may write.
+    /// Returns `true` if these permissions describe a readonly (unwritable)
+    /// file.
+    ///
+    /// On Unix this is `true` when none of the write bits (owner, group,
+    /// others) is set; it does not tell whether the current user may write the
+    /// file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-permissions-readonly.txt");
+    ///     fs::write(&path, "x")?;
+    ///     assert_eq(fs::metadata(&path)?.permissions().readonly(), false);
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn readonly(&self) -> bool {
         self.mode & 0o222 == 0
     }
 
-    /// Clears (true) or sets (false) every write bit.
+    /// Modifies the readonly flag for this set of permissions.
+    ///
+    /// If `readonly` is `true`, every write bit is cleared; if it is `false`,
+    /// every write bit is set. This only changes the value: use
+    /// [`set_permissions`] or [`File::set_permissions`] to apply it to a file.
+    ///
+    /// On Unix, `set_readonly(false)` makes the file writable by everyone
+    /// (owner, group and others), as in Rust; use
+    /// [`crate::os::unix::fs::PermissionsExt::set_mode`] for finer control.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi-doc-permissions-set-readonly.txt");
+    ///     fs::write(&path, "x")?;
+    ///     let mut permissions = fs::metadata(&path)?.permissions();
+    ///     permissions.set_readonly(true);
+    ///     // The file is unchanged until the permissions are set on it.
+    ///     assert(!fs::metadata(&path)?.permissions().readonly());
+    ///     fs::set_permissions(&path, permissions)?;
+    ///     assert(fs::metadata(&path)?.permissions().readonly());
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn set_readonly(&mut self, readonly: bool) {
         if readonly {
             self.mode = self.mode & !0o222;
@@ -398,8 +1399,40 @@ impl Permissions {
 
 // --- Directories --------------------------------------------------------------------
 
-/// The entries of a directory (fs::read_dir). They are read when read_dir
-/// is called (there is no Drop to close a directory read lazily).
+/// Iterator over the entries in a directory.
+///
+/// This iterator is returned from the [`read_dir`] function of this module and
+/// will yield instances of [`crate::io::Result`]`<`[`DirEntry`]`>`. Through a
+/// [`DirEntry`] information like the entry's path and possibly other metadata
+/// can be learned. The entries `.` and `..` are skipped, and the order is
+/// platform and filesystem dependent.
+///
+/// Unlike Rust's, navi's `ReadDir` is not lazy: [`read_dir`] reads all the
+/// entries and closes the directory before returning (there is no Drop to close
+/// a directory read lazily), and the iterator walks that list, so its items are
+/// always `Ok`.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-read-dir-type");
+///     let _ = fs::remove_dir_all(&dir);
+///     fs::create_dir(&dir)?;
+///     fs::write(dir.join("a.txt"), "")?;
+///     fs::write(dir.join("b.txt"), "")?;
+///     let mut names = Vec::new();
+///     for entry in fs::read_dir(&dir)? {
+///         names.push(entry?.file_name());
+///     }
+///     names.sort();
+///     assert_eq(names, Vec::from(["a.txt".to_string(), "b.txt".to_string()]));
+///     fs::remove_dir_all(&dir)?;
+///     Ok(())
+/// }
+/// ```
 pub struct ReadDir {
     dir: PathBuf,
     names: Vec<sys::DirEnt>,
@@ -428,7 +1461,32 @@ impl Debug for ReadDir {
     }
 }
 
-/// An entry of a directory.
+/// Entries returned by the [`ReadDir`] iterator.
+///
+/// An instance of `DirEntry` represents an entry inside of a directory on the
+/// filesystem. Each entry can be inspected via methods to learn about the full
+/// path or possibly other metadata through per-platform extension traits.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-dir-entry-type");
+///     let _ = fs::remove_dir_all(&dir);
+///     fs::create_dir(&dir)?;
+///     fs::write(dir.join("data.txt"), "abc")?;
+///     for entry in fs::read_dir(&dir)? {
+///         let entry = entry?;
+///         assert_eq(entry.file_name(), "data.txt");
+///         assert_eq(entry.path(), dir.join("data.txt"));
+///         assert_eq(entry.metadata()?.len(), 3);
+///     }
+///     fs::remove_dir_all(&dir)?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct DirEntry {
     path: PathBuf,
@@ -437,17 +1495,119 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    /// The directory's path joined with the entry's name.
+    /// Returns the full path to the file that this entry represents.
+    ///
+    /// The full path is created by joining the original path to [`read_dir`]
+    /// with the filename of this entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let dir = std::env::temp_dir().join("navi-doc-dir-entry-path");
+    ///     let _ = fs::remove_dir_all(&dir);
+    ///     fs::create_dir(&dir)?;
+    ///     fs::write(dir.join("f"), "")?;
+    ///     for entry in fs::read_dir(&dir)? {
+    ///         assert_eq(entry?.path(), dir.join("f"));
+    ///     }
+    ///     fs::remove_dir_all(&dir)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn path(&self) -> PathBuf {
         self.path.clone()
     }
+    /// Returns the file name of this directory entry without any leading path
+    /// component(s).
+    ///
+    /// As an example, the output of the function will result in "foo" for all
+    /// the following paths: "./foo", "/the/foo", "../../foo". navi has no
+    /// `OsString`: the name is a [`String`] (a name that is not valid UTF-8 is
+    /// converted lossily).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let dir = std::env::temp_dir().join("navi-doc-dir-entry-file-name");
+    ///     let _ = fs::remove_dir_all(&dir);
+    ///     fs::create_dir(&dir)?;
+    ///     fs::write(dir.join("foo"), "")?;
+    ///     for entry in fs::read_dir(&dir)? {
+    ///         assert_eq(entry?.file_name(), "foo");
+    ///     }
+    ///     fs::remove_dir_all(&dir)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn file_name(&self) -> String {
         self.name.clone()
     }
-    /// The entry's metadata (of a symbolic link itself, not its target).
+    /// Returns the metadata for the file that this entry points at.
+    ///
+    /// This function will not traverse symlinks if this entry points at a
+    /// symlink (it is [`symlink_metadata`] of [`DirEntry::path`]); use
+    /// [`metadata`] or [`Path::metadata`] to follow them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry was removed after [`read_dir`] listed it,
+    /// or the OS cannot read its metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let dir = std::env::temp_dir().join("navi-doc-dir-entry-metadata");
+    ///     let _ = fs::remove_dir_all(&dir);
+    ///     fs::create_dir(&dir)?;
+    ///     fs::write(dir.join("f"), "12")?;
+    ///     for entry in fs::read_dir(&dir)? {
+    ///         let metadata = entry?.metadata()?;
+    ///         assert(metadata.is_file());
+    ///         assert_eq(metadata.len(), 2);
+    ///     }
+    ///     fs::remove_dir_all(&dir)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn metadata(&self) -> io::Result<Metadata> {
         symlink_metadata(&self.path)
     }
+    /// Returns the file type for the file that this entry points at.
+    ///
+    /// This function will not traverse symlinks if this entry points at a
+    /// symlink. On most platforms the type comes with the directory listing, so
+    /// no extra system call is needed; otherwise it is read with
+    /// [`DirEntry::metadata`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the type must be read with `stat` and that fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let dir = std::env::temp_dir().join("navi-doc-dir-entry-file-type");
+    ///     let _ = fs::remove_dir_all(&dir);
+    ///     fs::create_dir_all(dir.join("sub"))?;
+    ///     for entry in fs::read_dir(&dir)? {
+    ///         assert(entry?.file_type()?.is_dir());
+    ///     }
+    ///     fs::remove_dir_all(&dir)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn file_type(&self) -> io::Result<FileType> {
         if self.typ != 0 {
             return Ok(FileType { mode: self.typ });
@@ -462,7 +1622,26 @@ impl Debug for DirEntry {
     }
 }
 
-/// Creates directories (DirBuilder::new().recursive(true).create(path)).
+/// A builder used to create directories in various manners.
+///
+/// It creates one directory, or with [`DirBuilder::recursive`] all the missing
+/// ones of a path. On Unix, [`crate::os::unix::fs::DirBuilderExt::mode`] sets
+/// the permissions of the directories it creates.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs::{self, DirBuilder};
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-dir-builder-type");
+///     let _ = fs::remove_dir_all(&dir);
+///     DirBuilder::new().recursive(true).create(dir.join("a/b/c"))?;
+///     assert(dir.join("a/b/c").is_dir());
+///     fs::remove_dir_all(&dir)?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct DirBuilder {
     recursive: bool,
@@ -470,16 +1649,68 @@ pub struct DirBuilder {
 }
 
 impl DirBuilder {
+    /// Creates a new set of options with default mode/security settings for all
+    /// platforms and also non-recursive.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::DirBuilder;
+    ///
+    /// let builder = DirBuilder::new();
+    /// # let _ = builder;
+    /// ```
     pub fn new() -> DirBuilder {
         DirBuilder {
             recursive: false,
             mode: 0o777,
         }
     }
+    /// Indicates that directories should be created recursively, creating all
+    /// parent directories.
+    ///
+    /// Parents that do not exist are created with the same security and
+    /// permissions settings. This option defaults to `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::DirBuilder;
+    ///
+    /// let mut builder = DirBuilder::new();
+    /// builder.recursive(true);
+    /// ```
     pub fn recursive(&mut self, recursive: bool) -> &mut DirBuilder {
         self.recursive = recursive;
         self
     }
+    /// Creates the specified directory with the options configured in this
+    /// builder.
+    ///
+    /// It is considered an error if the directory already exists unless
+    /// recursive mode is enabled.
+    ///
+    /// # Errors
+    ///
+    /// As [`create_dir`] (not recursive) or [`create_dir_all`] (recursive).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, DirBuilder};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let dir = std::env::temp_dir().join("navi-doc-dir-builder-create");
+    ///     let _ = fs::remove_dir_all(&dir);
+    ///     let path = dir.join("foo/bar");
+    ///     DirBuilder::new().recursive(true).create(&path)?;
+    ///     assert(fs::metadata(&path)?.is_dir());
+    ///     // Without recursive mode, an existing directory is an error.
+    ///     assert(DirBuilder::new().create(&path).is_err());
+    ///     fs::remove_dir_all(&dir)?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let p = path.as_ref();
         if self.recursive {
@@ -492,20 +1723,136 @@ impl DirBuilder {
 
 // --- Functions ----------------------------------------------------------------------
 
-/// The metadata of what path names (following symbolic links).
+/// Given a path, queries the file system to get information about a file,
+/// directory, etc.
+///
+/// This function will traverse symbolic links to query information about the
+/// destination file; [`symlink_metadata`] does not.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `stat` function on Unix and the
+/// `GetFileInformationByHandle` function on Windows. Note that, this may change
+/// in the future.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * The user lacks permissions to perform `metadata` call on `path`.
+/// * `path` does not exist.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-fn-metadata.txt");
+///     fs::write(&path, "abc")?;
+///     let attr = fs::metadata(&path)?;
+///     assert(attr.is_file());
+///     assert_eq(attr.len(), 3);
+///     fs::remove_file(&path)?;
+///     assert(fs::metadata(&path).is_err());
+///     Ok(())
+/// }
+/// ```
 pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     Ok(Metadata {
         attr: sys::stat(path.as_ref().as_str(), true)?,
     })
 }
 
-/// The metadata of path itself (a symbolic link is not followed).
+/// Queries the metadata about a file without following symlinks.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `lstat` function on Unix and the
+/// `GetFileInformationByHandle` function (on a handle opened without following
+/// reparse points) on Windows. Note that, this may change in the future.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * The user lacks permissions to perform `metadata` call on `path`.
+/// * `path` does not exist.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+/// use std::os::unix::fs::symlink;
+///
+/// fn main() -> std::io::Result<()> {
+///     let link = std::env::temp_dir().join("navi-doc-fn-symlink-metadata");
+///     let _ = fs::remove_file(&link);
+///     symlink("/", &link)?;
+///     assert(fs::symlink_metadata(&link)?.is_symlink());
+///     assert(fs::metadata(&link)?.is_dir());
+///     fs::remove_file(&link)?;
+///     Ok(())
+/// }
+/// ```
 pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     Ok(Metadata {
         attr: sys::stat(path.as_ref().as_str(), false)?,
     })
 }
 
+/// Returns an iterator over the entries within a directory.
+///
+/// The iterator will yield instances of
+/// [`crate::io::Result`]`<`[`DirEntry`]`>`. New errors may be encountered after
+/// an iterator is initially constructed in Rust; in navi all the entries are
+/// read (and the directory closed) by this call, so the items are always `Ok`.
+/// Entries for the current and parent directories (typically `.` and `..`) are
+/// skipped.
+///
+/// The order in which this iterator returns entries is platform and filesystem
+/// dependent.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `opendir` and `readdir` functions
+/// on Unix and the `FindFirstFileW` and `FindNextFileW` functions on Windows.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * The provided `path` doesn't exist.
+/// * The process lacks permissions to view the contents.
+/// * The `path` points at a non-directory file.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-fn-read-dir");
+///     let _ = fs::remove_dir_all(&dir);
+///     fs::create_dir_all(dir.join("sub"))?;
+///     fs::write(dir.join("file.txt"), "")?;
+///
+///     let mut entries = Vec::new();
+///     for entry in fs::read_dir(&dir)? {
+///         let entry = entry?;
+///         let kind = if entry.file_type()?.is_dir() { "dir" } else { "file" };
+///         entries.push(`${entry.file_name()} (${kind})`.to_string());
+///     }
+///     // The order in which read_dir returns entries is not guaranteed.
+///     entries.sort();
+///     assert_eq(entries, Vec::from(["file.txt (file)".to_string(), "sub (dir)".to_string()]));
+///     fs::remove_dir_all(&dir)?;
+///     Ok(())
+/// }
+/// ```
 pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     let p = path.as_ref();
     let names = sys::read_dir(p.as_str())?;
@@ -516,7 +1863,33 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     })
 }
 
-/// Reads a whole file.
+/// Reads the entire contents of a file into a bytes vector.
+///
+/// This is a convenience function for using [`File::open`] and
+/// [`Read::read_to_end`] with fewer imports and without an intermediate
+/// variable. The file is closed before it returns.
+///
+/// # Errors
+///
+/// This function will return an error if `path` does not already exist. Other
+/// errors may also be returned according to [`OpenOptions::open`]. It will also
+/// return an error if it encounters while reading an error of a kind other than
+/// [`ErrorKind::Interrupted`].
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-fn-read.bin");
+///     fs::write(&path, [1u8, 2, 3])?;
+///     let data: Vec<u8> = fs::read(&path)?;
+///     assert_eq(data, Vec::from([1u8, 2, 3]));
+///     fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     let mut f = File::open(path)?;
     let mut buf = Vec::new();
@@ -526,7 +1899,37 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Reads a whole file as UTF-8.
+/// Reads the entire contents of a file into a string.
+///
+/// This is a convenience function for using [`File::open`] and
+/// [`Read::read_to_string`] with fewer imports and without an intermediate
+/// variable. The file is closed before it returns.
+///
+/// # Errors
+///
+/// This function will return an error if `path` does not already exist. Other
+/// errors may also be returned according to [`OpenOptions::open`]. If the
+/// contents of the file are not valid UTF-8, then an error with
+/// [`ErrorKind::InvalidData`] will be returned.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+/// use std::io::ErrorKind;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-fn-read-to-string.txt");
+///     fs::write(&path, "name = \"navi\"\n")?;
+///     let text = fs::read_to_string(&path)?;
+///     assert_eq(text, "name = \"navi\"\n");
+///
+///     fs::write(&path, [0xffu8, 0xfe])?;
+///     assert_eq(fs::read_to_string(&path).unwrap_err().kind(), ErrorKind::InvalidData);
+///     fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
     let bytes = read(path)?;
     match String::from_utf8(bytes) {
@@ -538,7 +1941,34 @@ pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
     }
 }
 
-/// Writes a whole file, replacing it.
+/// Writes a slice as the entire contents of a file.
+///
+/// This function will create a file if it does not exist, and will entirely
+/// replace its contents if it does. Depending on the platform, this function
+/// may fail if the full directory path does not exist. The file is closed
+/// before it returns.
+///
+/// This is a convenience function for using [`File::create`] and
+/// [`Write::write_all`] with fewer imports.
+///
+/// # Errors
+///
+/// Returns the errors of [`File::create`] and [`Write::write_all`].
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-fn-write.txt");
+///     fs::write(&path, b"Lorem ipsum")?;
+///     fs::write(&path, "dolor sit")?;
+///     assert_eq(fs::read_to_string(&path)?, "dolor sit");
+///     fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
     let mut f = File::create(path)?;
     let r = f.write_all(contents.as_ref());
@@ -546,7 +1976,45 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result
     r
 }
 
-/// Copies a file's contents and permissions; returns how many bytes.
+/// Copies the contents of one file to another. This function will also copy the
+/// permission bits of the original file to the destination file.
+///
+/// This function will **overwrite** the contents of `to`. Note that if `from`
+/// and `to` both point to the same file, then the file will likely get
+/// truncated by this operation.
+///
+/// On success, the total number of bytes copied is returned and it is equal to
+/// the length of the `to` file as reported by `metadata`.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * `from` is neither a regular file nor a symlink to a regular file
+///   ([`ErrorKind::InvalidInput`]).
+/// * `from` does not exist.
+/// * The current process does not have the permission rights to read `from` or
+///   write `to`.
+/// * The parent directory of `to` doesn't exist.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir();
+///     let from = dir.join("navi-doc-fn-copy-from.txt");
+///     let to = dir.join("navi-doc-fn-copy-to.txt");
+///     fs::write(&from, "copy me")?;
+///     assert_eq(fs::copy(&from, &to)?, 7);
+///     assert_eq(fs::read_to_string(&to)?, "copy me");
+///     fs::remove_file(&from)?;
+///     fs::remove_file(&to)?;
+///     Ok(())
+/// }
+/// ```
 pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
     let mut src = File::open(from)?;
     let m = match src.metadata() {
@@ -583,21 +2051,152 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
     Ok(n)
 }
 
+/// Renames a file or directory to a new name, replacing the original file if
+/// `to` already exists.
+///
+/// This will not work if the new name is on a different mount point.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `rename` function on Unix and the
+/// `MoveFileExW` function (with `MOVEFILE_REPLACE_EXISTING`) on Windows. On
+/// Unix, if `from` is a directory, `to` must also be an (empty) directory if it
+/// exists.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * `from` does not exist.
+/// * The user lacks permissions to view contents.
+/// * `from` and `to` are on separate filesystems.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir();
+///     let a = dir.join("navi-doc-fn-rename-a.txt");
+///     let b = dir.join("navi-doc-fn-rename-b.txt");
+///     fs::write(&a, "x")?;
+///     fs::rename(&a, &b)?;
+///     assert(!a.exists());
+///     assert_eq(fs::read_to_string(&b)?, "x");
+///     fs::remove_file(&b)?;
+///     Ok(())
+/// }
+/// ```
 pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     sys::rename(from.as_ref().as_str(), to.as_ref().as_str())
 }
 
+/// Removes a file from the filesystem.
+///
+/// Note that there is no guarantee that the file is immediately deleted (e.g.,
+/// depending on platform, other open file descriptors may prevent immediate
+/// removal).
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `unlink` function on Unix and the
+/// `DeleteFileW` function on Windows.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * `path` points to a directory.
+/// * The file doesn't exist.
+/// * The user lacks permissions to remove the file.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+/// use std::io::ErrorKind;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-fn-remove-file.txt");
+///     fs::write(&path, "x")?;
+///     fs::remove_file(&path)?;
+///     assert_eq(fs::remove_file(&path).unwrap_err().kind(), ErrorKind::NotFound);
+///     Ok(())
+/// }
+/// ```
 pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     sys::unlink(path.as_ref().as_str())
 }
 
 /// Removes an empty directory.
+///
+/// To remove a directory and its contents, use [`remove_dir_all`].
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `rmdir` function on Unix and the
+/// `RemoveDirectoryW` function on Windows.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * `path` doesn't exist.
+/// * `path` isn't a directory.
+/// * The user lacks permissions to remove the directory at the provided `path`.
+/// * The directory isn't empty ([`ErrorKind::DirectoryNotEmpty`]).
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+/// use std::io::ErrorKind;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-fn-remove-dir");
+///     let _ = fs::remove_dir_all(&dir);
+///     fs::create_dir_all(dir.join("sub"))?;
+///     assert_eq(fs::remove_dir(&dir).unwrap_err().kind(), ErrorKind::DirectoryNotEmpty);
+///     fs::remove_dir(dir.join("sub"))?;
+///     fs::remove_dir(&dir)?;
+///     assert(!dir.exists());
+///     Ok(())
+/// }
+/// ```
 pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     sys::rmdir(path.as_ref().as_str())
 }
 
-/// Removes a directory and everything in it (symbolic links are removed,
-/// not followed).
+/// Removes a directory at this path, after removing all its contents. Use
+/// carefully!
+///
+/// This function does **not** follow symbolic links: a symbolic link inside the
+/// directory is removed, not what it points to, and if `path` itself is a
+/// symbolic link, only the link is removed.
+///
+/// # Errors
+///
+/// See [`remove_file`] and [`remove_dir`]. It fails if `path` does not exist,
+/// and stops at the first entry it cannot remove.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-fn-remove-dir-all");
+///     fs::create_dir_all(dir.join("a/b"))?;
+///     fs::write(dir.join("a/b/file.txt"), "x")?;
+///     fs::remove_dir_all(&dir)?;
+///     assert(!dir.exists());
+///     Ok(())
+/// }
+/// ```
 pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let p = path.as_ref();
     let m = symlink_metadata(p)?;
@@ -623,11 +2222,83 @@ fn remove_tree(p: &Path) -> io::Result<()> {
     sys::rmdir(p.as_str())
 }
 
+/// Creates a new, empty directory at the provided path.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `mkdir` function on Unix (with
+/// mode `0o777`, before the umask) and the `CreateDirectoryW` function on
+/// Windows.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * User lacks permissions to create directory at `path`.
+/// * A parent of the given path doesn't exist. (To create a directory and all
+///   its missing parents at the same time, use the [`create_dir_all`]
+///   function.)
+/// * `path` already exists ([`ErrorKind::AlreadyExists`]).
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+/// use std::io::ErrorKind;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-fn-create-dir");
+///     let _ = fs::remove_dir_all(&dir);
+///     fs::create_dir(&dir)?;
+///     assert(dir.is_dir());
+///     assert_eq(fs::create_dir(&dir).unwrap_err().kind(), ErrorKind::AlreadyExists);
+///     fs::remove_dir(&dir)?;
+///     Ok(())
+/// }
+/// ```
 pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     sys::mkdir(path.as_ref().as_str(), 0o777)
 }
 
-/// Creates a directory and its missing parents.
+/// Recursively creates a directory and all of its parent components if they are
+/// missing.
+///
+/// If this function returns an error, some of the parent components might have
+/// been created already. If the empty path is passed to this function, it
+/// always succeeds without creating any directories.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * If any directory in the path specified by `path` does not already exist
+///   and it could not be created otherwise. The specific error conditions for
+///   when a directory is being created (after it is determined to not exist)
+///   are outlined by [`create_dir`].
+///
+/// Notable exception is made for situations where any of the directories
+/// specified in the `path` could not be created as it was being created
+/// concurrently. Such cases are considered to be successful. That is, calling
+/// `create_dir_all` concurrently from multiple threads or processes is
+/// guaranteed not to fail due to a race condition with itself.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-fn-create-dir-all");
+///     fs::create_dir_all(dir.join("some/dir"))?;
+///     assert(dir.join("some/dir").is_dir());
+///     // Directories that already exist are fine.
+///     fs::create_dir_all(dir.join("some"))?;
+///     fs::remove_dir_all(&dir)?;
+///     Ok(())
+/// }
+/// ```
 pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
     create_dir_all_mode(path.as_ref(), 0o777)
 }
@@ -668,33 +2339,205 @@ fn create_dir_all_mode(p: &Path, mode: u32) -> io::Result<()> {
     }
 }
 
-/// The absolute path with no symbolic links, . or .. (the file must exist).
+/// Returns the canonical, absolute form of a path with all intermediate
+/// components normalized and symbolic links resolved.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `realpath` function on Unix and
+/// the `CreateFileW` and `GetFinalPathNameByHandleW` functions on Windows.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * `path` does not exist.
+/// * A non-final component in path is not a directory.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-fn-canonicalize");
+///     fs::create_dir_all(dir.join("a/b"))?;
+///     let path = fs::canonicalize(dir.join("a/../a/./b"))?;
+///     assert(path.is_absolute());
+///     assert(path.as_str().ends_with("/navi-doc-fn-canonicalize/a/b"));
+///     fs::remove_dir_all(&dir)?;
+///     Ok(())
+/// }
+/// ```
 pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     Ok(PathBuf::from(sys::realpath(path.as_ref().as_str())?))
 }
 
-/// What a symbolic link points to.
+/// Reads a symbolic link, returning the file that the link points to.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `readlink` function on Unix and
+/// the `CreateFileW` function with `FILE_FLAG_OPEN_REPARSE_POINT` and
+/// `FILE_FLAG_BACKUP_SEMANTICS` flags on Windows.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * `path` is not a symbolic link.
+/// * `path` does not exist.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+/// use std::os::unix::fs::symlink;
+///
+/// fn main() -> std::io::Result<()> {
+///     let link = std::env::temp_dir().join("navi-doc-fn-read-link");
+///     let _ = fs::remove_file(&link);
+///     symlink("target.txt", &link)?;
+///     assert_eq(fs::read_link(&link)?.as_str(), "target.txt");
+///     fs::remove_file(&link)?;
+///     Ok(())
+/// }
+/// ```
 pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     Ok(PathBuf::from(sys::readlink(path.as_ref().as_str())?))
 }
 
-/// A new name (link) for the file original.
+/// Creates a new hard link on the filesystem.
+///
+/// The `link` path will be a link pointing to the `original` path. Note that
+/// systems often require these two paths to both be located on the same
+/// filesystem.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `link` function on Unix and the
+/// `CreateHardLinkW` function on Windows.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * The `original` path is not a file or doesn't exist.
+/// * The `link` path already exists.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let dir = std::env::temp_dir().join("navi-doc-fn-hard-link");
+///     let _ = fs::remove_dir_all(&dir);
+///     fs::create_dir(&dir)?;
+///     fs::write(dir.join("a.txt"), "shared")?;
+///     fs::hard_link(dir.join("a.txt"), dir.join("b.txt"))?;
+///     fs::write(dir.join("a.txt"), "changed")?;
+///     assert_eq(fs::read_to_string(dir.join("b.txt"))?, "changed");
+///     fs::remove_dir_all(&dir)?;
+///     Ok(())
+/// }
+/// ```
 pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     sys::link(original.as_ref().as_str(), link.as_ref().as_str())
 }
 
-/// A symbolic link (deprecated in Rust for std::os::unix::fs::symlink and
-/// std::os::windows::fs::symlink_file/symlink_dir).
+/// Creates a new symbolic link on the filesystem.
+///
+/// The `link` path will be a symbolic link pointing to the `original` path. On
+/// Windows this makes a link to a file. Rust deprecates this function in favor
+/// of [`crate::os::unix::fs::symlink`] and `std::os::windows::fs::symlink_file`
+/// or `symlink_dir`, which should be preferred.
+///
+/// # Errors
+///
+/// Returns an error if `link` already exists or cannot be created.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let link = std::env::temp_dir().join("navi-doc-fn-soft-link");
+///     let _ = fs::remove_file(&link);
+///     fs::soft_link("a.txt", &link)?;
+///     assert(link.is_symlink());
+///     fs::remove_file(&link)?;
+///     Ok(())
+/// }
+/// ```
 pub fn soft_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     sys::symlink(original.as_ref().as_str(), link.as_ref().as_str(), false)
 }
 
+/// Changes the permissions found on a file or a directory.
+///
+/// # Platform-specific behavior
+///
+/// This function currently corresponds to the `chmod` function on Unix and the
+/// `SetFileAttributesW` function (the read-only attribute) on Windows.
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * `path` does not exist.
+/// * The user lacks the permission to change attributes of the file.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let path = std::env::temp_dir().join("navi-doc-fn-set-permissions.txt");
+///     fs::write(&path, "x")?;
+///     let mut perms = fs::metadata(&path)?.permissions();
+///     perms.set_readonly(true);
+///     fs::set_permissions(&path, perms)?;
+///     assert(fs::metadata(&path)?.permissions().readonly());
+///     fs::remove_file(&path)?;
+///     Ok(())
+/// }
+/// ```
 pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result<()> {
     sys::chmod(path.as_ref().as_str(), perm.mode, perm.readonly())
 }
 
-/// Whether a path exists: Ok(false) if it does not, Err if that cannot be
-/// told (a broken symbolic link does not exist).
+/// Returns `Ok(true)` if the path points at an existing entity.
+///
+/// This function will traverse symbolic links to query information about the
+/// destination file. In case of broken symbolic links this will return
+/// `Ok(false)`.
+///
+/// As opposed to [`Path::exists`], this function doesn't just return false on
+/// errors such as permission denied: it returns `Ok(false)` only when the path
+/// is not found, and `Err` when that cannot be told.
+///
+/// # Errors
+///
+/// Returns the error of [`metadata`] if it is not [`ErrorKind::NotFound`].
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     assert(fs::exists(std::env::temp_dir())?);
+///     assert(!fs::exists(std::env::temp_dir().join("navi-doc-fn-exists-missing"))?);
+///     Ok(())
+/// }
+/// ```
 pub fn exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {
     match metadata(path) {
         Ok(_) => Ok(true),

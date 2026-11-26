@@ -2,6 +2,38 @@
 //! are paired by hand (with defer), or with_lock runs a function holding
 //! the lock (see spec/std-diff.md).
 
+/// A mutual exclusion primitive useful for protecting shared data.
+///
+/// This mutex will block threads waiting for the lock to become available.
+/// The mutex can be created via [`Mutex::new`], and the data it protects is
+/// only accessed while holding the lock: [`Mutex::lock`] returns the data,
+/// [`Mutex::unlock`] releases it, and [`Mutex::with_lock`] runs a function
+/// holding the lock.
+///
+/// Unlike Rust's, navi's `Mutex` has no guard (there is no Drop): every
+/// `lock` must be paired with an `unlock`, usually with `defer`. There is no
+/// lock poisoning either. Waiting parks the green thread, not its OS thread.
+/// To share a mutex between threads, share a `&Mutex<T>` (Rust's
+/// `Arc<Mutex<T>>`).
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Mutex;
+/// use std::thread;
+///
+/// let counter = &Mutex::new(0);
+/// let mut handles = Vec::new();
+/// for _ in 0..10 {
+///     handles.push(thread::spawn(|| {
+///         counter.with_lock(|n| *n += 1);
+///     }));
+/// }
+/// for h in handles {
+///     h.join().unwrap();
+/// }
+/// assert_eq(counter.with_lock(|n| *n), 10);
+/// ```
 pub struct Mutex<T> {
     word: usize,
     // Guards waiters (the Gs sleeping until the lock is free).
@@ -11,6 +43,16 @@ pub struct Mutex<T> {
 }
 
 impl<T> Mutex<T> {
+    /// Creates a new mutex in an unlocked state ready for use.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Mutex;
+    ///
+    /// let mutex = Mutex::new(0);
+    /// assert_eq(mutex.into_inner(), 0);
+    /// ```
     pub fn new(t: T) -> Mutex<T> {
         Mutex {
             word: 0,
@@ -30,8 +72,24 @@ impl<T> Mutex<T> {
         &self.waiters as *const crate::rt::sched::WaitList as *mut crate::rt::sched::WaitList
     }
 
-    /// Waits until the lock is free and takes it; returns the data (until
-    /// unlock).
+    /// Acquires the mutex, blocking the current thread until it is able to do
+    /// so, and returns the protected data.
+    ///
+    /// The returned reference may be used until [`Mutex::unlock`] is called;
+    /// using it afterwards is a data race. Locking a mutex the current thread
+    /// already holds deadlocks.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Mutex;
+    ///
+    /// let mutex = Mutex::new(Vec::new());
+    /// let v = mutex.lock();
+    /// v.push(1);
+    /// assert_eq(v.len(), 1);
+    /// mutex.unlock();
+    /// ```
     pub fn lock(&self) -> &mut T {
         crate::rt::sched::mutex_lock(self.word(), self.lk(), self.q());
         self.data_mut()
@@ -41,16 +99,62 @@ impl<T> Mutex<T> {
         unsafe { &mut *(&self.data as *const T as *mut T) }
     }
 
-    /// Takes the lock if it is free.
+    /// Attempts to acquire the lock without blocking.
+    ///
+    /// Returns `true` if the lock was free and is now held by the caller, who
+    /// must [`unlock`](Mutex::unlock) it; `false` if another thread holds it.
+    /// Unlike Rust's, it returns no guard.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Mutex;
+    ///
+    /// let mutex = Mutex::new(1);
+    /// assert(mutex.try_lock());
+    /// assert(!mutex.try_lock());
+    /// mutex.unlock();
+    /// ```
     pub fn try_lock(&self) -> bool {
         crate::rt::sched::mutex_try_lock(self.word())
     }
 
+    /// Releases the lock taken by [`Mutex::lock`] or [`Mutex::try_lock`],
+    /// waking one waiting thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Mutex;
+    ///
+    /// let mutex = Mutex::new(5);
+    /// *mutex.lock() += 1;
+    /// mutex.unlock();
+    /// assert(mutex.try_lock());
+    /// mutex.unlock();
+    /// ```
     pub fn unlock(&self) {
         crate::rt::sched::mutex_unlock(self.word(), self.lk(), self.q());
     }
 
-    /// Runs f on the data holding the lock.
+    /// Runs `f` on the protected data while holding the lock, and returns what
+    /// it returns.
+    ///
+    /// This is the guard-free way to use a mutex: the lock is taken before `f`
+    /// runs and released after it returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Mutex;
+    ///
+    /// let mutex = Mutex::new(Vec::from([1, 2]));
+    /// let len = mutex.with_lock(|v| {
+    ///     v.push(3);
+    ///     v.len()
+    /// });
+    /// assert_eq(len, 3);
+    /// ```
     pub fn with_lock<R>(&self, f: fn(&mut T) -> R) -> R {
         self.lock();
         let p = &self.data as *const T as *mut T;
@@ -59,10 +163,34 @@ impl<T> Mutex<T> {
         r
     }
 
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// Since this call borrows the `Mutex` mutably, no locking needs to take
+    /// place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Mutex;
+    ///
+    /// let mut mutex = Mutex::new(0);
+    /// *mutex.get_mut() = 10;
+    /// assert_eq(mutex.into_inner(), 10);
+    /// ```
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.data
     }
 
+    /// Consumes this mutex, returning the underlying data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Mutex;
+    ///
+    /// let mutex = Mutex::new(0);
+    /// assert_eq(mutex.into_inner(), 0);
+    /// ```
     pub fn into_inner(self) -> T {
         self.data
     }

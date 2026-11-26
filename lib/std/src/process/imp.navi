@@ -1,6 +1,9 @@
-//! Child processes on the OS layer: Command, Child, Stdio, ExitStatus.
-//! navi has no Drop: a child's piped streams are closed by close() (wait
-//! and wait_with_output close the child's stdin first, as in Rust).
+//! Child processes on the OS layer: [`Command`], [`Child`], [`Stdio`],
+//! [`ExitStatus`] (re-exported by `std::process`).
+//!
+//! navi has no Drop: a child's piped streams are closed by `close()`
+//! ([`Child::wait`] and [`Child::wait_with_output`] close the child's stdin
+//! first, as in Rust).
 
 use crate::fmt::{self, Debug, Display, Formatter};
 use crate::io::{self, Error, ErrorKind, Read, Write};
@@ -13,7 +16,33 @@ const KIND_NULL: u8 = 1;
 const KIND_FD: u8 = 2;
 const KIND_PIPED: u8 = 3;
 
-/// What a child's standard stream is connected to.
+/// Describes what to do with a standard I/O stream for a child process when
+/// passed to the [`stdin`], [`stdout`], and [`stderr`] methods of [`Command`].
+///
+/// A `Stdio` is made with [`Stdio::piped`], [`Stdio::inherit`] or
+/// [`Stdio::null`], or converted from a [`File`](crate::fs::File), from a
+/// [`ChildStdin`], [`ChildStdout`] or [`ChildStderr`] (to connect two
+/// children), or from [`io::stdout()`](crate::io::stdout) and
+/// [`io::stderr()`](crate::io::stderr). A file or pipe converted this way is
+/// not closed by the conversion: the parent keeps its copy open until it calls
+/// `close()` on it.
+///
+/// # Examples
+///
+/// ```
+/// use std::process::{Command, Stdio};
+///
+/// let output = Command::new("echo")
+///     .arg("silent")
+///     .stdout(Stdio::null())
+///     .output()
+///     .unwrap();
+/// assert(output.stdout.is_empty());
+/// ```
+///
+/// [`stdin`]: Command::stdin
+/// [`stdout`]: Command::stdout
+/// [`stderr`]: Command::stderr
 #[derive(Clone, Debug)]
 pub struct Stdio {
     kind: u8,
@@ -21,21 +50,102 @@ pub struct Stdio {
 }
 
 impl Stdio {
-    /// A new pipe to the parent (Child::stdin, stdout, stderr).
+    /// A new pipe should be arranged to connect the parent and child processes.
+    ///
+    /// The parent's end is available as the [`Child`]'s `stdin`, `stdout` or
+    /// `stderr` field. The first time a pipe is created, the program starts
+    /// ignoring `SIGPIPE` (as Rust's does at start-up), so that writing to a
+    /// child that has exited gives an error rather than killing the program;
+    /// the child gets the default handling back.
+    ///
+    /// # Examples
+    ///
+    /// With stdout:
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// let output = Command::new("echo")
+    ///     .arg("Hello, world!")
+    ///     .stdout(Stdio::piped())
+    ///     .output()
+    ///     .expect("Failed to execute command");
+    ///
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "Hello, world!\n");
+    /// // Nothing echoed to console
+    /// ```
+    ///
+    /// With stdin:
+    ///
+    /// ```
+    /// use std::io::Write;
+    /// use std::process::{Command, Stdio};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut child = Command::new("tr")
+    ///         .args(["a-z", "A-Z"])
+    ///         .stdin(Stdio::piped())
+    ///         .stdout(Stdio::piped())
+    ///         .spawn()?;
+    ///
+    ///     let mut stdin = child.stdin.take().expect("Failed to open stdin");
+    ///     stdin.write_all("Hello, world!".as_bytes())?;
+    ///     // Close it so that tr sees the end of its input.
+    ///     stdin.close();
+    ///
+    ///     let output = child.wait_with_output()?;
+    ///     assert_eq(String::from_utf8(output.stdout).unwrap(), "HELLO, WORLD!");
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn piped() -> Stdio {
         Stdio {
             kind: KIND_PIPED,
             fd: -1,
         }
     }
-    /// The parent's stream.
+    /// The child inherits from the corresponding parent descriptor.
+    ///
+    /// This is the default for [`Command::spawn`] and [`Command::status`] (and
+    /// for the stdin of nothing else: [`Command::output`] makes stdin
+    /// [`Stdio::null`] unless set).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// let output = Command::new("true")
+    ///     .stdout(Stdio::inherit())
+    ///     .output()
+    ///     .expect("Failed to execute command");
+    ///
+    /// // Whatever the child wrote went to the parent's stdout, not to `output`.
+    /// assert(output.stdout.is_empty());
+    /// ```
     pub fn inherit() -> Stdio {
         Stdio {
             kind: KIND_INHERIT,
             fd: -1,
         }
     }
-    /// Nothing (/dev/null, NUL on Windows).
+    /// This stream will be ignored. This is the equivalent of attaching the
+    /// stream to `/dev/null` (`NUL` on Windows).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// let output = Command::new("echo")
+    ///     .arg("Hello, world!")
+    ///     .stdout(Stdio::null())
+    ///     .output()
+    ///     .expect("Failed to execute command");
+    ///
+    /// assert(output.stdout.is_empty());
+    /// // Nothing echoed to console
+    /// ```
     pub fn null() -> Stdio {
         Stdio {
             kind: KIND_NULL,
@@ -45,6 +155,27 @@ impl Stdio {
 }
 
 impl From<crate::fs::File> for Stdio {
+    /// Converts a [`File`](crate::fs::File) into a [`Stdio`]: the child reads
+    /// from or writes to the file. The parent's `File` stays open (close it
+    /// when done).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::{self, File};
+    /// use std::process::Command;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("navi_doc_stdio_from_file.txt");
+    ///     let mut file = File::create(&path)?;
+    ///     let status = Command::new("echo").arg("to a file").stdout(file).status()?;
+    ///     file.close();
+    ///     assert(status.success());
+    ///     assert_eq(fs::read_to_string(&path)?, "to a file\n");
+    ///     fs::remove_file(&path)?;
+    ///     Ok(())
+    /// }
+    /// ```
     fn from(f: crate::fs::File) -> Stdio {
         Stdio {
             kind: KIND_FD,
@@ -54,6 +185,8 @@ impl From<crate::fs::File> for Stdio {
 }
 
 impl From<ChildStdin> for Stdio {
+    /// Converts a [`ChildStdin`] into a [`Stdio`]: another child writes into
+    /// the first child's stdin.
     fn from(c: ChildStdin) -> Stdio {
         Stdio {
             kind: KIND_FD,
@@ -63,6 +196,24 @@ impl From<ChildStdin> for Stdio {
 }
 
 impl From<ChildStdout> for Stdio {
+    /// Converts a [`ChildStdout`] into a [`Stdio`]: another child reads the
+    /// first child's output.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut hello = Command::new("echo").arg("Hello, world!").stdout(Stdio::piped()).spawn()?;
+    ///     let mut hello_out = hello.stdout.take().unwrap();
+    ///     let upper = Command::new("tr").args(["a-z", "A-Z"]).stdin(hello_out).output()?;
+    ///     hello.wait()?;
+    ///     hello_out.close();
+    ///     assert_eq(String::from_utf8(upper.stdout).unwrap(), "HELLO, WORLD!\n");
+    ///     Ok(())
+    /// }
+    /// ```
     fn from(c: ChildStdout) -> Stdio {
         Stdio {
             kind: KIND_FD,
@@ -72,6 +223,8 @@ impl From<ChildStdout> for Stdio {
 }
 
 impl From<ChildStderr> for Stdio {
+    /// Converts a [`ChildStderr`] into a [`Stdio`]: another child reads the
+    /// first child's error output.
     fn from(c: ChildStderr) -> Stdio {
         Stdio {
             kind: KIND_FD,
@@ -81,6 +234,17 @@ impl From<ChildStderr> for Stdio {
 }
 
 impl From<io::Stdout> for Stdio {
+    /// Redirects the child's stream to the parent's standard output.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io;
+    /// use std::process::Command;
+    ///
+    /// let output = Command::new("true").stdout(io::stdout()).output().unwrap();
+    /// assert(output.stdout.is_empty());
+    /// ```
     fn from(s: io::Stdout) -> Stdio {
         Stdio {
             kind: KIND_FD,
@@ -90,6 +254,17 @@ impl From<io::Stdout> for Stdio {
 }
 
 impl From<io::Stderr> for Stdio {
+    /// Redirects the child's stream to the parent's standard error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io;
+    /// use std::process::Command;
+    ///
+    /// let output = Command::new("true").stdout(io::stderr()).output().unwrap();
+    /// assert(output.stdout.is_empty());
+    /// ```
     fn from(s: io::Stderr) -> Stdio {
         Stdio {
             kind: KIND_FD,
@@ -98,8 +273,61 @@ impl From<io::Stderr> for Stdio {
     }
 }
 
-/// A command to run: program, arguments, environment, directory and
-/// standard streams.
+/// A process builder, providing fine-grained control over how a new process
+/// should be spawned.
+///
+/// A default configuration can be generated using `Command::new(program)`,
+/// where `program` gives a path to the program to be executed. Additional
+/// builder methods allow the configuration to be changed (for example, by
+/// adding arguments) prior to spawning:
+///
+/// ```
+/// use std::process::Command;
+///
+/// let output = Command::new("sh")
+///     .arg("-c")
+///     .arg("echo hello")
+///     .output()
+///     .expect("failed to execute process");
+///
+/// let hello = output.stdout;
+/// assert_eq(hello, "hello\n".as_bytes().to_vec());
+/// ```
+///
+/// `Command` can be reused to spawn multiple processes. The builder methods
+/// change the command without needing to immediately spawn the process.
+///
+/// ```
+/// use std::process::Command;
+///
+/// let mut echo_hello = Command::new("sh");
+/// echo_hello.arg("-c").arg("echo hello");
+/// let hello_1 = echo_hello.output().expect("failed to execute process");
+/// let hello_2 = echo_hello.output().expect("failed to execute process");
+/// assert_eq(hello_1, hello_2);
+/// ```
+///
+/// Similarly, you can call builder methods after spawning a process and then
+/// spawn a new process with the modified settings.
+///
+/// ```
+/// use std::process::Command;
+///
+/// let mut list_dir = Command::new("ls");
+/// # list_dir.stdout(std::process::Stdio::null());
+///
+/// // Execute `ls` in the current directory of the program.
+/// list_dir.status().expect("process failed to execute");
+///
+/// // Change `ls` to execute in the root directory.
+/// list_dir.current_dir("/");
+///
+/// // And then execute `ls` again but in the root directory.
+/// list_dir.status().expect("process failed to execute");
+/// ```
+///
+/// Unlike Rust's, a `Command` is [`Clone`], and its arguments and environment
+/// are UTF-8 strings (navi has no `OsStr`).
 #[derive(Clone)]
 pub struct Command {
     program: String,
@@ -111,8 +339,42 @@ pub struct Command {
 }
 
 impl Command {
-    /// A command running program (searched in PATH unless it has a path
-    /// separator).
+    /// Constructs a new `Command` for launching the program at path `program`,
+    /// with the following default configuration:
+    ///
+    /// * No arguments to the program
+    /// * Inherit the current process's environment
+    /// * Inherit the current process's working directory
+    /// * Inherit stdin/stdout/stderr for [`spawn`] or [`status`], but create
+    ///   pipes for the stdout and stderr of [`output`] (and make its stdin
+    ///   null)
+    ///
+    /// Builder methods are provided to change these defaults and otherwise
+    /// configure the process.
+    ///
+    /// If `program` is not an absolute path (it has no path separator), the
+    /// `PATH` is searched for it, as Rust's: std itself searches the `PATH` of
+    /// the child's environment (the parent's if the child's has none), and
+    /// spawning fails with [`ErrorKind::NotFound`] if the program is in none of
+    /// its directories.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let mut child = Command::new("true")
+    ///     .spawn()
+    ///     .expect("true command failed to start");
+    /// child.wait().unwrap();
+    ///
+    /// let err = Command::new("navi_doc_no_such_program").spawn().unwrap_err();
+    /// assert_eq(err.kind(), std::io::ErrorKind::NotFound);
+    /// ```
+    ///
+    /// [`spawn`]: Self::spawn
+    /// [`status`]: Self::status
+    /// [`output`]: Self::output
     pub fn new<S: AsRef<str>>(program: S) -> Command {
         let mut stdio: Vec<Option<Stdio>> = Vec::new();
         stdio.push(None);
@@ -128,11 +390,67 @@ impl Command {
         }
     }
 
+    /// Adds an argument to pass to the program.
+    ///
+    /// Only one argument can be passed per use. So instead of:
+    ///
+    /// ```no_run
+    /// # std::process::Command::new("sh")
+    /// .arg("-C /path/to/repo")
+    /// # ;
+    /// ```
+    ///
+    /// usage would be:
+    ///
+    /// ```no_run
+    /// # std::process::Command::new("sh")
+    /// .arg("-C")
+    /// .arg("/path/to/repo")
+    /// # ;
+    /// ```
+    ///
+    /// To pass multiple arguments see [`args`](Command::args).
+    ///
+    /// Note that the argument is not passed through a shell, but given
+    /// literally to the program. This means that shell syntax like quotes,
+    /// escaped characters, word splitting, glob patterns, variable
+    /// substitution, etc. have no effect.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let output = Command::new("echo")
+    ///     .arg("$HOME")
+    ///     .arg("*")
+    ///     .output()
+    ///     .expect("echo command failed to start");
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "$HOME *\n");
+    /// ```
     pub fn arg<S: AsRef<str>>(&mut self, arg: S) -> &mut Command {
         self.args.push(arg.as_ref().to_string());
         self
     }
 
+    /// Adds multiple arguments to pass to the program.
+    ///
+    /// To pass a single argument see [`arg`](Command::arg).
+    ///
+    /// As with [`arg`](Command::arg), the arguments are not passed through a
+    /// shell.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let output = Command::new("echo")
+    ///     .args(["one", "two", "three"])
+    ///     .output()
+    ///     .expect("echo command failed to start");
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "one two three\n");
+    /// ```
     pub fn args<I, S>(&mut self, args: I) -> &mut Command
     where
         I: IntoIterator<Item = S>,
@@ -144,13 +462,62 @@ impl Command {
         self
     }
 
-    /// Sets a variable of the child's environment.
+    /// Inserts or updates an explicit environment variable mapping.
+    ///
+    /// This method allows you to add an environment variable mapping to the
+    /// spawned process or overwrite a previously set value. You can use
+    /// [`Command::envs`] to set multiple environment variables simultaneously.
+    ///
+    /// Child processes will inherit environment variables from their parent
+    /// process by default. Environment variables explicitly set using
+    /// [`Command::env`] take precedence over inherited variables. You can
+    /// disable environment variable inheritance entirely using
+    /// [`Command::env_clear`] or for a single key using
+    /// [`Command::env_remove`].
+    ///
+    /// Note that environment variable names are case-insensitive (but
+    /// case-preserving) on Windows and case-sensitive on all other platforms.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let output = Command::new("sh")
+    ///     .arg("-c")
+    ///     .arg("echo $NAVI_DOC_CMD_ENV")
+    ///     .env("NAVI_DOC_CMD_ENV", "from the parent")
+    ///     .output()
+    ///     .expect("sh command failed to start");
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "from the parent\n");
+    /// ```
     pub fn env<K: AsRef<str>, V: AsRef<str>>(&mut self, key: K, val: V) -> &mut Command {
         self.envs
             .push((key.as_ref().to_string(), Some(val.as_ref().to_string())));
         self
     }
 
+    /// Inserts or updates multiple explicit environment variable mappings.
+    ///
+    /// This method allows you to add multiple environment variable mappings to
+    /// the spawned process or overwrite previously set values. You can use
+    /// [`Command::env`] to set a single environment variable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let vars = [("NAVI_DOC_A", "1"), ("NAVI_DOC_B", "2")];
+    ///
+    /// let output = Command::new("sh")
+    ///     .arg("-c")
+    ///     .arg("echo $NAVI_DOC_A $NAVI_DOC_B")
+    ///     .envs(vars)
+    ///     .output()
+    ///     .expect("sh command failed to start");
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "1 2\n");
+    /// ```
     pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Command
     where
         I: IntoIterator<Item = (K, V)>,
@@ -164,54 +531,246 @@ impl Command {
         self
     }
 
-    /// Leaves a variable out of the child's environment.
+    /// Removes an explicitly set environment variable and prevents inheriting
+    /// it from a parent process.
+    ///
+    /// This method will remove the explicit value of an environment variable
+    /// set via [`Command::env`] or [`Command::envs`]. In addition, it will
+    /// prevent the spawned child process from inheriting that environment
+    /// variable from its parent process.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// // HOME is inherited from this process unless removed.
+    /// let output = Command::new("sh")
+    ///     .arg("-c")
+    ///     .arg("echo \"[$HOME][$NAVI_DOC_ENV_REMOVE]\"")
+    ///     .env("NAVI_DOC_ENV_REMOVE", "set")
+    ///     .env_remove("NAVI_DOC_ENV_REMOVE")
+    ///     .env_remove("HOME")
+    ///     .output()
+    ///     .expect("sh command failed to start");
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "[][]\n");
+    /// ```
     pub fn env_remove<K: AsRef<str>>(&mut self, key: K) -> &mut Command {
         self.envs.push((key.as_ref().to_string(), None));
         self
     }
 
-    /// Starts the child's environment empty (then env adds to it).
+    /// Clears all explicitly set environment variables and prevents inheriting
+    /// any parent process environment variables.
+    ///
+    /// This method will remove all explicitly added environment variables set
+    /// via [`Command::env`] or [`Command::envs`]. In addition, it will prevent
+    /// the spawned child process from inheriting any environment variable from
+    /// its parent process; variables set with [`Command::env`] afterwards are
+    /// still given to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let output = Command::new("/bin/sh")
+    ///     .arg("-c")
+    ///     .arg("echo \"[$HOME][$NAVI_DOC_KEPT]\"")
+    ///     .env_clear()
+    ///     .env("NAVI_DOC_KEPT", "yes")
+    ///     .output()
+    ///     .expect("sh command failed to start");
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "[][yes]\n");
+    /// ```
     pub fn env_clear(&mut self) -> &mut Command {
         self.clear = true;
         self.envs.clear();
         self
     }
 
-    /// The child's working directory.
+    /// Sets the working directory for the child process.
+    ///
+    /// If the program path is relative (e.g., `"./script.sh"`), it is
+    /// interpreted relative to the parent's working directory, not `dir`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let output = Command::new("pwd")
+    ///     .current_dir("/")
+    ///     .output()
+    ///     .expect("pwd command failed to start");
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "/\n");
+    /// ```
     pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Command {
         self.cwd = Some(dir.as_ref().as_str().to_string());
         self
     }
 
+    /// Configuration for the child process's standard input (stdin) handle.
+    ///
+    /// Defaults to [`inherit`] when used with [`spawn`] or [`status`], and
+    /// defaults to [`null`] when used with [`output`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// let output = Command::new("cat")
+    ///     .stdin(Stdio::null())
+    ///     .output()
+    ///     .expect("cat command failed to start");
+    /// assert(output.stdout.is_empty());
+    /// ```
+    ///
+    /// [`inherit`]: Stdio::inherit
+    /// [`null`]: Stdio::null
+    /// [`spawn`]: Self::spawn
+    /// [`status`]: Self::status
+    /// [`output`]: Self::output
     pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
         self.stdio[0] = Some(cfg.into());
         self
     }
 
+    /// Configuration for the child process's standard output (stdout) handle.
+    ///
+    /// Defaults to [`inherit`] when used with [`spawn`] or [`status`], and
+    /// defaults to [`piped`] when used with [`output`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// let output = Command::new("echo")
+    ///     .arg("unseen")
+    ///     .stdout(Stdio::null())
+    ///     .output()
+    ///     .expect("echo command failed to start");
+    /// assert(output.stdout.is_empty());
+    /// ```
+    ///
+    /// [`inherit`]: Stdio::inherit
+    /// [`piped`]: Stdio::piped
+    /// [`spawn`]: Self::spawn
+    /// [`status`]: Self::status
+    /// [`output`]: Self::output
     pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
         self.stdio[1] = Some(cfg.into());
         self
     }
 
+    /// Configuration for the child process's standard error (stderr) handle.
+    ///
+    /// Defaults to [`inherit`] when used with [`spawn`] or [`status`], and
+    /// defaults to [`piped`] when used with [`output`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// let output = Command::new("sh")
+    ///     .arg("-c")
+    ///     .arg("echo oops 1>&2")
+    ///     .stderr(Stdio::null())
+    ///     .output()
+    ///     .expect("sh command failed to start");
+    /// assert(output.stderr.is_empty());
+    /// ```
+    ///
+    /// [`inherit`]: Stdio::inherit
+    /// [`piped`]: Stdio::piped
+    /// [`spawn`]: Self::spawn
+    /// [`status`]: Self::status
+    /// [`output`]: Self::output
     pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
         self.stdio[2] = Some(cfg.into());
         self
     }
 
+    /// Returns the path to the program that was given to [`Command::new`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let cmd = Command::new("echo");
+    /// assert_eq(cmd.get_program(), "echo");
+    /// ```
     pub fn get_program(&self) -> &str {
         self.program.as_str()
     }
 
+    /// Returns an iterator of the arguments that will be passed to the program.
+    ///
+    /// This does not include the path to the program as the first argument; it
+    /// only includes the arguments specified with [`Command::arg`] and
+    /// [`Command::args`]. Unlike Rust's `CommandArgs`, the iterator is a
+    /// [`slice::Iter`](crate::slice::Iter) over [`String`]s.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let mut cmd = Command::new("echo");
+    /// cmd.arg("first").arg("second");
+    /// let args: Vec<String> = cmd.get_args().cloned().collect();
+    /// assert_eq(args, Vec::from(["first".to_string(), "second".to_string()]));
+    /// ```
     pub fn get_args(&self) -> crate::slice::Iter<String> {
         self.args.iter()
     }
 
-    /// The environment changes: (name, Some(value)) set, (name, None)
-    /// removed.
+    /// Returns an iterator of the environment variables explicitly set for the
+    /// child process.
+    ///
+    /// Each item is `(name, Some(value))` for a variable set with
+    /// [`Command::env`] or [`Command::envs`], or `(name, None)` for one removed
+    /// with [`Command::env_remove`], in the order the calls were made (a name
+    /// may appear more than once; the last change wins). [`Command::env_clear`]
+    /// empties the list. Unlike Rust's `CommandEnvs`, the iterator is a
+    /// [`slice::Iter`](crate::slice::Iter) over `(String, Option<String>)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let mut cmd = Command::new("ls");
+    /// cmd.env("TERM", "dumb").env_remove("TZ");
+    /// let envs: Vec<(String, Option<String>)> = cmd.get_envs().cloned().collect();
+    /// assert_eq(envs, Vec::from([
+    ///     ("TERM".to_string(), Some("dumb".to_string())),
+    ///     ("TZ".to_string(), None),
+    /// ]));
+    /// ```
     pub fn get_envs(&self) -> crate::slice::Iter<(String, Option<String>)> {
         self.envs.iter()
     }
 
+    /// Returns the working directory for the child process.
+    ///
+    /// This returns [`None`] if the working directory will not be changed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use std::process::Command;
+    ///
+    /// let mut cmd = Command::new("ls");
+    /// assert_eq(cmd.get_current_dir(), None);
+    /// cmd.current_dir("/bin");
+    /// assert_eq(cmd.get_current_dir(), Some(Path::new("/bin")));
+    /// ```
     pub fn get_current_dir(&self) -> Option<&Path> {
         match &self.cwd {
             Some(d) => Some(Path::new(d.as_str())),
@@ -219,19 +778,88 @@ impl Command {
         }
     }
 
-    /// Starts the child (streams not set are inherited).
+    /// Executes the command as a child process, returning a handle to it.
+    ///
+    /// By default, stdin, stdout and stderr are inherited from the parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the program cannot be found
+    /// ([`ErrorKind::NotFound`]) or started, or if creating a pipe fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let mut child = Command::new("true")
+    ///     .spawn()
+    ///     .expect("true command failed to start");
+    /// assert(child.wait().unwrap().success());
+    /// ```
     pub fn spawn(&mut self) -> io::Result<Child> {
         self.start(KIND_INHERIT, KIND_INHERIT)
     }
 
-    /// Runs the child to its end with its stdout and stderr captured
-    /// (unless set otherwise; stdin is null unless set).
+    /// Executes the command as a child process, waiting for it to finish and
+    /// collecting all of its output.
+    ///
+    /// By default, stdout and stderr are captured (and used to provide the
+    /// resulting output). Stdin is not inherited from the parent: it is
+    /// [`Stdio::null`] unless set. Both streams are read at the same time (with
+    /// `poll` on POSIX systems; on Windows stderr is read on another green
+    /// thread), so a child filling one pipe cannot block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child cannot be started, or if reading its
+    /// output or waiting for it fails. A child that exits with a failure is not
+    /// an error: see [`Output::status`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let output = Command::new("sh")
+    ///     .arg("-c")
+    ///     .arg("echo hello; echo world 1>&2; exit 1")
+    ///     .output()
+    ///     .expect("failed to execute process");
+    ///
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "hello\n");
+    /// assert_eq(String::from_utf8(output.stderr).unwrap(), "world\n");
+    /// assert_eq(output.status.code(), Some(1));
+    /// ```
     pub fn output(&mut self) -> io::Result<Output> {
         let child = self.start(KIND_NULL, KIND_PIPED)?;
         child.wait_with_output()
     }
 
-    /// Runs the child to its end (streams not set are inherited).
+    /// Executes a command as a child process, waiting for it to finish and
+    /// collecting its status.
+    ///
+    /// By default, stdin, stdout and stderr are inherited from the parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child cannot be started or waited for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let status = Command::new("sh")
+    ///     .arg("-c")
+    ///     .arg("exit 3")
+    ///     .status()
+    ///     .expect("failed to execute process");
+    ///
+    /// println(`process finished with: ${status}`);
+    /// assert(!status.success());
+    /// assert_eq(status.code(), Some(3));
+    /// ```
     pub fn status(&mut self) -> io::Result<ExitStatus> {
         let mut child = self.start(KIND_INHERIT, KIND_INHERIT)?;
         child.wait()
@@ -369,6 +997,17 @@ impl Command {
 }
 
 impl Debug for Command {
+    /// Writes the program and its arguments, each quoted as a string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let mut cmd = Command::new("echo");
+    /// cmd.arg("a b");
+    /// assert_eq(`${cmd:?}`.to_string(), "\"echo\" \"a b\"");
+    /// ```
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         Debug::fmt(&self.program, f)?;
         for a in self.args.iter() {
@@ -379,31 +1018,121 @@ impl Debug for Command {
     }
 }
 
-/// A running (or finished) child process. Copies of a Child share the
-/// process and its streams.
+/// Representation of a running or exited child process.
+///
+/// This structure is used to represent and manage child processes. A child
+/// process is created via the [`Command`] struct, which configures the
+/// spawning process and can itself be constructed using a builder-style
+/// interface.
+///
+/// There is no implementation of Drop for child processes, so if you do not
+/// ensure the `Child` has exited then it will continue to run, even after the
+/// `Child` handle to the child process has gone out of scope.
+///
+/// Calling [`wait`] (or other functions that wrap around it) will make the
+/// parent process wait until the child has actually exited before continuing.
+/// On Unix, a child that is never waited for stays a zombie until the parent
+/// exits.
+///
+/// Unlike Rust's, copies of a `Child` share the process and its pipes; the
+/// status that [`wait`] gets is only recorded in the copy it was called on.
+/// The pipes are closed by `close()` (navi has no Drop): a pipe left in the
+/// `Child` is closed by [`wait`] (stdin) or [`wait_with_output`] (all three),
+/// one taken out of it must be closed by hand.
+///
+/// # Examples
+///
+/// ```
+/// use std::process::Command;
+///
+/// let mut child = Command::new("sh")
+///     .arg("-c")
+///     .arg("exit 0")
+///     .spawn()
+///     .expect("failed to execute child");
+///
+/// let ecode = child.wait().expect("failed to wait on child");
+///
+/// assert(ecode.success());
+/// ```
+///
+/// [`wait`]: Child::wait
+/// [`wait_with_output`]: Child::wait_with_output
 pub struct Child {
     pid: i64,
     handle: i64,
+    /// The handle for writing to the child's standard input (stdin), if it has
+    /// been captured (with [`Stdio::piped`]).
+    ///
+    /// You may take it out with `child.stdin.take()`, to write to it while the
+    /// `Child` is used; then close it with [`ChildStdin::close`] so that the
+    /// child sees the end of its input.
     pub stdin: Option<ChildStdin>,
+    /// The handle for reading from the child's standard output (stdout), if it
+    /// has been captured (with [`Stdio::piped`]).
+    ///
+    /// You may take it out with `child.stdout.take()`;
+    /// [`Child::wait_with_output`] reads only what is left in the `Child`.
     pub stdout: Option<ChildStdout>,
+    /// The handle for reading from the child's standard error (stderr), if it
+    /// has been captured (with [`Stdio::piped`]).
+    ///
+    /// You may take it out with `child.stderr.take()`;
+    /// [`Child::wait_with_output`] reads only what is left in the `Child`.
     pub stderr: Option<ChildStderr>,
     status: Option<ExitStatus>,
 }
 
 impl Debug for Child {
+    /// Writes `Child { pid: .. }`.
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_struct("Child").field("pid", &self.pid).finish()
     }
 }
 
 impl Child {
-    /// The OS's process id.
+    /// Returns the OS-assigned process identifier associated with this child.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let mut child = Command::new("true").spawn().expect("true command failed to start");
+    /// println(`Child's ID is ${child.id()}`);
+    /// assert(child.id() > 0);
+    /// child.wait().unwrap();
+    /// ```
     pub fn id(&self) -> u32 {
         self.pid as u32
     }
 
-    /// Kills the child (SIGKILL; TerminateProcess on Windows). Ok if it
-    /// has already been waited for.
+    /// Forces the child process to exit. If the child has already exited,
+    /// `Ok(())` is returned.
+    ///
+    /// The mapping to [`ErrorKind`]s is not part of the compatibility contract
+    /// of the function.
+    ///
+    /// This is equivalent to sending a SIGKILL on Unix platforms
+    /// (`TerminateProcess` on Windows). Killing does not wait: call
+    /// [`Child::wait`] afterwards to reap the child.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sending the signal fails, which may happen for a
+    /// child that has exited but has not been waited for on some platforms.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+    /// child.kill().expect("command couldn't be killed");
+    /// let status = child.wait().unwrap();
+    /// assert(!status.success());
+    /// assert_eq(status.code(), None);
+    /// ```
     pub fn kill(&mut self) -> io::Result<()> {
         if self.status.is_some() {
             return Ok(());
@@ -411,7 +1140,35 @@ impl Child {
         sys::kill(self.pid, self.handle)
     }
 
-    /// Waits for the child to end (closing its stdin first).
+    /// Waits for the child to exit completely, returning the status that it
+    /// exited with. This function will continue to have the same return value
+    /// after it has been called at least once.
+    ///
+    /// The stdin handle to the child process, if any, will be closed before
+    /// waiting. This helps avoid deadlock: it ensures that the child does not
+    /// block waiting for input from the parent, while the parent waits for the
+    /// child to exit. Waiting parks the calling green thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if waiting for the child fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let mut command = Command::new("sh");
+    /// command.arg("-c").arg("exit 7");
+    /// if let Ok(mut child) = command.spawn() {
+    ///     let status = child.wait().expect("command wasn't running");
+    ///     assert_eq(status.code(), Some(7));
+    ///     // The status is remembered.
+    ///     assert_eq(child.wait().unwrap().code(), Some(7));
+    /// } else {
+    ///     panic("sh command didn't start");
+    /// }
+    /// ```
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(s) = self.stdin.take() {
             let mut s2 = s;
@@ -434,7 +1191,43 @@ impl Child {
         }
     }
 
-    /// The child's status if it has ended; None if it runs.
+    /// Attempts to collect the exit status of the child if it has already
+    /// exited.
+    ///
+    /// This function will not block the calling thread and will only check to
+    /// see if the child process has exited or not. If the child has exited then
+    /// on Unix the process ID is reaped. This function is guaranteed to
+    /// repeatedly return a successful exit status so long as the child has
+    /// already exited.
+    ///
+    /// If the child has exited, then `Ok(Some(status))` is returned. If the
+    /// exit status is not available at this time then `Ok(None)` is returned.
+    /// If an error occurs, then that error is returned.
+    ///
+    /// Unlike [`wait`](Child::wait), it does not close the child's stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checking the child's state fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// let mut child = Command::new("true").spawn().unwrap();
+    ///
+    /// let status = loop {
+    ///     match child.try_wait() {
+    ///         Ok(Some(status)) => break status,
+    ///         Ok(None) => thread::sleep(Duration::from_millis(5)),
+    ///         Err(e) => panic(`error attempting to wait: ${e}`),
+    ///     }
+    /// };
+    /// assert(status.success());
+    /// ```
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         if let Some(st) = &self.status {
             return Ok(Some(st.clone()));
@@ -450,8 +1243,40 @@ impl Child {
         }
     }
 
-    /// Closes stdin, reads stdout and stderr to their ends (those piped),
-    /// waits.
+    /// Simultaneously waits for the child to exit and collect all remaining
+    /// output on the stdout/stderr handles, returning an [`Output`] instance.
+    ///
+    /// The stdin handle to the child process, if any, will be closed before
+    /// waiting. This helps avoid deadlock: it ensures that the child does not
+    /// block waiting for input from the parent, while the parent waits for the
+    /// child to exit. The stdout and stderr handles left in the `Child` are
+    /// read to their ends and closed.
+    ///
+    /// By default, stdin, stdout and stderr are inherited from the parent. In
+    /// order to capture the output into this `Result<Output>` it is necessary
+    /// to create new pipes between parent and child. Use
+    /// `stdout(Stdio::piped())` or `stderr(Stdio::piped())`, respectively.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the output or waiting for the child fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// let child = Command::new("echo")
+    ///     .arg("Hello, world!")
+    ///     .stdout(Stdio::piped())
+    ///     .spawn()
+    ///     .expect("failed to execute child");
+    ///
+    /// let output = child.wait_with_output().expect("failed to wait on child");
+    ///
+    /// assert(output.status.success());
+    /// assert_eq(String::from_utf8(output.stdout).unwrap(), "Hello, world!\n");
+    /// ```
     pub fn wait_with_output(self) -> io::Result<Output> {
         let mut c = self;
         if let Some(s) = c.stdin.take() {
@@ -485,26 +1310,130 @@ impl Child {
     }
 }
 
-/// The write end of a child's stdin pipe. close() it when done (the child
-/// sees the end of its input).
+/// A handle to a child process's standard input (stdin).
+///
+/// This struct is used in the [`stdin`] field on [`Child`]. It implements
+/// [`Write`].
+///
+/// Unlike Rust's, it is not closed when dropped (navi has no Drop): call
+/// [`ChildStdin::close`] when done writing, and the child sees the end of its
+/// input. Copies share the pipe.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write;
+/// use std::process::{Command, Stdio};
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut child = Command::new("cat")
+///         .stdin(Stdio::piped())
+///         .stdout(Stdio::piped())
+///         .spawn()?;
+///     let mut stdin = child.stdin.take().unwrap();
+///     stdin.write_all("meow".as_bytes())?;
+///     stdin.close();
+///     let output = child.wait_with_output()?;
+///     assert_eq(String::from_utf8(output.stdout).unwrap(), "meow");
+///     Ok(())
+/// }
+/// ```
+///
+/// [`stdin`]: Child::stdin
 #[derive(Debug, Clone)]
 pub struct ChildStdin {
     fd: i64,
 }
 
-/// The read end of a child's stdout pipe.
+/// A handle to a child process's standard output (stdout).
+///
+/// This struct is used in the [`stdout`] field on [`Child`]. It implements
+/// [`Read`].
+///
+/// Unlike Rust's, it is not closed when dropped (navi has no Drop): call
+/// [`ChildStdout::close`] when done reading. Copies share the pipe.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Read;
+/// use std::process::{Command, Stdio};
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut child = Command::new("echo").arg("hi").stdout(Stdio::piped()).spawn()?;
+///     let mut stdout = child.stdout.take().unwrap();
+///     let mut text = String::new();
+///     stdout.read_to_string(&mut text)?;
+///     stdout.close();
+///     child.wait()?;
+///     assert_eq(text, "hi\n");
+///     Ok(())
+/// }
+/// ```
+///
+/// [`stdout`]: Child::stdout
 #[derive(Debug, Clone)]
 pub struct ChildStdout {
     fd: i64,
 }
 
-/// The read end of a child's stderr pipe.
+/// A handle to a child process's stderr.
+///
+/// This struct is used in the [`stderr`] field on [`Child`]. It implements
+/// [`Read`].
+///
+/// Unlike Rust's, it is not closed when dropped (navi has no Drop): call
+/// [`ChildStderr::close`] when done reading. Copies share the pipe.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Read;
+/// use std::process::{Command, Stdio};
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut child = Command::new("sh")
+///         .arg("-c")
+///         .arg("echo oops 1>&2")
+///         .stderr(Stdio::piped())
+///         .spawn()?;
+///     let mut stderr = child.stderr.take().unwrap();
+///     let mut text = String::new();
+///     stderr.read_to_string(&mut text)?;
+///     stderr.close();
+///     child.wait()?;
+///     assert_eq(text, "oops\n");
+///     Ok(())
+/// }
+/// ```
+///
+/// [`stderr`]: Child::stderr
 #[derive(Debug, Clone)]
 pub struct ChildStderr {
     fd: i64,
 }
 
 impl ChildStdin {
+    /// Closes the pipe, so that the child reads the end of its input. Calling
+    /// it again does nothing.
+    ///
+    /// This is navi's replacement for dropping Rust's `ChildStdin`; copies
+    /// share the pipe, and closing one closes it for all.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut child = Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn()?;
+    ///     let mut stdin = child.stdin.take().unwrap();
+    ///     stdin.close();
+    ///     // cat sees the end of its input and exits.
+    ///     assert(child.wait()?.success());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn close(&mut self) {
         if self.fd >= 0 {
             let _ = sys::close(self.fd);
@@ -514,6 +1443,25 @@ impl ChildStdin {
 }
 
 impl ChildStdout {
+    /// Closes the pipe. Calling it again does nothing.
+    ///
+    /// This is navi's replacement for dropping Rust's `ChildStdout`; copies
+    /// share the pipe, and closing one closes it for all. A child that writes
+    /// after the parent closed its stdout gets `SIGPIPE` or an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut child = Command::new("true").stdout(Stdio::piped()).spawn()?;
+    ///     let mut stdout = child.stdout.take().unwrap();
+    ///     stdout.close();
+    ///     child.wait()?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn close(&mut self) {
         if self.fd >= 0 {
             let _ = sys::close(self.fd);
@@ -523,6 +1471,24 @@ impl ChildStdout {
 }
 
 impl ChildStderr {
+    /// Closes the pipe. Calling it again does nothing.
+    ///
+    /// This is navi's replacement for dropping Rust's `ChildStderr`; copies
+    /// share the pipe, and closing one closes it for all.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::{Command, Stdio};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut child = Command::new("true").stderr(Stdio::piped()).spawn()?;
+    ///     let mut stderr = child.stderr.take().unwrap();
+    ///     stderr.close();
+    ///     child.wait()?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn close(&mut self) {
         if self.fd >= 0 {
             let _ = sys::close(self.fd);
@@ -532,48 +1498,129 @@ impl ChildStderr {
 }
 
 impl Write for ChildStdin {
+    /// Writes `buf` to the pipe, blocking until it is accepted.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         sys::write(self.fd, buf)
     }
+    /// Does nothing: the pipe is not buffered.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
 impl Read for ChildStdout {
+    /// Reads from the pipe; `Ok(0)` at the end, once the child closed its
+    /// stdout.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         sys::read(self.fd, buf)
     }
 }
 
 impl Read for ChildStderr {
+    /// Reads from the pipe; `Ok(0)` at the end, once the child closed its
+    /// stderr.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         sys::read(self.fd, buf)
     }
 }
 
-/// What Command::output and Child::wait_with_output return.
+/// The output of a finished process.
+///
+/// This is returned in a Result by either the [`output`] method of a
+/// [`Command`], or the [`wait_with_output`] method of a [`Child`] process.
+///
+/// # Examples
+///
+/// ```
+/// use std::process::Command;
+///
+/// let output = Command::new("sh").arg("-c").arg("printf done").output().unwrap();
+/// assert(output.status.success());
+/// assert_eq(output.stdout, "done".as_bytes().to_vec());
+/// assert(output.stderr.is_empty());
+/// ```
+///
+/// [`output`]: Command::output
+/// [`wait_with_output`]: Child::wait_with_output
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
+    /// The status (exit code) of the process.
     pub status: ExitStatus,
+    /// The data that the process wrote to stdout (empty if it was not piped).
     pub stdout: Vec<u8>,
+    /// The data that the process wrote to stderr (empty if it was not piped).
     pub stderr: Vec<u8>,
 }
 
-/// How a child ended: the raw wait status on Unix, the exit code on
+/// Describes the result of a process after it has terminated.
+///
+/// This struct is used to represent the exit status or other termination of a
+/// child process. Child processes are created via the [`Command`] struct and
+/// their exit status is exposed through the [`status`] method, or the
+/// [`wait`] method of a [`Child`] process.
+///
+/// It holds the raw wait status on Unix (see
+/// [`ExitStatusExt`](crate::os::unix::process::ExitStatusExt) for the
+/// signal), the exit code on Windows. Its [`Display`] form is
+/// `exit status: 1` or `signal: 9 (SIGKILL)` on Unix, `exit code: 1` on
 /// Windows.
+///
+/// # Examples
+///
+/// ```
+/// use std::process::Command;
+///
+/// let status = Command::new("false").status().unwrap();
+/// assert(!status.success());
+/// assert_eq(status.code(), Some(1));
+/// assert_eq(status.to_string(), "exit status: 1");
+/// ```
+///
+/// [`status`]: Command::status
+/// [`wait`]: Child::wait
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ExitStatus {
     pub(crate) raw: i32,
 }
 
 impl ExitStatus {
-    /// Whether it exited with 0.
+    /// Was termination successful? Signal termination is not considered a
+    /// success, and success is defined as a zero exit status.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let status = Command::new("true").status().expect("failed to execute true");
+    /// assert(status.success());
+    /// ```
     pub fn success(&self) -> bool {
         self.code() == Some(0)
     }
 
-    /// The exit code (None if a signal ended it).
+    /// Returns the exit code of the process, if any.
+    ///
+    /// In Unix terms the return value is the exit status: the value passed to
+    /// `exit`, if the process finished by calling `exit`. Note that on Unix the
+    /// exit status is truncated to 8 bits, and that values that didn't come
+    /// from a program's call to `exit` may be invented by the runtime system
+    /// (often, for example, 255, 254, 127 or 126).
+    ///
+    /// On Unix, this will return `None` if the process was terminated by a
+    /// signal. On Windows it always returns the exit code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::process::Command;
+    ///
+    /// let status = Command::new("sh").arg("-c").arg("exit 42").status().unwrap();
+    /// match status.code() {
+    ///     Some(code) => assert_eq(code, 42),
+    ///     None => println("Process terminated by signal"),
+    /// }
+    /// ```
     #[cfg(not(target_os = "windows"))]
     pub fn code(&self) -> Option<i32> {
         if self.raw & 0x7f == 0 {
@@ -583,6 +1630,8 @@ impl ExitStatus {
         }
     }
 
+    /// Returns the exit code of the process: on Windows it is always known,
+    /// so this always returns `Some` (see the Unix version for an example).
     #[cfg(target_os = "windows")]
     pub fn code(&self) -> Option<i32> {
         Some(self.raw)
@@ -610,6 +1659,9 @@ fn signal_name(sig: i32) -> &str {
 
 #[cfg(not(target_os = "windows"))]
 impl Display for ExitStatus {
+    /// Writes `exit status: <code>`, or `signal: <n> (<NAME>)` (followed by
+    /// ` (core dumped)` if it dumped core) for a process a signal ended.
+    /// (Windows: `exit code: <code>`.)
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self.code() {
             Some(c) => f.write_fmt(`exit status: ${c}`),
@@ -631,6 +1683,7 @@ impl Display for ExitStatus {
 
 #[cfg(target_os = "windows")]
 impl Display for ExitStatus {
+    /// Writes `exit code: <code>`.
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.write_fmt(`exit code: ${self.raw}`)
     }
@@ -638,6 +1691,8 @@ impl Display for ExitStatus {
 
 #[cfg(not(target_os = "windows"))]
 impl Debug for ExitStatus {
+    /// Writes `ExitStatus(unix_wait_status(<raw>))` (Windows:
+    /// `ExitStatus(<code>)`), as Rust's.
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.write_fmt(`ExitStatus(unix_wait_status(${self.raw}))`)
     }
@@ -645,12 +1700,22 @@ impl Debug for ExitStatus {
 
 #[cfg(target_os = "windows")]
 impl Debug for ExitStatus {
+    /// Writes `ExitStatus(<code>)`.
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.write_fmt(`ExitStatus(${self.raw})`)
     }
 }
 
-/// The id of this process.
+/// Returns the OS-assigned process identifier associated with this process.
+///
+/// # Examples
+///
+/// ```
+/// use std::process;
+///
+/// println(`My pid is ${process::id()}`);
+/// assert(process::id() > 0);
+/// ```
 pub fn id() -> u32 {
     sys::getpid()
 }

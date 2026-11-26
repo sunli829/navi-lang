@@ -1,9 +1,44 @@
-//! The garbage collector (navi addition; Rust has no GC). See spec/std-diff.md.
+//! The garbage collector.
+//!
+//! navi's memory is managed by a concurrent, non-moving garbage collector (Rust
+//! has none; this module is a navi addition, close to Go's `runtime` and
+//! `runtime/debug` packages). Programs rarely need it: collections start by
+//! themselves as the heap grows. This module lets a program:
+//!
+//! - run a collection ([`collect`]) or give memory back to the system
+//!   ([`free_os_memory`]);
+//! - tune when collections start ([`set_percent`], [`set_min_heap`],
+//!   [`set_memory_limit`]; the environment variables `NAVI_GC` and
+//!   `NAVI_MEMLIMIT` set the first and the last at start, as Go's `GOGC` and
+//!   `GOMEMLIMIT`);
+//! - read the collector's statistics ([`stats`]);
+//! - hold [`Weak`] references, which do not keep their object alive (for
+//!   caches);
+//! - run a function after an object has died ([`add_cleanup`]).
+//!
+//! # Examples
+//!
+//! ```
+//! use std::gc;
+//!
+//! let before = gc::stats().collections;
+//! gc::collect();
+//! assert(gc::stats().collections > before);
+//! ```
 
 use crate::fmt;
 use crate::marker::PhantomData;
 
-/// Collector statistics.
+/// Statistics of the collector, returned by [`stats`].
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+///
+/// let s = gc::stats();
+/// println(`${s.collections} collections, ${s.live_bytes} live bytes, ${s.heap_bytes} heap bytes`);
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     /// Collections run so far.
@@ -23,44 +58,117 @@ pub struct Stats {
     pub stack_bytes: usize,
 }
 
-/// Runs a full collection.
+/// Runs a full collection, blocking the caller until it is done (as Go's
+/// `runtime.GC`).
+///
+/// Collections start by themselves when the heap grows (see [`set_percent`]);
+/// calling this is only useful for measurements, tests, or before a phase where
+/// pauses are unwelcome.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+///
+/// let n = gc::stats().collections;
+/// gc::collect();
+/// assert(gc::stats().collections >= n + 1);
+/// ```
 pub fn collect() {
     crate::rt::gc::collect();
 }
 
-/// Runs a collection and returns as much memory to the system as possible
-/// (as Go's `debug.FreeOSMemory`). The collector also does that by itself
-/// after each collection, down to what the heap needs.
+/// Runs a collection and returns as much memory to the system as possible (as
+/// Go's `debug.FreeOSMemory`).
+///
+/// The collector also does that by itself after each collection, down to what
+/// the heap needs.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+///
+/// gc::free_os_memory();
+/// let s = gc::stats();
+/// assert(s.heap_bytes >= s.live_bytes);
+/// ```
 pub fn free_os_memory() {
     crate::rt::gc::free_os_memory();
 }
 
-/// Sets the heap size below which no collection starts (default 32 MiB);
-/// programs that build large heaps quickly can trade memory for time.
+/// Sets the heap size below which no collection starts (default 32 MiB).
+///
+/// Programs that build large heaps quickly can trade memory for time by raising
+/// it.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+///
+/// // No collection before the heap reaches 256 MiB.
+/// gc::set_min_heap(256 << 20);
+/// # gc::set_min_heap(32 << 20);
+/// ```
 pub fn set_min_heap(bytes: usize) {
     crate::rt::gc::set_min_heap(bytes);
 }
 
-/// Sets how much the heap may grow past what survived the last collection
-/// before the next is done, in percent of it (default 100; as Go's
-/// `debug.SetGCPercent`; `NAVI_GC=percent` sets it at start). `usize::MAX`
-/// turns it off (`NAVI_GC=off`, as `GOGC=off`): then only the memory limit
-/// starts a collection. Returns the previous setting.
+/// Sets how far the heap may grow past what survived the last collection before
+/// the next one starts, in percent of it, and returns the previous setting.
+///
+/// The default is 100 (the heap may double), as Go's `debug.SetGCPercent`;
+/// `NAVI_GC=percent` sets it at start. `usize::MAX` turns it off
+/// (`NAVI_GC=off`, as `GOGC=off`): then only the memory limit
+/// ([`set_memory_limit`]) starts a collection.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+///
+/// let old = gc::set_percent(200);
+/// assert_eq(gc::set_percent(old), 200);
+/// ```
 pub fn set_percent(percent: usize) -> usize {
     crate::rt::gc::set_percent(percent)
 }
 
-/// Sets a soft limit on the memory of the heap and the stacks, in bytes (as
-/// Go's `debug.SetMemoryLimit`; `NAVI_MEMLIMIT=bytes`, with a suffix `KiB`,
-/// `MiB`, `GiB` or `TiB`, sets it at start): collections run as often as
-/// needed to stay under it (the heap may still grow by at least 4 MiB past
-/// what survives), and freed memory goes back to the system below it.
-/// `usize::MAX` (the default) is no limit. Returns the previous limit.
+/// Sets a soft limit on the memory of the heap and the stacks, in bytes, and
+/// returns the previous limit.
+///
+/// As Go's `debug.SetMemoryLimit`: collections run as often as needed to stay
+/// under the limit (the heap may still grow by at least 4 MiB past what
+/// survives), and freed memory goes back to the system below it. `usize::MAX`,
+/// the default, is no limit. `NAVI_MEMLIMIT=bytes`, with a suffix `KiB`, `MiB`,
+/// `GiB` or `TiB`, sets it at start.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+///
+/// let old = gc::set_memory_limit(1 << 30);
+/// assert_eq(gc::set_memory_limit(old), 1 << 30);
+/// ```
 pub fn set_memory_limit(bytes: usize) -> usize {
     crate::rt::gc::set_memory_limit(bytes)
 }
 
-/// The collector's statistics.
+/// Returns the collector's statistics.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+///
+/// let v: Vec<u64> = Vec::with_capacity(1000);
+/// gc::collect();
+/// let s = gc::stats();
+/// assert(s.heap_bytes > 0);
+/// assert(s.live_bytes >= v.capacity() * 8);
+/// ```
 pub fn stats() -> Stats {
     let (collections, live_bytes, allocated_bytes) = crate::rt::gc::stats();
     let (heap_bytes, released_bytes) = crate::rt::gc::heap_bytes();
@@ -81,18 +189,49 @@ struct Handle {
     addr: usize,
 }
 
-/// A weak reference (as Go's `weak.Pointer`; Rust's `rc::Weak` without
-/// the `Rc`): it does not keep its object alive, and `upgrade` gives the
-/// object back while something else does. Weak references made from the
-/// same reference are equal.
+/// A weak reference: it does not keep its object alive (as Go's `weak.Pointer`;
+/// Rust's `rc::Weak` without the `Rc`).
+///
+/// [`Weak::upgrade`] gives the object back while something else keeps it alive,
+/// and [`None`] once the collector has found it unreachable. Weak references
+/// are meant for caches and canonicalizing maps, not for breaking cycles (the
+/// collector handles cycles). Weak references made from the same reference are
+/// equal ([`Weak::ptr_eq`], `==`); clones share the handle.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc::Weak;
+///
+/// let name = &String::from("navi");
+/// let w = Weak::new(name);
+/// // `name` is still in use, so the object is alive.
+/// assert_eq(w.upgrade().unwrap(), "navi");
+/// assert_eq(name.len(), 4);
+/// ```
 pub struct Weak<T> {
     handle: &Handle,
     t: PhantomData<T>,
 }
 
 impl<T> Weak<T> {
-    /// A weak reference to what `value` points to (an object of the heap;
-    /// one of a static never dies).
+    /// Creates a weak reference to the object `value` points to.
+    ///
+    /// The object should be one of the heap. One of a static never dies; a
+    /// reference to a constant expression, such as `&Point { x: 0, y: 0 }`,
+    /// can be one to a static.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::gc::Weak;
+    ///
+    /// let x = &mut 5;
+    /// let w = Weak::new(x);
+    /// assert_eq(*w.upgrade().unwrap(), 5);
+    /// *x = 6;
+    /// assert_eq(*w.upgrade().unwrap(), 6);
+    /// ```
     pub fn new(value: &T) -> Weak<T> {
         let h = crate::rt::gc::weak_handle(value as *const T as usize);
         Weak {
@@ -101,7 +240,24 @@ impl<T> Weak<T> {
         }
     }
 
-    /// The object, unless it died (it lives on from here).
+    /// Returns the object, unless it has died.
+    ///
+    /// The returned reference keeps the object alive from then on, as any other
+    /// reference does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::gc::Weak;
+    ///
+    /// let v = &Vec::from([1, 2, 3]);
+    /// let w = Weak::new(v);
+    /// match w.upgrade() {
+    ///     Some(v2) => assert_eq(v2.len(), 3),
+    ///     None => println("the vector was collected"),
+    /// }
+    /// assert_eq(v.len(), 3);
+    /// ```
     pub fn upgrade(&self) -> Option<&T> {
         let a = crate::rt::gc::weak_get(self.handle as *const Handle as usize);
         if a == 0 {
@@ -119,7 +275,21 @@ impl<T> Weak<T> {
         }
     }
 
-    /// Whether two weak references were made from the same reference.
+    /// Returns `true` if the two weak references were made from the same
+    /// reference.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::gc::Weak;
+    ///
+    /// let a = &1;
+    /// let b = &1;
+    /// let wa = Weak::new(a);
+    /// assert(wa.ptr_eq(&Weak::new(a)));
+    /// assert(wa.ptr_eq(&wa.clone()));
+    /// assert(!wa.ptr_eq(&Weak::new(b)));
+    /// ```
     pub fn ptr_eq(&self, other: &Weak<T>) -> bool {
         crate::ptr::eq(self.handle, other.handle)
     }
@@ -146,23 +316,91 @@ impl<T> fmt::Debug for Weak<T> {
     }
 }
 
-/// A registered cleanup (`add_cleanup`).
+/// A cleanup registered with [`add_cleanup`], which [`Cleanup::stop`] cancels.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+///
+/// let obj = &mut Vec::from([1, 2, 3]);
+/// let c = gc::add_cleanup(obj, |n: i32| println(`object ${n} died`), 7);
+/// c.stop();
+/// assert_eq(obj.len(), 3);
+/// ```
 pub struct Cleanup {
     id: usize,
 }
 
 impl Cleanup {
-    /// Cancels the cleanup if it has not been queued to run.
+    /// Cancels the cleanup if it has not been queued to run yet.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::gc;
+    ///
+    /// let obj = &mut Vec::from([1, 2]);
+    /// let c = gc::add_cleanup(obj, |s: &str| panic(s), "not to be run");
+    /// c.stop();
+    /// gc::collect();
+    /// ```
     pub fn stop(&self) {
         crate::rt::gc::stop_cleanup(self.id);
     }
 }
 
-/// Calls `cleanup(arg)` some time after the object `value` points to has
-/// become unreachable (as Go's `runtime.AddCleanup`), on a thread that
-/// runs the cleanups one after another. `arg` and `cleanup` must not
-/// reach the object (it would never become unreachable). Not run if the
-/// program exits first.
+/// Calls `cleanup(arg)` some time after the object `value` points to has become
+/// unreachable, and returns a handle that can cancel it (as Go's
+/// `runtime.AddCleanup`).
+///
+/// The cleanups run on a thread of their own, one after another. `arg` and
+/// `cleanup` must not reach the object (a closure capturing a variable that
+/// refers to it does), or it would never become unreachable; nor does an object
+/// of a static, such as one a constant expression like `&Point { x: 0, y: 0 }`
+/// can give. A cleanup is not run if the program exits first, so do not rely on
+/// one for anything that must happen (such as flushing a file); call `close()`
+/// or `flush()` explicitly instead.
+///
+/// # Examples
+///
+/// ```
+/// use std::gc;
+/// use std::sync::mpmc::{channel, Sender};
+/// use std::time::Duration;
+///
+/// struct Session {
+///     id: i32,
+///     name: String,
+/// }
+///
+/// fn new_session(id: i32, name: &str) -> &Session {
+///     &Session { id, name: name.to_string() }
+/// }
+///
+/// let (tx, rx) = channel::<i32>();
+/// // Made and dropped on a thread of its own, so that no stale copy of its
+/// // address stays on this thread's stack.
+/// std::thread::spawn(|| {
+///     let s = new_session(7, "alice");
+///     // The function captures nothing and gets what it needs as `arg`, so it
+///     // does not reach the object.
+///     let arg = (tx.clone(), s.id);
+///     gc::add_cleanup(s, |(tx, id): (Sender<i32>, i32)| tx.send(id).unwrap(), arg);
+/// })
+/// .join()
+/// .unwrap();
+/// // The cleanup runs some time after a collection finds the object dead.
+/// let mut got = None;
+/// for _ in 0..100 {
+///     gc::collect();
+///     if let Ok(id) = rx.recv_timeout(Duration::from_millis(10)) {
+///         got = Some(id);
+///         break;
+///     }
+/// }
+/// assert_eq(got, Some(7));
+/// ```
 pub fn add_cleanup<T, A>(value: &T, cleanup: fn(A), arg: A) -> Cleanup {
     let run: fn() = || cleanup(arg);
     Cleanup {
