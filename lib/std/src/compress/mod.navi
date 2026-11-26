@@ -1,14 +1,92 @@
-//! DEFLATE, zlib and gzip (as Go's compress/flate, compress/zlib and
-//! compress/gzip, with the API of Rust's flate2 crate): encoders and
-//! decoders wrapping a reader (read::) or a writer (write::).
+//! DEFLATE, zlib and gzip compression and decompression.
 //!
+//! This module covers what Go's `compress/flate`, `compress/zlib` and
+//! `compress/gzip` packages do, with the API of Rust's [flate2] crate. Three
+//! formats are supported, all built on the DEFLATE algorithm:
+//!
+//! * raw DEFLATE ([RFC 1951]): [`crate::compress::read::DeflateEncoder`],
+//!   [`crate::compress::read::DeflateDecoder`] and the `write::` ones;
+//! * zlib ([RFC 1950]): DEFLATE with a 2-byte header and an Adler-32
+//!   checksum: [`crate::compress::read::ZlibEncoder`],
+//!   [`crate::compress::read::ZlibDecoder`], ...;
+//! * gzip ([RFC 1952]): DEFLATE with a header (file name, comment,
+//!   modification time, ...) and a CRC-32 trailer:
+//!   [`crate::compress::read::GzEncoder`],
+//!   [`crate::compress::read::GzDecoder`],
+//!   [`crate::compress::read::MultiGzDecoder`], [`crate::compress::GzBuilder`].
+//!
+//! Each encoder and decoder comes in two flavors:
+//!
+//! * [`crate::compress::read`]: wraps a [`crate::io::Read`] and is itself a
+//!   reader; reading from it gives the compressed (encoders) or
+//!   decompressed (decoders) form of what the inner reader gives;
+//! * [`crate::compress::write`]: wraps a [`crate::io::Write`] and is itself
+//!   a writer; what is written to it is compressed (encoders) or
+//!   decompressed (decoders) into the inner writer.
+//!
+//! As in flate2, the types are also reachable per format
+//! (`compress::gzip::read::GzDecoder`, `compress::zlib::write::ZlibEncoder`,
+//! ...), and the decoders that read and the encoders that write are
+//! re-exported at the top of this module.
+//!
+//! The implementation is navi's own (no zlib or miniz): the encoder is a
+//! hash-chain LZ77 (with lazy matching from level 4 up) followed by dynamic
+//! Huffman coding, giving compression ratios close to zlib's; the decoder
+//! handles every block type. The output is compatible with zlib, Python's
+//! `zlib`/`gzip` modules and the `gzip` command.
+//!
+//! # Differences from flate2
+//!
+//! * There is no `Drop`: a `write::` encoder or decoder must be ended with
+//!   `finish()` (which returns the inner writer) or `try_finish()`;
+//!   otherwise the end of the stream is never written.
+//! * The `write::` decoders keep everything written to them and decompress
+//!   it all at `finish`/`try_finish`.
+//! * There are no `bufread::` types, no low-level `Compress`/`Decompress`,
+//!   no `GzHeader::mtime_as_datetime` and no zlib preset dictionaries.
+//!
+//! # Examples
+//!
+//! A gzip round trip:
+//!
+//! ```
+//! use std::compress::Compression;
+//! use std::compress::read::GzDecoder;
+//! use std::compress::write::GzEncoder;
+//! use std::io::{Read, Write};
+//!
+//! fn main() -> std::io::Result<()> {
 //!     let mut e = GzEncoder::new(Vec::new(), Compression::default());
-//!     e.write_all(b"hello")?;
-//!     let gz: Vec<u8> = e.finish()?;          // no Drop: finish writes the trailer
+//!     e.write_all(b"hello, hello, hello")?;
+//!     // No Drop: finish writes the end of the stream and the trailer.
+//!     let gz: Vec<u8> = e.finish()?;
+//!     assert_eq(&gz[0..2], b"\x1f\x8b");
 //!
 //!     let mut d = GzDecoder::new(gz.as_slice());
 //!     let mut s = String::new();
 //!     d.read_to_string(&mut s)?;
+//!     assert_eq(s, "hello, hello, hello");
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Decoding a zlib stream made by Python's `zlib.compress(b"Hello, world!")`:
+//!
+//! ```
+//! use std::compress::read::ZlibDecoder;
+//! use std::hex;
+//! use std::io::Read;
+//!
+//! let z = hex::decode("789cf348cdc9c9d75128cf2fca49510400205e048a").unwrap();
+//! let mut s = String::new();
+//! ZlibDecoder::new(z.as_slice()).read_to_string(&mut s).unwrap();
+//! assert_eq(s, "Hello, world!");
+//! ```
+//!
+//! [flate2]: https://docs.rs/flate2
+//! [RFC 1950]: https://www.rfc-editor.org/rfc/rfc1950
+//! [RFC 1951]: https://www.rfc-editor.org/rfc/rfc1951
+//! [RFC 1952]: https://www.rfc-editor.org/rfc/rfc1952
 
 mod deflate_enc;
 mod inflate;
@@ -20,23 +98,98 @@ use crate::io::{self, Read, Write};
 use deflate_enc::Deflater;
 use inflate::{Bits, Inflater};
 
-/// A compression level, 0 (none) to 9 (best).
+/// When compressing data, the compression level can be specified by a value
+/// in this struct.
+///
+/// The level is an integer from 0 to 9: 0 stores the data without
+/// compressing it, 1 is the fastest, 9 compresses the most. The default
+/// ([`Compression::default`]) is 6, as zlib's. Levels above 9 compress as 9.
+///
+/// # Examples
+///
+/// ```
+/// use std::compress::Compression;
+/// use std::compress::write::ZlibEncoder;
+/// use std::io::Write;
+///
+/// let data = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+///
+/// let mut stored = ZlibEncoder::new(Vec::new(), Compression::none());
+/// stored.write_all(data).unwrap();
+/// let stored = stored.finish().unwrap();
+///
+/// let mut best = ZlibEncoder::new(Vec::new(), Compression::best());
+/// best.write_all(data).unwrap();
+/// let best = best.finish().unwrap();
+///
+/// // Stored data is larger than the input; compressed data much smaller.
+/// assert(stored.len() > data.len());
+/// assert(best.len() < data.len() / 2);
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Compression(u32);
 
 impl Compression {
+    /// Creates a new compression level from an integer, 0 to 9 (higher
+    /// values compress as 9).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    ///
+    /// assert_eq(Compression::new(9), Compression::best());
+    /// assert_eq(Compression::new(5).level(), 5);
+    /// ```
     pub fn new(level: u32) -> Compression {
         Compression(level)
     }
+    /// No compression: the data is stored in DEFLATE's stored blocks
+    /// (level 0).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    ///
+    /// assert_eq(Compression::none().level(), 0);
+    /// ```
     pub fn none() -> Compression {
         Compression(0)
     }
+    /// Optimizes for speed (level 1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    ///
+    /// assert_eq(Compression::fast().level(), 1);
+    /// ```
     pub fn fast() -> Compression {
         Compression(1)
     }
+    /// Optimizes for size (level 9).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    ///
+    /// assert_eq(Compression::best().level(), 9);
+    /// ```
     pub fn best() -> Compression {
         Compression(9)
     }
+    /// Returns the integer level of this compression setting.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    ///
+    /// assert_eq(Compression::default().level(), 6);
+    /// ```
     pub fn level(&self) -> u32 {
         self.0
     }
@@ -229,7 +382,41 @@ impl<R: Read> EncR<R> {
 
 // --- Decoding ------------------------------------------------------------------------
 
-/// The header of a gzip member.
+/// The header of a gzip member, as read by a gzip decoder.
+///
+/// The header carries optional metadata about the compressed data: the
+/// original file name, a comment, an "extra" field, the modification time
+/// and the operating system it was made on. Get it from
+/// [`read::GzDecoder::header`] or [`read::MultiGzDecoder::header`] once the
+/// decoder has started reading; build one for writing with [`GzBuilder`].
+///
+/// # Examples
+///
+/// Reading the header of a member made by Python's
+/// `gzip.GzipFile(filename='hello.txt', mtime=1700000000)`:
+///
+/// ```
+/// use std::compress::read::GzDecoder;
+/// use std::hex;
+/// use std::io::Read;
+///
+/// // The header: magic, method, flags (FNAME), mtime, XFL, OS, "hello.txt\0".
+/// let mut gz = hex::decode("1f8b080800f1536502ff68656c6c6f2e74787400").unwrap();
+/// // The DEFLATE data, then the CRC-32 and the length.
+/// let body = hex::decode("f348cdc9c9d75128cf2fca49510400e6c6e6eb0d000000").unwrap();
+/// gz.extend_from_slice(body.as_slice());
+///
+/// let mut d = GzDecoder::new(gz.as_slice());
+/// let mut s = String::new();
+/// d.read_to_string(&mut s).unwrap();
+/// assert_eq(s, "Hello, world!");
+///
+/// let h = d.header().unwrap();
+/// assert_eq(h.filename(), Some(&b"hello.txt"[..]));
+/// assert_eq(h.comment(), None);
+/// assert_eq(h.mtime(), 1700000000);
+/// assert_eq(h.operating_system(), 255); // unknown
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct GzHeader {
     extra: Option<Vec<u8>>,
@@ -240,28 +427,128 @@ pub struct GzHeader {
 }
 
 impl GzHeader {
+    /// Returns the `filename` field of this gzip header, if present.
+    ///
+    /// The name is returned as bytes, without the terminating zero; RFC 1952
+    /// says it is ISO 8859-1 (Latin-1) text.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::compress::read::GzDecoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut e = GzBuilder::new().filename("notes.txt").write(Vec::new(), Compression::default());
+    /// e.write_all(b"text").unwrap();
+    /// let gz = e.finish().unwrap();
+    ///
+    /// let mut d = GzDecoder::new(gz.as_slice());
+    /// let mut out = Vec::new();
+    /// d.read_to_end(&mut out).unwrap();
+    /// assert_eq(d.header().unwrap().filename(), Some(&b"notes.txt"[..]));
+    /// ```
     pub fn filename(&self) -> Option<&[u8]> {
         match &self.filename {
             Some(v) => Some(v.as_slice()),
             None => None,
         }
     }
+    /// Returns the `extra` field of this gzip header, if present.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::compress::read::GzDecoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut e = GzBuilder::new().extra(b"AB\x02\x00hi").write(Vec::new(), Compression::fast());
+    /// e.write_all(b"data").unwrap();
+    /// let gz = e.finish().unwrap();
+    ///
+    /// let mut d = GzDecoder::new(gz.as_slice());
+    /// let mut out = Vec::new();
+    /// d.read_to_end(&mut out).unwrap();
+    /// assert_eq(d.header().unwrap().extra(), Some(&b"AB\x02\x00hi"[..]));
+    /// ```
     pub fn extra(&self) -> Option<&[u8]> {
         match &self.extra {
             Some(v) => Some(v.as_slice()),
             None => None,
         }
     }
+    /// Returns the `comment` field of this gzip header, if present.
+    ///
+    /// The comment is returned as bytes, without the terminating zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::compress::read::GzDecoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut e = GzBuilder::new().comment("made by navi").write(Vec::new(), Compression::default());
+    /// e.write_all(b"data").unwrap();
+    /// let gz = e.finish().unwrap();
+    ///
+    /// let mut d = GzDecoder::new(gz.as_slice());
+    /// let mut out = Vec::new();
+    /// d.read_to_end(&mut out).unwrap();
+    /// assert_eq(d.header().unwrap().comment(), Some(&b"made by navi"[..]));
+    /// ```
     pub fn comment(&self) -> Option<&[u8]> {
         match &self.comment {
             Some(v) => Some(v.as_slice()),
             None => None,
         }
     }
+    /// Returns the `operating_system` field of this gzip header.
+    ///
+    /// The values are those of RFC 1952 (0: FAT, 3: Unix, 7: Macintosh,
+    /// 11: NTFS, 255: unknown, ...). [`GzBuilder`] writes 255 unless
+    /// [`GzBuilder::operating_system`] sets it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::compress::read::GzDecoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut e = GzBuilder::new().operating_system(3).write(Vec::new(), Compression::default());
+    /// e.write_all(b"data").unwrap();
+    /// let gz = e.finish().unwrap();
+    ///
+    /// let mut d = GzDecoder::new(gz.as_slice());
+    /// let mut out = Vec::new();
+    /// d.read_to_end(&mut out).unwrap();
+    /// assert_eq(d.header().unwrap().operating_system(), 3);
+    /// ```
     pub fn operating_system(&self) -> u8 {
         self.operating_system
     }
-    /// Seconds since the epoch (0: unknown).
+    /// Returns the `mtime` field of this gzip header: the modification time
+    /// of the original file in seconds since the Unix epoch, or 0 if it is
+    /// not known.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::compress::read::GzDecoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut e = GzBuilder::new().mtime(1234567890).write(Vec::new(), Compression::default());
+    /// e.write_all(b"data").unwrap();
+    /// let gz = e.finish().unwrap();
+    ///
+    /// let mut d = GzDecoder::new(gz.as_slice());
+    /// let mut out = Vec::new();
+    /// d.read_to_end(&mut out).unwrap();
+    /// assert_eq(d.header().unwrap().mtime(), 1234567890);
+    /// ```
     pub fn mtime(&self) -> u32 {
         self.mtime
     }
@@ -475,7 +762,38 @@ impl<W: Write> DecW<W> {
 
 // --- The public types: one set per format --------------------------------------------
 
-/// Builds a gzip header (as flate2's GzBuilder).
+/// A builder structure to create a new gzip encoder with a custom header.
+///
+/// By default the header has no file name, comment or extra field, a
+/// modification time of 0 (unknown) and an operating system of 255
+/// (unknown). The setters return a new builder (the builder is cloned), so
+/// they chain; [`GzBuilder::write`] and [`GzBuilder::read`] then make an
+/// encoder that writes this header.
+///
+/// # Examples
+///
+/// ```
+/// use std::compress::{Compression, GzBuilder};
+/// use std::compress::read::GzDecoder;
+/// use std::io::{Read, Write};
+///
+/// let mut e = GzBuilder::new()
+///     .filename("hello_world.txt")
+///     .comment("test file, please delete")
+///     .mtime(1700000000)
+///     .write(Vec::new(), Compression::default());
+/// e.write_all(b"hello world").unwrap();
+/// let gz = e.finish().unwrap();
+///
+/// let mut d = GzDecoder::new(gz.as_slice());
+/// let mut s = String::new();
+/// d.read_to_string(&mut s).unwrap();
+/// assert_eq(s, "hello world");
+/// let h = d.header().unwrap();
+/// assert_eq(h.filename(), Some(&b"hello_world.txt"[..]));
+/// assert_eq(h.comment(), Some(&b"test file, please delete"[..]));
+/// assert_eq(h.mtime(), 1700000000);
+/// ```
 #[derive(Clone, Default)]
 pub struct GzBuilder {
     h: GzHeader,
@@ -483,29 +801,119 @@ pub struct GzBuilder {
 }
 
 impl GzBuilder {
+    /// Creates a new blank builder with no header by default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::io::Write;
+    ///
+    /// let mut e = GzBuilder::new().write(Vec::new(), Compression::default());
+    /// e.write_all(b"x").unwrap();
+    /// let gz = e.finish().unwrap();
+    /// // Magic, method 8 (DEFLATE), no flags, mtime 0, XFL 0, OS 255.
+    /// assert_eq(&gz[0..10], b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff");
+    /// ```
     pub fn new() -> GzBuilder {
         GzBuilder::default()
     }
+    /// Configures the file name in the gzip header (written with a
+    /// terminating zero; it should not contain one itself).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::io::Write;
+    ///
+    /// let mut e = GzBuilder::new().filename("a.txt").write(Vec::new(), Compression::default());
+    /// e.write_all(b"x").unwrap();
+    /// let gz = e.finish().unwrap();
+    /// assert_eq(gz[3], 0x08); // FNAME
+    /// assert_eq(&gz[10..16], b"a.txt\x00");
+    /// ```
     pub fn filename<S: Into<Vec<u8>>>(&self, name: S) -> GzBuilder {
         let mut b = self.clone();
         b.h.filename = Some(name.into());
         b
     }
+    /// Configures the comment in the gzip header (written with a terminating
+    /// zero; it should not contain one itself).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::io::Write;
+    ///
+    /// let mut e = GzBuilder::new().comment("hi").write(Vec::new(), Compression::default());
+    /// e.write_all(b"x").unwrap();
+    /// let gz = e.finish().unwrap();
+    /// assert_eq(gz[3], 0x10); // FCOMMENT
+    /// assert_eq(&gz[10..13], b"hi\x00");
+    /// ```
     pub fn comment<S: Into<Vec<u8>>>(&self, c: S) -> GzBuilder {
         let mut b = self.clone();
         b.h.comment = Some(c.into());
         b
     }
+    /// Configures the `extra` field in the gzip header (at most 65535
+    /// bytes; RFC 1952 makes it a list of subfields, each a 2-byte id, a
+    /// 2-byte little-endian length and the data).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::io::Write;
+    ///
+    /// let mut e = GzBuilder::new().extra(b"AB\x01\x00z").write(Vec::new(), Compression::default());
+    /// e.write_all(b"x").unwrap();
+    /// let gz = e.finish().unwrap();
+    /// assert_eq(gz[3], 0x04); // FEXTRA
+    /// // The length (little-endian), then the field.
+    /// assert_eq(&gz[10..17], b"\x05\x00AB\x01\x00z");
+    /// ```
     pub fn extra<S: Into<Vec<u8>>>(&self, x: S) -> GzBuilder {
         let mut b = self.clone();
         b.h.extra = Some(x.into());
         b
     }
+    /// Configures the `mtime` field in the gzip header: the modification
+    /// time in seconds since the Unix epoch (0, the default, means unknown).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::io::Write;
+    ///
+    /// let mut e = GzBuilder::new().mtime(0x01020304).write(Vec::new(), Compression::default());
+    /// e.write_all(b"x").unwrap();
+    /// let gz = e.finish().unwrap();
+    /// assert_eq(&gz[4..8], b"\x04\x03\x02\x01"); // little-endian
+    /// ```
     pub fn mtime(&self, t: u32) -> GzBuilder {
         let mut b = self.clone();
         b.h.mtime = t;
         b
     }
+    /// Configures the `operating_system` field in the gzip header (RFC 1952
+    /// values: 0 FAT, 3 Unix, 7 Macintosh, 11 NTFS, 255 unknown, ...;
+    /// 255 if not set).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::io::Write;
+    ///
+    /// let mut e = GzBuilder::new().operating_system(3).write(Vec::new(), Compression::default());
+    /// e.write_all(b"x").unwrap();
+    /// let gz = e.finish().unwrap();
+    /// assert_eq(gz[9], 3);
+    /// ```
     pub fn operating_system(&self, os: u8) -> GzBuilder {
         let mut b = self.clone();
         b.h.operating_system = os;
@@ -556,7 +964,29 @@ impl GzBuilder {
         v
     }
 
-    /// A gzip writer with this header.
+    /// Consumes this builder, creating a writer encoder in the process.
+    ///
+    /// The data written to the returned [`write::GzEncoder`] is compressed
+    /// at `level` into a gzip member with this header, written to `w`. The
+    /// XFL byte of the header is 2 for level 9 and 4 for levels 0 and 1, as
+    /// zlib writes it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::compress::read::GzDecoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut e = GzBuilder::new().filename("data.bin").write(Vec::new(), Compression::best());
+    /// e.write_all(b"some data").unwrap();
+    /// let gz = e.finish().unwrap();
+    /// assert_eq(gz[8], 2); // XFL: maximum compression
+    ///
+    /// let mut out = Vec::new();
+    /// GzDecoder::new(gz.as_slice()).read_to_end(&mut out).unwrap();
+    /// assert_eq(out, b"some data");
+    /// ```
     pub fn write<W: Write>(&self, w: W, level: Compression) -> write::GzEncoder<W> {
         write::GzEncoder {
             e: EncW {
@@ -567,7 +997,28 @@ impl GzBuilder {
         }
     }
 
-    /// A gzip reader with this header.
+    /// Consumes this builder, creating a reader encoder in the process.
+    ///
+    /// Reading from the returned [`read::GzEncoder`] gives a gzip member with
+    /// this header holding what `r` gives, compressed at `level`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::{Compression, GzBuilder};
+    /// use std::compress::read::GzDecoder;
+    /// use std::io::Read;
+    ///
+    /// let mut e = GzBuilder::new().comment("from a reader").read(&b"some data"[..], Compression::fast());
+    /// let mut gz = Vec::new();
+    /// e.read_to_end(&mut gz).unwrap();
+    ///
+    /// let mut d = GzDecoder::new(gz.as_slice());
+    /// let mut s = String::new();
+    /// d.read_to_string(&mut s).unwrap();
+    /// assert_eq(s, "some data");
+    /// assert_eq(d.header().unwrap().comment(), Some(&b"from a reader"[..]));
+    /// ```
     pub fn read<R: Read>(&self, r: R, level: Compression) -> read::GzEncoder<R> {
         read::GzEncoder {
             e: EncR {
@@ -582,20 +1033,109 @@ impl GzBuilder {
     }
 }
 
-/// Encoders and decoders that read their input from a reader.
+/// Types which operate over [`Read`](crate::io::Read) streams, both encoders
+/// and decoders for the various formats.
+///
+/// Each type wraps a reader and is a reader itself: an encoder gives the
+/// compressed form of what its inner reader gives, a decoder the
+/// decompressed form.
+///
+/// # Examples
+///
+/// ```
+/// use std::compress::Compression;
+/// use std::compress::read::{DeflateDecoder, DeflateEncoder};
+/// use std::io::Read;
+///
+/// let text = "a reader in, a reader out; a reader in, a reader out";
+/// let mut compressed = Vec::new();
+/// DeflateEncoder::new(text.as_bytes(), Compression::default())
+///     .read_to_end(&mut compressed)
+///     .unwrap();
+///
+/// let mut s = String::new();
+/// DeflateDecoder::new(compressed.as_slice()).read_to_string(&mut s).unwrap();
+/// assert_eq(s, text);
+/// ```
 pub mod read {
     use crate::compress::{Compression, Dec, Enc, EncR, GZIP, GzBuilder, GzHeader, RAW, ZLIB};
     use crate::io::{self, Read};
 
-    /// Compresses what a reader gives (raw DEFLATE).
+    /// A DEFLATE encoder, or compressor.
+    ///
+    /// This structure implements a [`Read`](crate::io::Read) interface: it
+    /// takes a stream of uncompressed data from the inner reader and gives
+    /// the compressed data (raw DEFLATE, RFC 1951, with no header or
+    /// checksum) when read from.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::read::{DeflateDecoder, DeflateEncoder};
+    /// use std::io::Read;
+    ///
+    /// let mut e = DeflateEncoder::new(&b"Hello World"[..], Compression::fast());
+    /// let mut compressed = Vec::new();
+    /// e.read_to_end(&mut compressed).unwrap();
+    ///
+    /// let mut out = Vec::new();
+    /// DeflateDecoder::new(compressed.as_slice()).read_to_end(&mut out).unwrap();
+    /// assert_eq(out, b"Hello World");
+    /// ```
     pub struct DeflateEncoder<R: Read> {
         e: EncR<R>,
     }
-    /// Compresses into a zlib stream.
+    /// A zlib encoder, or compressor.
+    ///
+    /// This structure implements a [`Read`](crate::io::Read) interface: it
+    /// takes a stream of uncompressed data from the inner reader and gives a
+    /// zlib stream (RFC 1950: a 2-byte header, the DEFLATE data and an
+    /// Adler-32 checksum) when read from.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::read::{ZlibDecoder, ZlibEncoder};
+    /// use std::io::Read;
+    ///
+    /// let mut e = ZlibEncoder::new(&b"Hello World"[..], Compression::default());
+    /// let mut z = Vec::new();
+    /// e.read_to_end(&mut z).unwrap();
+    /// assert_eq(&z[0..2], b"\x78\x9c"); // the header zlib writes for level 6
+    ///
+    /// let mut s = String::new();
+    /// ZlibDecoder::new(z.as_slice()).read_to_string(&mut s).unwrap();
+    /// assert_eq(s, "Hello World");
+    /// ```
     pub struct ZlibEncoder<R: Read> {
         e: EncR<R>,
     }
-    /// Compresses into a gzip member.
+    /// A gzip encoder, or compressor.
+    ///
+    /// This structure implements a [`Read`](crate::io::Read) interface: it
+    /// takes a stream of uncompressed data from the inner reader and gives a
+    /// gzip member (RFC 1952) when read from. [`GzEncoder::new`] writes a
+    /// default header; use [`crate::compress::GzBuilder::read`] for a custom
+    /// one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::read::{GzDecoder, GzEncoder};
+    /// use std::io::Read;
+    ///
+    /// let mut e = GzEncoder::new(&b"Hello World"[..], Compression::default());
+    /// let mut gz = Vec::new();
+    /// e.read_to_end(&mut gz).unwrap();
+    /// assert_eq(&gz[0..2], b"\x1f\x8b");
+    ///
+    /// let mut s = String::new();
+    /// GzDecoder::new(gz.as_slice()).read_to_string(&mut s).unwrap();
+    /// assert_eq(s, "Hello World");
+    /// ```
     pub struct GzEncoder<R: Read> {
         pub(crate) e: EncR<R>,
     }
@@ -612,61 +1152,203 @@ pub mod read {
     }
 
     impl<R: Read> DeflateEncoder<R> {
+        /// Creates a new encoder which will read uncompressed data from the
+        /// given stream and emit the compressed stream at `level`.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::compress::Compression;
+        /// use std::compress::read::DeflateEncoder;
+        /// use std::io::Read;
+        ///
+        /// let mut e = DeflateEncoder::new(&b"abc"[..], Compression::none());
+        /// let mut out = Vec::new();
+        /// e.read_to_end(&mut out).unwrap();
+        /// // Level 0: one final stored block (header, length, ~length), then the data.
+        /// assert_eq(out, b"\x01\x03\x00\xfc\xffabc");
+        /// ```
         pub fn new(r: R, level: Compression) -> DeflateEncoder<R> {
             DeflateEncoder {
                 e: enc(r, RAW, level),
             }
         }
+        /// Acquires a reference to the underlying reader.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::compress::Compression;
+        /// use std::compress::read::DeflateEncoder;
+        ///
+        /// let e = DeflateEncoder::new(&b"abc"[..], Compression::default());
+        /// // Nothing has been read yet.
+        /// assert_eq(e.get_ref().len(), 3);
+        /// ```
         pub fn get_ref(&self) -> &R {
             &self.e.inner
         }
+        /// Acquires a mutable reference to the underlying reader.
+        ///
+        /// Note that mutation of the reader may corrupt the compressed
+        /// stream: the data read from it directly is not compressed.
         pub fn get_mut(&mut self) -> &mut R {
             &mut self.e.inner
         }
+        /// Consumes this encoder, returning the underlying reader.
+        ///
+        /// The encoder reads its input in chunks of up to 32 KiB, so the
+        /// reader may be positioned past the data compressed so far.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::compress::Compression;
+        /// use std::compress::read::DeflateEncoder;
+        /// use std::io::Read;
+        ///
+        /// let mut e = DeflateEncoder::new(&b"abc"[..], Compression::default());
+        /// let mut out = Vec::new();
+        /// e.read_to_end(&mut out).unwrap();
+        /// let rest: &[u8] = e.into_inner();
+        /// assert(rest.is_empty());
+        /// ```
         pub fn into_inner(self) -> R {
             self.e.inner
         }
+        /// Returns the number of bytes that have been read from the inner
+        /// reader (and fed to the compressor) so far.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::compress::Compression;
+        /// use std::compress::read::DeflateEncoder;
+        /// use std::io::Read;
+        ///
+        /// let mut e = DeflateEncoder::new(&b"Hello World"[..], Compression::default());
+        /// let mut out = Vec::new();
+        /// e.read_to_end(&mut out).unwrap();
+        /// assert_eq(e.total_in(), 11);
+        /// assert_eq(e.total_out(), out.len() as u64);
+        /// ```
         pub fn total_in(&self) -> u64 {
             self.e.e.total_in()
         }
+        /// Returns the number of compressed bytes that have been read from
+        /// this encoder so far.
+        ///
+        /// See [`DeflateEncoder::total_in`] for an example.
         pub fn total_out(&self) -> u64 {
             self.e.total_out
         }
     }
 
     impl<R: Read> ZlibEncoder<R> {
+        /// Creates a new encoder which will read uncompressed data from the
+        /// given stream and emit a zlib stream compressed at `level`.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::compress::Compression;
+        /// use std::compress::read::ZlibEncoder;
+        /// use std::io::Read;
+        ///
+        /// let mut e = ZlibEncoder::new(&b"abc"[..], Compression::best());
+        /// let mut z = Vec::new();
+        /// e.read_to_end(&mut z).unwrap();
+        /// assert_eq(&z[0..2], b"\x78\xda"); // the header for levels 7 to 9
+        /// // The trailer: the Adler-32 checksum of "abc", big-endian.
+        /// assert_eq(&z[z.len() - 4..], b"\x02\x4d\x01\x27");
+        /// ```
         pub fn new(r: R, level: Compression) -> ZlibEncoder<R> {
             ZlibEncoder {
                 e: enc(r, ZLIB, level),
             }
         }
+        /// Acquires a reference to the underlying reader.
         pub fn get_ref(&self) -> &R {
             &self.e.inner
         }
+        /// Acquires a mutable reference to the underlying reader.
+        ///
+        /// Note that mutation of the reader may corrupt the compressed
+        /// stream: the data read from it directly is not compressed.
         pub fn get_mut(&mut self) -> &mut R {
             &mut self.e.inner
         }
+        /// Consumes this encoder, returning the underlying reader.
+        ///
+        /// The encoder reads its input in chunks of up to 32 KiB, so the
+        /// reader may be positioned past the data compressed so far.
         pub fn into_inner(self) -> R {
             self.e.inner
         }
+        /// Returns the number of bytes that have been read from the inner
+        /// reader (and fed to the compressor) so far.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::compress::Compression;
+        /// use std::compress::read::ZlibEncoder;
+        /// use std::io::Read;
+        ///
+        /// let mut e = ZlibEncoder::new(&b"Hello World"[..], Compression::default());
+        /// let mut z = Vec::new();
+        /// e.read_to_end(&mut z).unwrap();
+        /// assert_eq(e.total_in(), 11);
+        /// assert_eq(e.total_out(), z.len() as u64);
+        /// ```
         pub fn total_in(&self) -> u64 {
             self.e.e.total_in()
         }
+        /// Returns the number of compressed bytes (header and trailer
+        /// included) that have been read from this encoder so far.
+        ///
+        /// See [`ZlibEncoder::total_in`] for an example.
         pub fn total_out(&self) -> u64 {
             self.e.total_out
         }
     }
 
     impl<R: Read> GzEncoder<R> {
+        /// Creates a new encoder which will read uncompressed data from the
+        /// given stream and emit a gzip member compressed at `level`, with a
+        /// default header (no file name, mtime 0, operating system 255).
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use std::compress::Compression;
+        /// use std::compress::read::GzEncoder;
+        /// use std::io::Read;
+        ///
+        /// let mut e = GzEncoder::new(&b"abc"[..], Compression::default());
+        /// let mut gz = Vec::new();
+        /// e.read_to_end(&mut gz).unwrap();
+        /// // The trailer: CRC-32 of "abc" (0x352441c2) and the length, little-endian.
+        /// assert_eq(&gz[gz.len() - 8..], b"\xc2\x41\x24\x35\x03\x00\x00\x00");
+        /// ```
         pub fn new(r: R, level: Compression) -> GzEncoder<R> {
             GzBuilder::new().read(r, level)
         }
+        /// Acquires a reference to the underlying reader.
         pub fn get_ref(&self) -> &R {
             &self.e.inner
         }
+        /// Acquires a mutable reference to the underlying reader.
+        ///
+        /// Note that mutation of the reader may corrupt the compressed
+        /// stream: the data read from it directly is not compressed.
         pub fn get_mut(&mut self) -> &mut R {
             &mut self.e.inner
         }
+        /// Consumes this encoder, returning the underlying reader.
+        ///
+        /// The encoder reads its input in chunks of up to 32 KiB, so the
+        /// reader may be positioned past the data compressed so far.
         pub fn into_inner(self) -> R {
             self.e.inner
         }
@@ -688,93 +1370,194 @@ pub mod read {
         }
     }
 
-    /// Decompresses raw DEFLATE data from a reader.
+    /// A DEFLATE decoder, or decompressor: it reads raw DEFLATE data
+    /// (RFC 1951) from a reader and gives the decompressed bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::read::DeflateDecoder;
+    /// use std::io::Read;
+    ///
+    /// // Python: zlib.compressobj(9, zlib.DEFLATED, -15) on b"Hello, world!"
+    /// let raw = b"\xf3\x48\xcd\xc9\xc9\xd7\x51\x28\xcf\x2f\xca\x49\x51\x04\x00";
+    /// let mut d = DeflateDecoder::new(raw);
+    /// let mut s = String::new();
+    /// d.read_to_string(&mut s).unwrap();
+    /// assert_eq(s, "Hello, world!");
+    /// assert_eq(d.total_out(), 13);
+    /// ```
     pub struct DeflateDecoder<R: Read> {
         d: Dec<R>,
     }
-    /// Decompresses a zlib stream.
+    /// A zlib decoder, or decompressor: it reads a zlib stream (RFC 1950)
+    /// from a reader and gives the decompressed bytes, checking the
+    /// Adler-32 at the end.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::read::ZlibDecoder;
+    /// use std::compress::write::ZlibEncoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+    /// e.write_all(b"zlib data").unwrap();
+    /// let z = e.finish().unwrap();
+    ///
+    /// let mut d = ZlibDecoder::new(z.as_slice());
+    /// let mut out = Vec::new();
+    /// d.read_to_end(&mut out).unwrap();
+    /// assert_eq(out, b"zlib data");
+    /// ```
     pub struct ZlibDecoder<R: Read> {
         d: Dec<R>,
     }
-    /// Decompresses the first gzip member.
+    /// A gzip decoder, or decompressor: it reads the first member of a
+    /// gzip stream (RFC 1952) from a reader and gives its decompressed
+    /// bytes, checking the CRC-32 and length at the end.
+    ///
+    /// Data after the first member is not read; use [`MultiGzDecoder`] for
+    /// streams of several members (such as concatenated `.gz` files).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::read::GzDecoder;
+    /// use std::io::Read;
+    ///
+    /// // Python: gzip.compress(b"Hello, world!", 9, mtime=0)
+    /// let gz = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xf3\x48\xcd\xc9\xc9\xd7\x51\x28\xcf\x2f\xca\x49\x51\x04\x00\xe6\xc6\xe6\xeb\x0d\x00\x00\x00";
+    /// let mut d = GzDecoder::new(gz);
+    /// let mut s = String::new();
+    /// d.read_to_string(&mut s).unwrap();
+    /// assert_eq(s, "Hello, world!");
+    /// assert_eq(d.header().unwrap().mtime(), 0);
+    /// ```
     pub struct GzDecoder<R: Read> {
         d: Dec<R>,
     }
-    /// Decompresses every gzip member, one after another.
+    /// A gzip decoder that reads every member of a gzip stream, one after
+    /// another, giving their decompressed bytes as one sequence.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::read::MultiGzDecoder;
+    /// use std::compress::write::GzEncoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut both = Vec::new();
+    /// for part in ["Hello, ", "world!"].iter() {
+    ///     let mut e = GzEncoder::new(Vec::new(), Compression::fast());
+    ///     e.write_all(part.as_bytes()).unwrap();
+    ///     both.extend_from_slice(e.finish().unwrap().as_slice());
+    /// }
+    /// let mut s = String::new();
+    /// MultiGzDecoder::new(both.as_slice()).read_to_string(&mut s).unwrap();
+    /// assert_eq(s, "Hello, world!");
+    /// ```
     pub struct MultiGzDecoder<R: Read> {
         d: Dec<R>,
     }
 
     impl<R: Read> DeflateDecoder<R> {
+        /// Creates a decoder that reads raw DEFLATE data from `r`.
         pub fn new(r: R) -> DeflateDecoder<R> {
             DeflateDecoder {
                 d: Dec::new(r, RAW, false),
             }
         }
+        /// Returns a reference to the underlying reader.
         pub fn get_ref(&self) -> &R {
             &self.d.inf.src.inner
         }
+        /// Returns a mutable reference to the underlying reader.
+        ///
+        /// Reading from it directly may corrupt the decompressed stream.
         pub fn get_mut(&mut self) -> &mut R {
             &mut self.d.inf.src.inner
         }
+        /// Returns the number of decompressed bytes given so far.
         pub fn total_out(&self) -> u64 {
             self.d.total_out
         }
     }
 
     impl<R: Read> ZlibDecoder<R> {
+        /// Creates a decoder that reads a zlib stream from `r`.
         pub fn new(r: R) -> ZlibDecoder<R> {
             ZlibDecoder {
                 d: Dec::new(r, ZLIB, false),
             }
         }
+        /// Returns a reference to the underlying reader.
         pub fn get_ref(&self) -> &R {
             &self.d.inf.src.inner
         }
+        /// Returns a mutable reference to the underlying reader.
+        ///
+        /// Reading from it directly may corrupt the decompressed stream.
         pub fn get_mut(&mut self) -> &mut R {
             &mut self.d.inf.src.inner
         }
+        /// Returns the number of decompressed bytes given so far.
         pub fn total_out(&self) -> u64 {
             self.d.total_out
         }
     }
 
     impl<R: Read> GzDecoder<R> {
+        /// Creates a decoder that reads the first gzip member from `r`.
         pub fn new(r: R) -> GzDecoder<R> {
             GzDecoder {
                 d: Dec::new(r, GZIP, false),
             }
         }
-        /// The member's header, once it has been read.
+        /// Returns the member's header, once it has been read (after the
+        /// first read), or `None` before that or if it was not valid.
         pub fn header(&self) -> Option<&GzHeader> {
             match &self.d.header {
                 Some(h) => Some(h),
                 None => None,
             }
         }
+        /// Returns a reference to the underlying reader.
         pub fn get_ref(&self) -> &R {
             &self.d.inf.src.inner
         }
+        /// Returns a mutable reference to the underlying reader.
+        ///
+        /// Reading from it directly may corrupt the decompressed stream.
         pub fn get_mut(&mut self) -> &mut R {
             &mut self.d.inf.src.inner
         }
     }
 
     impl<R: Read> MultiGzDecoder<R> {
+        /// Creates a decoder that reads every gzip member from `r`.
         pub fn new(r: R) -> MultiGzDecoder<R> {
             MultiGzDecoder {
                 d: Dec::new(r, GZIP, true),
             }
         }
+        /// Returns the header of the member being read, once it has been read
+        /// (after the first read).
         pub fn header(&self) -> Option<&GzHeader> {
             match &self.d.header {
                 Some(h) => Some(h),
                 None => None,
             }
         }
+        /// Returns a reference to the underlying reader.
         pub fn get_ref(&self) -> &R {
             &self.d.inf.src.inner
         }
+        /// Returns a mutable reference to the underlying reader.
+        ///
+        /// Reading from it directly may corrupt the decompressed stream.
         pub fn get_mut(&mut self) -> &mut R {
             &mut self.d.inf.src.inner
         }
@@ -807,15 +1590,77 @@ pub mod write {
     use crate::compress::{Compression, DecW, Enc, EncW, GZIP, GzBuilder, RAW, ZLIB};
     use crate::io::{self, Write};
 
-    /// Compresses what is written into raw DEFLATE data.
+    /// A DEFLATE encoder, or compressor: it compresses the bytes written
+    /// to it into raw DEFLATE data (RFC 1951), which it writes to the
+    /// underlying writer.
+    ///
+    /// navi has no `Drop`: call [`DeflateEncoder::finish`] (or
+    /// [`DeflateEncoder::try_finish`]) to write the end of the stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::read::DeflateDecoder;
+    /// use std::compress::write::DeflateEncoder;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
+    /// e.write_all(b"foo bar baz foo bar baz").unwrap();
+    /// assert_eq(e.total_in(), 23);
+    /// let raw = e.finish().unwrap();
+    ///
+    /// let mut s = String::new();
+    /// DeflateDecoder::new(raw.as_slice()).read_to_string(&mut s).unwrap();
+    /// assert_eq(s, "foo bar baz foo bar baz");
+    /// ```
     pub struct DeflateEncoder<W: Write> {
         e: EncW<W>,
     }
-    /// Compresses into a zlib stream.
+    /// A zlib encoder, or compressor: it compresses the bytes written to
+    /// it into a zlib stream (RFC 1950), which it writes to the underlying
+    /// writer.
+    ///
+    /// navi has no `Drop`: call [`ZlibEncoder::finish`] (or
+    /// [`ZlibEncoder::try_finish`]) to write the end of the stream and the
+    /// Adler-32.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::write::ZlibEncoder;
+    /// use std::io::Write;
+    ///
+    /// let mut e = ZlibEncoder::new(Vec::new(), Compression::best());
+    /// e.write_all(b"Hello, world!").unwrap();
+    /// let z = e.finish().unwrap();
+    /// assert_eq(z[0], 0x78); // the zlib header
+    /// ```
     pub struct ZlibEncoder<W: Write> {
         e: EncW<W>,
     }
-    /// Compresses into a gzip member.
+    /// A gzip encoder, or compressor: it compresses the bytes written to
+    /// it into a gzip member (RFC 1952), which it writes to the underlying
+    /// writer.
+    ///
+    /// The header is the default one (no name, no modification time);
+    /// [`GzBuilder`](crate::compress::GzBuilder) sets its fields. navi has
+    /// no `Drop`: call [`GzEncoder::finish`] (or [`GzEncoder::try_finish`])
+    /// to write the end of the stream and the trailer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::write::GzEncoder;
+    /// use std::io::Write;
+    ///
+    /// let mut e = GzEncoder::new(Vec::new(), Compression::default());
+    /// e.write_all(b"Hello, world!").unwrap();
+    /// let gz = e.finish().unwrap();
+    /// assert_eq(&gz[0..2], b"\x1f\x8b");
+    /// ```
     pub struct GzEncoder<W: Write> {
         pub(crate) e: EncW<W>,
     }
@@ -829,76 +1674,144 @@ pub mod write {
     }
 
     impl<W: Write> DeflateEncoder<W> {
+        /// Creates an encoder that writes raw DEFLATE data compressed at
+        /// `level` to `w`.
         pub fn new(w: W, level: Compression) -> DeflateEncoder<W> {
             DeflateEncoder {
                 e: enc(w, RAW, level),
             }
         }
-        /// Writes the end of the stream (call it, or finish: there is no
-        /// Drop).
+        /// Writes the rest of the compressed data and the end of the
+        /// stream to the underlying writer, keeping the encoder.
+        ///
+        /// Call it or [`Self::finish`]: navi has no `Drop` to do it.
+        /// Nothing may be written after it.
+        ///
+        /// # Errors
+        ///
+        /// The underlying writer's errors.
         pub fn try_finish(&mut self) -> io::Result<()> {
             self.e.try_finish()
         }
-        /// Ends the stream and returns the writer.
+        /// Writes the rest of the compressed data and the end of the
+        /// stream, and returns the underlying writer.
+        ///
+        /// # Errors
+        ///
+        /// The underlying writer's errors.
         pub fn finish(mut self) -> io::Result<W> {
             self.e.try_finish()?;
             Ok(self.e.inner)
         }
+        /// Returns a reference to the underlying writer.
         pub fn get_ref(&self) -> &W {
             &self.e.inner
         }
+        /// Returns a mutable reference to the underlying writer.
+        ///
+        /// Writing to it directly may corrupt the compressed stream.
         pub fn get_mut(&mut self) -> &mut W {
             &mut self.e.inner
         }
+        /// Returns the number of uncompressed bytes written to the encoder so
+        /// far.
         pub fn total_in(&self) -> u64 {
             self.e.e.total_in()
         }
+        /// Returns the number of compressed bytes written to the underlying
+        /// writer so far.
         pub fn total_out(&self) -> u64 {
             self.e.total_out
         }
     }
 
     impl<W: Write> ZlibEncoder<W> {
+        /// Creates an encoder that writes a zlib stream compressed at `level`
+        /// to `w`.
         pub fn new(w: W, level: Compression) -> ZlibEncoder<W> {
             ZlibEncoder {
                 e: enc(w, ZLIB, level),
             }
         }
+        /// Writes the rest of the compressed data and the end of the stream
+        /// (with the trailer) to the underlying writer, keeping the encoder.
+        ///
+        /// Call it or [`Self::finish`]: navi has no `Drop` to do it. Nothing
+        /// may be written after it.
+        ///
+        /// # Errors
+        ///
+        /// The underlying writer's errors.
         pub fn try_finish(&mut self) -> io::Result<()> {
             self.e.try_finish()
         }
+        /// Writes the rest of the compressed data and the end of the stream
+        /// (with the trailer), and returns the underlying writer.
+        ///
+        /// # Errors
+        ///
+        /// The underlying writer's errors.
         pub fn finish(mut self) -> io::Result<W> {
             self.e.try_finish()?;
             Ok(self.e.inner)
         }
+        /// Returns a reference to the underlying writer.
         pub fn get_ref(&self) -> &W {
             &self.e.inner
         }
+        /// Returns a mutable reference to the underlying writer.
+        ///
+        /// Writing to it directly may corrupt the compressed stream.
         pub fn get_mut(&mut self) -> &mut W {
             &mut self.e.inner
         }
+        /// Returns the number of uncompressed bytes written to the encoder so
+        /// far.
         pub fn total_in(&self) -> u64 {
             self.e.e.total_in()
         }
+        /// Returns the number of compressed bytes written to the underlying
+        /// writer so far.
         pub fn total_out(&self) -> u64 {
             self.e.total_out
         }
     }
 
     impl<W: Write> GzEncoder<W> {
+        /// Creates an encoder that writes a gzip member compressed at `level`,
+        /// with a default header, to `w`.
         pub fn new(w: W, level: Compression) -> GzEncoder<W> {
             GzBuilder::new().write(w, level)
         }
+        /// Writes the rest of the compressed data and the end of the stream
+        /// (with the trailer) to the underlying writer, keeping the encoder.
+        ///
+        /// Call it or [`Self::finish`]: navi has no `Drop` to do it. Nothing
+        /// may be written after it.
+        ///
+        /// # Errors
+        ///
+        /// The underlying writer's errors.
         pub fn try_finish(&mut self) -> io::Result<()> {
             self.e.try_finish()
         }
+        /// Writes the rest of the compressed data and the end of the stream
+        /// (with the trailer), and returns the underlying writer.
+        ///
+        /// # Errors
+        ///
+        /// The underlying writer's errors.
         pub fn finish(mut self) -> io::Result<W> {
             self.e.try_finish()?;
             Ok(self.e.inner)
         }
+        /// Returns a reference to the underlying writer.
         pub fn get_ref(&self) -> &W {
             &self.e.inner
         }
+        /// Returns a mutable reference to the underlying writer.
+        ///
+        /// Writing to it directly may corrupt the compressed stream.
         pub fn get_mut(&mut self) -> &mut W {
             &mut self.e.inner
         }
@@ -930,19 +1843,82 @@ pub mod write {
         }
     }
 
-    /// Decompresses what is written (raw DEFLATE) into a writer.
+    /// A DEFLATE decoder that decompresses the raw DEFLATE data (RFC 1951)
+    /// written to it into the underlying writer.
+    ///
+    /// The compressed data is kept until [`DeflateDecoder::try_finish`]
+    /// or [`DeflateDecoder::finish`], which decode it all (navi has no
+    /// `Drop`: call one of them).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::write::DeflateDecoder;
+    /// use std::io::Write;
+    ///
+    /// // Python: zlib.compressobj(9, zlib.DEFLATED, -15) on b"Hello, world!"
+    /// let raw = b"\xf3\x48\xcd\xc9\xc9\xd7\x51\x28\xcf\x2f\xca\x49\x51\x04\x00";
+    /// let mut d = DeflateDecoder::new(Vec::new());
+    /// d.write_all(raw).unwrap();
+    /// assert_eq(d.finish().unwrap(), b"Hello, world!");
+    /// ```
     pub struct DeflateDecoder<W: Write> {
         d: DecW<W>,
     }
-    /// Decompresses a zlib stream.
+    /// A zlib decoder that decompresses the zlib stream (RFC 1950) written
+    /// to it into the underlying writer.
+    ///
+    /// The compressed data is kept until [`ZlibDecoder::try_finish`] or
+    /// [`ZlibDecoder::finish`], which decode it all (navi has no `Drop`:
+    /// call one of them).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::write::ZlibDecoder;
+    /// use std::hex;
+    /// use std::io::Write;
+    ///
+    /// // Python: zlib.compress(b"Hello, world!")
+    /// let z = hex::decode("789cf348cdc9c9d75128cf2fca49510400205e048a").unwrap();
+    /// let mut d = ZlibDecoder::new(Vec::new());
+    /// d.write_all(z.as_slice()).unwrap();
+    /// assert_eq(d.finish().unwrap(), b"Hello, world!");
+    /// ```
     pub struct ZlibDecoder<W: Write> {
         d: DecW<W>,
     }
-    /// Decompresses a gzip member.
+    /// A gzip decoder that decompresses the gzip member (RFC 1952) written
+    /// to it into the underlying writer.
+    ///
+    /// The compressed data is kept until [`GzDecoder::try_finish`] or
+    /// [`GzDecoder::finish`], which decode it all (navi has no `Drop`:
+    /// call one of them).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::compress::Compression;
+    /// use std::compress::write::{GzDecoder, GzEncoder};
+    /// use std::io::Write;
+    ///
+    /// let mut e = GzEncoder::new(Vec::new(), Compression::default());
+    /// e.write_all(b"round trip").unwrap();
+    /// let gz = e.finish().unwrap();
+    ///
+    /// let mut d = GzDecoder::new(Vec::new());
+    /// d.write_all(gz.as_slice()).unwrap();
+    /// assert_eq(d.finish().unwrap(), b"round trip");
+    /// ```
     pub struct GzDecoder<W: Write> {
         d: DecW<W>,
     }
-    /// Decompresses every gzip member.
+    /// A gzip decoder that decompresses every gzip member written to it,
+    /// one after another, into the underlying writer.
+    ///
+    /// The compressed data is kept until [`MultiGzDecoder::try_finish`] or
+    /// [`MultiGzDecoder::finish`], which decode it all (navi has no `Drop`:
+    /// call one of them).
     pub struct MultiGzDecoder<W: Write> {
         d: DecW<W>,
     }
@@ -958,85 +1934,148 @@ pub mod write {
     }
 
     impl<W: Write> DeflateDecoder<W> {
+        /// Creates a decoder that writes the decompressed data to `w`.
         pub fn new(w: W) -> DeflateDecoder<W> {
             DeflateDecoder {
                 d: dec(w, RAW, false),
             }
         }
-        /// Decodes what was written into the writer.
+        /// Decodes all the data written so far into the underlying writer,
+        /// keeping the decoder.
+        ///
+        /// # Errors
+        ///
+        /// An [`io::ErrorKind::InvalidData`] error if the data is not a
+        /// valid stream, and the underlying writer's errors.
         pub fn try_finish(&mut self) -> io::Result<()> {
             self.d.try_finish()
         }
+        /// Decodes all the data written and returns the underlying writer.
+        ///
+        /// # Errors
+        ///
+        /// An [`io::ErrorKind::InvalidData`] error if the data is not a valid
+        /// stream, and the underlying writer's errors.
         pub fn finish(mut self) -> io::Result<W> {
             self.d.try_finish()?;
             Ok(self.d.inner)
         }
+        /// Returns a reference to the underlying writer.
         pub fn get_ref(&self) -> &W {
             &self.d.inner
         }
+        /// Returns a mutable reference to the underlying writer.
         pub fn get_mut(&mut self) -> &mut W {
             &mut self.d.inner
         }
     }
 
     impl<W: Write> ZlibDecoder<W> {
+        /// Creates a decoder that writes the decompressed data to `w`.
         pub fn new(w: W) -> ZlibDecoder<W> {
             ZlibDecoder {
                 d: dec(w, ZLIB, false),
             }
         }
+        /// Decodes all the data written so far into the underlying writer,
+        /// keeping the decoder.
+        ///
+        /// # Errors
+        ///
+        /// An [`io::ErrorKind::InvalidData`] error if the data is not a valid
+        /// stream, and the underlying writer's errors.
         pub fn try_finish(&mut self) -> io::Result<()> {
             self.d.try_finish()
         }
+        /// Decodes all the data written and returns the underlying writer.
+        ///
+        /// # Errors
+        ///
+        /// An [`io::ErrorKind::InvalidData`] error if the data is not a valid
+        /// stream, and the underlying writer's errors.
         pub fn finish(mut self) -> io::Result<W> {
             self.d.try_finish()?;
             Ok(self.d.inner)
         }
+        /// Returns a reference to the underlying writer.
         pub fn get_ref(&self) -> &W {
             &self.d.inner
         }
+        /// Returns a mutable reference to the underlying writer.
         pub fn get_mut(&mut self) -> &mut W {
             &mut self.d.inner
         }
     }
 
     impl<W: Write> GzDecoder<W> {
+        /// Creates a decoder that writes the decompressed data to `w`.
         pub fn new(w: W) -> GzDecoder<W> {
             GzDecoder {
                 d: dec(w, GZIP, false),
             }
         }
+        /// Decodes all the data written so far into the underlying writer,
+        /// keeping the decoder.
+        ///
+        /// # Errors
+        ///
+        /// An [`io::ErrorKind::InvalidData`] error if the data is not a valid
+        /// stream, and the underlying writer's errors.
         pub fn try_finish(&mut self) -> io::Result<()> {
             self.d.try_finish()
         }
+        /// Decodes all the data written and returns the underlying writer.
+        ///
+        /// # Errors
+        ///
+        /// An [`io::ErrorKind::InvalidData`] error if the data is not a valid
+        /// stream, and the underlying writer's errors.
         pub fn finish(mut self) -> io::Result<W> {
             self.d.try_finish()?;
             Ok(self.d.inner)
         }
+        /// Returns a reference to the underlying writer.
         pub fn get_ref(&self) -> &W {
             &self.d.inner
         }
+        /// Returns a mutable reference to the underlying writer.
         pub fn get_mut(&mut self) -> &mut W {
             &mut self.d.inner
         }
     }
 
     impl<W: Write> MultiGzDecoder<W> {
+        /// Creates a decoder that writes the decompressed data to `w`.
         pub fn new(w: W) -> MultiGzDecoder<W> {
             MultiGzDecoder {
                 d: dec(w, GZIP, true),
             }
         }
+        /// Decodes all the data written so far into the underlying writer,
+        /// keeping the decoder.
+        ///
+        /// # Errors
+        ///
+        /// An [`io::ErrorKind::InvalidData`] error if the data is not a valid
+        /// stream, and the underlying writer's errors.
         pub fn try_finish(&mut self) -> io::Result<()> {
             self.d.try_finish()
         }
+        /// Decodes all the data written and returns the underlying writer.
+        ///
+        /// # Errors
+        ///
+        /// An [`io::ErrorKind::InvalidData`] error if the data is not a valid
+        /// stream, and the underlying writer's errors.
         pub fn finish(mut self) -> io::Result<W> {
             self.d.try_finish()?;
             Ok(self.d.inner)
         }
+        /// Returns a reference to the underlying writer.
         pub fn get_ref(&self) -> &W {
             &self.d.inner
         }
+        /// Returns a mutable reference to the underlying writer.
         pub fn get_mut(&mut self) -> &mut W {
             &mut self.d.inner
         }

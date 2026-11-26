@@ -1,23 +1,46 @@
-//! Authenticated encryption with associated data, with the API of
-//! RustCrypto's aead crate: ciphers (crypto::aes_gcm,
-//! crypto::chacha20poly1305) are made with `KeyInit::new_from_slice` and
-//! used through `Aead` (ciphertext with the tag appended) or `AeadInPlace`
-//! (a buffer and a detached tag).
+//! Authenticated encryption with associated data (AEAD), with the API of
+//! RustCrypto's `aead` crate.
 //!
-//!     use std::crypto::aead::{Aead, KeyInit, Payload};
-//!     use std::crypto::aes_gcm::Aes256Gcm;
-//!
-//!     let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-//!     let ct = cipher.encrypt(&nonce, b"plaintext".as_slice()).unwrap();
-//!     let pt = cipher.decrypt(&nonce, Payload { msg: &ct, aad: b"header" })?;
+//! The ciphers ([`crate::crypto::aes_gcm`],
+//! [`crate::crypto::chacha20poly1305`]) are made with
+//! [`KeyInit::new_from_slice`](crate::crypto::aead::KeyInit::new_from_slice)
+//! and used through [`Aead`](crate::crypto::aead::Aead) (the ciphertext with
+//! the tag appended) or [`AeadInPlace`](crate::crypto::aead::AeadInPlace)
+//! (a buffer and a detached tag). Decryption checks the tag: a modified
+//! ciphertext, associated data or nonce makes it fail.
 //!
 //! Keys, nonces and tags are byte slices (the crate uses fixed-size
-//! arrays); a nonce of the wrong length is an Error.
+//! arrays); a key of the wrong length is an `InvalidLength`, a nonce of the
+//! wrong length an `Error`.
+//!
+//! # Security
+//!
+//! A nonce must never be used twice with the same key.
+//!
+//! # Examples
+//!
+//! ```
+//! use std::crypto::aead::{Aead, KeyInit, Payload};
+//! use std::crypto::aes_gcm::Aes256Gcm;
+//!
+//! let key = [7u8; 32];
+//! let nonce = [1u8; 12]; // unique per message
+//! let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+//! let ct = cipher.encrypt(&nonce, Payload { msg: b"plaintext", aad: b"header" }).unwrap();
+//! assert_eq(ct.len(), 9 + 16); // the ciphertext, then the tag
+//!
+//! let pt = cipher.decrypt(&nonce, Payload { msg: ct.as_slice(), aad: b"header" }).unwrap();
+//! assert_eq(pt, b"plaintext");
+//! assert(cipher.decrypt(&nonce, Payload { msg: ct.as_slice(), aad: b"other" }).is_err());
+//! ```
 
 use crate::fmt::{self, Display, Formatter};
 
-/// The error of encryption or decryption (as the crate's: no detail, so
-/// that a failed decryption tells nothing).
+/// The error of encryption or decryption: a nonce of the wrong length, or
+/// a ciphertext that does not authenticate.
+///
+/// As the crate's, it has no detail, so that a failed decryption tells an
+/// attacker nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error;
 
@@ -27,7 +50,7 @@ impl Display for Error {
     }
 }
 
-/// A key of the wrong length.
+/// The error returned for a key of the wrong length.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidLength;
 
@@ -37,9 +60,18 @@ impl Display for InvalidLength {
     }
 }
 
-/// A message and its associated data (authenticated, not encrypted).
+/// A message and its associated data, for [`Aead::encrypt`] and
+/// [`Aead::decrypt`].
+///
+/// The associated data (a header, a record number) is authenticated but
+/// not encrypted: decryption fails unless it is the same as when
+/// encrypting. A plain `&[u8]` or `&Vec<u8>` converts into a `Payload`
+/// with no associated data.
 pub struct Payload {
+    /// The message: the plaintext to encrypt, or the ciphertext (with the
+    /// tag) to decrypt.
     pub msg: &[u8],
+    /// The associated data.
     pub aad: &[u8],
 }
 
@@ -62,24 +94,73 @@ impl From<&Vec<u8>> for Payload {
 pub trait KeyInit {
     /// The key's length in bytes.
     const KEY_SIZE: usize;
+    /// Creates the cipher with `key`.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidLength`] if `key` is not [`KeyInit::KEY_SIZE`] bytes long.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::crypto::aead::KeyInit;
+    /// use std::crypto::chacha20poly1305::ChaCha20Poly1305;
+    ///
+    /// assert(ChaCha20Poly1305::new_from_slice(&[0u8; 32]).is_ok());
+    /// assert(ChaCha20Poly1305::new_from_slice(&[0u8; 16]).is_err());
+    /// ```
     fn new_from_slice(key: &[u8]) -> Result<Self, InvalidLength>;
 }
 
 /// Encryption and decryption in place: the ciphertext replaces the
-/// plaintext in buffer, the tag is apart.
+/// plaintext in a buffer, and the tag is apart.
+///
+/// # Examples
+///
+/// ```
+/// use std::crypto::aead::{AeadInPlace, KeyInit};
+/// use std::crypto::aes_gcm::Aes128Gcm;
+///
+/// let cipher = Aes128Gcm::new_from_slice(&[0u8; 16]).unwrap();
+/// let nonce = [0u8; 12];
+/// let mut buf = [1u8, 2, 3, 4];
+/// let tag = cipher.encrypt_in_place_detached(&nonce, b"", &mut buf).unwrap();
+/// assert_ne(buf, [1u8, 2, 3, 4]);
+/// cipher.decrypt_in_place_detached(&nonce, b"", &mut buf, tag.as_slice()).unwrap();
+/// assert_eq(buf, [1u8, 2, 3, 4]);
+/// ```
 pub trait AeadInPlace {
-    /// The nonce's and the tag's lengths in bytes.
+    /// The nonce's length in bytes.
     const NONCE_SIZE: usize;
+    /// The tag's length in bytes.
     const TAG_SIZE: usize;
 
+    /// Encrypts `buffer` in place with `nonce`, authenticating it and
+    /// `aad`, and returns the tag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] if `nonce` is not [`AeadInPlace::NONCE_SIZE`] bytes long.
+    ///
+    /// # Security
+    ///
+    /// A nonce must never be used twice with the same key: that reveals the
+    /// xor of the two plaintexts and lets an attacker forge messages. Use a
+    /// counter, or random nonces from [`crate::rand::rngs::OsRng`] for at most
+    /// about 2<sup>32</sup> messages per key.
     fn encrypt_in_place_detached(
         &self,
         nonce: &[u8],
         aad: &[u8],
         buffer: &mut [u8],
     ) -> Result<Vec<u8>, Error>;
-    /// The plaintext replaces the ciphertext if the tag is right; else an
-    /// Error and buffer unchanged.
+    /// Checks `tag` against `buffer` (the ciphertext), `aad` and `nonce`
+    /// and, if it is right, decrypts `buffer` in place.
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] if the tag is wrong (or the nonce has the wrong length);
+    /// `buffer` is left unchanged then.
     fn decrypt_in_place_detached(
         &self,
         nonce: &[u8],
@@ -90,8 +171,57 @@ pub trait AeadInPlace {
 }
 
 /// Encryption to a new buffer: the ciphertext, then the tag.
+///
+/// Implemented for every [`AeadInPlace`] cipher.
 pub trait Aead {
+    /// Encrypts `plaintext` (a byte slice, or a [`Payload`] with
+    /// associated data) with `nonce`, returning the ciphertext followed by
+    /// the tag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] if `nonce` has the wrong length.
+    ///
+    /// # Security
+    ///
+    /// A nonce must never be used twice with the same key: that reveals the
+    /// xor of the two plaintexts and lets an attacker forge messages. Use a
+    /// counter, or random nonces from [`crate::rand::rngs::OsRng`] for at most
+    /// about 2<sup>32</sup> messages per key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::crypto::aead::{Aead, KeyInit};
+    /// use std::crypto::chacha20poly1305::ChaCha20Poly1305;
+    ///
+    /// let cipher = ChaCha20Poly1305::new_from_slice(&[9u8; 32]).unwrap();
+    /// let ct = cipher.encrypt(&[0u8; 12], b"hello").unwrap();
+    /// assert_eq(ct.len(), 5 + 16);
+    /// ```
     fn encrypt<P: Into<Payload>>(&self, nonce: &[u8], plaintext: P) -> Result<Vec<u8>, Error>;
+    /// Decrypts `ciphertext` (the ciphertext followed by the tag, as a
+    /// byte slice or a [`Payload`] with associated data) with `nonce`,
+    /// returning the plaintext.
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] if the tag does not match (the ciphertext, the associated
+    /// data or the nonce was changed, or the key is wrong), the ciphertext
+    /// is shorter than a tag, or `nonce` has the wrong length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::crypto::aead::{Aead, KeyInit};
+    /// use std::crypto::chacha20poly1305::ChaCha20Poly1305;
+    ///
+    /// let cipher = ChaCha20Poly1305::new_from_slice(&[9u8; 32]).unwrap();
+    /// let mut ct = cipher.encrypt(&[0u8; 12], b"hello").unwrap();
+    /// assert_eq(cipher.decrypt(&[0u8; 12], ct.as_slice()).unwrap(), b"hello");
+    /// ct[0] ^= 1;
+    /// assert(cipher.decrypt(&[0u8; 12], ct.as_slice()).is_err());
+    /// ```
     fn decrypt<P: Into<Payload>>(&self, nonce: &[u8], ciphertext: P) -> Result<Vec<u8>, Error>;
 }
 
