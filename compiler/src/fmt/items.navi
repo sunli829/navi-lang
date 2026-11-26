@@ -9,7 +9,7 @@ use crate::fmt::lists::*;
 use crate::fmt::overflow::*;
 
 impl Ctx {
-    // --- Comments and blank lines between elements -----------------------------------
+    // --- Comments and blank lines between elements ---------------------------
 
     /// Writes the comments between lo and hi; returns whether a blank line
     /// goes before what follows hi.
@@ -32,7 +32,12 @@ impl Ctx {
             // A run of // comments on lines of their own wraps as one.
             let mut text = self.comment_text(c, indent);
             let mut j = i + 1;
-            if c.line {
+            // A /* */ comment on lines of its own becomes // comments
+            // (rustfmt's normalize_comments).
+            let next = if j < cs.len() { cs[j].pos } else { hi };
+            let as_line = !c.line && self.line_of(c.end) != self.line_of(next);
+            if as_line { text = normalize_block(self.snippet(c.pos, c.end)); }
+            if c.line || as_line {
                 while j < cs.len() && cs[j].line && self.starts_line(cs[j].pos)
                     && self.line_of(cs[j].pos) == self.line_of(cs[j - 1].pos) + 1 {
                     text.push('\n');
@@ -43,7 +48,7 @@ impl Ctx {
             }
             out.push('\n');
             push_spaces(out, indent);
-            if c.line {
+            if c.line || as_line {
                 out.push_str(text.replace("\n", cat("\n", spaces(indent).as_str()).as_str()).as_str());
             } else {
                 // A block comment's later lines carry their indentation.
@@ -56,7 +61,7 @@ impl Ctx {
         !start && self.blank_between(last, hi)
     }
 
-    // --- Lists of items -------------------------------------------------------------
+    // --- Lists of items ------------------------------------------------------
 
     /// The items (and inner attributes) between lo and hi, each on lines
     /// of its own at indent, every one after a newline.
@@ -76,6 +81,17 @@ impl Ctx {
         while i < items.len() {
             let kind = reorder_kind(&items[i]);
             let mut j = i + 1;
+            // A run of use items, blank lines or not: merged by crate and
+            // grouped (imports_granularity = "Crate", group_imports =
+            // "StdExternalCrate").
+            if kind == 1 {
+                while j < items.len() && reorder_kind(&items[j]) == 1 { j += 1; }
+                let next = if j < items.len() { self.item_lo(&items[j]) } else { hi };
+                prev = self.use_run(&mut out, items, i, j, prev, next, indent, at_start);
+                at_start = false;
+                i = j;
+                continue;
+            }
             if kind != 0 {
                 while j < items.len() && reorder_kind(&items[j]) == kind
                     && self.line_of(self.item_lo(&items[j])) <= self.line_of(self.item_end(&items[j - 1])) + 1 {
@@ -134,6 +150,122 @@ impl Ctx {
         out
     }
 
+    // Items i..j (use items) as rustfmt writes them with
+    // imports_granularity = "Crate" and group_imports = "StdExternalCrate":
+    // those without attributes or comments merged by crate (and
+    // visibility), then std's, other crates' and this crate's, each group
+    // sorted, a blank line between. A comment on the lines before an item
+    // goes with it. The end of what was written.
+    fn use_run(&self, out: &mut String, items: &Vec<Item>, i: usize, j: usize, prev: Pos, next: Pos, indent: usize, at_start: bool) -> Pos {
+        // (vis, key, text: None to write the merged tree, group)
+        let mut plain: Vec<(String, UseKey)> = Vec::new();
+        let mut kept: Vec<(String, UseKey, String)> = Vec::new();
+        // The first item's comments that stand apart (a blank line before
+        // the item) stay where they are.
+        let lo0 = self.item_lo(&items[i]);
+        let cs0 = self.comments_in(prev, lo0);
+        let mut split = lo0;
+        let mut c = cs0.len();
+        while c > 0 {
+            let cm = &cs0[c - 1];
+            if !self.starts_line(cm.pos) || self.blank_between(cm.end, if c == cs0.len() { lo0 } else { cs0[c].pos }) { break; }
+            split = cm.pos;
+            c -= 1;
+        }
+        let blank = self.emit_gap(out, prev, split, indent, at_start);
+        let mut from = split;
+        let mut end = prev;
+        let mut k = i;
+        while k < j {
+            let it = &items[k];
+            let lo = self.item_lo(it);
+            let mut lead = String::new();
+            self.emit_gap(&mut lead, from, lo, indent, true);
+            let hi2 = self.item_end(it);
+            let after = if k + 1 < j { self.item_lo(&items[k + 1]) } else { next };
+            let mut tail = String::new();
+            end = hi2;
+            for cm in self.comments_in(hi2, after).iter() {
+                if self.line_of(cm.pos) != self.line_of(hi2) { break; }
+                tail.push(' ');
+                tail.push_str(self.comment_text(cm, indent).as_str());
+                end = cm.end;
+            }
+            from = end;
+            if let Item::Use(u) = it {
+                let key = crate::fmt::imports::normalize(self.use_key(u.tree));
+                let vis = vis_str(&u.base.vis);
+                let alone = u.base.attrs.len() > 0 || lead.len() > 0 || tail.len() > 0 || self.use_item(*u, indent).is_none();
+                if alone {
+                    let mut text = String::new();
+                    if lead.len() > 0 {
+                        text.push_str(&lead[1 + indent..]);
+                        text.push('\n');
+                        push_spaces(&mut text, indent);
+                    }
+                    text.push_str(self.item_or_source(it, indent, false).as_str());
+                    text.push_str(tail.as_str());
+                    kept.push((vis, key, text));
+                } else {
+                    plain.push((vis, key));
+                }
+            }
+            k += 1;
+        }
+        // Merged by visibility (in order of first appearance).
+        let mut entries: Vec<(UseKey, String)> = Vec::new();
+        let mut visses: Vec<String> = Vec::new();
+        for (v, _) in plain.iter() { if !visses.contains(v) { visses.push(v.clone()); } }
+        for v in visses.iter() {
+            let mut ks: Vec<UseKey> = Vec::new();
+            for (v2, kk) in plain.iter() { if v2 == v { ks.push(kk.clone()); } }
+            for m in crate::fmt::imports::merge_keys(&ks).iter() {
+                let mk = crate::fmt::imports::normalize(m.clone());
+                let text = match crate::fmt::imports::use_text(v.as_str(), &mk, indent) {
+                    Some(t) => t,
+                    None => {
+                        // (Too wide to fit any way: as one line.)
+                        let mut t = v.clone();
+                        t.push_str("use ");
+                        t.push_str(crate::fmt::imports::key_string(&mk).as_str());
+                        t.push(';');
+                        t
+                    }
+                };
+                entries.push((mk, text));
+            }
+        }
+        for (_, kk, t) in kept.iter() { entries.push((kk.clone(), t.clone())); }
+        let mut first = true;
+        let mut g = 0;
+        while g < 3 {
+            let mut grp: Vec<(UseKey, String)> = Vec::new();
+            for e in entries.iter() { if crate::fmt::imports::import_group(&e.0) == g { grp.push((e.0.clone(), e.1.clone())); } }
+            // (Stable: equal keys keep their order.)
+            let n = grp.len();
+            let mut a = 1;
+            while a < n {
+                let mut b = a;
+                while b > 0 && crate::fmt::imports::cmp_use(&grp[b - 1].0, &grp[b].0) > 0 {
+                    let t = grp[b - 1].clone();
+                    grp[b - 1] = grp[b].clone();
+                    grp[b] = t;
+                    b -= 1;
+                }
+                a += 1;
+            }
+            let mut gfirst = true;
+            for e in grp.iter() {
+                push_sep(out, if first { blank } else { gfirst }, indent);
+                out.push_str(e.1.as_str());
+                first = false;
+                gfirst = false;
+            }
+            g += 1;
+        }
+        end
+    }
+
     pub fn item_lo(&self, it: &Item) -> Pos {
         let b = it.base();
         for a in b.attrs.iter() {
@@ -149,7 +281,7 @@ impl Ctx {
         }
     }
 
-    // --- Attributes -------------------------------------------------------------------
+    // --- Attributes ----------------------------------------------------------
 
     pub fn attr_end(&self, a: &Attr) -> Pos {
         let i = self.tok_index(a.hash);
@@ -159,7 +291,16 @@ impl Ctx {
     }
 
     pub fn attr(&self, a: &Attr, sh: Shape) -> String {
-        let mut out = s(if a.inner { "#![" } else { "#[" });
+        let prefix = if a.inner { "#![" } else { "#[" };
+        // A list (rustfmt formats its meta item as a call).
+        if a.value.is_none() && (a.args.len() > 0 || self.kind_at(self.path_end(a.path)) == L_PAREN) {
+            if let Some(m) = self.attr_meta(a) {
+                if let Some(sh2) = sh.offset_left(prefix.len()) {
+                    if let Some(rw) = self.meta(m, sh2) { return cat3(prefix, rw.as_str(), "]"); }
+                }
+            }
+        }
+        let mut out = s(prefix);
         let mut first = true;
         for seg in a.path.segments.iter() {
             if !first { out.push_str("::"); }
@@ -182,6 +323,160 @@ impl Ctx {
         out
     }
 
+    // An attribute's path(items) as a meta item, or None if its tokens are
+    // not meta items.
+    fn attr_meta(&self, a: &Attr) -> Option<&Meta> {
+        let mut text = String::new();
+        for seg in a.path.segments.iter() {
+            if text.len() > 0 { text.push_str("::"); }
+            text.push_str(self.ident(seg.name).as_str());
+        }
+        let open = self.find(self.path_end(a.path), L_PAREN);
+        let mut i = 0;
+        let (items, _) = self.meta_items(&a.args, &mut i)?;
+        if i != a.args.len() { return None; }
+        let hi = self.close_end(open);
+        // (rustfmt keeps a trailing comma only in nested lists.)
+        Some(&Meta { lo: a.path.segments[0].name.pos, hi, text, kind: MetaKind::List(items, open, false) })
+    }
+
+    // Meta items separated by commas, up to ) or the end; whether a comma
+    // ends them.
+    fn meta_items(&self, toks: &Vec<crate::syntax::token::Token>, i: &mut usize) -> Option<(Vec<Node>, bool)> {
+        let mut items = Vec::new();
+        let mut comma = false;
+        while *i < toks.len() && toks[*i].kind != R_PAREN {
+            items.push(Node::M(self.meta_item(toks, i)?));
+            comma = false;
+            if *i < toks.len() && toks[*i].kind == COMMA {
+                *i += 1;
+                comma = true;
+            } else if *i < toks.len() && toks[*i].kind != R_PAREN {
+                return None;
+            }
+        }
+        Some((items, comma))
+    }
+
+    fn meta_item(&self, toks: &Vec<crate::syntax::token::Token>, i: &mut usize) -> Option<&Meta> {
+        let t = &toks[*i];
+        let lo = t.pos;
+        if is_lit(t.kind) {
+            *i += 1;
+            return Some(&Meta { lo, hi: t.end, text: self.snippet(t.pos, t.end).to_string(), kind: MetaKind::Lit });
+        }
+        if t.kind != IDENT && !is_keyword(t.kind) { return None; }
+        let mut text = self.snippet(t.pos, t.end).to_string();
+        let mut hi = t.end;
+        *i += 1;
+        while *i + 1 < toks.len() && toks[*i].kind == PATH_SEP && (toks[*i + 1].kind == IDENT || is_keyword(toks[*i + 1].kind)) {
+            text.push_str("::");
+            text.push_str(self.snippet(toks[*i + 1].pos, toks[*i + 1].end));
+            hi = toks[*i + 1].end;
+            *i += 2;
+        }
+        if *i < toks.len() && toks[*i].kind == L_PAREN {
+            let open = toks[*i].pos;
+            *i += 1;
+            let (items, comma) = self.meta_items(toks, i)?;
+            if *i >= toks.len() { return None; }
+            hi = toks[*i].end;
+            *i += 1;
+            return Some(&Meta { lo, hi, text, kind: MetaKind::List(items, open, comma) });
+        }
+        if *i < toks.len() && toks[*i].kind == EQ {
+            if *i + 1 >= toks.len() || !is_lit(toks[*i + 1].kind) { return None; }
+            let v = &toks[*i + 1];
+            *i += 2;
+            return Some(&Meta { lo, hi: v.end, text, kind: MetaKind::NameValue(self.snippet(v.pos, v.end).to_string()) });
+        }
+        Some(&Meta { lo, hi, text, kind: MetaKind::Word })
+    }
+
+    fn is_derive(&self, a: &Attr) -> bool {
+        a.value.is_none() && a.path.segments.len() == 1 && self.ident(a.path.segments[0].name) == "derive"
+            && self.kind_at(self.path_end(a.path)) == L_PAREN
+    }
+
+    // The end of the run of attributes from i that format as one: derives
+    // with no comment or blank line between them (rustfmt's merge_derives).
+    fn attr_run(&self, outer: &Vec<&Attr>, i: usize) -> usize {
+        if !self.is_derive(outer[i]) { return i + 1; }
+        let mut j = i + 1;
+        while j < outer.len() && self.is_derive(outer[j]) {
+            let gap = self.snippet(self.attr_end(outer[j - 1]), outer[j].hash);
+            if count_newlines(gap) >= 2 || gap.contains('/') { break; }
+            j += 1;
+        }
+        j
+    }
+
+    // Attributes i..j: one, or derives merged into one (rustfmt's
+    // format_derive).
+    fn attrs_at(&self, outer: &Vec<&Attr>, i: usize, j: usize, indent: usize) -> String {
+        if self.is_derive(outer[i]) {
+            if let Some(d) = self.format_derive(outer, i, j, indent) { return d; }
+        }
+        let mut out = String::new();
+        let mut k = i;
+        while k < j {
+            if k > i {
+                out.push('\n');
+                push_spaces(&mut out, indent);
+            }
+            out.push_str(self.attr(outer[k], Shape::indented(indent)).as_str());
+            k += 1;
+        }
+        out
+    }
+
+    fn format_derive(&self, outer: &Vec<&Attr>, i: usize, j: usize, indent: usize) -> Option<String> {
+        let mut list = Vec::new();
+        let mut k = i;
+        while k < j {
+            let a = outer[k];
+            if self.has_comment(a.hash, self.attr_end(a)) { return None; }
+            let mut depth = 0;
+            let mut first: Pos = -1;
+            let mut last: Pos = -1;
+            for t in a.args.iter() {
+                if t.kind == COMMA && depth == 0 {
+                    if first >= 0 { list.push(ListItem::of(self.snippet(first, last).to_string())); }
+                    first = -1;
+                    continue;
+                }
+                if t.kind == L_PAREN || t.kind == L_BRACKET || t.kind == LT { depth += 1; }
+                if t.kind == R_PAREN || t.kind == R_BRACKET || t.kind == GT { depth -= 1; }
+                if first < 0 { first = t.pos; }
+                last = t.end;
+            }
+            if first >= 0 { list.push(ListItem::of(self.snippet(first, last).to_string())); }
+            k += 1;
+        }
+        // (10 = "[derive()]", with # 11; 3 = ")]".)
+        let arg = Shape::indented(indent + TAB);
+        let budget = sub(MAX_WIDTH, indent + 11 + 3);
+        let tactic = definitive_tactic(&list, ListTactic::HorizontalVertical, 2, arg.width);
+        let mut f = ListFormatting::new(arg.clone());
+        f.tactic = tactic;
+        f.trailing = Trailing::Always;
+        f.ends_with_newline = false;
+        let items = write_list(&list, &f)?;
+        let mut out = s("#[derive(");
+        if items.contains('\n') || items.len() > budget {
+            out.push_str(arg.nl_indent().as_str());
+            out.push_str(items.as_str());
+            out.push('\n');
+            push_spaces(&mut out, indent);
+        } else if items.ends_with(",") {
+            out.push_str(&items[..items.len() - 1]);
+        } else {
+            out.push_str(items.as_str());
+        }
+        out.push_str(")]");
+        Some(out)
+    }
+
     fn attr_tokens(&self, toks: &Vec<crate::syntax::token::Token>) -> String {
         let mut out = String::new();
         let mut prev = EOF;
@@ -200,24 +495,55 @@ impl Ctx {
     /// The outer attributes of a node, each on a line of its own, then the
     /// indentation for the node.
     pub fn outer_attrs(&self, attrs: &Vec<&Attr>, indent: usize) -> String {
+        let outer = outer_of(attrs);
         let mut out = String::new();
-        for a in attrs.iter() {
-            if a.inner { continue; }
-            out.push_str(self.attr(*a, Shape::indented(indent)).as_str());
+        let mut i = 0;
+        while i < outer.len() {
+            let j = self.attr_run(&outer, i);
+            out.push_str(self.attrs_at(&outer, i, j, indent).as_str());
             out.push('\n');
             push_spaces(&mut out, indent);
+            i = j;
         }
         out
     }
 
-    // --- Items ------------------------------------------------------------------------
+    // The outer attributes with the comments between them and after them
+    // (up to start), as rustfmt's (where /// are attributes too). With a
+    // blank line among them, None: the source is kept.
+    fn outer_attrs_with_comments(&self, attrs: &Vec<&Attr>, start: Pos, indent: usize) -> Option<String> {
+        let outer = outer_of(attrs);
+        let mut out = String::new();
+        let mut prev: Pos = -1;
+        let mut i = 0;
+        while i < outer.len() {
+            let a = outer[i];
+            if prev >= 0 {
+                if self.emit_gap(&mut out, prev, a.hash, indent, false) || self.blank_between(prev, a.hash) { return None; }
+                out.push('\n');
+                push_spaces(&mut out, indent);
+            }
+            let j = self.attr_run(&outer, i);
+            out.push_str(self.attrs_at(&outer, i, j, indent).as_str());
+            prev = self.attr_end(outer[j - 1]);
+            i = j;
+        }
+        if self.emit_gap(&mut out, prev, start, indent, false) || self.blank_between(prev, start) { return None; }
+        out.push('\n');
+        push_spaces(&mut out, indent);
+        Some(out)
+    }
+
+    // --- Items ---------------------------------------------------------------
 
     pub fn item(&self, it: &Item, indent: usize, in_extern: bool) -> Option<String> {
         let b = it.base();
-        // Comments between attributes or in the header are not formatted.
         let lo = self.item_lo(it);
-        if b.attrs.len() > 0 && self.has_comment(lo, b.start) { return None; }
-        let attrs = self.outer_attrs(&b.attrs, indent);
+        let attrs = if b.attrs.len() > 0 && self.has_comment(lo, b.start) {
+            self.outer_attrs_with_comments(&b.attrs, b.start, indent)?
+        } else {
+            self.outer_attrs(&b.attrs, indent)
+        };
         let body = match it {
             Item::Fn(f) => self.fn_item(*f, indent, in_extern)?,
             Item::Struct(st) => self.struct_item(*st, indent)?,
@@ -340,7 +666,7 @@ impl Ctx {
         }
     }
 
-    // --- Functions --------------------------------------------------------------------
+    // --- Functions -----------------------------------------------------------
 
     fn fn_item(&self, f: &FnDecl, indent: usize, in_extern: bool) -> Option<String> {
         let has_body = f.body.is_some();
@@ -537,7 +863,7 @@ impl Ctx {
         Some(out)
     }
 
-    // --- Statements and blocks -------------------------------------------------------
+    // --- Statements and blocks -----------------------------------------------
 
     /// A block's braces and statements at indent.
     pub fn block_body(&self, b: &Block, indent: usize) -> Option<String> {
@@ -552,6 +878,20 @@ impl Ctx {
             let st = b.stmts[i];
             if let Stmt::Empty(_) = st {
                 i += 1;
+                continue;
+            }
+            // A run of use items: merged and grouped as at the top level.
+            if is_use_stmt(st) {
+                let mut uses: Vec<Item> = Vec::new();
+                let mut j = i;
+                while j < n && is_use_stmt(b.stmts[j]) {
+                    if let Stmt::Item(it) = b.stmts[j] { uses.push(it.clone()); }
+                    j += 1;
+                }
+                let next = if j < n { self.stmt_span(b.stmts[j]).0 } else { match b.tail { Some(t) => self.expr_start(t), None => b.rbrace } };
+                prev = self.use_run(&mut body, &uses, 0, uses.len(), prev, next, inner, at_start);
+                at_start = false;
+                i = j;
                 continue;
             }
             let (lo, hi) = self.stmt_span(st);
@@ -694,7 +1034,7 @@ impl Ctx {
         Some(out)
     }
 
-    // --- Structs and enums -------------------------------------------------------------
+    // --- Structs and enums ---------------------------------------------------
 
     fn struct_item(&self, st: &StructDecl, indent: usize) -> Option<String> {
         let mut out = vis_str(&st.base.vis);
@@ -954,7 +1294,7 @@ impl Ctx {
         Some(cat(attrs.as_str(), body2.as_str()))
     }
 
-    // --- impl and trait ----------------------------------------------------------------
+    // --- impl and trait ------------------------------------------------------
 
     fn impl_item(&self, im: &ImplDecl, indent: usize) -> Option<String> {
         let mut out = vis_str(&im.base.vis);
@@ -1004,7 +1344,7 @@ impl Ctx {
         let where_budget = if out.contains('\n') { MAX_WIDTH } else { sub(MAX_WIDTH, last_line_width(out.as_str())) };
         let snug = last_line_width(out.as_str()) == 1;
         let single_where = empty && im.generics.wheres.len() == 1 && !out.contains('\n');
-        let w = self.where_clause(im.generics, Shape::legacy(where_budget, indent), snug || single_where, single_where)?;
+        let w = self.where_clause_opt(im.generics, Shape::legacy(where_budget, indent), snug || single_where, single_where, single_where)?;
         if empty && !out.contains('\n') && out.len() + w.len() <= MAX_WIDTH {
             out.push_str(w.as_str());
             if w.contains('\n') {
@@ -1099,10 +1439,62 @@ pub fn vis_str(v: &Vis) -> String {
     }
 }
 
+fn is_use_stmt(st: &Stmt) -> bool {
+    match st {
+        Stmt::Item(Item::Use(_)) => true,
+        _ => false,
+    }
+}
+
 fn push_sep(out: &mut String, blank: bool, indent: usize) {
     if blank { out.push('\n'); }
     out.push('\n');
     push_spaces(out, indent);
+}
+
+// A /* */ comment as // comments: /** */ as ///, /*! */ as //!, the
+// leading * of its lines gone, and its empty first and last lines.
+fn normalize_block(raw: &str) -> String {
+    let (opener, skip) = if raw.starts_with("/**") && !raw.starts_with("/**/") {
+        ("///", 3)
+    } else if raw.starts_with("/*!") {
+        ("//!", 3)
+    } else {
+        ("//", 2)
+    };
+    let inner = if raw.len() >= skip + 2 { &raw[skip..raw.len() - 2] } else { "" };
+    let mut lines: Vec<String> = Vec::new();
+    for l in inner.split('\n') {
+        let mut t = l.trim();
+        if t.starts_with("*") { t = t[1..].trim(); }
+        lines.push(t.to_string());
+    }
+    while lines.len() > 0 && lines[0].len() == 0 { lines.remove(0); }
+    while lines.len() > 0 && lines[lines.len() - 1].len() == 0 { lines.pop(); }
+    let mut out = String::new();
+    for l in lines.iter() {
+        if out.len() > 0 { out.push('\n'); }
+        out.push_str(opener);
+        if l.len() > 0 {
+            out.push(' ');
+            out.push_str(l.as_str());
+        }
+    }
+    if out.len() == 0 { out.push_str(opener); }
+    out
+}
+
+fn outer_of(attrs: &Vec<&Attr>) -> Vec<&Attr> {
+    let mut out = Vec::new();
+    for a in attrs.iter() {
+        if !a.inner { out.push(*a); }
+    }
+    out
+}
+
+fn is_lit(k: Kind) -> bool {
+    k == INT || k == FLOAT || k == STRING || k == RAW_STRING || k == CHAR || k == BYTE || k == BYTE_STRING || k == KW_TRUE
+        || k == KW_FALSE
 }
 
 fn is_word(k: Kind) -> bool {

@@ -80,22 +80,227 @@ impl Ctx {
         if self.has_comment(lo, hi) { return None; }
         let vis = vis_str(&u.base.vis);
         let key = normalize(self.use_key(u.tree));
-        let sh = Shape::indented(indent).offset_left(4)?.sub_width(1)?.offset_left(vis.len())?;
-        let t = render_tree(&key, sh)?;
-        let mut out = vis;
-        out.push_str("use ");
-        out.push_str(t.as_str());
-        out.push(';');
-        Some(out)
+        use_text(vis.as_str(), &key, indent)
     }
 }
 
-fn render_tree(k: &UseKey, sh0: Shape) -> Option<String> {
+/// vis use tree; at indent.
+pub fn use_text(vis: &str, key: &UseKey, indent: usize) -> Option<String> {
+    let sh = Shape::indented(indent).offset_left(4)?.sub_width(1)?.offset_left(vis.len())?;
+    let t = render_tree(key, sh, 0)?;
+    let mut out = vis.to_string();
+    out.push_str("use ");
+    out.push_str(t.as_str());
+    out.push(';');
+    Some(out)
+}
+
+// --- imports_granularity = "Crate", group_imports = "StdExternalCrate" -----
+
+/// The group of a use tree (group_imports = "StdExternalCrate"): 0 std,
+/// core and alloc, 1 other crates, 2 self, super and crate.
+pub fn import_group(k: &UseKey) -> i32 {
+    if k.segs.len() == 0 { return 1; }
+    match &k.segs[0] {
+        Seg::Ident(n, _) => if n == "std" || n == "core" || n == "alloc" { 0 } else { 1 },
+        Seg::Slf(_) | Seg::Super(_) | Seg::Crate(_) => 2,
+        _ => 1,
+    }
+}
+
+fn seg_eq(a: &Seg, b: &Seg, alias: bool) -> bool {
+    match (a, b) {
+        (Seg::Slf(x), Seg::Slf(y)) => !alias || x == y,
+        (Seg::Super(x), Seg::Super(y)) => !alias || x == y,
+        (Seg::Crate(x), Seg::Crate(y)) => !alias || x == y,
+        (Seg::Ident(x, xa), Seg::Ident(y, ya)) => x == y && (!alias || xa == ya),
+        (Seg::Glob, Seg::Glob) => true,
+        (Seg::List(x), Seg::List(y)) => {
+            if x.len() != y.len() { return false; }
+            let mut i = 0;
+            while i < x.len() {
+                if !key_eq(&x[i], &y[i]) { return false; }
+                i += 1;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn key_eq(a: &UseKey, b: &UseKey) -> bool {
+    if a.segs.len() != b.segs.len() { return false; }
+    let mut i = 0;
+    while i < a.segs.len() {
+        if !seg_eq(&a.segs[i], &b.segs[i], true) { return false; }
+        i += 1;
+    }
+    true
+}
+
+/// rustfmt's UseTree::flatten: one tree per path (a lone {self} kept).
+pub fn flatten(k: &UseKey) -> Vec<UseKey> {
+    let n = k.segs.len();
+    let mut out = Vec::new();
+    if n == 0 {
+        out.push(k.clone());
+        return out;
+    }
+    if let Seg::List(list) = &k.segs[n - 1] {
+        if list.len() == 1 && list[0].segs.len() == 1 {
+            if let Seg::Slf(_) = &list[0].segs[0] {
+                out.push(k.clone());
+                return out;
+            }
+        }
+        for c in list.iter() {
+            for f in flatten(c).iter() {
+                let mut segs: Vec<Seg> = Vec::new();
+                let mut i = 0;
+                while i + 1 < n {
+                    segs.push(k.segs[i].clone());
+                    i += 1;
+                }
+                for s in f.segs.iter() { segs.push(s.clone()); }
+                out.push(UseKey { segs });
+            }
+        }
+        return out;
+    }
+    out.push(k.clone());
+    out
+}
+
+// Whether two trees merge (imports_granularity = "Crate"): the same first
+// segment.
+fn share_prefix(a: &UseKey, b: &UseKey) -> bool {
+    a.segs.len() > 0 && b.segs.len() > 0 && seg_eq(&a.segs[0], &b.segs[0], true)
+}
+
+/// rustfmt's UseTree::merge: other into t.
+pub fn merge_key(t: &mut UseKey, other: &UseKey) {
+    let mut prefix = 0;
+    while prefix < t.segs.len() && prefix < other.segs.len() {
+        let a = &t.segs[prefix];
+        let b = &other.segs[prefix];
+        // (Only the root's alias is set aside.)
+        if (prefix == 0 && seg_eq(a, b, false)) || seg_eq(a, b, true) { prefix += 1; } else { break; }
+    }
+    if let Some(p) = merge_rest(&t.segs, &other.segs, prefix) { t.segs = p; }
+}
+
+fn slice_key(s: &Vec<Seg>, from: usize, to: usize) -> UseKey {
+    let mut segs = Vec::new();
+    let mut i = from;
+    while i < to {
+        segs.push(s[i].clone());
+        i += 1;
+    }
+    UseKey { segs }
+}
+
+fn merge_rest(a: &Vec<Seg>, b: &Vec<Seg>, len0: usize) -> Option<Vec<Seg>> {
+    let mut len = len0;
+    if a.len() == len && b.len() == len { return None; }
+    if a.len() != len && b.len() != len {
+        if let Seg::List(list) = &a[len] {
+            let mut l2 = list.clone();
+            merge_inner(&mut l2, slice_key(b, len, b.len()));
+            let mut p = slice_key(b, 0, len).segs;
+            p.push(Seg::List(l2));
+            return Some(p);
+        }
+    } else if len == 1 {
+        let (common, rest) = if a.len() == len { (&a[0], slice_key(b, 1, b.len())) } else { (&b[0], slice_key(a, 1, a.len())) };
+        let alias = match common {
+            Seg::Ident(_, x) => x.clone(),
+            Seg::Slf(x) => x.clone(),
+            Seg::Super(x) => x.clone(),
+            Seg::Crate(x) => x.clone(),
+            _ => None,
+        };
+        let mut s1 = Vec::new();
+        s1.push(Seg::Slf(alias));
+        let mut list = Vec::new();
+        list.push(UseKey { segs: s1 });
+        list.push(rest);
+        sort_keys(&mut list);
+        let mut p = Vec::new();
+        p.push(b[0].clone());
+        p.push(Seg::List(list));
+        return Some(p);
+    } else {
+        len -= 1;
+    }
+    let mut list = Vec::new();
+    list.push(slice_key(a, len, a.len()));
+    list.push(slice_key(b, len, b.len()));
+    sort_keys(&mut list);
+    let mut p = slice_key(b, 0, len).segs;
+    p.push(Seg::List(list));
+    Some(p)
+}
+
+// rustfmt's merge_use_trees_inner (SharedPrefix::Crate): in a list, a path
+// of one segment stays apart if a tree of one segment shares it; another
+// merges into the longest tree sharing its prefix, if longer than one.
+fn merge_inner(list: &mut Vec<UseKey>, t: UseKey) {
+    let mut best: Option<usize> = None;
+    let mut shortest: Option<usize> = None;
+    let mut i = 0;
+    while i < list.len() {
+        if share_prefix(&list[i], &t) {
+            match best { Some(b) => if list[i].segs.len() > list[b].segs.len() { best = Some(i); }, None => best = Some(i) }
+            match shortest { Some(b) => if list[i].segs.len() < list[b].segs.len() { shortest = Some(i); }, None => shortest = Some(i) }
+        }
+        i += 1;
+    }
+    if t.segs.len() == 1 {
+        if let Some(s1) = shortest {
+            if list[s1].segs.len() == 1 { return; }
+        }
+    } else if let Some(b) = best {
+        if list[b].segs.len() > 1 {
+            let mut x = list[b].clone();
+            merge_key(&mut x, &t);
+            list[b] = x;
+            return;
+        }
+    }
+    list.push(t);
+    sort_keys(list);
+}
+
+/// Merges trees (imports_granularity = "Crate"): each of keys (in order)
+/// flattened into the first tree it shares a prefix with.
+pub fn merge_keys(keys: &Vec<UseKey>) -> Vec<UseKey> {
+    let mut out: Vec<UseKey> = Vec::new();
+    for k in keys.iter() {
+        for f in flatten(k).iter() {
+            let mut done = false;
+            let mut i = 0;
+            while i < out.len() {
+                if share_prefix(&out[i], f) {
+                    let mut x = out[i].clone();
+                    merge_key(&mut x, f);
+                    out[i] = x;
+                    done = true;
+                    break;
+                }
+                i += 1;
+            }
+            if !done { out.push(f.clone()); }
+        }
+    }
+    out
+}
+
+fn render_tree(k: &UseKey, sh0: Shape, depth: usize) -> Option<String> {
     let mut out = String::new();
     let mut sh = sh0;
     let mut i = 0;
     while i < k.segs.len() {
-        let s1 = render_seg(&k.segs[i], sh.clone())?;
+        let s1 = render_seg(&k.segs[i], sh.clone(), depth)?;
         out.push_str(s1.as_str());
         if i + 1 < k.segs.len() {
             out.push_str("::");
@@ -113,7 +318,8 @@ fn with_alias(name: &str, a: &Option<String>) -> String {
     }
 }
 
-fn render_seg(sg: &Seg, sh: Shape) -> Option<String> {
+// depth: how many lists the tree is in.
+fn render_seg(sg: &Seg, sh: Shape, depth: usize) -> Option<String> {
     match sg {
         Seg::Slf(a) => Some(with_alias("self", a)),
         Seg::Super(a) => Some(with_alias("super", a)),
@@ -125,12 +331,13 @@ fn render_seg(sg: &Seg, sh: Shape) -> Option<String> {
             let mut items = Vec::new();
             let mut has_nested = false;
             for t in list.iter() {
-                items.push(ListItem::of(render_tree(t, nested.clone())?));
+                items.push(ListItem::of(render_tree(t, nested.clone(), depth + 1)?));
                 if let Some(Seg::List(l)) = t.segs.last() {
                     if l.len() > 0 { has_nested = true; }
                 }
             }
-            let remaining = if has_nested { 0 } else { sub(sh.width, 2) };
+            // (A list in a list has 2 less, as rustfmt measures it.)
+            let remaining = if has_nested { 0 } else { sub(sh.width, if depth > 0 { 4 } else { 2 }) };
             let tactic = definitive_tactic(&items, ListTactic::Mixed, 2, remaining);
             let ends = tactic != Tactic::Horizontal;
             let mut f = ListFormatting::new(nested.clone());
@@ -342,3 +549,22 @@ pub fn version_cmp(a: &str, b: &str) -> i32 {
 }
 
 fn is_digit(c: u8) -> bool { c >= b'0' && c <= b'9' }
+
+/// A use tree on one line (a::{b, c as d, *}).
+pub fn key_string(k: &UseKey) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for sg in k.segs.iter() {
+        parts.push(match sg {
+            Seg::Slf(a) => with_alias("self", a),
+            Seg::Super(a) => with_alias("super", a),
+            Seg::Crate(a) => with_alias("crate", a),
+            Seg::Ident(n, a) => with_alias(n.as_str(), a),
+            Seg::Glob => "*".to_string(),
+            Seg::List(l) => {
+                let v: Vec<String> = l.iter().map(|x: &UseKey| -> String { key_string(x) }).collect();
+                `{${v.join(", ")}}`.to_string()
+            }
+        });
+    }
+    parts.join("::")
+}
