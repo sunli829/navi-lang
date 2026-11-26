@@ -131,6 +131,20 @@ else
 fi
 # std stays formatted (navi fmt).
 if "$navi" fmt --check lib/std > "$tmp/stdfmt.out" 2>&1; then echo "ok   navi fmt --check lib/std"; else echo "FAIL navi fmt --check lib/std"; head -20 "$tmp/stdfmt.out"; fail=1; fi
+# navi fmt on a module's file finds its modules where the compiler does
+# (src/a.navi's mod b: src/a/b.navi), and on a directory that is no
+# crate's, formats every file in it.
+fp=$tmp/fmtp
+mkdir -p "$fp/src/a" "$fp/loose/sub"
+printf '[package]\nname = "p"\n' > "$fp/navi.toml"
+printf 'mod a;\n' > "$fp/src/lib.navi"
+printf 'mod b;\n' > "$fp/src/a.navi"
+printf 'fn  inner( ) {}\n' > "$fp/src/a/b.navi"
+printf 'fn  decoy( ) {}\n' > "$fp/src/b.navi"
+printf 'fn  y( ) {}\n' > "$fp/loose/sub/y.navi"
+r1=$(cd "$fp" && "$navi" fmt --check src/a.navi 2>&1 | grep '^Diff in' | tr -d '\r')
+r2=$(cd "$fp" && "$navi" fmt --check loose 2>&1 | grep '^Diff in' | tr -d '\r')
+if [ "$r1" = "Diff in src/a/b.navi:" ] && [ "$r2" = "Diff in loose/sub/y.navi:" ]; then echo "ok   navi fmt module files and directories"; else echo "FAIL navi fmt module files and directories: $r1 / $r2"; fail=1; fi
 # navi fmt: tests/fmt/x.navi formats to x.out, which stays as it is;
 # --check reports a file that would change and passes one that would not.
 for f in tests/fmt/*.navi; do
