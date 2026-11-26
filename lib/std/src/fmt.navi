@@ -1,55 +1,352 @@
-//! Formatting: the traits behind template strings and #[derive(Debug)].
+//! Utilities for formatting and printing strings: the traits behind
+//! template strings and `#[derive(Debug)]`.
+//!
+//! navi has no `format!` macro: a template string `` `...${x}...` `` is
+//! the formatting syntax (Rust's `format_args!`). Its type is always
+//! [`Arguments`], a lazy value that formats when it is written; call
+//! `.to_string()` on it for a [`String`] (Rust's `format!`). Printing
+//! functions such as `println` take any `impl Display`, so a template
+//! string is written directly to the output.
+//!
+//! ```
+//! let name = "navi";
+//! let n = 3;
+//! let s = `hello ${name}, ${n} times`.to_string();
+//! assert_eq(s, "hello navi, 3 times");
+//! ```
+//!
+//! # Format specs
+//!
+//! After the outermost single `:` inside `${...}` comes a format spec, as
+//! in Rust: `[[fill]align][+][#][0][width][.precision][type]`. The compiler
+//! checks it and turns it into direct calls on a [`Formatter`]; nothing is
+//! parsed at run time. Width and precision are literal numbers (there is no
+//! `width$` or `.*`).
+//!
+//! | spec | meaning |
+//! |---|---|
+//! | `<` `^` `>` | align left, center, right within `width` (an optional fill character comes first) |
+//! | `+` | always print the sign of a number |
+//! | `#` | alternate form: `0x`/`0o`/`0b` prefixes, pretty-printed [`Debug`] |
+//! | `0` | pad a number with zeros after its sign |
+//! | `.N` | digits after the point for floats, maximum length for strings |
+//!
+//! The type at the end of the spec selects the trait used:
+//!
+//! | spec | trait |
+//! |---|---|
+//! | nothing | [`Display`] |
+//! | `?` | [`Debug`] |
+//! | `x` / `X` | [`LowerHex`] / [`UpperHex`] |
+//! | `o` | [`Octal`] |
+//! | `b` | [`Binary`] |
+//! | `e` / `E` | [`LowerExp`] / [`UpperExp`] |
+//!
+//! ```
+//! let pi = 3.14159;
+//! let n = 42;
+//! assert_eq(`${pi:.2}`.to_string(), "3.14");
+//! assert_eq(`[${n:>5}]`.to_string(), "[   42]");
+//! assert_eq(`[${n:<5}]`.to_string(), "[42   ]");
+//! assert_eq(`[${n:*^6}]`.to_string(), "[**42**]");
+//! assert_eq(`${n:05}`.to_string(), "00042");
+//! assert_eq(`${n:+}`.to_string(), "+42");
+//! assert_eq(`${n:x} ${n:X} ${n:#x}`.to_string(), "2a 2A 0x2a");
+//! assert_eq(`${n:o} ${n:#b}`.to_string(), "52 0b101010");
+//! assert_eq(`${"abc":?}`.to_string(), "\"abc\"");
+//! ```
+//!
+//! # Implementing the traits
+//!
+//! Implement [`Display`] (by hand) and [`Debug`] (usually with
+//! `#[derive(Debug)]`) for your types to use them in template strings;
+//! every [`Display`] type gets `to_string()`.
+//!
+//! ```
+//! use std::fmt;
+//!
+//! #[derive(Debug)]
+//! struct Point {
+//!     x: i32,
+//!     y: i32,
+//! }
+//!
+//! impl fmt::Display for Point {
+//!     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//!         f.write_fmt(`(${self.x}, ${self.y})`)
+//!     }
+//! }
+//!
+//! let p = Point { x: 1, y: 2 };
+//! assert_eq(`${p}`.to_string(), "(1, 2)");
+//! assert_eq(`${p:?}`.to_string(), "Point { x: 1, y: 2 }");
+//! assert_eq(p.to_string(), "(1, 2)");
+//! ```
 
 use crate::string::String;
 
 pub mod rt;
 
+/// The type returned by formatter methods.
+///
+/// It is a [`Result`](crate::result::Result) whose error, [`Error`],
+/// carries no information: formatting either succeeded or failed (usually
+/// because the underlying writer failed). Use `?` to pass the error on.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// #[derive(Debug)]
+/// struct Triangle {
+///     a: f32,
+///     b: f32,
+///     c: f32,
+/// }
+///
+/// impl fmt::Display for Triangle {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         f.write_fmt(`(${self.a}, ${self.b}, ${self.c})`)
+///     }
+/// }
+///
+/// let pythagorean_triple = Triangle { a: 3.0, b: 4.0, c: 5.0 };
+/// assert_eq(`${pythagorean_triple}`.to_string(), "(3, 4, 5)");
+/// ```
 pub type Result = crate::result::Result<(), Error>;
 
+/// The error type returned by formatting traits.
+///
+/// This type does not say what went wrong: formatting functions return it
+/// only to report that writing to the output failed. A formatting trait
+/// implementation should return it only when its writer does (pass it on
+/// with `?`); formatting into a [`String`] never fails.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt::{self, Write};
+///
+/// // A writer that refuses everything.
+/// struct Broken;
+///
+/// impl fmt::Write for Broken {
+///     fn write_str(&mut self, s: &str) -> fmt::Result {
+///         Err(fmt::Error)
+///     }
+/// }
+///
+/// let mut w = Broken;
+/// let r = w.write_fmt(`${1}`);
+/// assert_eq(r, Err(fmt::Error));
+/// assert_eq(fmt::Error.to_string(), "an error occurred when formatting an argument");
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Error;
 
+/// The alignment requested by a format spec (`<`, `^` or `>`), as returned
+/// by [`Formatter::align`].
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt::{self, Alignment};
+///
+/// struct Foo;
+///
+/// impl fmt::Display for Foo {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         let s = match f.align() {
+///             Some(Alignment::Left) => "left",
+///             Some(Alignment::Right) => "right",
+///             Some(Alignment::Center) => "center",
+///             None => "none",
+///         };
+///         f.write_str(s)
+///     }
+/// }
+///
+/// assert_eq(`${Foo:<}`.to_string(), "left");
+/// assert_eq(`${Foo:>}`.to_string(), "right");
+/// assert_eq(`${Foo:^}`.to_string(), "center");
+/// assert_eq(`${Foo}`.to_string(), "none");
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Alignment {
+    /// Output aligned to the left (`<`).
     Left,
+    /// Output aligned to the right (`>`).
     Right,
+    /// Output centered (`^`).
     Center,
 }
 
+/// A trait for writing or formatting into Unicode-accepting buffers or
+/// streams.
+///
+/// This trait accepts only UTF-8 text and does not flush. [`String`]
+/// implements it; for byte-oriented output use [`crate::io::Write`]
+/// instead.
+///
+/// Only [`write_str`](Self::write_str) must be implemented; the other
+/// methods are written on top of it.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt::{self, Write};
+///
+/// // Counts the characters written to it.
+/// struct Counter {
+///     chars: usize,
+/// }
+///
+/// impl fmt::Write for Counter {
+///     fn write_str(&mut self, s: &str) -> fmt::Result {
+///         self.chars += s.chars().count();
+///         Ok(())
+///     }
+/// }
+///
+/// let mut c = Counter { chars: 0 };
+/// c.write_str("héllo").unwrap();
+/// c.write_fmt(`, ${12}!`).unwrap();
+/// assert_eq(c.chars, 10);
+/// ```
 pub trait Write {
+    /// Writes a string slice into this writer, returning whether the write
+    /// succeeded.
+    ///
+    /// This method can only succeed if the entire string slice was
+    /// successfully written; it does not return until all data has been
+    /// written or an error occurs.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an [`Error`] on failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt::Write;
+    ///
+    /// let mut buf = String::new();
+    /// buf.write_str("hola").unwrap();
+    /// assert_eq(buf, "hola");
+    /// ```
     fn write_str(&mut self, s: &str) -> Result;
+    /// Writes a `char` into this writer, returning whether the write
+    /// succeeded.
+    ///
+    /// A single `char` may be encoded as more than one byte.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an [`Error`] on failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt::Write;
+    ///
+    /// let mut buf = String::new();
+    /// buf.write_char('a').unwrap();
+    /// buf.write_char('ß').unwrap();
+    /// assert_eq(buf, "aß");
+    /// ```
     fn write_char(&mut self, c: char) -> Result {
         let mut s = String::new();
         s.push(c);
         self.write_str(s.as_str())
     }
+    /// Writes a template string into this writer, returning whether the
+    /// write succeeded (Rust's `write!` macro calls this method).
+    ///
+    /// # Errors
+    ///
+    /// This function returns an [`Error`] on failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt::Write;
+    ///
+    /// let mut buf = String::new();
+    /// let n = 7;
+    /// buf.write_fmt(`n = ${n}`).unwrap();
+    /// buf.write_fmt(`, n * 2 = ${n * 2}`).unwrap();
+    /// assert_eq(buf, "n = 7, n * 2 = 14");
+    /// ```
     fn write_fmt(&mut self, args: Arguments) -> Result {
         write(self, args)
     }
 }
 
-/// The format spec of one ${...} in a template string.
+/// The format spec of one `${...}` in a template string.
+///
+/// This is part of what template strings compile to (with [`Piece`]), not
+/// an API to use directly: the compiler builds it from the text after `:`.
+/// A [`Formatter`] exposes the same information through its methods.
 #[derive(Clone)]
 pub struct Spec {
+    /// The fill character for padding (`' '` when not given).
     pub fill: char,
+    /// The alignment: 0 none, 1 left, 2 right, 3 center.
     pub align: u8, // 0 unknown, 1 left, 2 right, 3 center
+    /// The minimum width, if [`has_width`](Self::has_width).
     pub width: usize,
+    /// Whether a width was given.
     pub has_width: bool,
+    /// The precision, if [`has_precision`](Self::has_precision).
     pub precision: usize,
+    /// Whether a precision was given.
     pub has_precision: bool,
+    /// Whether the `#` flag was given.
     pub alternate: bool,
+    /// Whether the `+` flag was given.
     pub sign_plus: bool,
+    /// Whether the `0` flag was given.
     pub zero: bool,
 }
 
 /// A piece of a template string: literal text, or a value with its spec.
+///
+/// An [`Arguments`] is a list of pieces built by the compiler; this is not
+/// an API to use directly.
 pub enum Piece {
+    /// Literal text, written as is.
     Lit(&str),
+    /// An interpolated value: the function formats it (calling the trait
+    /// its spec selects) and the [`Spec`] configures the [`Formatter`].
     Arg(fn(&mut Formatter) -> Result, Spec),
 }
 
 /// A template string evaluated lazily: the interpolated values are captured
 /// when it is created and formatted when it is written.
+///
+/// Every template string `` `...` `` has this type (it is Rust's
+/// `format_args!`). The expressions inside `${...}` are evaluated when the
+/// template string is evaluated and their values copied in, but they are
+/// formatted only when the `Arguments` is written: printed, passed to
+/// [`Formatter::write_fmt`] or [`Write::write_fmt`], or turned into a
+/// [`String`] with `to_string()` (Rust's `format!`). Since collections are
+/// shared handles, a change to one after the template string is created
+/// shows in the output; call `.to_string()` right away to keep the text of
+/// the moment.
+///
+/// Cloning an `Arguments` shares the captured values.
+///
+/// # Examples
+///
+/// ```
+/// let mut v = Vec::from([1]);
+/// let a = `v = ${v:?}`; // captures the handle v, not its contents
+/// let before = a.to_string();
+/// v.push(2);
+/// assert_eq(before, "v = [1]");
+/// assert_eq(a.to_string(), "v = [1, 2]");
+/// ```
 pub struct Arguments {
     pieces: &[Piece],
 }
@@ -64,6 +361,24 @@ impl Clone for Arguments {
 }
 
 /// Writes formatted arguments to an output.
+///
+/// This is what [`Write::write_fmt`] does: it takes a writer and the
+/// [`Arguments`] of a template string.
+///
+/// # Errors
+///
+/// Returns an [`Error`] when the writer or a formatting trait
+/// implementation fails.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// let mut output = String::new();
+/// fmt::write(&mut output, `Hello ${"world"}!`).unwrap();
+/// assert_eq(output, "Hello world!");
+/// ```
 pub fn write(out: &mut dyn Write, args: Arguments) -> Result {
     for p in args.pieces {
         match p {
@@ -79,13 +394,58 @@ pub fn write(out: &mut dyn Write, args: Arguments) -> Result {
     Ok(())
 }
 
-/// Formats arguments into a String (what a template string evaluates to).
+/// Formats arguments into a [`String`].
+///
+/// This is what `.to_string()` on a template string does (Rust's
+/// `format!`).
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// let s = fmt::format(`Hello, ${"world"}!`);
+/// assert_eq(s, "Hello, world!");
+/// ```
 pub fn format(args: Arguments) -> String {
     let mut s = String::new();
     let _ = write(&mut s, args);
     s
 }
 
+/// Configuration for formatting, and the output to write to.
+///
+/// A `Formatter` is passed to the `fmt` method of every formatting trait
+/// ([`Display`], [`Debug`], ...). It carries the options of the format spec
+/// (`${x:>8.2}`: [`width`](Self::width), [`precision`](Self::precision),
+/// [`fill`](Self::fill), [`align`](Self::align), the `#` and `+` flags) and
+/// writes to the underlying output.
+///
+/// Implementations usually write with [`write_fmt`](Self::write_fmt) and a
+/// template string, apply the options with [`pad`](Self::pad) and
+/// [`pad_integral`](Self::pad_integral), or build [`Debug`] output with
+/// [`debug_struct`](Self::debug_struct) and the other builders.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Name(String);
+///
+/// impl fmt::Display for Name {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         // Honors width, alignment, fill and precision.
+///         f.pad(&self.0)
+///     }
+/// }
+///
+/// let n = Name("navi".to_string());
+/// assert_eq(`[${n}]`.to_string(), "[navi]");
+/// assert_eq(`[${n:>6}]`.to_string(), "[  navi]");
+/// assert_eq(`[${n:*^8}]`.to_string(), "[**navi**]");
+/// assert_eq(`[${n:.2}]`.to_string(), "[na]");
+/// ```
 pub struct Formatter {
     out: &mut dyn Write,
     width: Option<usize>,
@@ -140,27 +500,190 @@ impl Formatter {
         }
     }
 
+    /// Writes a template string to the output (Rust's `write!(f, ...)`).
+    ///
+    /// The values in the template string are formatted with their own
+    /// specs; this formatter's options (width, fill, ...) do not apply to
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] when the output or a nested formatting fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(i32);
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.write_fmt(`Foo(${self.0:03})`)
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo(7)}`.to_string(), "Foo(007)");
+    /// ```
     pub fn write_fmt(&mut self, args: Arguments) -> Result {
         write(self.out, args)
     }
+    /// Writes a string slice to the output, ignoring the format options.
+    ///
+    /// Use [`pad`](Self::pad) to apply width, alignment and precision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] when the output fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo;
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.write_str("Foo")
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo}`.to_string(), "Foo");
+    /// assert_eq(`${Foo:>6}`.to_string(), "Foo");
+    /// ```
     pub fn write_str(&mut self, s: &str) -> Result {
         self.out.write_str(s)
     }
+    /// Returns the minimum width requested, if any (`${x:8}` gives
+    /// `Some(8)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(i32);
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         match f.width() {
+    ///             Some(w) => f.write_fmt(`Foo(${self.0}) in ${w}`),
+    ///             None => f.write_fmt(`Foo(${self.0})`),
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo(23):10}`.to_string(), "Foo(23) in 10");
+    /// assert_eq(`${Foo(23)}`.to_string(), "Foo(23)");
+    /// ```
     pub fn width(&self) -> Option<usize> {
         self.width
     }
+    /// Returns the precision requested, if any (`${x:.3}` gives
+    /// `Some(3)`).
+    ///
+    /// For floats it is the number of digits after the point; for strings,
+    /// the maximum number of characters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(f64);
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         match f.precision() {
+    ///             Some(2) => f.write_fmt(`Foo(${self.0:.2})`),
+    ///             _ => f.write_fmt(`Foo(${self.0})`),
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo(23.2):.2}`.to_string(), "Foo(23.20)");
+    /// assert_eq(`${Foo(23.2)}`.to_string(), "Foo(23.2)");
+    /// ```
     pub fn precision(&self) -> Option<usize> {
         self.precision
     }
+    /// Returns the character used to pad to the width (`' '` unless the
+    /// spec gives one, as `*` in `${x:*>8}`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo;
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         let c = f.fill();
+    ///         f.write_fmt(`${c}${c}${c}`)
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo:*>}`.to_string(), "***");
+    /// assert_eq(`[${Foo}]`.to_string(), "[   ]");
+    /// ```
     pub fn fill(&self) -> char {
         self.fill
     }
+    /// Returns the alignment requested, if any.
+    ///
+    /// See [`Alignment`] for an example.
     pub fn align(&self) -> Option<Alignment> {
         self.align.clone()
     }
+    /// Returns whether the `#` flag was given (`${x:#?}`, `${x:#x}`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(i32);
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         if f.alternate() {
+    ///             f.write_fmt(`Foo(${self.0})`)
+    ///         } else {
+    ///             f.write_fmt(`${self.0}`)
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo(23):#}`.to_string(), "Foo(23)");
+    /// assert_eq(`${Foo(23)}`.to_string(), "23");
+    /// ```
     pub fn alternate(&self) -> bool {
         self.alternate
     }
+    /// Returns whether the `+` flag was given (`${x:+}`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(i32);
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         if f.sign_plus() && self.0 >= 0 {
+    ///             f.write_fmt(`Foo(+${self.0})`)
+    ///         } else {
+    ///             f.write_fmt(`Foo(${self.0})`)
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo(23):+}`.to_string(), "Foo(+23)");
+    /// assert_eq(`${Foo(23)}`.to_string(), "Foo(23)");
+    /// ```
     pub fn sign_plus(&self) -> bool {
         self.sign_plus
     }
@@ -206,7 +729,33 @@ impl Formatter {
         self.write_fill(after)
     }
 
-    /// Writes s, applying precision (truncation) and width.
+    /// Writes `s`, applying the precision (truncation to that many
+    /// characters), then the width, fill and alignment (left by default).
+    ///
+    /// This is how [`Display`] for `str` honors the format options; use it
+    /// in implementations that write a string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] when the output fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo;
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.pad("Foo")
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo:<4}|`.to_string(), "Foo |");
+    /// assert_eq(`${Foo:0>4}`.to_string(), "0Foo");
+    /// assert_eq(`${Foo:.1}`.to_string(), "F");
+    /// ```
     pub fn pad(&mut self, s: &str) -> Result {
         match self.precision {
             Some(p) => {
@@ -222,6 +771,38 @@ impl Formatter {
 
     /// Writes a number given its digits: adds the sign, the prefix (with
     /// #), and zero or fill padding.
+    ///
+    /// `is_nonnegative` tells whether the number is positive or zero (a `-`
+    /// is written otherwise, a `+` with the `+` flag); `prefix` is written
+    /// only with the `#` flag (as `0x`); `digits` must not contain the sign.
+    /// The padding is on the left by default; with the `0` flag, zeros go
+    /// between the sign and prefix and the digits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] when the output fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(i32);
+    ///
+    /// impl fmt::Display for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         let digits = self.0.abs().to_string();
+    ///         f.pad_integral(self.0 >= 0, "Foo ", &digits)
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo(-1)}`.to_string(), "-1");
+    /// assert_eq(`${Foo(1)}`.to_string(), "1");
+    /// assert_eq(`${Foo(1):+}`.to_string(), "+1");
+    /// assert_eq(`${Foo(-1):#}`.to_string(), "-Foo 1");
+    /// assert_eq(`${Foo(-1):>5}`.to_string(), "   -1");
+    /// assert_eq(`${Foo(-1):05}`.to_string(), "-0001");
+    /// ```
     pub fn pad_integral(&mut self, is_nonnegative: bool, prefix: &str, digits: &str) -> Result {
         let mut head = String::new();
         if !is_nonnegative {
@@ -250,6 +831,30 @@ impl Formatter {
         self.padded(head.as_str(), 2)
     }
 
+    /// Creates a [`DebugStruct`] builder, to write the [`Debug`] output of
+    /// a struct with named fields (`Name { a: 1, b: 2 }`).
+    ///
+    /// This is what `#[derive(Debug)]` does for such structs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo {
+    ///     bar: i32,
+    ///     baz: String,
+    /// }
+    ///
+    /// impl fmt::Debug for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_struct("Foo").field("bar", &self.bar).field("baz", &self.baz).finish()
+    ///     }
+    /// }
+    ///
+    /// let foo = Foo { bar: 10, baz: "Hello World".to_string() };
+    /// assert_eq(`${foo:?}`.to_string(), "Foo { bar: 10, baz: \"Hello World\" }");
+    /// ```
     pub fn debug_struct(&mut self, name: &str) -> DebugStruct {
         let result = self.write_str(name);
         DebugStruct {
@@ -259,6 +864,28 @@ impl Formatter {
         }
     }
 
+    /// Creates a [`DebugTuple`] builder, to write the [`Debug`] output of a
+    /// tuple struct (`Name(1, 2)`).
+    ///
+    /// This is what `#[derive(Debug)]` does for tuple structs and enum
+    /// variants with fields. With an empty name it writes a tuple, `(1, 2)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(i32, String);
+    ///
+    /// impl fmt::Debug for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_tuple("Foo").field(&self.0).field(&self.1).finish()
+    ///     }
+    /// }
+    ///
+    /// let foo = Foo(10, "Hello".to_string());
+    /// assert_eq(`${foo:?}`.to_string(), "Foo(10, \"Hello\")");
+    /// ```
     pub fn debug_tuple(&mut self, name: &str) -> DebugTuple {
         let result = self.write_str(name);
         DebugTuple {
@@ -269,6 +896,29 @@ impl Formatter {
         }
     }
 
+    /// Creates a [`DebugList`] builder, to write the [`Debug`] output of a
+    /// list (`[1, 2]`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(Vec<i32>);
+    ///
+    /// impl fmt::Debug for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         let mut list = f.debug_list();
+    ///         for x in self.0.iter() {
+    ///             list.entry(x);
+    ///         }
+    ///         list.finish()
+    ///     }
+    /// }
+    ///
+    /// let foo = Foo(Vec::from([10, 11]));
+    /// assert_eq(`${foo:?}`.to_string(), "[10, 11]");
+    /// ```
     pub fn debug_list(&mut self) -> DebugList {
         let result = self.write_str("[");
         DebugList {
@@ -278,6 +928,29 @@ impl Formatter {
         }
     }
 
+    /// Creates a [`DebugSet`] builder, to write the [`Debug`] output of a
+    /// set (`{1, 2}`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(Vec<i32>);
+    ///
+    /// impl fmt::Debug for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         let mut set = f.debug_set();
+    ///         for x in self.0.iter() {
+    ///             set.entry(x);
+    ///         }
+    ///         set.finish()
+    ///     }
+    /// }
+    ///
+    /// let foo = Foo(Vec::from([10, 11]));
+    /// assert_eq(`${foo:?}`.to_string(), "{10, 11}");
+    /// ```
     pub fn debug_set(&mut self) -> DebugSet {
         let result = self.write_str("{");
         DebugSet {
@@ -287,6 +960,29 @@ impl Formatter {
         }
     }
 
+    /// Creates a [`DebugMap`] builder, to write the [`Debug`] output of a
+    /// map (`{"A": 10, "B": 11}`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(Vec<(String, i32)>);
+    ///
+    /// impl fmt::Debug for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         let mut map = f.debug_map();
+    ///         for (k, v) in self.0.iter() {
+    ///             map.entry(k, v);
+    ///         }
+    ///         map.finish()
+    ///     }
+    /// }
+    ///
+    /// let foo = Foo(Vec::from([("A".to_string(), 10), ("B".to_string(), 11)]));
+    /// assert_eq(`${foo:?}`.to_string(), "{\"A\": 10, \"B\": 11}");
+    /// ```
     pub fn debug_map(&mut self) -> DebugMap {
         let result = self.write_str("{");
         DebugMap {
@@ -328,6 +1024,32 @@ fn pretty_entry(fmt: &mut Formatter, prefix: &str, value: &dyn Debug) -> Result 
     f2.write_str(",\n")
 }
 
+/// A helper to write the [`Debug`] output of a struct with named fields.
+///
+/// Made by [`Formatter::debug_struct`]: add the fields with
+/// [`field`](Self::field), then call [`finish`](Self::finish). It handles
+/// the pretty-printed form (`${x:#?}`), one field per line.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Foo {
+///     bar: i32,
+///     baz: String,
+/// }
+///
+/// impl fmt::Debug for Foo {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         f.debug_struct("Foo").field("bar", &self.bar).field("baz", &self.baz).finish()
+///     }
+/// }
+///
+/// let foo = Foo { bar: 10, baz: "Hello World".to_string() };
+/// assert_eq(`${foo:?}`.to_string(), "Foo { bar: 10, baz: \"Hello World\" }");
+/// assert_eq(`${foo:#?}`.to_string(), "Foo {\n    bar: 10,\n    baz: \"Hello World\",\n}");
+/// ```
 pub struct DebugStruct {
     fmt: &mut Formatter,
     result: Result,
@@ -335,6 +1057,31 @@ pub struct DebugStruct {
 }
 
 impl DebugStruct {
+    /// Adds a field named `name` with the [`Debug`] output of `value`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Bar {
+    ///     bar: i32,
+    ///     another: String,
+    /// }
+    ///
+    /// impl fmt::Debug for Bar {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_struct("Bar")
+    ///             .field("bar", &self.bar)
+    ///             .field("other", &self.another)
+    ///             .field("sum", &(self.bar + 1))
+    ///             .finish()
+    ///     }
+    /// }
+    ///
+    /// let bar = Bar { bar: 10, another: "Hello".to_string() };
+    /// assert_eq(`${bar:?}`.to_string(), "Bar { bar: 10, other: \"Hello\", sum: 11 }");
+    /// ```
     pub fn field(&mut self, name: &str, value: &dyn Debug) -> &mut DebugStruct {
         if self.result.is_ok() {
             self.result = if self.fmt.alternate {
@@ -369,6 +1116,25 @@ impl DebugStruct {
         self
     }
 
+    /// Finishes the output (writes the closing `}`) and returns any error
+    /// met while writing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Unit;
+    ///
+    /// impl fmt::Debug for Unit {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         // No fields: only the name is written.
+    ///         f.debug_struct("Unit").finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Unit:?}`.to_string(), "Unit");
+    /// ```
     pub fn finish(&mut self) -> Result {
         if self.result.is_ok() && self.has_fields {
             self.result = if self.fmt.alternate {
@@ -381,6 +1147,29 @@ impl DebugStruct {
     }
 }
 
+/// A helper to write the [`Debug`] output of a tuple struct.
+///
+/// Made by [`Formatter::debug_tuple`]: add the fields with
+/// [`field`](Self::field), then call [`finish`](Self::finish). It handles
+/// the pretty-printed form (`${x:#?}`), one field per line.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Foo(i32, String);
+///
+/// impl fmt::Debug for Foo {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         f.debug_tuple("Foo").field(&self.0).field(&self.1).finish()
+///     }
+/// }
+///
+/// let foo = Foo(10, "Hello World".to_string());
+/// assert_eq(`${foo:?}`.to_string(), "Foo(10, \"Hello World\")");
+/// assert_eq(`${foo:#?}`.to_string(), "Foo(\n    10,\n    \"Hello World\",\n)");
+/// ```
 pub struct DebugTuple {
     fmt: &mut Formatter,
     result: Result,
@@ -389,6 +1178,23 @@ pub struct DebugTuple {
 }
 
 impl DebugTuple {
+    /// Adds a field with the [`Debug`] output of `value`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Pair(i32, f64);
+    ///
+    /// impl fmt::Debug for Pair {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_tuple("Pair").field(&self.0).field(&self.1).finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Pair(1, 2.5):?}`.to_string(), "Pair(1, 2.5)");
+    /// ```
     pub fn field(&mut self, value: &dyn Debug) -> &mut DebugTuple {
         if self.result.is_ok() {
             self.result = if self.fmt.alternate {
@@ -413,6 +1219,27 @@ impl DebugTuple {
         self
     }
 
+    /// Finishes the output (writes the closing `)`) and returns any error
+    /// met while writing.
+    ///
+    /// A tuple with an empty name and one field is written as `(x,)`, as
+    /// Rust writes a one-element tuple.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct One(i32);
+    ///
+    /// impl fmt::Debug for One {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_tuple("").field(&self.0).finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${One(5):?}`.to_string(), "(5,)");
+    /// ```
     pub fn finish(&mut self) -> Result {
         if self.result.is_ok() && self.fields > 0 {
             if self.fields == 1 && self.empty_name && !self.fmt.alternate {
@@ -426,6 +1253,33 @@ impl DebugTuple {
     }
 }
 
+/// A helper to write the [`Debug`] output of a list.
+///
+/// Made by [`Formatter::debug_list`]: add the entries with
+/// [`entry`](Self::entry), then call [`finish`](Self::finish). It handles
+/// the pretty-printed form (`${x:#?}`), one entry per line.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Foo(Vec<i32>);
+///
+/// impl fmt::Debug for Foo {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         let mut list = f.debug_list();
+///         for x in self.0.iter() {
+///             list.entry(x);
+///         }
+///         list.finish()
+///     }
+/// }
+///
+/// let foo = Foo(Vec::from([10, 11]));
+/// assert_eq(`${foo:?}`.to_string(), "[10, 11]");
+/// assert_eq(`${foo:#?}`.to_string(), "[\n    10,\n    11,\n]");
+/// ```
 pub struct DebugList {
     fmt: &mut Formatter,
     result: Result,
@@ -433,6 +1287,23 @@ pub struct DebugList {
 }
 
 impl DebugList {
+    /// Adds an entry with the [`Debug`] output of `value`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(i32, String);
+    ///
+    /// impl fmt::Debug for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_list().entry(&self.0).entry(&self.1).finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo(10, "a".to_string()):?}`.to_string(), "[10, \"a\"]");
+    /// ```
     pub fn entry(&mut self, value: &dyn Debug) -> &mut DebugList {
         if self.result.is_ok() {
             self.result = if self.fmt.alternate {
@@ -461,6 +1332,24 @@ impl DebugList {
         self
     }
 
+    /// Finishes the output (writes the closing `]`) and returns any error
+    /// met while writing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Empty;
+    ///
+    /// impl fmt::Debug for Empty {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_list().finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Empty:?}`.to_string(), "[]");
+    /// ```
     pub fn finish(&mut self) -> Result {
         if self.result.is_ok() {
             self.result = self.fmt.write_str("]");
@@ -469,6 +1358,34 @@ impl DebugList {
     }
 }
 
+/// A helper to write the [`Debug`] output of a set.
+///
+/// Made by [`Formatter::debug_set`]: add the entries with
+/// [`entry`](Self::entry), then call [`finish`](Self::finish). Unlike
+/// Rust's, it writes the entries on one line in the pretty-printed form
+/// (`${x:#?}`) too.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Foo(Vec<i32>);
+///
+/// impl fmt::Debug for Foo {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         let mut set = f.debug_set();
+///         for x in self.0.iter() {
+///             set.entry(x);
+///         }
+///         set.finish()
+///     }
+/// }
+///
+/// let foo = Foo(Vec::from([10, 11]));
+/// assert_eq(`${foo:?}`.to_string(), "{10, 11}");
+/// assert_eq(`${foo:#?}`.to_string(), "{10, 11}");
+/// ```
 pub struct DebugSet {
     fmt: &mut Formatter,
     result: Result,
@@ -476,6 +1393,23 @@ pub struct DebugSet {
 }
 
 impl DebugSet {
+    /// Adds an entry with the [`Debug`] output of `value`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo(i32, String);
+    ///
+    /// impl fmt::Debug for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_set().entry(&self.0).entry(&self.1).finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo(10, "a".to_string()):?}`.to_string(), "{10, \"a\"}");
+    /// ```
     pub fn entry(&mut self, value: &dyn Debug) -> &mut DebugSet {
         if self.result.is_ok() {
             let sep = if self.has_fields {
@@ -492,6 +1426,24 @@ impl DebugSet {
         self
     }
 
+    /// Finishes the output (writes the closing `}`) and returns any error
+    /// met while writing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Empty;
+    ///
+    /// impl fmt::Debug for Empty {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_set().finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Empty:?}`.to_string(), "{}");
+    /// ```
     pub fn finish(&mut self) -> Result {
         if self.result.is_ok() {
             self.result = self.fmt.write_str("}");
@@ -500,6 +1452,33 @@ impl DebugSet {
     }
 }
 
+/// A helper to write the [`Debug`] output of a map.
+///
+/// Made by [`Formatter::debug_map`]: add the entries with
+/// [`entry`](Self::entry), then call [`finish`](Self::finish). Unlike
+/// Rust's, it writes the entries on one line in the pretty-printed form
+/// (`${x:#?}`) too, and has no separate `key` and `value` methods.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Foo(Vec<(String, i32)>);
+///
+/// impl fmt::Debug for Foo {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         let mut map = f.debug_map();
+///         for (k, v) in self.0.iter() {
+///             map.entry(k, v);
+///         }
+///         map.finish()
+///     }
+/// }
+///
+/// let foo = Foo(Vec::from([("A".to_string(), 10), ("B".to_string(), 11)]));
+/// assert_eq(`${foo:?}`.to_string(), "{\"A\": 10, \"B\": 11}");
+/// ```
 pub struct DebugMap {
     fmt: &mut Formatter,
     result: Result,
@@ -507,6 +1486,24 @@ pub struct DebugMap {
 }
 
 impl DebugMap {
+    /// Adds an entry: the [`Debug`] output of `key`, `: `, and that of
+    /// `value`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Foo;
+    ///
+    /// impl fmt::Debug for Foo {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_map().entry(&"whole", &1).entry(&"half", &0.5).finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Foo:?}`.to_string(), "{\"whole\": 1, \"half\": 0.5}");
+    /// ```
     pub fn entry(&mut self, key: &dyn Debug, value: &dyn Debug) -> &mut DebugMap {
         if self.result.is_ok() {
             let sep = if self.has_fields {
@@ -529,6 +1526,24 @@ impl DebugMap {
         self
     }
 
+    /// Finishes the output (writes the closing `}`) and returns any error
+    /// met while writing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Empty;
+    ///
+    /// impl fmt::Debug for Empty {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_map().finish()
+    ///     }
+    /// }
+    ///
+    /// assert_eq(`${Empty:?}`.to_string(), "{}");
+    /// ```
     pub fn finish(&mut self) -> Result {
         if self.result.is_ok() {
             self.result = self.fmt.write_str("}");
@@ -537,28 +1552,252 @@ impl DebugMap {
     }
 }
 
+/// Format trait for an empty format, `${x}`.
+///
+/// `Display` is for user-facing output: there is no derive for it, it is
+/// written by hand. Implementing it also gives the type a `to_string()`
+/// method (through [`ToString`](crate::string::ToString)).
+///
+/// Numbers, `bool`, `char`, `str` and [`String`] implement it; floats with
+/// no fractional part print without a `.0` (`1.0` prints as `1`).
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Point {
+///     x: i32,
+///     y: i32,
+/// }
+///
+/// impl fmt::Display for Point {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         f.write_fmt(`(${self.x}, ${self.y})`)
+///     }
+/// }
+///
+/// let origin = Point { x: 0, y: 0 };
+/// assert_eq(`The origin is: ${origin}`.to_string(), "The origin is: (0, 0)");
+/// assert_eq(origin.to_string(), "(0, 0)");
+/// ```
 pub trait Display {
+    /// Formats the value using the given formatter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] only when the formatter's output fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Position {
+    ///     longitude: f32,
+    ///     latitude: f32,
+    /// }
+    ///
+    /// impl fmt::Display for Position {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.write_fmt(`(${self.longitude}, ${self.latitude})`)
+    ///     }
+    /// }
+    ///
+    /// let p = Position { longitude: 1.987, latitude: 2.983 };
+    /// assert_eq(`${p}`.to_string(), "(1.987, 2.983)");
+    /// ```
     fn fmt(&self, f: &mut Formatter) -> Result;
 }
+/// `?` formatting, `${x:?}`: output for programmers, when debugging.
+///
+/// `Debug` is usually derived with `#[derive(Debug)]`: a struct prints as
+/// `Name { field: value, .. }`, a tuple struct as `Name(value, ..)`, an
+/// enum as its variant. The `#` flag (`${x:#?}`) pretty-prints over several
+/// lines, indented. To implement it by hand, use the builders
+/// [`Formatter::debug_struct`], [`debug_tuple`](Formatter::debug_tuple),
+/// [`debug_list`](Formatter::debug_list),
+/// [`debug_set`](Formatter::debug_set) and
+/// [`debug_map`](Formatter::debug_map).
+///
+/// Numbers, `bool`, `char`, `str` (quoted and escaped), tuples, arrays,
+/// slices and the std types implement it.
+///
+/// # Examples
+///
+/// Deriving an implementation:
+///
+/// ```
+/// #[derive(Debug)]
+/// struct Point {
+///     x: i32,
+///     y: i32,
+/// }
+///
+/// let origin = Point { x: 0, y: 0 };
+/// assert_eq(`The origin is: ${origin:?}`.to_string(), "The origin is: Point { x: 0, y: 0 }");
+/// assert_eq(`${origin:#?}`.to_string(), "Point {\n    x: 0,\n    y: 0,\n}");
+/// ```
+///
+/// Implementing it by hand:
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Point {
+///     x: i32,
+///     y: i32,
+/// }
+///
+/// impl fmt::Debug for Point {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         f.debug_struct("Point").field("x", &self.x).field("y", &self.y).finish()
+///     }
+/// }
+///
+/// let origin = Point { x: 0, y: 0 };
+/// assert_eq(`${origin:?}`.to_string(), "Point { x: 0, y: 0 }");
+/// ```
 pub trait Debug {
+    /// Formats the value using the given formatter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] only when the formatter's output fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    ///
+    /// struct Position {
+    ///     longitude: f32,
+    ///     latitude: f32,
+    /// }
+    ///
+    /// impl fmt::Debug for Position {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.debug_tuple("").field(&self.longitude).field(&self.latitude).finish()
+    ///     }
+    /// }
+    ///
+    /// let p = Position { longitude: 1.987, latitude: 2.983 };
+    /// assert_eq(`${p:?}`.to_string(), "(1.987, 2.983)");
+    /// ```
     fn fmt(&self, f: &mut Formatter) -> Result;
 }
+/// `x` formatting, `${x:x}`: lowercase hexadecimal.
+///
+/// Integers implement it; negative signed integers are formatted as their
+/// two's complement. The `#` flag adds a `0x` prefix.
+///
+/// # Examples
+///
+/// ```
+/// let x = 42;
+/// assert_eq(`${x:x}`.to_string(), "2a");
+/// assert_eq(`${x:#x}`.to_string(), "0x2a");
+/// assert_eq(`${-16i32:x}`.to_string(), "fffffff0");
+/// ```
+///
+/// Implementing it for a type, delegating to the integer's implementation
+/// so that the format options apply:
+///
+/// ```
+/// use std::fmt;
+///
+/// struct Length(i32);
+///
+/// impl fmt::LowerHex for Length {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         fmt::LowerHex::fmt(&self.0, f)
+///     }
+/// }
+///
+/// let l = Length(9);
+/// assert_eq(`${l:x}`.to_string(), "9");
+/// assert_eq(`${l:#06x}`.to_string(), "0x0009");
+/// ```
 pub trait LowerHex {
+    /// Formats the value using the given formatter.
     fn fmt(&self, f: &mut Formatter) -> Result;
 }
+/// `X` formatting, `${x:X}`: uppercase hexadecimal.
+///
+/// Integers implement it; negative signed integers are formatted as their
+/// two's complement. The `#` flag adds a `0x` prefix.
+///
+/// # Examples
+///
+/// ```
+/// let x = 255;
+/// assert_eq(`${x:X}`.to_string(), "FF");
+/// assert_eq(`${x:#X}`.to_string(), "0xFF");
+/// ```
 pub trait UpperHex {
+    /// Formats the value using the given formatter.
     fn fmt(&self, f: &mut Formatter) -> Result;
 }
+/// `o` formatting, `${x:o}`: octal.
+///
+/// Integers implement it; negative signed integers are formatted as their
+/// two's complement. The `#` flag adds a `0o` prefix.
+///
+/// # Examples
+///
+/// ```
+/// let x = 42;
+/// assert_eq(`${x:o}`.to_string(), "52");
+/// assert_eq(`${x:#o}`.to_string(), "0o52");
+/// ```
 pub trait Octal {
+    /// Formats the value using the given formatter.
     fn fmt(&self, f: &mut Formatter) -> Result;
 }
+/// `b` formatting, `${x:b}`: binary.
+///
+/// Integers implement it; negative signed integers are formatted as their
+/// two's complement. The `#` flag adds a `0b` prefix.
+///
+/// # Examples
+///
+/// ```
+/// let x = 42;
+/// assert_eq(`${x:b}`.to_string(), "101010");
+/// assert_eq(`${x:#b}`.to_string(), "0b101010");
+/// assert_eq(`${5u8:08b}`.to_string(), "00000101");
+/// ```
 pub trait Binary {
+    /// Formats the value using the given formatter.
     fn fmt(&self, f: &mut Formatter) -> Result;
 }
+/// `e` formatting, `${x:e}`: scientific notation with a lowercase `e`.
+///
+/// Floats implement it.
+///
+/// # Examples
+///
+/// ```
+/// let x = 42.0;
+/// assert_eq(`${x:e}`.to_string(), "4.2e1");
+/// assert_eq(`${1234.5:.2e}`.to_string(), "1.23e3");
+/// ```
 pub trait LowerExp {
+    /// Formats the value using the given formatter.
     fn fmt(&self, f: &mut Formatter) -> Result;
 }
+/// `E` formatting, `${x:E}`: scientific notation with an uppercase `E`.
+///
+/// Floats implement it.
+///
+/// # Examples
+///
+/// ```
+/// let x = 42.0;
+/// assert_eq(`${x:E}`.to_string(), "4.2E1");
+/// ```
 pub trait UpperExp {
+    /// Formats the value using the given formatter.
     fn fmt(&self, f: &mut Formatter) -> Result;
 }
 
