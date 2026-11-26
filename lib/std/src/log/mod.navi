@@ -1,40 +1,109 @@
-//! Logging: the API of Rust's log crate, with functions in place of its
-//! macros, and a built-in logger configured as env_logger (std::log::init,
-//! std::log::Builder), the way Go's std has log.
+//! A lightweight logging facade, with the API of Rust's [log] crate, and a
+//! built-in logger configured as [env_logger].
 //!
-//!     use std::log;
+//! Libraries log with the functions [`error`], [`warn`], [`info`],
+//! [`debug`] and [`trace`] (the log crate's macros), and programs choose
+//! where the records go by installing a logger. Like Go, whose standard
+//! library has a `log` package, navi's std includes a logger:
+//! [`init`] installs it, reading its filters from the `NAVI_LOG`
+//! environment variable (env_logger's `RUST_LOG`), and [`Builder`]
+//! configures it in code.
 //!
-//!     fn main() {
-//!         log::init();                       // NAVI_LOG=info, NAVI_LOG=net=debug,warn
-//!         log::info(`starting with ${n} workers`);
-//!         if log::log_enabled(log::Level::Debug) { log::debug(expensive_dump()); }
-//!         log::log(log::Level::Warn, "low disk space");
-//!         log::log_target("net", log::Level::Error, `connection reset by ${peer}`);
+//! [log]: https://docs.rs/log
+//! [env_logger]: https://docs.rs/env_logger
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use std::log;
+//!
+//! fn main() {
+//!     log::init(); // NAVI_LOG=info, NAVI_LOG=net=debug,warn, ...
+//!
+//!     let workers = 4;
+//!     log::info(`starting with ${workers} workers`);
+//!     if log::log_enabled(log::Level::Debug) {
+//!         log::debug(`state: ${expensive_dump()}`);
 //!     }
+//!     log::log(log::Level::Warn, "low disk space");
+//!     log::log_target("net", log::Level::Error, "connection reset");
+//! }
+//! # fn expensive_dump() -> String { String::new() }
+//! ```
 //!
-//! prints to the standard error, as env_logger does:
+//! With `NAVI_LOG=info`, the built-in logger writes to the standard error,
+//! as env_logger does:
 //!
-//!     [2024-01-02T03:04:05Z INFO  myapp] starting with 4 workers
+//! ```text
+//! [2024-01-02T03:04:05Z INFO  myapp] starting with 4 workers
+//! [2024-01-02T03:04:05Z WARN  myapp] low disk space
+//! [2024-01-02T03:04:05Z ERROR net] connection reset
+//! ```
 //!
-//! Levels and laziness: error, warn, info, debug and trace take an
-//! impl Display; a template string passed there is a fmt::Arguments,
-//! which is formatted only when the level is enabled (the values in
-//! ${...} are evaluated in any case, unlike the log crate's macros, which
-//! skip the arguments of a disabled call entirely).
+//! # Levels and laziness
+//!
+//! The logging functions take any `impl Display`. A template string passed
+//! to them is a `fmt::Arguments`, formatted only if the record is logged;
+//! but the expressions in its `${...}` are evaluated in any case, unlike
+//! the arguments of the log crate's macros, which a disabled call skips.
+//! Guard expensive arguments with [`log_enabled`].
+//!
+//! # Installing a logger
 //!
 //! As with the log crate, nothing is logged until a logger is installed:
-//! the maximum level starts at LevelFilter::Off and the logger is a no-op.
-//! log::init() (or Builder::init) installs the built-in logger; set_logger
-//! installs another implementation of Log (set_max_level sets the level
-//! the functions check before building a record).
+//! the maximum level starts at [`LevelFilter::Off`] and the logger is a
+//! no-op. [`init`] (or [`Builder::init`]) installs the built-in logger;
+//! [`set_logger`] installs any implementation of [`Log`], and
+//! [`set_max_level`] sets the level the logging functions check before
+//! making a record. A logger can be installed once per process.
 //!
-//! The target of a record defaults to its module path, which navi derives
-//! from the caller's file (#[track_caller]): src/net/http.navi in a crate
-//! is <crate>::net::http, where <crate> is the directory holding src (or,
-//! for a relative path, the program's name); a file outside src is its file
-//! stem (x.navi is x).
+//! ```
+//! use std::log::{Level, Log, Metadata, Record};
+//! use std::sync::Mutex;
 //!
-//! Loggers are shared by every thread: the built-in one writes each record
+//! // A logger that keeps the messages of Info and above.
+//! struct Memory {
+//!     lines: &Mutex<Vec<String>>,
+//! }
+//!
+//! impl Log for Memory {
+//!     fn enabled(&self, metadata: &Metadata) -> bool {
+//!         metadata.level() <= Level::Info
+//!     }
+//!     fn log(&self, record: &Record) {
+//!         if self.enabled(record.metadata()) {
+//!             self.lines.lock().push(`${record.level()}: ${record.args()}`.to_string());
+//!             self.lines.unlock();
+//!         }
+//!     }
+//!     fn flush(&self) {}
+//! }
+//!
+//! let logger = Memory { lines: &Mutex::new(Vec::new()) };
+//! // A program installs it with
+//! //     log::set_logger(&logger).unwrap();
+//! //     log::set_max_level(log::LevelFilter::Info);
+//! // here it is called directly.
+//! logger.log(&Record::builder().level(Level::Warn).args("disk almost full").build());
+//! logger.log(&Record::builder().level(Level::Debug).args("not kept").build());
+//! let lines = logger.lines.lock().clone();
+//! logger.lines.unlock();
+//! assert_eq(lines, Vec::from(["WARN: disk almost full".to_string()]));
+//! ```
+//!
+//! # Targets
+//!
+//! A record's target defaults to its module path, which navi derives from
+//! the caller's file (the logging functions are `#[track_caller]`):
+//! `src/net/http.navi` in a crate is `<crate>::net::http`, where `<crate>`
+//! is the directory holding `src` (or, for a relative path, the program's
+//! name); a file outside `src` is its file stem (`x.navi` is `x`).
+//! [`log_target`] gives a target explicitly (the log crate's
+//! `log!(target: "net", ...)`).
+//!
+//! # Threads
+//!
+//! A logger is shared by every thread; the built-in one writes each record
 //! with one write under a lock.
 
 use crate::cmp::Ordering;
@@ -49,25 +118,72 @@ pub use env::{
 
 // --- Levels -------------------------------------------------------------------------
 
-/// A record's level. Error is the most severe; it compares as the
-/// smallest (Error < Warn < Info < Debug < Trace), as in the log crate.
+/// The level of a log record: how important it is.
+///
+/// `Error` is the most severe; as in the log crate, it compares as the
+/// smallest (`Error < Warn < Info < Debug < Trace`), so "this level or more
+/// severe" is `level <= filter`. A `Level` compares with a [`LevelFilter`]
+/// too. It parses from its name, ignoring case, and displays as its name
+/// in capitals.
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{Level, LevelFilter};
+///
+/// assert(Level::Error < Level::Warn);
+/// assert(!(Level::Debug <= LevelFilter::Info));
+/// assert(Level::Warn <= LevelFilter::Info);
+///
+/// let l: Level = "info".parse().unwrap();
+/// assert_eq(l, Level::Info);
+/// assert_eq(l.to_string(), "INFO");
+/// assert("off".parse::<Level>().is_err());
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Level {
+    /// Serious errors.
     Error = 1,
+    /// Hazardous situations.
     Warn = 2,
+    /// Useful information.
     Info = 3,
+    /// Lower priority information, for debugging.
     Debug = 4,
+    /// Very low priority, often extremely verbose, information.
     Trace = 5,
 }
 
-/// A maximum level: Off, or a Level.
+/// A maximum level of the records to log: [`Off`](LevelFilter::Off) or a
+/// [`Level`].
+///
+/// [`set_max_level`] takes one, and the built-in logger's filters are
+/// made of them. Ordered as `Level` is, with `Off` the smallest; a
+/// `LevelFilter` compares with a `Level`.
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{Level, LevelFilter};
+///
+/// assert(LevelFilter::Off < LevelFilter::Error);
+/// assert(Level::Error <= LevelFilter::Warn);
+/// assert_eq("OFF".parse::<LevelFilter>(), Ok(LevelFilter::Off));
+/// assert_eq(LevelFilter::from(Level::Debug), LevelFilter::Debug);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LevelFilter {
+    /// Logs nothing.
     Off = 0,
+    /// Logs `Error` records.
     Error = 1,
+    /// Logs `Warn` records and more severe ones.
     Warn = 2,
+    /// Logs `Info` records and more severe ones.
     Info = 3,
+    /// Logs `Debug` records and more severe ones.
     Debug = 4,
+    /// Logs every record.
     Trace = 5,
 }
 
@@ -100,21 +216,56 @@ impl Level {
         self.clone() as usize
     }
 
-    /// The most verbose level, Trace.
+    /// Returns the most verbose level, [`Level::Trace`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::log::Level;
+    ///
+    /// assert_eq(Level::max(), Level::Trace);
+    /// ```
     pub fn max() -> Level {
         Level::Trace
     }
 
+    /// Returns the [`LevelFilter`] of the same name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::log::{Level, LevelFilter};
+    ///
+    /// assert_eq(Level::Warn.to_level_filter(), LevelFilter::Warn);
+    /// ```
     pub fn to_level_filter(&self) -> LevelFilter {
         filter_from(self.idx())
     }
 
-    /// "ERROR", "WARN", "INFO", "DEBUG" or "TRACE".
+    /// Returns the name of the level: `"ERROR"`, `"WARN"`, `"INFO"`,
+    /// `"DEBUG"` or `"TRACE"`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::log::Level;
+    ///
+    /// assert_eq(Level::Debug.as_str(), "DEBUG");
+    /// ```
     pub fn as_str(&self) -> &str {
         LEVEL_NAMES[self.idx()]
     }
 
-    /// The levels from Error to Trace.
+    /// Returns an iterator over the levels, from `Error` to `Trace`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::log::Level;
+    ///
+    /// let names: Vec<String> = Level::iter().map(|l| l.to_string()).collect();
+    /// assert_eq(names.join(" "), "ERROR WARN INFO DEBUG TRACE");
+    /// ```
     pub fn iter() -> crate::vec::IntoIter<Level> {
         Vec::from([
             Level::Error,
@@ -132,22 +283,56 @@ impl LevelFilter {
         self.clone() as usize
     }
 
-    /// The most verbose filter, Trace.
+    /// Returns the most verbose filter, [`LevelFilter::Trace`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::log::LevelFilter;
+    ///
+    /// assert_eq(LevelFilter::max(), LevelFilter::Trace);
+    /// ```
     pub fn max() -> LevelFilter {
         LevelFilter::Trace
     }
 
-    /// The level, or None for Off.
+    /// Returns the [`Level`] of the same name, or `None` for `Off`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::log::{Level, LevelFilter};
+    ///
+    /// assert_eq(LevelFilter::Info.to_level(), Some(Level::Info));
+    /// assert_eq(LevelFilter::Off.to_level(), None);
+    /// ```
     pub fn to_level(&self) -> Option<Level> {
         level_from(self.idx())
     }
 
-    /// "OFF", "ERROR", "WARN", "INFO", "DEBUG" or "TRACE".
+    /// Returns the name of the filter: `"OFF"`, `"ERROR"`, `"WARN"`,
+    /// `"INFO"`, `"DEBUG"` or `"TRACE"`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::log::LevelFilter;
+    ///
+    /// assert_eq(LevelFilter::Off.as_str(), "OFF");
+    /// ```
     pub fn as_str(&self) -> &str {
         LEVEL_NAMES[self.idx()]
     }
 
-    /// The filters from Off to Trace.
+    /// Returns an iterator over the filters, from `Off` to `Trace`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::log::LevelFilter;
+    ///
+    /// assert_eq(LevelFilter::iter().count(), 6);
+    /// ```
     pub fn iter() -> crate::vec::IntoIter<LevelFilter> {
         Vec::from([
             LevelFilter::Off,
@@ -203,7 +388,16 @@ impl From<Level> for LevelFilter {
     }
 }
 
-/// A string that names no level.
+/// The error of parsing a string that names no level as a [`Level`] or
+/// [`LevelFilter`].
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{Level, ParseLevelError};
+///
+/// assert_eq("verbose".parse::<Level>(), Err(ParseLevelError));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseLevelError;
 
@@ -224,7 +418,8 @@ fn parse_level_name(s: &str) -> Option<usize> {
     None
 }
 
-/// Case-insensitive: "info", "WARN", ... ("off" is not a Level).
+/// Parses a level's name, ignoring case (`"info"`, `"WARN"`...); `"off"`
+/// is not a `Level`.
 impl FromStr for Level {
     type Err = ParseLevelError;
     fn from_str(s: &str) -> Result<Level, ParseLevelError> {
@@ -248,13 +443,28 @@ impl FromStr for LevelFilter {
     }
 }
 
-/// The most verbose level compiled in (the log crate's features can lower
-/// it; navi always keeps every level).
+/// The most verbose level compiled in.
+///
+/// The log crate's features can lower it; navi always keeps every level,
+/// so it is `LevelFilter::Trace`.
 pub const STATIC_MAX_LEVEL: LevelFilter = LevelFilter::Trace;
 
 // --- Records ------------------------------------------------------------------------
 
-/// A record's level and target, which loggers filter on.
+/// The metadata of a log record: its level and target, which loggers
+/// filter on.
+///
+/// [`Log::enabled`] receives one; [`Record::metadata`] returns a record's.
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{Level, Metadata};
+///
+/// let m = Metadata::builder().level(Level::Debug).target("net").build();
+/// assert_eq(m.level(), Level::Debug);
+/// assert_eq(m.target(), "net");
+/// ```
 #[derive(Clone, Debug)]
 pub struct Metadata {
     level: Level,
@@ -262,6 +472,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    /// Returns a builder of metadata (level `Info`, target `""`).
     pub fn builder() -> MetadataBuilder {
         MetadataBuilder {
             m: Metadata {
@@ -270,37 +481,80 @@ impl Metadata {
             },
         }
     }
+    /// Returns the level.
     pub fn level(&self) -> Level {
         self.level.clone()
     }
+
+    /// Returns the target: by default the module path of the code that
+    /// logged (see [the module docs](crate::log)).
     pub fn target(&self) -> &str {
         self.target
     }
 }
 
+/// A builder of [`Metadata`], for loggers' tests and adapters.
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{Level, MetadataBuilder};
+///
+/// let m = MetadataBuilder::new().level(Level::Error).target("db").build();
+/// assert_eq(m.level(), Level::Error);
+/// assert_eq(m.target(), "db");
+/// ```
 pub struct MetadataBuilder {
     m: Metadata,
 }
 
 impl MetadataBuilder {
+    /// Returns a builder with level `Info` and target `""`.
     pub fn new() -> MetadataBuilder {
         Metadata::builder()
     }
+
+    /// Sets the level.
     pub fn level(&mut self, l: Level) -> &mut MetadataBuilder {
         self.m.level = l;
         self
     }
+
+    /// Sets the target.
     pub fn target(&mut self, t: &str) -> &mut MetadataBuilder {
         self.m.target = t;
         self
     }
+
+    /// Returns the metadata.
     pub fn build(&self) -> Metadata {
         self.m.clone()
     }
 }
 
-/// One log message: its metadata, its (unformatted) message and where it
-/// was logged.
+/// A log record: its metadata, its message and where it was logged.
+///
+/// The logging functions make one and pass it to the installed logger's
+/// [`Log::log`]. The message is kept unformatted ([`args`](Record::args)):
+/// writing it formats it.
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{Level, Record};
+///
+/// let r = Record::builder()
+///     .level(Level::Warn)
+///     .target("app::db")
+///     .args(`pool at ${90}%`)
+///     .line(Some(42))
+///     .build();
+/// assert_eq(r.level(), Level::Warn);
+/// assert_eq(r.target(), "app::db");
+/// assert_eq(r.args().to_string(), "pool at 90%");
+/// assert_eq(r.line(), Some(42));
+/// assert_eq(r.file(), None);
+/// ```
 #[derive(Clone)]
 pub struct Record {
     metadata: Metadata,
@@ -311,28 +565,43 @@ pub struct Record {
 }
 
 impl Record {
+    /// Returns a builder of a record (see [`RecordBuilder`]).
     pub fn builder() -> RecordBuilder {
         RecordBuilder::new()
     }
-    /// The message; written with ${record.args()} it is formatted then.
+
+    /// Returns the message; it is formatted when written (as
+    /// `${record.args()}`).
     pub fn args(&self) -> &fmt::Arguments {
         &self.args
     }
+
+    /// Returns the metadata: the level and the target.
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
+
+    /// Returns the level.
     pub fn level(&self) -> Level {
         self.metadata.level.clone()
     }
+
+    /// Returns the target.
     pub fn target(&self) -> &str {
         self.metadata.target
     }
+
+    /// Returns the module path of the code that logged, if known.
     pub fn module_path(&self) -> Option<&str> {
         self.module_path
     }
+
+    /// Returns the source file of the code that logged, if known.
     pub fn file(&self) -> Option<&str> {
         self.file
     }
+
+    /// Returns the line of the code that logged, if known.
     pub fn line(&self) -> Option<u32> {
         self.line
     }
@@ -350,11 +619,29 @@ impl Debug for Record {
     }
 }
 
+/// A builder of a [`Record`], for loggers' tests and adapters.
+///
+/// A new builder has level `Info`, target `""`, an empty message and no
+/// location.
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{Level, Metadata, RecordBuilder};
+///
+/// let m = Metadata::builder().level(Level::Error).target("net").build();
+/// let r = RecordBuilder::new().metadata(m).args("reset").file(Some("src/net.navi")).build();
+/// assert_eq(r.level(), Level::Error);
+/// assert_eq(r.target(), "net");
+/// assert_eq(r.file(), Some("src/net.navi"));
+/// ```
 pub struct RecordBuilder {
     r: Record,
 }
 
 impl RecordBuilder {
+    /// Returns a builder with level `Info`, target `""`, an empty message
+    /// and no location.
     pub fn new() -> RecordBuilder {
         RecordBuilder {
             r: Record {
@@ -369,34 +656,49 @@ impl RecordBuilder {
             },
         }
     }
+    /// Sets the message.
     pub fn args(&mut self, args: impl Display) -> &mut RecordBuilder {
         self.r.args = `${args}`;
         self
     }
+
+    /// Sets the metadata (the level and the target).
     pub fn metadata(&mut self, m: Metadata) -> &mut RecordBuilder {
         self.r.metadata = m;
         self
     }
+
+    /// Sets the level.
     pub fn level(&mut self, l: Level) -> &mut RecordBuilder {
         self.r.metadata.level = l;
         self
     }
+
+    /// Sets the target.
     pub fn target(&mut self, t: &str) -> &mut RecordBuilder {
         self.r.metadata.target = t;
         self
     }
+
+    /// Sets the module path.
     pub fn module_path(&mut self, p: Option<&str>) -> &mut RecordBuilder {
         self.r.module_path = p;
         self
     }
+
+    /// Sets the source file.
     pub fn file(&mut self, f: Option<&str>) -> &mut RecordBuilder {
         self.r.file = f;
         self
     }
+
+    /// Sets the line.
     pub fn line(&mut self, l: Option<u32>) -> &mut RecordBuilder {
         self.r.line = l;
         self
     }
+
+    /// Returns the record.
     pub fn build(&self) -> Record {
         self.r.clone()
     }
@@ -404,14 +706,24 @@ impl RecordBuilder {
 
 // --- Loggers ------------------------------------------------------------------------
 
-/// A logger: what set_logger installs. It is called from every thread.
+/// A logger: what [`set_logger`] installs.
+///
+/// The logging functions call the installed logger from every thread, so
+/// an implementation that keeps state must lock it (with a
+/// [`Mutex`](crate::sync::Mutex), for instance). See
+/// [the module docs](crate::log) for an example.
 pub trait Log {
-    /// Whether a record with this metadata would be logged (log_enabled
-    /// asks this).
+    /// Returns `true` if a record with this metadata would be logged
+    /// ([`log_enabled`](crate::log::log_enabled) asks this).
     fn enabled(&self, metadata: &Metadata) -> bool;
-    /// Logs a record (a logger filters here too: the logging functions
-    /// check only the maximum level).
+
+    /// Logs a record.
+    ///
+    /// A logger filters here too: the logging functions only check the
+    /// maximum level ([`set_max_level`]) before calling it.
     fn log(&self, record: &Record);
+
+    /// Flushes the records the logger buffers.
     fn flush(&self);
 }
 
@@ -425,7 +737,7 @@ impl Log for NopLogger {
     fn flush(&self) {}
 }
 
-/// set_logger was called after a logger had been installed.
+/// The error of [`set_logger`] when a logger is already installed.
 #[derive(Debug, Clone)]
 pub struct SetLoggerError;
 
@@ -443,9 +755,41 @@ static mut STATE: usize = 0;
 static mut MAX_LEVEL: usize = 0;
 static mut LOGGER: Option<&dyn Log> = None;
 
-/// Installs the logger, once (the log crate's set_logger, which takes a
-/// &'static dyn Log; any reference does in navi). The maximum level is
-/// still Off until set_max_level.
+/// Installs the global logger.
+///
+/// A logger can be installed once per process. The log crate's
+/// `set_logger` takes a `&'static dyn Log`; in navi any reference does.
+/// The maximum level stays [`LevelFilter::Off`] (nothing is logged) until
+/// [`set_max_level`] raises it.
+///
+/// # Errors
+///
+/// Fails if a logger is already installed (by this function, [`init`] or
+/// [`Builder::init`]).
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::log::{self, LevelFilter, Log, Metadata, Record};
+///
+/// struct Stderr;
+///
+/// impl Log for Stderr {
+///     fn enabled(&self, m: &Metadata) -> bool {
+///         true
+///     }
+///     fn log(&self, r: &Record) {
+///         eprintln(`${r.level()} ${r.target()}: ${r.args()}`);
+///     }
+///     fn flush(&self) {}
+/// }
+///
+/// fn main() {
+///     log::set_logger(&Stderr).unwrap();
+///     log::set_max_level(LevelFilter::Info);
+///     log::info("hello"); // INFO <module>: hello
+/// }
+/// ```
 pub fn set_logger(logger: &dyn Log) -> Result<(), SetLoggerError> {
     if !crate::rt::atomic_cas(&mut STATE as *mut usize, UNINITIALIZED, INITIALIZING) {
         return Err(SetLoggerError);
@@ -455,7 +799,8 @@ pub fn set_logger(logger: &dyn Log) -> Result<(), SetLoggerError> {
     Ok(())
 }
 
-/// The installed logger (a no-op one before set_logger).
+/// Returns the installed logger, or a logger that does nothing if none is
+/// installed.
 pub fn logger() -> &dyn Log {
     if crate::rt::atomic_load(&mut STATE as *mut usize) == INITIALIZED {
         if let Some(l) = LOGGER {
@@ -467,11 +812,36 @@ pub fn logger() -> &dyn Log {
     nop
 }
 
-/// Sets the most verbose level the logging functions pass on to the logger.
+/// Sets the global maximum level: the most verbose level the logging
+/// functions pass on to the logger.
+///
+/// Records above it are dropped before the logger sees them. It starts at
+/// [`LevelFilter::Off`]; [`init`] sets it from the logger's filters.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::log::{self, LevelFilter};
+///
+/// log::set_max_level(LevelFilter::Warn);
+/// assert_eq(log::max_level(), LevelFilter::Warn);
+/// ```
 pub fn set_max_level(level: LevelFilter) {
     crate::rt::atomic_store(&mut MAX_LEVEL as *mut usize, level.idx());
 }
 
+/// Returns the global maximum level (see [`set_max_level`]).
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{self, Level};
+///
+/// // Nothing above the maximum level reaches the logger.
+/// if Level::Debug <= log::max_level() {
+///     log::debug("details");
+/// }
+/// ```
 pub fn max_level() -> LevelFilter {
     filter_from(crate::rt::atomic_load(&mut MAX_LEVEL as *mut usize))
 }
@@ -562,51 +932,150 @@ fn emit(level: Level, target: Option<&str>, msg: impl Display, loc: Location) {
     logger().log(&r);
 }
 
-/// Logs at Error (the error! macro).
+/// Logs a message at the [`Level::Error`] level (the log crate's
+/// `error!`).
+///
+/// The record's target is the caller's module path. A template string
+/// argument is formatted only if the record is logged.
+///
+/// # Examples
+///
+/// ```
+/// use std::log;
+///
+/// let path = "/etc/app.toml";
+/// log::error(`cannot read ${path}`);
+/// ```
 #[track_caller]
 pub fn error(msg: impl Display) {
     emit(Level::Error, None, msg, Location::caller());
 }
 
-/// Logs at Warn (the warn! macro).
+/// Logs a message at the [`Level::Warn`] level (the log crate's
+/// `warn!`).
+///
+/// The record's target is the caller's module path. A template string
+/// argument is formatted only if the record is logged.
+///
+/// # Examples
+///
+/// ```
+/// use std::log;
+///
+/// let used = 93;
+/// log::warn(`disk ${used}% full`);
+/// ```
 #[track_caller]
 pub fn warn(msg: impl Display) {
     emit(Level::Warn, None, msg, Location::caller());
 }
 
-/// Logs at Info (the info! macro).
+/// Logs a message at the [`Level::Info`] level (the log crate's
+/// `info!`).
+///
+/// The record's target is the caller's module path. A template string
+/// argument is formatted only if the record is logged.
+///
+/// # Examples
+///
+/// ```
+/// use std::log;
+///
+/// let port = 8080;
+/// log::info(`listening on port ${port}`);
+/// ```
 #[track_caller]
 pub fn info(msg: impl Display) {
     emit(Level::Info, None, msg, Location::caller());
 }
 
-/// Logs at Debug (the debug! macro).
+/// Logs a message at the [`Level::Debug`] level (the log crate's
+/// `debug!`).
+///
+/// The record's target is the caller's module path. A template string
+/// argument is formatted only if the record is logged.
+///
+/// # Examples
+///
+/// ```
+/// use std::log;
+///
+/// let req = Vec::from(["GET", "/"]);
+/// log::debug(`request: ${req:?}`);
+/// ```
 #[track_caller]
 pub fn debug(msg: impl Display) {
     emit(Level::Debug, None, msg, Location::caller());
 }
 
-/// Logs at Trace (the trace! macro).
+/// Logs a message at the [`Level::Trace`] level (the log crate's
+/// `trace!`).
+///
+/// The record's target is the caller's module path. A template string
+/// argument is formatted only if the record is logged.
+///
+/// # Examples
+///
+/// ```
+/// use std::log;
+///
+/// log::trace("entering parse");
+/// ```
 #[track_caller]
 pub fn trace(msg: impl Display) {
     emit(Level::Trace, None, msg, Location::caller());
 }
 
-/// Logs at a level (the log! macro).
+/// Logs a message at a level (the log crate's `log!`).
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{self, Level};
+///
+/// let level = if 3 > 2 { Level::Warn } else { Level::Info };
+/// log::log(level, "retrying");
+/// ```
 #[track_caller]
 pub fn log(level: Level, msg: impl Display) {
     emit(level, None, msg, Location::caller());
 }
 
-/// Logs at a level with an explicit target (log!(target: "net", level, ..)).
+/// Logs a message at a level with an explicit target (the log crate's
+/// `log!(target: "net", level, ...)`).
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{self, Level};
+///
+/// log::log_target("net", Level::Error, "connection reset");
+/// ```
 #[track_caller]
 pub fn log_target(target: &str, level: Level, msg: impl Display) {
     emit(level, Some(target), msg, Location::caller());
 }
 
-/// Whether a message at the level would be logged from here (the
-/// log_enabled! macro): within the maximum level and enabled by the logger
-/// for the caller's module.
+/// Returns `true` if a message at the level would be logged from here
+/// (the log crate's `log_enabled!`).
+///
+/// It is if the level is within the maximum level and the logger enables
+/// it for the caller's module. Use it to skip computing an expensive
+/// message.
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{self, Level};
+///
+/// fn expensive_dump() -> String {
+///     "...".to_string()
+/// }
+///
+/// if log::log_enabled(Level::Debug) {
+///     log::debug(`state: ${expensive_dump()}`);
+/// }
+/// ```
 #[track_caller]
 pub fn log_enabled(level: Level) -> bool {
     if level.idx() > crate::rt::atomic_load(&mut MAX_LEVEL as *mut usize) {
@@ -619,8 +1088,18 @@ pub fn log_enabled(level: Level) -> bool {
     })
 }
 
-/// Whether a message at the level and target would be logged
-/// (log_enabled!(target: .., level)).
+/// Returns `true` if a message at the level with the target would be
+/// logged (the log crate's `log_enabled!(target: "net", level)`).
+///
+/// # Examples
+///
+/// ```
+/// use std::log::{self, Level};
+///
+/// if log::log_enabled_target("net", Level::Trace) {
+///     log::log_target("net", Level::Trace, "packet dump");
+/// }
+/// ```
 pub fn log_enabled_target(target: &str, level: Level) -> bool {
     if level.idx() > crate::rt::atomic_load(&mut MAX_LEVEL as *mut usize) {
         return false;

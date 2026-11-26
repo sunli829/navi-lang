@@ -1,15 +1,52 @@
-//! URLs (as Go's net/url, with the API of Rust's url crate): parsing and
-//! resolution follow the WHATWG URL Standard, except that non-ASCII host
-//! names are rejected (no IDNA).
+//! URL parsing and manipulation, as the url crate.
 //!
-//!     let u = Url::parse("https://user@example.com:8443/a/b?x=1#top").unwrap();
-//!     u.scheme()     // "https"
-//!     u.host_str()   // Some("example.com")
-//!     u.port()       // Some(8443)
-//!     u.path()       // "/a/b"
-//!     let v = u.join("../c?y=2").unwrap();   // https://user@example.com:8443/c?y=2
-//!     for (k, v) in u.query_pairs() { ... }
-//!     u.query_pairs_mut().append_pair("q", "a b");   // ?x=1&q=a+b
+//! [`Url`] parses and serializes URLs following the
+//! [WHATWG URL Standard](https://url.spec.whatwg.org/), the way web
+//! browsers do (the implementation follows Go's net/url where the two
+//! agree). Its accessors return the parts of a URL (scheme, user name,
+//! host, port, path, query, fragment), its setters change them, and
+//! [`Url::join`] resolves a relative URL against it.
+//!
+//! The submodules [`form_urlencoded`] (`application/x-www-form-urlencoded`
+//! query strings) and [`percent_encoding`] are the crates of the same names.
+//!
+//! Unlike the url crate, non-ASCII host names are rejected with
+//! [`ParseError::IdnaError`] (there are no IDNA tables), and a URL is sliced
+//! with [`Url::slice`] instead of indexing with a range of [`Position`]s.
+//!
+//! # Examples
+//!
+//! ```
+//! use std::url::{Host, Url};
+//!
+//! let u = Url::parse("https://user@example.com:8443/a/b?x=1#top").unwrap();
+//! assert_eq(u.scheme(), "https");
+//! assert_eq(u.username(), "user");
+//! assert_eq(u.host_str(), Some("example.com"));
+//! assert_eq(u.host(), Some(Host::Domain("example.com".to_string())));
+//! assert_eq(u.port(), Some(8443));
+//! assert_eq(u.path(), "/a/b");
+//! assert_eq(u.query(), Some("x=1"));
+//! assert_eq(u.fragment(), Some("top"));
+//!
+//! // Resolving a relative URL.
+//! let v = u.join("../c?y=2").unwrap();
+//! assert_eq(v.as_str(), "https://user@example.com:8443/c?y=2");
+//! ```
+//!
+//! Reading and building a query string:
+//!
+//! ```
+//! use std::url::Url;
+//!
+//! let mut u = Url::parse("https://example.com/search?q=navi+lang&page=2").unwrap();
+//! let pairs: Vec<(String, String)> = u.query_pairs().collect();
+//! assert_eq(pairs[0], ("q".to_string(), "navi lang".to_string()));
+//! assert_eq(pairs[1], ("page".to_string(), "2".to_string()));
+//!
+//! u.query_pairs_mut().append_pair("lang", "en & fr");
+//! assert_eq(u.as_str(), "https://example.com/search?q=navi+lang&page=2&lang=en+%26+fr");
+//! ```
 
 pub mod form_urlencoded;
 pub mod percent_encoding;
@@ -21,18 +58,42 @@ use crate::net::{Ipv4Addr, Ipv6Addr};
 use crate::str::FromStr;
 use percent_encoding::{AsciiSet, CONTROLS, encode_into};
 
-/// Why a URL could not be parsed.
+/// Errors that can occur during parsing.
+///
+/// Returned by [`Url::parse`], [`Url::join`], [`Host::parse`] and
+/// [`Url::set_host`]. Its `Display` is the url crate's message.
+///
+/// # Examples
+///
+/// ```
+/// use std::url::{ParseError, Url};
+///
+/// assert_eq(Url::parse("/relative/path"), Err(ParseError::RelativeUrlWithoutBase));
+/// assert_eq(Url::parse("http://example.com:99999/"), Err(ParseError::InvalidPort));
+/// assert_eq(ParseError::EmptyHost.to_string(), "empty host");
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ParseError {
+    /// A special URL (such as `http:`) has no host, as in `http://`.
     EmptyHost,
+    /// The host name is not ASCII: navi has no IDNA support.
     IdnaError,
+    /// The port is not a number or is larger than 65535.
     InvalidPort,
+    /// The host looks like an IPv4 address but is not a valid one.
     InvalidIpv4Address,
+    /// The host in brackets is not a valid IPv6 address.
     InvalidIpv6Address,
+    /// The host contains a character a domain name cannot have.
     InvalidDomainCharacter,
+    /// A relative URL was parsed without a base URL.
     RelativeUrlWithoutBase,
+    /// A relative URL was resolved against a cannot-be-a-base URL (such as
+    /// `mailto:x`).
     RelativeUrlWithCannotBeABaseBase,
+    /// A host was set on a cannot-be-a-base URL.
     SetHostOnCannotBeABaseUrl,
+    /// The URL is too long (more than 4 GB).
     Overflow,
 }
 
@@ -57,22 +118,79 @@ impl Display for ParseError {
     }
 }
 
-/// A URL's host.
+/// The host name of a URL.
+///
+/// Unlike the url crate's `Host<S>`, the domain is always a `String`.
+/// `Display` writes it as in a URL (an IPv6 address in brackets).
+///
+/// # Examples
+///
+/// ```
+/// use std::net::Ipv4Addr;
+/// use std::url::{Host, Url};
+///
+/// let u = Url::parse("http://192.168.0.1:8080/").unwrap();
+/// assert_eq(u.host(), Some(Host::Ipv4(Ipv4Addr::new(192, 168, 0, 1))));
+///
+/// let u = Url::parse("http://[::1]/").unwrap();
+/// assert_eq(u.host().unwrap().to_string(), "[::1]");
+/// ```
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Host {
+    /// A DNS domain name (lowercased in special URLs), as `.` separated
+    /// labels.
     Domain(String),
+    /// An IPv4 address.
     Ipv4(Ipv4Addr),
+    /// An IPv6 address.
     Ipv6(Ipv6Addr),
 }
 
 impl Host {
-    /// Parses a host as in a special URL (http, https, ...).
+    /// Parses a host as in a special URL (`http`, `https`, `ws`, `wss`,
+    /// `ftp`, `file`).
+    ///
+    /// The host is percent-decoded and lowercased; an IPv6 address must be
+    /// in brackets, and IPv4 addresses are accepted in the forms the URL
+    /// Standard allows (such as `0x7f.1`).
+    ///
+    /// # Errors
+    ///
+    /// Fails if the host is empty, contains a forbidden character, is not
+    /// ASCII, or is an invalid IP address.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::Ipv4Addr;
+    /// use std::url::{Host, ParseError};
+    ///
+    /// assert_eq(Host::parse("Example.COM"), Ok(Host::Domain("example.com".to_string())));
+    /// assert_eq(Host::parse("0x7f.1"), Ok(Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1))));
+    /// assert_eq(Host::parse("[::1"), Err(ParseError::InvalidIpv6Address));
+    /// ```
     pub fn parse(input: &str) -> Result<Host, ParseError> {
         parse_host(input, true)
     }
 
-    /// Parses a host as in a URL of another scheme (percent-encoded, not
-    /// lowercased).
+    /// Parses a host as in a non-special URL.
+    ///
+    /// The host is kept percent-encoded and is not lowercased, and only an
+    /// IPv6 address in brackets is taken as an IP address.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the host contains a forbidden character or an invalid IPv6
+    /// address.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Host;
+    ///
+    /// assert_eq(Host::parse_opaque("Example.COM"), Ok(Host::Domain("Example.COM".to_string())));
+    /// assert_eq(Host::parse_opaque("[::1]").unwrap().to_string(), "[::1]");
+    /// ```
     pub fn parse_opaque(input: &str) -> Result<Host, ParseError> {
         parse_host(input, false)
     }
@@ -88,29 +206,90 @@ impl Display for Host {
     }
 }
 
-/// The parts of a URL before its path.
+/// A position in a URL's serialization, for [`Url::slice`].
+///
+/// The url crate indexes a `Url` with a range of positions
+/// (`&url[Position::BeforePath..]`); navi writes
+/// `url.slice(Position::BeforePath, Position::AfterFragment)`. A part
+/// that is missing is an empty range at the place it would be; the
+/// delimiters (`://`, `@`, `:`, `?`, `#`) are between the `After` position
+/// of one part and the `Before` position of the next.
+///
+/// # Examples
+///
+/// ```
+/// use std::url::{Position, Url};
+///
+/// let u = Url::parse("https://user:pw@example.com:8080/a/b?q=1#frag").unwrap();
+/// assert_eq(u.slice(Position::BeforeScheme, Position::AfterScheme), "https");
+/// assert_eq(u.slice(Position::BeforeHost, Position::AfterPort), "example.com:8080");
+/// assert_eq(u.slice(Position::BeforePath, Position::AfterQuery), "/a/b?q=1");
+/// assert_eq(u.slice(Position::BeforeScheme, Position::AfterPath), "https://user:pw@example.com:8080/a/b");
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Position {
+    /// The start of the URL.
     BeforeScheme,
+    /// After the scheme, before its `:`.
     AfterScheme,
+    /// The start of the user name (after `://`).
     BeforeUsername,
+    /// The end of the user name.
     AfterUsername,
+    /// The start of the password (after its `:`).
     BeforePassword,
+    /// The end of the password.
     AfterPassword,
+    /// The start of the host (after the `@` of the credentials, if any).
     BeforeHost,
+    /// The end of the host.
     AfterHost,
+    /// The start of the port (after its `:`).
     BeforePort,
+    /// The end of the port.
     AfterPort,
+    /// The start of the path.
     BeforePath,
+    /// The end of the path.
     AfterPath,
+    /// The start of the query (after `?`).
     BeforeQuery,
+    /// The end of the query.
     AfterQuery,
+    /// The start of the fragment (after `#`).
     BeforeFragment,
+    /// The end of the URL.
     AfterFragment,
 }
 
-/// A parsed URL. Its parts are kept percent-encoded; as_str (and Display)
-/// is its serialization.
+/// A parsed URL record.
+///
+/// A `Url` is always absolute and valid: [`Url::parse`] normalizes its
+/// input (lowercasing the scheme and a special URL's host, removing a
+/// default port, resolving `.` and `..` path segments and percent-encoding
+/// the characters that need it), and the setters keep it so. Its parts are
+/// kept percent-encoded; [`as_str`](Url::as_str) (and `Display`) is its
+/// serialization, and two URLs are equal, ordered and hashed by it.
+///
+/// A URL is *special* if its scheme is `http`, `https`, `ws`, `wss`, `ftp`
+/// or `file` ([`is_special`](Url::is_special)); a URL like `mailto:x` or
+/// `data:...`, whose path is not a list of segments, *cannot be a base*
+/// ([`cannot_be_a_base`](Url::cannot_be_a_base)).
+///
+/// # Examples
+///
+/// ```
+/// use std::url::Url;
+///
+/// let u: Url = "HTTP://Example.com:80/a/./b/../c d".parse().unwrap();
+/// assert_eq(u.as_str(), "http://example.com/a/c%20d");
+/// assert_eq(u.to_string(), "http://example.com/a/c%20d");
+/// assert(u.is_special());
+///
+/// let m = Url::parse("mailto:joe@example.com").unwrap();
+/// assert(m.cannot_be_a_base());
+/// assert_eq(m.path(), "joe@example.com");
+/// ```
 #[derive(Clone)]
 pub struct Url {
     s: String,
@@ -153,7 +332,21 @@ fn userinfo_set() -> AsciiSet {
         .add(b'|')
 }
 
-/// The default port of a special scheme.
+/// Returns the default port of a special scheme.
+///
+/// It is 80 for `http` and `ws`, 443 for `https` and `wss`, 21 for `ftp`,
+/// and `None` for the others.
+///
+/// # Examples
+///
+/// ```
+/// use std::url::default_port;
+///
+/// assert_eq(default_port("https"), Some(443));
+/// assert_eq(default_port("ws"), Some(80));
+/// assert_eq(default_port("file"), None);
+/// assert_eq(default_port("mailto"), None);
+/// ```
 pub fn default_port(scheme: &str) -> Option<u16> {
     match scheme {
         "http" | "ws" => Some(80),
@@ -168,12 +361,52 @@ fn is_special(scheme: &str) -> bool {
 }
 
 impl Url {
-    /// Parses an absolute URL.
+    /// Parses an absolute URL from a string.
+    ///
+    /// Leading and trailing C0 control characters and spaces are removed,
+    /// and tabs and newlines inside are ignored, as the URL Standard says.
+    /// To parse a relative URL, use [`join`](Url::join) on a base URL or
+    /// [`Url::options`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the input is not an absolute URL (no scheme:
+    /// [`ParseError::RelativeUrlWithoutBase`]) or one of its parts is
+    /// invalid (an empty host, a bad port or IP address...).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::{ParseError, Url};
+    ///
+    /// let u = Url::parse("https://example.net/").unwrap();
+    /// assert_eq(u.host_str(), Some("example.net"));
+    ///
+    /// assert_eq(Url::parse("http://"), Err(ParseError::EmptyHost));
+    /// assert_eq(Url::parse("example.net"), Err(ParseError::RelativeUrlWithoutBase));
+    /// ```
     pub fn parse(input: &str) -> Result<Url, ParseError> {
         parse_url(input, None)
     }
 
-    /// Parses input and appends the pairs to its query.
+    /// Parses an absolute URL from a string and adds the key/value pairs to
+    /// its query.
+    ///
+    /// The pairs are `application/x-www-form-urlencoded`, as with
+    /// [`query_pairs_mut`](Url::query_pairs_mut).
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Url::parse`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let u = Url::parse_with_params("https://example.net?dont=clobberme", [("lang", "rust"), ("browser", "servo")]).unwrap();
+    /// assert_eq(u.as_str(), "https://example.net/?dont=clobberme&lang=rust&browser=servo");
+    /// ```
     pub fn parse_with_params<I, K, V>(input: &str, iter: I) -> Result<Url, ParseError>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -190,37 +423,168 @@ impl Url {
         Ok(u)
     }
 
-    /// Resolves input (absolute or relative) against this URL.
+    /// Parses a string as a URL, with this URL as the base URL.
+    ///
+    /// The input may be absolute (then the base is not used) or relative: a
+    /// path relative to the base's directory, an absolute path, a query or
+    /// fragment alone, or a scheme-relative `//host/path`.
+    ///
+    /// Note that a trailing slash matters: `https://example.net/a/b` joined
+    /// with `c` is `https://example.net/a/c`, while `https://example.net/a/b/`
+    /// joined with `c` is `https://example.net/a/b/c`.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Url::parse`], and with
+    /// [`ParseError::RelativeUrlWithCannotBeABaseBase`] if the input is
+    /// relative and this URL cannot be a base.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let base = Url::parse("https://example.net/a/b.html?q#f").unwrap();
+    /// assert_eq(base.join("c.png").unwrap().as_str(), "https://example.net/a/c.png");
+    /// assert_eq(base.join("../up").unwrap().as_str(), "https://example.net/up");
+    /// assert_eq(base.join("/root").unwrap().as_str(), "https://example.net/root");
+    /// assert_eq(base.join("?x=1").unwrap().as_str(), "https://example.net/a/b.html?x=1");
+    /// assert_eq(base.join("//other.org/p").unwrap().as_str(), "https://other.org/p");
+    /// assert_eq(base.join("http://abs.com/").unwrap().as_str(), "http://abs.com/");
+    /// ```
     pub fn join(&self, input: &str) -> Result<Url, ParseError> {
         parse_url(input, Some(self))
     }
 
-    /// Url::options().base_url(Some(&base)).parse(s), as the crate.
+    /// Returns the options of a parse, to set a base URL before parsing.
+    ///
+    /// `Url::options().base_url(Some(&base)).parse(s)` is `base.join(s)`;
+    /// without a base URL it is `Url::parse(s)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let base = Url::parse("https://example.net/api/").unwrap();
+    /// let u = Url::options().base_url(Some(&base)).parse("v1/items").unwrap();
+    /// assert_eq(u.as_str(), "https://example.net/api/v1/items");
+    /// ```
     pub fn options() -> ParseOptions {
         ParseOptions { base: None }
     }
 
+    /// Returns the serialization of this URL.
+    ///
+    /// This is fast, since the serialization is kept up to date.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let u = Url::parse("HTTPS://example.net:443").unwrap();
+    /// assert_eq(u.as_str(), "https://example.net/");
+    /// ```
     pub fn as_str(&self) -> &str {
         self.s.as_str()
     }
+
+    /// Returns the serialization of this URL as a `String`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let u = Url::parse("https://example.net/a").unwrap();
+    /// assert_eq(u.into_string(), "https://example.net/a".to_string());
+    /// ```
     pub fn into_string(self) -> String {
         self.s
     }
 
+    /// Returns the scheme of this URL, lowercased, without the `:`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("FILE:///tmp/foo").unwrap().scheme(), "file");
+    /// assert_eq(Url::parse("mailto:joe@example.com").unwrap().scheme(), "mailto");
+    /// ```
     pub fn scheme(&self) -> &str {
         self.scheme.as_str()
     }
+
+    /// Returns `true` if this URL cannot be a base URL.
+    ///
+    /// Such a URL (like `mailto:joe@example.com` or `data:text/plain,hi`)
+    /// has no host, and its path is not a list of segments; relative URLs
+    /// cannot be resolved against it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert(!Url::parse("ftp://rms@example.com").unwrap().cannot_be_a_base());
+    /// assert(!Url::parse("unix:/run/foo.socket").unwrap().cannot_be_a_base());
+    /// assert(Url::parse("data:text/plain,Stuff").unwrap().cannot_be_a_base());
+    /// ```
     pub fn cannot_be_a_base(&self) -> bool {
         self.opaque
     }
+
+    /// Returns `true` if the scheme is special: `http`, `https`, `ws`,
+    /// `wss`, `ftp` or `file`.
+    ///
+    /// Special URLs always have a host (but `file:` URLs may have an empty
+    /// one) and a path starting with `/`, and a backslash in them reads as
+    /// a slash.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert(Url::parse("wss://example.com").unwrap().is_special());
+    /// assert(!Url::parse("git://example.com/repo").unwrap().is_special());
+    /// ```
     pub fn is_special(&self) -> bool {
         is_special(self.scheme.as_str())
     }
 
+    /// Returns `true` if this URL has an authority: a `//` after the scheme,
+    /// with a (possibly empty) host.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert(Url::parse("ftp://rms@example.com").unwrap().has_authority());
+    /// assert(Url::parse("file:///tmp/foo").unwrap().has_authority());
+    /// assert(!Url::parse("unix:/run/foo.socket").unwrap().has_authority());
+    /// assert(!Url::parse("mailto:rms@example.com").unwrap().has_authority());
+    /// ```
     pub fn has_authority(&self) -> bool {
         self.host.is_some()
     }
-    /// "user:pass@host:port", or "" without a host.
+
+    /// Returns the authority of this URL: `user:password@host:port`, as it
+    /// is in the URL (percent-encoded), or `""` if it has none.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("ftp://rms:secret@example.com:2121/x").unwrap().authority(), "rms:secret@example.com:2121");
+    /// assert_eq(Url::parse("https://example.com:443/").unwrap().authority(), "example.com");
+    /// assert_eq(Url::parse("mailto:rms@example.com").unwrap().authority(), "");
+    /// ```
     pub fn authority(&self) -> &str {
         if self.host.is_none() {
             return "";
@@ -244,10 +608,32 @@ impl Url {
         n
     }
 
-    /// The percent-encoded user name ("" when none).
+    /// Returns the user name of this URL, percent-encoded, or `""` if it has
+    /// none.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("ftp://rms@example.com").unwrap().username(), "rms");
+    /// assert_eq(Url::parse("ftp://:secret@example.com").unwrap().username(), "");
+    /// assert_eq(Url::parse("https://example.com").unwrap().username(), "");
+    /// ```
     pub fn username(&self) -> &str {
         self.username.as_str()
     }
+
+    /// Returns the password of this URL, percent-encoded, if it has one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("ftp://rms:secret123@example.com").unwrap().password(), Some("secret123"));
+    /// assert_eq(Url::parse("ftp://rms@example.com").unwrap().password(), None);
+    /// ```
     pub fn password(&self) -> Option<&str> {
         match &self.password {
             Some(p) => Some(p.as_str()),
@@ -255,10 +641,37 @@ impl Url {
         }
     }
 
+    /// Returns `true` if this URL has a host (possibly empty, as in
+    /// `file:///tmp`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert(Url::parse("ftp://rms@example.com").unwrap().has_host());
+    /// assert(!Url::parse("unix:/run/foo.socket").unwrap().has_host());
+    /// assert(!Url::parse("data:text/plain,Stuff").unwrap().has_host());
+    /// ```
     pub fn has_host(&self) -> bool {
         self.host.is_some()
     }
-    /// The host as written in the URL (IPv6 addresses in brackets).
+
+    /// Returns the host of this URL as it is written in it: a domain
+    /// (percent-encoded in a non-special URL), an IPv4 address, or an IPv6
+    /// address in brackets.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("https://127.0.0.1/index.html").unwrap().host_str(), Some("127.0.0.1"));
+    /// assert_eq(Url::parse("http://[::1]:8080/").unwrap().host_str(), Some("[::1]"));
+    /// assert_eq(Url::parse("ftp://rms@example.com").unwrap().host_str(), Some("example.com"));
+    /// assert_eq(Url::parse("file:///tmp").unwrap().host_str(), Some(""));
+    /// assert_eq(Url::parse("unix:/run/foo.socket").unwrap().host_str(), None);
+    /// ```
     pub fn host_str(&self) -> Option<&str> {
         if self.host.is_none() {
             return None;
@@ -285,11 +698,41 @@ impl Url {
         }
     }
 
+    /// Returns the parsed host of this URL, if it has one.
+    ///
+    /// Unlike the url crate, which returns `Option<Host<&str>>`, this
+    /// returns a copy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::Ipv4Addr;
+    /// use std::url::{Host, Url};
+    ///
+    /// let u = Url::parse("https://127.0.0.1/index.html").unwrap();
+    /// assert_eq(u.host(), Some(Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1))));
+    ///
+    /// let u = Url::parse("https://Example.com/").unwrap();
+    /// assert_eq(u.host(), Some(Host::Domain("example.com".to_string())));
+    ///
+    /// assert_eq(Url::parse("data:text/plain,Stuff").unwrap().host(), None);
+    /// ```
     pub fn host(&self) -> Option<Host> {
         self.host.clone()
     }
 
-    /// The host if it is a domain name.
+    /// Returns the host of this URL if it is a domain name (not an IP
+    /// address).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("https://example.com/").unwrap().domain(), Some("example.com"));
+    /// assert_eq(Url::parse("https://127.0.0.1/").unwrap().domain(), None);
+    /// assert_eq(Url::parse("mailto:rms@example.net").unwrap().domain(), None);
+    /// ```
     pub fn domain(&self) -> Option<&str> {
         match &self.host {
             Some(Host::Domain(_)) => self.host_str(),
@@ -297,10 +740,34 @@ impl Url {
         }
     }
 
-    /// The port if it is not the scheme's default.
+    /// Returns the port of this URL, unless it is missing or is the default
+    /// port of the scheme (see [`default_port`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("https://example.com").unwrap().port(), None);
+    /// assert_eq(Url::parse("https://example.com:443/").unwrap().port(), None);
+    /// assert_eq(Url::parse("ssh://example.com:22").unwrap().port(), Some(22));
+    /// ```
     pub fn port(&self) -> Option<u16> {
         self.port
     }
+
+    /// Returns the port of this URL, or the default port of its scheme if
+    /// it has none.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("foo://example.com").unwrap().port_or_known_default(), None);
+    /// assert_eq(Url::parse("foo://example.com:1456").unwrap().port_or_known_default(), Some(1456));
+    /// assert_eq(Url::parse("https://example.com").unwrap().port_or_known_default(), Some(443));
+    /// ```
     pub fn port_or_known_default(&self) -> Option<u16> {
         match self.port {
             Some(p) => Some(p),
@@ -308,7 +775,31 @@ impl Url {
         }
     }
 
-    /// The host's addresses with the port (or default_port()'s).
+    /// Resolves the host of this URL to socket addresses.
+    ///
+    /// The port is the URL's, else the default port of its scheme, else
+    /// what `default_port` returns. An IP address is used as it is; a
+    /// domain is looked up (which may block).
+    ///
+    /// # Errors
+    ///
+    /// Fails with an [`io::ErrorKind::InvalidInput`](crate::io::ErrorKind)
+    /// error if the URL has no host or no port can be found, or with the
+    /// error of the name lookup.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let u = Url::parse("http://127.0.0.1/").unwrap();
+    /// let addrs = u.socket_addrs(|| None).unwrap();
+    /// assert_eq(addrs[0].to_string(), "127.0.0.1:80");
+    ///
+    /// let u = Url::parse("myproto://[::1]/").unwrap();
+    /// assert(u.socket_addrs(|| None).is_err());
+    /// assert_eq(u.socket_addrs(|| Some(7000)).unwrap()[0].to_string(), "[::1]:7000");
+    /// ```
     pub fn socket_addrs(
         &self,
         default_port: fn() -> Option<u16>,
@@ -350,12 +841,43 @@ impl Url {
         Ok(v)
     }
 
-    /// The percent-encoded path ("/" at least in special URLs).
+    /// Returns the path of this URL, percent-encoded.
+    ///
+    /// The path of a special URL starts with `/` (and is at least `/`); a
+    /// URL that cannot be a base has an opaque path; other URLs may have an
+    /// empty path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("https://example.com/countries/việt nam").unwrap().path(), "/countries/vi%E1%BB%87t%20nam");
+    /// assert_eq(Url::parse("https://example.com").unwrap().path(), "/");
+    /// assert_eq(Url::parse("mailto:rms@example.net").unwrap().path(), "rms@example.net");
+    /// ```
     pub fn path(&self) -> &str {
         self.path.as_str()
     }
 
-    /// The path's segments (None for a cannot-be-a-base URL).
+    /// Returns an iterator over the `/`-separated segments of the path, if
+    /// this URL can be a base.
+    ///
+    /// The segments are percent-encoded. A path ending with `/` has an empty
+    /// last segment. Returns `None` for a URL that cannot be a base (or
+    /// whose path does not start with `/`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let u = Url::parse("https://example.com/foo/bar/").unwrap();
+    /// let segs: Vec<&str> = u.path_segments().unwrap().collect();
+    /// assert_eq(segs, Vec::from(["foo", "bar", ""]));
+    ///
+    /// assert(Url::parse("data:text/plain,HelloWorld").unwrap().path_segments().is_none());
+    /// ```
     pub fn path_segments(&self) -> Option<crate::str::Split<char>> {
         if self.opaque || !self.path.starts_with("/") {
             return None;
@@ -363,6 +885,19 @@ impl Url {
         Some(self.path[1..].split('/'))
     }
 
+    /// Returns the query of this URL (after `?`), percent-encoded, if it has
+    /// one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("https://example.com/products?page=2").unwrap().query(), Some("page=2"));
+    /// assert_eq(Url::parse("https://example.com/products?").unwrap().query(), Some(""));
+    /// assert_eq(Url::parse("https://example.com/products").unwrap().query(), None);
+    /// assert_eq(Url::parse("https://example.com/?country=español").unwrap().query(), Some("country=espa%C3%B1ol"));
+    /// ```
     pub fn query(&self) -> Option<&str> {
         match &self.query {
             Some(q) => Some(q.as_str()),
@@ -370,7 +905,24 @@ impl Url {
         }
     }
 
-    /// The query's name/value pairs, decoded.
+    /// Parses the query as `application/x-www-form-urlencoded` and returns an
+    /// iterator over its decoded name/value pairs.
+    ///
+    /// The pairs are `(String, String)` (the url crate's are
+    /// `(Cow<str>, Cow<str>)`). A URL without a query has no pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let u = Url::parse("https://example.com/products?page=2&sort=desc&q=a+b%21").unwrap();
+    /// let mut pairs = u.query_pairs();
+    /// assert_eq(pairs.next(), Some(("page".to_string(), "2".to_string())));
+    /// assert_eq(pairs.next(), Some(("sort".to_string(), "desc".to_string())));
+    /// assert_eq(pairs.next(), Some(("q".to_string(), "a b!".to_string())));
+    /// assert_eq(pairs.next(), None);
+    /// ```
     pub fn query_pairs(&self) -> form_urlencoded::Parse {
         match &self.query {
             Some(q) => form_urlencoded::parse(q.as_bytes()),
@@ -378,6 +930,18 @@ impl Url {
         }
     }
 
+    /// Returns the fragment of this URL (after `#`), percent-encoded, if it
+    /// has one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("https://example.com/data.csv#row=4").unwrap().fragment(), Some("row=4"));
+    /// assert_eq(Url::parse("https://example.com/data.csv#cell=4,1-6,2").unwrap().fragment(), Some("cell=4,1-6,2"));
+    /// assert_eq(Url::parse("https://example.com/data.csv").unwrap().fragment(), None);
+    /// ```
     pub fn fragment(&self) -> Option<&str> {
         match &self.fragment {
             Some(q) => Some(q.as_str()),
@@ -385,7 +949,24 @@ impl Url {
         }
     }
 
-    /// A serializer appending to the query (each call updates the URL).
+    /// Returns a serializer that appends name/value pairs to the query of
+    /// this URL.
+    ///
+    /// The pairs are `application/x-www-form-urlencoded`. Unlike the url
+    /// crate, where the URL is updated when the serializer is dropped, each
+    /// call (such as [`append_pair`](form_urlencoded::Serializer::append_pair))
+    /// updates the URL at once.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("https://example.net?lang=fr#nav").unwrap();
+    /// u.query_pairs_mut().clear().append_pair("foo", "bar & baz").append_pair("saisons", "Été+hiver");
+    /// assert_eq(u.query(), Some("foo=bar+%26+baz&saisons=%C3%89t%C3%A9%2Bhiver"));
+    /// assert_eq(u.as_str(), "https://example.net/?foo=bar+%26+baz&saisons=%C3%89t%C3%A9%2Bhiver#nav");
+    /// ```
     pub fn query_pairs_mut(&mut self) -> form_urlencoded::Serializer {
         let start = match &self.query {
             Some(q) => q.clone(),
@@ -402,6 +983,23 @@ impl Url {
         self.serialize();
     }
 
+    /// Changes the fragment of this URL; `None` removes it.
+    ///
+    /// The characters that cannot be in a fragment are percent-encoded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("https://example.com/data.csv").unwrap();
+    /// u.set_fragment(Some("cell=4,1-6,2"));
+    /// assert_eq(u.as_str(), "https://example.com/data.csv#cell=4,1-6,2");
+    /// u.set_fragment(Some("a b"));
+    /// assert_eq(u.fragment(), Some("a%20b"));
+    /// u.set_fragment(None);
+    /// assert_eq(u.as_str(), "https://example.com/data.csv");
+    /// ```
     pub fn set_fragment(&mut self, fragment: Option<&str>) {
         self.fragment = match fragment {
             Some(f) => Some(encode(f, fragment_set())),
@@ -410,6 +1008,25 @@ impl Url {
         self.serialize();
     }
 
+    /// Changes the query of this URL; `None` removes it.
+    ///
+    /// The characters that cannot be in a query are percent-encoded (in a
+    /// special URL, `'` too). To build a query from pairs, use
+    /// [`query_pairs_mut`](Url::query_pairs_mut).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("https://example.com/products").unwrap();
+    /// u.set_query(Some("page=2"));
+    /// assert_eq(u.as_str(), "https://example.com/products?page=2");
+    /// u.set_query(Some("q=a b"));
+    /// assert_eq(u.query(), Some("q=a%20b"));
+    /// u.set_query(None);
+    /// assert_eq(u.query(), None);
+    /// ```
     pub fn set_query(&mut self, query: Option<&str>) {
         let set = if self.is_special() {
             special_query_set()
@@ -423,6 +1040,25 @@ impl Url {
         self.serialize();
     }
 
+    /// Changes the path of this URL.
+    ///
+    /// The characters that cannot be in a path are percent-encoded, `.` and
+    /// `..` segments are resolved, and a special URL's path gets a leading
+    /// `/`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("https://example.com").unwrap();
+    /// u.set_path("api/comments");
+    /// assert_eq(u.as_str(), "https://example.com/api/comments");
+    /// u.set_path("/data/report 1.csv");
+    /// assert_eq(u.path(), "/data/report%201.csv");
+    /// u.set_path("/a/../b/./c");
+    /// assert_eq(u.path(), "/b/c");
+    /// ```
     pub fn set_path(&mut self, path: &str) {
         if self.opaque {
             self.path = encode(path, CONTROLS);
@@ -442,7 +1078,33 @@ impl Url {
         self.serialize();
     }
 
-    /// Changes the port (Err for a URL without a host or a file URL).
+    /// Changes the port of this URL; `None` removes it.
+    ///
+    /// Setting the default port of the scheme removes the port, as parsing
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Fails, leaving the URL unchanged, if it has no host or an empty host,
+    /// or if it is a `file:` URL.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("ssh://example.net:2048/").unwrap();
+    /// u.set_port(Some(4096)).unwrap();
+    /// assert_eq(u.as_str(), "ssh://example.net:4096/");
+    /// u.set_port(None).unwrap();
+    /// assert_eq(u.as_str(), "ssh://example.net/");
+    ///
+    /// let mut h = Url::parse("https://example.org/").unwrap();
+    /// h.set_port(Some(443)).unwrap();
+    /// assert_eq(h.port(), None);
+    ///
+    /// assert(Url::parse("mailto:rms@example.net").unwrap().set_port(Some(80)).is_err());
+    /// ```
     pub fn set_port(&mut self, port: Option<u16>) -> Result<(), ()> {
         if self.host.is_none() || self.scheme == "file" {
             return Err(());
@@ -466,7 +1128,34 @@ impl Url {
         Ok(())
     }
 
-    /// Changes the host (None removes it, for non-special URLs).
+    /// Changes the host of this URL; `None` removes it (with the user name,
+    /// password and port), which only a non-special URL allows.
+    ///
+    /// The host is parsed as by [`Host::parse`] (in a special URL) or
+    /// [`Host::parse_opaque`].
+    ///
+    /// # Errors
+    ///
+    /// Fails, leaving the URL unchanged, if the URL cannot be a base
+    /// ([`ParseError::SetHostOnCannotBeABaseUrl`]), if the host is removed
+    /// or empty in a special URL other than `file:`
+    /// ([`ParseError::EmptyHost`]), or if the host is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::{ParseError, Url};
+    ///
+    /// let mut u = Url::parse("https://example.net").unwrap();
+    /// u.set_host(Some("rust-lang.org")).unwrap();
+    /// assert_eq(u.as_str(), "https://rust-lang.org/");
+    ///
+    /// assert_eq(u.set_host(None), Err(ParseError::EmptyHost));
+    ///
+    /// let mut f = Url::parse("foo://example.net/x").unwrap();
+    /// f.set_host(None).unwrap();
+    /// assert_eq(f.as_str(), "foo:/x");
+    /// ```
     pub fn set_host(&mut self, host: Option<&str>) -> Result<(), ParseError> {
         if self.opaque {
             return Err(ParseError::SetHostOnCannotBeABaseUrl);
@@ -497,6 +1186,25 @@ impl Url {
         Ok(())
     }
 
+    /// Changes the host of this URL to an IP address.
+    ///
+    /// # Errors
+    ///
+    /// Fails, leaving the URL unchanged, if the URL cannot be a base.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::{IpAddr, Ipv4Addr};
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("http://example.com/path").unwrap();
+    /// u.set_ip_host(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).unwrap();
+    /// assert_eq(u.as_str(), "http://127.0.0.1/path");
+    ///
+    /// let mut m = Url::parse("mailto:rms@example.com").unwrap();
+    /// assert(m.set_ip_host(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).is_err());
+    /// ```
     pub fn set_ip_host(&mut self, address: crate::net::IpAddr) -> Result<(), ()> {
         if self.opaque {
             return Err(());
@@ -509,6 +1217,28 @@ impl Url {
         Ok(())
     }
 
+    /// Changes the user name of this URL.
+    ///
+    /// The characters that cannot be in the user info are percent-encoded;
+    /// an empty user name removes it (unless there is a password).
+    ///
+    /// # Errors
+    ///
+    /// Fails, leaving the URL unchanged, if the URL has no host or an empty
+    /// host, or is a `file:` URL.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("ftp://:secret@example.com/").unwrap();
+    /// u.set_username("user1").unwrap();
+    /// assert_eq(u.as_str(), "ftp://user1:secret@example.com/");
+    ///
+    /// let mut m = Url::parse("mailto:rmz@example.com").unwrap();
+    /// assert(m.set_username("user1").is_err());
+    /// ```
     pub fn set_username(&mut self, username: &str) -> Result<(), ()> {
         if !self.can_have_credentials() {
             return Err(());
@@ -518,6 +1248,29 @@ impl Url {
         Ok(())
     }
 
+    /// Changes the password of this URL; `None` or an empty password
+    /// removes it.
+    ///
+    /// The characters that cannot be in the user info are percent-encoded.
+    ///
+    /// # Errors
+    ///
+    /// Fails, leaving the URL unchanged, if the URL has no host or an empty
+    /// host, or is a `file:` URL.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("ftp://user1@example.com/").unwrap();
+    /// u.set_password(Some("secret password")).unwrap();
+    /// assert_eq(u.as_str(), "ftp://user1:secret%20password@example.com/");
+    /// u.set_password(None).unwrap();
+    /// assert_eq(u.as_str(), "ftp://user1@example.com/");
+    ///
+    /// assert(Url::parse("mailto:rms@example.com").unwrap().set_password(Some("x")).is_err());
+    /// ```
     pub fn set_password(&mut self, password: Option<&str>) -> Result<(), ()> {
         if !self.can_have_credentials() {
             return Err(());
@@ -544,7 +1297,32 @@ impl Url {
         }
     }
 
-    /// Changes the scheme (not between special and non-special ones).
+    /// Changes the scheme of this URL.
+    ///
+    /// The new scheme is lowercased; a port that becomes the default port of
+    /// the new scheme is removed.
+    ///
+    /// # Errors
+    ///
+    /// Fails, leaving the URL unchanged, if the scheme is not valid (a
+    /// letter followed by letters, digits, `+`, `-` or `.`), if it would
+    /// change a special URL into a non-special one or the other way around,
+    /// or if it would make a `file:` URL with credentials or a port.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let mut u = Url::parse("http://example.net:443/").unwrap();
+    /// u.set_scheme("HTTPS").unwrap();
+    /// assert_eq(u.as_str(), "https://example.net/");
+    ///
+    /// // Not between special and non-special schemes.
+    /// assert(u.set_scheme("foo").is_err());
+    /// assert(u.set_scheme("1http").is_err());
+    /// assert_eq(u.scheme(), "https");
+    /// ```
     pub fn set_scheme(&mut self, scheme: &str) -> Result<(), ()> {
         let b = scheme.as_bytes();
         if b.len() == 0 || !b[0].is_ascii_alphabetic() {
@@ -572,7 +1350,28 @@ impl Url {
         Ok(())
     }
 
-    /// The URL's ASCII origin ("null" for opaque origins).
+    /// Returns the origin of this URL, as the URL Standard defines it.
+    ///
+    /// The origin of a URL with a special scheme other than `file:` is its
+    /// scheme, host and port (a tuple origin); a `blob:` URL has the origin
+    /// of the `http(s):` URL in its path; the others have an opaque origin.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let o = Url::parse("https://example.com:443/index.html").unwrap().origin();
+    /// assert(o.is_tuple());
+    /// assert_eq(o.ascii_serialization(), "https://example.com");
+    ///
+    /// let b = Url::parse("blob:https://example.com:8080/uuid").unwrap().origin();
+    /// assert_eq(b.ascii_serialization(), "https://example.com:8080");
+    ///
+    /// let f = Url::parse("file:///tmp/foo").unwrap().origin();
+    /// assert(!f.is_tuple());
+    /// assert_eq(f.ascii_serialization(), "null");
+    /// ```
     pub fn origin(&self) -> Origin {
         let s = self.scheme.as_str();
         if default_port(s).is_some() {
@@ -600,8 +1399,25 @@ impl Url {
         }
     }
 
-    /// The serialization up to or from a part (url[..Position::AfterPath]
-    /// in the crate).
+    /// Returns the part of the serialization between two [`Position`]s.
+    ///
+    /// This is the url crate's `&url[from..to]` (navi cannot index with a
+    /// range of a custom type).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from` is after `to`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::{Position, Url};
+    ///
+    /// let u = Url::parse("https://example.com/a/b?q=1#top").unwrap();
+    /// assert_eq(u.slice(Position::BeforeScheme, Position::AfterPath), "https://example.com/a/b");
+    /// assert_eq(u.slice(Position::BeforePath, Position::AfterFragment), "/a/b?q=1#top");
+    /// assert_eq(u.slice(Position::BeforeQuery, Position::AfterQuery), "q=1");
+    /// ```
     pub fn slice(&self, from: Position, to: Position) -> &str {
         &self.s[self.index(from)..self.index(to)]
     }
@@ -710,13 +1526,36 @@ impl Url {
     }
 }
 
-/// Url::options(): parsing relative to a base.
+/// Options for parsing a URL, made by [`Url::options`].
+///
+/// # Examples
+///
+/// ```
+/// use std::url::Url;
+///
+/// let base = Url::parse("https://example.org/docs/").unwrap();
+/// let opts = Url::options().base_url(Some(&base));
+/// assert_eq(opts.parse("intro.html").unwrap().as_str(), "https://example.org/docs/intro.html");
+/// assert_eq(opts.parse("https://other.org/").unwrap().as_str(), "https://other.org/");
+/// ```
 #[derive(Clone)]
 pub struct ParseOptions {
     base: Option<Url>,
 }
 
 impl ParseOptions {
+    /// Returns these options with a base URL to resolve relative URLs
+    /// against (`None`: no base URL).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::{ParseError, Url};
+    ///
+    /// let base = Url::parse("https://example.org/a/").unwrap();
+    /// assert_eq(Url::options().base_url(Some(&base)).parse("b").unwrap().as_str(), "https://example.org/a/b");
+    /// assert_eq(Url::options().base_url(None).parse("b"), Err(ParseError::RelativeUrlWithoutBase));
+    /// ```
     pub fn base_url(&self, base: Option<&Url>) -> ParseOptions {
         ParseOptions {
             base: match base {
@@ -726,6 +1565,22 @@ impl ParseOptions {
         }
     }
 
+    /// Parses a URL with these options: as [`Url::join`] on the base URL,
+    /// or as [`Url::parse`] without one.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Url::join`] or [`Url::parse`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// let base = Url::parse("https://example.org/a/b").unwrap();
+    /// let u = Url::options().base_url(Some(&base)).parse("../c?x").unwrap();
+    /// assert_eq(u.as_str(), "https://example.org/c?x");
+    /// ```
     pub fn parse(&self, input: &str) -> Result<Url, ParseError> {
         match &self.base {
             Some(b) => parse_url(input, Some(b)),
@@ -734,7 +1589,23 @@ impl ParseOptions {
     }
 }
 
-/// A URL's origin: scheme, host and port, or opaque.
+/// The origin of a URL, as [`Url::origin`] returns it.
+///
+/// An origin is either a tuple of a scheme, a host and a port, or opaque.
+/// Two tuple origins are equal when their parts are; opaque origins are
+/// all equal to each other here (the URL Standard makes each one unique).
+///
+/// # Examples
+///
+/// ```
+/// use std::url::Url;
+///
+/// let a = Url::parse("https://example.com/a").unwrap().origin();
+/// let b = Url::parse("https://example.com:443/b?x").unwrap().origin();
+/// let c = Url::parse("http://example.com/").unwrap().origin();
+/// assert_eq(a, b);
+/// assert_ne(a, c);
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Origin {
     tuple: bool,
@@ -744,10 +1615,33 @@ pub struct Origin {
 }
 
 impl Origin {
+    /// Returns `true` if this is a tuple origin (scheme, host and port), not
+    /// an opaque one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert(Url::parse("wss://example.com/chat").unwrap().origin().is_tuple());
+    /// assert(!Url::parse("data:text/plain,hi").unwrap().origin().is_tuple());
+    /// ```
     pub fn is_tuple(&self) -> bool {
         self.tuple
     }
-    /// "scheme://host[:port]", or "null".
+
+    /// Returns the ASCII serialization of this origin:
+    /// `scheme://host[:port]` (the port only if it is not the scheme's
+    /// default), or `null` for an opaque origin.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::url::Url;
+    ///
+    /// assert_eq(Url::parse("http://example.com:8080/x").unwrap().origin().ascii_serialization(), "http://example.com:8080");
+    /// assert_eq(Url::parse("mailto:x@example.com").unwrap().origin().ascii_serialization(), "null");
+    /// ```
     pub fn ascii_serialization(&self) -> String {
         if !self.tuple {
             return "null".to_string();

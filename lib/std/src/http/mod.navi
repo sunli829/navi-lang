@@ -1,24 +1,84 @@
-//! HTTP/1.1 and HTTP/2 client and server (as Go's net/http; the types
-//! follow Rust's http crate, the client reqwest::blocking, the router Go's
-//! ServeMux). HTTP/2 is spoken over TLS when both sides offer it by ALPN,
-//! and without TLS by prior knowledge (`Protocols`,
-//! `ClientBuilder::http2_prior_knowledge`); the API is the same.
-//! Connections are blocking calls on green threads: the server runs each
-//! connection on its own thread. The client speaks https over std::tls
-//! (TLS 1.3 and 1.2; the server certificate checked against the system's roots,
-//! `ClientBuilder::add_root_certificate` adds others); the server too
-//! (`Server::tls`, `serve_tls` as Go's ListenAndServeTLS).
+//! HTTP/1.1 and HTTP/2 clients and servers.
 //!
-//!     let body = http::get("http://example.com/")?.text()?;
+//! This module is navi's counterpart of Go's `net/http`, with an API taken
+//! from the Rust crates people use: the message types ([`Request`],
+//! [`Response`], [`Method`], [`StatusCode`], [`HeaderMap`], [`Version`])
+//! follow the `http` crate, the client ([`Client`], [`ClientBuilder`],
+//! [`RequestBuilder`]) follows `reqwest::blocking`, and the [`Router`]
+//! matches patterns as Go 1.22's `ServeMux` does.
 //!
-//!     let resp = Client::new().post("http://localhost:8080/api")
-//!         .with_header("Content-Type", "application/json")
-//!         .body(r#"{"a": 1}"#)
-//!         .send()?;
+//! All calls are blocking. Since navi's threads are green threads, this is
+//! cheap: a [`Server`] runs each connection on a thread of its own, and a
+//! program that wants many requests in flight spawns a thread for each.
 //!
-//!     let mut r = Router::new();
-//!     r.route("GET /users/{id}", |req| Response::from_string(`user ${req.path_value("id").unwrap()}`));
-//!     http::serve("127.0.0.1:8080", |req| r.handle(req))?;
+//! # Clients
+//!
+//! [`get`] and [`post`] send one request with a new [`Client`]. A client
+//! made once and reused keeps its connections open between requests (a
+//! connection goes back to the client's pool once a response's body has
+//! been read to the end); [`Client::builder`] sets timeouts, default
+//! headers, redirects and TLS options.
+//!
+//! ```no_run
+//! # fn main() -> Result<(), std::http::Error> {
+//! let body = std::http::get("https://www.rust-lang.org")?.text()?;
+//! println(`body = ${body}`);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Servers
+//!
+//! A server handler is a function `fn(&mut Request) -> Response`, called
+//! on the connection's thread. [`serve`] listens on an address and answers
+//! every request with a handler (as Go's `http.ListenAndServe`); a
+//! [`Server`] made with [`Server::bind`] can also be configured, asked for
+//! the address it listens on, and closed. A [`Router`] picks a handler by
+//! the request's method and path.
+//!
+//! # Examples
+//!
+//! A server on a free port of 127.0.0.1, serving a [`Router`] on a thread
+//! of its own, and a client fetching a page from it:
+//!
+//! ```
+//! use std::http::{Client, Response, Router, Server};
+//!
+//! let mut router = Router::new();
+//! router.route("GET /hello/{name}", |req| {
+//!     Response::from_string(`hello, ${req.path_value("name").unwrap()}`.to_string())
+//! });
+//!
+//! // Port 0: the system picks a free port; local_addr tells which.
+//! let server = Server::bind("127.0.0.1:0").unwrap();
+//! let addr = server.local_addr();
+//! let srv = server.clone();
+//! let handle = std::thread::spawn(|| srv.serve(|req| router.handle(req)));
+//!
+//! let resp = Client::new().get(`http://${addr}/hello/navi`.to_string()).send().unwrap();
+//! assert_eq(resp.status().as_u16(), 200);
+//! assert_eq(resp.header("content-type"), Some("text/plain; charset=utf-8"));
+//! assert_eq(resp.text().unwrap(), "hello, navi");
+//!
+//! // serve returns once the server is closed.
+//! server.close();
+//! handle.join().unwrap().unwrap();
+//! ```
+//!
+//! # HTTP/2 and TLS
+//!
+//! The client speaks https over [`crate::tls`] (TLS 1.3 and 1.2), checking
+//! the server's certificate against the system's roots
+//! ([`ClientBuilder::add_root_certificate`] adds others); a server speaks
+//! https with [`Server::tls`] or [`serve_tls`] (as Go's
+//! `ListenAndServeTLS`).
+//!
+//! HTTP/2 is chosen over TLS when both sides offer it by ALPN, as Go and
+//! reqwest do. Without TLS it is spoken by prior knowledge only: a server
+//! needs [`Protocols::set_unencrypted_http2`] and a client
+//! [`ClientBuilder::http2_prior_knowledge`]. The API is the same for both
+//! versions; [`Request::version`] and [`Response::version`] tell which one
+//! carried a message.
 
 mod client;
 mod h2;
@@ -38,24 +98,76 @@ use crate::net::SocketAddr;
 use crate::str::FromStr;
 use crate::url::Url;
 
-/// A request method.
+/// The request method (verb) of an HTTP request.
+///
+/// The standard methods are associated constants ([`Method::GET`],
+/// [`Method::POST`], ...); others (extension methods) are made with
+/// [`Method::from_bytes`] or by parsing a string. Method names are case
+/// sensitive: `"get"` is a method of its own, not `GET`.
+///
+/// Unlike the `http` crate's, a `Method` is not `Copy`; it is a small
+/// value, cloned when assigned.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::Method;
+///
+/// assert_eq(Method::GET.as_str(), "GET");
+/// assert(Method::GET.is_safe());
+/// assert(!Method::POST.is_idempotent());
+///
+/// let m: Method = "PURGE".parse().unwrap();
+/// assert_eq(m.to_string(), "PURGE");
+/// assert_ne(m, Method::GET);
+/// ```
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Method {
     s: &str,
 }
 
 impl Method {
+    /// The `GET` method: asks for a representation of the resource.
     pub const GET: Method = Method { s: "GET" };
+    /// The `POST` method: sends data for the resource to process.
     pub const POST: Method = Method { s: "POST" };
+    /// The `PUT` method: replaces the resource with the request's body.
     pub const PUT: Method = Method { s: "PUT" };
+    /// The `DELETE` method: deletes the resource.
     pub const DELETE: Method = Method { s: "DELETE" };
+    /// The `HEAD` method: as `GET`, but the response has no body.
     pub const HEAD: Method = Method { s: "HEAD" };
+    /// The `OPTIONS` method: asks which communication options the
+    /// resource has.
     pub const OPTIONS: Method = Method { s: "OPTIONS" };
+    /// The `CONNECT` method: asks for a tunnel to the server.
     pub const CONNECT: Method = Method { s: "CONNECT" };
+    /// The `PATCH` method: changes part of the resource.
     pub const PATCH: Method = Method { s: "PATCH" };
+    /// The `TRACE` method: asks the server to echo the request back.
     pub const TRACE: Method = Method { s: "TRACE" };
 
-    /// A method from its name (a token: letters, digits and !#$%&'*+-.^_`|~).
+    /// Converts a method name to a `Method`.
+    ///
+    /// The name must be an HTTP token: a non-empty sequence of ASCII
+    /// letters, digits and ``!#$%&'*+-.^_`|~``. The standard names give the
+    /// same values as the constants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidMethod`] if `b` is empty or has a byte that is not
+    /// allowed in a token.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Method;
+    ///
+    /// assert_eq(Method::from_bytes(b"GET").unwrap(), Method::GET);
+    /// assert_eq(Method::from_bytes(b"PROPFIND").unwrap().as_str(), "PROPFIND");
+    /// assert(Method::from_bytes(b"").is_err());
+    /// assert(Method::from_bytes(b"GET /").is_err());
+    /// ```
     pub fn from_bytes(b: &[u8]) -> Result<Method, InvalidMethod> {
         if b.len() == 0 {
             return Err(InvalidMethod {});
@@ -69,11 +181,33 @@ impl Method {
         Ok(Method { s: name.as_str() })
     }
 
+    /// Returns the method's name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Method;
+    ///
+    /// assert_eq(Method::DELETE.as_str(), "DELETE");
+    /// ```
     pub fn as_str(&self) -> &str {
         self.s
     }
 
-    /// Whether requests with it change nothing (GET, HEAD, OPTIONS, TRACE).
+    /// Returns `true` if the method is safe: a request with it is not
+    /// meant to change anything on the server.
+    ///
+    /// The safe methods are `GET`, `HEAD`, `OPTIONS` and `TRACE`
+    /// (RFC 9110, section 9.2.1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Method;
+    ///
+    /// assert(Method::HEAD.is_safe());
+    /// assert(!Method::PUT.is_safe());
+    /// ```
     pub fn is_safe(&self) -> bool {
         match self.s {
             "GET" | "HEAD" | "OPTIONS" | "TRACE" => true,
@@ -81,6 +215,22 @@ impl Method {
         }
     }
 
+    /// Returns `true` if the method is idempotent: sending a request with
+    /// it twice has the same effect as sending it once.
+    ///
+    /// The idempotent methods are the safe ones (see [`Method::is_safe`])
+    /// and `PUT` and `DELETE` (RFC 9110, section 9.2.2).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Method;
+    ///
+    /// assert(Method::GET.is_idempotent());
+    /// assert(Method::PUT.is_idempotent());
+    /// assert(!Method::POST.is_idempotent());
+    /// assert(!Method::PATCH.is_idempotent());
+    /// ```
     pub fn is_idempotent(&self) -> bool {
         self.is_safe() || self.s == "PUT" || self.s == "DELETE"
     }
@@ -111,7 +261,19 @@ impl Default for Method {
     }
 }
 
-/// Method::from_bytes's error.
+/// The error returned when a method name is not valid.
+///
+/// Returned by [`Method::from_bytes`] and by parsing a [`Method`] from a
+/// string.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::Method;
+///
+/// let err = "BAD METHOD".parse::<Method>().unwrap_err();
+/// assert_eq(err.to_string(), "invalid HTTP method");
+/// ```
 #[derive(Clone, Debug)]
 pub struct InvalidMethod {}
 
@@ -130,48 +292,148 @@ pub(crate) fn is_token(c: u8) -> bool {
         }
 }
 
-/// A response status code (100 to 999).
+/// An HTTP response status code.
+///
+/// A status code is a number from 100 to 999; the standard ones are
+/// associated constants ([`StatusCode::OK`], [`StatusCode::NOT_FOUND`],
+/// ...) and others are made with [`StatusCode::from_u16`]. Its first
+/// digit gives its class, tested by [`StatusCode::is_success`] and the
+/// like.
+///
+/// Displayed, a status code shows its number and its reason phrase
+/// (`"404 Not Found"`); debug-formatted, only its number.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::StatusCode;
+///
+/// let s = StatusCode::NOT_FOUND;
+/// assert_eq(s.as_u16(), 404);
+/// assert(s.is_client_error());
+/// assert_eq(s.canonical_reason(), Some("Not Found"));
+/// assert_eq(s.to_string(), "404 Not Found");
+/// assert_eq(StatusCode::from_u16(404).unwrap(), s);
+/// ```
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StatusCode(u16);
 
 impl StatusCode {
+    /// `100 Continue`: the client may go on and send the request's body.
     pub const CONTINUE: StatusCode = StatusCode(100);
+    /// `101 Switching Protocols`: the server switches to the protocol the
+    /// request's `Upgrade` header asked for.
     pub const SWITCHING_PROTOCOLS: StatusCode = StatusCode(101);
+    /// `200 OK`: the request succeeded.
     pub const OK: StatusCode = StatusCode(200);
+    /// `201 Created`: the request succeeded and made a new resource.
     pub const CREATED: StatusCode = StatusCode(201);
+    /// `202 Accepted`: the request was accepted but has not been acted on yet.
     pub const ACCEPTED: StatusCode = StatusCode(202);
+    /// `204 No Content`: the request succeeded and the response has no body.
     pub const NO_CONTENT: StatusCode = StatusCode(204);
+    /// `206 Partial Content`: the body is the part of the resource the
+    /// request's `Range` header asked for.
     pub const PARTIAL_CONTENT: StatusCode = StatusCode(206);
+    /// `301 Moved Permanently`: the resource is now at the URL in the
+    /// `Location` header.
     pub const MOVED_PERMANENTLY: StatusCode = StatusCode(301);
+    /// `302 Found`: the resource is for now at the URL in the `Location`
+    /// header.
     pub const FOUND: StatusCode = StatusCode(302);
+    /// `303 See Other`: the answer is at the URL in the `Location` header, to
+    /// be fetched with `GET`.
     pub const SEE_OTHER: StatusCode = StatusCode(303);
+    /// `304 Not Modified`: the copy the client has (from a conditional request)
+    /// is still good.
     pub const NOT_MODIFIED: StatusCode = StatusCode(304);
+    /// `307 Temporary Redirect`: the same request should be sent again to the
+    /// URL in the `Location` header.
     pub const TEMPORARY_REDIRECT: StatusCode = StatusCode(307);
+    /// `308 Permanent Redirect`: the resource is now at the URL in the
+    /// `Location` header, and the same request should be sent there.
     pub const PERMANENT_REDIRECT: StatusCode = StatusCode(308);
+    /// `400 Bad Request`: the server cannot process the request because it is
+    /// malformed.
     pub const BAD_REQUEST: StatusCode = StatusCode(400);
+    /// `401 Unauthorized`: the request needs authentication.
     pub const UNAUTHORIZED: StatusCode = StatusCode(401);
+    /// `403 Forbidden`: the server refuses the request.
     pub const FORBIDDEN: StatusCode = StatusCode(403);
+    /// `404 Not Found`: the server has nothing at the request's URL.
     pub const NOT_FOUND: StatusCode = StatusCode(404);
+    /// `405 Method Not Allowed`: the resource does not support the request's
+    /// method.
     pub const METHOD_NOT_ALLOWED: StatusCode = StatusCode(405);
+    /// `406 Not Acceptable`: the server has no representation that the
+    /// request's `Accept` headers accept.
     pub const NOT_ACCEPTABLE: StatusCode = StatusCode(406);
+    /// `408 Request Timeout`: the server did not receive the whole request in
+    /// time.
     pub const REQUEST_TIMEOUT: StatusCode = StatusCode(408);
+    /// `409 Conflict`: the request conflicts with the current state of the
+    /// resource.
     pub const CONFLICT: StatusCode = StatusCode(409);
+    /// `410 Gone`: the resource is no longer available, for good.
     pub const GONE: StatusCode = StatusCode(410);
+    /// `411 Length Required`: the request needs a `Content-Length` header.
     pub const LENGTH_REQUIRED: StatusCode = StatusCode(411);
+    /// `413 Payload Too Large`: the request's body is larger than the server
+    /// accepts.
     pub const PAYLOAD_TOO_LARGE: StatusCode = StatusCode(413);
+    /// `414 URI Too Long`: the request's URL is longer than the server accepts.
     pub const URI_TOO_LONG: StatusCode = StatusCode(414);
+    /// `415 Unsupported Media Type`: the server does not support the format of
+    /// the request's body.
     pub const UNSUPPORTED_MEDIA_TYPE: StatusCode = StatusCode(415);
+    /// `417 Expectation Failed`: the server cannot meet the request's `Expect`
+    /// header.
     pub const EXPECTATION_FAILED: StatusCode = StatusCode(417);
+    /// `422 Unprocessable Entity`: the body is well-formed but its content
+    /// cannot be processed.
     pub const UNPROCESSABLE_ENTITY: StatusCode = StatusCode(422);
+    /// `429 Too Many Requests`: the client sent too many requests in a given
+    /// time.
     pub const TOO_MANY_REQUESTS: StatusCode = StatusCode(429);
+    /// `431 Request Header Fields Too Large`: the request's headers are larger
+    /// than the server accepts.
     pub const REQUEST_HEADER_FIELDS_TOO_LARGE: StatusCode = StatusCode(431);
+    /// `500 Internal Server Error`: the server failed to handle the request.
     pub const INTERNAL_SERVER_ERROR: StatusCode = StatusCode(500);
+    /// `501 Not Implemented`: the server does not support what the request
+    /// needs.
     pub const NOT_IMPLEMENTED: StatusCode = StatusCode(501);
+    /// `502 Bad Gateway`: a gateway or proxy received an invalid response from
+    /// the server behind it.
     pub const BAD_GATEWAY: StatusCode = StatusCode(502);
+    /// `503 Service Unavailable`: the server cannot handle requests for now (it
+    /// is overloaded or down for maintenance).
     pub const SERVICE_UNAVAILABLE: StatusCode = StatusCode(503);
+    /// `504 Gateway Timeout`: a gateway or proxy did not get a response in time
+    /// from the server behind it.
     pub const GATEWAY_TIMEOUT: StatusCode = StatusCode(504);
+    /// `505 HTTP Version Not Supported`: the server does not support the
+    /// request's HTTP version.
     pub const HTTP_VERSION_NOT_SUPPORTED: StatusCode = StatusCode(505);
 
+    /// Converts a number to a status code.
+    ///
+    /// Any number from 100 to 999 is accepted, standard or not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidStatusCode`] if `code` is below 100 or above 999.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert_eq(StatusCode::from_u16(200).unwrap(), StatusCode::OK);
+    /// assert_eq(StatusCode::from_u16(299).unwrap().as_u16(), 299);
+    /// assert(StatusCode::from_u16(99).is_err());
+    /// assert(StatusCode::from_u16(1000).is_err());
+    /// ```
     pub fn from_u16(code: u16) -> Result<StatusCode, InvalidStatusCode> {
         if code < 100 || code > 999 {
             Err(InvalidStatusCode {})
@@ -180,32 +442,118 @@ impl StatusCode {
         }
     }
 
+    /// Returns the status code as a number.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert_eq(StatusCode::CREATED.as_u16(), 201);
+    /// ```
     pub fn as_u16(&self) -> u16 {
         self.0
     }
 
-    /// "200", as the http crate.
+    /// Returns the status code's number as a string.
+    ///
+    /// Unlike the `http` crate's, which returns a `&str`, this returns a
+    /// new `String`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert_eq(StatusCode::OK.as_str(), "200");
+    /// ```
     pub fn as_str(&self) -> String {
         self.0.to_string()
     }
 
+    /// Returns `true` for a status code from 100 to 199 (informational).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert(StatusCode::CONTINUE.is_informational());
+    /// assert(!StatusCode::OK.is_informational());
+    /// ```
     pub fn is_informational(&self) -> bool {
         self.0 >= 100 && self.0 < 200
     }
+    /// Returns `true` for a status code from 200 to 299 (success).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert(StatusCode::OK.is_success());
+    /// assert(StatusCode::NO_CONTENT.is_success());
+    /// assert(!StatusCode::NOT_FOUND.is_success());
+    /// ```
     pub fn is_success(&self) -> bool {
         self.0 >= 200 && self.0 < 300
     }
+    /// Returns `true` for a status code from 300 to 399 (redirection).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert(StatusCode::FOUND.is_redirection());
+    /// assert(!StatusCode::OK.is_redirection());
+    /// ```
     pub fn is_redirection(&self) -> bool {
         self.0 >= 300 && self.0 < 400
     }
+    /// Returns `true` for a status code from 400 to 499 (client error).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert(StatusCode::BAD_REQUEST.is_client_error());
+    /// assert(!StatusCode::INTERNAL_SERVER_ERROR.is_client_error());
+    /// ```
     pub fn is_client_error(&self) -> bool {
         self.0 >= 400 && self.0 < 500
     }
+    /// Returns `true` for a status code from 500 to 599 (server error).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert(StatusCode::BAD_GATEWAY.is_server_error());
+    /// assert(!StatusCode::NOT_FOUND.is_server_error());
+    /// ```
     pub fn is_server_error(&self) -> bool {
         self.0 >= 500 && self.0 < 600
     }
 
-    /// The standard reason phrase ("Not Found").
+    /// Returns the standard reason phrase of the status code, if it has
+    /// one.
+    ///
+    /// This is the text that follows the number in an HTTP/1.1 status
+    /// line, such as `"Not Found"` for 404. Status codes that are not
+    /// registered have none.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::StatusCode;
+    ///
+    /// assert_eq(StatusCode::NOT_FOUND.canonical_reason(), Some("Not Found"));
+    /// assert_eq(StatusCode::from_u16(418).unwrap().canonical_reason(), Some("I'm a teapot"));
+    /// assert_eq(StatusCode::from_u16(599).unwrap().canonical_reason(), None);
+    /// ```
     pub fn canonical_reason(&self) -> Option<&str> {
         let r = match self.0 {
             100 => "Continue",
@@ -297,7 +645,17 @@ impl Default for StatusCode {
     }
 }
 
-/// StatusCode::from_u16's error.
+/// The error returned by [`StatusCode::from_u16`] for a number that is not
+/// from 100 to 999.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::StatusCode;
+///
+/// let err = StatusCode::from_u16(42).unwrap_err();
+/// assert_eq(err.to_string(), "invalid status code");
+/// ```
 #[derive(Clone, Debug)]
 pub struct InvalidStatusCode {}
 
@@ -307,13 +665,30 @@ impl Display for InvalidStatusCode {
     }
 }
 
-/// The HTTP version of a message.
+/// The HTTP version of a request or response.
+///
+/// Versions compare in order (`HTTP_10 < HTTP_11 < HTTP_2`) and are
+/// debug-formatted as in a request line (`"HTTP/1.1"`). The default is
+/// HTTP/1.1.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::Version;
+///
+/// assert(Version::HTTP_10 < Version::HTTP_2);
+/// assert_eq(`${Version::HTTP_11:?}`.to_string(), "HTTP/1.1");
+/// assert_eq(Version::default(), Version::HTTP_11);
+/// ```
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Version(u8);
 
 impl Version {
+    /// HTTP/1.0.
     pub const HTTP_10: Version = Version(10);
+    /// HTTP/1.1.
     pub const HTTP_11: Version = Version(11);
+    /// HTTP/2.
     pub const HTTP_2: Version = Version(20);
 }
 
@@ -335,26 +710,101 @@ impl Default for Version {
     }
 }
 
-/// Header fields: names compare without case and are kept lowercase; a
-/// name may have several values (in order).
+/// The header fields of a request or response.
+///
+/// Header names are case-insensitive: they are compared without regard to
+/// case and stored in lowercase. A name may have several values, kept in
+/// the order they were added; [`HeaderMap::get`] returns the first and
+/// [`HeaderMap::get_all`] all of them.
+///
+/// Unlike the `http` crate's `HeaderMap`, names and values are plain
+/// strings (there are no `HeaderName` and `HeaderValue` types).
+///
+/// # Examples
+///
+/// ```
+/// use std::http::HeaderMap;
+///
+/// let mut headers = HeaderMap::new();
+/// headers.insert("Content-Type", "text/html");
+/// headers.append("Set-Cookie", "a=1");
+/// headers.append("Set-Cookie", "b=2");
+///
+/// assert_eq(headers.get("content-type"), Some("text/html"));
+/// assert_eq(headers.get_all("set-cookie"), Vec::from(["a=1", "b=2"]));
+/// assert_eq(headers.len(), 3);
+/// assert_eq(headers.keys(), Vec::from(["content-type", "set-cookie"]));
+/// ```
 #[derive(Clone, Default)]
 pub struct HeaderMap {
     v: Vec<(String, String)>,
 }
 
 impl HeaderMap {
+    /// Creates an empty `HeaderMap`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let headers = HeaderMap::new();
+    /// assert(headers.is_empty());
+    /// ```
     pub fn new() -> HeaderMap {
         HeaderMap { v: Vec::new() }
     }
 
+    /// Returns the number of values in the map.
+    ///
+    /// Each value counts, so a name with two values counts twice (as in the
+    /// `http` crate).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// assert_eq(headers.len(), 0);
+    /// headers.append("Accept", "text/html");
+    /// headers.append("Accept", "text/plain");
+    /// assert_eq(headers.len(), 2);
+    /// ```
     pub fn len(&self) -> usize {
         self.v.len()
     }
+    /// Returns `true` if the map has no values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// assert(headers.is_empty());
+    /// headers.insert("Host", "example.com");
+    /// assert(!headers.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.v.len() == 0
     }
 
-    /// The first value of name.
+    /// Returns the first value of the header `name`, if it has any.
+    ///
+    /// `name` is matched without regard to case.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// assert_eq(headers.get("host"), None);
+    /// headers.insert("Host", "example.com");
+    /// assert_eq(headers.get("host"), Some("example.com"));
+    /// assert_eq(headers.get("HOST"), Some("example.com"));
+    /// ```
     pub fn get(&self, name: &str) -> Option<&str> {
         for (k, v) in self.v.iter() {
             if k.eq_ignore_ascii_case(name) {
@@ -364,6 +814,22 @@ impl HeaderMap {
         None
     }
 
+    /// Returns all the values of the header `name`, in the order they were
+    /// added.
+    ///
+    /// The vector is empty if the map has no value for `name`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.append("Vary", "Accept");
+    /// headers.append("vary", "Accept-Encoding");
+    /// assert_eq(headers.get_all("Vary"), Vec::from(["Accept", "Accept-Encoding"]));
+    /// assert(headers.get_all("Host").is_empty());
+    /// ```
     pub fn get_all(&self, name: &str) -> Vec<&str> {
         let mut out = Vec::new();
         for (k, v) in self.v.iter() {
@@ -374,25 +840,79 @@ impl HeaderMap {
         out
     }
 
+    /// Returns `true` if the map has a value for the header `name`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("Content-Length", "0");
+    /// assert(headers.contains_key("content-length"));
+    /// assert(!headers.contains_key("content-type"));
+    /// ```
     pub fn contains_key(&self, name: &str) -> bool {
         self.get(name).is_some()
     }
 
-    /// Sets name to value, replacing its values; returns the first old one.
+    /// Sets the header `name` to `value`, replacing all its values.
+    ///
+    /// Returns the first of the values it had, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// assert_eq(headers.insert("Accept", "text/html"), None);
+    /// headers.append("Accept", "text/plain");
+    /// assert_eq(headers.insert("Accept", "*/*"), Some("text/html".to_string()));
+    /// assert_eq(headers.get_all("accept"), Vec::from(["*/*"]));
+    /// ```
     pub fn insert(&mut self, name: &str, value: &str) -> Option<String> {
         let old = self.remove(name);
         self.v.push((name.to_ascii_lowercase(), value.to_string()));
         old
     }
 
-    /// Adds a value for name; returns whether name had values.
+    /// Adds `value` to the values of the header `name`, after those it has.
+    ///
+    /// Returns `true` if `name` already had a value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// assert(!headers.append("Set-Cookie", "a=1"));
+    /// assert(headers.append("Set-Cookie", "b=2"));
+    /// assert_eq(headers.get_all("set-cookie"), Vec::from(["a=1", "b=2"]));
+    /// ```
     pub fn append(&mut self, name: &str, value: &str) -> bool {
         let had = self.contains_key(name);
         self.v.push((name.to_ascii_lowercase(), value.to_string()));
         had
     }
 
-    /// Removes name's values; returns the first.
+    /// Removes all the values of the header `name`.
+    ///
+    /// Returns the first of them, if it had any.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.append("Via", "1.1 a");
+    /// headers.append("Via", "1.1 b");
+    /// assert_eq(headers.remove("via"), Some("1.1 a".to_string()));
+    /// assert_eq(headers.remove("via"), None);
+    /// assert(headers.is_empty());
+    /// ```
     pub fn remove(&mut self, name: &str) -> Option<String> {
         let mut first: Option<String> = None;
         let mut i = 0;
@@ -409,16 +929,60 @@ impl HeaderMap {
         first
     }
 
+    /// Removes all the headers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("Host", "example.com");
+    /// headers.clear();
+    /// assert(headers.is_empty());
+    /// ```
     pub fn clear(&mut self) {
         self.v.clear();
     }
 
-    /// The (name, value) pairs, in order.
+    /// Returns an iterator over the `(name, value)` pairs, in the order
+    /// they were added.
+    ///
+    /// A name with several values comes once for each value; names are in
+    /// lowercase.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("Host", "example.com");
+    /// headers.insert("Accept", "*/*");
+    /// let mut lines: Vec<String> = Vec::new();
+    /// for (name, value) in headers.iter() {
+    ///     lines.push(`${name}: ${value}`.to_string());
+    /// }
+    /// assert_eq(lines.join("\n"), "host: example.com\naccept: */*");
+    /// ```
     pub fn iter(&self) -> crate::slice::Iter<(String, String)> {
         self.v.iter()
     }
 
-    /// The names, each once.
+    /// Returns the header names, each once, in the order they were first
+    /// added.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.append("Accept", "text/html");
+    /// headers.append("Host", "example.com");
+    /// headers.append("Accept", "text/plain");
+    /// assert_eq(headers.keys(), Vec::from(["accept", "host"]));
+    /// ```
     pub fn keys(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
         for (k, _) in self.v.iter() {
@@ -454,9 +1018,31 @@ impl Debug for HeaderMap {
     }
 }
 
-/// A message body: bytes, or a reader (the body of a received message
-/// reads from the connection). Read it with Read, or text()/bytes() on
-/// the message.
+/// The body of a request or response.
+///
+/// A body is either bytes held in memory (made with `Body::from` a
+/// `String`, `&str`, `Vec<u8>` or `&[u8]`) or a reader the bytes are read
+/// from as they are sent ([`Body::from_reader`]). The body of a received
+/// message is a reader too: it reads from the connection.
+///
+/// A body implements [`Read`]; most code reads one through its message
+/// instead, with [`Response::text`], [`Response::bytes`],
+/// [`Response::json`] or the same methods of [`Request`].
+///
+/// # Examples
+///
+/// ```
+/// use std::http::Body;
+/// use std::io::Read;
+///
+/// let mut body = Body::from("hello");
+/// assert_eq(body.len(), Some(5));
+/// assert_eq(body.as_bytes(), Some(b"hello"));
+///
+/// let mut s = String::new();
+/// body.read_to_string(&mut s).unwrap();
+/// assert_eq(s, "hello");
+/// ```
 #[derive(Clone)]
 pub struct Body {
     bytes: Vec<u8>,
@@ -466,6 +1052,19 @@ pub struct Body {
 }
 
 impl Body {
+    /// Creates an empty body (of length 0).
+    ///
+    /// This is also `Body::default()`, and the body of a new [`Request`]
+    /// or [`Response`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Body;
+    ///
+    /// let body = Body::empty();
+    /// assert_eq(body.len(), Some(0));
+    /// ```
     pub fn empty() -> Body {
         Body {
             bytes: Vec::new(),
@@ -475,8 +1074,29 @@ impl Body {
         }
     }
 
-    /// A body read from r (len: its length if known; else it is sent
-    /// chunked).
+    /// Creates a body whose bytes are read from `r` when it is sent.
+    ///
+    /// `len` is the number of bytes `r` gives, if known: it is sent as the
+    /// `Content-Length`. With `None`, an HTTP/1.1 message is sent with
+    /// chunked transfer coding (a response to an HTTP/1.0 request ends
+    /// when the connection closes). Such a body can be sent once only: a
+    /// request with it is not sent again after a redirect that keeps the
+    /// body (307 or 308) or a failure on a reused connection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Body, Response};
+    /// use std::io::Cursor;
+    ///
+    /// let data = &mut Cursor::new(b"streamed".to_vec());
+    /// let body = Body::from_reader(data, None);
+    /// assert_eq(body.len(), None);
+    /// assert(body.as_bytes().is_none());
+    ///
+    /// let resp = Response::from_body(body);
+    /// assert_eq(resp.text().unwrap(), "streamed");
+    /// ```
     pub fn from_reader(r: &mut dyn Read, len: Option<u64>) -> Body {
         Body {
             bytes: Vec::new(),
@@ -486,12 +1106,37 @@ impl Body {
         }
     }
 
-    /// Its length, if known.
+    /// Returns the length of the body in bytes, if it is known.
+    ///
+    /// A body made from bytes knows its length; one made with
+    /// [`Body::from_reader`] has the length it was given, and a received
+    /// one the length its message's `Content-Length` header gave.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Body;
+    ///
+    /// assert_eq(Body::from(Vec::from([1u8, 2, 3])).len(), Some(3));
+    /// ```
     pub fn len(&self) -> Option<u64> {
         self.len
     }
 
-    /// Its bytes, if it is not a reader (so it can be sent again).
+    /// Returns the bytes of the body, if it holds them in memory.
+    ///
+    /// Returns `None` for a body that is a reader ([`Body::from_reader`],
+    /// or a received body): its bytes are not at hand, and the body cannot
+    /// be sent again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Body;
+    ///
+    /// let body = Body::from("abc".to_string());
+    /// assert_eq(body.as_bytes(), Some(b"abc"));
+    /// ```
     pub fn as_bytes(&self) -> Option<&[u8]> {
         if self.reader.is_some() {
             None
@@ -555,8 +1200,32 @@ fn read_all(b: &mut Body) -> io::Result<Vec<u8>> {
     Ok(v)
 }
 
-/// A request: sent by Client (built with RequestBuilder or new), or
-/// received by a server handler.
+/// An HTTP request.
+///
+/// A client sends one with [`Client::execute`] (most code builds and sends
+/// it with a [`RequestBuilder`] instead); a server handler receives one,
+/// with the client's address and, after a [`Router`] matched it, the
+/// values of the pattern's wildcards.
+///
+/// Unlike the `http` crate's `Request<T>`, it has no type parameter: its
+/// body is a [`Body`], and the body of a received request reads from the
+/// connection.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::{Body, Method, Request};
+/// use std::url::Url;
+///
+/// let mut req = Request::new(Method::POST, Url::parse("http://example.com/api?v=2").unwrap());
+/// req.headers_mut().insert("Content-Type", "text/plain");
+/// req.set_body(Body::from("hello"));
+///
+/// assert_eq(*req.method(), Method::POST);
+/// assert_eq(req.uri(), "/api?v=2");
+/// assert_eq(req.header("content-type"), Some("text/plain"));
+/// assert_eq(req.text().unwrap(), "hello");
+/// ```
 #[derive(Clone)]
 pub struct Request {
     method: Method,
@@ -570,6 +1239,20 @@ pub struct Request {
 }
 
 impl Request {
+    /// Creates a request with the method and URL, no headers, an empty
+    /// body and version HTTP/1.1.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request, Version};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::GET, Url::parse("https://example.com/").unwrap());
+    /// assert_eq(req.url().as_str(), "https://example.com/");
+    /// assert_eq(req.version(), Version::HTTP_11);
+    /// assert(req.headers().is_empty());
+    /// ```
     pub fn new(method: Method, url: Url) -> Request {
         let target = wire::target_of(&url);
         Request {
@@ -584,60 +1267,234 @@ impl Request {
         }
     }
 
+    /// Returns the request's method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::HEAD, Url::parse("http://example.com/").unwrap());
+    /// assert_eq(*req.method(), Method::HEAD);
+    /// ```
     pub fn method(&self) -> &Method {
         &self.method
     }
+    /// Returns a mutable reference to the request's method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/").unwrap());
+    /// *req.method_mut() = Method::PUT;
+    /// assert_eq(*req.method(), Method::PUT);
+    /// ```
     pub fn method_mut(&mut self) -> &mut Method {
         &mut self.method
     }
-    /// The URL (for a received request: http://host/target, the host
-    /// from the Host header).
+    /// Returns the request's URL.
+    ///
+    /// For a received request this is the URL rebuilt from the request:
+    /// `http://` (or `https://`), the host of the `Host` header (or of the
+    /// HTTP/2 `:authority`), then the request target.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::GET, Url::parse("http://example.com:8080/a").unwrap());
+    /// assert_eq(req.url().host_str(), Some("example.com"));
+    /// assert_eq(req.url().port(), Some(8080));
+    /// ```
     pub fn url(&self) -> &Url {
         &self.url
     }
+    /// Returns a mutable reference to the request's URL.
+    ///
+    /// Changing it does not change the request target [`Request::uri`]
+    /// returns, which is what a client sends: to send a request to another
+    /// URL, make a new one.
     pub fn url_mut(&mut self) -> &mut Url {
         &mut self.url
     }
-    /// The request target as sent: "/path?query".
+    /// Returns the request target: the path and query, as sent in the
+    /// request line (`"/path?query"`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::GET, Url::parse("http://example.com/search?q=navi#top").unwrap());
+    /// assert_eq(req.uri(), "/search?q=navi");
+    /// ```
     pub fn uri(&self) -> &str {
         self.target.as_str()
     }
+    /// Returns the path of the request's URL (still percent-encoded).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::GET, Url::parse("http://example.com/a%20b/c?x=1").unwrap());
+    /// assert_eq(req.path(), "/a%20b/c");
+    /// ```
     pub fn path(&self) -> &str {
         self.url.path()
     }
+    /// Returns the query of the request's URL (without the `?`), if it
+    /// has one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::GET, Url::parse("http://example.com/?a=1&b=2").unwrap());
+    /// assert_eq(req.query(), Some("a=1&b=2"));
+    /// ```
     pub fn query(&self) -> Option<&str> {
         self.url.query()
     }
+    /// Returns an iterator over the decoded name-value pairs of the URL's
+    /// query (as [`Url::query_pairs`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::GET, Url::parse("http://example.com/?q=a+b&n=1").unwrap());
+    /// let pairs: Vec<(String, String)> = req.query_pairs().collect();
+    /// assert_eq(pairs[0], ("q".to_string(), "a b".to_string()));
+    /// assert_eq(pairs[1], ("n".to_string(), "1".to_string()));
+    /// ```
     pub fn query_pairs(&self) -> crate::url::form_urlencoded::Parse {
         self.url.query_pairs()
     }
+    /// Returns the HTTP version of the request.
+    ///
+    /// For a received request, the version the client spoke; a request
+    /// made with [`Request::new`] is HTTP/1.1.
     pub fn version(&self) -> Version {
         self.version
     }
+    /// Returns the request's headers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::GET, Url::parse("http://example.com/").unwrap());
+    /// assert(req.headers().is_empty());
+    /// ```
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
+    /// Returns a mutable reference to the request's headers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/").unwrap());
+    /// req.headers_mut().insert("Accept", "text/html");
+    /// assert_eq(req.header("accept"), Some("text/html"));
+    /// ```
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
     }
+    /// Returns the first value of the header `name`, if it has any.
+    ///
+    /// This is `self.headers().get(name)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/").unwrap());
+    /// req.headers_mut().insert("User-Agent", "navi");
+    /// assert_eq(req.header("user-agent"), Some("navi"));
+    /// assert_eq(req.header("referer"), None);
+    /// ```
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name)
     }
+    /// Returns the request's body.
     pub fn body(&self) -> &Body {
         &self.body
     }
+    /// Returns a mutable reference to the request's body.
+    ///
+    /// The body can be read through it (it implements [`Read`]).
     pub fn body_mut(&mut self) -> &mut Body {
         &mut self.body
     }
+    /// Replaces the request's body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Body, Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let mut req = Request::new(Method::POST, Url::parse("http://example.com/").unwrap());
+    /// req.set_body(Body::from("data"));
+    /// assert_eq(req.body().len(), Some(4));
+    /// ```
     pub fn set_body(&mut self, b: Body) {
         self.body = b;
     }
-    /// The client's address (received requests).
+    /// Returns the address of the client that sent the request.
+    ///
+    /// This is `Some` for a request a server received, and `None` for one
+    /// made with [`Request::new`].
     pub fn remote_addr(&self) -> Option<SocketAddr> {
         self.remote.clone()
     }
 
-    /// The value of a {name} wildcard of the Router pattern that matched.
+    /// Returns the value of the wildcard `name` of the [`Router`] pattern
+    /// that matched the request.
+    ///
+    /// For a pattern `/users/{id}` and a path `/users/7`, the value of
+    /// `"id"` is `"7"`; a `{name...}` wildcard gets the rest of the path.
+    /// Values are percent-decoded. Returns `None` if the pattern has no
+    /// such wildcard (or no pattern matched the request).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request, Response, Router};
+    /// use std::url::Url;
+    ///
+    /// let mut router = Router::new();
+    /// router.route("/users/{id}/files/{path...}", |req| {
+    ///     Response::from_string(`${req.path_value("id").unwrap()} ${req.path_value("path").unwrap()}`.to_string())
+    /// });
+    ///
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/users/7/files/a/b.txt").unwrap());
+    /// assert_eq(router.handle(&mut req).text().unwrap(), "7 a/b.txt");
+    /// assert_eq(req.path_value("id"), Some("7"));
+    /// assert_eq(req.path_value("name"), None);
+    /// ```
     pub fn path_value(&self, name: &str) -> Option<&str> {
         for (k, v) in self.params.iter() {
             if k == name {
@@ -647,6 +1504,21 @@ impl Request {
         None
     }
 
+    /// Sets the value [`Request::path_value`] returns for `name`.
+    ///
+    /// A [`Router`] calls it for each wildcard of the pattern that matched;
+    /// it is useful to test handlers without a router.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/").unwrap());
+    /// req.set_path_value("id", "42");
+    /// assert_eq(req.path_value("id"), Some("42"));
+    /// ```
     pub fn set_path_value(&mut self, name: &str, value: &str) {
         for p in self.params.iter_mut() {
             if p.0 == name {
@@ -657,17 +1529,83 @@ impl Request {
         self.params.push((name.to_string(), value.to_string()));
     }
 
-    /// Reads the whole body.
+    /// Reads the rest of the body and returns its bytes.
+    ///
+    /// The body is consumed: reading it again gives nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the body fails (for a received request:
+    /// the connection failed or timed out, or the body was malformed).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Body, Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let mut req = Request::new(Method::POST, Url::parse("http://example.com/").unwrap());
+    /// req.set_body(Body::from(Vec::from([1u8, 2, 3])));
+    /// assert_eq(req.bytes().unwrap(), Vec::from([1u8, 2, 3]));
+    /// assert(req.bytes().unwrap().is_empty());
+    /// ```
     pub fn bytes(&mut self) -> io::Result<Vec<u8>> {
         read_all(&mut self.body)
     }
 
+    /// Reads the rest of the body and returns it as text.
+    ///
+    /// Invalid UTF-8 is replaced with U+FFFD (as
+    /// [`String::from_utf8_lossy`]); the body's `Content-Type` charset is
+    /// not looked at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the body fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Body, Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let mut req = Request::new(Method::POST, Url::parse("http://example.com/").unwrap());
+    /// req.set_body(Body::from("hello"));
+    /// assert_eq(req.text().unwrap(), "hello");
+    /// ```
     pub fn text(&mut self) -> io::Result<String> {
         let v = read_all(&mut self.body)?;
         Ok(String::from_utf8_lossy(v.as_slice()))
     }
 
-    /// The body as JSON (std::json).
+    /// Reads the rest of the body and deserializes it from JSON (with
+    /// [`crate::json::from_str`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of kind [`ErrorKind::Decode`] if the body is not
+    /// valid JSON for `T`, and of kind [`ErrorKind::Io`] (or
+    /// [`ErrorKind::Timeout`]) if reading it fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Body, Method, Request};
+    /// use std::serde::Deserialize;
+    /// use std::url::Url;
+    ///
+    /// #[derive(Deserialize, Debug)]
+    /// struct Point {
+    ///     x: i64,
+    ///     y: i64,
+    /// }
+    ///
+    /// let mut req = Request::new(Method::POST, Url::parse("http://example.com/").unwrap());
+    /// req.set_body(Body::from(r#"{"x": 3, "y": -4}"#));
+    /// let p: Point = req.json().unwrap();
+    /// assert_eq(p.x, 3);
+    /// assert_eq(p.y, -4);
+    /// ```
     pub fn json<T: crate::serde::Deserialize>(&mut self) -> Result<T, Error> {
         let s = self.text()?;
         match crate::json::from_str::<T>(s.as_str()) {
@@ -676,7 +1614,27 @@ impl Request {
         }
     }
 
-    /// The pairs of an application/x-www-form-urlencoded body.
+    /// Reads the rest of the body and returns its decoded name-value pairs,
+    /// for an `application/x-www-form-urlencoded` body (an HTML form).
+    ///
+    /// The `Content-Type` header is not checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the body fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Body, Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let mut req = Request::new(Method::POST, Url::parse("http://example.com/").unwrap());
+    /// req.set_body(Body::from("name=navi&greeting=hello+world"));
+    /// let form = req.form().unwrap();
+    /// assert_eq(form[0], ("name".to_string(), "navi".to_string()));
+    /// assert_eq(form[1], ("greeting".to_string(), "hello world".to_string()));
+    /// ```
     pub fn form(&mut self) -> io::Result<Vec<(String, String)>> {
         let v = read_all(&mut self.body)?;
         let mut out = Vec::new();
@@ -698,8 +1656,36 @@ impl Debug for Request {
     }
 }
 
-/// A response: received by Client, or made by a server handler
-/// (Response::text("hi"), Response::new(StatusCode::NOT_FOUND), ...).
+/// An HTTP response.
+///
+/// A client receives one from [`RequestBuilder::send`] (its body reads
+/// from the connection); a server handler makes one and returns it. The
+/// constructors make the common responses: [`Response::from_string`],
+/// [`Response::from_html`], [`Response::from_json`],
+/// [`Response::from_body`], [`Response::error`] and
+/// [`Response::redirect`]; [`Response::with_status`],
+/// [`Response::with_header`] and [`Response::with_body`] return a changed
+/// copy, for chaining.
+///
+/// Unlike the `http` crate's `Response<T>`, it has no type parameter: its
+/// body is a [`Body`]. The methods that read the body
+/// ([`Response::text`], [`Response::bytes`], [`Response::json`]) take the
+/// response by value, as reqwest's do. A client's connection goes back to
+/// its pool only when the body has been read to the end.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::{Response, StatusCode};
+///
+/// let resp = Response::from_string("not here")
+///     .with_status(StatusCode::NOT_FOUND)
+///     .with_header("Cache-Control", "no-store");
+/// assert_eq(resp.status(), StatusCode::NOT_FOUND);
+/// assert_eq(resp.header("content-type"), Some("text/plain; charset=utf-8"));
+/// assert_eq(resp.header("cache-control"), Some("no-store"));
+/// assert_eq(resp.text().unwrap(), "not here");
+/// ```
 #[derive(Clone)]
 pub struct Response {
     status: StatusCode,
@@ -710,6 +1696,18 @@ pub struct Response {
 }
 
 impl Response {
+    /// Creates a response with the status, no headers and an empty body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let resp = Response::new(StatusCode::NO_CONTENT);
+    /// assert_eq(resp.status().as_u16(), 204);
+    /// assert(resp.headers().is_empty());
+    /// assert_eq(resp.body().len(), Some(0));
+    /// ```
     pub fn new(status: StatusCode) -> Response {
         Response {
             status,
@@ -720,23 +1718,83 @@ impl Response {
         }
     }
 
-    /// A 200 response with body.
+    /// Creates a `200 OK` response with the body.
+    ///
+    /// No `Content-Type` is set; when a server sends a non-empty body
+    /// without one, it sends `text/plain; charset=utf-8` (it does not
+    /// sniff the content, as Go's server does).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let resp = Response::from_body(Vec::from([0u8, 1, 2]))
+    ///     .with_header("Content-Type", "application/octet-stream");
+    /// assert_eq(resp.content_length(), None);
+    /// assert_eq(resp.bytes().unwrap(), Vec::from([0u8, 1, 2]));
+    /// ```
     pub fn from_body<B: Into<Body>>(body: B) -> Response {
         let mut r = Response::new(StatusCode::OK);
         r.body = body.into();
         r
     }
 
-    /// A text/plain response.
+    /// Creates a `200 OK` response with the text as its body and
+    /// `Content-Type: text/plain; charset=utf-8`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let resp = Response::from_string("hello");
+    /// assert_eq(resp.header("content-type"), Some("text/plain; charset=utf-8"));
+    /// assert_eq(resp.text().unwrap(), "hello");
+    /// ```
     pub fn from_string<S: Into<String>>(s: S) -> Response {
         Response::from_body(s.into()).with_header("Content-Type", "text/plain; charset=utf-8")
     }
 
+    /// Creates a `200 OK` response with the HTML as its body and
+    /// `Content-Type: text/html; charset=utf-8`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let resp = Response::from_html("<h1>Hello</h1>");
+    /// assert_eq(resp.header("content-type"), Some("text/html; charset=utf-8"));
+    /// ```
     pub fn from_html<S: Into<String>>(s: S) -> Response {
         Response::from_body(s.into()).with_header("Content-Type", "text/html; charset=utf-8")
     }
 
-    /// x as JSON (std::json).
+    /// Creates a `200 OK` response with `x` serialized to JSON (with
+    /// [`crate::json::to_string`]) as its body and
+    /// `Content-Type: application/json`.
+    ///
+    /// If `x` cannot be serialized, the response is a
+    /// `500 Internal Server Error` with the error's message (see
+    /// [`Response::error`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    /// use std::serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct User {
+    ///     id: u32,
+    ///     name: String,
+    /// }
+    ///
+    /// let resp = Response::from_json(&User { id: 7, name: "navi".to_string() });
+    /// assert_eq(resp.header("content-type"), Some("application/json"));
+    /// assert_eq(resp.text().unwrap(), r#"{"id":7,"name":"navi"}"#);
+    /// ```
     pub fn from_json<T: crate::serde::Serialize>(x: &T) -> Response {
         match crate::json::to_string(x) {
             Ok(s) => Response::from_body(s).with_header("Content-Type", "application/json"),
@@ -744,68 +1802,202 @@ impl Response {
         }
     }
 
-    /// The status with a text/plain message (as Go's http.Error).
+    /// Creates an error response: the status, and `msg` and a newline as a
+    /// plain-text body (as Go's `http.Error`).
+    ///
+    /// The response also has `X-Content-Type-Options: nosniff`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let resp = Response::error(StatusCode::BAD_REQUEST, "missing name");
+    /// assert_eq(resp.status(), StatusCode::BAD_REQUEST);
+    /// assert_eq(resp.header("x-content-type-options"), Some("nosniff"));
+    /// assert_eq(resp.text().unwrap(), "missing name\n");
+    /// ```
     pub fn error(status: StatusCode, msg: &str) -> Response {
         Response::from_string(`${msg}\n`.to_string())
             .with_status(status)
             .with_header("X-Content-Type-Options", "nosniff")
     }
 
-    /// A redirect to location (a 3xx status).
+    /// Creates a redirect: a response with the status (a 3xx one) and
+    /// `location` as its `Location` header.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let resp = Response::redirect("/login", StatusCode::SEE_OTHER);
+    /// assert_eq(resp.status().as_u16(), 303);
+    /// assert_eq(resp.header("location"), Some("/login"));
+    /// ```
     pub fn redirect(location: &str, status: StatusCode) -> Response {
         Response::new(status).with_header("Location", location)
     }
 
-    /// The response with the status (builder style).
+    /// Returns a copy of the response with the status.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let resp = Response::from_string("made").with_status(StatusCode::CREATED);
+    /// assert_eq(resp.status(), StatusCode::CREATED);
+    /// ```
     pub fn with_status(&self, s: StatusCode) -> Response {
         let mut r = self.clone();
         r.status = s;
         r
     }
 
-    /// The response with a header value added (builder style).
+    /// Returns a copy of the response with a value added to the header
+    /// `name` (after any it has, as [`HeaderMap::append`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let resp = Response::new(StatusCode::OK)
+    ///     .with_header("Set-Cookie", "a=1")
+    ///     .with_header("Set-Cookie", "b=2");
+    /// assert_eq(resp.headers().get_all("set-cookie"), Vec::from(["a=1", "b=2"]));
+    /// ```
     pub fn with_header(&self, name: &str, value: &str) -> Response {
         let mut r = self.clone();
         r.headers.append(name, value);
         r
     }
 
-    /// The response with the body (builder style).
+    /// Returns a copy of the response with the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let resp = Response::new(StatusCode::OK).with_body("body");
+    /// assert_eq(resp.text().unwrap(), "body");
+    /// ```
     pub fn with_body<B: Into<Body>>(&self, body: B) -> Response {
         let mut r = self.clone();
         r.body = body.into();
         r
     }
 
+    /// Returns the response's status code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// assert_eq(Response::from_string("hi").status(), StatusCode::OK);
+    /// ```
     pub fn status(&self) -> StatusCode {
         self.status
     }
+    /// Sets the response's status code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let mut resp = Response::from_string("hi");
+    /// resp.set_status(StatusCode::ACCEPTED);
+    /// assert_eq(resp.status().as_u16(), 202);
+    /// ```
     pub fn set_status(&mut self, s: StatusCode) {
         self.status = s;
     }
+    /// Returns the HTTP version of the response.
+    ///
+    /// For a received response, the version the server spoke; a response
+    /// a handler makes is HTTP/1.1 (the server sends it in the version of
+    /// the request).
     pub fn version(&self) -> Version {
         self.version
     }
+    /// Returns the response's headers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let resp = Response::from_html("<p>hi</p>");
+    /// assert(resp.headers().contains_key("content-type"));
+    /// ```
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
+    /// Returns a mutable reference to the response's headers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let mut resp = Response::from_string("hi");
+    /// resp.headers_mut().insert("Content-Type", "text/markdown");
+    /// assert_eq(resp.header("content-type"), Some("text/markdown"));
+    /// ```
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
     }
+    /// Returns the first value of the header `name`, if it has any.
+    ///
+    /// This is `self.headers().get(name)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let resp = Response::redirect("/", StatusCode::FOUND);
+    /// assert_eq(resp.header("Location"), Some("/"));
+    /// assert_eq(resp.header("Content-Type"), None);
+    /// ```
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name)
     }
+    /// Returns the response's body.
     pub fn body(&self) -> &Body {
         &self.body
     }
+    /// Returns a mutable reference to the response's body.
+    ///
+    /// The body can be read through it (it implements [`Read`]); so can
+    /// the response itself.
     pub fn body_mut(&mut self) -> &mut Body {
         &mut self.body
     }
+    /// Replaces the response's body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Body, Response, StatusCode};
+    ///
+    /// let mut resp = Response::new(StatusCode::OK);
+    /// resp.set_body(Body::from("new body"));
+    /// assert_eq(resp.text().unwrap(), "new body");
+    /// ```
     pub fn set_body(&mut self, b: Body) {
         self.body = b;
     }
 
-    /// The URL it answers (after redirects; received responses).
+    /// Returns the URL the response came from, for a response a client
+    /// received.
+    ///
+    /// After redirects, this is the URL of the last request. A response a
+    /// handler makes has none.
     pub fn url(&self) -> Option<&Url> {
         match &self.url {
             Some(u) => Some(u),
@@ -813,7 +2005,21 @@ impl Response {
         }
     }
 
-    /// The Content-Length, if given.
+    /// Returns the value of the `Content-Length` header, if it has a
+    /// valid one.
+    ///
+    /// The header is only there in a received response (or if set by
+    /// hand): a response a handler makes gets it when it is sent.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let resp = Response::from_string("hello").with_header("Content-Length", "5");
+    /// assert_eq(resp.content_length(), Some(5));
+    /// assert_eq(Response::from_string("hello").content_length(), None);
+    /// ```
     pub fn content_length(&self) -> Option<u64> {
         match self.headers.get("content-length") {
             Some(v) => v.trim().parse::<u64>().ok(),
@@ -821,17 +2027,75 @@ impl Response {
         }
     }
 
-    /// Reads the whole body.
+    /// Reads the rest of the body and returns its bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the body fails (the connection failed
+    /// or timed out, or the body was malformed).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let resp = Response::from_body(Vec::from([1u8, 2, 3]));
+    /// assert_eq(resp.bytes().unwrap(), Vec::from([1u8, 2, 3]));
+    /// ```
     pub fn bytes(mut self) -> Result<Vec<u8>, Error> {
         Ok(read_all(&mut self.body)?)
     }
 
+    /// Reads the rest of the body and returns it as text.
+    ///
+    /// Invalid UTF-8 is replaced with U+FFFD; the `Content-Type` charset is
+    /// not looked at (reqwest decodes by it).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the body fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let resp = Response::from_string("hello");
+    /// assert_eq(resp.text().unwrap(), "hello");
+    /// ```
     pub fn text(mut self) -> Result<String, Error> {
         let v = read_all(&mut self.body)?;
         Ok(String::from_utf8_lossy(v.as_slice()))
     }
 
-    /// The body as JSON (std::json).
+    /// Reads the rest of the body and deserializes it from JSON (with
+    /// [`crate::json::from_str`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of kind [`ErrorKind::Decode`] if the body is not
+    /// valid JSON for `T`, and of kind [`ErrorKind::Io`] (or
+    /// [`ErrorKind::Timeout`]) if reading it fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    /// use std::serde::Deserialize;
+    ///
+    /// #[derive(Deserialize, Debug)]
+    /// struct Point {
+    ///     x: i64,
+    ///     y: i64,
+    /// }
+    ///
+    /// let resp = Response::from_body(r#"{"x": 1, "y": 2}"#);
+    /// let p: Point = resp.json().unwrap();
+    /// assert_eq(p.x + p.y, 3);
+    ///
+    /// let err = Response::from_body("not json").json::<Point>().unwrap_err();
+    /// assert(err.is_decode());
+    /// ```
     pub fn json<T: crate::serde::Deserialize>(mut self) -> Result<T, Error> {
         let s = self.text()?;
         match crate::json::from_str::<T>(s.as_str()) {
@@ -840,7 +2104,26 @@ impl Response {
         }
     }
 
-    /// Err for a 4xx or 5xx status.
+    /// Returns an error if the status is a client or server error (4xx or
+    /// 5xx), and a copy of the response otherwise.
+    ///
+    /// # Errors
+    ///
+    /// The error has kind [`ErrorKind::Status`], the status
+    /// ([`Error::status`]) and the response's URL ([`Error::url`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let ok = Response::new(StatusCode::OK);
+    /// assert(ok.error_for_status().is_ok());
+    ///
+    /// let err = Response::new(StatusCode::NOT_FOUND).error_for_status().unwrap_err();
+    /// assert(err.is_status());
+    /// assert_eq(err.status(), Some(StatusCode::NOT_FOUND));
+    /// ```
     pub fn error_for_status(&self) -> Result<Response, Error> {
         if self.status.is_client_error() || self.status.is_server_error() {
             let mut e = Error::new(ErrorKind::Status, `HTTP status ${self.status}`.to_string());
@@ -868,27 +2151,64 @@ impl Debug for Response {
     }
 }
 
-/// What kind of failure an Error is.
+/// The kind of an [`Error`], returned by [`Error::kind`].
+///
+/// reqwest has no such type, only the `is_*` methods of its error; they
+/// are here too ([`Error::is_timeout`] and the like).
+///
+/// # Examples
+///
+/// ```
+/// use std::http::{Client, ErrorKind};
+///
+/// let err = Client::new().get("not a url").send().unwrap_err();
+/// assert_eq(err.kind(), ErrorKind::Builder);
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ErrorKind {
-    /// A bad URL, or an unsupported scheme.
+    /// The request could not be built: a bad URL, an unsupported scheme, or
+    /// a body that could not be serialized.
     Builder,
-    /// Connecting or sending failed.
+    /// Connecting failed (the host could not be resolved, the connection
+    /// was refused, or the TLS handshake failed), or the server closed the
+    /// connection before responding.
     Connect,
-    /// A timeout.
+    /// A connect, read or write took longer than its timeout.
     Timeout,
-    /// Too many redirects.
+    /// A redirect was not followed because there were too many.
     Redirect,
-    /// A 4xx or 5xx status (error_for_status).
+    /// The response's status was a client or server error (from
+    /// [`Response::error_for_status`]).
     Status,
-    /// The peer broke the protocol.
+    /// The server broke the HTTP protocol (a malformed status line,
+    /// headers or framing).
     Protocol,
-    /// Reading or decoding the body failed.
+    /// The body could not be decoded (as from [`Response::json`]).
     Decode,
+    /// Another I/O error, as from reading a body.
     Io,
 }
 
-/// An HTTP failure.
+/// The error type of the HTTP client and of reading a message's body.
+///
+/// Its [`ErrorKind`] tells what failed ([`Error::kind`], or the `is_*`
+/// methods as reqwest's). Displayed, it shows a message and, when known,
+/// the URL of the request.
+///
+/// An `io::Error` converts to an `Error` (of kind [`ErrorKind::Io`], or
+/// [`ErrorKind::Timeout`] for a timeout), and an `Error` to an
+/// `io::Error`, so `?` works between them.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::{Response, StatusCode};
+///
+/// let err = Response::new(StatusCode::SERVICE_UNAVAILABLE).error_for_status().unwrap_err();
+/// assert(err.is_status());
+/// assert_eq(err.status(), Some(StatusCode::SERVICE_UNAVAILABLE));
+/// assert_eq(err.to_string(), "HTTP status 503 Service Unavailable");
+/// ```
 #[derive(Clone)]
 pub struct Error {
     kind: ErrorKind,
@@ -907,33 +2227,121 @@ impl Error {
         }
     }
 
+    /// Returns the kind of the error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{ErrorKind, Response};
+    ///
+    /// let err = Response::from_body("{").json::<i32>().unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::Decode);
+    /// ```
     pub fn kind(&self) -> ErrorKind {
         self.kind.clone()
     }
+    /// Returns the status of the response, for an error from
+    /// [`Response::error_for_status`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let err = Response::new(StatusCode::FORBIDDEN).error_for_status().unwrap_err();
+    /// assert_eq(err.status(), Some(StatusCode::FORBIDDEN));
+    /// ```
     pub fn status(&self) -> Option<StatusCode> {
         self.status
     }
+    /// Returns the URL of the request that failed, if known.
+    ///
+    /// Errors from connecting, sending and redirects have it, as do status
+    /// errors of received responses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// // Nothing listens on port 1.
+    /// let err = Client::new().get("http://127.0.0.1:1/").send().unwrap_err();
+    /// assert(err.is_connect());
+    /// assert_eq(err.url().unwrap().as_str(), "http://127.0.0.1:1/");
+    /// ```
     pub fn url(&self) -> Option<&Url> {
         match &self.url {
             Some(u) => Some(u),
             None => None,
         }
     }
+    /// Returns `true` if the error is a timeout ([`ErrorKind::Timeout`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::http::Client;
+    /// use std::time::Duration;
+    ///
+    /// let client = Client::builder().timeout(Duration::from_millis(1)).build().unwrap();
+    /// match client.get("https://example.com/").send() {
+    ///     Err(e) if e.is_timeout() => println("timed out"),
+    ///     Err(e) => println(`failed: ${e}`),
+    ///     Ok(resp) => println(`status: ${resp.status()}`),
+    /// }
+    /// ```
     pub fn is_timeout(&self) -> bool {
         self.kind == ErrorKind::Timeout
     }
+    /// Returns `true` if the error is from connecting
+    /// ([`ErrorKind::Connect`]).
     pub fn is_connect(&self) -> bool {
         self.kind == ErrorKind::Connect
     }
+    /// Returns `true` if the error is from
+    /// [`Response::error_for_status`] ([`ErrorKind::Status`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, StatusCode};
+    ///
+    /// let err = Response::new(StatusCode::BAD_GATEWAY).error_for_status().unwrap_err();
+    /// assert(err.is_status());
+    /// ```
     pub fn is_status(&self) -> bool {
         self.kind == ErrorKind::Status
     }
+    /// Returns `true` if the error is from following too many redirects
+    /// ([`ErrorKind::Redirect`]).
     pub fn is_redirect(&self) -> bool {
         self.kind == ErrorKind::Redirect
     }
+    /// Returns `true` if the request could not be built
+    /// ([`ErrorKind::Builder`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let err = Client::new().get("ftp://example.com/").send().unwrap_err();
+    /// assert(err.is_builder());
+    /// ```
     pub fn is_builder(&self) -> bool {
         self.kind == ErrorKind::Builder
     }
+    /// Returns `true` if the body could not be decoded
+    /// ([`ErrorKind::Decode`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Response;
+    ///
+    /// let err = Response::from_body("[1, 2").json::<Vec<i32>>().unwrap_err();
+    /// assert(err.is_decode());
+    /// ```
     pub fn is_decode(&self) -> bool {
         self.kind == ErrorKind::Decode
     }

@@ -1,7 +1,81 @@
-//! Deserialization (as Rust's serde::de; no lifetimes, so no borrowed
-//! strings): a Deserialize type asks a Deserializer, the data format, for
-//! a kind of value and passes a Visitor that builds it from what the input
-//! holds.
+//! Generic deserialization: the [`Deserialize`] and [`Deserializer`]
+//! traits, and the [`Visitor`] a type gives a deserializer.
+//!
+//! This is serde's `de` module without lifetimes: there is no `'de`, and
+//! nothing is borrowed from the input (navi has a garbage collector, so a
+//! deserialized `&str` or `&T` points to a new allocation instead).
+//!
+//! Deserialization goes in two directions. A type that implements
+//! [`Deserialize`] asks a [`Deserializer`] (the data format, such as
+//! [`std::json`](crate::json)) for the kind of value it expects by calling
+//! one of its `deserialize_*` methods, and passes a [`Visitor`]. The
+//! deserializer reads the input and calls the visitor's `visit_*` method
+//! for what it actually finds; the visitor builds the value, or returns an
+//! error if it cannot accept that kind of input. Compound inputs come to
+//! the visitor as a [`SeqAccess`], a [`MapAccess`] or an [`EnumAccess`],
+//! from which it pulls the elements.
+//!
+//! A self-describing format like JSON can ignore what it is asked for and
+//! report what the input holds; the type's visitor then decides. Every
+//! `deserialize_*` method has a default implementation that calls
+//! [`Deserializer::deserialize_any`], so only that one has to be written.
+//!
+//! Most types derive [`Deserialize`] with `#[derive(Deserialize)]` (see
+//! [`crate::serde`]). std implements it for the primitive types, `String`,
+//! `&str`, `Option`, references, `()`, pairs and triples, arrays, `Vec`,
+//! `VecDeque`, `HashSet`, `BTreeSet`, `HashMap` and `BTreeMap`.
+//!
+//! # Examples
+//!
+//! Implementing [`Deserialize`] by hand with a [`Visitor`], for a type
+//! written as a string:
+//!
+//! ```
+//! use std::fmt;
+//! use std::json;
+//! use std::serde::de::{self, Deserialize, Deserializer, Unexpected, Visitor};
+//!
+//! #[derive(Debug, PartialEq)]
+//! struct Celsius(f64);
+//!
+//! struct CelsiusVisitor;
+//!
+//! impl Visitor for CelsiusVisitor {
+//!     type Value = Celsius;
+//!
+//!     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+//!         formatter.write_str("a temperature such as \"21.5C\"")
+//!     }
+//!
+//!     fn visit_str<E: de::Error>(self, v: &str) -> Result<Celsius, E> {
+//!         match v.strip_suffix("C").and_then(|n| n.parse::<f64>().ok()) {
+//!             Some(x) => Ok(Celsius(x)),
+//!             None => Err(E::invalid_value(Unexpected::Str(v.to_string()), &self)),
+//!         }
+//!     }
+//! }
+//!
+//! impl Deserialize for Celsius {
+//!     fn deserialize<D: Deserializer>(deserializer: D) -> Result<Celsius, D::Error> {
+//!         deserializer.deserialize_str(CelsiusVisitor)
+//!     }
+//! }
+//!
+//! let t: Celsius = json::from_str("\"21.5C\"").unwrap();
+//! assert_eq(t, Celsius(21.5));
+//!
+//! // A string the visitor does not accept, and a number where it wants a string.
+//! let e = json::from_str::<Celsius>("\"warm\"").unwrap_err();
+//! assert_eq(
+//!     e.to_string(),
+//!     "json: invalid value: string \"warm\", expected a temperature such as \"21.5C\" at offset 6",
+//! );
+//! let e = json::from_str::<Celsius>("3").unwrap_err();
+//! assert_eq(
+//!     e.to_string(),
+//!     "json: invalid type: integer `3`, expected a temperature such as \"21.5C\" at offset 1",
+//! );
+//! ```
 
 use crate::cmp::{Eq, Ord};
 use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -9,29 +83,124 @@ use crate::fmt::{self, Display, Formatter};
 use crate::hash::Hash;
 use crate::marker::PhantomData;
 
-/// An error a Deserializer can make (as serde's de::Error): from a message,
-/// or one of the usual mistakes.
+/// The error type a [`Deserializer`] returns, as serde's `de::Error`.
+///
+/// [`Deserialize`] implementations and [`Visitor`]s use it to make errors
+/// of whatever deserializer they are running against. Only
+/// [`custom`](Error::custom) must be implemented; the other constructors
+/// make serde's usual messages with it.
+///
+/// # Examples
+///
+/// ```
+/// use std::json;
+/// use std::serde::de::Error;
+///
+/// let e = <json::Error as Error>::missing_field("id");
+/// assert_eq(e.to_string(), "json: missing field `id`");
+///
+/// let e = <json::Error as Error>::unknown_field("nmae", &["name", "age"]);
+/// assert_eq(e.to_string(), "json: unknown field `nmae`, expected one of `name`, `age`");
+/// ```
 pub trait Error: Display {
+    /// Makes an error from a message, for a [`Deserialize`] implementation
+    /// or [`Visitor`] that fails for a reason of its own.
+    ///
+    /// The message should not be capitalized and should not end with a
+    /// period.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::json;
+    /// use std::serde::de::Error;
+    ///
+    /// let e = <json::Error as Error>::custom("port must not be 0");
+    /// assert_eq(e.to_string(), "json: port must not be 0");
+    /// ```
     fn custom<T: Display>(msg: T) -> Self;
 
+    /// An error for input of the wrong kind: `unexp` is what was found,
+    /// `exp` what was wanted (usually the visitor, `&self`).
+    ///
+    /// The message is ``invalid type: <unexp>, expected <exp>``. Use it
+    /// when the input is the wrong kind of value, and
+    /// [`invalid_value`](Error::invalid_value) when it is the right kind
+    /// with a wrong value.
     fn invalid_type(unexp: Unexpected, exp: &dyn Expected) -> Self {
         Self::custom(`invalid type: ${unexp}, expected ${ExpectedText(exp)}`)
     }
+    /// An error for input of the right kind but a wrong value: `unexp` is
+    /// what was found, `exp` what was wanted.
+    ///
+    /// The message is ``invalid value: <unexp>, expected <exp>``; for
+    /// example std's `u8` reports `300` as
+    /// ``invalid value: integer `300`, expected u8``.
     fn invalid_value(unexp: Unexpected, exp: &dyn Expected) -> Self {
         Self::custom(`invalid value: ${unexp}, expected ${ExpectedText(exp)}`)
     }
+    /// An error for a sequence or map with the wrong number of elements:
+    /// `len` is how many were found, `exp` what was wanted.
+    ///
+    /// The message is ``invalid length <len>, expected <exp>``.
     fn invalid_length(len: usize, exp: &dyn Expected) -> Self {
         Self::custom(`invalid length ${len}, expected ${ExpectedText(exp)}`)
     }
+    /// An error for an enum variant that is not one of `expected`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::json;
+    /// use std::serde::de::Error;
+    ///
+    /// let e = <json::Error as Error>::unknown_variant("Purple", &["Red", "Green"]);
+    /// assert_eq(e.to_string(), "json: unknown variant `Purple`, expected one of `Red`, `Green`");
+    /// ```
     fn unknown_variant(variant: &str, expected: &[&str]) -> Self {
         Self::custom(`unknown variant \`${variant}\`, ${one_of(expected)}`)
     }
+    /// An error for a struct field that is not one of `expected` (the
+    /// derive reports it with `#[serde(deny_unknown_fields)]`; otherwise
+    /// unknown fields are skipped).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::json;
+    /// use std::serde::de::Error;
+    ///
+    /// let e = <json::Error as Error>::unknown_field("colour", &["color"]);
+    /// assert_eq(e.to_string(), "json: unknown field `colour`, expected `color`");
+    /// ```
     fn unknown_field(field: &str, expected: &[&str]) -> Self {
         Self::custom(`unknown field \`${field}\`, ${one_of(expected)}`)
     }
+    /// An error for a struct field missing from the input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::json;
+    /// use std::serde::de::Error;
+    ///
+    /// let e = <json::Error as Error>::missing_field("name");
+    /// assert_eq(e.to_string(), "json: missing field `name`");
+    /// ```
     fn missing_field(field: &str) -> Self {
         Self::custom(`missing field \`${field}\``)
     }
+    /// An error for a struct field given more than once in the input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::json;
+    /// use std::serde::de::Error;
+    ///
+    /// let e = <json::Error as Error>::duplicate_field("id");
+    /// assert_eq(e.to_string(), "json: duplicate field `id`");
+    /// ```
     fn duplicate_field(field: &str) -> Self {
         Self::custom(`duplicate field \`${field}\``)
     }
@@ -60,27 +229,61 @@ fn one_of(names: &[&str]) -> String {
     s
 }
 
-/// What a Deserializer found where something else was expected (as
-/// serde's).
+/// What a deserializer found in the input where something else was
+/// expected, for the messages of [`Error::invalid_type`] and
+/// [`Error::invalid_value`].
+///
+/// As serde's `Unexpected`, but `Str` and `Other` own their `String` (and
+/// there is no `Bytes` payload or `Other(&str)` borrowing from the input).
+/// Its [`Display`] is the phrase used in error messages.
+///
+/// # Examples
+///
+/// ```
+/// use std::serde::de::Unexpected;
+///
+/// assert_eq(Unexpected::Bool(true).to_string(), "boolean `true`");
+/// assert_eq(Unexpected::Signed(-3).to_string(), "integer `-3`");
+/// assert_eq(Unexpected::Str("abc".to_string()).to_string(), "string \"abc\"");
+/// assert_eq(Unexpected::Seq.to_string(), "sequence");
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub enum Unexpected {
+    /// A boolean (shown as ``boolean `true` ``).
     Bool(bool),
+    /// An unsigned integer (shown as ``integer `1` ``).
     Unsigned(u64),
+    /// A signed integer (shown as ``integer `-1` ``).
     Signed(i64),
+    /// A floating-point number (shown as ``floating point `1.5` ``).
     Float(f64),
+    /// A character (shown as ``character `c` ``).
     Char(char),
+    /// A string (shown as `string "text"`).
     Str(String),
+    /// A byte array.
     Bytes,
+    /// The unit value `()` (JSON's `null`).
     Unit,
+    /// An `Option` value.
     Option,
+    /// A newtype struct.
     NewtypeStruct,
+    /// A sequence (JSON's array).
     Seq,
+    /// A map (JSON's object).
     Map,
+    /// An enum.
     Enum,
+    /// A unit variant of an enum.
     UnitVariant,
+    /// A newtype variant of an enum.
     NewtypeVariant,
+    /// A tuple variant of an enum.
     TupleVariant,
+    /// A struct variant of an enum.
     StructVariant,
+    /// Anything else, described by the string (shown as it is).
     Other(String),
 }
 
@@ -109,8 +312,33 @@ impl Display for Unexpected {
     }
 }
 
-/// What was expected (as serde's: a Visitor's expecting, or a text).
+/// What a deserializer expected, for the messages of [`Error`]'s
+/// constructors, as serde's `Expected`.
+///
+/// Every [`Visitor`] is one (its [`expecting`](Visitor::expecting) text),
+/// which is why visitors pass `&self` as the expected value.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+/// use std::json;
+/// use std::serde::de::{Error, Expected};
+///
+/// struct Between(usize, usize);
+///
+/// impl Expected for Between {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         f.write_str(`between ${self.0} and ${self.1} elements`.to_string().as_str())
+///     }
+/// }
+///
+/// let e = <json::Error as Error>::invalid_length(5, &Between(1, 3));
+/// assert_eq(e.to_string(), "json: invalid length 5, expected between 1 and 3 elements");
+/// ```
 pub trait Expected {
+    /// Writes what was expected, as a phrase such as `a string` that
+    /// follows the word "expected".
     fn fmt(&self, f: &mut Formatter) -> fmt::Result;
 }
 
@@ -135,73 +363,263 @@ impl Display for ExpectedText {
     }
 }
 
-/// A value that can be deserialized (as serde's Deserialize; derive it with
-/// #[derive(Deserialize)]).
+/// A data structure that can be deserialized from any data format
+/// supported by serde.
+///
+/// std implements `Deserialize` for its common types (listed in the
+/// [module documentation](crate::serde::de)). Your own structs and enums
+/// usually derive it with `#[derive(Deserialize)]` (imported with
+/// `use std::serde::Deserialize;`, which brings in both the trait and the
+/// derive); the `#[serde(...)]` attributes described in [`crate::serde`]
+/// adjust what the derive reads. Implementing it by hand means asking the
+/// [`Deserializer`] for a kind of value with a [`Visitor`] (see the module
+/// documentation for an example).
+///
+/// # Examples
+///
+/// ```
+/// use std::json;
+/// use std::serde::Deserialize;
+///
+/// #[derive(Deserialize, Debug, PartialEq)]
+/// struct Point {
+///     x: i32,
+///     y: i32,
+/// }
+///
+/// let p: Point = json::from_str("{\"y\": 2, \"x\": 1}").unwrap();
+/// assert_eq(p, Point { x: 1, y: 2 });
+///
+/// let e = json::from_str::<Point>("{\"x\": 1}").unwrap_err();
+/// assert_eq(e.to_string(), "json: missing field `y` at offset 8");
+/// ```
 pub trait Deserialize {
+    /// Deserializes a value of this type from the given deserializer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error if the input is malformed or does
+    /// not hold a value of this type.
+    ///
+    /// # Examples
+    ///
+    /// Any deserializer works, such as this one, which holds one integer:
+    ///
+    /// ```
+    /// use std::fmt;
+    /// use std::serde::de::{self, Deserialize, Deserializer, Visitor};
+    ///
+    /// #[derive(Debug)]
+    /// struct Error(String);
+    ///
+    /// impl fmt::Display for Error {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         f.write_str(self.0.as_str())
+    ///     }
+    /// }
+    ///
+    /// impl de::Error for Error {
+    ///     fn custom<T: fmt::Display>(msg: T) -> Error {
+    ///         Error(msg.to_string())
+    ///     }
+    /// }
+    ///
+    /// struct Int(i64);
+    ///
+    /// impl Deserializer for Int {
+    ///     type Error = Error;
+    ///
+    ///     fn deserialize_any<V: Visitor>(self, visitor: V) -> Result<V::Value, Error> {
+    ///         visitor.visit_i64(self.0)
+    ///     }
+    /// }
+    ///
+    /// assert_eq(i32::deserialize(Int(7)).unwrap(), 7);
+    /// assert_eq(f64::deserialize(Int(7)).unwrap(), 7.0);
+    /// let e = u8::deserialize(Int(300)).unwrap_err();
+    /// assert_eq(e.to_string(), "invalid value: integer `300`, expected u8");
+    /// ```
     fn deserialize<D: Deserializer>(deserializer: D) -> Result<Self, D::Error>;
 }
 
-/// A data format (as serde's Deserializer): asked for a kind of value, it
-/// gives what the input holds to the visitor (deserialize_any: whatever it
-/// holds, for a self-describing format).
+/// A data format that can deserialize any data structure supported by
+/// serde.
+///
+/// A [`Deserialize`] implementation calls one of the `deserialize_*`
+/// methods to say what kind of value it expects, and passes a [`Visitor`].
+/// The deserializer reads the input and calls the visitor's `visit_*`
+/// method for what it holds: a self-describing format such as JSON reports
+/// whatever the input holds (the visitor rejects what it cannot take),
+/// while a format that does not describe its data relies on the hint.
+///
+/// Only [`deserialize_any`](Deserializer::deserialize_any) is required:
+/// every other method's default implementation calls it (or a related
+/// method, as noted on each). The methods take `self` by value, so a
+/// deserializer reads exactly one value; formats usually implement this
+/// trait for `&mut` a reader type ([`std::json`](crate::json)'s is
+/// `&mut json::Reader`). serde's `i128`/`u128` methods are not provided.
+///
+/// # Examples
+///
+/// A deserializer reading a value from a list of words, "true"/"false",
+/// integers and anything else as strings:
+///
+/// ```
+/// use std::fmt;
+/// use std::serde::de::{self, Deserialize, Deserializer, Visitor};
+///
+/// #[derive(Debug)]
+/// struct Error(String);
+///
+/// impl fmt::Display for Error {
+///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+///         f.write_str(self.0.as_str())
+///     }
+/// }
+///
+/// impl de::Error for Error {
+///     fn custom<T: fmt::Display>(msg: T) -> Error {
+///         Error(msg.to_string())
+///     }
+/// }
+///
+/// struct Word {
+///     text: String,
+/// }
+///
+/// impl Deserializer for Word {
+///     type Error = Error;
+///
+///     fn deserialize_any<V: Visitor>(self, visitor: V) -> Result<V::Value, Error> {
+///         match self.text.as_str() {
+///             "true" => visitor.visit_bool(true),
+///             "false" => visitor.visit_bool(false),
+///             t => match t.parse::<i64>() {
+///                 Ok(n) => visitor.visit_i64(n),
+///                 Err(_) => visitor.visit_string(self.text),
+///             },
+///         }
+///     }
+/// }
+///
+/// fn word(s: &str) -> Word {
+///     Word { text: s.to_string() }
+/// }
+///
+/// assert_eq(bool::deserialize(word("true")).unwrap(), true);
+/// assert_eq(u16::deserialize(word("8080")).unwrap(), 8080);
+/// assert_eq(String::deserialize(word("hello")).unwrap(), "hello");
+/// let e = u16::deserialize(word("hello")).unwrap_err();
+/// assert_eq(e.to_string(), "invalid type: string \"hello\", expected u16");
+/// ```
 pub trait Deserializer {
+    /// The error type when deserialization fails.
     type Error: Error;
 
+    /// Reads whatever value the input holds and passes it to the visitor's
+    /// matching `visit_*` method.
+    ///
+    /// Self-describing formats implement it; a format that cannot tell
+    /// what its input holds returns an error.
     fn deserialize_any<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error>;
+    /// Hints that the type expects a `bool`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_bool<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects an `i8`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_i8<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects an `i16`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_i16<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects an `i32`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_i32<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects an `i64` (std's `isize` asks for this
+    /// too). The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_i64<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a `u8`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_u8<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a `u16`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_u16<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a `u32`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_u32<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a `u64` (std's `usize` asks for this
+    /// too). The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_u64<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects an `f32`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_f32<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects an `f64`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_f64<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a `char`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_char<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a string and only needs to look at it
+    /// ([`Visitor::visit_str`]). The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_str<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a string it keeps
+    /// ([`Visitor::visit_string`] can hand over an owned `String`). The
+    /// default calls [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_string<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects bytes and only needs to look at them.
+    /// The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_bytes<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects bytes it keeps. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_byte_buf<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects an optional value: the deserializer
+    /// calls [`Visitor::visit_none`] or [`Visitor::visit_some`]. The
+    /// default calls [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_option<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects `()`. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_unit<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a unit struct named `name`. The default
+    /// calls [`deserialize_unit`](Deserializer::deserialize_unit).
     fn deserialize_unit_struct<V: Visitor>(
         self,
         name: &str,
@@ -209,6 +627,9 @@ pub trait Deserializer {
     ) -> Result<V::Value, Self::Error> {
         self.deserialize_unit(visitor)
     }
+    /// Hints that the type expects a newtype struct named `name`; formats
+    /// usually pass its content to [`Visitor::visit_newtype_struct`]. The
+    /// default calls [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_newtype_struct<V: Visitor>(
         self,
         name: &str,
@@ -216,9 +637,14 @@ pub trait Deserializer {
     ) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a sequence of values. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_seq<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a sequence of `len` values (a tuple or
+    /// an array). The default calls
+    /// [`deserialize_seq`](Deserializer::deserialize_seq).
     fn deserialize_tuple<V: Visitor>(
         self,
         len: usize,
@@ -226,6 +652,9 @@ pub trait Deserializer {
     ) -> Result<V::Value, Self::Error> {
         self.deserialize_seq(visitor)
     }
+    /// Hints that the type expects a tuple struct named `name` with `len`
+    /// fields. The default calls
+    /// [`deserialize_seq`](Deserializer::deserialize_seq).
     fn deserialize_tuple_struct<V: Visitor>(
         self,
         name: &str,
@@ -234,9 +663,14 @@ pub trait Deserializer {
     ) -> Result<V::Value, Self::Error> {
         self.deserialize_seq(visitor)
     }
+    /// Hints that the type expects a map of key-value pairs. The default
+    /// calls [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_map<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects a struct named `name` with the given
+    /// field names. The default calls
+    /// [`deserialize_map`](Deserializer::deserialize_map).
     fn deserialize_struct<V: Visitor>(
         self,
         name: &str,
@@ -245,6 +679,9 @@ pub trait Deserializer {
     ) -> Result<V::Value, Self::Error> {
         self.deserialize_map(visitor)
     }
+    /// Hints that the type expects an enum named `name` with the given
+    /// variant names; formats pass it to [`Visitor::visit_enum`]. The
+    /// default calls [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_enum<V: Visitor>(
         self,
         name: &str,
@@ -253,86 +690,214 @@ pub trait Deserializer {
     ) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
+    /// Hints that the type expects the name of a struct field or an enum
+    /// variant. The default calls
+    /// [`deserialize_str`](Deserializer::deserialize_str).
     fn deserialize_identifier<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_str(visitor)
     }
+    /// Hints that the type will ignore the value, whatever it is (as
+    /// [`IgnoredAny`] does for unknown fields); formats may skip it
+    /// quickly. The default calls
+    /// [`deserialize_any`](Deserializer::deserialize_any).
     fn deserialize_ignored_any<V: Visitor>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.deserialize_any(visitor)
     }
 
-    /// Whether the format is meant for people (as serde's: JSON is).
+    /// Whether the input is in a human-readable form, for types that
+    /// have both a readable and a compact form (see
+    /// [`Serializer::is_human_readable`](crate::serde::Serializer::is_human_readable)).
+    ///
+    /// The default returns `true`; JSON is human-readable.
     fn is_human_readable(&self) -> bool {
         true
     }
 }
 
-/// Builds a value from what a Deserializer finds (as serde's Visitor): each
-/// visit method not provided rejects that kind of input.
+/// Builds a value from what a [`Deserializer`] finds in the input, as
+/// serde's `Visitor`.
+///
+/// A [`Deserialize`] implementation passes a visitor to the deserializer,
+/// which calls the `visit_*` method for the kind of value the input holds.
+/// Implement the methods for the kinds the type accepts; the default of
+/// each other method rejects its input with [`Error::invalid_type`] (whose
+/// message uses [`expecting`](Visitor::expecting)). Several defaults
+/// forward instead, so one method covers a family: the smaller integers to
+/// [`visit_i64`](Visitor::visit_i64) and [`visit_u64`](Visitor::visit_u64),
+/// `f32` to [`visit_f64`](Visitor::visit_f64), `char` and `String` to
+/// [`visit_str`](Visitor::visit_str), and `Vec<u8>` to
+/// [`visit_bytes`](Visitor::visit_bytes).
+///
+/// # Examples
+///
+/// A visitor taking an integer, or a string holding one:
+///
+/// ```
+/// use std::fmt;
+/// use std::json;
+/// use std::serde::de::{self, Deserialize, Deserializer, Unexpected, Visitor};
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// struct Port(u16);
+///
+/// struct PortVisitor;
+///
+/// impl Visitor for PortVisitor {
+///     type Value = Port;
+///
+///     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+///         formatter.write_str("a port number")
+///     }
+///
+///     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Port, E> {
+///         if v > 65535 {
+///             return Err(E::invalid_value(Unexpected::Unsigned(v), &self));
+///         }
+///         Ok(Port(v as u16))
+///     }
+///
+///     fn visit_str<E: de::Error>(self, v: &str) -> Result<Port, E> {
+///         match v.parse::<u16>() {
+///             Ok(n) => Ok(Port(n)),
+///             Err(_) => Err(E::invalid_value(Unexpected::Str(v.to_string()), &self)),
+///         }
+///     }
+/// }
+///
+/// impl Deserialize for Port {
+///     fn deserialize<D: Deserializer>(deserializer: D) -> Result<Port, D::Error> {
+///         deserializer.deserialize_any(PortVisitor)
+///     }
+/// }
+///
+/// let ports: Vec<Port> = json::from_str("[80, \"8080\"]").unwrap();
+/// assert_eq(ports, Vec::from([Port(80), Port(8080)]));
+///
+/// let e = json::from_str::<Port>("true").unwrap_err();
+/// assert_eq(e.to_string(), "json: invalid type: boolean `true`, expected a port number at offset 4");
+/// ```
 pub trait Visitor {
+    /// The type of value this visitor builds.
     type Value;
 
-    /// What the visitor expects ("a string", "struct Point"), for errors.
+    /// Writes what the visitor expects, for error messages: a phrase that
+    /// follows "expected", such as `a string` or `struct Point`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    /// use std::serde::de::Visitor;
+    ///
+    /// struct Even;
+    ///
+    /// impl Visitor for Even {
+    ///     type Value = u64;
+    ///
+    ///     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    ///         formatter.write_str("an even number")
+    ///     }
+    /// }
+    /// ```
     fn expecting(&self, formatter: &mut Formatter) -> fmt::Result;
 
+    /// The input holds a `bool`. The default rejects it.
     fn visit_bool<E: Error>(self, v: bool) -> Result<Self::Value, E> {
         Err(E::invalid_type(Unexpected::Bool(v), &self))
     }
+    /// The input holds an `i8`. The default calls
+    /// [`visit_i64`](Visitor::visit_i64).
     fn visit_i8<E: Error>(self, v: i8) -> Result<Self::Value, E> {
         self.visit_i64(v as i64)
     }
+    /// The input holds an `i16`. The default calls
+    /// [`visit_i64`](Visitor::visit_i64).
     fn visit_i16<E: Error>(self, v: i16) -> Result<Self::Value, E> {
         self.visit_i64(v as i64)
     }
+    /// The input holds an `i32`. The default calls
+    /// [`visit_i64`](Visitor::visit_i64).
     fn visit_i32<E: Error>(self, v: i32) -> Result<Self::Value, E> {
         self.visit_i64(v as i64)
     }
+    /// The input holds an `i64` (JSON reports negative integers this way).
+    /// The default rejects it.
     fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
         Err(E::invalid_type(Unexpected::Signed(v), &self))
     }
+    /// The input holds a `u8`. The default calls
+    /// [`visit_u64`](Visitor::visit_u64).
     fn visit_u8<E: Error>(self, v: u8) -> Result<Self::Value, E> {
         self.visit_u64(v as u64)
     }
+    /// The input holds a `u16`. The default calls
+    /// [`visit_u64`](Visitor::visit_u64).
     fn visit_u16<E: Error>(self, v: u16) -> Result<Self::Value, E> {
         self.visit_u64(v as u64)
     }
+    /// The input holds a `u32`. The default calls
+    /// [`visit_u64`](Visitor::visit_u64).
     fn visit_u32<E: Error>(self, v: u32) -> Result<Self::Value, E> {
         self.visit_u64(v as u64)
     }
+    /// The input holds a `u64` (JSON reports non-negative integers this
+    /// way). The default rejects it.
     fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
         Err(E::invalid_type(Unexpected::Unsigned(v), &self))
     }
+    /// The input holds an `f32`. The default calls
+    /// [`visit_f64`](Visitor::visit_f64).
     fn visit_f32<E: Error>(self, v: f32) -> Result<Self::Value, E> {
         self.visit_f64(v as f64)
     }
+    /// The input holds an `f64`. The default rejects it.
     fn visit_f64<E: Error>(self, v: f64) -> Result<Self::Value, E> {
         Err(E::invalid_type(Unexpected::Float(v), &self))
     }
+    /// The input holds a `char`. The default calls
+    /// [`visit_str`](Visitor::visit_str) with a string of that one
+    /// character.
     fn visit_char<E: Error>(self, v: char) -> Result<Self::Value, E> {
         let mut s = String::new();
         s.push(v);
         self.visit_str(s.as_str())
     }
+    /// The input holds a string. The default rejects it.
     fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
         Err(E::invalid_type(Unexpected::Str(v.to_string()), &self))
     }
+    /// The input holds a string the deserializer hands over, which the
+    /// visitor may keep without copying it. The default calls
+    /// [`visit_str`](Visitor::visit_str).
     fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
         self.visit_str(v.as_str())
     }
+    /// The input holds bytes. The default rejects them.
     fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
         Err(E::invalid_type(Unexpected::Bytes, &self))
     }
+    /// The input holds bytes the deserializer hands over. The default calls
+    /// [`visit_bytes`](Visitor::visit_bytes).
     fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
         self.visit_bytes(v.as_slice())
     }
+    /// The input holds an absent optional value (JSON's `null`, read with
+    /// [`Deserializer::deserialize_option`]). The default rejects it.
     fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
         Err(E::invalid_type(Unexpected::Option, &self))
     }
+    /// The input holds a present optional value, which the visitor reads
+    /// from `deserializer` (as `Option<T>` does with `T::deserialize`). The
+    /// default rejects it.
     fn visit_some<D: Deserializer>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         Err(<D::Error as Error>::invalid_type(Unexpected::Option, &self))
     }
+    /// The input holds `()` (JSON's `null`). The default rejects it.
     fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
         Err(E::invalid_type(Unexpected::Unit, &self))
     }
+    /// The input holds a newtype struct, whose content the visitor reads
+    /// from `deserializer`. The default rejects it.
     fn visit_newtype_struct<D: Deserializer>(
         self,
         deserializer: D,
@@ -342,31 +907,156 @@ pub trait Visitor {
             &self,
         ))
     }
+    /// The input holds a sequence, whose elements the visitor reads from
+    /// `seq` (see [`SeqAccess`] for an example). The default rejects it.
     fn visit_seq<A: SeqAccess>(self, seq: A) -> Result<Self::Value, A::Error> {
         Err(<A::Error as Error>::invalid_type(Unexpected::Seq, &self))
     }
+    /// The input holds a map, whose entries the visitor reads from `map`
+    /// (see [`MapAccess`] for an example). The default rejects it.
     fn visit_map<A: MapAccess>(self, map: A) -> Result<Self::Value, A::Error> {
         Err(<A::Error as Error>::invalid_type(Unexpected::Map, &self))
     }
+    /// The input holds an enum variant, which the visitor reads from
+    /// `data` (see [`EnumAccess`] for an example). The default rejects it.
     fn visit_enum<A: EnumAccess>(self, data: A) -> Result<Self::Value, A::Error> {
         Err(<A::Error as Error>::invalid_type(Unexpected::Enum, &self))
     }
 }
 
-/// The elements of a sequence, one at a time.
+/// Gives a [`Visitor`] the elements of a sequence, one at a time.
+///
+/// The deserializer passes it to [`Visitor::visit_seq`].
+///
+/// # Examples
+///
+/// A visitor adding up a list of numbers:
+///
+/// ```
+/// use std::fmt;
+/// use std::json;
+/// use std::serde::de::{Deserialize, Deserializer, SeqAccess, Visitor};
+///
+/// struct Total(i64);
+///
+/// struct TotalVisitor;
+///
+/// impl Visitor for TotalVisitor {
+///     type Value = Total;
+///
+///     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+///         formatter.write_str("a list of integers")
+///     }
+///
+///     fn visit_seq<A: SeqAccess>(self, seq: A) -> Result<Total, A::Error> {
+///         let mut seq = seq;
+///         let mut sum = 0;
+///         while let Some(n) = seq.next_element::<i64>()? {
+///             sum += n;
+///         }
+///         Ok(Total(sum))
+///     }
+/// }
+///
+/// impl Deserialize for Total {
+///     fn deserialize<D: Deserializer>(deserializer: D) -> Result<Total, D::Error> {
+///         deserializer.deserialize_seq(TotalVisitor)
+///     }
+/// }
+///
+/// let t: Total = json::from_str("[1, 2, 3, 4]").unwrap();
+/// assert_eq(t.0, 10);
+/// ```
 pub trait SeqAccess {
+    /// The error type of the deserializer.
     type Error: Error;
+    /// Reads the next element as a `T`, or returns `Ok(None)` at the end
+    /// of the sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is malformed or the element is not a
+    /// `T`.
     fn next_element<T: Deserialize>(&mut self) -> Result<Option<T>, Self::Error>;
+    /// The number of elements left, if known. The default returns `None`.
     fn size_hint(&self) -> Option<usize> {
         None
     }
 }
 
-/// The entries of a map, a key then its value.
+/// Gives a [`Visitor`] the entries of a map, each a key then its value.
+///
+/// The deserializer passes it to [`Visitor::visit_map`]. Call
+/// [`next_key`](MapAccess::next_key) then
+/// [`next_value`](MapAccess::next_value) for each entry, or
+/// [`next_entry`](MapAccess::next_entry) for both.
+///
+/// # Examples
+///
+/// A visitor keeping a JSON object's entries in their order:
+///
+/// ```
+/// use std::fmt;
+/// use std::json;
+/// use std::serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
+///
+/// struct Ordered(Vec<(String, i32)>);
+///
+/// struct OrderedVisitor;
+///
+/// impl Visitor for OrderedVisitor {
+///     type Value = Ordered;
+///
+///     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+///         formatter.write_str("a map of integers")
+///     }
+///
+///     fn visit_map<A: MapAccess>(self, map: A) -> Result<Ordered, A::Error> {
+///         let mut map = map;
+///         let mut out = Vec::new();
+///         while let Some(key) = map.next_key::<String>()? {
+///             let value = map.next_value::<i32>()?;
+///             out.push((key, value));
+///         }
+///         Ok(Ordered(out))
+///     }
+/// }
+///
+/// impl Deserialize for Ordered {
+///     fn deserialize<D: Deserializer>(deserializer: D) -> Result<Ordered, D::Error> {
+///         deserializer.deserialize_map(OrderedVisitor)
+///     }
+/// }
+///
+/// let o: Ordered = json::from_str("{\"b\": 2, \"a\": 1}").unwrap();
+/// assert_eq(o.0, Vec::from([("b".to_string(), 2), ("a".to_string(), 1)]));
+/// ```
 pub trait MapAccess {
+    /// The error type of the deserializer.
     type Error: Error;
+    /// Reads the next key as a `K`, or returns `Ok(None)` at the end of the
+    /// map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is malformed or the key is not a `K`.
     fn next_key<K: Deserialize>(&mut self) -> Result<Option<K>, Self::Error>;
+    /// Reads the value of the key read last, as a `V`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is malformed or the value is not a
+    /// `V`.
     fn next_value<V: Deserialize>(&mut self) -> Result<V, Self::Error>;
+    /// Reads the next entry, or returns `Ok(None)` at the end of the map.
+    ///
+    /// The default implementation calls [`next_key`](MapAccess::next_key)
+    /// and then [`next_value`](MapAccess::next_value).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is malformed or the key or value has
+    /// the wrong type.
     fn next_entry<K: Deserialize, V: Deserialize>(
         &mut self,
     ) -> Result<Option<(K, V)>, Self::Error> {
@@ -378,24 +1068,126 @@ pub trait MapAccess {
             None => Ok(None),
         }
     }
+    /// The number of entries left, if known. The default returns `None`.
     fn size_hint(&self) -> Option<usize> {
         None
     }
 }
 
-/// An enum's variant: which one, then its content.
+/// Gives a [`Visitor`] an enum variant: first which variant it is, then
+/// (through [`VariantAccess`]) its content.
+///
+/// The deserializer passes it to [`Visitor::visit_enum`], when the type
+/// asked with [`Deserializer::deserialize_enum`]. JSON gives a unit
+/// variant as `"Name"` and the others as `{"Name": content}`.
+///
+/// # Examples
+///
+/// ```
+/// use std::fmt;
+/// use std::json;
+/// use std::serde::de::{self, Deserialize, Deserializer, EnumAccess, VariantAccess, Visitor};
+///
+/// #[derive(Debug, PartialEq, Clone)]
+/// enum Level {
+///     Low,
+///     High,
+///     Custom(u8),
+/// }
+///
+/// const VARIANTS: [&str; 3] = ["Low", "High", "Custom"];
+///
+/// struct LevelVisitor;
+///
+/// impl Visitor for LevelVisitor {
+///     type Value = Level;
+///
+///     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+///         formatter.write_str("enum Level")
+///     }
+///
+///     fn visit_enum<A: EnumAccess>(self, data: A) -> Result<Level, A::Error> {
+///         let (name, variant): (String, A::Variant) = data.variant::<String>()?;
+///         match name.as_str() {
+///             "Low" => {
+///                 variant.unit_variant()?;
+///                 Ok(Level::Low)
+///             }
+///             "High" => {
+///                 variant.unit_variant()?;
+///                 Ok(Level::High)
+///             }
+///             "Custom" => Ok(Level::Custom(variant.newtype_variant::<u8>()?)),
+///             _ => Err(<A::Error as de::Error>::unknown_variant(name.as_str(), &VARIANTS)),
+///         }
+///     }
+/// }
+///
+/// impl Deserialize for Level {
+///     fn deserialize<D: Deserializer>(deserializer: D) -> Result<Level, D::Error> {
+///         deserializer.deserialize_enum("Level", &VARIANTS, LevelVisitor)
+///     }
+/// }
+///
+/// let v: Vec<Level> = json::from_str("[\"Low\", {\"Custom\": 7}, \"High\"]").unwrap();
+/// assert_eq(v, Vec::from([Level::Low, Level::Custom(7), Level::High]));
+///
+/// let e = json::from_str::<Level>("\"Mid\"").unwrap_err();
+/// assert_eq(e.to_string(), "json: unknown variant `Mid`, expected one of `Low`, `High`, `Custom` at offset 5");
+/// ```
 pub trait EnumAccess {
+    /// The error type of the deserializer.
     type Error: Error;
+    /// The [`VariantAccess`] that reads the variant's content.
     type Variant: VariantAccess<Error = Self::Error>;
+    /// Reads which variant the input holds, as a `V` (usually a `String`
+    /// or an identifier type), and returns it with the access to its
+    /// content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not an enum variant, or its name
+    /// is not a `V`.
     fn variant<V: Deserialize>(self) -> Result<(V, Self::Variant), Self::Error>;
 }
 
-/// The content of an enum's variant.
+/// Reads the content of an enum variant, as the kind of variant the
+/// [`Visitor`] expects.
+///
+/// [`EnumAccess::variant`] returns it after the variant's name; call the
+/// one method for that variant's kind (see [`EnumAccess`] for an example).
 pub trait VariantAccess {
+    /// The error type of the deserializer.
     type Error: Error;
+    /// Reads a unit variant (no content).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input has content for the variant.
     fn unit_variant(self) -> Result<(), Self::Error>;
+    /// Reads a newtype variant's one field as a `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input has no content for the variant, or
+    /// the content is not a `T`.
     fn newtype_variant<T: Deserialize>(self) -> Result<T, Self::Error>;
+    /// Reads a tuple variant's `len` fields: passes them to the visitor's
+    /// [`visit_seq`](Visitor::visit_seq).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the content is not a sequence, or the visitor
+    /// fails.
     fn tuple_variant<V: Visitor>(self, len: usize, visitor: V) -> Result<V::Value, Self::Error>;
+    /// Reads a struct variant with the given fields: passes them to the
+    /// visitor's [`visit_map`](Visitor::visit_map) (or
+    /// [`visit_seq`](Visitor::visit_seq), for a format that writes structs
+    /// as sequences).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the content is not a map, or the visitor fails.
     fn struct_variant<V: Visitor>(
         self,
         fields: &[&str],
@@ -403,7 +1195,22 @@ pub trait VariantAccess {
     ) -> Result<V::Value, Self::Error>;
 }
 
-/// Any value, read and dropped (an unknown field's).
+/// A value of any kind, read and thrown away, as serde's `IgnoredAny`.
+///
+/// Deserializing it accepts any input (and reads all of it); the derive
+/// uses it to skip the values of unknown struct fields.
+///
+/// # Examples
+///
+/// Reading only the second element of a pair:
+///
+/// ```
+/// use std::json;
+/// use std::serde::de::IgnoredAny;
+///
+/// let (_, n): (IgnoredAny, i32) = json::from_str("[{\"a\": [1, null]}, 7]").unwrap();
+/// assert_eq(n, 7);
+/// ```
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IgnoredAny;
 

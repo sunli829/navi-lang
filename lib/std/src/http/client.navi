@@ -15,8 +15,17 @@ use crate::time::{Duration, Instant};
 use crate::tls::{Certificate, TlsConnector};
 use crate::url::Url;
 
-/// What can be turned into a URL (&str, String, Url).
+/// A value that can be converted to a [`Url`]: `&str`, `String`, `Url`
+/// or `&Url`.
+///
+/// The methods of [`Client`] that take a URL take any of these.
 pub trait IntoUrl {
+    /// Converts the value to a `Url`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of kind [`ErrorKind::Builder`] if the string is
+    /// not a valid absolute URL.
     fn into_url(&self) -> Result<Url, Error>;
 }
 
@@ -44,12 +53,52 @@ impl IntoUrl for &Url {
     }
 }
 
-/// GETs url with a new Client.
+/// Sends a `GET` request to `url` with a new [`Client`].
+///
+/// This is a shortcut for `Client::new().get(url).send()`. A program that
+/// sends several requests should make one [`Client`] and reuse it: it
+/// keeps its connections open between requests, and this function makes
+/// a new one each time.
+///
+/// # Errors
+///
+/// Returns an error if `url` is not a valid `http` or `https` URL, or if
+/// connecting, sending the request or reading the response's head fails.
+/// A response with an error status is not an error (see
+/// [`Response::error_for_status`]).
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn main() -> Result<(), std::http::Error> {
+/// let body = std::http::get("https://www.rust-lang.org")?.text()?;
+/// println(`body = ${body}`);
+/// # Ok(())
+/// # }
+/// ```
 pub fn get<U: IntoUrl>(url: U) -> Result<Response, Error> {
     Client::new().get(url).send()
 }
 
-/// POSTs body to url with a new Client.
+/// Sends a `POST` request with the body to `url` with a new [`Client`].
+///
+/// This is a shortcut for `Client::new().post(url).body(body).send()`; no
+/// `Content-Type` is set.
+///
+/// # Errors
+///
+/// Returns an error if `url` is not a valid `http` or `https` URL, or if
+/// connecting, sending the request or reading the response's head fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn main() -> Result<(), std::http::Error> {
+/// let resp = std::http::post("https://httpbin.org/post", "the body")?;
+/// println(`status: ${resp.status()}`);
+/// # Ok(())
+/// # }
+/// ```
 pub fn post<U: IntoUrl, B: Into<Body>>(url: U, body: B) -> Result<Response, Error> {
     Client::new().post(url).body(body).send()
 }
@@ -62,7 +111,49 @@ struct Conn {
     r: &mut BufReader<NetStream>,
 }
 
-/// Sends requests; clones share the connection pool.
+/// An HTTP client, to send requests with.
+///
+/// A client keeps the connections it opened and reuses them for later
+/// requests to the same host (a connection goes back to the pool once a
+/// response's body has been read to the end; a response whose body is not
+/// read keeps its connection, and the next request opens a new one).
+/// Over https it speaks HTTP/2 when the server chooses it, and then sends
+/// all its requests to that host on one connection. Clones of a client
+/// share its connections, so a client is cheap to clone and to share
+/// between threads.
+///
+/// `Client::new()` makes a client with the default settings;
+/// [`Client::builder`] configures one. Its methods [`Client::get`],
+/// [`Client::post`], ... start a [`RequestBuilder`], which sets the
+/// request's headers and body and sends it.
+///
+/// This is reqwest's `blocking::Client`; it has no proxy support, cookie
+/// store or response decompression.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::{Client, Response, Server};
+///
+/// # let server = Server::bind("127.0.0.1:0").unwrap();
+/// # let addr = server.local_addr();
+/// # let srv = server.clone();
+/// # let handle = std::thread::spawn(|| {
+/// #     srv.serve(|req| Response::from_string(`${req.method()} ${req.uri()}`.to_string()))
+/// # });
+/// // A server is listening at `addr`.
+/// let client = Client::new();
+/// let base = `http://${addr}`.to_string();
+///
+/// let resp = client.get(`${base}/items`.to_string()).query(&[("page", "2")]).send().unwrap();
+/// assert(resp.status().is_success());
+/// assert_eq(resp.text().unwrap(), "GET /items?page=2");
+///
+/// let resp = client.post(`${base}/items`.to_string()).body("new item").send().unwrap();
+/// assert_eq(resp.text().unwrap(), "POST /items");
+/// # server.close();
+/// # handle.join().unwrap().unwrap();
+/// ```
 #[derive(Clone)]
 pub struct Client {
     timeout: Option<Duration>,
@@ -82,97 +173,273 @@ pub struct Client {
     h2_prior: bool,
 }
 
-/// Configures a Client.
+/// A builder to configure a [`Client`], made by [`Client::builder`].
+///
+/// Each method returns a changed copy of the builder, so the calls chain;
+/// [`ClientBuilder::build`] makes the client.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::{Client, HeaderMap};
+/// use std::time::Duration;
+///
+/// let mut headers = HeaderMap::new();
+/// headers.insert("X-Api-Key", "secret");
+///
+/// let client = Client::builder()
+///     .timeout(Duration::from_secs(10))
+///     .user_agent("my-app/1.0")
+///     .default_headers(headers)
+///     .max_redirects(3)
+///     .build()
+///     .unwrap();
+/// ```
 #[derive(Clone)]
 pub struct ClientBuilder {
     c: Client,
 }
 
 impl ClientBuilder {
-    /// The timeout of each connect, read and write (none by default).
+    /// Sets the timeout of each connect, read and write of a request.
+    ///
+    /// There is no timeout by default. Unlike reqwest's, where this is the
+    /// time the whole request may take, here it applies to each step on
+    /// its own: a response whose bytes keep coming does not time out. A
+    /// request's own [`RequestBuilder::timeout`] takes its place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    /// use std::time::Duration;
+    ///
+    /// let client = Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+    /// ```
     pub fn timeout(&self, d: Duration) -> ClientBuilder {
         let mut b = self.clone();
         b.c.timeout = Some(d);
         b
     }
 
+    /// Sets the timeout for connecting to a server.
+    ///
+    /// Without one, connecting has the timeout of
+    /// [`ClientBuilder::timeout`], if set, and none otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    /// use std::time::Duration;
+    ///
+    /// let client = Client::builder().connect_timeout(Duration::from_secs(5)).build().unwrap();
+    /// ```
     pub fn connect_timeout(&self, d: Duration) -> ClientBuilder {
         let mut b = self.clone();
         b.c.connect_timeout = Some(d);
         b
     }
 
-    /// Redirects followed (10 by default; 0: none).
+    /// Sets how many redirects a request follows (10 by default).
+    ///
+    /// With 0, redirects are not followed: the 3xx response is returned.
+    /// A request that would follow more than `n` fails with an error of
+    /// kind [`ErrorKind::Redirect`].
+    ///
+    /// The client follows 301, 302, 303, 307 and 308 responses with a
+    /// `Location` header. After 301, 302 and 303 it sends a `GET` without
+    /// a body (a `HEAD` stays a `HEAD`); after 307 and 308 the same method
+    /// and body (a body made with [`Body::from_reader`] cannot be sent
+    /// again: the 3xx response is returned). `Authorization` and `Cookie`
+    /// headers are not sent to another host.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// // A client that returns redirects instead of following them.
+    /// let client = Client::builder().max_redirects(0).build().unwrap();
+    /// ```
     pub fn max_redirects(&self, n: usize) -> ClientBuilder {
         let mut b = self.clone();
         b.c.max_redirects = n;
         b
     }
 
+    /// Sets the `User-Agent` header sent with each request
+    /// (`navi-http/1.0` by default; an empty string sends none).
+    ///
+    /// A `User-Agent` in the default headers or in the request takes its
+    /// place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let client = Client::builder().user_agent("my-crawler/0.1").build().unwrap();
+    /// ```
     pub fn user_agent(&self, ua: &str) -> ClientBuilder {
         let mut b = self.clone();
         b.c.user_agent = ua.to_string();
         b
     }
 
-    /// Headers sent with every request.
+    /// Sets headers sent with every request.
+    ///
+    /// A header the request sets itself is sent instead of the default
+    /// one of the same name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Client, HeaderMap};
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("Accept", "application/json");
+    /// let client = Client::builder().default_headers(headers).build().unwrap();
+    /// ```
     pub fn default_headers(&self, h: HeaderMap) -> ClientBuilder {
         let mut b = self.clone();
         b.c.headers = h;
         b
     }
 
-    /// Idle connections kept per client (0: none).
+    /// Sets how many idle HTTP/1.1 connections the client keeps open for
+    /// reuse (32 by default; 0 keeps none).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// // A new connection for each request.
+    /// let client = Client::builder().pool_max_idle(0).build().unwrap();
+    /// ```
     pub fn pool_max_idle(&self, n: usize) -> ClientBuilder {
         let mut b = self.clone();
         b.c.pool_max_idle = n;
         b
     }
 
-    /// Trusts cert for https (as a root), besides the system's.
+    /// Adds a root certificate to trust for https, besides the system's.
+    ///
+    /// This lets a client talk to a server whose certificate is signed by
+    /// a private certificate authority.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::http::{Certificate, Client};
+    ///
+    /// let pem = std::fs::read("my-ca.pem").unwrap();
+    /// let cert = Certificate::from_pem(pem.as_slice()).unwrap();
+    /// let client = Client::builder().add_root_certificate(cert).build().unwrap();
+    /// ```
     pub fn add_root_certificate(&self, cert: Certificate) -> ClientBuilder {
         let mut b = self.clone();
         b.c.tls_roots.push(cert);
         b
     }
 
-    /// Whether https trusts the system's roots (default true).
+    /// Sets whether https trusts the system's root certificates (`true`
+    /// by default).
+    ///
+    /// With `false`, only the certificates added with
+    /// [`ClientBuilder::add_root_certificate`] are trusted.
     pub fn tls_built_in_root_certs(&self, on: bool) -> ClientBuilder {
         let mut b = self.clone();
         b.c.tls_built_in_roots = on;
         b
     }
 
-    /// Accepts any server certificate for https (no checks at all: anyone
-    /// in the middle can read and change the traffic).
+    /// Sets whether https accepts any server certificate (`false` by
+    /// default).
+    ///
+    /// # Warning
+    ///
+    /// With `true`, the server's certificate is not checked at all: anyone
+    /// in the middle can read and change the traffic. Use it only for
+    /// tests.
     pub fn danger_accept_invalid_certs(&self, accept: bool) -> ClientBuilder {
         let mut b = self.clone();
         b.c.tls_invalid_certs = accept;
         b
     }
 
-    /// Accepts server certificates for other host names.
+    /// Sets whether https accepts a server certificate made for another
+    /// host name (`false` by default).
+    ///
+    /// # Warning
+    ///
+    /// With `true`, any server with a trusted certificate can pretend to
+    /// be the one asked for.
     pub fn danger_accept_invalid_hostnames(&self, accept: bool) -> ClientBuilder {
         let mut b = self.clone();
         b.c.tls_invalid_hostnames = accept;
         b
     }
 
-    /// Speaks only HTTP/1.1 (offers no h2 to https servers).
+    /// Makes the client speak only HTTP/1.1: it does not offer HTTP/2 to
+    /// https servers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let client = Client::builder().http1_only().build().unwrap();
+    /// ```
     pub fn http1_only(&self) -> ClientBuilder {
         let mut b = self.clone();
         b.c.http1_only = true;
         b
     }
 
-    /// Speaks HTTP/2 from the first byte to http:// servers too (prior
-    /// knowledge, RFC 9113 3.3).
+    /// Makes the client speak HTTP/2 to `http://` servers too, from the
+    /// first byte ("prior knowledge", RFC 9113 section 3.3).
+    ///
+    /// The server must speak HTTP/2 without TLS (for a navi
+    /// [`Server`](crate::http::Server):
+    /// [`Protocols::set_unencrypted_http2`](crate::http::Protocols::set_unencrypted_http2)).
+    /// Over https, HTTP/2 is chosen by ALPN without this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Client, Protocols, Response, Server, Version};
+    ///
+    /// let mut protocols = Protocols::new();
+    /// protocols.set_unencrypted_http2(true);
+    /// let server = Server::bind("127.0.0.1:0").unwrap().protocols(protocols);
+    /// let addr = server.local_addr();
+    /// let srv = server.clone();
+    /// let handle = std::thread::spawn(|| {
+    ///     srv.serve(|req| Response::from_string(`${req.version():?}`.to_string()))
+    /// });
+    ///
+    /// let client = Client::builder().http2_prior_knowledge().build().unwrap();
+    /// let resp = client.get(`http://${addr}/`.to_string()).send().unwrap();
+    /// assert_eq(resp.version(), Version::HTTP_2);
+    /// assert_eq(resp.text().unwrap(), "HTTP/2.0");
+    ///
+    /// server.close();
+    /// handle.join().unwrap().unwrap();
+    /// ```
     pub fn http2_prior_knowledge(&self) -> ClientBuilder {
         let mut b = self.clone();
         b.c.h2_prior = true;
         b
     }
 
+    /// Makes the [`Client`].
+    ///
+    /// # Errors
+    ///
+    /// None for now: the result is always `Ok` (it is a `Result` as
+    /// reqwest's is).
     pub fn build(&self) -> Result<Client, Error> {
         Ok(self.c.clone())
     }
@@ -185,6 +452,19 @@ impl Default for Client {
 }
 
 impl Client {
+    /// Creates a client with the default settings.
+    ///
+    /// It has no timeouts, follows up to 10 redirects, sends
+    /// `User-Agent: navi-http/1.0` and trusts the system's root
+    /// certificates. Use [`Client::builder`] to change these.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let client = Client::new();
+    /// ```
     pub fn new() -> Client {
         Client {
             timeout: None,
@@ -204,29 +484,85 @@ impl Client {
         }
     }
 
+    /// Returns a [`ClientBuilder`], to configure a client.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    /// use std::time::Duration;
+    ///
+    /// let client = Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+    /// ```
     pub fn builder() -> ClientBuilder {
         ClientBuilder { c: Client::new() }
     }
 
+    /// Starts a `GET` request to `url`.
+    ///
+    /// Nothing is sent until [`RequestBuilder::send`]. An invalid URL is
+    /// reported by `send` (or [`RequestBuilder::build`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::http::Client;
+    ///
+    /// let resp = Client::new().get("https://www.rust-lang.org").send().unwrap();
+    /// println(`status: ${resp.status()}`);
+    /// ```
     pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::GET, url)
     }
+    /// Starts a `POST` request to `url`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::http::Client;
+    ///
+    /// let resp = Client::new()
+    ///     .post("https://httpbin.org/post")
+    ///     .header("Content-Type", "application/json")
+    ///     .body(r#"{"a": 1}"#)
+    ///     .send()
+    ///     .unwrap();
+    /// ```
     pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::POST, url)
     }
+    /// Starts a `PUT` request to `url`.
     pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::PUT, url)
     }
+    /// Starts a `PATCH` request to `url`.
     pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::PATCH, url)
     }
+    /// Starts a `DELETE` request to `url`.
     pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::DELETE, url)
     }
+    /// Starts a `HEAD` request to `url`.
+    ///
+    /// The response has the headers a `GET` would have, and no body.
     pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::HEAD, url)
     }
 
+    /// Starts a request with the method to `url`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Client, Method};
+    ///
+    /// let req = Client::new()
+    ///     .request(Method::OPTIONS, "http://example.com/")
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq(*req.method(), Method::OPTIONS);
+    /// ```
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
         match url.into_url() {
             Ok(u) => RequestBuilder {
@@ -244,7 +580,28 @@ impl Client {
         }
     }
 
-    /// Sends req, following redirects.
+    /// Sends a request and returns the response, following redirects (see
+    /// [`ClientBuilder::max_redirects`]).
+    ///
+    /// The function returns once the response's head has arrived; its
+    /// body is read from the connection as the response is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL's scheme is not `http` or `https`, if
+    /// connecting, sending the request or reading the response's head fails
+    /// or times out, or if there are too many redirects. A response with
+    /// an error status is not an error (see [`Response::error_for_status`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::http::{Client, Method, Request};
+    /// use std::url::Url;
+    ///
+    /// let req = Request::new(Method::GET, Url::parse("https://www.rust-lang.org").unwrap());
+    /// let resp = Client::new().execute(req).unwrap();
+    /// ```
     pub fn execute(&self, req: Request) -> Result<Response, Error> {
         self.execute_timeout(req, self.timeout)
     }
@@ -758,7 +1115,31 @@ fn parse_status_line(line: &str) -> Option<(Version, u16)> {
     Some((version, code))
 }
 
-/// A request being built (Client::get(url).header(..).send()).
+/// A request being built, made by [`Client::get`], [`Client::post`],
+/// [`Client::request`] and the like.
+///
+/// Each method returns a changed copy of the builder, so the calls chain;
+/// [`RequestBuilder::send`] sends the request with the client that made
+/// the builder, and [`RequestBuilder::build`] returns it as a
+/// [`Request`] instead.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::Client;
+///
+/// let req = Client::new()
+///     .post("http://example.com/api")
+///     .query(&[("v", "2")])
+///     .header("Accept", "application/json")
+///     .bearer_auth("token123")
+///     .body("payload")
+///     .build()
+///     .unwrap();
+/// assert_eq(req.uri(), "/api?v=2");
+/// assert_eq(req.header("authorization"), Some("Bearer token123"));
+/// assert_eq(req.body().len(), Some(7));
+/// ```
 #[derive(Clone)]
 pub struct RequestBuilder {
     client: Client,
@@ -768,14 +1149,41 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    /// Adds a header value.
+    /// Adds a value to the header `name` of the request (after any it
+    /// has).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let req = Client::new()
+    ///     .get("http://example.com/")
+    ///     .header("Accept", "text/html")
+    ///     .header("Accept", "text/plain")
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq(req.headers().get_all("accept"), Vec::from(["text/html", "text/plain"]));
+    /// ```
     pub fn header(&self, name: &str, value: &str) -> RequestBuilder {
         let mut b = self.clone();
         b.req.headers.append(name, value);
         b
     }
 
-    /// Adds the headers' values.
+    /// Adds all the values of `h` to the request's headers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Client, HeaderMap};
+    ///
+    /// let mut h = HeaderMap::new();
+    /// h.insert("X-Trace", "1");
+    /// h.insert("X-Debug", "on");
+    /// let req = Client::new().get("http://example.com/").headers(h).build().unwrap();
+    /// assert_eq(req.header("x-debug"), Some("on"));
+    /// ```
     pub fn headers(&self, h: HeaderMap) -> RequestBuilder {
         let mut b = self.clone();
         for (k, v) in h.iter() {
@@ -784,7 +1192,21 @@ impl RequestBuilder {
         b
     }
 
-    /// Appends the pairs to the URL's query.
+    /// Appends the name-value pairs to the query of the request's URL,
+    /// percent-encoding them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let req = Client::new()
+    ///     .get("http://example.com/search?lang=en")
+    ///     .query(&[("q", "navi lang"), ("page", "2")])
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq(req.uri(), "/search?lang=en&q=navi+lang&page=2");
+    /// ```
     pub fn query(&self, pairs: &[(&str, &str)]) -> RequestBuilder {
         let mut b = self.clone();
         {
@@ -797,6 +1219,21 @@ impl RequestBuilder {
         b
     }
 
+    /// Adds an `Authorization` header for HTTP basic authentication with
+    /// the user name and password.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let req = Client::new()
+    ///     .get("http://example.com/")
+    ///     .basic_auth("aladdin", Some("opensesame"))
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq(req.header("authorization"), Some("Basic YWxhZGRpbjpvcGVuc2VzYW1l"));
+    /// ```
     pub fn basic_auth(&self, user: &str, password: Option<&str>) -> RequestBuilder {
         let cred = match password {
             Some(p) => `${user}:${p}`.to_string(),
@@ -808,17 +1245,56 @@ impl RequestBuilder {
         )
     }
 
+    /// Adds an `Authorization` header with the bearer token.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let req = Client::new().get("http://example.com/").bearer_auth("abc").build().unwrap();
+    /// assert_eq(req.header("authorization"), Some("Bearer abc"));
+    /// ```
     pub fn bearer_auth(&self, token: &str) -> RequestBuilder {
         self.header("Authorization", `Bearer ${token}`.to_string().as_str())
     }
 
+    /// Sets the request's body.
+    ///
+    /// No `Content-Type` is set. A body of known length is sent with a
+    /// `Content-Length`; a [`Body::from_reader`] of unknown length is sent
+    /// chunked (over HTTP/1.1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let req = Client::new().put("http://example.com/file.txt").body("contents").build().unwrap();
+    /// assert_eq(req.body().as_bytes(), Some(b"contents"));
+    /// ```
     pub fn body<B: Into<Body>>(&self, body: B) -> RequestBuilder {
         let mut b = self.clone();
         b.req.body = body.into();
         b
     }
 
-    /// An application/x-www-form-urlencoded body of the pairs.
+    /// Sets the request's body to the pairs, encoded as an HTML form, and
+    /// its `Content-Type` to `application/x-www-form-urlencoded`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    ///
+    /// let req = Client::new()
+    ///     .post("http://example.com/login")
+    ///     .form(&[("user", "navi"), ("note", "a&b c")])
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq(req.header("content-type"), Some("application/x-www-form-urlencoded"));
+    /// assert_eq(req.body().as_bytes(), Some(b"user=navi&note=a%26b+c"));
+    /// ```
     pub fn form(&self, pairs: &[(&str, &str)]) -> RequestBuilder {
         let mut s = crate::url::form_urlencoded::Serializer::new(String::new());
         for (k, v) in pairs.iter() {
@@ -831,7 +1307,32 @@ impl RequestBuilder {
         b
     }
 
-    /// A JSON body of x (std::json).
+    /// Sets the request's body to `x` serialized to JSON (with
+    /// [`crate::json::to_string`]), and its `Content-Type` to
+    /// `application/json` unless the request already has one.
+    ///
+    /// If `x` cannot be serialized, [`RequestBuilder::send`] returns an
+    /// error of kind [`ErrorKind::Builder`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Client;
+    /// use std::serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct NewUser {
+    ///     name: String,
+    /// }
+    ///
+    /// let mut req = Client::new()
+    ///     .post("http://example.com/users")
+    ///     .json(&NewUser { name: "navi".to_string() })
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq(req.header("content-type"), Some("application/json"));
+    /// assert_eq(req.text().unwrap(), r#"{"name":"navi"}"#);
+    /// ```
     pub fn json<T: crate::serde::Serialize>(&self, x: &T) -> RequestBuilder {
         let mut b = self.clone();
         match crate::json::to_string(x) {
@@ -846,19 +1347,55 @@ impl RequestBuilder {
         b
     }
 
-    /// The timeout of each connect, read and write of this request.
+    /// Sets the timeout of each connect, read and write of this request,
+    /// in place of the client's ([`ClientBuilder::timeout`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::http::Client;
+    /// use std::time::Duration;
+    ///
+    /// let resp = Client::new()
+    ///     .get("https://www.rust-lang.org")
+    ///     .timeout(Duration::from_secs(3))
+    ///     .send();
+    /// ```
     pub fn timeout(&self, d: Duration) -> RequestBuilder {
         let mut b = self.clone();
         b.timeout = Some(d);
         b
     }
 
+    /// Sets the HTTP version of the request.
+    ///
+    /// The version is only recorded in the [`Request`]: which version is
+    /// spoken is decided by the client's settings and the server
+    /// (HTTP/1.1, or HTTP/2 when it is negotiated).
     pub fn version(&self, v: Version) -> RequestBuilder {
         let mut b = self.clone();
         b.req.version = v;
         b
     }
 
+    /// Returns the request that was built, without sending it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of kind [`ErrorKind::Builder`] if the URL was not
+    /// valid or the JSON body could not be serialized.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Client, Method};
+    ///
+    /// let req = Client::new().delete("http://example.com/items/3").build().unwrap();
+    /// assert_eq(*req.method(), Method::DELETE);
+    /// assert_eq(req.uri(), "/items/3");
+    ///
+    /// assert(Client::new().get("no scheme").build().unwrap_err().is_builder());
+    /// ```
     pub fn build(&self) -> Result<Request, Error> {
         match &self.err {
             Some(e) => Err(e.clone()),
@@ -866,6 +1403,31 @@ impl RequestBuilder {
         }
     }
 
+    /// Sends the request with the client and returns the response.
+    ///
+    /// This is [`Client::execute`] with the built request, and this
+    /// builder's timeout if it has one. It returns once the response's
+    /// head has arrived; the body is read with [`Response::text`] and the
+    /// like.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request could not be built
+    /// ([`RequestBuilder::build`]), or if sending it fails as described
+    /// for [`Client::execute`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), std::http::Error> {
+    /// use std::http::Client;
+    ///
+    /// let resp = Client::new().get("https://www.rust-lang.org").send()?;
+    /// assert(resp.status().is_success());
+    /// let html = resp.text()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn send(&self) -> Result<Response, Error> {
         let req = self.build()?;
         let t = match self.timeout {

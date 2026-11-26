@@ -1,27 +1,61 @@
-//! HPACK, HTTP/2's header compression (RFC 7541), as Go's
-//! golang.org/x/net/http2/hpack: an Encoder and a Decoder, each with its
-//! dynamic table (one per direction of a connection).
+//! HPACK, the header compression of HTTP/2 (RFC 7541), as Go's
+//! `golang.org/x/net/http2/hpack`.
 //!
-//!     let mut e = Encoder::new();
-//!     let mut block: Vec<u8> = Vec::new();
-//!     e.write_field(&mut block, &HeaderField::new(":method", "GET"));
-//!     let mut d = Decoder::new(4096);
-//!     let fields = d.decode_full(block.as_slice())?;
+//! An [`Encoder`] writes header fields as header blocks and a [`Decoder`]
+//! reads them back; each keeps a dynamic table of recent fields, so one
+//! encoder and one decoder serve each direction of a connection. The HTTP/2
+//! client and server of [`crate::http`] use it; it is public for tools that
+//! speak HTTP/2 themselves.
+//!
+//! # Examples
+//!
+//! ```
+//! use std::http::hpack::{Decoder, Encoder, HeaderField};
+//!
+//! let mut e = Encoder::new();
+//! let mut block: Vec<u8> = Vec::new();
+//! e.write_field(&mut block, &HeaderField::new(":method", "GET"));
+//! e.write_field(&mut block, &HeaderField::new("user-agent", "navi"));
+//!
+//! let mut d = Decoder::new(4096);
+//! let fields = d.decode_full(block.as_slice()).unwrap();
+//! assert_eq(fields.len(), 2);
+//! assert_eq(fields[0], HeaderField::new(":method", "GET"));
+//! assert_eq(fields[1].value, "navi");
+//! ```
 
 mod huffman;
 
 use crate::fmt::{self, Debug, Display, Formatter};
 
-/// A name-value pair; a sensitive one is never put in a table (sent
-/// "never indexed", RFC 7541 6.2.3).
+/// A header field: a name and a value.
+///
+/// A sensitive field (such as a cookie or an authorization) is never put
+/// in a dynamic table: it is sent "never indexed" (RFC 7541, section
+/// 6.2.3), so that intermediaries do not index it either.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::hpack::HeaderField;
+///
+/// let f = HeaderField::new(":path", "/index.html");
+/// assert(f.is_pseudo());
+/// assert_eq(f.size(), 5 + 11 + 32);
+/// assert(!f.sensitive);
+/// ```
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct HeaderField {
+    /// The name (lowercase in HTTP/2).
     pub name: String,
+    /// The value.
     pub value: String,
+    /// Whether the field must never be indexed.
     pub sensitive: bool,
 }
 
 impl HeaderField {
+    /// Returns a field that is not sensitive.
     pub fn new(name: &str, value: &str) -> HeaderField {
         HeaderField {
             name: name.to_string(),
@@ -51,8 +85,18 @@ impl Debug for HeaderField {
     }
 }
 
-/// Why a header block could not be decoded (for HTTP/2 a connection
-/// error, COMPRESSION_ERROR).
+/// An error decoding a header block.
+///
+/// For HTTP/2 it is a connection error of type `COMPRESSION_ERROR`.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::hpack::Decoder;
+///
+/// // An index of the static table that does not exist.
+/// assert(Decoder::new(4096).decode_full(&[0xFF, 0x7F]).is_err());
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DecodingError {
     msg: &str,
@@ -245,8 +289,27 @@ fn put_string(out: &mut Vec<u8>, s: &str) {
     }
 }
 
-/// Writes header fields as header blocks, keeping its dynamic table as
-/// the peer's decoder will.
+/// An HPACK encoder: writes header fields as header blocks, keeping its
+/// dynamic table as the peer's decoder will.
+///
+/// A field already in the static or dynamic table is written as an index;
+/// another is written as a literal (Huffman-coded when shorter) and added
+/// to the dynamic table, so that writing it again takes one byte.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::hpack::{Encoder, HeaderField};
+///
+/// let mut e = Encoder::new();
+/// let f = HeaderField::new("x-request-id", "42");
+/// let mut first: Vec<u8> = Vec::new();
+/// e.write_field(&mut first, &f);
+/// let mut again: Vec<u8> = Vec::new();
+/// e.write_field(&mut again, &f);
+/// assert(first.len() > 1);
+/// assert_eq(again.len(), 1);
+/// ```
 #[derive(Clone)]
 pub struct Encoder {
     table: Table,
@@ -419,7 +482,23 @@ impl Decoder {
         self.max_string = n;
     }
 
-    /// The fields of a whole header block, in order.
+    /// Decodes a whole header block and returns its fields, in order.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the block is malformed, refers to an entry no table has,
+    /// sets a table size above the allowed one, or has a string longer
+    /// than the limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::hpack::{Decoder, HeaderField};
+    ///
+    /// // Index 2 of the static table: ":method: GET".
+    /// let fields = Decoder::new(4096).decode_full(&[0x82]).unwrap();
+    /// assert_eq(fields, Vec::from([HeaderField::new(":method", "GET")]));
+    /// ```
     pub fn decode_full(&mut self, b: &[u8]) -> Result<Vec<HeaderField>, DecodingError> {
         let mut out: Vec<HeaderField> = Vec::new();
         let mut pos = 0;

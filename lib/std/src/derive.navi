@@ -1,11 +1,16 @@
-//! Derive macros (docs/derive.md): what a `#[derive_macro]` function sees
-//! of the type it derives for (TypeInfo, by its syntax), and the code it
-//! returns (Code, written with quote`...`).
+//! The API of derive macros: what a `#[derive_macro]` function sees of the
+//! type it derives for, and the code it returns.
 //!
-//! A derive macro is a function in a library crate:
+//! A derive macro is a function of a library crate, marked
+//! `#[derive_macro(Name)]` (or `#[derive_macro(Name, attrs = [ns])]` to
+//! take `#[ns(...)]` helper attributes). It gets the [`TypeInfo`] of the
+//! struct or enum that derives it, as written (its name, generics, fields,
+//! variants and attributes), and returns the [`Code`] of the items to add,
+//! usually written with [`quote`] templates (``quote`...` ``, Rust's
+//! `quote!`) and wrapped with [`TypeInfo::impl_for`]:
 //!
 //! ```navi
-//! use std::derive::{TypeInfo, Code, Error, quote};
+//! use std::derive::{Code, Error, TypeInfo, quote};
 //!
 //! #[derive_macro(Describe)]
 //! pub fn describe(t: &TypeInfo) -> Result<Code, Error> {
@@ -16,37 +21,88 @@
 //! ```
 //!
 //! The compiler builds the macro's crate into a small program for the host
-//! (serve is its main), sends it the TypeInfo of every type that derives
-//! one of its macros and parses the Code it returns as impl blocks in the
-//! type's module. Positions in a TypeInfo are byte offsets in the type's
-//! file: code made from its parts (identifiers, types, fields) keeps them,
-//! so errors in it point at the user's code; the rest of the code is at the
-//! #[derive(...)] attribute.
+//! ([`serve`] is its main), sends it the `TypeInfo` of every type that
+//! derives one of its macros, and parses the `Code` it returns as items in
+//! the type's module. Positions in a `TypeInfo` are byte offsets in the
+//! type's file: code made from its parts (identifiers, types, fields)
+//! keeps them, so errors in it point at the user's code; the rest of the
+//! code is at the `#[derive(...)]` attribute. See `docs/derive.md` for the
+//! whole design.
+//!
+//! # Testing a macro
+//!
+//! [`TypeInfo::of`] gives the `TypeInfo` of a type in an ordinary test, so
+//! a macro's function can be called and its code checked:
+//!
+//! ```
+//! use std::derive::{Binding, Code, Error, TypeInfo, quote};
+//!
+//! struct Point {
+//!     x: i32,
+//!     y: i32,
+//! }
+//!
+//! // Sums the fields.
+//! fn total(t: &TypeInfo) -> Result<Code, Error> {
+//!     let sum = t.each(|b: &Binding| quote`n = n + ${b} as i64;`);
+//!     Ok(t.impl_for("Total", quote`fn total(&self) -> i64 { let mut n = 0i64; ${sum} n }`))
+//! }
+//!
+//! let code = total(&TypeInfo::of::<Point>()).unwrap();
+//! assert_eq(
+//!     code.text(),
+//!     "impl Total for Point { fn total(&self) -> i64 { let mut n = 0i64; { n = n + self.x as i64; n = n + self.y as i64; } n } }",
+//! );
+//! ```
 
 use crate::collections::HashMap;
 
-/// No position: the code's default (the #[derive(...)] attribute).
+/// The position of code that has none of its own: it is reported at the
+/// `#[derive(...)]` attribute.
 pub const NO_POS: i32 = -1;
 
 // --- Code ----------------------------------------------------------------
 
 /// Generated code: its text, and the positions in the user's file that
 /// parts of it come from.
+///
+/// Code is usually made with [`quote`] templates; values put in a
+/// template's holes keep their positions (an [`Ident`], a [`TypeRef`], a
+/// [`Binding`]), so a compile error in the generated code points at the
+/// user's code they come from.
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::{Code, Ident, quote};
+///
+/// let name = Ident::new("Point");
+/// let mut c = quote`impl Default for ${name}`;
+/// c.push(&quote`{ fn default() -> ${name} { ${name} { x: 0 } } }`);
+/// assert_eq(c.text(), "impl Default for Point { fn default() -> Point { Point { x: 0 } } }");
+/// assert(!c.is_empty());
+/// assert(Code::new().is_empty());
+/// ```
 #[derive(Clone)]
 pub struct Code {
     text: String,
     spans: Vec<Span>,
 }
 
-/// Bytes start..end of a Code's text come from position pos.
+/// A part of a [`Code`]'s text that comes from a position in the user's
+/// file: bytes `start..end` of the text come from position `pos`.
 #[derive(Clone)]
 pub struct Span {
+    /// The start of the part, a byte offset in the code's text.
     pub start: u32,
+    /// The end of the part (exclusive).
     pub end: u32,
+    /// The position in the user's file (a byte offset), or [`NO_POS`].
     pub pos: i32,
 }
 
 impl Code {
+    /// Returns empty code.
     pub fn new() -> Code {
         Code {
             text: String::new(),
@@ -54,7 +110,15 @@ impl Code {
         }
     }
 
-    /// Code with the given text, at the default position.
+    /// Returns code with the given text, at the default position.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::derive::Code;
+    ///
+    /// assert_eq(Code::from_text("::std::fmt::Debug").text(), "::std::fmt::Debug");
+    /// ```
     pub fn from_text(text: &str) -> Code {
         Code {
             text: text.to_string(),
@@ -62,7 +126,8 @@ impl Code {
         }
     }
 
-    /// Code with the given text from position pos.
+    /// Returns code with the given text, from position `pos` of the user's
+    /// file.
     pub fn spanned(text: &str, pos: i32) -> Code {
         let mut c = Code::from_text(text);
         if pos >= 0 && text.len() > 0 {
@@ -75,21 +140,36 @@ impl Code {
         c
     }
 
+    /// Returns `true` if the code has no text but whitespace.
     pub fn is_empty(&self) -> bool {
         self.text.trim().len() == 0
     }
 
-    /// The code's text (as generated: not formatted).
+    /// Returns the code's text, as generated (not formatted).
     pub fn text(&self) -> &str {
         self.text.as_str()
     }
 
+    /// Returns the parts of the text that come from positions in the user's
+    /// file.
     pub fn spans(&self) -> &Vec<Span> {
         &self.spans
     }
 
-    /// Appends other, with a space between unless the code reads as well
-    /// without one (never where two tokens would run together).
+    /// Appends `other`, with a space between unless the code reads as well
+    /// without one (there is always one where two tokens would run
+    /// together).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::derive::Code;
+    ///
+    /// let mut c = Code::from_text("fn f()");
+    /// c.push(&Code::from_text("{}"));
+    /// c.push_str("fn g() {}");
+    /// assert_eq(c.text(), "fn f() {} fn g() {}");
+    /// ```
     pub fn push(&mut self, other: &Code) {
         let a = self.text.as_bytes();
         let b = other.text.as_bytes();
@@ -130,13 +210,13 @@ impl Code {
         }
     }
 
-    /// Appends text at the default position.
+    /// Appends `text`, at the default position (see [`push`](Code::push)).
     pub fn push_str(&mut self, text: &str) {
         self.push(&Code::from_text(text));
     }
 
-    /// The same code at x's position (as Rust's quote_spanned!): errors in
-    /// it that no inner part claims point at x.
+    /// Returns the same code at `x`'s position (as Rust's `quote_spanned!`):
+    /// errors in it that no inner part claims point at `x`.
     pub fn at<X: Spanned>(&self, x: &X) -> Code {
         let mut c = self.clone();
         let p = x.pos();
@@ -227,10 +307,34 @@ fn spaced(a: &[u8], y: u8) -> bool {
     true
 }
 
-/// quote`...`: the code of a template. The compiler lexes the template's
-/// text when it compiles the macro (its brackets must match) and calls this
-/// with the text between the holes and each hole's value as code
-/// (ToCode).
+/// Returns the code of a template: ``quote`...` ``, as Rust's `quote!`.
+///
+/// It is called as a template tag: ``quote`fn f() -> ${ty} { ${body} }` ``.
+/// The compiler lexes the template's text when it compiles the macro (its
+/// brackets must match) and calls this function with the text between the
+/// holes and each hole's value as code (by [`ToCode`]): code, identifiers,
+/// types and bindings as they are, strings as string literals, numbers
+/// with their type's suffix, a `Vec` or slice as its elements one after
+/// the other, an `Option` as its value or nothing. `` \` `` and `\$` write
+/// a backquote and a dollar sign.
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::{Code, Ident, quote};
+///
+/// let name = Ident::new("Foo");
+/// let label = "a\"b";
+/// let n = 3usize;
+/// let c = quote`struct ${name}; const N: usize = ${n}; const S: &str = ${label};`;
+/// assert_eq(c.text(), "struct Foo; const N: usize = 3usize; const S: &str = \"a\\\"b\";");
+///
+/// let mut stmts: Vec<Code> = Vec::new();
+/// stmts.push(quote`a();`);
+/// stmts.push(quote`b();`);
+/// let none: Option<Code> = None;
+/// assert_eq(quote`{ ${stmts} ${none} }`.text(), "{ a(); b(); }");
+/// ```
 pub fn quote(parts: &[&str], values: &[Code]) -> Code {
     let mut c = Code::new();
     let mut i = 0;
@@ -244,8 +348,9 @@ pub fn quote(parts: &[&str], values: &[Code]) -> Code {
     c
 }
 
-/// A value that can be put in a quote`...` hole.
+/// A value that can be put in a hole of a [`quote`] template.
 pub trait ToCode {
+    /// Returns the value as code.
     fn to_code(&self) -> Code;
 }
 
@@ -350,7 +455,15 @@ impl ToCode for isize {
     }
 }
 
-/// s as a navi string literal.
+/// Returns `s` as a navi string literal, quoted and escaped.
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::string_literal;
+///
+/// assert_eq(string_literal("say \"hi\"\n"), "\"say \\\"hi\\\"\\n\"");
+/// ```
 pub fn string_literal(s: &str) -> String {
     let mut out = String::new();
     out.push('"');
@@ -371,12 +484,25 @@ pub fn string_literal(s: &str) -> String {
 
 // --- What a macro sees -----------------------------------------------------
 
-/// Something with a position in the user's code.
+/// Something with a position in the user's code: what [`Error::at`] and
+/// [`Code::at`] take.
 pub trait Spanned {
+    /// Returns the position, a byte offset in the type's file, or
+    /// [`NO_POS`].
     fn pos(&self) -> i32;
 }
 
 /// An identifier; put in code, it keeps its position.
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::{Ident, quote};
+///
+/// let f = Ident::new("len");
+/// assert_eq(f.as_str(), "len");
+/// assert_eq(quote`self.${f}()`.text(), "self.len()");
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ident {
     name: String,
@@ -384,7 +510,7 @@ pub struct Ident {
 }
 
 impl Ident {
-    /// A new identifier (at the default position).
+    /// Returns an identifier at the default position.
     pub fn new(name: &str) -> Ident {
         Ident {
             name: name.to_string(),
@@ -392,6 +518,7 @@ impl Ident {
         }
     }
 
+    /// Returns an identifier at position `pos` of the user's file.
     pub fn with_pos(name: &str, pos: i32) -> Ident {
         Ident {
             name: name.to_string(),
@@ -399,6 +526,7 @@ impl Ident {
         }
     }
 
+    /// Returns the identifier's text.
     pub fn as_str(&self) -> &str {
         self.name.as_str()
     }
@@ -422,7 +550,31 @@ impl crate::fmt::Display for Ident {
     }
 }
 
-/// A type as written: its text, and its parts.
+/// A type as written in the user's code: its text, and its parts.
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::{TypeInfo, TypeKind};
+///
+/// struct S {
+///     tags: Vec<Option<String>>,
+///     raw: [u8; 4],
+/// }
+///
+/// let fields = TypeInfo::of::<S>().fields();
+/// let t = fields[0].ty();
+/// assert_eq(t.text(), "Vec<Option<String>>");
+/// assert_eq(t.last_name(), Some("Vec"));
+/// assert(t.args()[0].is("Option"));
+/// match fields[1].ty().kind() {
+///     TypeKind::Array(elem, len) => {
+///         assert_eq(elem.text(), "u8");
+///         assert_eq(len.as_str(), "4");
+///     }
+///     _ => panic("not an array"),
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct TypeRef {
     text: String,
@@ -430,7 +582,7 @@ pub struct TypeRef {
     kind: TypeKind,
 }
 
-/// The parts of a TypeRef.
+/// The parts of a [`TypeRef`].
 #[derive(Clone, Debug)]
 pub enum TypeKind {
     /// a::b::C<X, Y>: each segment's name and generic arguments.
@@ -447,22 +599,28 @@ pub enum TypeKind {
     Other,
 }
 
+/// A segment of a path type: `C<X, Y>` in `a::b::C<X, Y>`.
 #[derive(Clone, Debug)]
 pub struct Segment {
+    /// The segment's name.
     pub name: String,
+    /// Its generic arguments (none if it has no `<...>`).
     pub args: Vec<TypeRef>,
 }
 
 impl TypeRef {
+    /// Returns the parts of the type.
     pub fn kind(&self) -> &TypeKind {
         &self.kind
     }
 
+    /// Returns the type's text as written.
     pub fn text(&self) -> &str {
         self.text.as_str()
     }
 
-    /// The last segment's name of a path type (Option for Option<T>).
+    /// Returns the name of a path type's last segment (`Option` for
+    /// `std::option::Option<T>`), or `None` for another type.
     pub fn last_name(&self) -> Option<&str> {
         match &self.kind {
             TypeKind::Path(segs) => {
@@ -476,7 +634,8 @@ impl TypeRef {
         }
     }
 
-    /// The generic arguments of a path type's last segment.
+    /// Returns the generic arguments of a path type's last segment (none
+    /// for another type).
     pub fn args(&self) -> Vec<TypeRef> {
         match &self.kind {
             TypeKind::Path(segs) => {
@@ -490,7 +649,8 @@ impl TypeRef {
         }
     }
 
-    /// Whether this is the path type name (one segment), as Option<T>.
+    /// Returns `true` if this is a one-segment path type named `name`, as
+    /// `Option<T>` is `Option`.
     pub fn is(&self, name: &str) -> bool {
         match &self.kind {
             TypeKind::Path(segs) => segs.len() == 1 && segs[0].name == name,
@@ -511,25 +671,37 @@ impl ToCode for TypeRef {
     }
 }
 
-/// An attribute: #[name(key = value, flag, ...)].
+/// An attribute: `#[name(key = value, flag, ...)]`.
+///
+/// Most macros read attributes with `parse_attrs` and a type deriving
+/// [`FromAttrs`] rather than these fields.
 #[derive(Clone, Debug)]
 pub struct Attr {
+    /// The attribute's name (`serde` in `#[serde(...)]`).
     pub name: String,
+    /// Its position.
     pub pos: i32,
+    /// Its arguments, in order.
     pub args: Vec<AttrArg>,
 }
 
+/// An argument of an attribute: `key = value` or a `key` alone.
 #[derive(Clone, Debug)]
 pub struct AttrArg {
+    /// The key.
     pub key: Ident,
+    /// The value, `None` for a key alone.
     pub value: Option<AttrValue>,
 }
 
-/// An attribute argument's value.
+/// An attribute argument's value, with its position.
 #[derive(Clone, Debug)]
 pub enum AttrValue {
+    /// A string literal (its value, unescaped).
     Str(String, i32),
+    /// An integer literal.
     Int(i64, i32),
+    /// `true` or `false`.
     Bool(bool, i32),
     /// Any other literal or path, as written.
     Other(String, i32),
@@ -546,7 +718,22 @@ impl Spanned for AttrArg {
     }
 }
 
-/// A struct's or variant's field.
+/// A field of a struct or of an enum's variant.
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::TypeInfo;
+///
+/// struct Pair(pub i32, String);
+///
+/// let fields = TypeInfo::of::<Pair>().fields();
+/// assert(fields[0].name().is_none());
+/// assert_eq(fields[1].ident().as_str(), "1");
+/// assert_eq(fields[1].index(), 1);
+/// assert_eq(fields[0].vis(), "pub");
+/// assert_eq(fields[1].ty().text(), "String");
+/// ```
 #[derive(Clone, Debug)]
 pub struct Field {
     name: Option<Ident>,
@@ -558,12 +745,12 @@ pub struct Field {
 }
 
 impl Field {
-    /// The name of a named field.
+    /// Returns the name of a named field (`None` for a tuple field).
     pub fn name(&self) -> Option<Ident> {
         self.name.clone()
     }
 
-    /// The name, or the index of a tuple field (as in self.0).
+    /// Returns the name, or the index of a tuple field (as in `self.0`).
     pub fn ident(&self) -> Ident {
         match &self.name {
             Some(n) => n.clone(),
@@ -571,23 +758,28 @@ impl Field {
         }
     }
 
+    /// Returns the field's position among the fields, from 0.
     pub fn index(&self) -> usize {
         self.index
     }
 
+    /// Returns the field's type.
     pub fn ty(&self) -> &TypeRef {
         &self.ty
     }
 
-    /// "" (private), "pub", "pub(crate)" or "pub(super)".
+    /// Returns the field's visibility as written: `""` (private), `"pub"`,
+    /// `"pub(crate)"` or `"pub(super)"`.
     pub fn vis(&self) -> &str {
         self.vis.as_str()
     }
 
+    /// Returns the field's attributes.
     pub fn attrs(&self) -> &Vec<Attr> {
         &self.attrs
     }
 
+    /// Returns `true` if the field has an attribute named `name`.
     pub fn has_attr(&self, name: &str) -> bool {
         has(&self.attrs, name)
     }
@@ -598,7 +790,13 @@ impl Field {
         doc_of(&self.attrs)
     }
 
-    /// The field's #[ns(...)] attributes parsed as T (FromAttrs).
+    /// Parses the field's `#[ns(...)]` attributes as `T` (see
+    /// [`FromAttrs`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails, at the field, if an argument is unknown or of the wrong type,
+    /// or a required one is missing.
     pub fn parse_attrs<T: FromAttrs>(&self, ns: &str) -> Result<T, Error> {
         parse_attrs::<T>(&self.attrs, ns, self.pos)
     }
@@ -613,12 +811,39 @@ impl Spanned for Field {
 /// The kind of a struct or variant.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
+    /// Named fields: `S { a: A }`.
     Named,
+    /// Tuple fields: `S(A, B)`.
     Tuple,
+    /// No fields: `S`.
     Unit,
 }
 
-/// An enum's variant, or the struct itself (each_variant handles both).
+/// A variant of an enum, or a struct itself (taken as one variant, so that
+/// [`TypeInfo::each_variant`] handles both).
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::{Code, Kind, TypeInfo, quote};
+///
+/// enum Shape {
+///     Circle { r: f64 },
+///     Square(i32),
+///     Empty,
+/// }
+///
+/// let t = TypeInfo::of::<Shape>();
+/// let v = &t.variants()[1];
+/// assert_eq(v.name().as_str(), "Square");
+/// assert_eq(v.kind(), Kind::Tuple);
+/// assert_eq(v.index(), 1);
+/// assert_eq(v.path().text(), "Shape::Square");
+/// assert_eq(v.pattern().text(), "Shape::Square(__binding_0)");
+/// let zero: Vec<Code> = Vec::from([quote`0`]);
+/// assert_eq(v.construct(zero.as_slice()).text(), "Shape::Square(0)");
+/// assert_eq(t.variants()[0].pattern().text(), "Shape::Circle { r: __binding_0 }");
+/// ```
 #[derive(Clone, Debug)]
 pub struct Variant {
     name: Ident,
@@ -634,22 +859,27 @@ pub struct Variant {
 }
 
 impl Variant {
+    /// Returns the variant's name (the struct's, for a struct).
     pub fn name(&self) -> Ident {
         self.name.clone()
     }
 
+    /// Returns the kind of the variant's fields.
     pub fn kind(&self) -> Kind {
         self.kind
     }
 
+    /// Returns the variant's fields.
     pub fn fields(&self) -> &Vec<Field> {
         &self.fields
     }
 
+    /// Returns the variant's attributes.
     pub fn attrs(&self) -> &Vec<Attr> {
         &self.attrs
     }
 
+    /// Returns `true` if the variant has an attribute named `name`.
     pub fn has_attr(&self, name: &str) -> bool {
         has(&self.attrs, name)
     }
@@ -660,6 +890,13 @@ impl Variant {
         doc_of(&self.attrs)
     }
 
+    /// Parses the variant's `#[ns(...)]` attributes as `T` (see
+    /// [`FromAttrs`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails, at the variant, if an argument is unknown or of the wrong
+    /// type, or a required one is missing.
     pub fn parse_attrs<T: FromAttrs>(&self, ns: &str) -> Result<T, Error> {
         parse_attrs::<T>(&self.attrs, ns, self.name.pos)
     }
@@ -793,10 +1030,13 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// Returns the field it binds.
     pub fn field(&self) -> &Field {
         &self.field
     }
 
+    /// Returns the bound variable (`__binding_0`, or `self.x` for a
+    /// struct's field) as an identifier at the field's position.
     pub fn ident(&self) -> Ident {
         Ident::with_pos(self.name.as_str(), self.field.pos)
     }
@@ -817,6 +1057,7 @@ impl ToCode for Binding {
 /// A type or const parameter.
 #[derive(Clone, Debug)]
 pub struct GenericParam {
+    /// The parameter's name.
     pub name: Ident,
     /// const N: usize
     pub is_const: bool,
@@ -829,12 +1070,39 @@ pub struct GenericParam {
 /// The type's generic parameters and where clause.
 #[derive(Clone, Debug)]
 pub struct Generics {
+    /// The parameters, in order.
     pub params: Vec<GenericParam>,
     /// The where clause's predicates as written ("" if none).
     pub where_clause: String,
 }
 
-/// The struct or enum a macro derives for.
+/// The struct or enum a derive macro derives for, as written.
+///
+/// It gives the type's name, generics, attributes and variants (a struct
+/// is one variant), and helpers that make the code derives usually need:
+/// [`impl_for`](TypeInfo::impl_for), [`each`](TypeInfo::each),
+/// [`each_variant`](TypeInfo::each_variant),
+/// [`each_construct`](TypeInfo::each_construct),
+/// [`each_pair`](TypeInfo::each_pair).
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::TypeInfo;
+///
+/// struct Point<T: Clone> {
+///     pub x: T,
+///     y: T,
+/// }
+///
+/// let t = TypeInfo::of::<Point<i32>>();
+/// assert_eq(t.name().as_str(), "Point");
+/// assert(!t.is_enum());
+/// assert_eq(t.generics().params[0].name.as_str(), "T");
+/// assert_eq(t.generics().params[0].bounds, "Clone");
+/// assert_eq(t.fields().len(), 2);
+/// assert_eq(t.self_type().text(), "Point<T>");
+/// ```
 #[derive(Clone, Debug)]
 pub struct TypeInfo {
     name: Ident,
@@ -865,6 +1133,7 @@ impl TypeInfo {
         d.type_info()
     }
 
+    /// Returns the type's name.
     pub fn name(&self) -> Ident {
         self.name.clone()
     }
@@ -874,14 +1143,18 @@ impl TypeInfo {
         self.module.as_str()
     }
 
+    /// Returns the type's visibility as written: `""`, `"pub"`,
+    /// `"pub(crate)"`...
     pub fn vis(&self) -> &str {
         self.vis.as_str()
     }
 
+    /// Returns the type's attributes (the derive itself is not among them).
     pub fn attrs(&self) -> &Vec<Attr> {
         &self.attrs
     }
 
+    /// Returns `true` if the type has an attribute named `name`.
     pub fn has_attr(&self, name: &str) -> bool {
         has(&self.attrs, name)
     }
@@ -892,15 +1165,22 @@ impl TypeInfo {
         doc_of(&self.attrs)
     }
 
-    /// The type's #[ns(...)] attributes parsed as T (FromAttrs).
+    /// Parses the type's `#[ns(...)]` attributes as `T` (see [`FromAttrs`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails, at the type, if an argument is unknown or of the wrong type,
+    /// or a required one is missing.
     pub fn parse_attrs<T: FromAttrs>(&self, ns: &str) -> Result<T, Error> {
         parse_attrs::<T>(&self.attrs, ns, self.name.pos)
     }
 
+    /// Returns the type's generic parameters and where clause.
     pub fn generics(&self) -> &Generics {
         &self.generics
     }
 
+    /// Returns `true` if the type is an enum.
     pub fn is_enum(&self) -> bool {
         self.is_enum
     }
@@ -981,8 +1261,23 @@ impl TypeInfo {
         c
     }
 
-    /// impl<...> trait_path for Self<...> where ... { items }: every type
-    /// parameter must implement the trait too (as Rust's derives).
+    /// Returns `impl<...> trait_path for Self<...> where ... { items }`:
+    /// every type parameter must implement the trait too, as Rust's
+    /// derives require.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::derive::{TypeInfo, quote};
+    ///
+    /// struct Wrapper<T> {
+    ///     inner: T,
+    /// }
+    ///
+    /// let t = TypeInfo::of::<Wrapper<i32>>();
+    /// let code = t.impl_for("Tr", quote`fn f() {}`);
+    /// assert_eq(code.text(), "impl<T: Tr> Tr for Wrapper<T> { fn f() {} }");
+    /// ```
     pub fn impl_for(&self, trait_path: &str, items: Code) -> Code {
         let mut bound = Code::new();
         if self.generics.params.len() > 0 {
@@ -1053,7 +1348,22 @@ impl TypeInfo {
         c
     }
 
-    /// match *self { each variant's pattern => { f(binding) for each field } }
+    /// Returns `match *self { each variant's pattern => { f(binding) for
+    /// each field } }`; for a struct, `{ f(self.x) for each field }`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::derive::{Binding, TypeInfo, quote};
+    ///
+    /// enum E {
+    ///     A(i32),
+    ///     B { x: i32, y: i32 },
+    /// }
+    ///
+    /// let code = TypeInfo::of::<E>().each(|b: &Binding| quote`f(${b});`);
+    /// assert_eq(code.text(), "match *self { E::A(__binding_0) => { f(__binding_0); } E::B { x: __binding_0, y: __binding_1 } => { f(__binding_0); f(__binding_1); } }");
+    /// ```
     pub fn each(&self, f: fn(&Binding) -> Code) -> Code {
         if !self.is_enum {
             let mut body = Code::from_text("{");
@@ -1215,15 +1525,33 @@ fn doc_of(attrs: &[Attr]) -> Option<String> {
 
 // --- Errors ----------------------------------------------------------------
 
-/// A macro's error, at a position in the user's code.
+/// An error of a derive macro, at a position in the user's code.
+///
+/// The compiler reports it as a compile error there.
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::{Error, TypeInfo};
+///
+/// struct Unit;
+///
+/// let t = TypeInfo::of::<Unit>();
+/// let e = Error::at(&t, "Unit structs are not supported");
+/// assert_eq(e.to_string(), "Unit structs are not supported");
+/// assert_eq(Error::new("oops").pos, -1);
+/// ```
 #[derive(Clone, Debug)]
 pub struct Error {
+    /// Where the error is, a byte offset in the type's file, or [`NO_POS`]
+    /// (the `#[derive(...)]` attribute).
     pub pos: i32,
+    /// The message.
     pub msg: String,
 }
 
 impl Error {
-    /// An error at the #[derive(...)] attribute.
+    /// Returns an error at the `#[derive(...)]` attribute.
     pub fn new(msg: &str) -> Error {
         Error {
             pos: NO_POS,
@@ -1231,7 +1559,7 @@ impl Error {
         }
     }
 
-    /// An error at x (a field, variant, type, attribute...).
+    /// Returns an error at `x` (a field, variant, type, attribute...).
     pub fn at<X: Spanned>(x: &X, msg: &str) -> Error {
         Error {
             pos: x.pos(),
@@ -1248,11 +1576,40 @@ impl crate::fmt::Display for Error {
 
 // --- Attributes --------------------------------------------------------------
 
-/// A type made from an attribute's arguments: #[derive(FromAttrs)] on a
-/// struct makes it, each field from the key of its name by its type's
-/// FromAttrValue (an Option<T> is an optional key, a bool a flag, any
-/// other a required key); unknown keys are errors.
+/// A type made from the arguments of a macro's helper attributes, as
+/// darling's `FromMeta`.
+///
+/// `#[derive(FromAttrs)]` on a struct implements it: each field is read
+/// from the key of its name by its type's [`FromAttrValue`] (an `Option<T>`
+/// is an optional key, a `bool` a flag, any other type a required key);
+/// unknown keys are errors. `parse_attrs` of [`TypeInfo`], [`Variant`] and
+/// [`Field`] use it.
+///
+/// # Examples
+///
+/// ```
+/// use std::derive::{FromAttrs, TypeInfo};
+/// use std::serde::Serialize;
+///
+/// #[derive(FromAttrs)]
+/// struct Opts {
+///     rename: Option<String>,
+///     skip: bool,
+/// }
+///
+/// #[derive(Serialize)]
+/// struct S {
+///     #[serde(rename = "b", skip)]
+///     a: i32,
+/// }
+///
+/// let f = &TypeInfo::of::<S>().fields()[0];
+/// let o: Opts = f.parse_attrs::<Opts>("serde").unwrap();
+/// assert_eq(o.rename, Some("b".to_string()));
+/// assert(o.skip);
+/// ```
 pub trait FromAttrs {
+    /// Makes the value from the arguments, taking each key it knows.
     fn from_attrs(args: &mut AttrArgs) -> Result<Self, Error>;
 }
 
@@ -1395,6 +1752,7 @@ impl AttrArgs {
 /// An attribute value a FromAttrs field can have (as darling's FromMeta):
 /// from key = value, from the key alone, or when the key is not given.
 pub trait FromAttrValue {
+    /// `#[ns(key = value)]`: the value, or `None` if it has the wrong type.
     fn from_value(v: &AttrValue) -> Option<Self>;
     /// #[ns(key)]: none but for a flag (bool: true).
     fn from_word() -> Option<Self> {

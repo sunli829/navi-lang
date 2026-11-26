@@ -23,18 +23,78 @@ struct Route {
     handler: fn(&mut Request) -> Response,
 }
 
-/// Routes requests to handlers by patterns "[METHOD ][HOST]/path":
+/// A request router: picks the handler of a request by its method, host
+/// and path (as Go 1.22's `http.ServeMux`).
 ///
-/// - "/users/{id}" matches /users/7 (req.path_value("id") is "7");
-/// - "/files/{path...}" matches /files/a/b ("a/b");
-/// - a pattern ending in "/" matches every path under it, "/{$}" only
-///   the path itself;
-/// - "GET /x" matches GET and HEAD requests only; "example.com/" only
-///   requests for that host.
+/// Each route has a pattern `[METHOD ][HOST]/PATH`:
 ///
-/// The most specific matching pattern wins. Unmatched paths get 404, paths
-/// matched for other methods 405 (with Allow), and a path matched by
-/// "/dir/" but given as "/dir" a redirect.
+/// - A path segment `{name}` matches any one segment, and
+///   [`Request::path_value`] gives its value: `/users/{id}` matches
+///   `/users/7`, with `"7"` for `"id"`.
+/// - A last segment `{name...}` matches the rest of the path:
+///   `/files/{path...}` matches `/files/a/b.txt`, with `"a/b.txt"` for
+///   `"path"`.
+/// - A pattern ending in `/` matches every path under it (`/static/`
+///   matches `/static/css/main.css`; `/` matches every path); one ending
+///   in `/{$}` matches only the path itself (`/{$}` matches only `/`).
+/// - With a method, the route matches only requests with that method
+///   (`GET` matches `HEAD` requests too); with a host, only requests for
+///   that host (`example.com/`).
+///
+/// When several patterns match a request, the most specific one wins: a
+/// pattern with a host beats one without; then, segment by segment, a
+/// literal beats a `{name}` wildcard, which beats a rest; then the longer
+/// pattern, then one with a method. So `/users/new` beats `/users/{id}`,
+/// which beats `/users/`.
+///
+/// A path no route matches is answered with `404 Not Found` (or the
+/// [`Router::fallback`] handler); a path that matches routes of other
+/// methods only, with `405 Method Not Allowed` and an `Allow` header; and
+/// a path such as `/dir` when `/dir/` is a pattern, with a
+/// `301 Moved Permanently` redirect to `/dir/`. Unlike Go's, it does not
+/// redirect unclean paths (with `//` or `..`), and only identical
+/// patterns count as conflicting.
+///
+/// [`Router::handle`] answers a request; give it to a server as
+/// `|req| router.handle(req)`.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::{Method, Request, Response, Router, StatusCode};
+/// use std::url::Url;
+///
+/// let mut router = Router::new();
+/// router.route("GET /users/{id}", |req| {
+///     Response::from_string(`user ${req.path_value("id").unwrap()}`.to_string())
+/// });
+/// router.route("POST /users", |_req| Response::new(StatusCode::CREATED));
+///
+/// // A router can be tried without a server.
+/// fn request(method: Method, path: &str) -> Request {
+///     Request::new(method, Url::parse(`http://example.com${path}`.to_string().as_str()).unwrap())
+/// }
+/// let resp = router.handle(&mut request(Method::GET, "/users/7"));
+/// assert_eq(resp.text().unwrap(), "user 7");
+/// let resp = router.handle(&mut request(Method::POST, "/users"));
+/// assert_eq(resp.status(), StatusCode::CREATED);
+/// let resp = router.handle(&mut request(Method::DELETE, "/users"));
+/// assert_eq(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+/// assert_eq(resp.header("allow"), Some("POST"));
+/// let resp = router.handle(&mut request(Method::GET, "/posts"));
+/// assert_eq(resp.status(), StatusCode::NOT_FOUND);
+/// ```
+///
+/// Serving it:
+///
+/// ```no_run
+/// use std::http::{self, Response, Router};
+///
+/// let mut router = Router::new();
+/// router.route("GET /{$}", |_req| Response::from_html("<h1>Home</h1>"));
+/// router.route("GET /static/", |req| Response::from_string(`file ${req.path()}`.to_string()));
+/// http::serve("127.0.0.1:8080", |req| router.handle(req)).unwrap();
+/// ```
 #[derive(Clone)]
 pub struct Router {
     routes: Vec<Route>,
@@ -48,6 +108,18 @@ impl Default for Router {
 }
 
 impl Router {
+    /// Creates a router without routes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request, Router, StatusCode};
+    /// use std::url::Url;
+    ///
+    /// let router = Router::new();
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/").unwrap());
+    /// assert_eq(router.handle(&mut req).status(), StatusCode::NOT_FOUND);
+    /// ```
     pub fn new() -> Router {
         Router {
             routes: Vec::new(),
@@ -55,8 +127,41 @@ impl Router {
         }
     }
 
-    /// Adds a route (panics if the pattern is invalid or already
-    /// registered, as Go's).
+    /// Adds a route: requests matching `pattern` are answered with
+    /// `handler`.
+    ///
+    /// See [`Router`] for the patterns. Returns the router, so calls can
+    /// chain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pattern is invalid (no `/`, a bad method, a wildcard
+    /// that is not a whole segment, `{name...}` or `{$}` not at the end, a
+    /// wildcard name used twice), or if the same pattern is already
+    /// registered (as Go's).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request, Response, Router};
+    /// use std::url::Url;
+    ///
+    /// let mut router = Router::new();
+    /// router
+    ///     .route("/users/{id}", |_req| Response::from_string("one user"))
+    ///     .route("/users/new", |_req| Response::from_string("new user form"));
+    ///
+    /// // The literal segment is more specific than the wildcard.
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/users/new").unwrap());
+    /// assert_eq(router.handle(&mut req).text().unwrap(), "new user form");
+    /// ```
+    ///
+    /// ```should_panic
+    /// use std::http::{Response, Router};
+    ///
+    /// let mut router = Router::new();
+    /// router.route("/a/{x}/{x}", |_req| Response::from_string("duplicate wildcard"));
+    /// ```
     pub fn route(&mut self, pattern: &str, handler: fn(&mut Request) -> Response) -> &mut Router {
         let r = parse_pattern(pattern, handler);
         for x in self.routes.iter() {
@@ -74,13 +179,56 @@ impl Router {
         self
     }
 
-    /// The handler for requests nothing matches (404 by default).
+    /// Sets the handler for requests no route matches.
+    ///
+    /// Without one, they get `404 Not Found` with the text
+    /// `404 page not found`. Requests whose path matches routes of other
+    /// methods only still get `405 Method Not Allowed`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request, Response, Router, StatusCode};
+    /// use std::url::Url;
+    ///
+    /// let mut router = Router::new();
+    /// router.route("GET /{$}", |_req| Response::from_string("home"));
+    /// router.fallback(|req| {
+    ///     Response::error(StatusCode::NOT_FOUND, `nothing at ${req.path()}`.to_string().as_str())
+    /// });
+    ///
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/x").unwrap());
+    /// assert_eq(router.handle(&mut req).text().unwrap(), "nothing at /x\n");
+    /// ```
     pub fn fallback(&mut self, handler: fn(&mut Request) -> Response) -> &mut Router {
         self.not_found = Some(handler);
         self
     }
 
-    /// Answers req with the matching route's handler.
+    /// Answers the request with the handler of the route that matches it
+    /// best, or with a 404, 405 or 301 response (see [`Router`]).
+    ///
+    /// Before calling the handler, it sets the request's wildcard values
+    /// ([`Request::path_value`]). Its signature makes it a server handler:
+    /// pass `|req| router.handle(req)` to
+    /// [`Server::serve`](crate::http::Server::serve) or
+    /// [`serve`](crate::http::serve).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Method, Request, Response, Router, StatusCode};
+    /// use std::url::Url;
+    ///
+    /// let mut router = Router::new();
+    /// router.route("/docs/", |_req| Response::from_string("docs"));
+    ///
+    /// // "/docs" is redirected to the subtree's root.
+    /// let mut req = Request::new(Method::GET, Url::parse("http://example.com/docs?v=1").unwrap());
+    /// let resp = router.handle(&mut req);
+    /// assert_eq(resp.status(), StatusCode::MOVED_PERMANENTLY);
+    /// assert_eq(resp.header("location"), Some("/docs/?v=1"));
+    /// ```
     pub fn handle(&self, req: &mut Request) -> Response {
         let path = req.path().to_string();
         let segs = split_path(path.as_str());

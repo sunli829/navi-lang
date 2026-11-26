@@ -1,20 +1,86 @@
-//! CSV reading and writing (as Go's encoding/csv, with the API of Rust's
-//! csv crate): RFC 4180 quoting, configurable delimiters, quotes,
-//! escapes, comments and trimming, records as StringRecord or ByteRecord,
-//! and records to and from types that implement std::serde's Serialize and
-//! Deserialize (structs by header names, as the crate's).
+//! Reading and writing CSV, as the csv crate.
 //!
+//! [`Reader`] reads records from anything that implements
+//! [`Read`](crate::io::Read), and [`Writer`] writes them to anything that
+//! implements [`Write`](crate::io::Write). Both follow RFC 4180 by default
+//! (fields separated by `,`, quoted with `"`, a quote inside a quoted field
+//! doubled) and both are configured with a builder: [`ReaderBuilder`] and
+//! [`WriterBuilder`] set the delimiter, the quote and escape characters,
+//! comments, trimming, the record terminator and whether records may have
+//! different numbers of fields.
+//!
+//! A record is read as a [`StringRecord`] (fields that must be UTF-8) or a
+//! [`ByteRecord`] (fields of any bytes), or deserialized into a type that
+//! implements [`Deserialize`](crate::serde::Deserialize) with
+//! [`Reader::deserialize`]: a struct's fields are matched with the header
+//! row by name (by position without headers), and tuples, arrays and `Vec`s
+//! take the fields in order. [`Writer::serialize`] does the reverse for types
+//! that implement [`Serialize`](crate::serde::Serialize), writing a header row
+//! of a struct's field names first. The results and error messages are those
+//! of the csv crate 1.4.
+//!
+//! Where navi differs from the crate:
+//!
+//! - [`Reader::headers`] returns a copy of the header row, not a reference.
+//! - A [`Writer`] has no `Drop`: call [`Writer::flush`] or
+//!   [`Writer::into_inner`] at the end, or the buffered records are lost.
+//! - [`StringRecord`] cannot be indexed (`&rec[0]`): use
+//!   [`StringRecord::get`].
+//! - A record's [`Position`] is the byte offset and the line of its first
+//!   byte.
+//!
+//! # Examples
+//!
+//! Reading records, the first row being the header row:
+//!
+//! ```
+//! use std::csv::Reader;
+//!
+//! fn main() -> Result<(), std::csv::Error> {
+//!     let data = "city,country,pop\nBoston,United States,4628910\nConcord,United States,42695\n";
 //!     let mut rdr = Reader::from_reader(data.as_bytes());
-//!     for rec in rdr.records() {
-//!         let rec = rec?;
-//!         println(`${rec.get(0).unwrap()}`);
-//!     }
-//!     for p in Reader::from_reader(data.as_bytes()).deserialize::<Person>() { ... }
+//!     assert_eq(rdr.headers()?.get(2), Some("pop"));
 //!
-//!     let mut w = Writer::from_writer(Vec::new());
-//!     w.write_record(&["a", "b,c"])?;
-//!     w.serialize(&person)?;
-//!     let bytes = w.into_inner()?;          // no Drop: into_inner or flush
+//!     let mut cities = Vec::new();
+//!     for result in rdr.records() {
+//!         let record = result?;
+//!         cities.push(record.get(0).unwrap().to_string());
+//!     }
+//!     assert_eq(cities, Vec::from([String::from("Boston"), String::from("Concord")]));
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Reading records into structs, and writing them back:
+//!
+//! ```
+//! use std::csv::{Reader, Writer};
+//! use std::serde::{Deserialize, Serialize};
+//!
+//! #[derive(Debug, Serialize, Deserialize, PartialEq)]
+//! struct City {
+//!     name: String,
+//!     population: Option<u64>,
+//! }
+//!
+//! fn main() -> Result<(), std::csv::Error> {
+//!     let data = "name,population\nBoston,4628910\nAtlantis,\n";
+//!     let mut rdr = Reader::from_reader(data.as_bytes());
+//!     let mut cities = Vec::new();
+//!     for result in rdr.deserialize::<City>() {
+//!         cities.push(result?);
+//!     }
+//!     assert_eq(cities[1], City { name: "Atlantis".to_string(), population: None });
+//!
+//!     let mut wtr = Writer::from_writer(Vec::new());
+//!     for city in cities.iter() {
+//!         wtr.serialize(city)?;
+//!     }
+//!     let out = String::from_utf8(wtr.into_inner()?).unwrap();
+//!     assert_eq(out, data);
+//!     Ok(())
+//! }
+//! ```
 
 use crate::fmt::{self, Debug, Display, Formatter};
 use crate::io::{self, Read, Write};
@@ -28,8 +94,32 @@ use crate::serde::ser::{
 
 // --- Records and positions -----------------------------------------------------------
 
-/// Where a record starts: its byte offset, line (from 1) and index
-/// (from 0, the header row included).
+/// The position of a record in the CSV data.
+///
+/// It holds the byte offset of the record's first byte (from 0), the line
+/// that byte is on (from 1) and the index of the record (from 0, the header
+/// row included). Records returned by a [`Reader`] carry their position (see
+/// [`StringRecord::position`]), and so do the errors about a record (see
+/// [`Error::position`]).
+///
+/// The csv crate gives the position its parser state has reached, which
+/// differs after a `\r\n` or a quoted line break; navi gives the record's
+/// true start.
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::Reader;
+///
+/// let mut rdr = Reader::from_reader("a,b\n1,2\n\"x\ny\",3\n".as_bytes());
+/// let mut lines = Vec::new();
+/// for result in rdr.records() {
+///     let record = result.unwrap();
+///     let pos = record.position().unwrap();
+///     lines.push((pos.byte(), pos.line(), pos.record()));
+/// }
+/// assert_eq(lines, Vec::from([(4, 2, 1), (8, 3, 2)]));
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Position {
     byte: u64,
@@ -38,6 +128,18 @@ pub struct Position {
 }
 
 impl Position {
+    /// Returns a position at the start of the data: byte 0, line 1, record 0.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Position;
+    ///
+    /// let pos = Position::new();
+    /// assert_eq(pos.byte(), 0);
+    /// assert_eq(pos.line(), 1);
+    /// assert_eq(pos.record(), 0);
+    /// ```
     pub fn new() -> Position {
         Position {
             byte: 0,
@@ -45,30 +147,65 @@ impl Position {
             record: 0,
         }
     }
+    /// Returns the byte offset of the record's first byte, from 0.
     pub fn byte(&self) -> u64 {
         self.byte
     }
+    /// Returns the line of the record's first byte, from 1.
     pub fn line(&self) -> u64 {
         self.line
     }
+    /// Returns the index of the record, from 0 (the header row is record 0).
     pub fn record(&self) -> u64 {
         self.record
     }
+    /// Sets the byte offset, returning the position for chaining.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Position;
+    ///
+    /// let mut pos = Position::new();
+    /// pos.set_byte(10).set_line(3).set_record(2);
+    /// assert_eq(pos.byte(), 10);
+    /// assert_eq(pos.line(), 3);
+    /// assert_eq(pos.record(), 2);
+    /// ```
     pub fn set_byte(&mut self, b: u64) -> &mut Position {
         self.byte = b;
         self
     }
+    /// Sets the line number, returning the position for chaining.
     pub fn set_line(&mut self, l: u64) -> &mut Position {
         self.line = l;
         self
     }
+    /// Sets the record index, returning the position for chaining.
     pub fn set_record(&mut self, r: u64) -> &mut Position {
         self.record = r;
         self
     }
 }
 
-/// A record of byte fields.
+/// A single CSV record of fields that may hold any bytes.
+///
+/// Use it, with [`Reader::byte_records`] or [`Reader::read_byte_record`],
+/// for data that is not necessarily UTF-8; a [`StringRecord`] is the same
+/// with UTF-8 fields. A record read from a [`Reader`] also carries its
+/// [`Position`].
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::ReaderBuilder;
+///
+/// let data = b"latin1,\xe9t\xe9\n";
+/// let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(&data[..]);
+/// let record = rdr.byte_records().next().unwrap().unwrap();
+/// assert_eq(record.len(), 2);
+/// assert_eq(record.get(1), Some(&b"\xe9t\xe9"[..]));
+/// ```
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct ByteRecord {
     fields: Vec<Vec<u8>>,
@@ -76,15 +213,40 @@ pub struct ByteRecord {
 }
 
 impl ByteRecord {
+    /// Creates an empty record.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ByteRecord;
+    ///
+    /// let record = ByteRecord::new();
+    /// assert_eq(record.len(), 0);
+    /// ```
     pub fn new() -> ByteRecord {
         ByteRecord::default()
     }
+    /// Returns the number of fields in the record.
     pub fn len(&self) -> usize {
         self.fields.len()
     }
+    /// Returns `true` if the record has no fields.
     pub fn is_empty(&self) -> bool {
         self.fields.len() == 0
     }
+    /// Returns field `i` (from 0), or `None` if there is no such field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ByteRecord;
+    ///
+    /// let mut record = ByteRecord::new();
+    /// record.push_field(b"a");
+    /// record.push_field(b"b");
+    /// assert_eq(record.get(1), Some(&b"b"[..]));
+    /// assert_eq(record.get(2), None);
+    /// ```
     pub fn get(&self, i: usize) -> Option<&[u8]> {
         if i < self.fields.len() {
             Some(self.fields[i].as_slice())
@@ -92,21 +254,51 @@ impl ByteRecord {
             None
         }
     }
+    /// Adds a field at the end of the record.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ByteRecord;
+    ///
+    /// let mut record = ByteRecord::new();
+    /// record.push_field(b"foo");
+    /// record.push_field(b"");
+    /// assert_eq(record.len(), 2);
+    /// assert_eq(record.get(1), Some(&b""[..]));
+    /// ```
     pub fn push_field(&mut self, f: &[u8]) {
         self.fields.push(f.to_vec());
     }
+    /// Removes all the fields (the position is kept).
     pub fn clear(&mut self) {
         self.fields.clear();
     }
+    /// Returns the record's position in the data it was read from, if it has
+    /// one.
     pub fn position(&self) -> Option<&Position> {
         match &self.pos {
             Some(p) => Some(p),
             None => None,
         }
     }
+    /// Sets the record's position, or removes it with `None`.
     pub fn set_position(&mut self, p: Option<Position>) {
         self.pos = p;
     }
+    /// Returns an iterator over the fields.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ByteRecord;
+    ///
+    /// let mut record = ByteRecord::new();
+    /// record.push_field(b"a");
+    /// record.push_field(b"bc");
+    /// let lens: Vec<usize> = record.iter().map(|f| f.len()).collect();
+    /// assert_eq(lens, Vec::from([1, 2]));
+    /// ```
     pub fn iter(&self) -> crate::vec::IntoIter<&[u8]> {
         let mut v = Vec::new();
         for f in self.fields.iter() {
@@ -114,7 +306,21 @@ impl ByteRecord {
         }
         v.into_iter()
     }
-    /// The fields' bytes one after another.
+    /// Returns all the fields' bytes concatenated, without separators.
+    ///
+    /// As the crate's `ByteRecord::as_slice`, but a new `Vec` rather than a
+    /// view of the record's buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ByteRecord;
+    ///
+    /// let mut record = ByteRecord::new();
+    /// record.push_field(b"ab");
+    /// record.push_field(b"c");
+    /// assert_eq(record.as_slice(), b"abc".to_vec());
+    /// ```
     pub fn as_slice(&self) -> Vec<u8> {
         let mut v = Vec::new();
         for f in self.fields.iter() {
@@ -134,7 +340,28 @@ impl Debug for ByteRecord {
     }
 }
 
-/// A record of UTF-8 fields.
+/// A single CSV record of UTF-8 fields.
+///
+/// This is what [`Reader::records`] and [`Reader::read_record`] give; a
+/// [`ByteRecord`] is the same with fields of any bytes. Fields are read
+/// with [`get`](StringRecord::get) (the crate's `&record[i]` is not
+/// available) or [`iter`](StringRecord::iter). A record can be built from a
+/// `Vec<&str>` or `Vec<String>` with `From`. A record read from a [`Reader`]
+/// also carries its [`Position`].
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::StringRecord;
+///
+/// let record = StringRecord::from(Vec::from(["a", "b", "c"]));
+/// assert_eq(record.len(), 3);
+/// assert_eq(record.get(0), Some("a"));
+/// assert_eq(record.get(3), None);
+///
+/// let fields: Vec<&str> = record.iter().collect();
+/// assert_eq(fields, Vec::from(["a", "b", "c"]));
+/// ```
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct StringRecord {
     fields: Vec<String>,
@@ -142,15 +369,40 @@ pub struct StringRecord {
 }
 
 impl StringRecord {
+    /// Creates an empty record.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::StringRecord;
+    ///
+    /// let mut record = StringRecord::new();
+    /// assert(record.is_empty());
+    /// record.push_field("x");
+    /// assert_eq(record.len(), 1);
+    /// ```
     pub fn new() -> StringRecord {
         StringRecord::default()
     }
+    /// Returns the number of fields in the record.
     pub fn len(&self) -> usize {
         self.fields.len()
     }
+    /// Returns `true` if the record has no fields.
     pub fn is_empty(&self) -> bool {
         self.fields.len() == 0
     }
+    /// Returns field `i` (from 0), or `None` if there is no such field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::StringRecord;
+    ///
+    /// let record = StringRecord::from(Vec::from(["a", "b"]));
+    /// assert_eq(record.get(1), Some("b"));
+    /// assert_eq(record.get(2), None);
+    /// ```
     pub fn get(&self, i: usize) -> Option<&str> {
         if i < self.fields.len() {
             Some(self.fields[i].as_str())
@@ -158,24 +410,76 @@ impl StringRecord {
             None
         }
     }
+    /// Adds a field at the end of the record.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::StringRecord;
+    ///
+    /// let mut record = StringRecord::new();
+    /// record.push_field("foo");
+    /// record.push_field("bar");
+    /// assert_eq(record, StringRecord::from(Vec::from(["foo", "bar"])));
+    /// ```
     pub fn push_field(&mut self, f: &str) {
         self.fields.push(f.to_string());
     }
+    /// Removes all the fields (the position is kept).
     pub fn clear(&mut self) {
         self.fields.clear();
     }
+    /// Keeps the first `n` fields and removes the rest (nothing if the record
+    /// has `n` fields or fewer).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::StringRecord;
+    ///
+    /// let mut record = StringRecord::from(Vec::from(["a", "b", "c"]));
+    /// record.truncate(1);
+    /// assert_eq(record, StringRecord::from(Vec::from(["a"])));
+    /// ```
     pub fn truncate(&mut self, n: usize) {
         self.fields.truncate(n);
     }
+    /// Returns the record's position in the data it was read from, if it has
+    /// one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Reader;
+    ///
+    /// let mut rdr = Reader::from_reader("h\nx\ny\n".as_bytes());
+    /// let record = rdr.records().nth(1).unwrap().unwrap();
+    /// let pos = record.position().unwrap();
+    /// assert_eq(pos.line(), 3);
+    /// assert_eq(pos.byte(), 4);
+    /// assert_eq(pos.record(), 2);
+    /// ```
     pub fn position(&self) -> Option<&Position> {
         match &self.pos {
             Some(p) => Some(p),
             None => None,
         }
     }
+    /// Sets the record's position, or removes it with `None`.
     pub fn set_position(&mut self, p: Option<Position>) {
         self.pos = p;
     }
+    /// Returns an iterator over the fields.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::StringRecord;
+    ///
+    /// let record = StringRecord::from(Vec::from(["1", "2", "3"]));
+    /// let sum: i32 = record.iter().map(|f| f.parse::<i32>().unwrap()).sum();
+    /// assert_eq(sum, 6);
+    /// ```
     pub fn iter(&self) -> crate::vec::IntoIter<&str> {
         let mut v = Vec::new();
         for f in self.fields.iter() {
@@ -183,11 +487,35 @@ impl StringRecord {
         }
         v.into_iter()
     }
-    /// The fields one after another.
+    /// Returns all the fields concatenated, without separators.
+    ///
+    /// As the crate's `StringRecord::as_slice`, but a new `String` rather than
+    /// a view of the record's buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::StringRecord;
+    ///
+    /// let record = StringRecord::from(Vec::from(["foo", "bar"]));
+    /// assert_eq(record.as_slice(), "foobar");
+    /// ```
     pub fn as_slice(&self) -> String {
         self.fields.concat()
     }
-    /// The fields without leading and trailing whitespace.
+    /// Removes the leading and trailing whitespace of every field.
+    ///
+    /// [`ReaderBuilder::trim`] does this as records are read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::StringRecord;
+    ///
+    /// let mut record = StringRecord::from(Vec::from([" a ", "\tb", "c"]));
+    /// record.trim();
+    /// assert_eq(record, StringRecord::from(Vec::from(["a", "b", "c"])));
+    /// ```
     pub fn trim(&mut self) {
         let mut i = 0;
         while i < self.fields.len() {
@@ -195,6 +523,17 @@ impl StringRecord {
             i += 1;
         }
     }
+    /// Returns the record as a [`ByteRecord`] (a copy, with the same position).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::StringRecord;
+    ///
+    /// let record = StringRecord::from(Vec::from(["a", "é"]));
+    /// let bytes = record.as_byte_record();
+    /// assert_eq(bytes.get(1), Some("é".as_bytes()));
+    /// ```
     pub fn as_byte_record(&self) -> ByteRecord {
         let mut b = ByteRecord::new();
         for f in self.fields.iter() {
@@ -203,6 +542,29 @@ impl StringRecord {
         b.pos = self.pos.clone();
         b
     }
+    /// Converts a [`ByteRecord`] into a `StringRecord`, keeping its position.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FromUtf8Error`] naming the first field that is not valid
+    /// UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{ByteRecord, StringRecord};
+    ///
+    /// let mut bytes = ByteRecord::new();
+    /// bytes.push_field(b"ok");
+    /// let record = StringRecord::from_byte_record(bytes).unwrap();
+    /// assert_eq(record.get(0), Some("ok"));
+    ///
+    /// let mut bad = ByteRecord::new();
+    /// bad.push_field(b"ok");
+    /// bad.push_field(b"\xff");
+    /// let err = StringRecord::from_byte_record(bad).unwrap_err();
+    /// assert_eq(err.field(), 1);
+    /// ```
     pub fn from_byte_record(b: ByteRecord) -> crate::result::Result<StringRecord, FromUtf8Error> {
         let mut r = StringRecord::new();
         let mut i = 0;
@@ -243,13 +605,17 @@ impl From<Vec<String>> for StringRecord {
     }
 }
 
-/// StringRecord::from_byte_record's error: field is not UTF-8.
+/// The error of [`StringRecord::from_byte_record`]: a field is not valid
+/// UTF-8.
+///
+/// It displays as `invalid utf-8 in field N`.
 #[derive(Clone, Debug)]
 pub struct FromUtf8Error {
     field: usize,
 }
 
 impl FromUtf8Error {
+    /// Returns the index of the first field that is not valid UTF-8.
     pub fn field(&self) -> usize {
         self.field
     }
@@ -263,46 +629,77 @@ impl Display for FromUtf8Error {
 
 // --- Errors --------------------------------------------------------------------------
 
-/// What went wrong.
+/// The kind of a CSV [`Error`].
 #[derive(Clone, Debug)]
 pub enum ErrorKind {
+    /// An I/O error of the underlying reader or writer (its message: navi keeps
+    /// the text of the [`io::Error`](crate::io::Error)).
     Io(String),
-    /// A field that is not UTF-8 (read as a StringRecord).
-    Utf8 {
-        pos: Option<Position>,
-        field: usize,
-    },
-    /// A record with another number of fields than the first (not
-    /// flexible).
+    /// A field that is not valid UTF-8, read as a [`StringRecord`].
+    Utf8 { pos: Option<Position>, field: usize },
+    /// A record with a number of fields other than that of the first record,
+    /// when the reader or writer is not
+    /// [`flexible`](ReaderBuilder::flexible).
     UnequalLengths {
         pos: Option<Position>,
         expected_len: u64,
         len: u64,
     },
-    /// A record that does not fit the type (deserialize).
+    /// A record that does not fit the type it is deserialized into.
     Deserialize {
         pos: Option<Position>,
         err: DeserializeError,
     },
-    /// A value that cannot be written (serialize).
+    /// A value that cannot be written as a record.
     Serialize(String),
 }
 
-/// A CSV error.
+/// An error reading or writing CSV.
+///
+/// [`kind`](Error::kind) tells what went wrong. An error about a record
+/// read carries the record's [`Position`], which its message shows, as the
+/// crate's:
+///
+/// ```text
+/// CSV error: record 2 (line: 3, byte: 8): found record with 3 fields, but the previous record has 2 fields
+/// ```
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::{ErrorKind, Reader};
+///
+/// let mut rdr = Reader::from_reader("a,b\n1,2\n3,4,5\n".as_bytes());
+/// let mut records = rdr.records();
+/// assert(records.next().unwrap().is_ok());
+/// let err = records.next().unwrap().unwrap_err();
+/// match err.kind() {
+///     ErrorKind::UnequalLengths { expected_len, len, .. } => {
+///         assert_eq(*expected_len, 2);
+///         assert_eq(*len, 3);
+///     }
+///     _ => panic("unexpected error"),
+/// }
+/// assert_eq(err.position().unwrap().line(), 3);
+/// ```
 #[derive(Clone, Debug)]
 pub struct Error {
     kind: ErrorKind,
 }
 
+/// A `Result` whose error is a CSV [`Error`].
 pub type Result<T> = crate::result::Result<T, Error>;
 
 impl Error {
+    /// Returns the kind of the error.
     pub fn kind(&self) -> &ErrorKind {
         &self.kind
     }
+    /// Returns the kind of the error, consuming it.
     pub fn into_kind(self) -> ErrorKind {
         self.kind
     }
+    /// Returns `true` if this is an I/O error ([`ErrorKind::Io`]).
     pub fn is_io_error(&self) -> bool {
         if let ErrorKind::Io(_) = self.kind {
             true
@@ -310,6 +707,24 @@ impl Error {
             false
         }
     }
+    /// Returns the position of the record the error is about, if it has one.
+    ///
+    /// Errors about a record read ([`ErrorKind::Utf8`],
+    /// [`ErrorKind::UnequalLengths`], [`ErrorKind::Deserialize`]) have one;
+    /// errors writing do not.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Reader;
+    ///
+    /// let data = "name,age\nann,thirty\n";
+    /// let mut rdr = Reader::from_reader(data.as_bytes());
+    /// let err = rdr.deserialize::<(String, u32)>().next().unwrap().unwrap_err();
+    /// let pos = err.position().unwrap();
+    /// assert_eq(pos.line(), 2);
+    /// assert_eq(pos.record(), 1);
+    /// ```
     pub fn position(&self) -> Option<&Position> {
         match &self.kind {
             ErrorKind::Utf8 { pos, .. }
@@ -352,7 +767,26 @@ impl Display for Error {
     }
 }
 
-/// Why a record does not fit a type.
+/// Why a record does not fit the type it is deserialized into.
+///
+/// It is held by [`ErrorKind::Deserialize`] and displays as
+/// `field N: message` when the error is about a field.
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::{ErrorKind, Reader};
+///
+/// let mut rdr = Reader::from_reader("name,age\nann,thirty\n".as_bytes());
+/// let err = rdr.deserialize::<(String, u32)>().next().unwrap().unwrap_err();
+/// match err.kind() {
+///     ErrorKind::Deserialize { err, .. } => {
+///         assert_eq(err.field(), Some(1));
+///         assert_eq(err.to_string(), "field 1: invalid digit found in string");
+///     }
+///     _ => panic("unexpected error"),
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct DeserializeError {
     field: Option<u64>,
@@ -360,6 +794,7 @@ pub struct DeserializeError {
 }
 
 impl DeserializeError {
+    /// Returns the index of the field the error is about, if any.
     pub fn field(&self) -> Option<u64> {
         self.field
     }
@@ -376,24 +811,52 @@ impl Display for DeserializeError {
 
 // --- Reading -------------------------------------------------------------------------
 
-/// Which fields lose their surrounding whitespace.
+/// Which fields a [`Reader`] removes leading and trailing whitespace from
+/// (see [`ReaderBuilder::trim`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Trim {
+    /// Nothing is trimmed (the default).
     None,
+    /// Only the header row's fields are trimmed.
     Headers,
+    /// Only the fields of the records after the header row are trimmed.
     Fields,
+    /// All fields are trimmed, the header row's included.
     All,
 }
 
-/// What ends a record.
+/// What ends a record (see [`ReaderBuilder::terminator`] and
+/// [`WriterBuilder::terminator`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Terminator {
-    /// \r, \n or \r\n when reading; \r\n when writing.
+    /// `\r`, `\n` or `\r\n` when reading (the reader's default); `\r\n` when
+    /// writing.
     CRLF,
+    /// The given byte (a writer's default is `Any(b'\n')`).
     Any(u8),
 }
 
-/// Configures a Reader.
+/// Builds a [`Reader`] with a configuration.
+///
+/// The defaults are those of [`Reader::from_reader`]: `,` as the
+/// delimiter, a header row, records of equal lengths, quoting with `"`
+/// (doubled inside a quoted field), no escape character, no comments, no
+/// trimming and `\r`, `\n` or `\r\n` as the terminator.
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::ReaderBuilder;
+///
+/// let data = "# a comment\nx;y\n1;2\n";
+/// let mut rdr = ReaderBuilder::new()
+///     .delimiter(b';')
+///     .comment(Some(b'#'))
+///     .from_reader(data.as_bytes());
+/// assert_eq(rdr.headers().unwrap().get(1), Some("y"));
+/// let record = rdr.records().next().unwrap().unwrap();
+/// assert_eq(record.get(0), Some("1"));
+/// ```
 #[derive(Clone)]
 pub struct ReaderBuilder {
     delimiter: u8,
@@ -415,6 +878,7 @@ impl Default for ReaderBuilder {
 }
 
 impl ReaderBuilder {
+    /// Creates a builder with the default configuration.
     pub fn new() -> ReaderBuilder {
         ReaderBuilder {
             delimiter: b',',
@@ -429,47 +893,200 @@ impl ReaderBuilder {
             terminator: Terminator::CRLF,
         }
     }
+    /// Sets the field delimiter (`b','` by default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let mut rdr = ReaderBuilder::new()
+    ///     .delimiter(b'\t')
+    ///     .has_headers(false)
+    ///     .from_reader("a\tb,c\n".as_bytes());
+    /// let record = rdr.records().next().unwrap().unwrap();
+    /// assert_eq(record.get(1), Some("b,c"));
+    /// ```
     pub fn delimiter(&mut self, d: u8) -> &mut ReaderBuilder {
         self.delimiter = d;
         self
     }
+    /// Sets whether the first record is a header row (`true` by default).
+    ///
+    /// The header row is not returned as a record; it is read by
+    /// [`Reader::headers`], and [`Reader::deserialize`] uses it to match fields
+    /// with a struct's field names. Without it, every row is a record and
+    /// structs take the fields in order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let mut rdr = ReaderBuilder::new()
+    ///     .has_headers(false)
+    ///     .from_reader("a,b\n1,2\n".as_bytes());
+    /// assert_eq(rdr.records().count(), 2);
+    /// ```
     pub fn has_headers(&mut self, yes: bool) -> &mut ReaderBuilder {
         self.has_headers = yes;
         self
     }
+    /// Sets whether records may have different numbers of fields (`false` by
+    /// default).
+    ///
+    /// When not flexible, a record whose length differs from the first
+    /// record's is an [`ErrorKind::UnequalLengths`] error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let data = "a,b\n1\n2,3,4\n";
+    /// let mut rdr = ReaderBuilder::new().flexible(true).from_reader(data.as_bytes());
+    /// let lens: Vec<usize> = rdr.records().map(|r| r.unwrap().len()).collect();
+    /// assert_eq(lens, Vec::from([1, 3]));
+    /// ```
     pub fn flexible(&mut self, yes: bool) -> &mut ReaderBuilder {
         self.flexible = yes;
         self
     }
+    /// Sets whether quotes are special (`true` by default).
+    ///
+    /// When off, a quote character is read as any other byte.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let mut rdr = ReaderBuilder::new()
+    ///     .quoting(false)
+    ///     .has_headers(false)
+    ///     .from_reader("\"a,b\"\n".as_bytes());
+    /// let record = rdr.records().next().unwrap().unwrap();
+    /// assert_eq(record.get(0), Some("\"a"));
+    /// assert_eq(record.get(1), Some("b\""));
+    /// ```
     pub fn quoting(&mut self, yes: bool) -> &mut ReaderBuilder {
         self.quoting = yes;
         self
     }
+    /// Sets the quote character (`b'"'` by default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let mut rdr = ReaderBuilder::new()
+    ///     .quote(b'\'')
+    ///     .has_headers(false)
+    ///     .from_reader("'a,b',c\n".as_bytes());
+    /// let record = rdr.records().next().unwrap().unwrap();
+    /// assert_eq(record.get(0), Some("a,b"));
+    /// ```
     pub fn quote(&mut self, q: u8) -> &mut ReaderBuilder {
         self.quote = q;
         self
     }
+    /// Sets the escape character of quoted fields (`None` by default).
+    ///
+    /// Inside a quoted field, the byte after the escape character is taken as
+    /// it is, so an escaped quote does not end the field. Quotes can still be
+    /// doubled unless [`double_quote`](ReaderBuilder::double_quote) is off.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let mut rdr = ReaderBuilder::new()
+    ///     .escape(Some(b'\\'))
+    ///     .has_headers(false)
+    ///     .from_reader("\"say \\\"hi\\\"\",x\n".as_bytes());
+    /// let record = rdr.records().next().unwrap().unwrap();
+    /// assert_eq(record.get(0), Some("say \"hi\""));
+    /// ```
     pub fn escape(&mut self, e: Option<u8>) -> &mut ReaderBuilder {
         self.escape = e;
         self
     }
+    /// Sets whether two quotes in a quoted field are one quote (`true` by
+    /// default).
     pub fn double_quote(&mut self, yes: bool) -> &mut ReaderBuilder {
         self.double_quote = yes;
         self
     }
+    /// Sets the comment character (`None` by default).
+    ///
+    /// A line that starts with it is skipped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let data = "a,b\n#1,2\n3,4\n";
+    /// let mut rdr = ReaderBuilder::new().comment(Some(b'#')).from_reader(data.as_bytes());
+    /// let record = rdr.records().next().unwrap().unwrap();
+    /// assert_eq(record.get(0), Some("3"));
+    /// ```
     pub fn comment(&mut self, c: Option<u8>) -> &mut ReaderBuilder {
         self.comment = c;
         self
     }
+    /// Sets which fields lose their leading and trailing whitespace
+    /// ([`Trim::None`] by default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{ReaderBuilder, Trim};
+    ///
+    /// let data = " name , age \n ann , 30 \n";
+    /// let mut rdr = ReaderBuilder::new().trim(Trim::All).from_reader(data.as_bytes());
+    /// assert_eq(rdr.headers().unwrap().get(0), Some("name"));
+    /// let record = rdr.records().next().unwrap().unwrap();
+    /// assert_eq(record.get(1), Some("30"));
+    /// ```
     pub fn trim(&mut self, t: Trim) -> &mut ReaderBuilder {
         self.trim = t;
         self
     }
+    /// Sets what ends a record ([`Terminator::CRLF`] by default: `\r`, `\n` or
+    /// `\r\n`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{ReaderBuilder, Terminator};
+    ///
+    /// let mut rdr = ReaderBuilder::new()
+    ///     .terminator(Terminator::Any(b';'))
+    ///     .has_headers(false)
+    ///     .from_reader("a,b;c,d;".as_bytes());
+    /// assert_eq(rdr.records().count(), 2);
+    /// ```
     pub fn terminator(&mut self, t: Terminator) -> &mut ReaderBuilder {
         self.terminator = t;
         self
     }
 
+    /// Builds a [`Reader`] with this configuration that reads from `rdr`.
+    ///
+    /// The reader is buffered: there is no need to wrap `rdr` in a
+    /// [`BufReader`](crate::io::BufReader).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let mut rdr = ReaderBuilder::new().from_reader("a\n1\n".as_bytes());
+    /// assert_eq(rdr.records().count(), 1);
+    /// ```
     pub fn from_reader<R: Read>(&self, rdr: R) -> Reader<R> {
         let mut buf = Vec::new();
         buf.resize(32768, 0);
@@ -490,6 +1107,23 @@ impl ReaderBuilder {
         }
     }
 
+    /// Builds a [`Reader`] with this configuration that reads the file at
+    /// `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::Io`] error if the file cannot be opened.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::csv::ReaderBuilder;
+    ///
+    /// let mut rdr = ReaderBuilder::new().delimiter(b';').from_path("data.csv").unwrap();
+    /// for result in rdr.records() {
+    ///     println(`${result.unwrap():?}`);
+    /// }
+    /// ```
     pub fn from_path<P: AsRef<crate::path::Path>>(
         &self,
         path: P,
@@ -499,7 +1133,30 @@ impl ReaderBuilder {
     }
 }
 
-/// Reads CSV records from a reader.
+/// A CSV reader.
+///
+/// It reads records from a [`Read`](crate::io::Read) as [`StringRecord`]s
+/// ([`records`](Reader::records), [`read_record`](Reader::read_record)),
+/// [`ByteRecord`]s ([`byte_records`](Reader::byte_records)) or values of a
+/// type that implements [`Deserialize`](crate::serde::Deserialize)
+/// ([`deserialize`](Reader::deserialize)). By default the first record is
+/// the header row; [`ReaderBuilder`] configures this and the format. Blank
+/// lines are skipped.
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::Reader;
+///
+/// let data = "name,age\nann,30\nben,40\n";
+/// let mut rdr = Reader::from_reader(data.as_bytes());
+/// let mut total = 0;
+/// for result in rdr.records() {
+///     let record = result.unwrap();
+///     total += record.get(1).unwrap().parse::<u32>().unwrap();
+/// }
+/// assert_eq(total, 70);
+/// ```
 pub struct Reader<R: Read> {
     cfg: ReaderBuilder,
     rdr: R,
@@ -518,6 +1175,24 @@ pub struct Reader<R: Read> {
 }
 
 impl Reader<crate::fs::File> {
+    /// Creates a reader with the default configuration that reads the file at
+    /// `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::Io`] error if the file cannot be opened.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::csv::Reader;
+    ///
+    /// let mut rdr = Reader::from_path("people.csv").unwrap();
+    /// for result in rdr.records() {
+    ///     let record = result.unwrap();
+    ///     println(`${record:?}`);
+    /// }
+    /// ```
     pub fn from_path<P: AsRef<crate::path::Path>>(path: P) -> Result<Reader<crate::fs::File>> {
         ReaderBuilder::new().from_path(path)
     }
@@ -530,6 +1205,20 @@ const S_QUOTE_IN_QUOTED: u8 = 3;
 const S_ESCAPE: u8 = 4;
 
 impl<R: Read> Reader<R> {
+    /// Creates a reader with the default configuration that reads from `rdr`.
+    ///
+    /// Use [`ReaderBuilder`] for another configuration. The reader is
+    /// buffered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Reader;
+    ///
+    /// let mut rdr = Reader::from_reader("a,b\n1,2\n".as_bytes());
+    /// let record = rdr.records().next().unwrap().unwrap();
+    /// assert_eq(record.get(1), Some("2"));
+    /// ```
     pub fn from_reader(rdr: R) -> Reader<R> {
         ReaderBuilder::new().from_reader(rdr)
     }
@@ -741,8 +1430,30 @@ impl<R: Read> Reader<R> {
         Ok(())
     }
 
-    /// The header row (the first record when has_headers; empty without
-    /// headers or input).
+    /// Returns the header row, reading it if no record has been read yet.
+    ///
+    /// It is a copy (the crate returns a reference). It is empty if the input
+    /// is empty or, unless [`set_headers`](Reader::set_headers) was called, if
+    /// the reader has no header row ([`ReaderBuilder::has_headers`] off; the
+    /// crate returns the first record then).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header row cannot be read: an I/O error, or a
+    /// header row that is not UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Reader;
+    ///
+    /// let mut rdr = Reader::from_reader("city,pop\nOslo,700000\n".as_bytes());
+    /// let headers = rdr.headers().unwrap();
+    /// let names: Vec<&str> = headers.iter().collect();
+    /// assert_eq(names, Vec::from(["city", "pop"]));
+    /// // Reading the headers does not take a record away.
+    /// assert_eq(rdr.records().count(), 1);
+    /// ```
     pub fn headers(&mut self) -> Result<StringRecord> {
         if !self.headers_read && !self.cfg.has_headers {
             // Without headers the first record stands for them, as the
@@ -756,20 +1467,74 @@ impl<R: Read> Reader<R> {
         }
     }
 
+    /// Returns the header row as a [`ByteRecord`] (see
+    /// [`headers`](Reader::headers)).
+    ///
+    /// # Errors
+    ///
+    /// As [`headers`](Reader::headers).
     pub fn byte_headers(&mut self) -> Result<ByteRecord> {
         Ok(self.headers()?.as_byte_record())
     }
 
+    /// Sets the header row used by [`deserialize`](Reader::deserialize) and
+    /// returned by [`headers`](Reader::headers).
+    ///
+    /// If no record has been read yet, the first row is then not taken as a
+    /// header row: it is read as a record.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{ReaderBuilder, StringRecord};
+    /// use std::serde::Deserialize;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct Point {
+    ///     y: i32,
+    ///     x: i32,
+    /// }
+    ///
+    /// let mut rdr = ReaderBuilder::new().has_headers(false).from_reader("1,2\n".as_bytes());
+    /// rdr.set_headers(StringRecord::from(Vec::from(["x", "y"])));
+    /// let p = rdr.deserialize::<Point>().next().unwrap().unwrap();
+    /// assert_eq((p.x, p.y), (1, 2));
+    /// ```
     pub fn set_headers(&mut self, h: StringRecord) {
         self.headers_read = true;
         self.headers = Some(h);
     }
 
+    /// Returns `true` if the first record is read as a header row (see
+    /// [`ReaderBuilder::has_headers`]).
     pub fn has_headers(&self) -> bool {
         self.cfg.has_headers
     }
 
-    /// Reads the next record into rec; false at the end.
+    /// Reads the next record into `rec`, returning `false` at the end of the
+    /// input.
+    ///
+    /// The header row, if any, is skipped. Reusing one record this way avoids
+    /// an allocation per record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on an I/O error, a field that is not UTF-8, or a record
+    /// of another length than the first (unless flexible).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{Reader, StringRecord};
+    ///
+    /// let mut rdr = Reader::from_reader("n\n1\n2\n".as_bytes());
+    /// let mut record = StringRecord::new();
+    /// let mut sum = 0;
+    /// while rdr.read_record(&mut record).unwrap() {
+    ///     sum += record.get(0).unwrap().parse::<i32>().unwrap();
+    /// }
+    /// assert_eq(sum, 3);
+    /// ```
     pub fn read_record(&mut self, rec: &mut StringRecord) -> Result<bool> {
         self.ensure_headers()?;
         let mut b = ByteRecord::new();
@@ -782,25 +1547,120 @@ impl<R: Read> Reader<R> {
         Ok(true)
     }
 
+    /// Reads the next record into `rec` as bytes, returning `false` at the end
+    /// of the input.
+    ///
+    /// The header row, if any, is skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on an I/O error or a record of another length than the
+    /// first (unless flexible).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{ByteRecord, Reader};
+    ///
+    /// let mut rdr = Reader::from_reader("h\nabc\n".as_bytes());
+    /// let mut record = ByteRecord::new();
+    /// assert(rdr.read_byte_record(&mut record).unwrap());
+    /// assert_eq(record.get(0), Some(&b"abc"[..]));
+    /// assert(!rdr.read_byte_record(&mut record).unwrap());
+    /// ```
     pub fn read_byte_record(&mut self, rec: &mut ByteRecord) -> Result<bool> {
         self.ensure_headers()?;
         self.read_checked(rec)
     }
 
-    /// The records after the header row.
+    /// Returns an iterator over the records after the header row, as
+    /// [`StringRecord`]s.
+    ///
+    /// Each item is a `Result`: see [`read_record`](Reader::read_record) for
+    /// the errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Reader;
+    ///
+    /// let mut rdr = Reader::from_reader("a,b\n1,2\n3,4\n".as_bytes());
+    /// let firsts: Vec<String> = rdr.records()
+    ///     .map(|r| r.unwrap().get(0).unwrap().to_string())
+    ///     .collect();
+    /// assert_eq(firsts, Vec::from([String::from("1"), String::from("3")]));
+    /// ```
     pub fn records(&mut self) -> StringRecordsIter<R> {
         StringRecordsIter { r: self }
     }
+    /// Returns an iterator over the records after the header row, consuming the
+    /// reader.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Reader;
+    ///
+    /// let records = Reader::from_reader("a\n1\n2\n".as_bytes()).into_records();
+    /// assert_eq(records.count(), 2);
+    /// ```
     pub fn into_records(self) -> StringRecordsIter<R> {
         let mut me = self;
         StringRecordsIter { r: &mut me }
     }
+    /// Returns an iterator over the records after the header row, as
+    /// [`ByteRecord`]s.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Reader;
+    ///
+    /// let mut rdr = Reader::from_reader("a\nx\n".as_bytes());
+    /// let record = rdr.byte_records().next().unwrap().unwrap();
+    /// assert_eq(record.get(0), Some(&b"x"[..]));
+    /// ```
     pub fn byte_records(&mut self) -> ByteRecordsIter<R> {
         ByteRecordsIter { r: self }
     }
 
-    /// The records as values of D (structs by header names, or by
-    /// position without headers; tuples and Vecs by position).
+    /// Returns an iterator over the records after the header row, each
+    /// deserialized into a `D`.
+    ///
+    /// A struct's fields are matched with the header row by name (by position
+    /// without a header row); tuples, arrays and `Vec`s take the fields in
+    /// order; a type that is not a sequence takes the first field. An empty
+    /// field is `None` for an `Option`. Numbers and booleans are parsed from
+    /// the field's text.
+    ///
+    /// # Errors
+    ///
+    /// Each item is an error when the record cannot be read (see
+    /// [`read_record`](Reader::read_record)) or does not fit `D`
+    /// ([`ErrorKind::Deserialize`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Reader;
+    /// use std::serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, PartialEq)]
+    /// struct Record {
+    ///     city: String,
+    ///     pop: u64,
+    ///     note: Option<String>,
+    /// }
+    ///
+    /// let data = "pop,city,note\n700000,Oslo,\n";
+    /// let mut rdr = Reader::from_reader(data.as_bytes());
+    /// let r = rdr.deserialize::<Record>().next().unwrap().unwrap();
+    /// assert_eq(r, Record { city: "Oslo".to_string(), pop: 700000, note: None });
+    ///
+    /// let mut rdr = Reader::from_reader(data.as_bytes());
+    /// let t = rdr.deserialize::<(u64, String)>().next().unwrap().unwrap();
+    /// assert_eq(t, (700000, "Oslo".to_string()));
+    /// ```
     pub fn deserialize<D: Deserialize>(&mut self) -> DeserializeRecordsIter<R, D> {
         DeserializeRecordsIter {
             r: self,
@@ -808,7 +1668,21 @@ impl<R: Read> Reader<R> {
         }
     }
 
-    /// The position of the next record.
+    /// Returns the position the reader has reached: that of the byte after the
+    /// last record read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{Reader, StringRecord};
+    ///
+    /// let mut rdr = Reader::from_reader("a,b\n1,2\n".as_bytes());
+    /// assert_eq(rdr.position().byte(), 0);
+    /// let mut record = StringRecord::new();
+    /// rdr.read_record(&mut record).unwrap();
+    /// assert_eq(rdr.position().byte(), 8);
+    /// assert_eq(rdr.position().line(), 3);
+    /// ```
     pub fn position(&self) -> Position {
         Position {
             byte: self.byte,
@@ -816,21 +1690,43 @@ impl<R: Read> Reader<R> {
             record: self.record,
         }
     }
+    /// Returns `true` once the reader has reached the end of the input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{Reader, StringRecord};
+    ///
+    /// let mut rdr = Reader::from_reader("a\n1\n".as_bytes());
+    /// let mut record = StringRecord::new();
+    /// assert(rdr.read_record(&mut record).unwrap());
+    /// assert(!rdr.is_done());
+    /// assert(!rdr.read_record(&mut record).unwrap());
+    /// assert(rdr.is_done());
+    /// ```
     pub fn is_done(&self) -> bool {
         self.done
     }
+    /// Returns a reference to the underlying reader.
     pub fn get_ref(&self) -> &R {
         &self.rdr
     }
+    /// Returns a mutable reference to the underlying reader.
+    ///
+    /// Reading from it directly skips data the CSV reader has not buffered.
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.rdr
     }
+    /// Returns the underlying reader, consuming the CSV reader (data it has
+    /// buffered is lost).
     pub fn into_inner(self) -> R {
         self.rdr
     }
 }
 
-/// Reader::records.
+/// An iterator over the [`StringRecord`]s of a [`Reader`].
+///
+/// It is returned by [`Reader::records`] and [`Reader::into_records`].
 pub struct StringRecordsIter<R: Read> {
     r: &mut Reader<R>,
 }
@@ -847,7 +1743,9 @@ impl<R: Read> Iterator for StringRecordsIter<R> {
     }
 }
 
-/// Reader::byte_records.
+/// An iterator over the [`ByteRecord`]s of a [`Reader`].
+///
+/// It is returned by [`Reader::byte_records`].
 pub struct ByteRecordsIter<R: Read> {
     r: &mut Reader<R>,
 }
@@ -864,7 +1762,10 @@ impl<R: Read> Iterator for ByteRecordsIter<R> {
     }
 }
 
-/// Reader::deserialize.
+/// An iterator over a [`Reader`]'s records deserialized into values of
+/// type `D`.
+///
+/// It is returned by [`Reader::deserialize`].
 pub struct DeserializeRecordsIter<R: Read, D> {
     r: &mut Reader<R>,
     t: crate::marker::PhantomData<D>,
@@ -1275,18 +2176,56 @@ impl VariantAccess for UnitOnly {
 
 // --- Writing -------------------------------------------------------------------------
 
-/// When fields are quoted.
+/// When a [`Writer`] quotes a field (see [`WriterBuilder::quote_style`]).
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::{QuoteStyle, WriterBuilder};
+///
+/// let mut wtr = WriterBuilder::new()
+///     .quote_style(QuoteStyle::NonNumeric)
+///     .from_writer(Vec::new());
+/// wtr.write_record(&["a", "1.5", "b c"]).unwrap();
+/// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+/// assert_eq(out, "\"a\",1.5,\"b c\"\n");
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum QuoteStyle {
-    /// When they contain the delimiter, a quote or a line break.
+    /// Only fields that need it (the default): those that contain the
+    /// delimiter, the quote character, `\r` or `\n`, and an empty field that is
+    /// a record's only field (it would be a blank line otherwise).
     Necessary,
+    /// Every field.
     Always,
+    /// No field, even one that needs it (the output may then not be valid CSV).
     Never,
-    /// When they are not numbers.
+    /// Every field that is not an integer or a floating-point number (empty
+    /// fields included).
     NonNumeric,
 }
 
-/// Configures a Writer.
+/// Builds a [`Writer`] with a configuration.
+///
+/// The defaults are those of [`Writer::from_writer`]: `,` as the
+/// delimiter, a header row written by [`Writer::serialize`], records of
+/// equal lengths, fields quoted with `"` only when necessary (a quote
+/// inside doubled) and `\n` after each record.
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::{Terminator, WriterBuilder};
+///
+/// let mut wtr = WriterBuilder::new()
+///     .delimiter(b'\t')
+///     .terminator(Terminator::CRLF)
+///     .from_writer(Vec::new());
+/// wtr.write_record(&["a", "b"]).unwrap();
+/// wtr.write_record(&["1", "2"]).unwrap();
+/// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+/// assert_eq(out, "a\tb\r\n1\t2\r\n");
+/// ```
 #[derive(Clone)]
 pub struct WriterBuilder {
     delimiter: u8,
@@ -1306,6 +2245,7 @@ impl Default for WriterBuilder {
 }
 
 impl WriterBuilder {
+    /// Creates a builder with the default configuration.
     pub fn new() -> WriterBuilder {
         WriterBuilder {
             delimiter: b',',
@@ -1318,40 +2258,151 @@ impl WriterBuilder {
             terminator: Terminator::Any(b'\n'),
         }
     }
+    /// Sets the field delimiter (`b','` by default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::WriterBuilder;
+    ///
+    /// let mut wtr = WriterBuilder::new().delimiter(b';').from_writer(Vec::new());
+    /// wtr.write_record(&["a", "b;c"]).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "a;\"b;c\"\n");
+    /// ```
     pub fn delimiter(&mut self, d: u8) -> &mut WriterBuilder {
         self.delimiter = d;
         self
     }
-    /// Whether serialize writes a header row of field names first.
+    /// Sets whether [`Writer::serialize`] writes a header row of a struct's
+    /// field names before the first record (`true` by default).
+    ///
+    /// It has no effect on [`Writer::write_record`], nor on values that are not
+    /// structs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::WriterBuilder;
+    /// use std::serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct Point {
+    ///     x: i32,
+    ///     y: i32,
+    /// }
+    ///
+    /// let mut wtr = WriterBuilder::new().has_headers(false).from_writer(Vec::new());
+    /// wtr.serialize(&Point { x: 1, y: 2 }).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "1,2\n");
+    /// ```
     pub fn has_headers(&mut self, yes: bool) -> &mut WriterBuilder {
         self.has_headers = yes;
         self
     }
+    /// Sets whether records may have different numbers of fields (`false` by
+    /// default).
+    ///
+    /// When not flexible, writing a record whose length differs from the first
+    /// record's is an [`ErrorKind::UnequalLengths`] error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::WriterBuilder;
+    ///
+    /// let mut wtr = WriterBuilder::new().flexible(true).from_writer(Vec::new());
+    /// wtr.write_record(&["a", "b"]).unwrap();
+    /// wtr.write_record(&["c"]).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "a,b\nc\n");
+    /// ```
     pub fn flexible(&mut self, yes: bool) -> &mut WriterBuilder {
         self.flexible = yes;
         self
     }
+    /// Sets when fields are quoted ([`QuoteStyle::Necessary`] by default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{QuoteStyle, WriterBuilder};
+    ///
+    /// let mut wtr = WriterBuilder::new()
+    ///     .quote_style(QuoteStyle::Always)
+    ///     .from_writer(Vec::new());
+    /// wtr.write_record(&["a", "1"]).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "\"a\",\"1\"\n");
+    /// ```
     pub fn quote_style(&mut self, s: QuoteStyle) -> &mut WriterBuilder {
         self.quote_style = s;
         self
     }
+    /// Sets the quote character (`b'"'` by default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::WriterBuilder;
+    ///
+    /// let mut wtr = WriterBuilder::new().quote(b'\'').from_writer(Vec::new());
+    /// wtr.write_record(&["it's", "a,b"]).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "'it''s','a,b'\n");
+    /// ```
     pub fn quote(&mut self, q: u8) -> &mut WriterBuilder {
         self.quote = q;
         self
     }
+    /// Sets the character written before a quote inside a quoted field when
+    /// [`double_quote`](WriterBuilder::double_quote) is off (`b'\\'` by
+    /// default).
     pub fn escape(&mut self, e: u8) -> &mut WriterBuilder {
         self.escape = e;
         self
     }
+    /// Sets whether a quote inside a quoted field is written doubled (`true` by
+    /// default); when off, it is written after the
+    /// [`escape`](WriterBuilder::escape) character.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::WriterBuilder;
+    ///
+    /// let mut wtr = WriterBuilder::new().double_quote(false).from_writer(Vec::new());
+    /// wtr.write_record(&["say \"hi\""]).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "\"say \\\"hi\\\"\"\n");
+    /// ```
     pub fn double_quote(&mut self, yes: bool) -> &mut WriterBuilder {
         self.double_quote = yes;
         self
     }
+    /// Sets what is written after each record (`Terminator::Any(b'\n')` by
+    /// default; [`Terminator::CRLF`] writes `\r\n`).
     pub fn terminator(&mut self, t: Terminator) -> &mut WriterBuilder {
         self.terminator = t;
         self
     }
 
+    /// Builds a [`Writer`] with this configuration that writes to `w`.
+    ///
+    /// The writer is buffered: there is no need to wrap `w` in a
+    /// [`BufWriter`](crate::io::BufWriter). Call [`Writer::flush`] or
+    /// [`Writer::into_inner`] at the end.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::WriterBuilder;
+    ///
+    /// let mut wtr = WriterBuilder::new().from_writer(Vec::new());
+    /// wtr.write_record(&["x"]).unwrap();
+    /// assert_eq(wtr.into_inner().unwrap(), b"x\n".to_vec());
+    /// ```
     pub fn from_writer<W: Write>(&self, w: W) -> Writer<W> {
         Writer {
             cfg: self.clone(),
@@ -1363,6 +2414,22 @@ impl WriterBuilder {
         }
     }
 
+    /// Builds a [`Writer`] with this configuration that writes to the file at
+    /// `path`, creating it or truncating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::Io`] error if the file cannot be created.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::csv::WriterBuilder;
+    ///
+    /// let mut wtr = WriterBuilder::new().delimiter(b'\t').from_path("out.tsv").unwrap();
+    /// wtr.write_record(&["a", "b"]).unwrap();
+    /// wtr.flush().unwrap();
+    /// ```
     pub fn from_path<P: AsRef<crate::path::Path>>(
         &self,
         path: P,
@@ -1372,8 +2439,33 @@ impl WriterBuilder {
     }
 }
 
-/// Writes CSV records to a writer (buffered: call flush or into_inner,
-/// there is no Drop).
+/// A CSV writer.
+///
+/// It writes records to a [`Write`](crate::io::Write): lists of fields with
+/// [`write_record`](Writer::write_record), single fields with
+/// [`write_field`](Writer::write_field), or values of a type that implements
+/// [`Serialize`](crate::serde::Serialize) with
+/// [`serialize`](Writer::serialize). Fields are quoted when needed.
+/// [`WriterBuilder`] configures the format.
+///
+/// The output is buffered and, as navi has no `Drop`, nothing flushes it
+/// for you: call [`flush`](Writer::flush) or
+/// [`into_inner`](Writer::into_inner) when done.
+///
+/// # Examples
+///
+/// ```
+/// use std::csv::Writer;
+///
+/// fn main() -> Result<(), std::csv::Error> {
+///     let mut wtr = Writer::from_writer(Vec::new());
+///     wtr.write_record(&["city", "note"])?;
+///     wtr.write_record(&["Boston", "big, old"])?;
+///     let out = String::from_utf8(wtr.into_inner()?).unwrap();
+///     assert_eq(out, "city,note\nBoston,\"big, old\"\n");
+///     Ok(())
+/// }
+/// ```
 pub struct Writer<W: Write> {
     cfg: WriterBuilder,
     wtr: W,
@@ -1384,6 +2476,22 @@ pub struct Writer<W: Write> {
 }
 
 impl Writer<crate::fs::File> {
+    /// Creates a writer with the default configuration that writes to the file
+    /// at `path`, creating it or truncating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::Io`] error if the file cannot be created.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::csv::Writer;
+    ///
+    /// let mut wtr = Writer::from_path("out.csv").unwrap();
+    /// wtr.write_record(&["a", "b"]).unwrap();
+    /// wtr.flush().unwrap();
+    /// ```
     pub fn from_path<P: AsRef<crate::path::Path>>(path: P) -> Result<Writer<crate::fs::File>> {
         WriterBuilder::new().from_path(path)
     }
@@ -1397,11 +2505,46 @@ fn numeric(f: &[u8]) -> bool {
 }
 
 impl<W: Write> Writer<W> {
+    /// Creates a writer with the default configuration that writes to `w`.
+    ///
+    /// Use [`WriterBuilder`] for another configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Writer;
+    ///
+    /// let mut wtr = Writer::from_writer(Vec::new());
+    /// wtr.write_record(&["a", "b"]).unwrap();
+    /// assert_eq(String::from_utf8(wtr.into_inner().unwrap()).unwrap(), "a,b\n");
+    /// ```
     pub fn from_writer(w: W) -> Writer<W> {
         WriterBuilder::new().from_writer(w)
     }
 
     /// Writes one field of the current record.
+    ///
+    /// End the record with [`write_record`](Writer::write_record) and an empty
+    /// iterator (the crate's `write_record(None::<&[u8]>)`), or with more
+    /// fields in it.
+    ///
+    /// # Errors
+    ///
+    /// The field itself cannot fail; the error is there for the crate's
+    /// signature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Writer;
+    ///
+    /// let mut wtr = Writer::from_writer(Vec::new());
+    /// wtr.write_field("a").unwrap();
+    /// wtr.write_field("b").unwrap();
+    /// let end: Vec<&str> = Vec::new();
+    /// wtr.write_record(end).unwrap();
+    /// assert_eq(String::from_utf8(wtr.into_inner().unwrap()).unwrap(), "a,b\n");
+    /// ```
     pub fn write_field<T: AsRef<[u8]>>(&mut self, field: T) -> Result<()> {
         self.field(field.as_ref(), false);
         Ok(())
@@ -1470,8 +2613,30 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// Writes a record (its fields, then the end of the record; an empty
-    /// iterator ends a record begun with write_field).
+    /// Writes a record: its fields, then the terminator.
+    ///
+    /// The fields are added to those written with
+    /// [`write_field`](Writer::write_field) since the last record, so an empty
+    /// iterator ends such a record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::UnequalLengths`] error if the record's length
+    /// differs from the first record's (unless flexible; the record's fields
+    /// have been written then, without the terminator), or an I/O error when
+    /// the buffer is written out.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Writer;
+    ///
+    /// let mut wtr = Writer::from_writer(Vec::new());
+    /// wtr.write_record(&["a", "b"]).unwrap();
+    /// wtr.write_record(Vec::from([String::from("1"), String::from("2")])).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "a,b\n1,2\n");
+    /// ```
     pub fn write_record<I, T>(&mut self, record: I) -> Result<()>
     where
         I: IntoIterator<Item = T>,
@@ -1485,6 +2650,24 @@ impl<W: Write> Writer<W> {
         self.end()
     }
 
+    /// Writes a [`ByteRecord`] as a record.
+    ///
+    /// # Errors
+    ///
+    /// As [`write_record`](Writer::write_record).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::{ByteRecord, Writer};
+    ///
+    /// let mut record = ByteRecord::new();
+    /// record.push_field(b"a");
+    /// record.push_field(b"b c");
+    /// let mut wtr = Writer::from_writer(Vec::new());
+    /// wtr.write_byte_record(&record).unwrap();
+    /// assert_eq(wtr.into_inner().unwrap(), b"a,b c\n".to_vec());
+    /// ```
     pub fn write_byte_record(&mut self, record: &ByteRecord) -> Result<()> {
         let only = record.len() == 1 && self.fields_in_record == 0;
         for f in record.fields.iter() {
@@ -1493,9 +2676,46 @@ impl<W: Write> Writer<W> {
         self.end()
     }
 
-    /// Writes x as a record: a struct's fields (after a header row of its
-    /// field names, the first time, with has_headers), or a tuple's,
-    /// array's or Vec's elements, or one value.
+    /// Writes a value as a record.
+    ///
+    /// A struct's fields are written in order, after a header row of its field
+    /// names the first time (if [`WriterBuilder::has_headers`] is on, the
+    /// default); a tuple's, array's or `Vec`'s elements are the fields; any
+    /// other value is a record of one field. `None` is an empty field; nested
+    /// structs, maps and enum variants with fields cannot be fields.
+    ///
+    /// Unlike the crate, records written before with
+    /// [`write_record`](Writer::write_record) do not stop the header row from
+    /// being written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::Serialize`] error if the value cannot be written
+    /// as a record, or the errors of [`write_record`](Writer::write_record).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Writer;
+    /// use std::serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct Row {
+    ///     city: String,
+    ///     pop: Option<u64>,
+    /// }
+    ///
+    /// let mut wtr = Writer::from_writer(Vec::new());
+    /// wtr.serialize(&Row { city: "Oslo".to_string(), pop: Some(700000) }).unwrap();
+    /// wtr.serialize(&Row { city: "Atlantis".to_string(), pop: None }).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "city,pop\nOslo,700000\nAtlantis,\n");
+    ///
+    /// let mut wtr = Writer::from_writer(Vec::new());
+    /// wtr.serialize(&("a", 1, true)).unwrap();
+    /// let out = String::from_utf8(wtr.into_inner().unwrap()).unwrap();
+    /// assert_eq(out, "a,1,true\n");
+    /// ```
     pub fn serialize<T: Serialize>(&mut self, x: &T) -> Result<()> {
         let rec = &mut RecordWriter {
             names: Vec::new(),
@@ -1519,19 +2739,55 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// Writes the buffered records to the writer and flushes it.
+    /// Writes the buffered records to the underlying writer and flushes it.
+    ///
+    /// navi has no `Drop`, so this (or [`into_inner`](Writer::into_inner)) must
+    /// be called when done writing, or the buffered records are lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::Io`] error if writing or flushing fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Writer;
+    ///
+    /// let mut wtr = Writer::from_writer(Vec::new());
+    /// wtr.write_record(&["a"]).unwrap();
+    /// assert(wtr.get_ref().is_empty());
+    /// wtr.flush().unwrap();
+    /// assert_eq(wtr.get_ref().clone(), b"a\n".to_vec());
+    /// ```
     pub fn flush(&mut self) -> Result<()> {
         self.flush_buf()?;
         self.wtr.flush()?;
         Ok(())
     }
 
-    /// Flushes and returns the writer.
+    /// Flushes the writer and returns the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::Io`] error if writing or flushing fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::csv::Writer;
+    ///
+    /// let mut wtr = Writer::from_writer(Vec::new());
+    /// wtr.write_record(&["a", "b"]).unwrap();
+    /// let bytes: Vec<u8> = wtr.into_inner().unwrap();
+    /// assert_eq(bytes, b"a,b\n".to_vec());
+    /// ```
     pub fn into_inner(mut self) -> Result<W> {
         self.flush()?;
         Ok(self.wtr)
     }
 
+    /// Returns a reference to the underlying writer (records still buffered are
+    /// not in it yet).
     pub fn get_ref(&self) -> &W {
         &self.wtr
     }

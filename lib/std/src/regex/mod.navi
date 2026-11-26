@@ -1,22 +1,72 @@
-//! Regular expressions (as Go's regexp, with the API of Rust's regex
-//! crate): RE2 syntax and semantics, so searching takes time linear in the
-//! haystack (no backreferences or look-around). Matches are leftmost-first
-//! like Perl's; positions are byte offsets into the haystack.
+//! Regular expressions, as the regex crate.
 //!
-//!     let re = Regex::new(r"(?P<y>\d{4})-(?P<m>\d{2})").unwrap();
-//!     re.is_match("on 2024-05")                          // true
-//!     let c = re.captures("on 2024-05").unwrap();
-//!     c.name("y").unwrap().as_str()                      // "2024"
-//!     re.replace_all("2024-05 2025-01", "$m/$y")         // "05/2024 01/2025"
-//!     for m in Regex::new(r"\w+").unwrap().find_iter("a bc") { ... }
+//! The syntax and semantics are RE2's, as in the regex crate and Go's
+//! regexp: there are no backreferences or look-around, so a search takes
+//! time linear in the length of the haystack. Matches are leftmost-first,
+//! as Perl's; positions are byte offsets into the haystack.
 //!
-//! Syntax: literals and escapes (\n \t \x7F \x{10FFFF} \u{..}), `.`,
-//! classes ([a-z], [^..], [[:alpha:]], nested classes and && -- ~~
-//! operations), \d \w \s \D \W \S, \p{Greek} \pL \P{..} (general
-//! categories, scripts and some properties), groups ( ), (?: ), (?P<n> )
-//! and (?<n> ), alternation, * + ? {n} {n,} {n,m} and their lazy forms,
-//! ^ $ \A \z \b \B \b{start} \b{end} \< \>, and the flags i m s x U u
-//! as (?flags) or (?flags: ..).
+//! The main type is [`Regex`]: [`Regex::new`] compiles a pattern, and its
+//! methods search a haystack ([`is_match`](Regex::is_match),
+//! [`find`](Regex::find), [`captures`](Regex::captures), their `_iter`
+//! forms), split it or replace matches. [`RegexBuilder`] sets flags and
+//! limits; [`RegexSet`] matches several patterns in one pass.
+//!
+//! Where navi differs from the regex crate: a replacement computed by a
+//! closure is passed to [`Regex::replace_all_with`] (and `replace_with`,
+//! `replacen_with`); a group's text is [`Captures::at`] (`&caps[i]` in
+//! Rust) or [`Captures::name`]; replacements return a `String`, not a
+//! `Cow<str>`; there is no `regex::bytes`.
+//!
+//! # Examples
+//!
+//! ```
+//! use std::regex::Regex;
+//!
+//! let re = Regex::new(r"(?P<y>\d{4})-(?P<m>\d{2})").unwrap();
+//! assert(re.is_match("released on 2024-05"));
+//!
+//! let caps = re.captures("released on 2024-05").unwrap();
+//! assert_eq(caps.name("y").unwrap().as_str(), "2024");
+//! assert_eq(caps.at(2), "05");
+//!
+//! assert_eq(re.replace_all("2024-05 and 2025-01", "$m/$y"), "05/2024 and 01/2025");
+//!
+//! let words: Vec<&str> = Regex::new(r"\w+").unwrap().find_iter("a bc, def").map(|m| m.as_str()).collect();
+//! assert_eq(words, Vec::from(["a", "bc", "def"]));
+//! ```
+//!
+//! # Syntax
+//!
+//! ```text
+//! .             any character but \n (with the s flag, \n too)
+//! [xyz]  [^xyz] a character class, and its negation
+//! [a-z]         a range; [[:alpha:]] an ASCII class; [a-y&&xyz] [a-z--b]
+//!               [a-c~~b-d] intersection, difference, symmetric difference
+//! \d \w \s      digit, word character, whitespace (Unicode); \D \W \S
+//! \pL \p{Greek} a Unicode general category or script; \PL \P{..}
+//! \n \t \x7F \x{10FFFF} \u{..}   escapes
+//!
+//! xy  x|y       concatenation, alternation
+//! x* x+ x?      zero or more, one or more, zero or one (greedy)
+//! x{n} x{n,} x{n,m}              repetitions
+//! x*? x+? x?? x{n,m}?            lazy forms
+//!
+//! (x)  (?P<name>x)  (?<name>x)   capture groups, numbered from 1
+//! (?:x)  (?flags)  (?flags:x)    a group without capture; set flags
+//!
+//! ^ $           start and end of the text (of a line with the m flag)
+//! \A \z         start and end of the text
+//! \b \B         word boundary, not a word boundary
+//! \b{start} \b{end} \< \>        start and end of a word
+//!
+//! Flags: i  case-insensitive          m  ^ and $ match at lines
+//!        s  . matches \n              x  ignore whitespace, # comments
+//!        U  swap greedy and lazy      u  Unicode (on by default)
+//! ```
+//!
+//! Unicode classes cover the general categories, the scripts and a few
+//! properties (`Alphabetic`, `White_Space`, `Lowercase`, `Uppercase`...),
+//! from Unicode 15.0; case-insensitive matching uses simple case folding.
 
 mod class;
 mod compile;
@@ -31,7 +81,21 @@ use compile::Prog;
 use parse::Flags;
 use vm::{Backtrack, NONE, PikeVM};
 
-/// Why a pattern could not be compiled.
+/// An error compiling a regular expression.
+///
+/// Its `Display` is the regex crate's message; for a syntax error, it
+/// shows the pattern with the error's place marked.
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::{Error, Regex};
+///
+/// match Regex::new("a(b") {
+///     Err(Error::Syntax(msg)) => assert(msg.contains("unclosed group")),
+///     _ => panic("expected a syntax error"),
+/// }
+/// ```
 #[derive(Clone, PartialEq, Eq)]
 pub enum Error {
     /// The pattern is not valid; the message shows where.
@@ -77,8 +141,21 @@ struct Cache {
     slots: Vec<usize>,
 }
 
-/// A compiled regular expression (cheap to clone: clones share the
-/// program).
+/// A compiled regular expression.
+///
+/// Compile a pattern with [`Regex::new`] (or [`RegexBuilder`]) once and
+/// search with it many times; a `Regex` is cheap to clone (clones share
+/// the compiled program) and can be used by several threads at once.
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::Regex;
+///
+/// let re = Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap();
+/// assert(re.is_match("2014-01-01"));
+/// assert(!re.is_match("2014-1-1"));
+/// ```
 #[derive(Clone)]
 pub struct Regex {
     pattern: String,
@@ -87,7 +164,19 @@ pub struct Regex {
     pool: &Mutex<Vec<&mut Cache>>,
 }
 
-/// Escapes the meta characters of text so it matches literally.
+/// Escapes the meta characters of `text`, so that it matches literally as
+/// a pattern.
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::{escape, Regex};
+///
+/// assert_eq(escape("1.5*(x+y)"), r"1\.5\*\(x\+y\)");
+/// let re = Regex::new(escape("a.b").as_str()).unwrap();
+/// assert(re.is_match("a.b"));
+/// assert(!re.is_match("axb"));
+/// ```
 pub fn escape(text: &str) -> String {
     let mut s = String::with_capacity(text.len());
     for c in text.chars() {
@@ -103,7 +192,19 @@ pub fn escape(text: &str) -> String {
     s
 }
 
-/// Configures how a pattern compiles.
+/// A builder of a [`Regex`] with flags and limits.
+///
+/// The flags are those a pattern can set with `(?flags)`; the builder
+/// sets them for the whole pattern.
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::RegexBuilder;
+///
+/// let re = RegexBuilder::new(r"^hello$").case_insensitive(true).multi_line(true).build().unwrap();
+/// assert(re.is_match("first line\nHeLLo\nlast"));
+/// ```
 #[derive(Clone)]
 pub struct RegexBuilder {
     pats: Vec<String>,
@@ -114,6 +215,8 @@ pub struct RegexBuilder {
 }
 
 impl RegexBuilder {
+    /// Returns a builder of a regex of `pattern`, with the default flags
+    /// and limits.
     pub fn new(pattern: &str) -> RegexBuilder {
         let mut v = Vec::new();
         v.push(pattern.to_string());
@@ -137,6 +240,12 @@ impl RegexBuilder {
         }
     }
 
+    /// Compiles the pattern with the builder's settings.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the pattern is not valid, nests deeper than the nest limit
+    /// or compiles to a program larger than the size limit.
     pub fn build(&self) -> Result<Regex, Error> {
         let p = parse::parse(
             self.pats[0].as_str(),
@@ -156,55 +265,66 @@ impl RegexBuilder {
         })
     }
 
-    /// (?i)
+    /// Sets the `i` flag: letters match regardless of case.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::RegexBuilder;
+    ///
+    /// let re = RegexBuilder::new("navi").case_insensitive(true).build().unwrap();
+    /// assert(re.is_match("NAVI"));
+    /// ```
     pub fn case_insensitive(&mut self, yes: bool) -> &mut RegexBuilder {
         self.flags.i = yes;
         self
     }
 
-    /// (?m): ^ and $ match at line starts and ends.
+    /// Sets the `m` flag: `^` and `$` match at the start and end of lines.
     pub fn multi_line(&mut self, yes: bool) -> &mut RegexBuilder {
         self.flags.m = yes;
         self
     }
 
-    /// (?s): . matches \n.
+    /// Sets the `s` flag: `.` matches `\n` too.
     pub fn dot_matches_new_line(&mut self, yes: bool) -> &mut RegexBuilder {
         self.flags.s = yes;
         self
     }
 
-    /// (?x): whitespace and # comments in the pattern are ignored.
+    /// Sets the `x` flag: whitespace and `#` comments in the pattern are
+    /// ignored.
     pub fn ignore_whitespace(&mut self, yes: bool) -> &mut RegexBuilder {
         self.flags.x = yes;
         self
     }
 
-    /// (?U): x* is lazy and x*? greedy.
+    /// Sets the `U` flag: `x*` is lazy and `x*?` greedy.
     pub fn swap_greed(&mut self, yes: bool) -> &mut RegexBuilder {
         self.flags.swap_greed = yes;
         self
     }
 
-    /// (?u), on by default: \w, \d, \s, \b and case folding are Unicode's.
+    /// Sets the `u` flag, on by default: `\w`, `\d`, `\s`, `\b` and case
+    /// folding are Unicode's; off, they are ASCII's.
     pub fn unicode(&mut self, yes: bool) -> &mut RegexBuilder {
         self.flags.unicode = yes;
         self
     }
 
-    /// Whether \0 to \777 are octal escapes (off by default).
+    /// Sets whether `\0` to `\777` are octal escapes (off by default).
     pub fn octal(&mut self, yes: bool) -> &mut RegexBuilder {
         self.octal = yes;
         self
     }
 
-    /// The largest compiled program in bytes (10 MiB by default).
+    /// Sets the largest compiled program, in bytes (10 MiB by default).
     pub fn size_limit(&mut self, bytes: usize) -> &mut RegexBuilder {
         self.size_limit = bytes;
         self
     }
 
-    /// The deepest nesting of groups and repetitions (250 by default).
+    /// Sets the deepest nesting of groups and repetitions (250 by default).
     pub fn nest_limit(&mut self, limit: u32) -> &mut RegexBuilder {
         self.nest_limit = limit;
         self
@@ -212,21 +332,64 @@ impl RegexBuilder {
 }
 
 impl Regex {
+    /// Compiles a regular expression.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the pattern is not valid, or compiles to a program larger
+    /// than the default size limit (10 MiB; see [`RegexBuilder`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\bnavi\b").unwrap();
+    /// assert(re.is_match("hello navi"));
+    /// assert(Regex::new(r"\").is_err());
+    /// ```
     pub fn new(pattern: &str) -> Result<Regex, Error> {
         RegexBuilder::new(pattern).build()
     }
 
-    /// The pattern it was compiled from.
+    /// Returns the pattern the regex was compiled from.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// assert_eq(Regex::new(r"a+b").unwrap().as_str(), r"a+b");
+    /// ```
     pub fn as_str(&self) -> &str {
         self.pattern.as_str()
     }
 
-    /// The number of capture groups, group 0 (the whole match) included.
+    /// Returns the number of capture groups, group 0 (the whole match)
+    /// included.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// assert_eq(Regex::new(r"(a)(?:b)(?P<c>c)").unwrap().captures_len(), 3);
+    /// ```
     pub fn captures_len(&self) -> usize {
         self.names.len()
     }
 
-    /// The groups' names (None for group 0 and unnamed groups).
+    /// Returns an iterator over the names of the capture groups, in order:
+    /// `None` for group 0 and unnamed groups.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let names: Vec<Option<&str>> = Regex::new(r"(?P<y>\d+)-(\d+)").unwrap().capture_names().collect();
+    /// assert_eq(names, Vec::from([None, Some("y"), None]));
+    /// ```
     pub fn capture_names(&self) -> crate::vec::IntoIter<Option<&str>> {
         let mut v: Vec<Option<&str>> = Vec::new();
         for n in self.names.iter() {
@@ -314,12 +477,39 @@ impl Regex {
         Some(slots)
     }
 
+    /// Returns `true` if the regex matches somewhere in the haystack.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\b\w{13}\b").unwrap();
+    /// assert(re.is_match("I categorically deny having triskaidekaphobia."));
+    /// assert(!re.is_match("short words only"));
+    /// ```
     pub fn is_match(&self, haystack: &str) -> bool {
         self.is_match_at(haystack, 0)
     }
 
-    /// Whether there is a match starting at or after start (assertions see
-    /// the whole haystack).
+    /// Returns `true` if there is a match starting at or after byte
+    /// `start`.
+    ///
+    /// The haystack before `start` is still seen by the assertions (`^`,
+    /// `\b`...), unlike searching `&haystack[start..]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\bchew\b").unwrap();
+    /// let h = "eschew";
+    /// // Searching the slice from 2, "chew" is a word.
+    /// assert(re.is_match(&h[2..]));
+    /// // But the \b before "chew" sees the "s" before it.
+    /// assert(!re.is_match_at(h, 2));
+    /// ```
     pub fn is_match_at(&self, haystack: &str, start: usize) -> bool {
         let b = haystack.as_bytes();
         if start > b.len() {
@@ -338,12 +528,26 @@ impl Regex {
         r
     }
 
-    /// The end of the match that ends first (not necessarily the leftmost
-    /// one's end).
+    /// Returns the end of the match that ends first, if there is one.
+    ///
+    /// This is not necessarily the end of the leftmost-first match: the
+    /// search stops as soon as any match is found.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"a+").unwrap();
+    /// assert_eq(re.shortest_match("aaaaa"), Some(1));
+    /// assert_eq(re.shortest_match("bbb"), None);
+    /// ```
     pub fn shortest_match(&self, haystack: &str) -> Option<usize> {
         self.shortest_match_at(haystack, 0)
     }
 
+    /// Returns the end of the match that ends first, searching from byte
+    /// `start` (see [`is_match_at`](Regex::is_match_at)).
     pub fn shortest_match_at(&self, haystack: &str, start: usize) -> Option<usize> {
         let b = haystack.as_bytes();
         if start > b.len() {
@@ -364,11 +568,34 @@ impl Regex {
         r
     }
 
-    /// The leftmost-first match.
+    /// Returns the leftmost-first match in the haystack, if there is one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\d+").unwrap();
+    /// let m = re.find("order 66, row 7").unwrap();
+    /// assert_eq(m.as_str(), "66");
+    /// assert_eq(m.start(), 6);
+    /// assert_eq(m.end(), 8);
+    /// ```
     pub fn find(&self, haystack: &str) -> Option<Match> {
         self.find_at(haystack, 0)
     }
 
+    /// Returns the leftmost-first match starting at or after byte `start`
+    /// (see [`is_match_at`](Regex::is_match_at)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\d+").unwrap();
+    /// assert_eq(re.find_at("order 66, row 7", 9).unwrap().as_str(), "7");
+    /// ```
     pub fn find_at(&self, haystack: &str, start: usize) -> Option<Match> {
         match self.search(haystack.as_bytes(), start) {
             Some((s, e)) => Some(Match {
@@ -380,7 +607,20 @@ impl Regex {
         }
     }
 
-    /// The successive non-overlapping matches.
+    /// Returns an iterator over the successive non-overlapping matches in
+    /// the haystack.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\b\w{5}\b").unwrap();
+    /// let found: Vec<&str> = re.find_iter("Retroactively relinquishing remunerations is reprehensible.").map(|m| m.as_str()).collect();
+    /// assert_eq(found.len(), 0);
+    /// let found: Vec<&str> = re.find_iter("apple pie, lemon tarts").map(|m| m.as_str()).collect();
+    /// assert_eq(found, Vec::from(["apple", "lemon", "tarts"]));
+    /// ```
     pub fn find_iter(&self, haystack: &str) -> Matches {
         Matches {
             re: self.clone(),
@@ -390,11 +630,26 @@ impl Regex {
         }
     }
 
-    /// The leftmost-first match with its groups.
+    /// Returns the leftmost-first match with its capture groups, if there
+    /// is one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"'([^']+)'\s+\((\d{4})\)").unwrap();
+    /// let caps = re.captures("Not my favorite movie: 'Citizen Kane' (1941).").unwrap();
+    /// assert_eq(caps.at(0), "'Citizen Kane' (1941)");
+    /// assert_eq(caps.at(1), "Citizen Kane");
+    /// assert_eq(caps.at(2), "1941");
+    /// ```
     pub fn captures(&self, haystack: &str) -> Option<Captures> {
         self.captures_at(haystack, 0)
     }
 
+    /// Returns the leftmost-first match with its groups, starting at or
+    /// after byte `start` (see [`is_match_at`](Regex::is_match_at)).
     pub fn captures_at(&self, haystack: &str, start: usize) -> Option<Captures> {
         match self.search_slots(haystack.as_bytes(), start) {
             Some(slots) => Some(Captures {
@@ -406,7 +661,21 @@ impl Regex {
         }
     }
 
-    /// The groups of the successive non-overlapping matches.
+    /// Returns an iterator over the capture groups of the successive
+    /// non-overlapping matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"(?P<k>\w+)=(?P<v>\w+)").unwrap();
+    /// let mut pairs = Vec::new();
+    /// for caps in re.captures_iter("a=1, b=2") {
+    ///     pairs.push(`${caps.name("k").unwrap().as_str()}:${caps.name("v").unwrap().as_str()}`.to_string());
+    /// }
+    /// assert_eq(pairs, Vec::from(["a:1".to_string(), "b:2".to_string()]));
+    /// ```
     pub fn captures_iter(&self, haystack: &str) -> CaptureMatches {
         CaptureMatches {
             re: self.clone(),
@@ -416,7 +685,18 @@ impl Regex {
         }
     }
 
-    /// The pieces between matches.
+    /// Returns an iterator over the pieces of the haystack between the
+    /// matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"[ \t]+").unwrap();
+    /// let fields: Vec<&str> = re.split("a b \t  c\td    e").collect();
+    /// assert_eq(fields, Vec::from(["a", "b", "c", "d", "e"]));
+    /// ```
     pub fn split(&self, haystack: &str) -> Split {
         Split {
             finder: self.find_iter(haystack),
@@ -425,7 +705,18 @@ impl Regex {
         }
     }
 
-    /// At most limit pieces (the last one is the rest).
+    /// Returns an iterator over at most `limit` pieces of the haystack
+    /// between matches; the last piece is the rest of the haystack.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\W+").unwrap();
+    /// let fields: Vec<&str> = re.splitn("Hey! How are you?", 3).collect();
+    /// assert_eq(fields, Vec::from(["Hey", "How", "are you?"]));
+    /// ```
     pub fn splitn(&self, haystack: &str, limit: usize) -> SplitN {
         SplitN {
             splits: self.split(haystack),
@@ -433,17 +724,54 @@ impl Regex {
         }
     }
 
-    /// Replaces the first match ($1, $name, ${name} and $$ in a string
-    /// replacement; see Replacer).
+    /// Replaces the leftmost-first match with a replacement and returns the
+    /// new string.
+    ///
+    /// In a string replacement, `$1` or `$name` (or `${1}`, `${name}`) is
+    /// the text of a group (empty if it did not take part) and `$$` is a
+    /// `$` (see [`Captures::expand`]); [`NoExpand`] gives a literal
+    /// replacement, and [`replace_with`](Regex::replace_with) a computed
+    /// one. Unlike the regex crate, the result is always a new `String`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"(?P<last>[^,\s]+),\s+(?P<first>\S+)").unwrap();
+    /// assert_eq(re.replace("Springsteen, Bruce", "$first $last"), "Bruce Springsteen");
+    /// assert_eq(re.replace("no match", "$first"), "no match");
+    /// ```
     pub fn replace<R: Replacer>(&self, haystack: &str, rep: R) -> String {
         self.replacen(haystack, 1, rep)
     }
 
+    /// Replaces every non-overlapping match with a replacement and returns
+    /// the new string (see [`replace`](Regex::replace)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"(\w+)@(\w+)\.com").unwrap();
+    /// assert_eq(re.replace_all("ann@a.com, bo@b.com", "${1} at $2"), "ann at a, bo at b");
+    /// ```
     pub fn replace_all<R: Replacer>(&self, haystack: &str, rep: R) -> String {
         self.replacen(haystack, 0, rep)
     }
 
-    /// Replaces the first limit matches (0: all).
+    /// Replaces the first `limit` non-overlapping matches (all of them if
+    /// `limit` is 0) and returns the new string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\d").unwrap();
+    /// assert_eq(re.replacen("1 2 3 4", 2, "#"), "# # 3 4");
+    /// ```
     pub fn replacen<R: Replacer>(&self, haystack: &str, limit: usize, rep: R) -> String {
         let mut out = String::with_capacity(haystack.len());
         let mut last = 0;
@@ -491,16 +819,53 @@ impl Regex {
         out
     }
 
-    /// replace_all with the replacement computed by f (Rust passes a
-    /// closure to replace_all).
+    /// Replaces every non-overlapping match with what `f` computes from its
+    /// groups.
+    ///
+    /// The regex crate passes a closure to `replace_all`; navi has a method
+    /// of its own for it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"\d+").unwrap();
+    /// let doubled = re.replace_all_with("3 apples, 10 pears", |c| {
+    ///     `${c.at(0).parse::<i32>().unwrap() * 2}`.to_string()
+    /// });
+    /// assert_eq(doubled, "6 apples, 20 pears");
+    /// ```
     pub fn replace_all_with(&self, haystack: &str, f: fn(&Captures) -> String) -> String {
         self.replacen_with(haystack, 0, f)
     }
 
+    /// Replaces the leftmost-first match with what `f` computes from its
+    /// groups.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"(\w+) (\w+)").unwrap();
+    /// assert_eq(re.replace_with("hello world", |c| `${c.at(2)} ${c.at(1)}`.to_string()), "world hello");
+    /// ```
     pub fn replace_with(&self, haystack: &str, f: fn(&Captures) -> String) -> String {
         self.replacen_with(haystack, 1, f)
     }
 
+    /// Replaces the first `limit` matches (all if 0) with what `f` computes
+    /// from their groups.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"[a-z]+").unwrap();
+    /// assert_eq(re.replacen_with("ab cd ef", 2, |c| c.at(0).to_uppercase()), "AB CD ef");
+    /// ```
     pub fn replacen_with(
         &self,
         haystack: &str,
@@ -544,7 +909,21 @@ impl FromStr for Regex {
     }
 }
 
-/// A match: its bounds in the haystack.
+/// A match of a regex: its byte range in the haystack and its text.
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::Regex;
+///
+/// let m = Regex::new(r"b+").unwrap().find("abbbc").unwrap();
+/// assert_eq(m.start(), 1);
+/// assert_eq(m.end(), 4);
+/// assert_eq(m.range(), 1..4);
+/// assert_eq(m.len(), 3);
+/// assert(!m.is_empty());
+/// assert_eq(m.as_str(), "bbb");
+/// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct Match {
     haystack: &str,
@@ -553,21 +932,27 @@ pub struct Match {
 }
 
 impl Match {
+    /// Returns the byte offset of the start of the match.
     pub fn start(&self) -> usize {
         self.start
     }
+    /// Returns the byte offset just past the end of the match.
     pub fn end(&self) -> usize {
         self.end
     }
+    /// Returns the byte range of the match.
     pub fn range(&self) -> crate::ops::Range<usize> {
         self.start..self.end
     }
+    /// Returns the length of the match in bytes.
     pub fn len(&self) -> usize {
         self.end - self.start
     }
+    /// Returns `true` if the match is empty.
     pub fn is_empty(&self) -> bool {
         self.start == self.end
     }
+    /// Returns the text of the match.
     pub fn as_str(&self) -> &str {
         &self.haystack[self.start..self.end]
     }
@@ -579,7 +964,27 @@ impl Debug for Match {
     }
 }
 
-/// The groups of a match (group 0 is the whole match).
+/// The capture groups of a match.
+///
+/// Group 0 is the whole match; the others are numbered from 1 in the order
+/// of their opening parentheses, and named groups can also be found by
+/// name. A group that did not take part in the match is `None` for
+/// [`get`](Captures::get) and [`name`](Captures::name), and `""` for
+/// [`at`](Captures::at).
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::Regex;
+///
+/// let re = Regex::new(r"(?P<user>\w+)(?:@(?P<host>\w+))?").unwrap();
+/// let caps = re.captures("ann").unwrap();
+/// assert_eq(caps.len(), 3);
+/// assert_eq(caps.at(0), "ann");
+/// assert_eq(caps.name("user").unwrap().as_str(), "ann");
+/// assert(caps.name("host").is_none());
+/// assert_eq(caps.at(2), "");
+/// ```
 #[derive(Clone)]
 pub struct Captures {
     haystack: &str,
@@ -588,7 +993,7 @@ pub struct Captures {
 }
 
 impl Captures {
-    /// Group i, if it took part in the match.
+    /// Returns group `i`, if it took part in the match.
     pub fn get(&self, i: usize) -> Option<Match> {
         if 2 * i + 1 >= self.slots.len() {
             return None;
@@ -605,7 +1010,7 @@ impl Captures {
         })
     }
 
-    /// The group named name, if it took part in the match.
+    /// Returns the group named `name`, if it took part in the match.
     pub fn name(&self, name: &str) -> Option<Match> {
         let mut i = 0;
         while i < self.names.len() {
@@ -619,12 +1024,13 @@ impl Captures {
         None
     }
 
-    /// The number of groups (group 0 included).
+    /// Returns the number of groups, group 0 included.
     pub fn len(&self) -> usize {
         self.slots.len() / 2
     }
 
-    /// The groups in order.
+    /// Returns an iterator over the groups in order, `None` for those that
+    /// did not take part in the match.
     pub fn iter(&self) -> crate::vec::IntoIter<Option<Match>> {
         let mut v = Vec::new();
         let mut i = 0;
@@ -635,8 +1041,15 @@ impl Captures {
         v.into_iter()
     }
 
-    /// Group i's text ("" if it did not take part; &caps[i] in Rust, which
-    /// panics then).
+    /// Returns the text of group `i`, or `""` if it did not take part in the
+    /// match.
+    ///
+    /// This is the regex crate's `&caps[i]`, which panics where this
+    /// returns `""`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no group `i`.
     pub fn at(&self, i: usize) -> &str {
         match self.get(i) {
             Some(m) => m.as_str(),
@@ -644,9 +1057,24 @@ impl Captures {
         }
     }
 
-    /// Appends replacement to dst with $1, $name, ${name} and $$
-    /// expanded ($name takes the longest run of letters, digits and _; a
-    /// missing group is empty).
+    /// Appends `replacement` to `dst`, with group references expanded.
+    ///
+    /// `$1` or `$name` is the text of a group, `${1}` or `${name}` the same
+    /// with explicit bounds, and `$$` a `$`. `$name` takes the longest run of
+    /// letters, digits and `_`, so `$1a` is the group named `1a`: write
+    /// `${1}a`. A group that does not exist or did not take part is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::Regex;
+    ///
+    /// let re = Regex::new(r"(?P<d>\d+)(\w)").unwrap();
+    /// let caps = re.captures("12px").unwrap();
+    /// let mut out = String::new();
+    /// caps.expand("${d}$$ $2 [$nope]", &mut out);
+    /// assert_eq(out, "12$ p []");
+    /// ```
     pub fn expand(&self, replacement: &str, dst: &mut String) {
         let b = replacement.as_bytes();
         let mut i = 0;
@@ -727,16 +1155,23 @@ impl Debug for Captures {
     }
 }
 
-/// What replaces a match: a string with $ groups (&str, String), a literal
-/// (NoExpand), or computed (Regex::replace_all_with).
+/// A replacement for the matches of [`Regex::replace`] and the like.
+///
+/// It is implemented by `&str`, `String` and `&String` (with `$` group
+/// references expanded, see [`Captures::expand`]) and by [`NoExpand`] (a
+/// literal). The regex crate also implements it for closures; navi has
+/// [`Regex::replace_all_with`] and the like for those.
 pub trait Replacer {
+    /// Appends the replacement of the match with groups `caps` to `dst`.
     fn replace_append(&self, caps: &Captures, dst: &mut String);
 
-    /// The replacement if it is the same for every match.
+    /// Returns the replacement if it is the same for every match (no `$`
+    /// to expand), which makes replacing faster.
     fn no_expansion(&self) -> Option<String> {
         None
     }
 
+    /// Returns `true` if the replacement needs the groups of each match.
     fn needs_captures(&self) -> bool {
         true
     }
@@ -785,7 +1220,16 @@ impl Replacer for &String {
     }
 }
 
-/// A replacement used as it is ($ is not special).
+/// A replacement used as it is: `$` is not special in it.
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::{NoExpand, Regex};
+///
+/// let re = Regex::new(r"\d+").unwrap();
+/// assert_eq(re.replace_all("cost 10", NoExpand("$1")), "cost $1");
+/// ```
 #[derive(Clone)]
 pub struct NoExpand(pub &str);
 
@@ -826,7 +1270,8 @@ fn next_match(
     }
 }
 
-/// Regex::find_iter.
+/// An iterator over the non-overlapping matches of a regex, made by
+/// [`Regex::find_iter`].
 #[derive(Clone)]
 pub struct Matches {
     re: Regex,
@@ -849,7 +1294,8 @@ impl Iterator for Matches {
     }
 }
 
-/// Regex::captures_iter.
+/// An iterator over the groups of the non-overlapping matches of a regex,
+/// made by [`Regex::captures_iter`].
 #[derive(Clone)]
 pub struct CaptureMatches {
     re: Regex,
@@ -874,7 +1320,8 @@ impl Iterator for CaptureMatches {
     }
 }
 
-/// Regex::split.
+/// An iterator over the pieces of a haystack between the matches of a
+/// regex, made by [`Regex::split`].
 #[derive(Clone)]
 pub struct Split {
     finder: Matches,
@@ -903,7 +1350,8 @@ impl Iterator for Split {
     }
 }
 
-/// Regex::splitn.
+/// An iterator over at most a given number of pieces of a haystack
+/// between the matches of a regex, made by [`Regex::splitn`].
 #[derive(Clone)]
 pub struct SplitN {
     splits: Split,
@@ -929,7 +1377,22 @@ impl Iterator for SplitN {
     }
 }
 
-/// Several patterns matched in one pass: which of them match.
+/// A set of regular expressions matched together, in one pass over the
+/// haystack.
+///
+/// A `RegexSet` tells which of its patterns match somewhere in a
+/// haystack, not where: use a [`Regex`] of a pattern for its matches.
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::RegexSet;
+///
+/// let set = RegexSet::new([r"\w+", r"\d+", r"\pL+", r"foo", r"bar", r"barfoo", r"foobar"]).unwrap();
+/// let matched: Vec<usize> = set.matches("foobar").into_iter().collect();
+/// assert_eq(matched, Vec::from([0, 2, 3, 4, 6]));
+/// assert(set.matches("foobar").matched(6));
+/// ```
 #[derive(Clone)]
 pub struct RegexSet {
     pats: Vec<String>,
@@ -938,6 +1401,11 @@ pub struct RegexSet {
 }
 
 impl RegexSet {
+    /// Compiles a set of patterns.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a pattern is not valid or the set is too big.
     pub fn new<I, S>(patterns: I) -> Result<RegexSet, Error>
     where
         I: IntoIterator<Item = S>,
@@ -950,6 +1418,7 @@ impl RegexSet {
         RegexSet::build(pats, RegexBuilder::with(Vec::new()))
     }
 
+    /// Returns a set of no patterns, which matches nothing.
     pub fn empty() -> RegexSet {
         RegexSet::build(Vec::new(), RegexBuilder::with(Vec::new())).unwrap()
     }
@@ -968,21 +1437,35 @@ impl RegexSet {
         })
     }
 
+    /// Returns the number of patterns.
     pub fn len(&self) -> usize {
         self.pats.len()
     }
+    /// Returns `true` if the set has no patterns.
     pub fn is_empty(&self) -> bool {
         self.pats.len() == 0
     }
+    /// Returns the patterns, in the order they were given.
     pub fn patterns(&self) -> &[String] {
         self.pats.as_slice()
     }
 
+    /// Returns `true` if any pattern matches somewhere in the haystack.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::regex::RegexSet;
+    ///
+    /// let set = RegexSet::new([r"^\d+$", r"^[a-z]+$"]).unwrap();
+    /// assert(set.is_match("abc"));
+    /// assert(!set.is_match("a1"));
+    /// ```
     pub fn is_match(&self, haystack: &str) -> bool {
         self.run(haystack, true).matched_any()
     }
 
-    /// Which patterns match somewhere in haystack.
+    /// Returns which patterns match somewhere in the haystack.
     pub fn matches(&self, haystack: &str) -> SetMatches {
         self.run(haystack, false)
     }
@@ -1016,27 +1499,53 @@ impl Debug for RegexSet {
     }
 }
 
-/// RegexSet::matches.
+/// Which patterns of a [`RegexSet`] matched, as [`RegexSet::matches`]
+/// returns it.
+///
+/// Iterating over it gives the indices of the patterns that matched.
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::RegexSet;
+///
+/// let m = RegexSet::new(["a", "b", "c"]).unwrap().matches("cab?");
+/// assert(m.matched_all());
+/// let m = RegexSet::new(["a", "x"]).unwrap().matches("cab");
+/// assert(m.matched_any());
+/// assert(!m.matched(1));
+/// assert_eq(m.len(), 2);
+/// assert_eq(m.iter().collect::<Vec<usize>>(), Vec::from([0]));
+/// ```
 #[derive(Clone, Debug)]
 pub struct SetMatches {
     m: Vec<bool>,
 }
 
 impl SetMatches {
+    /// Returns `true` if any pattern matched.
     pub fn matched_any(&self) -> bool {
         self.m.contains(&true)
     }
+    /// Returns `true` if every pattern matched.
     pub fn matched_all(&self) -> bool {
         !self.m.contains(&false)
     }
+    /// Returns `true` if pattern `i` matched.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no pattern `i`.
     pub fn matched(&self, i: usize) -> bool {
         self.m[i]
     }
+    /// Returns the number of patterns of the set (matched or not).
     pub fn len(&self) -> usize {
         self.m.len()
     }
 
-    /// The indices of the patterns that matched.
+    /// Returns an iterator over the indices of the patterns that matched,
+    /// in increasing order.
     pub fn iter(&self) -> crate::vec::IntoIter<usize> {
         let mut v = Vec::new();
         let mut i = 0;
@@ -1058,13 +1567,24 @@ impl IntoIterator for SetMatches {
     }
 }
 
-/// Configures a RegexSet (the flags of RegexBuilder).
+/// A builder of a [`RegexSet`] with flags and limits, as [`RegexBuilder`].
+///
+/// # Examples
+///
+/// ```
+/// use std::regex::RegexSetBuilder;
+///
+/// let set = RegexSetBuilder::new(["^foo", "bar$"]).case_insensitive(true).build().unwrap();
+/// assert(set.matches("FOO BAR").matched_all());
+/// ```
 #[derive(Clone)]
 pub struct RegexSetBuilder {
     b: RegexBuilder,
 }
 
 impl RegexSetBuilder {
+    /// Returns a builder of a set of `patterns`, with the default flags and
+    /// limits.
     pub fn new<I, S>(patterns: I) -> RegexSetBuilder
     where
         I: IntoIterator<Item = S>,
@@ -1079,35 +1599,50 @@ impl RegexSetBuilder {
         }
     }
 
+    /// Compiles the set with the builder's settings.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a pattern is not valid or the set is too big.
     pub fn build(&self) -> Result<RegexSet, Error> {
         RegexSet::build(self.b.pats.clone(), self.b.clone())
     }
 
+    /// Sets the `i` flag for every pattern (see
+    /// [`RegexBuilder::case_insensitive`]).
     pub fn case_insensitive(&mut self, yes: bool) -> &mut RegexSetBuilder {
         self.b.flags.i = yes;
         self
     }
 
+    /// Sets the `m` flag for every pattern (see [`RegexBuilder::multi_line`]).
     pub fn multi_line(&mut self, yes: bool) -> &mut RegexSetBuilder {
         self.b.flags.m = yes;
         self
     }
 
+    /// Sets the `s` flag for every pattern (see
+    /// [`RegexBuilder::dot_matches_new_line`]).
     pub fn dot_matches_new_line(&mut self, yes: bool) -> &mut RegexSetBuilder {
         self.b.flags.s = yes;
         self
     }
 
+    /// Sets the `x` flag for every pattern (see
+    /// [`RegexBuilder::ignore_whitespace`]).
     pub fn ignore_whitespace(&mut self, yes: bool) -> &mut RegexSetBuilder {
         self.b.flags.x = yes;
         self
     }
 
+    /// Sets the `u` flag for every pattern (see [`RegexBuilder::unicode`]).
     pub fn unicode(&mut self, yes: bool) -> &mut RegexSetBuilder {
         self.b.flags.unicode = yes;
         self
     }
 
+    /// Sets the largest compiled program, in bytes (see
+    /// [`RegexBuilder::size_limit`]).
     pub fn size_limit(&mut self, bytes: usize) -> &mut RegexSetBuilder {
         self.b.size_limit = bytes;
         self

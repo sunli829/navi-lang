@@ -1,42 +1,207 @@
-//! Command-line parsing (as Go's flag package, with the builder API of
-//! Rust's clap 4 and its derive: Parser, Args, Subcommand, ValueEnum):
-//! options, flags, counters, positionals, subcommands, help and version
-//! output and errors in clap's format.
+//! Command-line argument parsing, with the API of Rust's [clap] 4.
 //!
-//!     let m = Command::new("prog")
-//!         .version("1.0")
-//!         .about("Does things")
-//!         .arg(Arg::new("file").required(true).help("The input"))
-//!         .arg(Arg::new("verbose").short('v').long("verbose").action(ArgAction::Count))
-//!         .arg(Arg::new("port").short('p').long("port").default_value("80"))
-//!         .get_matches();                       // exits with help, version or errors
-//!     let file: String = m.get_one("file").unwrap();
-//!     let port: u16 = m.get_one("port").unwrap(); // parsed on access (FromStr)
-//!     let v = m.get_count("verbose");
+//! This module plays the part of Go's `flag` package with clap's two
+//! interfaces: the *builder* API ([`Command`], [`Arg`], [`ArgMatches`]) and
+//! the *derive* API (`#[derive(Parser, Args, Subcommand, ValueEnum)]` and the
+//! traits [`Parser`], [`Args`], [`Subcommand`] and [`ValueEnum`]). It
+//! handles options, flags, counters, positionals, subcommands, defaults,
+//! environment variables, and generates help, version and error messages
+//! word for word as clap 4 does (without colors, and without wrapping to the
+//! terminal's width).
+//!
+//! [clap]: https://docs.rs/clap/4
+//!
+//! # Builder API
+//!
+//! A [`Command`] lists its [`Arg`]s; parsing returns the [`ArgMatches`],
+//! which are asked for each argument's value by its id:
+//!
+//! ```
+//! use std::cli::{Arg, ArgAction, Command};
+//!
+//! let cmd = Command::new("prog")
+//!     .version("1.0")
+//!     .about("Does things")
+//!     .arg(Arg::new("file").required(true).help("The input"))
+//!     .arg(Arg::new("verbose").short('v').long("verbose").action(ArgAction::Count))
+//!     .arg(Arg::new("port").short('p').long("port").default_value("80"));
+//!
+//! // A real program calls `cmd.get_matches()`, which reads the process's
+//! // arguments and exits with the help, the version or an error.
+//! let m = cmd.get_matches_from(["prog", "-vv", "--port", "8080", "in.txt"]);
+//!
+//! let file: String = m.get_one("file").unwrap();
+//! let port: u16 = m.get_one("port").unwrap(); // parsed when asked for (FromStr)
+//! assert_eq(file, "in.txt");
+//! assert_eq(port, 8080);
+//! assert_eq(m.get_count("verbose"), 2);
+//! ```
+//!
+//! # Derive API
+//!
+//! `#[derive(Parser)]` on a struct builds the [`Command`] from its fields
+//! (their types say what kind of argument each is, their `///` comments are
+//! the help) and fills the struct from the matches:
+//!
+//! ```
+//! use std::cli::Parser;
+//!
+//! #[derive(Parser, Debug)]
+//! #[command(name = "copy", version = "1.0")]
+//! /// Copies files.
+//! struct Cli {
+//!     /// Say more
+//!     #[arg(short, long)]
+//!     verbose: bool,
+//!     /// The port to use
+//!     #[arg(short, long, default_value = "8080")]
+//!     port: u16,
+//!     /// The files to copy
+//!     files: Vec<String>,
+//! }
+//!
+//! // A real program calls `Cli::parse()`.
+//! let cli = Cli::parse_from(["copy", "-v", "a.txt", "b.txt"]);
+//! assert(cli.verbose);
+//! assert_eq(cli.port, 8080);
+//! assert_eq(cli.files, Vec::from(["a.txt".to_string(), "b.txt".to_string()]));
+//! ```
+//!
+//! See the [`derive`] module for the attributes the derives take.
+//!
+//! # Help, version and errors
+//!
+//! [`Command::try_get_matches_from`] and [`Parser::try_parse_from`] return
+//! an [`Error`] for bad arguments, and also for `--help` and `--version`
+//! (of kinds [`ErrorKind::DisplayHelp`] and [`ErrorKind::DisplayVersion`]);
+//! [`Error::exit`] prints it where clap does and exits with clap's code.
+//! The non-`try_` functions do that themselves.
+//!
+//! ```
+//! use std::cli::{Arg, Command, ErrorKind};
+//!
+//! let cmd = Command::new("prog").arg(Arg::new("name").long("name"));
+//! let err = cmd.try_get_matches_from(["prog", "--nme", "x"]).unwrap_err();
+//! assert_eq(err.kind(), ErrorKind::UnknownArgument);
+//! assert(err.render().contains("tip: a similar argument exists: '--name'"));
+//! assert_eq(err.exit_code(), 2);
+//! ```
+//!
+//! # Differences from clap
+//!
+//! - Builder methods take `&self` and return a modified copy, so a
+//!   [`Command`] or [`Arg`] can be reused as a template.
+//! - [`ArgMatches::get_one`] returns `Option<T>` (not `Option<&T>`): the
+//!   value is converted with [`FromStr`] when it is asked for, and a value
+//!   that does not convert is `None`.
+//! - There is no `value_parser!` macro: [`ValueParser`] has constructors
+//!   such as [`ValueParser::i64_range`] and [`ValueParser::possible`].
+//! - No colors, no wrapping to the terminal's width; the long help is the
+//!   same as the short one. `ArgGroup`, `allow_negative_numbers`,
+//!   `Command::mut_arg` and shell completions are not provided.
 
 use crate::fmt::{self, Debug, Display, Formatter};
 use crate::str::FromStr;
 
-/// What an argument does when it is given.
+/// The behavior of an argument when it is found on the command line.
+///
+/// Set it with [`Arg::action`]. Without one, an argument takes one value
+/// ([`ArgAction::Set`]), or [`ArgAction::Append`] when
+/// [`Arg::num_args`] allows more than one value.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, ArgAction, Command};
+///
+/// let cmd = Command::new("prog")
+///     .arg(Arg::new("verbose").short('v').action(ArgAction::Count))
+///     .arg(Arg::new("quiet").long("quiet").action(ArgAction::SetTrue));
+/// let m = cmd.get_matches_from(["prog", "-vvv", "--quiet"]);
+/// assert_eq(m.get_count("verbose"), 3);
+/// assert(m.get_flag("quiet"));
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ArgAction {
-    /// Takes a value (the last one given wins... once: twice is an error).
+    /// Takes a value; giving the argument twice is an error (clap's
+    /// default for options).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("name").long("name").action(ArgAction::Set));
+    /// let m = cmd.get_matches_from(["prog", "--name", "ann"]);
+    /// assert_eq(m.get_one::<String>("name"), Some("ann".to_string()));
+    ///
+    /// let err = cmd.try_get_matches_from(["prog", "--name", "a", "--name", "b"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::ArgumentConflict);
+    /// ```
     Set,
-    /// Takes values, every time it is given.
+    /// Takes a value every time the argument is given, keeping them all.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("tag").short('t').action(ArgAction::Append));
+    /// let m = cmd.get_matches_from(["prog", "-t", "a", "-t", "b"]);
+    /// let tags: Vec<String> = m.get_many("tag").unwrap().collect();
+    /// assert_eq(tags, Vec::from(["a".to_string(), "b".to_string()]));
+    /// ```
     Append,
-    /// A flag: true when given.
+    /// A flag: `true` when given, `false` otherwise (read with
+    /// [`ArgMatches::get_flag`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("force").short('f').action(ArgAction::SetTrue));
+    /// assert(cmd.get_matches_from(["prog", "-f"]).get_flag("force"));
+    /// assert(!cmd.get_matches_from(["prog"]).get_flag("force"));
+    /// ```
     SetTrue,
-    /// A flag: false when given.
+    /// A flag: `false` when given, `true` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("color").long("no-color").action(ArgAction::SetFalse));
+    /// assert(!cmd.get_matches_from(["prog", "--no-color"]).get_flag("color"));
+    /// assert(cmd.get_matches_from(["prog"]).get_flag("color"));
+    /// ```
     SetFalse,
-    /// Counts how often it is given (-vvv).
+    /// Counts how often the argument is given, as in `-vvv` (read with
+    /// [`ArgMatches::get_count`]).
     Count,
-    /// Prints help and exits.
+    /// Prints the help and exits (the action of the generated `-h`,
+    /// `--help`).
     Help,
-    /// Prints the version and exits.
+    /// Prints the version and exits (the action of the generated `-V`,
+    /// `--version`).
     Version,
 }
 
-/// How many values an argument takes.
+/// The number of values an argument takes, for [`Arg::num_args`].
+///
+/// It is made from a `usize` (exactly that many), or from a range:
+/// `1..=3`, `2..` (at least two), `0..4` (at most three).
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::ValueRange;
+///
+/// assert_eq(ValueRange::from(2), ValueRange::from(2..=2));
+/// assert_eq(ValueRange::from(0..4), ValueRange::from(0..=3));
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ValueRange {
     min: usize,
@@ -76,41 +241,179 @@ impl From<crate::ops::Range<usize>> for ValueRange {
     }
 }
 
-/// How values are checked while parsing (clap's value_parser!, without
-/// macros): any string, a number, a bool, or one of a list.
+/// How an argument's values are checked while the command line is parsed.
+///
+/// This stands for clap's `value_parser!` macro and its typed parsers. A
+/// value that fails the check is an [`ErrorKind::InvalidValue`] error with
+/// clap's message. The values themselves are kept as strings: they are
+/// converted to a type when asked for, with [`ArgMatches::get_one`].
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, Command, ErrorKind, ValueParser};
+///
+/// let cmd = Command::new("prog")
+///     .arg(Arg::new("port").long("port").value_parser(ValueParser::u64_range(1, 65535)));
+///
+/// let m = cmd.get_matches_from(["prog", "--port", "8080"]);
+/// assert_eq(m.get_one::<u16>("port"), Some(8080));
+///
+/// let err = cmd.try_get_matches_from(["prog", "--port", "0"]).unwrap_err();
+/// assert_eq(err.kind(), ErrorKind::InvalidValue);
+/// assert(err.render().starts_with("error: invalid value '0' for '--port <port>': 0 is not in 1..=65535\n"));
+/// ```
 #[derive(Clone, Debug)]
 pub enum ValueParser {
+    /// Any string (the default).
     String,
+    /// An integer from the first bound to the second, inclusive.
     I64(i64, i64),
+    /// An unsigned integer from the first bound to the second, inclusive.
     U64(u64, u64),
+    /// A floating-point number.
     F64,
+    /// `true` or `false`.
     Bool,
+    /// One of the listed values.
     Possible(Vec<String>),
 }
 
 impl ValueParser {
+    /// Accepts any string; the parser of an [`Arg`] without one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueParser};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("name").value_parser(ValueParser::string()));
+    /// let m = cmd.get_matches_from(["prog", "anything"]);
+    /// assert_eq(m.get_one::<String>("name"), Some("anything".to_string()));
+    /// ```
     pub fn string() -> ValueParser {
         ValueParser::String
     }
+
+    /// Accepts any `i64` (`value_parser!(i64)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueParser};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("n").long("n").value_parser(ValueParser::i64()));
+    /// assert_eq(cmd.get_matches_from(["prog", "--n=-3"]).get_one::<i64>("n"), Some(-3));
+    /// assert(cmd.try_get_matches_from(["prog", "--n", "three"]).is_err());
+    /// ```
     pub fn i64() -> ValueParser {
         ValueParser::I64(i64::MIN, i64::MAX)
     }
+
+    /// Accepts any `u64` (`value_parser!(u64)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueParser};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("n").value_parser(ValueParser::u64()));
+    /// assert_eq(cmd.get_matches_from(["prog", "42"]).get_one::<u64>("n"), Some(42));
+    /// assert(cmd.try_get_matches_from(["prog", "x"]).is_err());
+    /// ```
     pub fn u64() -> ValueParser {
         ValueParser::U64(0, u64::MAX)
     }
+
+    /// Accepts a floating-point number (`value_parser!(f64)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueParser};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("ratio").value_parser(ValueParser::f64()));
+    /// assert_eq(cmd.get_matches_from(["prog", "0.5"]).get_one::<f64>("ratio"), Some(0.5));
+    /// assert(cmd.try_get_matches_from(["prog", "half"]).is_err());
+    /// ```
     pub fn f64() -> ValueParser {
         ValueParser::F64
     }
+
+    /// Accepts `true` or `false` (`value_parser!(bool)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueParser};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("on").long("on").value_parser(ValueParser::bool()));
+    /// assert_eq(cmd.get_matches_from(["prog", "--on", "false"]).get_one::<bool>("on"), Some(false));
+    /// assert(cmd.try_get_matches_from(["prog", "--on", "yes"]).is_err());
+    /// ```
     pub fn bool() -> ValueParser {
         ValueParser::Bool
     }
-    /// Integers in lo..=hi.
+
+    /// Accepts integers in `lo..=hi` (`value_parser!(i64).range(lo..=hi)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueParser};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("level").long("level").value_parser(ValueParser::i64_range(-1, 9)));
+    /// assert_eq(cmd.get_matches_from(["prog", "--level", "9"]).get_one::<i32>("level"), Some(9));
+    ///
+    /// let err = cmd.try_get_matches_from(["prog", "--level", "10"]).unwrap_err();
+    /// assert(err.render().contains("10 is not in -1..=9"));
+    /// ```
     pub fn i64_range(lo: i64, hi: i64) -> ValueParser {
         ValueParser::I64(lo, hi)
     }
+
+    /// Accepts unsigned integers in `lo..=hi`
+    /// (`value_parser!(u64).range(lo..=hi)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueParser};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("jobs").short('j').value_parser(ValueParser::u64_range(1, 64)));
+    /// assert_eq(cmd.get_matches_from(["prog", "-j", "8"]).get_one::<usize>("jobs"), Some(8));
+    /// assert(cmd.try_get_matches_from(["prog", "-j", "0"]).is_err());
+    /// ```
     pub fn u64_range(lo: u64, hi: u64) -> ValueParser {
         ValueParser::U64(lo, hi)
     }
+
+    /// Accepts only the given values (clap's `PossibleValuesParser`, or an
+    /// array of strings as a value parser).
+    ///
+    /// The values are listed in the help (`[possible values: ...]`) and in
+    /// the error for any other value, with a suggestion when one is close.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ErrorKind, ValueParser};
+    ///
+    /// let cmd = Command::new("prog").arg(
+    ///     Arg::new("color")
+    ///         .long("color")
+    ///         .value_parser(ValueParser::possible(&["auto", "always", "never"])),
+    /// );
+    /// let m = cmd.get_matches_from(["prog", "--color", "never"]);
+    /// assert_eq(m.get_one::<String>("color"), Some("never".to_string()));
+    ///
+    /// let err = cmd.try_get_matches_from(["prog", "--color", "nevr"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::InvalidValue);
+    /// assert(err.render().contains("[possible values: auto, always, never]"));
+    /// assert(err.render().contains("tip: a similar value exists: 'never'"));
+    /// ```
     pub fn possible(values: &[&str]) -> ValueParser {
         let mut v = Vec::new();
         for s in values.iter() {
@@ -188,8 +491,30 @@ fn range_msg(x: i128, lo: i128, hi: i128, min: i128, max: i128) -> String {
     }
 }
 
-/// An argument: an option (--name value), a flag (--verbose) or a
-/// positional (neither short nor long).
+/// The definition of a command-line argument.
+///
+/// An argument is an *option* taking a value (`--name value`), a *flag*
+/// (`--verbose`, with an action such as [`ArgAction::SetTrue`]), or a
+/// *positional* when it has neither [`short`](Arg::short) nor
+/// [`long`](Arg::long) names. It is identified by its id, which
+/// [`ArgMatches`] are asked for.
+///
+/// The settings are builder methods; each takes `&self` and returns a
+/// modified copy (clap's consume `self`).
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, Command};
+///
+/// let cfg = Arg::new("config")
+///     .short('c')
+///     .long("config")
+///     .value_name("FILE")
+///     .help("Provides a config file to myprog");
+/// let m = Command::new("prog").arg(cfg).get_matches_from(["prog", "-c", "my.toml"]);
+/// assert_eq(m.get_one::<String>("config"), Some("my.toml".to_string()));
+/// ```
 #[derive(Clone, Debug)]
 pub struct Arg {
     id: String,
@@ -218,6 +543,21 @@ pub struct Arg {
 }
 
 impl Arg {
+    /// Creates an argument with the id `id`.
+    ///
+    /// The id names the argument in [`ArgMatches`], in [`Arg::requires`]
+    /// and [`Arg::conflicts_with`], and, for a positional, in the help and
+    /// usage (`<id>`, unless [`Arg::value_name`] is set). Without
+    /// [`Arg::short`] or [`Arg::long`] the argument is a positional.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let m = Command::new("prog").arg(Arg::new("input")).get_matches_from(["prog", "a.txt"]);
+    /// assert_eq(m.get_one::<String>("input"), Some("a.txt".to_string()));
+    /// ```
     pub fn new(id: &str) -> Arg {
         Arg {
             id: id.to_string(),
@@ -246,52 +586,202 @@ impl Arg {
         }
     }
 
+    /// Sets the short name, given as `-c` on the command line.
+    ///
+    /// Short flags can be combined (`-vq`), and a short option's value
+    /// can follow it directly (`-p80`, `-p=80`) or as the next argument.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("port").short('p'));
+    /// assert_eq(cmd.get_matches_from(["prog", "-p", "80"]).get_one::<u16>("port"), Some(80));
+    /// assert_eq(cmd.get_matches_from(["prog", "-p80"]).get_one::<u16>("port"), Some(80));
+    /// ```
     pub fn short(&self, c: char) -> Arg {
         let mut a = self.clone();
         a.short = Some(c);
         a
     }
+    /// Sets the long name, given as `--name` on the command line.
+    ///
+    /// A long option's value follows as the next argument or after `=`
+    /// (`--name=value`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("cfg").long("config"));
+    /// let m = cmd.get_matches_from(["prog", "--config=app.toml"]);
+    /// assert_eq(m.get_one::<String>("cfg"), Some("app.toml".to_string()));
+    /// ```
     pub fn long(&self, s: &str) -> Arg {
         let mut a = self.clone();
         a.long = Some(s.to_string());
         a
     }
+    /// Sets the description shown next to the argument in the help.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("cfg").long("config").help("Some help text"));
+    /// assert(cmd.render_help().contains("      --config <cfg>  Some help text\n"));
+    /// ```
     pub fn help(&self, s: &str) -> Arg {
         let mut a = self.clone();
         a.help = s.to_string();
         a
     }
+
+    /// Sets a longer description, for `--help`.
+    ///
+    /// clap shows it with `--help` and the short one with `-h`; navi keeps
+    /// it but renders one help format, with the short description.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Arg;
+    ///
+    /// let a = Arg::new("cfg").help("The config").long_help("The config file, in TOML.");
+    /// assert_eq(a.get_help(), "The config");
+    /// ```
     pub fn long_help(&self, s: &str) -> Arg {
         let mut a = self.clone();
         a.long_help = Some(s.to_string());
         a
     }
+
+    /// Makes the argument required: parsing fails with
+    /// [`ErrorKind::MissingRequiredArgument`] when it is not given (or
+    /// set by a default value or the environment).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("cfg").long("config").required(true));
+    /// assert(cmd.try_get_matches_from(["prog", "--config", "a.toml"]).is_ok());
+    ///
+    /// let err = cmd.try_get_matches_from(["prog"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::MissingRequiredArgument);
+    /// assert_eq(err.to_string(), "error: the following required arguments were not provided:\n  --config <cfg>\n\nUsage: prog --config <cfg>\n\nFor more information, try '--help'.");
+    /// ```
     pub fn required(&self, yes: bool) -> Arg {
         let mut a = self.clone();
         a.required = yes;
         a
     }
+
+    /// Sets the value used when the argument is not given.
+    ///
+    /// The help shows it as `[default: value]`, and
+    /// [`ArgMatches::value_source`] tells it from a value that was given.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueSource};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("port").long("port").default_value("80"));
+    ///
+    /// let m = cmd.get_matches_from(["prog"]);
+    /// assert_eq(m.get_one::<u16>("port"), Some(80));
+    /// assert_eq(m.value_source("port"), Some(ValueSource::DefaultValue));
+    ///
+    /// let m = cmd.get_matches_from(["prog", "--port", "8080"]);
+    /// assert_eq(m.get_one::<u16>("port"), Some(8080));
+    /// assert_eq(m.value_source("port"), Some(ValueSource::CommandLine));
+    /// ```
     pub fn default_value(&self, v: &str) -> Arg {
         let mut a = self.clone();
         a.default = Vec::from([v.to_string()]);
         a
     }
+
+    /// Sets what the argument does when it is found; see [`ArgAction`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("flag").long("flag").action(ArgAction::SetTrue));
+    /// assert(cmd.get_matches_from(["prog", "--flag"]).get_flag("flag"));
+    /// ```
     pub fn action(&self, act: ArgAction) -> Arg {
         let mut a = self.clone();
         a.action = Some(act);
         a
     }
+
+    /// Sets how many values the argument takes each time it is given: a
+    /// number, or a range such as `1..=3` or `0..` (see [`ValueRange`]).
+    ///
+    /// An option reads values until the next argument starting with `-`
+    /// or the maximum. More than one value makes the default action
+    /// [`ArgAction::Append`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("point").long("point").num_args(2))
+    ///     .arg(Arg::new("files").num_args(0..));
+    /// let m = cmd.get_matches_from(["prog", "--point", "3", "4", "a", "b", "c"]);
+    /// let p: Vec<i32> = m.get_many("point").unwrap().collect();
+    /// assert_eq(p, Vec::from([3, 4]));
+    /// assert_eq(m.get_many::<String>("files").unwrap().count(), 3);
+    /// ```
     pub fn num_args<R: Into<ValueRange>>(&self, n: R) -> Arg {
         let mut a = self.clone();
         a.num_args = Some(n.into());
         a
     }
+
+    /// Sets the name of the value in the help and usage (`--config <FILE>`);
+    /// it defaults to the id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("cfg").long("config").value_name("FILE"));
+    /// assert(cmd.render_help().contains("--config <FILE>"));
+    /// ```
     pub fn value_name(&self, s: &str) -> Arg {
         let mut a = self.clone();
         a.value_name = Some(s.to_string());
         a
     }
-    /// The names of its values (num_args of them: --pair <K> <V>).
+
+    /// Sets the names of several values (`--pair <K> <V>`).
+    ///
+    /// Unless [`Arg::num_args`] says otherwise, the argument then takes as
+    /// many values as there are names.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("pair").long("pair").value_names(&["K", "V"]));
+    /// assert(cmd.render_help().contains("--pair <K> <V>"));
+    /// let m = cmd.get_matches_from(["prog", "--pair", "name", "ann"]);
+    /// let kv: Vec<String> = m.get_many("pair").unwrap().collect();
+    /// assert_eq(kv, Vec::from(["name".to_string(), "ann".to_string()]));
+    /// ```
     pub fn value_names(&self, names: &[&str]) -> Arg {
         let mut a = self.clone();
         a.value_names = Vec::new();
@@ -306,77 +796,282 @@ impl Arg {
         }
         a
     }
-    /// The position (from 1) of a positional.
+    /// Sets the position of a positional argument, counting from 1.
+    ///
+    /// Positionals without an index are numbered in the order they were
+    /// added, so this is needed only to put them in another order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("dst").index(2))
+    ///     .arg(Arg::new("src").index(1));
+    /// let m = cmd.get_matches_from(["prog", "a", "b"]);
+    /// assert_eq(m.get_one::<String>("src"), Some("a".to_string()));
+    /// assert_eq(m.get_one::<String>("dst"), Some("b".to_string()));
+    /// ```
     pub fn index(&self, i: usize) -> Arg {
         let mut a = self.clone();
         a.index = Some(i);
         a
     }
-    /// An environment variable giving the value when it is not on the
-    /// command line.
+
+    /// Reads the value from the environment variable `var` when the
+    /// argument is not on the command line.
+    ///
+    /// The variable comes before a [default value](Arg::default_value);
+    /// the help shows `[env: VAR=]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueSource};
+    ///
+    /// unsafe { std::env::set_var("NAVI_DOC_CLI_PORT", "8080"); }
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("port").long("port").env("NAVI_DOC_CLI_PORT").default_value("80"));
+    ///
+    /// let m = cmd.get_matches_from(["prog"]);
+    /// assert_eq(m.get_one::<u16>("port"), Some(8080));
+    /// assert_eq(m.value_source("port"), Some(ValueSource::EnvVariable));
+    ///
+    /// let m = cmd.get_matches_from(["prog", "--port", "9000"]);
+    /// assert_eq(m.get_one::<u16>("port"), Some(9000));
+    /// ```
     pub fn env(&self, var: &str) -> Arg {
         let mut a = self.clone();
         a.env = Some(var.to_string());
         a
     }
+
+    /// Hides the argument from the help and usage; it is still accepted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("debug").long("debug").action(ArgAction::SetTrue).hide(true));
+    /// assert(!cmd.render_help().contains("--debug"));
+    /// assert(cmd.get_matches_from(["prog", "--debug"]).get_flag("debug"));
+    /// ```
     pub fn hide(&self, yes: bool) -> Arg {
         let mut a = self.clone();
         a.hide = yes;
         a
     }
+
+    /// Adds another long name the argument is accepted by, not shown in
+    /// the help.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("test").long("test").alias("alias"));
+    /// let m = cmd.get_matches_from(["prog", "--alias", "cool"]);
+    /// assert_eq(m.get_one::<String>("test"), Some("cool".to_string()));
+    /// ```
     pub fn alias(&self, s: &str) -> Arg {
         let mut a = self.clone();
         a.aliases.push(s.to_string());
         a
     }
+
+    /// Adds another short name the argument is accepted by, not shown in
+    /// the help.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("test").short('t').short_alias('e'));
+    /// let m = cmd.get_matches_from(["prog", "-e", "cool"]);
+    /// assert_eq(m.get_one::<String>("test"), Some("cool".to_string()));
+    /// ```
     pub fn short_alias(&self, c: char) -> Arg {
         let mut a = self.clone();
         a.short_aliases.push(c);
         a
     }
+
+    /// Makes giving both this argument and the one with id `id` an
+    /// [`ErrorKind::ArgumentConflict`] error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("cfg").long("config").conflicts_with("debug"))
+    ///     .arg(Arg::new("debug").long("debug").action(ArgAction::SetTrue));
+    /// let err = cmd.try_get_matches_from(["prog", "--debug", "--config", "a.toml"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::ArgumentConflict);
+    /// assert(err.render().starts_with("error: the argument '--config <cfg>' cannot be used with '--debug'\n"));
+    /// ```
     pub fn conflicts_with(&self, id: &str) -> Arg {
         let mut a = self.clone();
         a.conflicts.push(id.to_string());
         a
     }
+
+    /// Makes the argument with id `id` required whenever this one is given.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("cfg").long("config").requires("input"))
+    ///     .arg(Arg::new("input"));
+    /// assert(cmd.try_get_matches_from(["prog"]).is_ok());
+    /// assert(cmd.try_get_matches_from(["prog", "--config", "a.toml", "in.txt"]).is_ok());
+    ///
+    /// let err = cmd.try_get_matches_from(["prog", "--config", "a.toml"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::MissingRequiredArgument);
+    /// ```
     pub fn requires(&self, id: &str) -> Arg {
         let mut a = self.clone();
         a.requires.push(id.to_string());
         a
     }
+
+    /// Sets how the argument's values are checked; see [`ValueParser`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueParser};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("mode").long("mode").value_parser(ValueParser::possible(&["fast", "slow"])));
+    /// assert(cmd.try_get_matches_from(["prog", "--mode", "fast"]).is_ok());
+    /// assert(cmd.try_get_matches_from(["prog", "--mode", "medium"]).is_err());
+    /// ```
     pub fn value_parser(&self, p: ValueParser) -> Arg {
         let mut a = self.clone();
         a.parser = p;
         a
     }
-    /// Splits each value at c (--tag a,b).
+
+    /// Splits each value at `c`, so `--tag a,b` gives two values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("tag").long("tag").action(ArgAction::Append).value_delimiter(','));
+    /// let m = cmd.get_matches_from(["prog", "--tag", "a,b", "--tag", "c"]);
+    /// let tags: Vec<String> = m.get_many("tag").unwrap().collect();
+    /// assert_eq(tags, Vec::from(["a".to_string(), "b".to_string(), "c".to_string()]));
+    /// ```
     pub fn value_delimiter(&self, c: char) -> Arg {
         let mut a = self.clone();
         a.delimiter = Some(c);
         a
     }
+
+    /// Lets the argument's values start with `-`.
+    ///
+    /// Without it, a word starting with `-` is taken as an option and ends
+    /// an option's values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("pat").long("pattern").allow_hyphen_values(true));
+    /// let m = cmd.get_matches_from(["prog", "--pattern", "-foo"]);
+    /// assert_eq(m.get_one::<String>("pat"), Some("-foo".to_string()));
+    /// ```
     pub fn allow_hyphen_values(&self, yes: bool) -> Arg {
         let mut a = self.clone();
         a.hyphen_values = yes;
         a
     }
-    /// A positional that takes only what comes after "--" (as clap's: shown
-    /// as [-- <name>...]).
+
+    /// Makes a positional take only the arguments after `--`, as clap's
+    /// `last`; the usage shows it as `[-- <id>...]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("run")
+    ///     .arg(Arg::new("prog"))
+    ///     .arg(Arg::new("args").action(ArgAction::Append).last(true));
+    /// let m = cmd.get_matches_from(["run", "app", "--", "-v", "x"]);
+    /// assert_eq(m.get_one::<String>("prog"), Some("app".to_string()));
+    /// let rest: Vec<String> = m.get_many("args").unwrap().collect();
+    /// assert_eq(rest, Vec::from(["-v".to_string(), "x".to_string()]));
+    /// assert(cmd.render_usage().ends_with("[prog] [-- <args>...]"));
+    /// ```
     pub fn last(&self, yes: bool) -> Arg {
         let mut a = self.clone();
         a.last = yes;
         a
     }
-    /// Also accepted after the subcommands' names.
+
+    /// Marks the argument as global: it is meant to be accepted after the
+    /// names of the command's subcommands too.
+    ///
+    /// The setting is recorded (the derive's `#[arg(global)]` sets it),
+    /// but the parser does not yet pass global arguments on to
+    /// subcommands: give them before the subcommand's name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("verbose").short('v').action(ArgAction::SetTrue).global(true))
+    ///     .subcommand(Command::new("run"));
+    /// let m = cmd.get_matches_from(["prog", "-v", "run"]);
+    /// assert(m.get_flag("verbose"));
+    /// ```
     pub fn global(&self, yes: bool) -> Arg {
         let mut a = self.clone();
         a.global = yes;
         a
     }
 
+    /// Returns the argument's id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Arg;
+    ///
+    /// assert_eq(Arg::new("config").long("cfg").get_id(), "config");
+    /// ```
     pub fn get_id(&self) -> &str {
         self.id.as_str()
     }
+
+    /// Returns the argument's help text (empty if none was set).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Arg;
+    ///
+    /// assert_eq(Arg::new("config").help("The config file").get_help(), "The config file");
+    /// assert_eq(Arg::new("config").get_help(), "");
+    /// ```
     pub fn get_help(&self) -> &str {
         self.help.as_str()
     }
@@ -530,11 +1225,28 @@ impl Arg {
     }
 }
 
-/// Where a value came from.
+/// Where an argument's value came from, as [`ArgMatches::value_source`]
+/// reports it.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, Command, ValueSource};
+///
+/// let cmd = Command::new("prog").arg(Arg::new("mode").long("mode").default_value("fast"));
+/// let m = cmd.get_matches_from(["prog"]);
+/// assert_eq(m.value_source("mode"), Some(ValueSource::DefaultValue));
+/// let m = cmd.get_matches_from(["prog", "--mode", "slow"]);
+/// assert_eq(m.value_source("mode"), Some(ValueSource::CommandLine));
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ValueSource {
+    /// The argument's [default value](Arg::default_value), or the
+    /// implicit value of a flag or counter that was not given.
     DefaultValue,
+    /// The [environment variable](Arg::env) of the argument.
     EnvVariable,
+    /// The command line.
     CommandLine,
 }
 
@@ -547,7 +1259,30 @@ struct Matched {
     flag: Option<bool>,
 }
 
-/// The parsed arguments of a command.
+/// The result of parsing a command line: the values of the arguments, and
+/// the subcommand given with its own matches.
+///
+/// Values are looked up by the argument's id. They are kept as the strings
+/// given, and converted with [`FromStr`] when they are asked for: an
+/// argument checked with a [`ValueParser`] converts as expected.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, ArgAction, Command};
+///
+/// let cmd = Command::new("prog")
+///     .arg(Arg::new("out").short('o'))
+///     .arg(Arg::new("verbose").short('v').action(ArgAction::SetTrue))
+///     .subcommand(Command::new("build").arg(Arg::new("target")));
+/// let m = cmd.get_matches_from(["prog", "-v", "-o", "dist", "build", "wasm"]);
+///
+/// assert_eq(m.get_one::<String>("out"), Some("dist".to_string()));
+/// assert(m.get_flag("verbose"));
+/// let (name, sub) = m.subcommand().unwrap();
+/// assert_eq(name, "build");
+/// assert_eq(sub.get_one::<String>("target"), Some("wasm".to_string()));
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct ArgMatches {
     args: Vec<Matched>,
@@ -564,8 +1299,32 @@ impl ArgMatches {
         None
     }
 
-    /// The value of id parsed as T (clap returns a reference to a value
-    /// its parser made; here values are parsed on access).
+    /// Returns the value of the argument `id` converted to `T`.
+    ///
+    /// For an argument given several times, this is the last value. A
+    /// [`SetTrue`](ArgAction::SetTrue) or [`SetFalse`](ArgAction::SetFalse)
+    /// flag's value is `true` or `false`.
+    ///
+    /// Unlike clap, which returns a reference to the value its parser
+    /// made (`Option<&T>`), this converts the string with [`FromStr`] when
+    /// asked: it returns `None` when the argument has no value, when `id`
+    /// is not an argument, and when the value does not convert to `T`. Use
+    /// [`ArgMatches::try_get_one`] to tell those apart.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("port").long("port"))
+    ///     .arg(Arg::new("name").long("name"));
+    /// let m = cmd.get_matches_from(["prog", "--port", "8080"]);
+    /// assert_eq(m.get_one::<u16>("port"), Some(8080));
+    /// assert_eq(m.get_one::<String>("port"), Some("8080".to_string()));
+    /// assert_eq(m.get_one::<String>("name"), None);
+    /// assert_eq(m.get_one::<u8>("port"), None); // 8080 does not fit
+    /// ```
     pub fn get_one<T: FromStr>(&self, id: &str) -> Option<T> {
         let m = self.find(id)?;
         if let Some(f) = m.flag {
@@ -581,7 +1340,27 @@ impl ArgMatches {
         }
     }
 
-    /// The value of id, or why there is none usable.
+    /// Returns the value of the argument `id` converted to `T`, or an
+    /// error if it does not convert.
+    ///
+    /// The result is `Ok(None)` when the argument has no value or `id` is
+    /// not an argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MatchesError`] when the value does not parse as `T`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("port").long("port"));
+    /// let m = cmd.get_matches_from(["prog", "--port", "http"]);
+    /// assert_eq(m.try_get_one::<String>("port").unwrap(), Some("http".to_string()));
+    /// assert(m.try_get_one::<u16>("port").is_err());
+    /// assert_eq(m.try_get_one::<u16>("missing").unwrap(), None);
+    /// ```
     pub fn try_get_one<T: FromStr>(&self, id: &str) -> Result<Option<T>, MatchesError> {
         let m = match self.find(id) {
             Some(m) => m,
@@ -602,8 +1381,25 @@ impl ArgMatches {
         }
     }
 
-    /// The values of id parsed as T (those that do not parse are left
-    /// out).
+    /// Returns an iterator over the values of the argument `id`, converted
+    /// to `T`.
+    ///
+    /// The values are those of every time the argument was given, in
+    /// order. Values that do not convert to `T` are left out. Returns
+    /// `None` when the argument has no values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("n").short('n').action(ArgAction::Append));
+    /// let m = cmd.get_matches_from(["prog", "-n", "1", "-n", "2", "-n", "3"]);
+    /// let sum: i32 = m.get_many::<i32>("n").unwrap().sum();
+    /// assert_eq(sum, 6);
+    ///
+    /// assert(cmd.get_matches_from(["prog"]).get_many::<i32>("n").is_none());
+    /// ```
     pub fn get_many<T: FromStr>(&self, id: &str) -> Option<crate::vec::IntoIter<T>> {
         let m = self.find(id)?;
         if m.values.len() == 0 {
@@ -618,7 +1414,19 @@ impl ArgMatches {
         Some(out.into_iter())
     }
 
-    /// The raw values of id.
+    /// Returns an iterator over the values of the argument `id` as they
+    /// were given, or `None` if `id` was not matched.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("files").num_args(1..));
+    /// let m = cmd.get_matches_from(["prog", "a.txt", "b.txt"]);
+    /// let raw: Vec<&str> = m.get_raw("files").unwrap().collect();
+    /// assert_eq(raw, Vec::from(["a.txt", "b.txt"]));
+    /// ```
     pub fn get_raw(&self, id: &str) -> Option<crate::vec::IntoIter<&str>> {
         let m = self.find(id)?;
         let mut out = Vec::new();
@@ -628,7 +1436,20 @@ impl ArgMatches {
         Some(out.into_iter())
     }
 
-    /// A SetTrue/SetFalse flag's value (false when not defined).
+    /// Returns the value of the flag `id` (an argument with the action
+    /// [`ArgAction::SetTrue`] or [`ArgAction::SetFalse`]).
+    ///
+    /// Returns `false` for an `id` that is not a flag (clap panics).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("all").short('a').action(ArgAction::SetTrue));
+    /// assert(cmd.get_matches_from(["prog", "-a"]).get_flag("all"));
+    /// assert(!cmd.get_matches_from(["prog"]).get_flag("all"));
+    /// ```
     pub fn get_flag(&self, id: &str) -> bool {
         match self.find(id) {
             Some(m) => m.flag.unwrap_or(false),
@@ -636,7 +1457,21 @@ impl ArgMatches {
         }
     }
 
-    /// How often a Count argument was given.
+    /// Returns how many times the argument `id`, of action
+    /// [`ArgAction::Count`], was given (at most 255).
+    ///
+    /// Returns 0 for an `id` that is not a counter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("verbose").short('v').long("verbose").action(ArgAction::Count));
+    /// assert_eq(cmd.get_matches_from(["prog", "-vv", "--verbose"]).get_count("verbose"), 3);
+    /// assert_eq(cmd.get_matches_from(["prog"]).get_count("verbose"), 0);
+    /// ```
     pub fn get_count(&self, id: &str) -> u8 {
         match self.find(id) {
             Some(m) => {
@@ -650,12 +1485,40 @@ impl ArgMatches {
         }
     }
 
-    /// Whether id has a value (from the command line, a default or the
-    /// environment).
+    /// Returns `true` if the argument `id` has a value: from the command
+    /// line, the environment or a default.
+    ///
+    /// Flags and counters always have one (`false` or 0 when not given).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("out").short('o'))
+    ///     .arg(Arg::new("level").short('l').default_value("1"));
+    /// let m = cmd.get_matches_from(["prog"]);
+    /// assert(!m.contains_id("out"));
+    /// assert(m.contains_id("level"));
+    /// ```
     pub fn contains_id(&self, id: &str) -> bool {
         self.find(id).is_some()
     }
 
+    /// Returns where the value of the argument `id` came from, or `None`
+    /// if it has none.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ValueSource};
+    ///
+    /// let cmd = Command::new("prog").arg(Arg::new("level").short('l').default_value("1"));
+    /// assert_eq(cmd.get_matches_from(["prog"]).value_source("level"), Some(ValueSource::DefaultValue));
+    /// assert_eq(cmd.get_matches_from(["prog", "-l", "2"]).value_source("level"), Some(ValueSource::CommandLine));
+    /// assert_eq(cmd.get_matches_from(["prog"]).value_source("other"), None);
+    /// ```
     pub fn value_source(&self, id: &str) -> Option<ValueSource> {
         match self.find(id) {
             Some(m) => Some(m.source.clone()),
@@ -663,7 +1526,25 @@ impl ArgMatches {
         }
     }
 
-    /// The subcommand given and its matches.
+    /// Returns the name and matches of the subcommand given, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("git")
+    ///     .subcommand(Command::new("clone").arg(Arg::new("repo").required(true)))
+    ///     .subcommand(Command::new("push"));
+    /// let m = cmd.get_matches_from(["git", "clone", "https://example.com/r.git"]);
+    /// match m.subcommand() {
+    ///     Some(("clone", sub)) => {
+    ///         assert_eq(sub.get_one::<String>("repo"), Some("https://example.com/r.git".to_string()))
+    ///     }
+    ///     Some(("push", _)) => panic("not pushed"),
+    ///     _ => panic("no subcommand"),
+    /// }
+    /// ```
     pub fn subcommand(&self) -> Option<(&str, &ArgMatches)> {
         match &self.sub {
             Some((n, m)) => Some((n.as_str(), *m)),
@@ -671,6 +1552,17 @@ impl ArgMatches {
         }
     }
 
+    /// Returns the name of the subcommand given, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("git").subcommand(Command::new("status"));
+    /// assert_eq(cmd.get_matches_from(["git", "status"]).subcommand_name(), Some("status"));
+    /// assert_eq(cmd.get_matches_from(["git"]).subcommand_name(), None);
+    /// ```
     pub fn subcommand_name(&self) -> Option<&str> {
         match &self.sub {
             Some((n, _)) => Some(n.as_str()),
@@ -678,6 +1570,19 @@ impl ArgMatches {
         }
     }
 
+    /// Returns the matches of the subcommand `name` if it is the one given.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("git")
+    ///     .subcommand(Command::new("commit").arg(Arg::new("all").short('a').action(ArgAction::SetTrue)));
+    /// let m = cmd.get_matches_from(["git", "commit", "-a"]);
+    /// assert(m.subcommand_matches("commit").unwrap().get_flag("all"));
+    /// assert(m.subcommand_matches("push").is_none());
+    /// ```
     pub fn subcommand_matches(&self, name: &str) -> Option<&ArgMatches> {
         match &self.sub {
             Some((n, m)) => {
@@ -691,7 +1596,20 @@ impl ArgMatches {
         }
     }
 
-    /// The ids with values.
+    /// Returns an iterator over the ids of the arguments that have values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("prog")
+    ///     .arg(Arg::new("a").short('a'))
+    ///     .arg(Arg::new("b").short('b'));
+    /// let m = cmd.get_matches_from(["prog", "-b", "1"]);
+    /// let ids: Vec<&str> = m.ids().collect();
+    /// assert_eq(ids, Vec::from(["b"]));
+    /// ```
     pub fn ids(&self) -> crate::vec::IntoIter<&str> {
         let mut v = Vec::new();
         for m in self.args.iter() {
@@ -701,7 +1619,18 @@ impl ArgMatches {
     }
 }
 
-/// ArgMatches::try_get_one's error.
+/// The error of [`ArgMatches::try_get_one`]: a value that does not convert
+/// to the type asked for.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, Command};
+///
+/// let m = Command::new("prog").arg(Arg::new("n")).get_matches_from(["prog", "ten"]);
+/// let err = m.try_get_one::<i32>("n").unwrap_err();
+/// assert_eq(err.to_string(), "could not parse the value of 'n'");
+/// ```
 #[derive(Clone, Debug)]
 pub struct MatchesError {
     msg: String,
@@ -713,29 +1642,92 @@ impl Display for MatchesError {
     }
 }
 
-/// What went wrong (or help and version, which are errors to
-/// try_get_matches).
+/// The kind of an [`Error`]: what went wrong, or the help or version
+/// that was asked for.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, Command, ErrorKind};
+///
+/// let cmd = Command::new("prog").version("1.0").arg(Arg::new("n").long("n"));
+/// let kind = |args: &[&str]| -> ErrorKind {
+///     let mut v = Vec::from(["prog"]);
+///     v.extend_from_slice(args);
+///     cmd.try_get_matches_from(v).unwrap_err().kind()
+/// };
+/// assert_eq(kind(&["--x"]), ErrorKind::UnknownArgument);
+/// assert_eq(kind(&["--n"]), ErrorKind::InvalidValue);
+/// assert_eq(kind(&["--help"]), ErrorKind::DisplayHelp);
+/// assert_eq(kind(&["--version"]), ErrorKind::DisplayVersion);
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ErrorKind {
+    /// A value was rejected by the argument's [`ValueParser`], or an
+    /// option was given without its value.
     InvalidValue,
+    /// An argument that is not defined was given.
     UnknownArgument,
+    /// A word was taken as a subcommand, and the command has no such
+    /// subcommand.
     InvalidSubcommand,
+    /// An option required `=` before its value (clap's
+    /// `require_equals`; not produced by navi's parser).
     NoEquals,
+    /// A value failed to convert to its field's type (made by the derive's
+    /// generated code, or by [`Error::raw`]).
     ValueValidation,
+    /// A flag was given a value, as in `--quiet=yes`.
     TooManyValues,
+    /// An option was given fewer values than it needs (clap's; navi's
+    /// parser reports [`ErrorKind::WrongNumberOfValues`]).
     TooFewValues,
+    /// An option was given fewer values than its
+    /// [`num_args`](Arg::num_args) requires.
     WrongNumberOfValues,
+    /// Two arguments that [conflict](Arg::conflicts_with) were given, or
+    /// an argument that takes one value was given twice.
     ArgumentConflict,
+    /// A [required](Arg::required) argument was not given.
     MissingRequiredArgument,
+    /// A command whose [subcommand is required](Command::subcommand_required)
+    /// was given none.
     MissingSubcommand,
+    /// `--help`, `-h` or the `help` subcommand: the error's text is the
+    /// help, printed to the standard output with exit code 0.
     DisplayHelp,
+    /// `--version` or `-V`: the error's text is the version, printed to the
+    /// standard output with exit code 0.
     DisplayVersion,
+    /// Nothing was given to a command with
+    /// [`arg_required_else_help`](Command::arg_required_else_help): the
+    /// error's text is the help, and the exit code 2.
     DisplayHelpOnMissingArgumentOrSubcommand,
+    /// An I/O error (kept for clap's API).
     Io,
+    /// A formatting error (kept for clap's API).
     Format,
 }
 
-/// A parse error, or the help or version text.
+/// A command-line parsing error, or the help or version text asked for.
+///
+/// Returned by [`Command::try_get_matches_from`] and
+/// [`Parser::try_parse_from`]. Its text is clap's, word for word: the
+/// message, a usage line and a pointer to `--help`. [`Error::exit`]
+/// prints it where clap would and exits with clap's code; the
+/// [`Display`] form is the same text without the final newline.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, Command, ErrorKind};
+///
+/// let cmd = Command::new("prog").arg(Arg::new("file").required(true));
+/// let err = cmd.try_get_matches_from(["prog"]).unwrap_err();
+/// assert_eq(err.kind(), ErrorKind::MissingRequiredArgument);
+/// assert_eq(err.exit_code(), 2);
+/// assert_eq(err.render(), "error: the following required arguments were not provided:\n  <file>\n\nUsage: prog <file>\n\nFor more information, try '--help'.\n");
+/// ```
 #[derive(Clone)]
 pub struct Error {
     kind: ErrorKind,
@@ -743,8 +1735,18 @@ pub struct Error {
 }
 
 impl Error {
-    /// An error of kind with message (clap's Error::raw): printed as
-    /// "error: message".
+    /// Creates an error of kind `kind` with a message, as clap's
+    /// `Error::raw`; its text is `error: message`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Error, ErrorKind};
+    ///
+    /// let err = Error::raw(ErrorKind::InvalidValue, "the port must be even");
+    /// assert_eq(err.kind(), ErrorKind::InvalidValue);
+    /// assert_eq(err.to_string(), "error: the port must be even");
+    /// ```
     pub fn raw<M: Display>(kind: ErrorKind, message: M) -> Error {
         Error {
             kind,
@@ -752,11 +1754,32 @@ impl Error {
         }
     }
 
+    /// Returns the kind of the error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Command, ErrorKind};
+    ///
+    /// let err = Command::new("prog").try_get_matches_from(["prog", "extra"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::UnknownArgument);
+    /// ```
     pub fn kind(&self) -> ErrorKind {
         self.kind.clone()
     }
 
-    /// 0 for help and version, 2 for errors.
+    /// Returns the code the program exits with for this error: 0 for the
+    /// help and version, 2 otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("prog");
+    /// assert_eq(cmd.try_get_matches_from(["prog", "--help"]).unwrap_err().exit_code(), 0);
+    /// assert_eq(cmd.try_get_matches_from(["prog", "--bad"]).unwrap_err().exit_code(), 2);
+    /// ```
     pub fn exit_code(&self) -> i32 {
         match self.kind {
             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
@@ -764,16 +1787,49 @@ impl Error {
         }
     }
 
-    /// The text clap prints (help and version to stdout, errors to stderr).
+    /// Returns the text clap prints for the error: the message, or the
+    /// help or version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("prog").version("2.1");
+    /// assert_eq(cmd.try_get_matches_from(["prog", "-V"]).unwrap_err().render(), "prog 2.1\n");
+    /// ```
     pub fn render(&self) -> String {
         self.text.clone()
     }
 
+    /// Returns `true` if the text goes to the standard error: for errors,
+    /// not for the help and version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("prog");
+    /// assert(!cmd.try_get_matches_from(["prog", "--help"]).unwrap_err().use_stderr());
+    /// assert(cmd.try_get_matches_from(["prog", "--bad"]).unwrap_err().use_stderr());
+    /// ```
     pub fn use_stderr(&self) -> bool {
         self.exit_code() != 0
     }
 
-    /// Prints the text where it belongs.
+    /// Prints the text: errors to the standard error, the help and version
+    /// to the standard output.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::cli::Command;
+    ///
+    /// if let Err(e) = Command::new("prog").try_get_matches() {
+    ///     e.print();
+    /// }
+    /// ```
     pub fn print(&self) {
         if self.use_stderr() {
             crate::io::eprint(self.text.as_str());
@@ -782,7 +1838,19 @@ impl Error {
         }
     }
 
-    /// Prints and exits.
+    /// Prints the text as [`Error::print`] does and exits the process with
+    /// [`Error::exit_code`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::cli::Command;
+    ///
+    /// let m = match Command::new("prog").try_get_matches() {
+    ///     Ok(m) => m,
+    ///     Err(e) => e.exit(),
+    /// };
+    /// ```
     pub fn exit(&self) -> ! {
         self.print();
         crate::process::exit(self.exit_code())
@@ -801,7 +1869,46 @@ impl Debug for Error {
     }
 }
 
-/// A command: its arguments, subcommands, and help and version text.
+/// The definition of a program or subcommand: its arguments, its
+/// subcommands, and its help and version text.
+///
+/// A command gets a `-h`, `--help` flag, a `-V`, `--version` flag when it
+/// has a [version](Command::version), and a `help` subcommand when it has
+/// subcommands, as in clap. The settings are builder methods; each takes
+/// `&self` and returns a modified copy (clap's consume `self`).
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Arg, ArgAction, Command};
+///
+/// let cmd = Command::new("myprog")
+///     .version("1.0")
+///     .about("Does great things")
+///     .arg(Arg::new("verbose").short('v').long("verbose").action(ArgAction::SetTrue).help("Say more"))
+///     .subcommand(Command::new("test").about("Runs the tests"));
+///
+/// let m = cmd.get_matches_from(["myprog", "-v", "test"]);
+/// assert(m.get_flag("verbose"));
+/// assert_eq(m.subcommand_name(), Some("test"));
+///
+/// let help = cmd.render_help();
+/// let lines: Vec<&str> = help.lines().collect();
+/// assert_eq(lines, Vec::from([
+///     "Does great things",
+///     "",
+///     "Usage: myprog [OPTIONS] [COMMAND]",
+///     "",
+///     "Commands:",
+///     "  test  Runs the tests",
+///     "  help  Print this message or the help of the given subcommand(s)",
+///     "",
+///     "Options:",
+///     "  -v, --verbose  Say more",
+///     "  -h, --help     Print help",
+///     "  -V, --version  Print version",
+/// ]));
+/// ```
 #[derive(Clone, Debug)]
 pub struct Command {
     name: String,
@@ -822,6 +1929,21 @@ pub struct Command {
 }
 
 impl Command {
+    /// Creates a command named `name`.
+    ///
+    /// The name is the program's in the usage and version, unless
+    /// [`Command::bin_name`] is set; for a subcommand it is the word that
+    /// selects it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("myprog");
+    /// assert_eq(cmd.get_name(), "myprog");
+    /// assert_eq(cmd.render_usage(), "Usage: myprog [OPTIONS]");
+    /// ```
     pub fn new(name: &str) -> Command {
         Command {
             name: name.to_string(),
@@ -842,41 +1964,141 @@ impl Command {
         }
     }
 
+    /// Sets the version, printed by `-V`, `--version` (which this adds) as
+    /// `name version`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("myprog").version("1.2.3");
+    /// assert_eq(cmd.render_version(), "myprog 1.2.3\n");
+    /// let err = cmd.try_get_matches_from(["myprog", "--version"]).unwrap_err();
+    /// assert_eq(err.render(), "myprog 1.2.3\n");
+    /// ```
     pub fn version(&self, v: &str) -> Command {
         let mut c = self.clone();
         c.version = Some(v.to_string());
         c
     }
+
+    /// Sets the description shown at the top of the help, and next to a
+    /// subcommand's name in its parent's help.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("myprog").about("Does really amazing things");
+    /// assert(cmd.render_help().starts_with("Does really amazing things\n\nUsage: myprog"));
+    /// ```
     pub fn about(&self, s: &str) -> Command {
         let mut c = self.clone();
         c.about = Some(s.to_string());
         c
     }
+
+    /// Sets a longer description for the top of the help, in place of
+    /// [`Command::about`] (which is still shown in a parent's list of
+    /// subcommands).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("myprog")
+    ///     .about("Does things")
+    ///     .long_about("Does things.\n\nAll of them, in order.");
+    /// assert(cmd.render_help().starts_with("Does things.\n\nAll of them, in order.\n\nUsage:"));
+    /// ```
     pub fn long_about(&self, s: &str) -> Command {
         let mut c = self.clone();
         c.long_about = Some(s.to_string());
         c
     }
+
+    /// Sets the author. It is kept for clap's API; the default help does
+    /// not show it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("myprog").author("Ann <ann@example.com>");
+    /// assert(!cmd.render_help().contains("Ann"));
+    /// ```
     pub fn author(&self, s: &str) -> Command {
         let mut c = self.clone();
         c.author = Some(s.to_string());
         c
     }
+
+    /// Sets text printed after the help (examples, links, notes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("myprog").after_help("See https://example.com for more.");
+    /// assert(cmd.render_help().ends_with("\nSee https://example.com for more.\n"));
+    /// ```
     pub fn after_help(&self, s: &str) -> Command {
         let mut c = self.clone();
         c.after_help = Some(s.to_string());
         c
     }
+
+    /// Sets the program's name as shown in the usage and help, in place of
+    /// the command's name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("tool").bin_name("cargo-tool").arg(Arg::new("x").required(true));
+    /// let err = cmd.try_get_matches_from(["cargo-tool"]).unwrap_err();
+    /// assert(err.render().contains("Usage: cargo-tool <x>"));
+    /// ```
     pub fn bin_name(&self, s: &str) -> Command {
         let mut c = self.clone();
         c.bin_name = Some(s.to_string());
         c
     }
+
+    /// Adds an argument.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("myprog").arg(Arg::new("config").short('c').long("config"));
+    /// let m = cmd.get_matches_from(["myprog", "-c", "a.toml"]);
+    /// assert_eq(m.get_one::<String>("config"), Some("a.toml".to_string()));
+    /// ```
     pub fn arg(&self, a: Arg) -> Command {
         let mut c = self.clone();
         c.args.push(a);
         c
     }
+
+    /// Adds several arguments.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("myprog").args([Arg::new("input"), Arg::new("output")]);
+    /// let m = cmd.get_matches_from(["myprog", "in.txt", "out.txt"]);
+    /// assert_eq(m.get_one::<String>("output"), Some("out.txt".to_string()));
+    /// ```
     pub fn args<I: IntoIterator<Item = Arg>>(&self, xs: I) -> Command {
         let mut c = self.clone();
         for a in xs {
@@ -884,11 +2106,41 @@ impl Command {
         }
         c
     }
+
+    /// Adds a subcommand: a command of its own, selected by its name on
+    /// the command line, with its own arguments and help.
+    ///
+    /// The arguments of the parent come before the subcommand's name;
+    /// everything after it is the subcommand's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("git").subcommand(
+    ///     Command::new("config").about("Controls configuration").arg(Arg::new("key")),
+    /// );
+    /// let m = cmd.get_matches_from(["git", "config", "user.name"]);
+    /// let sub = m.subcommand_matches("config").unwrap();
+    /// assert_eq(sub.get_one::<String>("key"), Some("user.name".to_string()));
+    /// ```
     pub fn subcommand(&self, s: Command) -> Command {
         let mut c = self.clone();
         c.subs.push(s);
         c
     }
+
+    /// Adds several subcommands.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("git").subcommands([Command::new("fetch"), Command::new("push")]);
+    /// assert_eq(cmd.get_matches_from(["git", "push"]).subcommand_name(), Some("push"));
+    /// ```
     pub fn subcommands<I: IntoIterator<Item = Command>>(&self, xs: I) -> Command {
         let mut c = self.clone();
         for s in xs {
@@ -896,51 +2148,174 @@ impl Command {
         }
         c
     }
-    /// Help instead of an error when nothing is given.
+
+    /// Shows the help, instead of an error, when no arguments at all are
+    /// given.
+    ///
+    /// The error is then of kind
+    /// [`ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand`], with the
+    /// help as its text (and exit code 2).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("myprog")
+    ///     .arg(Arg::new("file").required(true))
+    ///     .arg_required_else_help(true);
+    /// let err = cmd.try_get_matches_from(["myprog"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
+    /// assert(err.render().starts_with("Usage: myprog [OPTIONS] <file>"));
+    /// assert_eq(err.exit_code(), 2);
+    /// ```
     pub fn arg_required_else_help(&self, yes: bool) -> Command {
         let mut c = self.clone();
         c.required_else_help = yes;
         c
     }
+
+    /// Makes giving no subcommand an [`ErrorKind::MissingSubcommand`]
+    /// error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("myprog").subcommand(Command::new("test")).subcommand_required(true);
+    /// let err = cmd.try_get_matches_from(["myprog"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::MissingSubcommand);
+    /// assert(err.render().starts_with("error: 'myprog' requires a subcommand but one was not provided\n"));
+    /// ```
     pub fn subcommand_required(&self, yes: bool) -> Command {
         let mut c = self.clone();
         c.subcommand_required = yes;
         c
     }
+
+    /// Leaves out the generated `-h`, `--help` flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("myprog").disable_help_flag(true);
+    /// let err = cmd.try_get_matches_from(["myprog", "--help"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::UnknownArgument);
+    /// ```
     pub fn disable_help_flag(&self, yes: bool) -> Command {
         let mut c = self.clone();
         c.no_help_flag = yes;
         c
     }
+
+    /// Leaves out the generated `-V`, `--version` flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("myprog").version("1.0").disable_version_flag(true);
+    /// let err = cmd.try_get_matches_from(["myprog", "-V"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::UnknownArgument);
+    /// ```
     pub fn disable_version_flag(&self, yes: bool) -> Command {
         let mut c = self.clone();
         c.no_version_flag = yes;
         c
     }
-    /// A subcommand left out of its parent's help.
+
+    /// Hides a subcommand from its parent's help; it is still accepted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("myprog")
+    ///     .subcommand(Command::new("run"))
+    ///     .subcommand(Command::new("debug").hide(true));
+    /// assert(!cmd.render_help().contains("debug"));
+    /// assert_eq(cmd.get_matches_from(["myprog", "debug"]).subcommand_name(), Some("debug"));
+    /// ```
     pub fn hide(&self, yes: bool) -> Command {
         let mut c = self.clone();
         c.hide = yes;
         c
     }
-    /// Once the last positional (of many values) takes a value, it takes
-    /// everything after it, flags too (as clap's trailing_var_arg).
+
+    /// Makes the last positional, if it takes several values, take
+    /// everything after its first value, options included (clap's
+    /// `trailing_var_arg`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, ArgAction, Command};
+    ///
+    /// let cmd = Command::new("exec")
+    ///     .arg(Arg::new("verbose").short('v').action(ArgAction::SetTrue))
+    ///     .arg(Arg::new("cmd").num_args(1..))
+    ///     .trailing_var_arg(true);
+    /// let m = cmd.get_matches_from(["exec", "-v", "ls", "-l", "-a"]);
+    /// assert(m.get_flag("verbose"));
+    /// let argv: Vec<String> = m.get_many("cmd").unwrap().collect();
+    /// assert_eq(argv, Vec::from(["ls".to_string(), "-l".to_string(), "-a".to_string()]));
+    /// ```
     pub fn trailing_var_arg(&self, yes: bool) -> Command {
         let mut c = self.clone();
         c.trailing = yes;
         c
     }
 
+    /// Returns the command's name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// assert_eq(Command::new("myprog").get_name(), "myprog");
+    /// ```
     pub fn get_name(&self) -> &str {
         self.name.as_str()
     }
 
-    /// Parses the program's arguments; prints help, the version or an
-    /// error and exits as clap does.
+    /// Parses the program's arguments ([`std::env::args`]).
+    ///
+    /// On an error, or for `--help` or `--version`, it prints the text
+    /// and exits as clap does (see [`Error::exit`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let m = Command::new("myprog").arg(Arg::new("file").required(true)).get_matches();
+    /// let file: String = m.get_one("file").unwrap();
+    /// ```
     pub fn get_matches(&self) -> ArgMatches {
         self.get_matches_from(crate::env::args())
     }
 
+    /// Parses the arguments `args`, the first of which is the program's
+    /// name (as in `argv`, and ignored).
+    ///
+    /// On an error, or for `--help` or `--version`, it prints the text
+    /// and exits as clap does (see [`Error::exit`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("myprog").arg(Arg::new("file"));
+    /// let m = cmd.get_matches_from(["myprog", "a.txt"]);
+    /// assert_eq(m.get_one::<String>("file"), Some("a.txt".to_string()));
+    /// ```
     pub fn get_matches_from<I, T>(&self, args: I) -> ArgMatches
     where
         I: IntoIterator<Item = T>,
@@ -952,11 +2327,50 @@ impl Command {
         }
     }
 
+    /// Parses the program's arguments ([`std::env::args`]), returning an
+    /// error instead of exiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for arguments that do not parse, and for
+    /// `--help` and `--version` (see [`Command::try_get_matches_from`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let m = match Command::new("myprog").arg(Arg::new("file")).try_get_matches() {
+    ///     Ok(m) => m,
+    ///     Err(e) => e.exit(),
+    /// };
+    /// ```
     pub fn try_get_matches(&self) -> Result<ArgMatches, Error> {
         self.try_get_matches_from(crate::env::args())
     }
 
-    /// Parses args (the first is the program, as in argv).
+    /// Parses the arguments `args` (the first is the program's name, as in
+    /// `argv`), returning an error instead of exiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for arguments that do not parse; `--help` and
+    /// `--version` are errors too, of kinds [`ErrorKind::DisplayHelp`] and
+    /// [`ErrorKind::DisplayVersion`], whose text is the help or version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command, ErrorKind};
+    ///
+    /// let cmd = Command::new("myprog").arg(Arg::new("n").long("n"));
+    /// let m = cmd.try_get_matches_from(["myprog", "--n", "3"]).unwrap();
+    /// assert_eq(m.get_one::<i32>("n"), Some(3));
+    ///
+    /// let err = cmd.try_get_matches_from(["myprog", "--help"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::DisplayHelp);
+    /// assert(err.render().starts_with("Usage: myprog [OPTIONS]"));
+    /// ```
     pub fn try_get_matches_from<I, T>(&self, args: I) -> Result<ArgMatches, Error>
     where
         I: IntoIterator<Item = T>,
@@ -980,23 +2394,97 @@ impl Command {
         p.parse(&c, prog.as_str(), &Vec::new())
     }
 
-    /// The help text.
+    /// Returns the help text, as `--help` prints it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("myprog")
+    ///     .about("Counts lines")
+    ///     .arg(Arg::new("file").required(true).help("The input file"))
+    ///     .arg(Arg::new("max").short('m').long("max").default_value("10").help("Stop after this many"));
+    /// let help = cmd.render_help();
+    /// let lines: Vec<&str> = help.lines().collect();
+    /// assert_eq(lines, Vec::from([
+    ///     "Counts lines",
+    ///     "",
+    ///     "Usage: myprog [OPTIONS] <file>",
+    ///     "",
+    ///     "Arguments:",
+    ///     "  <file>  The input file",
+    ///     "",
+    ///     "Options:",
+    ///     "  -m, --max <max>  Stop after this many [default: 10]",
+    ///     "  -h, --help       Print help",
+    /// ]));
+    /// ```
     pub fn render_help(&self) -> String {
         self.built(true).help_text(self.name.as_str(), &Vec::new())
     }
+
+    /// Returns the long help text; the same as [`Command::render_help`]
+    /// (navi has one help format).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// let cmd = Command::new("myprog").about("Does things");
+    /// assert_eq(cmd.render_long_help(), cmd.render_help());
+    /// ```
     pub fn render_long_help(&self) -> String {
         self.render_help()
     }
+
+    /// Returns the version text, `name version` and a newline, as
+    /// `--version` prints it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Command;
+    ///
+    /// assert_eq(Command::new("myprog").version("0.3.1").render_version(), "myprog 0.3.1\n");
+    /// ```
     pub fn render_version(&self) -> String {
         match &self.version {
             Some(v) => `${self.name} ${v}\n`.to_string(),
             None => `${self.name}\n`.to_string(),
         }
     }
+
+    /// Returns the usage line, as the help and errors show it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("cp")
+    ///     .arg(Arg::new("src").required(true))
+    ///     .arg(Arg::new("dst").required(true));
+    /// assert_eq(cmd.render_usage(), "Usage: cp [OPTIONS] <src> <dst>");
+    /// ```
     pub fn render_usage(&self) -> String {
         `Usage: ${self.built(true).full_usage(self.name.as_str(), &Vec::new())}`.to_string()
     }
 
+    /// Prints the help text to the standard output.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `Ok(())` (the result is kept for clap's API).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::cli::Command;
+    ///
+    /// Command::new("myprog").about("Does things").print_help().unwrap();
+    /// ```
     pub fn print_help(&self) -> crate::io::Result<()> {
         crate::io::print(self.render_help());
         Ok(())
@@ -1348,43 +2836,170 @@ fn suggest(word: &str, candidates: &[String]) -> Option<String> {
 pub mod derive;
 pub use self::derive::{Args, Parser, Subcommand, ValueEnum};
 
-/// A type's Command (clap's CommandFactory; #[derive(Parser)] makes it).
+/// A type that has a [`Command`] (clap's `CommandFactory`).
+///
+/// `#[derive(Parser)]` implements it: the command is named by
+/// `#[command(name = "...")]` (or the package's name), and has the
+/// struct's fields as arguments.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{CommandFactory, Parser};
+///
+/// #[derive(Parser)]
+/// #[command(name = "greet")]
+/// /// Greets people.
+/// struct Cli {
+///     /// Who to greet
+///     name: String,
+/// }
+///
+/// let cmd = Cli::command();
+/// assert_eq(cmd.get_name(), "greet");
+/// assert(cmd.render_help().starts_with("Greets people\n\nUsage: greet"));
+/// assert(cmd.render_help().contains("  <NAME>  Who to greet\n"));
+/// ```
 pub trait CommandFactory {
+    /// Returns the type's command, with all its arguments and subcommands.
     fn command() -> Command;
 }
 
-/// The value from parsed matches (clap's FromArgMatches; Parser, Args and
-/// Subcommand derives make it).
+/// A type that can be made from [`ArgMatches`] (clap's `FromArgMatches`).
+///
+/// `#[derive(Parser)]`, `#[derive(Args)]` and `#[derive(Subcommand)]`
+/// implement it.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{CommandFactory, FromArgMatches, Parser};
+///
+/// #[derive(Parser)]
+/// #[command(name = "prog")]
+/// struct Cli {
+///     #[arg(long)]
+///     level: u8,
+/// }
+///
+/// let m = Cli::command().get_matches_from(["prog", "--level", "3"]);
+/// let cli = Cli::from_arg_matches(&m).unwrap();
+/// assert_eq(cli.level, 3);
+/// ```
 pub trait FromArgMatches {
+    /// Makes the value from parsed matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] when a value does not convert to its field's
+    /// type, or a required value or subcommand is missing (which parsing
+    /// with the type's own [`Command`] has already checked).
     fn from_arg_matches(m: &ArgMatches) -> Result<Self, Error>;
 }
 
-/// The program's arguments parsed into the type (clap's Parser;
-/// #[derive(Parser)] on a struct):
+/// Parses command-line arguments into a struct (clap's `Parser`).
 ///
-///     #[derive(Parser)]
-///     #[command(version = "1.0")]
-///     /// Copies things.
-///     struct Cli {
-///         /// Say more
-///         #[arg(short, long)]
-///         verbose: bool,
-///         #[arg(short, long, default_value = "8080")]
-///         port: u16,
-///         files: Vec<String>,
-///     }
-///     let cli = Cli::parse();
+/// It is implemented with `#[derive(Parser)]` on a struct whose fields
+/// are the arguments; see the [`derive`] module for the attributes.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::Parser;
+///
+/// #[derive(Parser, Debug)]
+/// #[command(name = "copy", version = "1.0")]
+/// /// Copies things.
+/// struct Cli {
+///     /// Say more
+///     #[arg(short, long)]
+///     verbose: bool,
+///     /// The port to use
+///     #[arg(short, long, default_value = "8080")]
+///     port: u16,
+///     /// The files
+///     files: Vec<String>,
+/// }
+///
+/// // A real program calls `Cli::parse()`.
+/// let cli = Cli::parse_from(["copy", "-p", "9000", "a", "b"]);
+/// assert(!cli.verbose);
+/// assert_eq(cli.port, 9000);
+/// assert_eq(cli.files.len(), 2);
+/// ```
 pub trait Parser: FromArgMatches + CommandFactory {
-    /// Parses the program's arguments; prints help, the version or an
-    /// error and exits as clap does.
+    /// Parses the program's arguments ([`std::env::args`]).
+    ///
+    /// On an error, or for `--help` or `--version`, it prints the text
+    /// and exits as clap does (see [`Error::exit`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::cli::Parser;
+    ///
+    /// #[derive(Parser)]
+    /// struct Cli {
+    ///     #[arg(short, long)]
+    ///     name: String,
+    /// }
+    ///
+    /// let cli = Cli::parse();
+    /// println(`hello, ${cli.name}`);
+    /// ```
     fn parse() -> Self {
         Self::parse_from(crate::env::args())
     }
 
+    /// Parses the program's arguments ([`std::env::args`]), returning an
+    /// error instead of exiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for arguments that do not parse, and for
+    /// `--help` and `--version` (see [`Parser::try_parse_from`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::cli::Parser;
+    ///
+    /// #[derive(Parser)]
+    /// struct Cli {
+    ///     #[arg(short, long)]
+    ///     name: String,
+    /// }
+    ///
+    /// let cli = match Cli::try_parse() {
+    ///     Ok(cli) => cli,
+    ///     Err(e) => e.exit(),
+    /// };
+    /// ```
     fn try_parse() -> Result<Self, Error> {
         Self::try_parse_from(crate::env::args())
     }
 
+    /// Parses the arguments `args`, the first of which is the program's
+    /// name (as in `argv`, and ignored).
+    ///
+    /// On an error, or for `--help` or `--version`, it prints the text
+    /// and exits as clap does (see [`Error::exit`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::Parser;
+    ///
+    /// #[derive(Parser)]
+    /// #[command(name = "prog")]
+    /// struct Cli {
+    ///     #[arg(short, long)]
+    ///     name: String,
+    /// }
+    ///
+    /// let cli = Cli::parse_from(["prog", "--name", "ann"]);
+    /// assert_eq(cli.name, "ann");
+    /// ```
     fn parse_from<I, T>(args: I) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -1396,7 +3011,34 @@ pub trait Parser: FromArgMatches + CommandFactory {
         }
     }
 
-    /// Parses args (the first is the program, as in argv).
+    /// Parses the arguments `args` (the first is the program's name, as in
+    /// `argv`), returning an error instead of exiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] for arguments that do not parse; `--help` and
+    /// `--version` are errors too, of kinds [`ErrorKind::DisplayHelp`] and
+    /// [`ErrorKind::DisplayVersion`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{ErrorKind, Parser};
+    ///
+    /// #[derive(Parser, Debug)]
+    /// #[command(name = "prog")]
+    /// struct Cli {
+    ///     #[arg(short, long)]
+    ///     count: u32,
+    /// }
+    ///
+    /// assert_eq(Cli::try_parse_from(["prog", "-c", "3"]).unwrap().count, 3);
+    ///
+    /// let err = Cli::try_parse_from(["prog", "-c", "three"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::InvalidValue);
+    /// let err = Cli::try_parse_from(["prog"]).unwrap_err();
+    /// assert_eq(err.kind(), ErrorKind::MissingRequiredArgument);
+    /// ```
     fn try_parse_from<I, T>(args: I) -> Result<Self, Error>
     where
         I: IntoIterator<Item = T>,
@@ -1407,27 +3049,180 @@ pub trait Parser: FromArgMatches + CommandFactory {
     }
 }
 
-/// A group of arguments (clap's Args): #[derive(Args)], used by
-/// #[command(flatten)] fields and by subcommand variants of one field.
+/// A group of arguments that can be added to a command (clap's `Args`).
+///
+/// `#[derive(Args)]` implements it on a struct. Such a struct is used by a
+/// `#[command(flatten)]` field, which adds its arguments to the
+/// command's, and as the one field of a subcommand variant.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Args, Parser};
+///
+/// #[derive(Args, Debug)]
+/// struct Net {
+///     #[arg(long, default_value = "127.0.0.1")]
+///     host: String,
+///     #[arg(long, default_value = "80")]
+///     port: u16,
+/// }
+///
+/// #[derive(Parser, Debug)]
+/// #[command(name = "serve")]
+/// struct Cli {
+///     #[command(flatten)]
+///     net: Net,
+///     #[arg(short, long)]
+///     verbose: bool,
+/// }
+///
+/// let cli = Cli::parse_from(["serve", "--port", "8080", "-v"]);
+/// assert_eq(cli.net.host, "127.0.0.1");
+/// assert_eq(cli.net.port, 8080);
+/// assert(cli.verbose);
+/// ```
 pub trait Args: FromArgMatches {
+    /// Adds the group's arguments to `cmd` and returns it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Args, Command};
+    ///
+    /// #[derive(Args)]
+    /// struct Opts {
+    ///     #[arg(short, long)]
+    ///     force: bool,
+    /// }
+    ///
+    /// let cmd = Opts::augment_args(Command::new("rm"));
+    /// assert(cmd.render_help().contains("-f, --force"));
+    /// ```
     fn augment_args(cmd: Command) -> Command;
 }
 
-/// Subcommands (clap's Subcommand): #[derive(Subcommand)] on an enum, a
-/// #[command(subcommand)] field's type.
+/// A set of subcommands (clap's `Subcommand`).
+///
+/// `#[derive(Subcommand)]` implements it on an enum with a subcommand per
+/// variant; a `#[command(subcommand)]` field of that type (or an `Option`
+/// of it) holds the one given.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Parser, Subcommand};
+///
+/// #[derive(Parser, Debug)]
+/// #[command(name = "git")]
+/// struct Cli {
+///     #[command(subcommand)]
+///     command: Commands,
+/// }
+///
+/// #[derive(Subcommand, Debug, PartialEq)]
+/// enum Commands {
+///     /// Adds files
+///     Add { files: Vec<String> },
+///     /// Shows the status
+///     Status,
+/// }
+///
+/// let cli = Cli::parse_from(["git", "add", "a.txt"]);
+/// assert_eq(cli.command, Commands::Add { files: Vec::from(["a.txt".to_string()]) });
+/// assert_eq(Cli::parse_from(["git", "status"]).command, Commands::Status);
+/// ```
 pub trait Subcommand: FromArgMatches {
+    /// Adds the subcommands to `cmd` and returns it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::{Command, Subcommand};
+    ///
+    /// #[derive(Subcommand)]
+    /// enum Op {
+    ///     /// Starts it
+    ///     Start,
+    ///     /// Stops it
+    ///     Stop,
+    /// }
+    ///
+    /// let cmd = Op::augment_subcommands(Command::new("svc"));
+    /// let help = cmd.render_help();
+    /// assert(help.contains("  start  Starts it\n"));
+    /// assert(help.contains("  stop   Stops it\n"));
+    /// ```
     fn augment_subcommands(cmd: Command) -> Command;
 }
 
-/// A value from a fixed set (clap's ValueEnum): #[derive(ValueEnum)] on an
-/// enum of unit variants, which also makes FromStr and Display; with
-/// #[arg(value_enum)] its values are an argument's possible ones.
+/// An enum whose values are given by name on the command line (clap's
+/// `ValueEnum`).
+///
+/// `#[derive(ValueEnum)]` implements it on an enum of unit variants, named
+/// in kebab-case (`SlowAndSafe` is `slow-and-safe`) or by
+/// `#[value(name = "...")]`. The derive also implements [`FromStr`] and
+/// [`Display`] with those names. With `#[arg(value_enum)]` on a field of
+/// the type, the names are the argument's possible values.
+///
+/// # Examples
+///
+/// ```
+/// use std::cli::{Parser, ValueEnum};
+///
+/// #[derive(ValueEnum, Clone, Debug, PartialEq)]
+/// enum Mode {
+///     Fast,
+///     SlowAndSafe,
+///     #[value(name = "x")]
+///     Other,
+/// }
+///
+/// #[derive(Parser)]
+/// #[command(name = "prog")]
+/// struct Cli {
+///     #[arg(long, value_enum, default_value = "fast")]
+///     mode: Mode,
+/// }
+///
+/// assert_eq(Cli::parse_from(["prog", "--mode", "slow-and-safe"]).mode, Mode::SlowAndSafe);
+/// assert_eq(Cli::parse_from(["prog"]).mode, Mode::Fast);
+/// assert(Cli::try_parse_from(["prog", "--mode", "medium"]).is_err());
+///
+/// assert_eq("x".parse::<Mode>(), Ok(Mode::Other));
+/// assert_eq(Mode::SlowAndSafe.to_string(), "slow-and-safe");
+/// ```
 pub trait ValueEnum {
-    /// The values, as written on the command line.
+    /// Returns the names of the values, as written on the command line.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cli::ValueEnum;
+    ///
+    /// #[derive(ValueEnum, Clone, Debug)]
+    /// enum Color {
+    ///     Auto,
+    ///     Always,
+    ///     Never,
+    /// }
+    ///
+    /// assert_eq(Color::value_names(), Vec::from(["auto", "always", "never"]));
+    /// ```
     fn value_names() -> Vec<&str>;
 }
 
-/// The program's name: the file name of its path (argv[0]; without .exe).
+/// Returns the program's name: the file name of the program's path (the
+/// first of [`std::env::args`]), without a `.exe` suffix. It is empty if
+/// there are no arguments.
+///
+/// # Examples
+///
+/// ```
+/// let name = std::cli::program_name();
+/// assert(!name.is_empty());
+/// assert(!name.contains('/'));
+/// ```
 pub fn program_name() -> String {
     let a0 = match crate::env::args().next() {
         Some(a) => a,

@@ -11,7 +11,59 @@ use crate::time::Duration;
 use crate::tls::{Identity, TlsAcceptor};
 use crate::url::Url;
 
-/// Listens for HTTP connections and answers each request with a handler.
+/// An HTTP server: listens for connections and answers each request with
+/// a handler.
+///
+/// [`Server::bind`] makes a server listening on an address; the methods
+/// that configure it ([`Server::read_timeout`], [`Server::tls`], ...)
+/// return a changed copy, and [`Server::serve`] accepts connections and
+/// answers their requests until [`Server::close`] is called. Clones of a
+/// server share its listener, so one clone can serve on a thread while
+/// another closes it.
+///
+/// The handler is a function `fn(&mut Request) -> Response` (a
+/// [`Router`](crate::http::Router)'s handle method passed as `|req|
+/// router.handle(req)`, for one). Each connection runs on a green thread of its
+/// own, which calls the handler for each request in turn (HTTP/1.1 keep-alive),
+/// or for each stream at once (HTTP/2). A panic in a handler ends the program
+/// (Go's server recovers it and only closes the connection).
+///
+/// A request body the handler did not read is read and dropped (up to 256
+/// KiB, as Go's server does) so that the connection can take the next
+/// request. A response without a `Content-Type` that has a body gets
+/// `text/plain; charset=utf-8`; one whose body has an unknown length is
+/// sent chunked.
+///
+/// # Examples
+///
+/// A server on a free port, answering on a thread of its own:
+///
+/// ```
+/// use std::http::{Client, Request, Response, Server, StatusCode};
+///
+/// let server = Server::bind("127.0.0.1:0").unwrap();
+/// let addr = server.local_addr();
+/// let srv = server.clone();
+/// let handle = std::thread::spawn(|| {
+///     srv.serve(|req: &mut Request| -> Response {
+///         if req.path() == "/" {
+///             Response::from_string("home")
+///         } else {
+///             Response::error(StatusCode::NOT_FOUND, "no such page")
+///         }
+///     })
+/// });
+///
+/// let client = Client::new();
+/// let resp = client.get(`http://${addr}/`.to_string()).send().unwrap();
+/// assert_eq(resp.text().unwrap(), "home");
+/// let resp = client.get(`http://${addr}/other`.to_string()).send().unwrap();
+/// assert_eq(resp.status(), StatusCode::NOT_FOUND);
+/// assert_eq(resp.text().unwrap(), "no such page\n");
+///
+/// server.close();
+/// handle.join().unwrap().unwrap();
+/// ```
 #[derive(Clone)]
 pub struct Server {
     listener: TcpListener,
@@ -25,37 +77,133 @@ pub struct Server {
     protocols: Protocols,
 }
 
-/// The protocols a server speaks (Go's http.Protocols): by default
-/// HTTP/1.1 and, over TLS, HTTP/2 (chosen by ALPN). HTTP/2 without TLS
-/// (unencrypted_http2) is spoken to clients that start with its preface
-/// (prior knowledge; RFC 9113 dropped Upgrade: h2c).
+/// The set of protocols a [`Server`] speaks (Go's `http.Protocols`).
+///
+/// There are three: HTTP/1.1 (and 1.0), HTTP/2 over TLS (chosen by ALPN
+/// in the TLS handshake), and HTTP/2 without TLS ("unencrypted", spoken to
+/// clients that start with the HTTP/2 preface: prior knowledge, as
+/// RFC 9113 dropped `Upgrade: h2c`). `Protocols::default()`, what a server
+/// speaks unless told otherwise, has the first two; `Protocols::new()`
+/// has none.
+///
+/// # Examples
+///
+/// ```
+/// use std::http::{Protocols, Server};
+///
+/// // HTTP/1.1, and HTTP/2 without TLS too.
+/// let mut p = Protocols::default();
+/// p.set_unencrypted_http2(true);
+/// assert(p.http1() && p.http2() && p.unencrypted_http2());
+///
+/// let server = Server::bind("127.0.0.1:0").unwrap().protocols(p);
+/// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct Protocols {
     bits: u8,
 }
 
 impl Protocols {
-    /// None: set those to speak.
+    /// Creates an empty set: a server with it speaks nothing until some
+    /// are set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Protocols;
+    ///
+    /// let mut p = Protocols::new();
+    /// assert(!p.http1());
+    /// p.set_http1(true);
+    /// assert(p.http1());
+    /// ```
     pub fn new() -> Protocols {
         Protocols { bits: 0 }
     }
 
+    /// Returns `true` if the set has HTTP/1.1.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Protocols;
+    ///
+    /// assert(Protocols::default().http1());
+    /// assert(!Protocols::new().http1());
+    /// ```
     pub fn http1(&self) -> bool {
         self.bits & 1 != 0
     }
+    /// Returns `true` if the set has HTTP/2 over TLS.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Protocols;
+    ///
+    /// assert(Protocols::default().http2());
+    /// ```
     pub fn http2(&self) -> bool {
         self.bits & 2 != 0
     }
+    /// Returns `true` if the set has HTTP/2 without TLS.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Protocols;
+    ///
+    /// assert(!Protocols::default().unencrypted_http2());
+    /// ```
     pub fn unencrypted_http2(&self) -> bool {
         self.bits & 4 != 0
     }
 
+    /// Adds HTTP/1.1 to the set (`true`) or removes it (`false`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Protocols;
+    ///
+    /// // HTTP/2 only (over TLS).
+    /// let mut p = Protocols::default();
+    /// p.set_http1(false);
+    /// assert(!p.http1() && p.http2());
+    /// ```
     pub fn set_http1(&mut self, on: bool) {
         self.set(1, on);
     }
+    /// Adds HTTP/2 over TLS to the set (`true`) or removes it (`false`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Protocols;
+    ///
+    /// let mut p = Protocols::default();
+    /// p.set_http2(false);
+    /// assert(!p.http2());
+    /// ```
     pub fn set_http2(&mut self, on: bool) {
         self.set(2, on);
     }
+    /// Adds HTTP/2 without TLS to the set (`true`) or removes it
+    /// (`false`).
+    ///
+    /// Clients reach it by prior knowledge (for a navi
+    /// [`Client`](crate::http::Client):
+    /// [`ClientBuilder::http2_prior_knowledge`](crate::http::ClientBuilder::http2_prior_knowledge)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Protocols;
+    ///
+    /// let mut p = Protocols::new();
+    /// p.set_unencrypted_http2(true);
+    /// assert(p.unencrypted_http2() && !p.http1());
+    /// ```
     pub fn set_unencrypted_http2(&mut self, on: bool) {
         self.set(4, on);
     }
@@ -92,13 +240,53 @@ impl crate::fmt::Debug for Protocols {
     }
 }
 
-/// Serves handler on addr (as Go's http.ListenAndServe).
+/// Listens on `addr` and answers every request with `handler` (as Go's
+/// `http.ListenAndServe`).
+///
+/// This is `Server::bind(addr)?.serve(handler)`: it does not return
+/// unless binding fails. Use a [`Server`] to configure timeouts, learn the
+/// port picked for port 0, or stop serving.
+///
+/// # Errors
+///
+/// Returns an error if the address cannot be bound (it is in use, or not
+/// a local address).
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::http::{self, Response, Router};
+///
+/// let mut router = Router::new();
+/// router.route("GET /", |_req| Response::from_string("hello"));
+/// http::serve("127.0.0.1:8080", |req| router.handle(req)).unwrap();
+/// ```
 pub fn serve<A: ToSocketAddrs>(addr: A, handler: fn(&mut Request) -> Response) -> io::Result<()> {
     Server::bind(addr)?.serve(handler)
 }
 
-/// Serves handler over https on addr with the certificate chain and key
-/// of two PEM files (as Go's http.ListenAndServeTLS).
+/// Listens on `addr` and answers every request over https with `handler`
+/// (as Go's `http.ListenAndServeTLS`).
+///
+/// `cert_file` is a PEM file with the server's certificate chain (its own
+/// certificate first), `key_file` one with its private key (PKCS#8,
+/// PKCS#1 or SEC 1). Clients that offer HTTP/2 get it.
+///
+/// # Errors
+///
+/// Returns an error if a file cannot be read or parsed, or if the address
+/// cannot be bound.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::http::{self, Response};
+///
+/// http::serve_tls("0.0.0.0:8443", "cert.pem", "key.pem", |_req| {
+///     Response::from_string("hello over TLS")
+/// })
+/// .unwrap();
+/// ```
 pub fn serve_tls<A: ToSocketAddrs>(
     addr: A,
     cert_file: &str,
@@ -115,6 +303,28 @@ pub fn serve_tls<A: ToSocketAddrs>(
 }
 
 impl Server {
+    /// Creates a server listening on `addr`.
+    ///
+    /// The server listens from now on, but answers nothing until
+    /// [`Server::serve`] is called. Binding port 0 picks a free port;
+    /// [`Server::local_addr`] tells which.
+    ///
+    /// The server has no read or write timeouts, a 120-second idle
+    /// timeout, a 1 MiB limit on a request's headers, and speaks
+    /// [`Protocols::default`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address cannot be resolved or bound.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Server;
+    ///
+    /// let server = Server::bind("127.0.0.1:0").unwrap();
+    /// assert_ne(server.local_addr().port(), 0);
+    /// ```
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Server> {
         let l = TcpListener::bind(addr)?;
         let a = l.local_addr()?;
@@ -131,58 +341,150 @@ impl Server {
         })
     }
 
-    /// The address it listens on (the port, after binding port 0).
+    /// Returns the address the server listens on.
+    ///
+    /// After binding port 0, this has the port that was picked.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Server;
+    ///
+    /// let server = Server::bind("127.0.0.1:0").unwrap();
+    /// let addr = server.local_addr();
+    /// assert_eq(addr.ip().to_string(), "127.0.0.1");
+    /// let base = `http://${addr}`.to_string();
+    /// ```
     pub fn local_addr(&self) -> SocketAddr {
         self.addr.clone()
     }
 
-    /// The time to read a request's head (none by default).
+    /// Returns a copy of the server with the timeout for reading a
+    /// request's head (`None`, the default: no timeout).
+    ///
+    /// It also bounds the TLS handshake of an https connection. Reading
+    /// the body is up to the handler.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::Server;
+    /// use std::time::Duration;
+    ///
+    /// let server = Server::bind("127.0.0.1:0")
+    ///     .unwrap()
+    ///     .read_timeout(Some(Duration::from_secs(10)))
+    ///     .write_timeout(Some(Duration::from_secs(10)));
+    /// ```
     pub fn read_timeout(&self, d: Option<Duration>) -> Server {
         let mut s = self.clone();
         s.read_timeout = d;
         s
     }
 
-    /// The time to write a response (none by default).
+    /// Returns a copy of the server with the timeout for each write of a
+    /// response (`None`, the default: no timeout).
     pub fn write_timeout(&self, d: Option<Duration>) -> Server {
         let mut s = self.clone();
         s.write_timeout = d;
         s
     }
 
-    /// How long a kept-alive connection waits for its next request (120s
-    /// by default; None: forever).
+    /// Returns a copy of the server with the time a kept-alive connection
+    /// waits for its next request before it is closed (120 seconds by
+    /// default; `None`: forever).
     pub fn idle_timeout(&self, d: Option<Duration>) -> Server {
         let mut s = self.clone();
         s.idle_timeout = d;
         s
     }
 
-    /// The protocols to speak (Protocols::default() by default).
+    /// Returns a copy of the server speaking the protocols
+    /// ([`Protocols::default`] by default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Protocols, Server};
+    ///
+    /// let mut p = Protocols::default();
+    /// p.set_unencrypted_http2(true);
+    /// let server = Server::bind("127.0.0.1:0").unwrap().protocols(p);
+    /// ```
     pub fn protocols(&self, p: Protocols) -> Server {
         let mut s = self.clone();
         s.protocols = p;
         s
     }
 
-    /// Serves https: each connection's TLS handshake with acceptor (on the
-    /// connection's thread, within read_timeout). An acceptor without ALPN
-    /// protocols offers h2 and http/1.1 (those the server speaks).
+    /// Returns a copy of the server that speaks https, with the TLS
+    /// handshake of each connection done by `acceptor`.
+    ///
+    /// The handshake runs on the connection's thread, within the
+    /// [`Server::read_timeout`]. An acceptor without ALPN protocols of its
+    /// own offers `h2` and `http/1.1` (those of the server's
+    /// [`Protocols`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::http::{Response, Server};
+    /// use std::tls::{Identity, TlsAcceptor};
+    ///
+    /// let cert = std::fs::read("cert.pem").unwrap();
+    /// let key = std::fs::read("key.pem").unwrap();
+    /// let identity = Identity::from_pkcs8(cert.as_slice(), key.as_slice()).unwrap();
+    /// let server = Server::bind("0.0.0.0:8443")
+    ///     .unwrap()
+    ///     .tls(TlsAcceptor::new(identity).unwrap());
+    /// server.serve(|_req| Response::from_string("hello over TLS")).unwrap();
+    /// ```
     pub fn tls(&self, acceptor: TlsAcceptor) -> Server {
         let mut s = self.clone();
         s.tls = Some(acceptor);
         s
     }
 
+    /// Returns a copy of the server with the most bytes a request's head
+    /// may have (its request line, or its headers; 1 MiB by default).
+    ///
+    /// A longer request line or longer headers are answered with
+    /// `431 Request Header Fields Too Large` and the connection is closed.
     pub fn max_header_bytes(&self, n: usize) -> Server {
         let mut s = self.clone();
         s.max_header_bytes = n;
         s
     }
 
-    /// Accepts connections until close(), answering each request with
-    /// handler (called on the connection's thread; a panic in it ends the
-    /// program).
+    /// Accepts connections and answers each of their requests with
+    /// `handler`, until [`Server::close`] is called.
+    ///
+    /// Each connection runs on a thread of its own, which calls `handler`
+    /// for its requests. This function blocks: to do something else while
+    /// serving, call it on another thread, as below. A panic in the handler
+    /// ends the program.
+    ///
+    /// # Errors
+    ///
+    /// None for now: it returns `Ok(())` once the server is closed (a
+    /// failed accept is tried again).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Client, Response, Server};
+    ///
+    /// let server = Server::bind("127.0.0.1:0").unwrap();
+    /// let addr = server.local_addr();
+    /// let srv = server.clone();
+    /// let handle = std::thread::spawn(|| srv.serve(|req| Response::from_string(req.uri())));
+    ///
+    /// let resp = Client::new().get(`http://${addr}/ping`.to_string()).send().unwrap();
+    /// assert_eq(resp.text().unwrap(), "/ping");
+    ///
+    /// server.close();
+    /// assert(handle.join().unwrap().is_ok());
+    /// ```
     pub fn serve(&self, handler: fn(&mut Request) -> Response) -> io::Result<()> {
         let mut me0 = self.clone();
         if let Some(a) = &self.tls {
@@ -213,8 +515,24 @@ impl Server {
         }
     }
 
-    /// Stops accepting connections (serve returns; open connections finish
-    /// their current request).
+    /// Stops the server: it accepts no more connections, and
+    /// [`Server::serve`] returns.
+    ///
+    /// Connections already open are not closed: each finishes the request
+    /// it is handling and the requests that follow on it, until it is idle
+    /// for the idle timeout or the client closes it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::http::{Response, Server};
+    ///
+    /// let server = Server::bind("127.0.0.1:0").unwrap();
+    /// let srv = server.clone();
+    /// let handle = std::thread::spawn(|| srv.serve(|_req| Response::from_string("hi")));
+    /// server.close();
+    /// handle.join().unwrap().unwrap();
+    /// ```
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.listener.close();
