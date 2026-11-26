@@ -144,8 +144,9 @@ pub struct Socket {
     /// Read and write timeouts in nanoseconds (0: none).
     pub rto: u64,
     pub wto: u64,
-    // 1 once closed (set by one close only).
-    closed: usize,
+    // Bit 0: closed; above it, how many operations hold the descriptor
+    // (twice the count; see incref).
+    state: usize,
 }
 
 /// A new non-blocking socket for addresses like a.
@@ -178,7 +179,7 @@ fn wrap(fd: i32) -> io::Result<&mut Socket> {
         pd,
         rto: 0,
         wto: 0,
-        closed: 0,
+        state: 0,
     })
 }
 
@@ -323,7 +324,7 @@ impl Socket {
         Ok(())
     }
 
-    pub fn bind(&self, a: &SocketAddr) -> io::Result<()> {
+    fn bind_held(&self, a: &SocketAddr) -> io::Result<()> {
         set_int(self.fd, SOL_SOCKET, SO_REUSEADDR, 1)?;
         let (b, n) = encode(a);
         if unsafe { bind(self.fd, &b as *const [u8; 28] as *const u8, n) } < 0 {
@@ -332,14 +333,14 @@ impl Socket {
         Ok(())
     }
 
-    pub fn listen(&self, backlog: i32) -> io::Result<()> {
+    fn listen_held(&self, backlog: i32) -> io::Result<()> {
         if unsafe { listen(self.fd, backlog) } < 0 {
             return Err(last_error());
         }
         Ok(())
     }
 
-    pub fn accept(&self) -> io::Result<(&mut Socket, SocketAddr)> {
+    fn accept_held(&self) -> io::Result<(&mut Socket, SocketAddr)> {
         let dl = deadline(self.rto);
         loop {
             let mut b = [0u8; 28];
@@ -365,7 +366,7 @@ impl Socket {
         }
     }
 
-    pub fn connect(&self, a: &SocketAddr, timeout: u64) -> io::Result<()> {
+    fn connect_held(&self, a: &SocketAddr, timeout: u64) -> io::Result<()> {
         let (b, n) = encode(a);
         if unsafe { connect(self.fd, &b as *const [u8; 28] as *const u8, n) } == 0 {
             return Ok(());
@@ -382,7 +383,7 @@ impl Socket {
         Ok(())
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read_held(&self, buf: &mut [u8]) -> io::Result<usize> {
         let dl = deadline(self.rto);
         loop {
             let n = unsafe { recv(self.fd, crate::rt::slice_ptr(buf) as *mut u8, buf.len(), 0) };
@@ -400,7 +401,7 @@ impl Socket {
         }
     }
 
-    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+    fn write_held(&self, buf: &[u8]) -> io::Result<usize> {
         let dl = deadline(self.wto);
         loop {
             let n = unsafe { send(self.fd, crate::rt::slice_ptr(buf), buf.len(), SEND_FLAGS) };
@@ -418,7 +419,7 @@ impl Socket {
         }
     }
 
-    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    fn recv_from_held(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let dl = deadline(self.rto);
         loop {
             let mut b = [0u8; 28];
@@ -447,7 +448,7 @@ impl Socket {
         }
     }
 
-    pub fn send_to(&self, buf: &[u8], a: &SocketAddr) -> io::Result<usize> {
+    fn send_to_held(&self, buf: &[u8], a: &SocketAddr) -> io::Result<usize> {
         let dl = deadline(self.wto);
         let (b, an) = encode(a);
         loop {
@@ -475,7 +476,7 @@ impl Socket {
         }
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    fn local_addr_held(&self) -> io::Result<SocketAddr> {
         let mut b = [0u8; 28];
         let mut n = 28u32;
         if unsafe {
@@ -491,7 +492,7 @@ impl Socket {
         Ok(decode(&b))
     }
 
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+    fn peer_addr_held(&self) -> io::Result<SocketAddr> {
         let mut b = [0u8; 28];
         let mut n = 28u32;
         if unsafe {
@@ -507,7 +508,7 @@ impl Socket {
         Ok(decode(&b))
     }
 
-    pub fn shutdown(&self, how: i32) -> io::Result<()> {
+    fn shutdown_held(&self, how: i32) -> io::Result<()> {
         if unsafe { shutdown(self.fd, how) } < 0 {
             return Err(last_error());
         }
@@ -515,7 +516,126 @@ impl Socket {
     }
 
     fn is_closed(&self) -> bool {
-        crate::rt::atomic_load(&self.closed as *const usize as *mut usize) != 0
+        crate::rt::atomic_load(self.state_ptr()) & 1 != 0
+    }
+
+    fn state_ptr(&self) -> *mut usize {
+        &self.state as *const usize as *mut usize
+    }
+
+    // Holds the descriptor for an operation, or fails once the socket is
+    // closed. The descriptor is closed when the last holder lets go (as Go's
+    // fdMutex): its number, once another socket reuses it, is never used
+    // through this one.
+    fn incref(&self) -> io::Result<()> {
+        let p = self.state_ptr();
+        loop {
+            let s = crate::rt::atomic_load(p);
+            if s & 1 != 0 {
+                return Err(closed());
+            }
+            if crate::rt::atomic_cas(p, s, s + 2) {
+                return Ok(());
+            }
+        }
+    }
+
+    fn decref(&self) {
+        let p = self.state_ptr();
+        loop {
+            let s = crate::rt::atomic_load(p);
+            if crate::rt::atomic_cas(p, s, s - 2) {
+                if s - 2 == 1 {
+                    unsafe {
+                        close(self.fd);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    pub fn bind(&self, a: &SocketAddr) -> io::Result<()> {
+        self.incref()?;
+        let r = self.bind_held(a);
+        self.decref();
+        r
+    }
+    pub fn listen(&self, backlog: i32) -> io::Result<()> {
+        self.incref()?;
+        let r = self.listen_held(backlog);
+        self.decref();
+        r
+    }
+    pub fn accept(&self) -> io::Result<(&mut Socket, SocketAddr)> {
+        self.incref()?;
+        let r = self.accept_held();
+        self.decref();
+        r
+    }
+    pub fn connect(&self, a: &SocketAddr, timeout: u64) -> io::Result<()> {
+        self.incref()?;
+        let r = self.connect_held(a, timeout);
+        self.decref();
+        r
+    }
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.incref()?;
+        let r = self.read_held(buf);
+        self.decref();
+        r
+    }
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.incref()?;
+        let r = self.write_held(buf);
+        self.decref();
+        r
+    }
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.incref()?;
+        let r = self.recv_from_held(buf);
+        self.decref();
+        r
+    }
+    pub fn send_to(&self, buf: &[u8], a: &SocketAddr) -> io::Result<usize> {
+        self.incref()?;
+        let r = self.send_to_held(buf, a);
+        self.decref();
+        r
+    }
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.incref()?;
+        let r = self.local_addr_held();
+        self.decref();
+        r
+    }
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.incref()?;
+        let r = self.peer_addr_held();
+        self.decref();
+        r
+    }
+    pub fn shutdown(&self, how: i32) -> io::Result<()> {
+        self.incref()?;
+        let r = self.shutdown_held(how);
+        self.decref();
+        r
+    }
+
+    /// Sets an int socket option.
+    pub fn set_opt(&self, level: i32, name: i32, v: i32) -> io::Result<()> {
+        self.incref()?;
+        let r = set_int(self.fd, level, name, v);
+        self.decref();
+        r
+    }
+
+    /// An int socket option.
+    pub fn get_opt(&self, level: i32, name: i32) -> io::Result<i32> {
+        self.incref()?;
+        let r = get_int(self.fd, level, name);
+        self.decref();
+        r
     }
 
     /// Sets the read and write timeouts (nanoseconds; 0: none). Sockets are
@@ -534,14 +654,19 @@ impl Socket {
 
     /// Closes the socket (waiters see it closed); again is a no-op.
     pub fn close(&self) {
-        let p = &self.closed as *const usize as *mut usize;
-        if !crate::rt::atomic_cas(p, 0, 1) {
-            return;
+        // (Closing holds the descriptor too: whoever lets go last closes it.)
+        let p = self.state_ptr();
+        loop {
+            let s = crate::rt::atomic_load(p);
+            if s & 1 != 0 {
+                return;
+            }
+            if crate::rt::atomic_cas(p, s, (s | 1) + 2) {
+                break;
+            }
         }
         netpoll::close(self.pd);
-        unsafe {
-            close(self.fd);
-        }
+        self.decref();
     }
 }
 
