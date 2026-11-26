@@ -1,35 +1,57 @@
 //! Lowering closures, template strings and select.
 
 use std::collections::HashMap;
-use crate::resolve::{self, Def};
-use crate::syntax::ast::{self, Expr, ExprKind, SelectArm, TemplatePart};
-use crate::syntax::source::Pos;
-use crate::types::{self, Type};
-use crate::mir::*;
-use crate::mir::build::*;
-use crate::mir::expr::*;
-use crate::mir::boxing::box_address_taken;
+
+use crate::{
+    mir::{boxing::box_address_taken, build::*, expr::*, *},
+    resolve::{self, Def},
+    syntax::{
+        ast::{self, Expr, ExprKind, SelectArm, TemplatePart},
+        source::Pos,
+    },
+    types::{self, Type},
+};
 
 impl Builder {
     /// Lowers a closure expression into its own Func and stores the closure
     /// value (code + environment of captured cell pointers) in dest.
     pub fn closure(&mut self, x: &Expr, dest: Place) {
-        let (params, body) = match &x.kind { ExprKind::Closure { params, body, .. } => (params.clone(), *body), _ => panic("not a closure") };
+        let (params, body) = match &x.kind {
+            ExprKind::Closure { params, body, .. } => (params.clone(), *body),
+            _ => panic("not a closure"),
+        };
         let ft = self.type_of(x);
-        let caps: Vec<&mut resolve::Local> = match self.closure_caps.get(&x.id) { Some(c) => c.clone(), None => Vec::new() };
+        let caps: Vec<&mut resolve::Local> = match self.closure_caps.get(&x.id) {
+            Some(c) => c.clone(),
+            None => Vec::new(),
+        };
         let mut cap_tys: Vec<&Type> = Vec::new();
         for l in caps.iter() {
             let lt = self.body.locals[&l.id];
             cap_tys.push(self.ctx().reference(true, lt));
         }
-        let name = `${self.fn_.name}::{closure#${self.p.closure_base + self.p.closures.len()}}`.to_string();
+        let name = `${self.fn_.name}::{closure#${self.p.closure_base + self.p.closures.len()}}`
+            .to_string();
         let f = new_func(name, None, self.fn_.owner, self.fn_.file);
         f.closure = true;
         f.captures = cap_tys.clone();
         self.p.closures.push(f);
-        let child = &mut Builder { p: self.p, info: self.info, body: self.body, fn_: f, cur: -1, locals: HashMap::new(), boxed: self.boxed,
-            captures: HashMap::new(), env_local: 0, loops: Vec::new(), closure_node: Some(x), closure_caps: self.closure_caps,
-            defer_closures: HashMap::new(), or_bound: None };
+        let child = &mut Builder {
+            p: self.p,
+            info: self.info,
+            body: self.body,
+            fn_: f,
+            cur: -1,
+            locals: HashMap::new(),
+            boxed: self.boxed,
+            captures: HashMap::new(),
+            env_local: 0,
+            loops: Vec::new(),
+            closure_node: Some(x),
+            closure_caps: self.closure_caps,
+            defer_closures: HashMap::new(),
+            or_bound: None,
+        };
         child.new_local(ft.ret.unwrap(), "");
         let tt = self.ctx().tuple(cap_tys);
         let et = self.ctx().ptr(false, tt);
@@ -55,10 +77,23 @@ impl Builder {
         child.expr_into(body, local_place(0));
         child.terminate(Term::Return);
         crate::mir::int128::lower(self.p, f);
-        if !self.p.escape { box_address_taken(self.info.ctx, f); }
+        if !self.p.escape {
+            box_address_taken(self.info.ctx, f);
+        }
         let mut ops = Vec::new();
-        for l in caps.iter() { ops.push(self.cell_pointer(*l)); }
-        self.assign(dest, Rvalue::Aggregate { kind: AGG_CLOSURE, ty: ft, variant: 0, ops, closure: Some(f) });
+        for l in caps.iter() {
+            ops.push(self.cell_pointer(*l));
+        }
+        self.assign(
+            dest,
+            Rvalue::Aggregate {
+                kind: AGG_CLOSURE,
+                ty: ft,
+                variant: 0,
+                ops,
+                closure: Some(f),
+            },
+        );
     }
 
     /// Lowers a template string: each hole becomes a closure that formats
@@ -69,7 +104,9 @@ impl Builder {
         let args_ty = self.ctx().adt(args_def, Vec::new());
         let piece_ty = self.field_elem_type(args_ty, 0);
         let spec_ty = self.p.std_type(&["fmt", "Spec"]);
-        let fmtr_ty = self.ctx().adt(self.info.lang_def("Formatter").unwrap(), Vec::new());
+        let fmtr_ty = self
+            .ctx()
+            .adt(self.info.lang_def("Formatter").unwrap(), Vec::new());
         let disp_fmt = self.info.trait_item("Display", "fmt").unwrap();
         let res_ty = self.info.fn_sig_of(disp_fmt).ret;
         let str_ty = self.ctx().str_;
@@ -97,7 +134,10 @@ impl Builder {
             let rvt = self.ctx().reference(true, vt);
             let cell = self.new_local(rvt, "");
             self.fn_.locals[cell].boxed = true;
-            self.emit(Stmt::Box { local: cell, ty: vt });
+            self.emit(Stmt::Box {
+                local: cell,
+                ty: vt,
+            });
             self.expr_into(px, local_place(cell).deref());
             let sp = parse_spec(part.spec.as_str());
             let rf = self.ctx().reference(true, fmtr_ty);
@@ -108,7 +148,16 @@ impl Builder {
             let cv = self.temp(fn_ty);
             let mut cops = Vec::new();
             cops.push(copy(local_place(cell)));
-            self.assign(cv.clone(), Rvalue::Aggregate { kind: AGG_CLOSURE, ty: fn_ty, variant: 0, ops: cops, closure: Some(f) });
+            self.assign(
+                cv.clone(),
+                Rvalue::Aggregate {
+                    kind: AGG_CLOSURE,
+                    ty: fn_ty,
+                    variant: 0,
+                    ops: cops,
+                    closure: Some(f),
+                },
+            );
             let mut spec_ops = Vec::new();
             spec_ops.push(int_const(C_CHAR, sp.fill as i64, char_));
             spec_ops.push(int_const(C_INT, sp.align, u8_));
@@ -133,13 +182,29 @@ impl Builder {
         let rat = self.ctx().reference(true, arr_ty);
         let arr = self.new_local(rat, "");
         self.fn_.locals[arr].boxed = true;
-        self.emit(Stmt::Box { local: arr, ty: arr_ty });
-        self.assign(local_place(arr).deref(), aggregate(AGG_ARRAY, arr_ty, 0, pieces));
+        self.emit(Stmt::Box {
+            local: arr,
+            ty: arr_ty,
+        });
+        self.assign(
+            local_place(arr).deref(),
+            aggregate(AGG_ARRAY, arr_ty, 0, pieces),
+        );
         let st = self.ctx().slice(piece_ty);
         let slice_ty = self.ctx().reference(false, st);
         let sl = self.temp(slice_ty);
-        self.assign(sl.clone(), Rvalue::Unsize { x: copy(local_place(arr)), len: n, to: slice_ty });
-        let want_args = match self.body.templates.get(&x.id) { Some(w) => w.kind == types::K_ADT && w.d().id == args_def.id, None => false };
+        self.assign(
+            sl.clone(),
+            Rvalue::Unsize {
+                x: copy(local_place(arr)),
+                len: n,
+                to: slice_ty,
+            },
+        );
+        let want_args = match self.body.templates.get(&x.id) {
+            Some(w) => w.kind == types::K_ADT && w.d().id == args_def.id,
+            None => false,
+        };
         let mut aops = Vec::new();
         aops.push(copy(sl));
         if want_args {
@@ -175,7 +240,12 @@ impl Builder {
         let u8_ = self.ctx().int(types::U8);
         let s = self.temp(string_ty);
         let new_fn = self.p.inherent_fn(string_def, "new");
-        self.call(self.fn_const(new_fn, Vec::new()), Vec::new(), s.clone(), pos);
+        self.call(
+            self.fn_const(new_fn, Vec::new()),
+            Vec::new(),
+            s.clone(),
+            pos,
+        );
         let push_str = self.p.inherent_fn(string_def, "push_str");
         let ref_s_ty = self.ctx().reference(true, string_ty);
         let fmtr_new = self.p.inherent_fn(fmtr_def, "new");
@@ -184,11 +254,19 @@ impl Builder {
             let px = match part.x {
                 None => {
                     let text = decode_escapes(part.text.as_str());
-                    if text.len() == 0 { continue; }
+                    if text.len() == 0 {
+                        continue;
+                    }
                     let c = cnst(C_STR, Some(ref_str));
                     c.bytes = text;
                     let r = self.temp(ref_s_ty);
-                    self.assign(r.clone(), Rvalue::Ref { is_mut: true, place: s.clone() });
+                    self.assign(
+                        r.clone(),
+                        Rvalue::Ref {
+                            is_mut: true,
+                            place: s.clone(),
+                        },
+                    );
                     let u = self.temp(unit);
                     let mut args = Vec::new();
                     args.push(copy(r));
@@ -215,12 +293,31 @@ impl Builder {
             let spec = self.temp(spec_ty);
             self.assign(spec.clone(), aggregate(AGG_ADT, spec_ty, 0, spec_ops));
             let rs = self.temp(ref_s_ty);
-            self.assign(rs.clone(), Rvalue::Ref { is_mut: true, place: s.clone() });
+            self.assign(
+                rs.clone(),
+                Rvalue::Ref {
+                    is_mut: true,
+                    place: s.clone(),
+                },
+            );
             let wd = self.temp(dyn_ref);
-            self.assign(wd.clone(), Rvalue::MakeDyn { x: copy(rs), concrete: string_ty, to: dyn_ref });
+            self.assign(
+                wd.clone(),
+                Rvalue::MakeDyn {
+                    x: copy(rs),
+                    concrete: string_ty,
+                    to: dyn_ref,
+                },
+            );
             let rspec_ty = self.ctx().reference(false, spec_ty);
             let rspec = self.temp(rspec_ty);
-            self.assign(rspec.clone(), Rvalue::Ref { is_mut: false, place: spec });
+            self.assign(
+                rspec.clone(),
+                Rvalue::Ref {
+                    is_mut: false,
+                    place: spec,
+                },
+            );
             let f = self.temp(fmtr_ty);
             let mut nargs = Vec::new();
             nargs.push(copy(wd));
@@ -228,10 +325,22 @@ impl Builder {
             self.call(self.fn_const(fmtr_new, Vec::new()), nargs, f.clone(), pos);
             let rv_ty = self.ctx().reference(false, vt);
             let rv = self.temp(rv_ty);
-            self.assign(rv.clone(), Rvalue::Ref { is_mut: false, place: v });
+            self.assign(
+                rv.clone(),
+                Rvalue::Ref {
+                    is_mut: false,
+                    place: v,
+                },
+            );
             let rf_ty = self.ctx().reference(true, fmtr_ty);
             let rf = self.temp(rf_ty);
-            self.assign(rf.clone(), Rvalue::Ref { is_mut: true, place: f });
+            self.assign(
+                rf.clone(),
+                Rvalue::Ref {
+                    is_mut: true,
+                    place: f,
+                },
+            );
             let m = self.info.trait_item(sp.trait_name.as_str(), "fmt").unwrap();
             let res = self.temp(res_ty);
             let mut fargs = Vec::new();
@@ -243,9 +352,20 @@ impl Builder {
     }
 
     /// Builds |f| <T as Trait>::fmt(&*cell, f) for a template hole.
-    fn fmt_closure(&mut self, vt: &Type, trait_name: &str, res_ty: &Type, fmtr_ty: &Type) -> &mut Func {
+    fn fmt_closure(
+        &mut self,
+        vt: &Type,
+        trait_name: &str,
+        res_ty: &Type,
+        fmtr_ty: &Type,
+    ) -> &mut Func {
         let cap_ty = self.ctx().reference(true, vt);
-        let f = new_func(`${self.fn_.name}::{fmt}`.to_string(), None, self.fn_.owner, self.fn_.file);
+        let f = new_func(
+            `${self.fn_.name}::{fmt}`.to_string(),
+            None,
+            self.fn_.owner,
+            self.fn_.file,
+        );
         f.closure = true;
         f.captures.push(cap_ty);
         let mut tl = Vec::new();
@@ -254,20 +374,51 @@ impl Builder {
         let env_ty = self.ctx().ptr(false, tt);
         let f_ty = self.ctx().reference(true, fmtr_ty);
         let v_ty = self.ctx().reference(false, vt);
-        f.locals.push(&mut Local { ty: res_ty, name: String::new(), boxed: false });
-        f.locals.push(&mut Local { ty: env_ty, name: "env".to_string(), boxed: false });
-        f.locals.push(&mut Local { ty: f_ty, name: "f".to_string(), boxed: false });
+        f.locals.push(&mut Local {
+            ty: res_ty,
+            name: String::new(),
+            boxed: false,
+        });
+        f.locals.push(&mut Local {
+            ty: env_ty,
+            name: "env".to_string(),
+            boxed: false,
+        });
+        f.locals.push(&mut Local {
+            ty: f_ty,
+            name: "f".to_string(),
+            boxed: false,
+        });
         f.nargs = 2;
         let m = self.info.trait_item(trait_name, "fmt").unwrap();
-        f.locals.push(&mut Local { ty: v_ty, name: String::new(), boxed: false });
+        f.locals.push(&mut Local {
+            ty: v_ty,
+            name: String::new(),
+            boxed: false,
+        });
         let mut stmts = Vec::new();
-        stmts.push(Stmt::Assign { place: local_place(3), rv: Rvalue::Ref { is_mut: false, place: local_place(1).deref().field(0).deref() } });
+        stmts.push(Stmt::Assign {
+            place: local_place(3),
+            rv: Rvalue::Ref {
+                is_mut: false,
+                place: local_place(1).deref().field(0).deref(),
+            },
+        });
         let mut args = Vec::new();
         args.push(copy(local_place(3)));
         args.push(copy(local_place(2)));
-        let call = Term::Call { fn_op: fn_op(fn_ref(m, Vec::new(), Some(vt)), None), args, dest: local_place(0), target: 1, pos: 0 };
+        let call = Term::Call {
+            fn_op: fn_op(fn_ref(m, Vec::new(), Some(vt)), None),
+            args,
+            dest: local_place(0),
+            target: 1,
+            pos: 0,
+        };
         f.blocks.push(&mut Block { stmts, term: call });
-        f.blocks.push(&mut Block { stmts: Vec::new(), term: Term::Return });
+        f.blocks.push(&mut Block {
+            stmts: Vec::new(),
+            term: Term::Return,
+        });
         self.p.closures.push(f);
         f
     }
@@ -276,8 +427,12 @@ impl Builder {
     /// (Arguments.pieces: &[Piece] -> Piece).
     fn field_elem_type(&self, t: &Type, i: usize) -> &Type {
         let mut ft = self.info.adts[&t.d().id].fields[i].ty;
-        while ft.kind == types::K_REF { ft = ft.el(); }
-        if ft.kind == types::K_SLICE { return ft.el(); }
+        while ft.kind == types::K_REF {
+            ft = ft.el();
+        }
+        if ft.kind == types::K_SLICE {
+            return ft.el();
+        }
         ft
     }
 
@@ -330,30 +485,85 @@ impl Builder {
                 continue;
             }
             let mc = arm.op.unwrap();
-            let (mname, margs) = match &mc.kind { ExprKind::MethodCall { name, args, .. } => (name.value.clone(), args.clone()), _ => panic("select arm") };
+            let (mname, margs) = match &mc.kind {
+                ExprKind::MethodCall { name, args, .. } => (name.value.clone(), args.clone()),
+                _ => panic("select arm"),
+            };
             let res_ty = self.type_of(mc);
             let args = self.method_args(mc);
             let rrt = self.ctx().reference(true, res_ty);
             let slot = self.new_local(rrt, "");
             self.fn_.locals[slot].boxed = true;
-            self.emit(Stmt::Box { local: slot, ty: res_ty });
+            self.emit(Stmt::Box {
+                local: slot,
+                ty: res_ty,
+            });
             let mut chan_ptr = self.temp(ptr_u8);
-            self.assign(chan_ptr.clone(), Rvalue::Cast { kind: CAST_PTR, x: args[0].clone(), from: ref_err, to: ptr_u8 });
+            self.assign(
+                chan_ptr.clone(),
+                Rvalue::Cast {
+                    kind: CAST_PTR,
+                    x: args[0].clone(),
+                    from: ref_err,
+                    to: ptr_u8,
+                },
+            );
             if let Some(g) = guard {
                 // The pointer times the guard (1 or 0).
                 let on = self.temp(usize_);
-                self.assign(on.clone(), Rvalue::Cast { kind: CAST_NUMERIC, x: g, from: bool_, to: usize_ });
+                self.assign(
+                    on.clone(),
+                    Rvalue::Cast {
+                        kind: CAST_NUMERIC,
+                        x: g,
+                        from: bool_,
+                        to: usize_,
+                    },
+                );
                 let pi = self.temp(usize_);
-                self.assign(pi.clone(), Rvalue::Cast { kind: CAST_PTR_INT, x: copy(chan_ptr), from: ptr_u8, to: usize_ });
+                self.assign(
+                    pi.clone(),
+                    Rvalue::Cast {
+                        kind: CAST_PTR_INT,
+                        x: copy(chan_ptr),
+                        from: ptr_u8,
+                        to: usize_,
+                    },
+                );
                 let m = self.temp(usize_);
-                self.assign(m.clone(), Rvalue::Bin { op: MUL, x: copy(pi), y: copy(on), ty: usize_, pos: 0 });
+                self.assign(
+                    m.clone(),
+                    Rvalue::Bin {
+                        op: MUL,
+                        x: copy(pi),
+                        y: copy(on),
+                        ty: usize_,
+                        pos: 0,
+                    },
+                );
                 chan_ptr = self.temp(ptr_u8);
-                self.assign(chan_ptr.clone(), Rvalue::Cast { kind: CAST_INT_PTR, x: copy(m), from: usize_, to: ptr_u8 });
+                self.assign(
+                    chan_ptr.clone(),
+                    Rvalue::Cast {
+                        kind: CAST_INT_PTR,
+                        x: copy(m),
+                        from: usize_,
+                        to: ptr_u8,
+                    },
+                );
             }
             let mut c: Place = local_place(0);
             if mname == "recv" {
                 let slot_ptr = self.temp(mptr_u8);
-                self.assign(slot_ptr.clone(), Rvalue::Cast { kind: CAST_PTR, x: copy(local_place(slot)), from: rrt, to: mptr_u8 });
+                self.assign(
+                    slot_ptr.clone(),
+                    Rvalue::Cast {
+                        kind: CAST_PTR,
+                        x: copy(local_place(slot)),
+                        from: rrt,
+                        to: mptr_u8,
+                    },
+                );
                 c = self.temp(case_ty);
                 let mut ops = Vec::new();
                 ops.push(int_const(C_BOOL, 0, bool_));
@@ -366,10 +576,21 @@ impl Builder {
                 let rvt = self.ctx().reference(true, val_ty);
                 let val = self.new_local(rvt, "");
                 self.fn_.locals[val].boxed = true;
-                self.emit(Stmt::Box { local: val, ty: val_ty });
+                self.emit(Stmt::Box {
+                    local: val,
+                    ty: val_ty,
+                });
                 self.assign(local_place(val).deref(), Rvalue::Use(args[1].clone()));
                 let val_ptr = self.temp(mptr_u8);
-                self.assign(val_ptr.clone(), Rvalue::Cast { kind: CAST_PTR, x: copy(local_place(val)), from: rvt, to: mptr_u8 });
+                self.assign(
+                    val_ptr.clone(),
+                    Rvalue::Cast {
+                        kind: CAST_PTR,
+                        x: copy(local_place(val)),
+                        from: rvt,
+                        to: mptr_u8,
+                    },
+                );
                 c = self.temp(case_ty);
                 let mut ops = Vec::new();
                 ops.push(int_const(C_BOOL, 1, bool_));
@@ -379,7 +600,11 @@ impl Builder {
                 self.assign(c.clone(), aggregate(AGG_ADT, case_ty, 0, ops));
             }
             cases.push(copy(c));
-            slots.push(if arm.pat.is_some() { Some(local_place(slot).deref()) } else { None });
+            slots.push(if arm.pat.is_some() {
+                Some(local_place(slot).deref())
+            } else {
+                None
+            });
         }
         let n = cases.len() as i64;
         let arr_ty = self.ctx().array(case_ty, n);
@@ -387,11 +612,24 @@ impl Builder {
         self.assign(arr.clone(), aggregate(AGG_ARRAY, arr_ty, 0, cases));
         let rat = self.ctx().reference(false, arr_ty);
         let r = self.temp(rat);
-        self.assign(r.clone(), Rvalue::Ref { is_mut: false, place: arr });
+        self.assign(
+            r.clone(),
+            Rvalue::Ref {
+                is_mut: false,
+                place: arr,
+            },
+        );
         let cst = self.ctx().slice(case_ty);
         let slice_ty = self.ctx().reference(false, cst);
         let sl = self.temp(slice_ty);
-        self.assign(sl.clone(), Rvalue::Unsize { x: copy(r), len: n, to: slice_ty });
+        self.assign(
+            sl.clone(),
+            Rvalue::Unsize {
+                x: copy(r),
+                len: n,
+                to: slice_ty,
+            },
+        );
         let idx = self.temp(usize_);
         let mut cargs = Vec::new();
         cargs.push(copy(sl));
@@ -416,7 +654,13 @@ impl Builder {
             }
             i += 1;
         }
-        self.terminate(Term::Switch { x: copy(idx), ty: usize_, vals, targets, els: else_blk });
+        self.terminate(Term::Switch {
+            x: copy(idx),
+            ty: usize_,
+            vals,
+            targets,
+            els: else_blk,
+        });
         if !has_default {
             self.cur = else_blk as i64;
             self.terminate(Term::Unreachable);
@@ -424,9 +668,13 @@ impl Builder {
         i = 0;
         while i < arms.len() {
             self.cur = arm_blocks[i] as i64;
-            if let Some(slot) = slots[i].clone() { self.bind_pattern(arms[i].pat.unwrap(), slot); }
+            if let Some(slot) = slots[i].clone() {
+                self.bind_pattern(arms[i].pat.unwrap(), slot);
+            }
             self.expr_into(arms[i].body, dest.clone());
-            if self.cur >= 0 { self.terminate(Term::Goto(join)); }
+            if self.cur >= 0 {
+                self.terminate(Term::Goto(join));
+            }
             i += 1;
         }
         self.cur = join as i64;
@@ -449,15 +697,31 @@ pub struct Spec {
 }
 
 fn align_of(c: char) -> i64 {
-    if c == '<' { return 1; }
-    if c == '>' { return 2; }
-    if c == '^' { return 3; }
+    if c == '<' {
+        return 1;
+    }
+    if c == '>' {
+        return 2;
+    }
+    if c == '^' {
+        return 3;
+    }
     0
 }
 
 pub fn parse_spec(spec: &str) -> Spec {
-    let mut sp = Spec { fill: ' ', align: 0, sign_plus: false, alternate: false, zero: false, width: 0, has_width: false, prec: 0,
-        has_prec: false, trait_name: "Display".to_string() };
+    let mut sp = Spec {
+        fill: ' ',
+        align: 0,
+        sign_plus: false,
+        alternate: false,
+        zero: false,
+        width: 0,
+        has_width: false,
+        prec: 0,
+        has_prec: false,
+        trait_name: "Display".to_string(),
+    };
     let r: Vec<char> = spec.chars().collect();
     let mut s: String = spec.to_string();
     if r.len() >= 2 && align_of(r[1]) != 0 && (r[1] as u32) < 128 {
@@ -465,7 +729,10 @@ pub fn parse_spec(spec: &str) -> Spec {
         sp.align = align_of(r[1]);
         let mut rest = String::new();
         let mut i = 2;
-        while i < r.len() { rest.push(r[i]); i += 1; }
+        while i < r.len() {
+            rest.push(r[i]);
+            i += 1;
+        }
         s = rest;
     } else if r.len() >= 1 && align_of(r[0]) != 0 {
         sp.align = align_of(r[0]);
@@ -496,12 +763,26 @@ pub fn parse_spec(spec: &str) -> Spec {
             s = s[1..].to_string();
         }
     }
-    if s == "?" { sp.trait_name = "Debug".to_string(); }
-    if s == "x" { sp.trait_name = "LowerHex".to_string(); }
-    if s == "X" { sp.trait_name = "UpperHex".to_string(); }
-    if s == "o" { sp.trait_name = "Octal".to_string(); }
-    if s == "b" { sp.trait_name = "Binary".to_string(); }
-    if s == "e" { sp.trait_name = "LowerExp".to_string(); }
-    if s == "E" { sp.trait_name = "UpperExp".to_string(); }
+    if s == "?" {
+        sp.trait_name = "Debug".to_string();
+    }
+    if s == "x" {
+        sp.trait_name = "LowerHex".to_string();
+    }
+    if s == "X" {
+        sp.trait_name = "UpperHex".to_string();
+    }
+    if s == "o" {
+        sp.trait_name = "Octal".to_string();
+    }
+    if s == "b" {
+        sp.trait_name = "Binary".to_string();
+    }
+    if s == "e" {
+        sp.trait_name = "LowerExp".to_string();
+    }
+    if s == "E" {
+        sp.trait_name = "UpperExp".to_string();
+    }
     sp
 }

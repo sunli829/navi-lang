@@ -129,8 +129,10 @@ if [ "$("$navi" bench tests/harness 2>&1 | grep -c ' ns/iter ')" = 2 ]; then
 else
 	echo "FAIL navi bench tests/harness"; fail=1
 fi
-# std stays formatted (navi fmt).
-if "$navi" fmt --check lib/std > "$tmp/stdfmt.out" 2>&1; then echo "ok   navi fmt --check lib/std"; else echo "FAIL navi fmt --check lib/std"; head -20 "$tmp/stdfmt.out"; fail=1; fi
+# std and the compiler stay formatted (navi fmt, as nightly rustfmt).
+for d in lib/std compiler; do
+	if "$navi" fmt --check $d > "$tmp/stdfmt.out" 2>&1; then echo "ok   navi fmt --check $d"; else echo "FAIL navi fmt --check $d"; head -20 "$tmp/stdfmt.out"; fail=1; fi
+done
 # navi fmt on a module's file finds its modules where the compiler does
 # (src/a.navi's mod b: src/a/b.navi), and on a directory that is no
 # crate's, formats every file in it.
