@@ -15,7 +15,8 @@ HTML documentation of a crate, its dependencies and std, as rustdoc's
 - std's pages are made every time (with a crate: about 1200 pages in
   0.6s on an M4; caching them is left for when it matters).
 - Warnings, as rustdoc's: intra-doc links that name nothing (in the
-  documented crates, not std).
+  crate documented, not its dependencies; `navi doc` in lib/std warns
+  about std's).
 
 ## What is documented
 
@@ -73,7 +74,9 @@ CommonMark's blocks and inlines that documentation uses, as rustdoc's
   hard breaks;
 - intra-doc links: `` [`Name`] ``, `[Name]`, `[text](path::Name)` resolve as
   a path written in the item's module would (std::vec::Vec, Self::new,
-  crate::a::B);
+  crate::a::B); a primitive type or its method (`u8`, `str::len`) when no
+  item has the name, or with `prim@`; `path#fragment` links to a part of
+  the page the path names (`[examples](crate#examples)`);
 - raw HTML is shown as text (escaped).
 
 ## Doctests
@@ -95,7 +98,10 @@ a library crate (its `src/lib.navi` tree), as rustdoc's:
   (rustdoc's `src/lib.rs - Thing::new (line 12)`; the harness prints test
   functions' paths); `navi test . name` filters them with the others;
   `navi test --doc` runs only them. The program is written to
-  `target/doctest/<crate>/src/main.navi` (an error points into it).
+  `target/doctest/<crate>/src/main.navi`, each test's lines as written
+  (not indented: a multi-line string keeps its text) after a line
+  directive (`//line src/lib.navi:12:9`, as Go's): an error or a panic in a
+  test points at the documented file.
 - Only a library's (as rustdoc's: a program's items cannot be named from
   another crate).
 

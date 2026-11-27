@@ -391,10 +391,15 @@ grep -q 'href="../std/vec/struct.Vec.html"' "$dd/target/doc/geo/type.Points.html
 grep -q 'impl.*Area.*for.*Shape' "$dd/target/doc/geo/trait.Area.html" || d_fail "implementors"
 grep -q '/\* private fields \*/' "$dd/target/doc/geo/struct.Point.html" || d_fail "private fields"
 grep -q '"dist","method","geo::Point"' "$dd/target/doc/search-index.js" || d_fail "search index"
+grep -q 'href="../../std/primitive.f64.html"' "$dd/target/doc/geo/util/fn.helper.html" || d_fail "link to a primitive"
+grep -q 'href="../../std/primitive.str.html#method.len"' "$dd/target/doc/geo/util/fn.helper.html" || d_fail "link to a primitive's method"
+grep -q 'href="../../geo/index.html#examples"' "$dd/target/doc/geo/util/fn.helper.html" || d_fail "path#fragment link"
+grep -q 'Its own docs' "$dd/target/doc/geo/util/inner/index.html" && ! grep -q 'Helpers' "$dd/target/doc/geo/util/inner/index.html" || d_fail "an inline module's docs"
+[ -f "$dd/target/doc/std/cli/derive/derive.Parser.html" ] || d_fail "a derive macro's page"
 set +e
 r=$(cd "$dd" && "$navi" test 2>&1); c=$?
 set -e
 [ "$c" = 0 ] || d_fail "doctests: exit $c: $r"
-case "$r" in *"Doc-tests geo"*"4 passed, 0 failed"*"Point::new (line 38) - compile fail"*) ;; *) d_fail "doctests: $r" ;; esac
+case "$r" in *"Doc-tests geo"*"4 passed, 0 failed"*"Point::new (line 41) - compile fail"*) ;; *) d_fail "doctests: $r" ;; esac
 [ "$d_ok" = 1 ] && echo "ok   navi doc"
 exit $fail

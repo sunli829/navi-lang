@@ -13,6 +13,7 @@
 
 - **源文件**：UTF-8，扩展名 `.navi`
 - **注释**：`//`、`/* */`（可嵌套）；文档注释 `///`（写在条目前面）、`//!`（写在 crate 或模块开头）
+  - 行号指令（同 Go）：行首的 `//line 路径:行:列` 表示下一行是该文件的第几行、从第几列开始（`//line 路径:行` 不改列号）；之后的报错、panic 和 `#[track_caller]` 的位置都按它换算。供生成代码用（如 doctest）
 - **标识符**：`[A-Za-z_][A-Za-z0-9_]*`，暂不支持 Unicode 标识符；原始标识符 `r#match`
 - **关键字**：
   `as break const continue crate defer dyn else enum extern false fn for if impl in let loop match mod mut pub return select self Self static struct super trait true type unsafe use where while`
