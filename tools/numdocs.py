@@ -807,9 +807,7 @@ def int_doc(c, name):
                     "The string is expected to be an optional `+` sign followed by only digits.") +
                    " Leading and trailing non-digit characters (including whitespace) represent an error. "
                    "Underscores (which can appear in literals) also represent an error.",
-                   "Digits are a subset of these characters, depending on `radix`: `0-9`, `a-z`, `A-Z`.",
-                   "`radix` must be in the range from 2 to 36; unlike Rust, which panics otherwise, navi does not "
-                   "check it."]
+                   "Digits are a subset of these characters, depending on `radix`: `0-9`, `a-z`, `A-Z`."]
         ex = [f'assert_eq({T}::from_str_radix("A", 16), Ok(10));']
         if s:
             ex.append(f'assert_eq({T}::from_str_radix("-1111", 2), Ok(-15));')
@@ -818,7 +816,8 @@ def int_doc(c, name):
         ex.append(f'assert({T}::from_str_radix("12 ", 10).is_err());')
         big = c.max + 1
         ex.append(f'assert({T}::from_str_radix("{big}", 10).is_err());')
-        return doc("Parses an integer from a string slice with digits in the given base.", details, ex=ex)
+        return doc("Parses an integer from a string slice with digits in the given base.", details,
+                   panics="This function panics if `radix` is not in the range from 2 to 36.", ex=ex)
 
     # u64's bignum helpers.
     if name == "widening_mul":
@@ -1087,10 +1086,7 @@ def float_doc(c, name):
                        f"assert((-{F}::EPSILON).rem_euclid(3.0) != 0.0);"])
     if name == "powi":
         return doc("Raises a number to an integer power.",
-                   "navi computes it by multiplying `self` `n.abs()` times (and taking the reciprocal for a "
-                   "negative `n`), so a large `n` takes long and the result can differ from Rust's in the last "
-                   "bits." + (" The product is computed in `f64` and rounded to `f32`." if not f64 else ""),
-                   panics="This function panics if `n` is `i32::MIN` (Rust does not).",
+                   "It is computed by repeated squaring, as Rust's (so the result is the same to the last bit).",
                    ex=[f"let x = {L('2.0')};", "let abs_difference = (x.powi(2) - (x * x)).abs();", "",
                        f"assert(abs_difference <= {F}::EPSILON);", "assert_eq(x.powi(-2), 0.25);",
                        f"assert_eq({F}::NAN.powi(0), 1.0);"])
