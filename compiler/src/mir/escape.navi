@@ -254,6 +254,16 @@ fn builtin_pairs(trait_name: &str, s: &mut Summary, nargs: usize) {
     }
 }
 
+// Whether the shims of a lang trait call the method on the parts of the
+// self type (a reference's referent, a tuple's or an array's elements).
+fn forwards(trait_name: &str) -> bool {
+    match trait_name {
+        "Clone" | "PartialEq" | "PartialOrd" | "Ord" | "Hash" | "Default" | "Debug" | "Display"
+        | "LowerHex" | "UpperHex" | "Octal" | "Binary" | "LowerExp" | "UpperExp" => true,
+        _ => false,
+    }
+}
+
 /// The head of a self type that selects impls (-1: any impl may apply).
 /// Impls do not overlap, so a call whose self type has a concrete head can
 /// only reach impls with that head or blanket impls.
@@ -272,17 +282,6 @@ fn head(t: &Type) -> i64 {
         return -1;
     }
     k as i64
-}
-
-// Whether a head (see head) is a scalar's (bool, char, str, an int, a float,
-// !).
-fn scalar_head(h: i64) -> bool {
-    h == types::K_BOOL as i64
-        || h == types::K_CHAR as i64
-        || h == types::K_STR as i64
-        || h == types::K_INT as i64
-        || h == types::K_FLOAT as i64
-        || h == types::K_NEVER as i64
 }
 
 struct Escape {
@@ -406,39 +405,28 @@ impl Escape {
                 builtin_pairs(ln.as_str(), &mut s, nargs);
             }
             let key = `${p.id}.${d.name}`.to_string();
-            let h = match r.self_ty {
-                Some(t) => head(t),
-                None => -1,
+            // The impls the call may reach: those for the self type's head
+            // (and blanket ones); for a builtin impl (a shim, made later by
+            // the code generator), those of the parts it calls the method of
+            // (<&T as Display>::fmt calls T's); any, for a type parameter.
+            let fwd = match self.lang_of.get(&p.id) {
+                Some(n) => forwards(n.as_str()),
+                None => false,
             };
-            // A compound self type (a reference, a tuple, an array, ...)
-            // that no impl here has the head of is served by a builtin impl:
-            // a shim, made later by the code generator, which calls the
-            // impls of its parts (<&T as Display>::fmt calls T's), any of
-            // them. (Scalars' shims call std::fmt::rt's helpers, which keep
-            // nothing.)
-            let mut exact = false;
-            if let Some(fs) = self.impls.get(&key) {
-                for (_, fh) in fs.iter() {
-                    if *fh == h {
-                        exact = true;
-                    }
+            let shim = match r.self_ty {
+                Some(t) => self.merge_for(&key, t, nargs, &mut s, fwd, 0),
+                None => {
+                    self.merge_all(&key, nargs, &mut s);
+                    true
                 }
-            }
-            let shim = h >= 0 && !exact && !scalar_head(h);
-            if let Some(fs) = self.impls.get(&key) {
-                for (f, fh) in fs.iter() {
-                    if h < 0 || *fh < 0 || *fh == h || shim {
-                        merge(&mut s, self.summary_of(*f, nargs));
-                    }
-                }
-            }
+            };
             // Debug's shims keep the Formatter in a boxed builder
             // (Formatter::debug_tuple).
             let debug = match self.lang_of.get(&p.id) {
                 Some(n) => n == "Debug",
                 None => false,
             };
-            if debug && (h < 0 || shim) && nargs > 1 {
+            if debug && shim && nargs > 1 {
                 s.esc[1] = 1;
             }
             return Some(s);
@@ -446,6 +434,60 @@ impl Escape {
         match self.by_def.get(&d.id) {
             Some(f) => Some(self.summary_of(*f, nargs)),
             None => None,
+        }
+    }
+
+    // Merges into s the summaries of key's impls a call with self type t
+    // may reach; whether it may reach a shim (an impl no source has).
+    fn merge_for(
+        &mut self,
+        key: &String,
+        t: &Type,
+        nargs: usize,
+        s: &mut Summary,
+        fwd: bool,
+        depth: usize,
+    ) -> bool {
+        let h = head(t);
+        if h < 0 || depth > 4 {
+            self.merge_all(key, nargs, s);
+            return true;
+        }
+        let mut exact = false;
+        if let Some(fs) = self.impls.get(key) {
+            for (f, fh) in fs.iter() {
+                if *fh < 0 || *fh == h {
+                    merge(s, self.summary_of(*f, nargs));
+                    if *fh == h {
+                        exact = true;
+                    }
+                }
+            }
+        }
+        if exact {
+            return false;
+        }
+        // A shim: its parts' impls, if its trait's shims call them (scalars'
+        // call std::fmt::rt's helpers, which keep nothing).
+        if !fwd {
+            return true;
+        }
+        let k = t.kind;
+        if k == types::K_REF || k == types::K_PTR || k == types::K_ARRAY || k == types::K_SLICE {
+            self.merge_for(key, t.el(), nargs, s, fwd, depth + 1);
+        } else if k == types::K_TUPLE {
+            for e in t.elems.iter() {
+                self.merge_for(key, *e, nargs, s, fwd, depth + 1);
+            }
+        }
+        true
+    }
+
+    fn merge_all(&mut self, key: &String, nargs: usize, s: &mut Summary) {
+        if let Some(fs) = self.impls.get(key) {
+            for (f, _) in fs.iter() {
+                merge(s, self.summary_of(*f, nargs));
+            }
         }
     }
 

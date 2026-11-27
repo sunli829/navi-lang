@@ -84,7 +84,6 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `HashMap` 迭代顺序 | 随机种子 | 确定（取决于插入历史） | 便于编译器输出稳定 |
 | `str` 的模式参数 | `Pattern` 支持 `&str`、`char`、`&[char]`、`[char; N]`、闭包 | `std::str::pattern::Pattern` 支持 `&str`、`&String`、`char`、`fn(char) -> bool`、`&[char]`、`[char; N]`、`&[char; N]` | — |
 | `f32` 解析 | 精确舍入 | 先精确解析成 `f64` 再转换（极少数情况下有两次舍入） | 简化 |
-| `BTreeSet::union` | `a.union(&b)` | `a.r#union(&b)` | `union` 在 navi 是保留字 |
 | `BTreeMap`/`BTreeSet` 的查找参数 | `get<Q>(&self, key: &Q) where K: Borrow<Q>`；`range<T, R: RangeBounds<T>>` | `get(&self, key: &K)`；`range<R: RangeBounds<K>>`（同 `HashMap`） | 没有 `Borrow` |
 | `BinaryHeap::peek_mut` | 返回 `PeekMut`，drop 时下沉 | 不提供；用 `pop` 再 `push` | 没有 Drop |
 | `BinaryHeap::into_sorted_vec` | 原地排序 | 返回排好序的新 Vec，堆本身不变 | 没有 move：原地排序会破坏仍共享缓冲区的堆 |
@@ -160,7 +159,7 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 | `query_pairs_mut()` | 返回的 `Serializer` drop 时写回 URL | 每次 `append_pair` 等调用后立即写回 URL；`finish()` 返回查询串 | 没有 Drop |
 | `query_pairs()` | 迭代 `(Cow<str>, Cow<str>)` | 迭代 `(String, String)` | 没有 `Cow` |
 | `socket_addrs` | 参数是 `impl Fn() -> Option<u16>` | 参数是 `fn() -> Option<u16>` | 闭包类型 |
-| `percent_encoding::AsciiSet` | `const fn add`，`&'static AsciiSet` 常量 | `add`/`remove`/`r#union`/`complement` 是普通方法，常量是值（`NON_ALPHANUMERIC`、`CONTROLS`）；`union` 是保留字，写 `r#union` | 没有 `const fn` 方法链 |
+| `percent_encoding::AsciiSet` | `const fn add`，`&'static AsciiSet` 常量 | `add`/`remove`/`union`/`complement` 是普通方法，常量是值（`NON_ALPHANUMERIC`、`CONTROLS`） | 没有 `const fn` 方法链 |
 | `make_relative`、`from_file_path`、`to_file_path` | 有 | 没有 | 暂不需要 |
 
 ### std::http（类型照 http crate，客户端照 reqwest::blocking，路由照 Go 的 ServeMux）

@@ -17,7 +17,7 @@
 - **关键字**：
   `as break const continue crate defer dyn else enum extern false fn for if impl in let loop match mod mut pub return select self Self static struct super trait true type unsafe use where while`
 - **保留字**（现在不用，留给以后）：
-  `async await box macro move try union yield`
+  `async await box macro move try yield`（`union` 同 Rust，不是关键字，可以作名字，如 `HashSet::union`）
 - **整数字面量**：`42`、`1_000_000`、`0xff`、`0o17`、`0b1010`；带后缀的写法如 `10u8`、`3i64`、`7usize`
 - **浮点字面量**：`1.5`、`2e10`、`1.0e-3f32`
 - **字符**：`'a'`、`'\n'`、`'\u{1F600}'`，类型是 `char`（Unicode 标量值）
