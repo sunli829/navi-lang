@@ -147,9 +147,11 @@ pub struct G {
     // output (see native::capture_new; 0: the standard streams). A G it
     // starts inherits it.
     capture: usize,
-    // Set while it scans its own stack (an assist): the scan holds
-    // addresses in it as integers, which a move would leave in the old one.
+    // Set while its stack must stay where it is (see systemstack).
     nomove: usize,
+    // A record systemstack runs f as: f and its context buffer.
+    sys_f: fn(*mut usize),
+    sys_ctx: usize,
 }
 
 // G.sys: running navi code; blocked in C (a system call or waiting for the
@@ -628,25 +630,20 @@ pub fn scan_g(gp: usize, cyc: usize, dst: usize) -> bool {
             return true;
         }
         if g as usize == current() as usize {
-            // Its own (an assist): now, from here up, its registers too. The
-            // stack must not move meanwhile (Go scans on the system stack):
-            // it grows first if the scan could need it to.
-            scan_room();
-            (*g).nomove = 1;
-            let r = calloc(10, 8) as usize;
-            crate::rt::spill_registers(r as *mut usize);
-            scan_stack_into(
-                crate::rt::stack_pointer() as usize,
-                crate::rt::frame_address() as usize,
-                (*g).stack_hi,
-                dst,
-            );
-            crate::rt::gc::scan_into(r, r + 80, dst);
-            free(r as *mut u8);
+            // Its own (an assist), on the system stack (as Go's): the scan
+            // holds addresses in this one as integers, and this one does
+            // not move while nothing runs on it. From the context the switch
+            // saved (its registers on the stack) up.
+            // (No GC memory here: an allocation in the middle of a mark's
+            // stack scan may step the collection.)
+            let ctx = calloc(5, 8) as *mut usize;
+            *((ctx as usize + 24) as *mut usize) = gp;
+            *((ctx as usize + 32) as *mut usize) = dst;
+            systemstack(own_scan, ctx);
+            free(ctx as *mut u8);
             if dst == 0 {
                 crate::rt::gc::flush_wbuf();
             }
-            (*g).nomove = 0;
             (*g).scan_cyc = cyc;
             return true;
         }
@@ -4462,6 +4459,79 @@ fn stack_headroom() {
     pad[i] = 1;
     if pad[(i + 1) & 32767] != 0 {
         crate::rt::native::fatal("stack_headroom");
+    }
+}
+
+// The scan of the running G's stack, on the system stack: ctx holds the
+// context the switch saved (SP, FP, PC), the G and the mark stack.
+fn own_scan(ctx: *mut usize) {
+    unsafe {
+        let c = ctx as usize;
+        let g = *((c + 24) as *mut usize) as *mut G;
+        scan_stack_into(
+            *ctx,
+            *((c + 8) as *mut usize),
+            (*g).stack_hi,
+            *((c + 32) as *mut usize),
+        );
+    }
+}
+
+/// Calls f(ctx) on the M's system stack (as Go's systemstack): the running
+/// G's stack neither grows nor moves meanwhile. ctx's first three words get
+/// the G's context as the switch saved it (SP, FP, PC; its callee-saved
+/// registers on the stack at SP); the rest is f's. f runs as a record of
+/// its own (is_g0, no stack limit) below the frame of the M's scheduler
+/// record, where C calls run; it must not block, panic or switch. Nothing
+/// here allocates GC memory.
+pub fn systemstack(f: fn(*mut usize), ctx: *mut usize) {
+    let g = current();
+    unsafe {
+        let top = (*g).c_stack;
+        if (*g).is_g0 || top == 0 {
+            // (No system stack: here, with room made first and the stack
+            // kept where it is.)
+            scan_room();
+            (*g).nomove += 1;
+            *ctx = crate::rt::stack_pointer() as usize;
+            *((ctx as usize + 8) as *mut usize) = crate::rt::frame_address() as usize;
+            f(ctx);
+            (*g).nomove -= 1;
+            return;
+        }
+        // The record it runs as, and its first context: the registers the
+        // switch restores (the record's in the G register's slot).
+        let sg = calloc(1, crate::intrinsics::size_of::<G>()) as *mut G;
+        (*sg).is_g0 = true;
+        (*sg).m = (*g).m;
+        (*sg).stack_hi = top;
+        (*sg).stack_lo = top - 65536;
+        (*sg).capture = (*g).capture;
+        (*sg).entry = sys_main;
+        (*sg).sys_f = f;
+        (*sg).sys_ctx = ctx as usize;
+        let mut k = 0;
+        while k < 10 {
+            *((top - 80 + 8 * k) as *mut usize) = 0;
+            k += 1;
+        }
+        *((top - 8) as *mut usize) = sg as usize;
+        (*sg).sp = top - 80;
+        (*sg).fp = 0;
+        (*sg).pc = crate::rt::gstart_address() as usize;
+        crate::rt::swap_context(ctx as *mut u8, &mut (*sg).sp as *mut usize as *mut u8);
+        free(sg as *mut u8);
+    }
+}
+
+// The entry of systemstack's record: f(ctx), then back to the G.
+fn sys_main() {
+    let sg = current();
+    unsafe {
+        let f = (*sg).sys_f;
+        let ctx = (*sg).sys_ctx as *mut usize;
+        f(ctx);
+        crate::rt::swap_context(&mut (*sg).sp as *mut usize as *mut u8, ctx as *mut u8);
     }
 }
 
