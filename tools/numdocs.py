@@ -643,14 +643,10 @@ def int_doc(c, name):
                        f"assert(!{r(10)}.is_power_of_two());",
                        f"assert(!{r(0)}.is_power_of_two());"])
     if name == "next_power_of_two":
-        if T == "u128":
-            over = ("When the return value overflows (that is, `self > (1 << 127)`), it is 0 (the only situation in "
-                    "which this method can return 0); Rust panics there in debug builds.")
-        else:
-            over = (f"The return value must fit in the type (`self <= (1 << {b - 1})`): when it does not, this "
-                    "method never returns (a known bug; Rust panics in debug builds and returns 0 otherwise). Use "
-                    "`checked_next_power_of_two` when it may not fit.")
-        return doc("Returns the smallest power of two greater than or equal to `self`.", over,
+        return doc("Returns the smallest power of two greater than or equal to `self`.",
+                   panics=(f"Panics when the return value overflows (that is, `self > (1 << {b - 1})`), as Rust's "
+                           "debug builds do (Rust's release builds return 0). Use `checked_next_power_of_two` when "
+                           "it may not fit."),
                    ex=[f"assert_eq({r(2)}.next_power_of_two(), 2);",
                        f"assert_eq({r(3)}.next_power_of_two(), 4);",
                        f"assert_eq({r(0)}.next_power_of_two(), 1);"])
@@ -805,14 +801,7 @@ def int_doc(c, name):
         else:
             ex = [f"let value = {T}::{name}("] + ["    " + l for l in arr[:-1]] + ["    " + arr[-1] + ","] + [");"]
         ex.append(f"assert_eq(value, {c.hexv(v)});")
-        attr = ""
-        extra = None
-        if b == 8:
-            # std bug: the 8-bit from_le_bytes shifts a u8 by 8 and panics.
-            attr = "ignore"
-            extra = ("The example is not run: this method of the 8-bit types panics today "
-                     "(\"attempt to shift with overflow\"), a known bug.")
-        return doc(summary, details, ex=ex, attr=attr, extra=extra)
+        return doc(summary, details, ex=ex)
     if name == "from_str_radix":
         details = [("The string is expected to be an optional `+` or `-` sign followed by only digits." if s else
                     "The string is expected to be an optional `+` sign followed by only digits.") +
