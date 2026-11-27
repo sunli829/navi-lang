@@ -1,8 +1,9 @@
 //! Inlines calls of small functions (after escape analysis and boxing):
 //! the callee's blocks are copied into the caller with its locals renamed,
 //! its types instantiated with the call's generic arguments and its
-//! positions moved to the call site. Calls through traits, closures and
-//! function values are left alone, and so are callees that create
+//! positions kept if it is in the caller's file (a panic in it reports its
+//! line, as Rust's), else moved to the call site. Calls through traits,
+//! closures and function values are left alone, and so are callees that create
 //! closures, register defers, use #[track_caller] or #[inline(never)], or
 //! belong to the runtime (which relies on its frames), but for its leaves
 //! (functions that call nothing); runtime functions only get leaves.
@@ -109,13 +110,20 @@ pub fn inline_hint(d: &Def) -> bool {
     false
 }
 
+fn is_track_caller(d: &Def) -> bool {
+    match &d.node {
+        Node::Item(Item::Fn(f)) => has_attr(&f.base.attrs, "track_caller"),
+        _ => false,
+    }
+}
+
 fn never_inline(d: &Def) -> bool {
     let attrs = match &d.node {
         Node::Item(Item::Fn(f)) => f.base.attrs.clone(),
         _ => return true,
     };
     // #[track_caller] functions inline: the copy's positions are the call
-    // site's, which is the location they would report.
+    // site's, which is the location they would report (Copier::same_file).
     if has_attr(&attrs, "intrinsic") {
         return true;
     }
@@ -199,6 +207,9 @@ struct Copier {
     base: usize,
     block_base: usize,
     pos: Pos,
+    /// Whether the callee is in the caller's file (its positions hold) and
+    /// not #[track_caller] (whose positions are its call's).
+    same_file: bool,
 }
 
 impl Copier {
@@ -283,7 +294,6 @@ impl Copier {
     }
 
     fn rv(&self, rv: &Rvalue) -> Rvalue {
-        let p = self.pos;
         match rv {
             Rvalue::Use(x) => Rvalue::Use(self.op(x)),
             Rvalue::Ref { is_mut, place } => Rvalue::Ref {
@@ -295,13 +305,13 @@ impl Copier {
                 x: self.op(x),
                 y: self.op(y),
                 ty: self.ty(*ty),
-                pos: if *pos > 0 { p } else { 0 },
+                pos: if *pos > 0 { self.at(*pos) } else { 0 },
             },
             Rvalue::Un { op, x, ty, pos } => Rvalue::Un {
                 op: *op,
                 x: self.op(x),
                 ty: self.ty(*ty),
-                pos: if *pos > 0 { p } else { 0 },
+                pos: if *pos > 0 { self.at(*pos) } else { 0 },
             },
             Rvalue::Cast { kind, x, from, to } => Rvalue::Cast {
                 kind: *kind,
@@ -359,13 +369,21 @@ impl Copier {
         }
     }
 
+    // A position of the callee in the caller.
+    fn at(&self, pos: Pos) -> Pos {
+        if self.same_file && pos > 0 {
+            pos
+        } else {
+            self.pos
+        }
+    }
+
     fn blk(&self, b: usize) -> usize {
         b + self.block_base
     }
 
     /// The callee's terminator t; Return goes to ret.
     fn term(&self, t: &Term, ret: usize) -> Term {
-        let p = self.pos;
         match t {
             Term::None => Term::None,
             Term::Goto(b) => Term::Goto(self.blk(*b)),
@@ -395,7 +413,7 @@ impl Copier {
                 args,
                 dest,
                 target,
-                ..
+                pos,
             } => {
                 let tg = if *target < 0 {
                     *target
@@ -407,7 +425,7 @@ impl Copier {
                     args: self.ops(args),
                     dest: self.place(dest),
                     target: tg,
-                    pos: p,
+                    pos: self.at(*pos),
                 }
             }
             Term::Assert {
@@ -417,12 +435,12 @@ impl Copier {
                 bounds,
                 len,
                 index,
-                ..
+                pos,
             } => Term::Assert {
                 cond: self.op(cond),
                 msg: msg.clone(),
                 target: self.blk(*target),
-                pos: p,
+                pos: self.at(*pos),
                 bounds: *bounds,
                 len: self.op(len),
                 index: self.op(index),
@@ -639,7 +657,7 @@ pub fn inline_program(
                 if let Some((did, args)) = calls.get(&((lv[k] as u64) << 32 | bi as u64)) {
                     let callee = by_def[did];
                     if callee.id != caller.id && (!rt || leaf(callee)) {
-                        inline_call(info, body, bi, callee, args);
+                        inline_call(info, body, bi, caller, callee, args);
                     }
                 }
                 bi += 1;
@@ -666,7 +684,14 @@ struct Body {
 }
 
 /// Replaces the call ending block bi of the body with a copy of callee.
-fn inline_call(info: &mut Info, body: &mut Body, bi: usize, callee: &Func, targs: &Vec<&Type>) {
+fn inline_call(
+    info: &mut Info,
+    body: &mut Body,
+    bi: usize,
+    caller: &Func,
+    callee: &Func,
+    targs: &Vec<&Type>,
+) {
     let call = body.blocks[bi];
     let (args, dest, target, pos) = match &call.term {
         Term::Call {
@@ -692,6 +717,11 @@ fn inline_call(info: &mut Info, body: &mut Body, bi: usize, callee: &Func, targs
         base: body.locals.len(),
         block_base: body.blocks.len(),
         pos,
+        same_file: !is_track_caller(d)
+            && match (caller.file, callee.file) {
+                (Some(a), Some(b)) => std::ptr::eq(a, b),
+                _ => false,
+            },
     };
     for l in callee.locals.iter() {
         body.locals.push(&mut Local {

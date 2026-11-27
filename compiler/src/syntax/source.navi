@@ -13,6 +13,8 @@ pub struct File {
     pub name: String,
     pub src: String,
     lines: Vec<Pos>,
+    /// Its line directives, by line.
+    directives: Vec<Directive>,
     /// Code a derive macro generated: where its positions are in the
     /// user's file (crate::derive).
     pub origin: Option<&Origin>,
@@ -27,6 +29,67 @@ pub struct Origin {
     pub spans: Vec<(Pos, Pos, Pos)>,
     /// What generated it (derive X for T), for notes.
     pub what: String,
+}
+
+/// A line directive (as Go's): `//line path:line:col` at the start of a
+/// line says the next line is line `line` of `path` and starts at its column
+/// `col` (`//line path:line` keeps columns). Generated code (doctests) says
+/// where its lines come from.
+#[derive(Clone)]
+struct Directive {
+    /// The directive's own line (from one).
+    at: i32,
+    file: String,
+    line: i32,
+    col: i32,
+}
+
+// The directives of src: lines that start with //line and name a position.
+fn parse_directives(src: &str) -> Vec<Directive> {
+    let mut out: Vec<Directive> = Vec::new();
+    if !src.contains("//line ") {
+        return out;
+    }
+    let mut n = 0;
+    for l in src.split('\n') {
+        n += 1;
+        let rest = match l.strip_prefix("//line ") {
+            Some(r) => r.trim_end(),
+            None => continue,
+        };
+        // From the right: path:line:col or path:line (the path may hold
+        // colons).
+        let (a, last) = match rest.rfind(':') {
+            Some(k) => (&rest[..k], &rest[k + 1..]),
+            None => continue,
+        };
+        let last = match last.parse::<i32>() {
+            Ok(v) if v > 0 => v,
+            _ => continue,
+        };
+        let mut file = a;
+        let mut line = last;
+        let mut col = 0;
+        if let Some(k) = a.rfind(':') {
+            if let Ok(v) = a[k + 1..].parse::<i32>() {
+                if v > 0 {
+                    file = &a[..k];
+                    line = v;
+                    col = last;
+                }
+            }
+        }
+        if file.len() == 0 {
+            continue;
+        }
+        out.push(Directive {
+            at: n,
+            file: file.to_string(),
+            line,
+            col,
+        });
+    }
+    out
 }
 
 /// A human-readable location (line and column count from one; columns
@@ -56,10 +119,12 @@ impl File {
             }
             i += 1;
         }
+        let directives = parse_directives(src.as_str());
         &File {
             name: name.to_string(),
             src,
             lines,
+            directives,
             origin: None,
         }
     }
@@ -71,6 +136,7 @@ impl File {
             name: f.name.clone(),
             src: f.src.clone(),
             lines: f.lines.clone(),
+            directives: Vec::new(),
             origin: Some(origin),
         }
     }
@@ -82,6 +148,7 @@ impl File {
             name: name.to_string(),
             src: String::new(),
             lines,
+            directives: Vec::new(),
             origin: None,
         }
     }
@@ -92,8 +159,14 @@ impl File {
             name: name.to_string(),
             src: String::new(),
             lines,
+            directives: Vec::new(),
             origin: Some(origin),
         }
+    }
+
+    /// Whether line directives say where its lines come from.
+    pub fn has_directives(&self) -> bool {
+        self.directives.len() > 0
     }
 
     /// Where each line starts.
@@ -131,7 +204,30 @@ impl File {
         if let Some(o) = self.origin {
             return o.file.position(self.origin_pos(pos));
         }
-        self.own_position(pos)
+        let p = self.own_position(pos);
+        if self.directives.len() == 0 {
+            return p;
+        }
+        // The last directive above p's line.
+        let mut lo = 0;
+        let mut hi = self.directives.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.directives[mid].at < p.line {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return p;
+        }
+        let d = &self.directives[lo - 1];
+        Position {
+            file: d.file.clone(),
+            line: d.line + (p.line - d.at - 1),
+            col: if d.col > 0 { d.col + p.col - 1 } else { p.col },
+        }
     }
 
     /// The position in the user's file that pos in generated code comes
@@ -254,5 +350,31 @@ impl Errors {
             i += 1;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_directives() {
+        let src = "\na\n//line src/x.navi:10:5\nb c\nd\n//line C:\\w\\y.navi:3\n e\n//line bad\nf";
+        let f = File::new("gen.navi", src.to_string());
+        let at = |s: &str| -> String {
+            let k = src.find(`\n${s}`.to_string().as_str()).unwrap() + 1;
+            f.position(k as Pos).to_string()
+        };
+        assert_eq(at("a"), "gen.navi:2:1".to_string());
+        assert_eq(at("b"), "src/x.navi:10:5".to_string());
+        let c = f
+            .position((src.find("b c").unwrap() + 2) as Pos)
+            .to_string();
+        assert_eq(c, "src/x.navi:10:7".to_string());
+        assert_eq(at("d"), "src/x.navi:11:5".to_string());
+        // Without a column, columns are the line's own.
+        assert_eq(at(" e"), "C:\\w\\y.navi:3:1".to_string());
+        // Not a directive: the one above holds.
+        assert_eq(at("f"), "C:\\w\\y.navi:5:1".to_string());
     }
 }

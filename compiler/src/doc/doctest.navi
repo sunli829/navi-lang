@@ -9,6 +9,8 @@ pub struct DocTest {
     /// The file (from the crate's directory) and the line of the fence.
     pub file: String,
     pub line: usize,
+    /// The column of its code in the file (after `/// `, from one).
+    pub col: usize,
     /// What the documentation is of: Point::new, the module's name.
     pub item: String,
     /// The code with hidden lines shown (as compiled).
@@ -126,6 +128,11 @@ fn file_tests(name: &str, src: &str, out: &mut Vec<DocTest>) {
             continue;
         }
         let start = i;
+        let col = {
+            let l = lines[i];
+            let t = l.trim_start();
+            l.len() - t.len() + (if t[3..].starts_with(" ") { 5 } else { 4 })
+        };
         let mut text: Vec<String> = Vec::new();
         while i < lines.len() {
             let t = lines[i].trim_start();
@@ -186,6 +193,7 @@ fn file_tests(name: &str, src: &str, out: &mut Vec<DocTest>) {
             out.push(DocTest {
                 file: name.to_string(),
                 line: start + b.line,
+                col,
                 item: item.clone(),
                 code: shown_code(b.code.as_str()),
                 ignore: has("ignore") || here,
@@ -311,8 +319,25 @@ fn shown_code(code: &str) -> String {
 /// the items go in its module, the statements in the function that runs.
 pub fn split(code: &str) -> (String, String) {
     let lines: Vec<&str> = code.split('\n').collect();
-    let mut items = String::new();
-    let mut body = String::new();
+    let (a, b) = split_lines(code);
+    (joined(&lines, &a), joined(&lines, &b))
+}
+
+// The lines ks of lines, each ended by a newline.
+fn joined(lines: &Vec<&str>, ks: &Vec<usize>) -> String {
+    let mut s = String::new();
+    for k in ks.iter() {
+        s.push_str(lines[*k]);
+        s.push('\n');
+    }
+    s
+}
+
+// split by line numbers (from zero): the item lines and the statement lines.
+fn split_lines(code: &str) -> (Vec<usize>, Vec<usize>) {
+    let lines: Vec<&str> = code.split('\n').collect();
+    let mut items: Vec<usize> = Vec::new();
+    let mut body: Vec<usize> = Vec::new();
     let mut i = 0;
     let mut depth: i32 = 0;
     let mut in_item = false;
@@ -323,11 +348,9 @@ pub fn split(code: &str) -> (String, String) {
             in_item = is_item_start(t);
         }
         if in_item {
-            items.push_str(l);
-            items.push('\n');
+            items.push(i);
         } else {
-            body.push_str(l);
-            body.push('\n');
+            body.push(i);
         }
         depth += brace_delta(l);
         // An item ends at depth 0 with } or ;
@@ -456,7 +479,9 @@ pub fn program(tests: &Vec<DocTest>) -> String {
 // One test: its module and its #[test] (no_run: built, not a test).
 fn test_text(t: &DocTest) -> String {
     let id = t.ident();
-    let (items, body) = split(t.code.as_str());
+    let lines: Vec<&str> = t.code.split('\n').collect();
+    let (item_lines, body_lines) = split_lines(t.code.as_str());
+    let items = joined(&lines, &item_lines);
     let has_main = items.contains("fn main(");
     let main_result = has_main && {
         let k = items.find("fn main(").unwrap();
@@ -474,13 +499,12 @@ fn test_text(t: &DocTest) -> String {
         ""
     };
     let mut s = `    // ${t.title()}\n    mod m_${id} {\n`.to_string();
-    for l in items.lines() {
-        s.push_str(`        ${l}\n`.to_string().as_str());
-    }
+    // The code as written (a multi-line string keeps its lines), each run
+    // of its lines after a line directive: positions in it (panics, errors)
+    // are in the documented file.
+    code_lines(t, &lines, &item_lines, &mut s);
     s.push_str("        pub fn run() {\n");
-    for l in body.lines() {
-        s.push_str(`            ${l}\n`.to_string().as_str());
-    }
+    code_lines(t, &lines, &body_lines, &mut s);
     if call.len() > 0 {
         s.push_str(`            ${call}\n`.to_string().as_str());
     }
@@ -504,6 +528,27 @@ fn test_text(t: &DocTest) -> String {
         );
     }
     s
+}
+
+// The lines ks of a test's code, unindented, each run after a //line
+// directive.
+fn code_lines(t: &DocTest, lines: &Vec<&str>, ks: &Vec<usize>, s: &mut String) {
+    let mut next = usize::MAX;
+    for k in ks.iter() {
+        if *k == lines.len() - 1 && lines[*k].len() == 0 {
+            continue;
+        }
+        if *k != next {
+            s.push_str(
+                `//line ${t.file}:${t.line + 1 + *k}:${t.col}\n`
+                    .to_string()
+                    .as_str(),
+            );
+        }
+        s.push_str(lines[*k]);
+        s.push('\n');
+        next = *k + 1;
+    }
 }
 
 /// A compile_fail test's program (built alone; it must not compile).
@@ -534,8 +579,19 @@ mod tests {
             "src/lib.navi - Point::new (line 18)".to_string(),
         );
         assert(out[2].should_panic);
+        assert_eq((out[0].col, out[2].col), (5, 9));
         assert_eq(out[2].ident(), "line_18_point_new".to_string());
         assert_eq(out[0].module(), "src_lib_navi".to_string());
+    }
+
+    #[test]
+    fn program_keeps_lines() {
+        let src = "/// Doc.\n///\n/// ```\n/// fn two() -> i32 { 2 }\n/// let s = \"a\n/// b\";\n/// ```\npub fn f() {}\n";
+        let mut out: Vec<DocTest> = Vec::new();
+        file_tests("src/lib.navi", src, &mut out);
+        let p = program(&out);
+        assert(p.contains("//line src/lib.navi:4:5\nfn two() -> i32 { 2 }\n"));
+        assert(p.contains("//line src/lib.navi:5:5\nlet s = \"a\nb\";\n"));
     }
 
     #[test]
