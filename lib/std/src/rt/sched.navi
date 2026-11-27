@@ -147,8 +147,6 @@ pub struct G {
     // output (see native::capture_new; 0: the standard streams). A G it
     // starts inherits it.
     capture: usize,
-    // Set while its stack must stay where it is (see systemstack).
-    nomove: usize,
     // A record systemstack runs f as: f and its context buffer.
     sys_f: fn(*mut usize),
     sys_ctx: usize,
@@ -3846,7 +3844,6 @@ pub fn morestack() -> usize {
         let poll = (*g).need == 0;
         let stress = STACKMOVE
             && !poll
-            && (*g).nomove == 0
             && !owner
             && !(*g).main
             && !(*g).is_g0
@@ -3866,13 +3863,9 @@ pub fn morestack() -> usize {
                     "the collector ran out of stack while the world was stopped",
                 );
             }
-            if (*g).nomove != 0 {
-                crate::rt::native::fatal("the stack ran out while the G scanned it");
-            }
             delta = grow(g, !was_blocked && (*g).cb_stack == 0);
         } else if (*g).shrink != 0
             && !poll
-            && (*g).nomove == 0
             && !was_blocked
             && !owner
             && !(*g).main
@@ -4481,31 +4474,34 @@ fn own_scan(ctx: *mut usize) {
 /// G's stack neither grows nor moves meanwhile. ctx's first three words get
 /// the G's context as the switch saved it (SP, FP, PC; its callee-saved
 /// registers on the stack at SP); the rest is f's. f runs as a record of
-/// its own (is_g0, no stack limit) below the frame of the M's scheduler
-/// record, where C calls run; it must not block, panic or switch. Nothing
-/// here allocates GC memory.
+/// its own (is_g0) on the G's system stack, where its C calls run: below
+/// the frame of the M's scheduler record, or (a callback's G) below C's
+/// frames; 32 KiB of it, past which it is a stack overflow. f must not
+/// block, panic or switch. Nothing here allocates GC memory.
 pub fn systemstack(f: fn(*mut usize), ctx: *mut usize) {
     let g = current();
     unsafe {
-        let top = (*g).c_stack;
-        if (*g).is_g0 || top == 0 {
-            // (No system stack: here, with room made first and the stack
-            // kept where it is.)
-            scan_room();
-            (*g).nomove += 1;
+        if (*g).is_g0 {
+            // Already on one: here (its stack does not move).
             *ctx = crate::rt::stack_pointer() as usize;
             *((ctx as usize + 8) as *mut usize) = crate::rt::frame_address() as usize;
             f(ctx);
-            (*g).nomove -= 1;
             return;
+        }
+        let top = (*g).c_stack;
+        if top == 0 {
+            crate::rt::native::fatal("systemstack: a G without a system stack");
         }
         // The record it runs as, and its first context: the registers the
         // switch restores (the record's in the G register's slot).
         let sg = calloc(1, crate::intrinsics::size_of::<G>()) as *mut G;
         (*sg).is_g0 = true;
         (*sg).m = (*g).m;
+        // (32 KiB at most, as Go's g0 on a C thread: past them, a stack
+        // overflow.)
         (*sg).stack_hi = top;
-        (*sg).stack_lo = top - 65536;
+        (*sg).stack_lo = top - 32768 - RED_ZONE;
+        (*sg).guard = top - 32768;
         (*sg).capture = (*g).capture;
         (*sg).entry = sys_main;
         (*sg).sys_f = f;
@@ -4532,17 +4528,6 @@ fn sys_main() {
         let ctx = (*sg).sys_ctx as *mut usize;
         f(ctx);
         crate::rt::swap_context(&mut (*sg).sp as *mut usize as *mut u8, ctx as *mut u8);
-    }
-}
-
-// Grows the stack now if need be, so that a G's scan of its own stack has
-// room (16 KiB below the caller's frame) without moving it.
-fn scan_room() {
-    let mut pad = [0u64; 2048];
-    let i = (crate::rt::stack_pointer() as usize >> 4) & 2047;
-    pad[i] = 1;
-    if pad[(i + 1) & 2047] != 0 {
-        crate::rt::native::fatal("scan_room");
     }
 }
 

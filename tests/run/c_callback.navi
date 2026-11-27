@@ -1,6 +1,8 @@
 // C calling back into navi (qsort's comparator): callbacks that allocate
 // and collect, grow their stack, call C again, wait for another thread, and
-// run on several threads at once; extern "C" fn values called from navi.
+// run on several threads at once; extern "C" fn values called from navi;
+// callbacks allocating while a collection marks (their mark assists scan
+// their stacks on the system stack below C's frames).
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpmc::sync_channel;
 
@@ -44,6 +46,23 @@ extern "C" fn cmp_rows(a: *const u8, b: *const u8) -> i32 {
 }
 
 extern "C" fn scale(x: f64, k: i32) -> f64 { x * k as f64 }
+
+// Compares two i32 after allocating a few KiB (some kept a while).
+extern "C" fn cmp_alloc(a: *const u8, b: *const u8) -> i32 {
+    let x = unsafe { *(a as *const i32) };
+    let y = unsafe { *(b as *const i32) };
+    let mut v: Vec<u64> = Vec::new();
+    v.resize(512, x as u64);
+    let mut keep: Vec<Vec<u64>> = Vec::new();
+    keep.push(v);
+    let mut w: Vec<u64> = Vec::new();
+    w.resize(256, y as u64);
+    keep.push(w);
+    if keep[0][0] as i32 != x || keep[1][255] as i32 != y {
+        return 0;
+    }
+    if x < y { -1 } else if x > y { 1 } else { 0 }
+}
 
 static mut WAITED: i32 = 0;
 
@@ -117,3 +136,36 @@ fn callbacks_on_several_threads() {
     for h in hs.iter() { h.join().unwrap(); }
     assert_eq(total.load(Ordering::Relaxed), 8000);
 }
+
+#[test]
+fn callbacks_allocate_while_a_collection_marks() {
+    let mut hs = Vec::new();
+    let mut t = 0;
+    while t < 8 {
+        hs.push(std::thread::spawn(|| -> bool {
+            let mut ok = true;
+            let mut r = 0;
+            while r < 20 {
+                let mut u: Vec<i32> = Vec::new();
+                let mut i = 0;
+                while i < 500 {
+                    u.push((i * 7919 + r * 31) % 1000);
+                    i += 1;
+                }
+                unsafe { qsort(u.as_mut_ptr() as *mut u8, u.len(), 4, cmp_alloc); }
+                let mut k = 1;
+                while k < u.len() {
+                    if u[k - 1] > u[k] {
+                        ok = false;
+                    }
+                    k += 1;
+                }
+                r += 1;
+            }
+            ok
+        }));
+        t += 1;
+    }
+    for h in hs.iter() { assert(h.join().unwrap()); }
+}
+
