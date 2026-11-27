@@ -68,7 +68,7 @@ navi 的标准库默认照搬 Rust std（模块路径、类型名、trait 名、
 | `std::unique` | `Handle<T>`（同 Go 的 `unique` 包：`Handle::new(v)`、`value()`，相等的值同一个句柄；Rust 的 std 没有） |
 | `std::bench::Bencher` | `navi bench` 用（Rust 里是不稳定的 `test::Bencher`）：`iter(f)` |
 | `std::serde` | 照搬 serde 这个 crate（Rust 的 std 没有）：`Serialize`、`Serializer`、`Deserialize`、`Deserializer`、`Visitor`、`SeqAccess`、`MapAccess`、`EnumAccess` 等，签名去掉生命周期；`#[derive(Serialize, Deserialize)]` 是 std 里的派生宏（`use std::serde::{Serialize, Deserialize}` 同时引入 trait 和宏，同 serde 的 derive 特性），`#[serde(...)]` 支持 rename、rename_all、skip、skip_serializing、skip_deserializing、default、skip_serializing_if、deny_unknown_fields；枚举的四种表示都有：默认的外部标记，`tag`（内部标记）、`tag` + `content`（相邻标记）、`untagged`（反序列化时先读成 `private::Content` 再按标记或逐个变体去试，同 serde） |
-| `std::json` | 照 serde_json 这个 crate：`to_string`、`to_string_pretty`、`to_writer`、`from_str`、`from_reader`，类型要实现 `Serialize` / `Deserialize`（一般用派生），返回 `Result<_, json::Error>`；`json::Value` 表示任意 JSON |
+| `std::json` | 照 serde_json 这个 crate：`to_string`、`to_string_pretty`、`to_vec`、`to_vec_pretty`、`to_writer`、`to_writer_pretty`、`from_str`、`from_slice`、`from_reader`（`from_reader` 先读完再解析），类型要实现 `Serialize` / `Deserialize`（一般用派生），返回 `Result<_, json::Error>`；`json::Value` 表示任意 JSON |
 | `std::any::type_name` | 和 Rust 一样，但名字不带模块路径（`Vec<i32>`，Rust 是 `alloc::vec::Vec<i32>`）；`TypeId`、`Any` 不提供 |
 
 ## 5. M7 补充标准库时新增的偏离
@@ -166,7 +166,7 @@ Go 的标准库里有、Rust 要靠第三方 crate 的功能，navi 放进 std�
 
 | 项目 | 参考 | navi | 原因 |
 |---|---|---|---|
-| TLS | reqwest 用 native-tls 或 rustls，支持 TLS 1.2 和 1.3 | https 走 `std::tls`（TLS 1.3 和 1.2）；`ClientBuilder::add_root_certificate`、`tls_built_in_root_certs`、`danger_accept_invalid_certs`、`danger_accept_invalid_hostnames` 同 reqwest；证书类型是 `crypto::x509::Certificate`（`http::Certificate`） | TLS 1.2 在后面做 |
+| TLS | reqwest 用 native-tls 或 rustls，支持 TLS 1.2 和 1.3 | https 走 `std::tls`（TLS 1.3 和 1.2）；`ClientBuilder::add_root_certificate`、`tls_built_in_root_certs`、`danger_accept_invalid_certs`、`danger_accept_invalid_hostnames` 同 reqwest；证书类型是 `crypto::x509::Certificate`（`http::Certificate`） | — |
 | `HeaderMap` | 键是 `HeaderName`，值是 `HeaderValue` | 键和值都是字符串：`get` 返回 `Option<&str>`，`get_all` 返回 `Vec<&str>`；名字不区分大小写，存成小写，按插入顺序保留多个值 | 简化 |
 | `Request<T>` / `Response<T>` | 泛型 body | 不带类型参数，body 是 `Body`（字节或 `&mut dyn Read`）；收到的消息的 body 从连接上读 | 简化 |
 | `Method` | `Method::GET` 等常量 | 相同；不是 `Copy`（值类型，赋值即拷贝） | 没有 `Copy` |
@@ -247,7 +247,7 @@ API 照 base64 0.22（`Engine`）、hex、RustCrypto（`Digest`、`Mac`、`Hmac<
 | `Digest::finalize` | 返回定长的 `GenericArray` | 返回 `Vec<u8>` | 没有 const 泛型数组输出 |
 | `Hmac<D>` | `Hmac<Sha256>` 等 | 相同；`Mac` trait 的 `finalize` 返回 `Vec<u8>`（crate 是 `CtOutput`，比较时恒定时间），比较请用 `verify_slice` 或 `crypto::subtle::constant_time_eq` | 简化 |
 | 哈希器写入 | `Digest::update`、`io::Write` | 相同（都实现 `io::Write`，可以 `io::copy` 进去） | — |
-| base64 的自定义 `GeneralPurpose` 配置、`read`/`write` 包装器 | 有 | 只有四个预设引擎（`STANDARD`、`STANDARD_NO_PAD`、`URL_SAFE`、`URL_SAFE_NO_PAD`） | 暂不需要 |
+| base64 的引擎 | `GeneralPurpose`、`GeneralPurposeConfig`、`alphabet`、`read`/`write` 包装器 | 同 base64：`engine::GeneralPurpose::new(&alphabet, config)`、`general_purpose` 里的预设引擎和配置、`alphabet` 的预设字母表和 `Alphabet::new`；没有 `read`/`write` 包装器（`EncoderWriter`、`DecoderReader`） | 暂不需要 |
 | crc32 的 `Hasher::new_with_initial` | 有 | 有；没有 SIMD 加速 | — |
 | AEAD（`aead`、`aes`、`aes-gcm`、`chacha20poly1305`、`hkdf` crate） | 密钥、nonce、标签是定长数组（`GenericArray`），`encrypt_in_place_detached` 返回 `Tag` | `crypto::aead`、`crypto::aes`、`crypto::aes_gcm`、`crypto::chacha20poly1305`、`crypto::hkdf`，用 `&[u8]`，长度不对返回错误；`encrypt_in_place_detached` 返回 `Vec<u8>` 的标签 | 没有定长数组输出 |
 | SHA-256 的实现 | sha2 crate 有 CPU 指令时用指令 | 相同：arm64 的 SHA2 指令、x86 的 SHA 扩展（`.s` 汇编，同 Go）；M4 上约 2.8 GB/s（软件约 0.16 GB/s）；`NAVI_DEBUG=noaes` 也让它走软件 | — |
