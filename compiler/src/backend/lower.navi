@@ -4553,19 +4553,69 @@ impl FnGen {
                 }
             }
         }
-        let mut order: Vec<usize> = Vec::new();
-        let mut cold: Vec<usize> = Vec::new();
+        // The order (as Go's layout): chains of blocks, each followed by a
+        // successor not placed yet, so that its edge falls through; of a
+        // branch's two the one that stays in the loop (as deep in loops),
+        // else not a return, else the first. Blocks that end in a panic come
+        // last.
+        let depth = loop_depths(sf);
+        let mut placed: Vec<bool> = Vec::new();
+        placed.resize(nb, false);
+        let mut is_cold: Vec<bool> = Vec::new();
         i = 0;
         while i < nb {
             let b = sf.blocks[i];
-            if to[i] == i {
-                let panics =
-                    b.kind == crate::ssa::B_EXIT && b.control.unwrap().op == crate::ssa::OP_PANIC;
-                if panics && i != 0 {
-                    cold.push(i);
-                } else {
-                    order.push(i);
+            let panics =
+                b.kind == crate::ssa::B_EXIT && b.control.unwrap().op == crate::ssa::OP_PANIC;
+            is_cold.push(panics && i != 0);
+            i += 1;
+        }
+        let mut order: Vec<usize> = Vec::new();
+        let mut cold: Vec<usize> = Vec::new();
+        let mut scan = 0;
+        let mut cur: i64 = 0;
+        loop {
+            if cur < 0 {
+                while scan < nb && (placed[scan] || to[scan] != scan || is_cold[scan]) {
+                    scan += 1;
                 }
+                if scan >= nb {
+                    break;
+                }
+                cur = scan as i64;
+            }
+            let bi = cur as usize;
+            placed[bi] = true;
+            order.push(bi);
+            let b = sf.blocks[bi];
+            cur = -1;
+            // (Deeper in loops first, then not a return: as Go's static
+            // likelihoods.)
+            let mut best: i64 = -1;
+            let mut best_score = -1i64;
+            let mut k = 0;
+            while k < b.succs.len() {
+                let t = to[b.succs[k].id as usize];
+                let score = 2 * depth[t] as i64
+                    + if sf.blocks[t].kind == crate::ssa::B_RET {
+                        0
+                    } else {
+                        1
+                    };
+                if !placed[t] && !is_cold[t] && score > best_score {
+                    best = t as i64;
+                    best_score = score;
+                }
+                k += 1;
+            }
+            cur = best;
+        }
+        i = 0;
+        while i < nb {
+            if to[i] == i && is_cold[i] {
+                cold.push(i);
+            } else if to[i] == i && !placed[i] {
+                order.push(i);
             }
             i += 1;
         }
@@ -6270,6 +6320,55 @@ impl FnGen {
 
 /// Whether arm64 code for v leaves the flags alone (no compares, checks or
 /// calls): loads, stores, addresses, moves and unchecked integer ops.
+// By block: how many loops hold it (a loop: the blocks reaching a back
+// edge's source without passing its header, which dominates the source).
+fn loop_depths(f: &crate::ssa::Func) -> Vec<i32> {
+    let nb = f.blocks.len();
+    let mut depth: Vec<i32> = Vec::new();
+    depth.resize(nb, 0);
+    let d = crate::ssa::dom::dominators(f);
+    let mut mark: Vec<i64> = Vec::new();
+    mark.resize(nb, -1);
+    let mut stamp = 0i64;
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        if d.order[b.id as usize] < 0 {
+            continue;
+        }
+        for hh in b.succs.iter() {
+            let h = *hh;
+            // h dominates b: b -> h is a back edge.
+            let mut x = b.id as i32;
+            while x >= 0 && x != h.id as i32 {
+                x = d.idom[x as usize];
+            }
+            if x != h.id as i32 {
+                continue;
+            }
+            stamp += 1;
+            mark[h.id as usize] = stamp;
+            depth[h.id as usize] += 1;
+            let mut work: Vec<&mut crate::ssa::Block> = Vec::new();
+            if mark[b.id as usize] != stamp {
+                mark[b.id as usize] = stamp;
+                depth[b.id as usize] += 1;
+                work.push(b);
+            }
+            while let Some(y) = work.pop() {
+                for p in y.preds.iter() {
+                    let pi = p.id as usize;
+                    if mark[pi] != stamp && d.order[pi] >= 0 {
+                        mark[pi] = stamp;
+                        depth[pi] += 1;
+                        work.push(*p);
+                    }
+                }
+            }
+        }
+    }
+    depth
+}
+
 fn keeps_flags_arm64(v: &crate::ssa::Value) -> bool {
     match v.op {
         crate::ssa::OP_LOAD
