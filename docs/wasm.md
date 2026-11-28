@@ -170,6 +170,7 @@ doc.call("addEventListener", &[Value::from("click"), cb.value()]);
 - **`Func`**：把 navi 闭包包成 JS 函数，`release()` 释放。
   - JS 调用它时，胶水 JS 设好事件，再调用 `resume()`。navi 侧有一个处理事件的 G 去运行闭包，闭包返回后 `resume()` 才返回，所以事件处理函数里可以调用 `preventDefault`。
   - 闭包里不能阻塞，否则报死锁，同 Go。
+- **等待 Promise**：`Value::await_()`（名字待定）让当前 G 停下，Promise 完成后返回 `Result<Value, Value>`。navi 有绿色线程，fetch、IndexedDB 这类异步 API 可以写成同步的样子，不用回调。Go 没有这个，用户通常自己用 channel 加回调来等。
 - 不提供 Go 早期的 `js.Wrapper` 之类的接口。
 
 ## 9. 链接和文件格式
@@ -200,12 +201,22 @@ doc.call("addEventListener", &[Value::from("click"), cb.value()]);
 
 | 模块 | js 上 |
 |---|---|
-| io 的标准输出和标准错误、time、rand、env（参数和环境变量由胶水 JS 传入）、process::exit | 支持 |
-| thread（绿色线程）、sync、mpmc、select、定时器 | 支持（单线程） |
-| fs、net、process（子进程） | 返回 `ErrorKind::Unsupported`（浏览器里没有这些）。`http::Client` 以后可以用 fetch 实现（Go 的 net/http 在 js 上就是这样），放到 W4 |
-| crypto | 用纯 navi 的实现 |
+| 纯计算的模块：集合、字符串、`fmt`、`iter`、`num`、`json`、`serde`、`csv`、`base64`、`hex`、`url`、`regex`、`compress`、`pem`、`path`（只做拼接和解析）、`derive`、`cli`、`gc`、`bench` | 不变 |
+| `crypto` | 用纯 navi 的后备实现（没有汇编加速）；`crypto::x509` 能解析和用给定的根证书验证，不能用系统根证书 |
+| `io` 的标准输出和标准错误、`log` | 写到 console |
+| `time`、`thread::sleep`、定时器 | `performance.now`、`Date`、`setTimeout` |
+| `rand` | `crypto.getRandomValues` |
+| `chrono` 的本地时区（`Local`） | 用 JS `Date` 的时区偏移（导入 `tz_offset(sec) -> sec`） |
+| `env::args`、`env::var` | 由页面通过胶水 JS 传入 |
+| `thread`、`sync`、`mpmc`、`select` | 支持，所有 G 在一个 M 上；`available_parallelism()` 为 1 |
+| `process::exit` | 支持 |
+| `fs`、`net`（TCP、UDP、DNS）、`http` 的服务端、`tls`、`process::Command`、`io::stdin`、`env::current_dir` / `home_dir` / `temp_dir` 等 | 照常能编译，运行时返回 `ErrorKind::Unsupported`（同 Rust 的 wasm32-unknown-unknown 和 Go 的 js/wasm：跨平台的代码和库不用加 cfg 就能编译）。`stdin` 读到的是空 |
+| `http::Client` | 先返回 Unsupported；以后可以用 fetch 实现（Go 的 net/http 在 js 上就是这样），放到 W4 |
+| `os` 的 unix、windows 扩展 | 本来就不在 js 上编译 |
 
-`std::sys` 加 `js.navi`，和 unix、windows 并列；`net/sys`、`os` 同样处理。
+`std::sys` 加 `js.navi`，和 unix、windows 并列；`net/sys` 同样处理，里面的函数都返回 Unsupported。
+
+浏览器特有的 API（localStorage、IndexedDB、Canvas、WebSocket……）不进 std，通过 `std::js` 直接调用（第 8 节）。从 WebIDL 生成带类型的绑定（像 Rust 的 web-sys）以后再考虑，不在这次的计划里。
 
 ## 11. 测试和 CI
 
@@ -236,3 +247,5 @@ doc.call("addEventListener", &[Value::from("click"), cb.value()]);
 2. 指针照 Go：8 字节指针，32 位线性内存。
 3. 抢占照 Go：只做协作式。
 4. 只面向浏览器，不支持 Node；测试也在无头浏览器里跑。
+5. 浏览器里没有的 std 功能照常能编译，运行时返回 `ErrorKind::Unsupported`。
+6. 浏览器特有的 API 通过 `std::js` 调用；从 WebIDL 生成绑定暂不做。
