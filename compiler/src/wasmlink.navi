@@ -15,7 +15,9 @@
 //! - Exports: memory, run(argc, argv) and resume(), both the run loop: it calls
 //!   the function G_TARGET names until a frame returns 0 (then on at G_RA_OUT)
 //!   or the stack unwinds to go idle (then back to JS with the milliseconds to
-//!   wait: -1 until an event).
+//!   wait: -1 until an event); and callback(), which runs _navi_jscb (the Funcs
+//!   JS calls from inside a call to JS) on the running G, a run loop of its own
+//!   until that returns.
 
 use std::collections::HashMap;
 
@@ -312,7 +314,8 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
             i += 1;
         }
     }
-    // Types: 0 navi functions, 1 run, 2 resume, then the imports'.
+    // Types: 0 navi functions, 1 run, 2 resume and callback, then the
+    // imports'.
     let mut types: Vec<String> = Vec::new();
     types.push("i:i".to_string());
     types.push("ii:i".to_string());
@@ -368,16 +371,17 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
         ii += 1;
     }
     section(&mut out, 2, &b);
-    // Function section: the functions, then run and resume.
+    // Function section: the functions, then run, resume and callback.
     let nfun = funs.len() as u64;
     b = Vec::new();
-    uleb(&mut b, nfun + 2);
+    uleb(&mut b, nfun + 3);
     k = 0;
     while k < funs.len() {
         uleb(&mut b, 0);
         k += 1;
     }
     uleb(&mut b, 1);
+    uleb(&mut b, 2);
     uleb(&mut b, 2);
     section(&mut out, 3, &b);
     // Table: every function by its index.
@@ -409,7 +413,7 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     section(&mut out, 6, &b);
     // Exports.
     b = Vec::new();
-    uleb(&mut b, 3);
+    uleb(&mut b, 4);
     name(&mut b, "memory");
     b.push(0x02);
     uleb(&mut b, 0);
@@ -419,6 +423,9 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     name(&mut b, "resume");
     b.push(0x00);
     uleb(&mut b, nimp + nfun + 1);
+    name(&mut b, "callback");
+    b.push(0x00);
+    uleb(&mut b, nimp + nfun + 2);
     section(&mut out, 7, &b);
     // Elements: table[i] = function i (the defined ones).
     b = Vec::new();
@@ -447,17 +454,28 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
         Some(id) => value[*id as usize],
         None => 0,
     };
+    let jscb = match o.ids.get(&"_navi_jscb".to_string()) {
+        Some(id) => value[*id as usize],
+        None => 0,
+    };
     b = Vec::new();
-    uleb(&mut b, nfun + 2);
+    uleb(&mut b, nfun + 3);
     for f in funs.iter() {
         b.extend_from_slice(&code[f.off as usize..f.end as usize]);
     }
-    let run = run_body(true, entry, argc, argv, g0_top as i64);
-    uleb(&mut b, run.len() as u64);
-    b.extend_from_slice(run.as_slice());
-    let res = run_body(false, 0, 0, 0, 0);
-    uleb(&mut b, res.len() as u64);
-    b.extend_from_slice(res.as_slice());
+    let mut bi = 0u8;
+    while bi < 3 {
+        let body = run_body(
+            bi,
+            if bi == 2 { jscb } else { entry },
+            argc,
+            argv,
+            g0_top as i64,
+        );
+        uleb(&mut b, body.len() as u64);
+        b.extend_from_slice(body.as_slice());
+        bi += 1;
+    }
     section(&mut out, 10, &b);
     // Data: the sections from 4096.
     b = Vec::new();
@@ -487,7 +505,7 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     b = Vec::new();
     name(&mut b, "name");
     let mut fnames: Vec<u8> = Vec::new();
-    uleb(&mut fnames, nfun + 2);
+    uleb(&mut fnames, nfun + 3);
     k = 0;
     while k < funs.len() {
         uleb(&mut fnames, nimp + k as u64);
@@ -498,6 +516,8 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     name(&mut fnames, "run");
     uleb(&mut fnames, nimp + nfun + 1);
     name(&mut fnames, "resume");
+    uleb(&mut fnames, nimp + nfun + 2);
+    name(&mut fnames, "callback");
     b.push(1);
     uleb(&mut b, fnames.len() as u64);
     b.extend_from_slice(fnames.as_slice());
@@ -505,8 +525,9 @@ pub fn link(o: &Object) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-// The code entry of run (else resume): the start, then the run loop.
-fn run_body(run: bool, entry: i64, argc: i64, argv: i64, top: i64) -> Vec<u8> {
+// The code entry of run (kind 0), resume (1) or callback (2): the start,
+// then the run loop.
+fn run_body(kind: u8, entry: i64, argc: i64, argv: i64, top: i64) -> Vec<u8> {
     let mut c: Vec<u8> = Vec::new();
     uleb(&mut c, 0); // no locals
     let gset = |c: &mut Vec<u8>, g: u32| {
@@ -521,7 +542,7 @@ fn run_body(run: bool, entry: i64, argc: i64, argv: i64, top: i64) -> Vec<u8> {
         c.push(0x42);
         sleb(c, v);
     };
-    if run {
+    if kind == 0 {
         // [argc] = argc, [argv] = argv (i64 words).
         c.push(0x41);
         sleb(&mut c, argc);
@@ -545,13 +566,21 @@ fn run_body(run: bool, entry: i64, argc: i64, argv: i64, top: i64) -> Vec<u8> {
         gset(&mut c, w::G_FP);
         i64c(&mut c, entry);
         gset(&mut c, w::G_TARGET);
-    } else {
+    } else if kind == 1 {
         gget(&mut c, w::G_IDLE_SP);
         gset(&mut c, w::G_SP);
         gget(&mut c, w::G_IDLE_FP);
         gset(&mut c, w::G_FP);
         gget(&mut c, w::G_IDLE_PC);
         gset(&mut c, w::G_TARGET);
+    } else {
+        // On the running G's stack, returning to PC 0 (the end).
+        i64c(&mut c, entry);
+        gset(&mut c, w::G_TARGET);
+        i64c(&mut c, 0);
+        gset(&mut c, w::G_RA);
+        i64c(&mut c, 0);
+        gset(&mut c, w::G_DEPTH);
     }
     i64c(&mut c, 0);
     gset(&mut c, w::G_REASON);
@@ -576,12 +605,28 @@ fn run_body(run: bool, entry: i64, argc: i64, argv: i64, top: i64) -> Vec<u8> {
     c.push(0x50);
     c.push(0x0d); // br_if 1: a switch, on at G_TARGET
     uleb(&mut c, 1);
+    if kind == 2 {
+        // Idle inside a call from JS: what the callback waits for cannot
+        // come.
+        c.push(0x00);
+    }
     i64c(&mut c, 0);
     gset(&mut c, w::G_REASON);
     gget(&mut c, w::G_WAIT);
     c.push(0xa7);
     c.push(0x0f);
     c.push(0x05);
+    if kind == 2 {
+        // The callback returned (to PC 0): back to JS.
+        gget(&mut c, w::G_RA_OUT);
+        c.push(0x50);
+        c.push(0x04);
+        c.push(0x40);
+        c.push(0x41);
+        c.push(0x00);
+        c.push(0x0f);
+        c.push(0x0b);
+    }
     gget(&mut c, w::G_RA_OUT);
     gset(&mut c, w::G_TARGET);
     c.push(0x0b);

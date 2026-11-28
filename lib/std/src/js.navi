@@ -1,0 +1,469 @@
+//! Access to JavaScript from programs built for js-wasm32 (docs/wasm.md),
+//! as Go's syscall/js: [`Value`]s are JS values (a number, a string, an
+//! object, a function...), [`Func`] makes a navi closure callable from JS.
+//!
+//! Calls are synchronous and block the green thread making them (as the
+//! rest of navi); a JS function that returns a Promise returns it as a
+//! Value. A JS exception thrown by [`Value::call`], [`Value::invoke`] or
+//! [`Value::new`] panics with the exception's message, as Go's.
+//!
+//! ```no_run
+//! use std::js::{self, Func, Value};
+//!
+//! let doc = js::global().get("document");
+//! let p = doc.call("createElement", &[Value::from("p")]);
+//! p.set("textContent", Value::from("hello"));
+//! doc.get("body").call("appendChild", &[p]);
+//!
+//! let cb = Func::new(|_this: Value, args: Vec<Value>| -> Value {
+//!     println(`clicked at ${args[0].get("clientX").int()}`);
+//!     Value::undefined()
+//! });
+//! doc.call("addEventListener", &[Value::from("click"), cb.value()]);
+//! ```
+
+use crate::{fmt, string::String, vec::Vec};
+
+#[link(wasm_import_module = "navi")]
+#[nonblocking]
+extern "C" {
+    fn js_get(v: u32, p: u32, n: u32) -> u32;
+    fn js_set(v: u32, p: u32, n: u32, x: u32);
+    fn js_delete(v: u32, p: u32, n: u32);
+    fn js_index(v: u32, i: u32) -> u32;
+    fn js_set_index(v: u32, i: u32, x: u32);
+    // >= 0: the result; < 0: the exception thrown (-1 - its id).
+    fn js_call(v: u32, p: u32, n: u32, args: u32, nargs: u32) -> i32;
+    fn js_invoke(v: u32, args: u32, nargs: u32) -> i32;
+    fn js_new(v: u32, args: u32, nargs: u32) -> i32;
+    fn js_number(x: f64) -> u32;
+    fn js_float(v: u32) -> f64;
+    fn js_string(p: u32, n: u32) -> u32;
+    // String(v) as UTF-8: its length (kept), then copied to p.
+    fn js_string_len(v: u32) -> u32;
+    fn js_string_copy(p: u32);
+    fn js_type(v: u32) -> i32;
+    fn js_truthy(v: u32) -> i32;
+    fn js_instance_of(v: u32, t: u32) -> i32;
+    fn js_length(v: u32) -> u32;
+    fn js_equal(a: u32, b: u32) -> i32;
+    fn js_release(v: u32);
+    fn js_copy_to_navi(p: u32, n: u32, v: u32) -> u32;
+    fn js_copy_to_js(v: u32, p: u32, n: u32) -> u32;
+    // A JS function calling Func id.
+    fn js_func(id: u32) -> u32;
+    // The event a JS function call made (crate::rt): its Func (-1: none),
+    // this and arguments; its result.
+    fn js_event_func() -> i32;
+    fn js_event_this() -> u32;
+    fn js_event_nargs() -> u32;
+    fn js_event_arg(i: u32) -> u32;
+    fn js_event_return(v: u32);
+}
+
+// The values the glue's table starts with.
+const UNDEFINED: u32 = 0;
+const NULL: u32 = 1;
+const TRUE: u32 = 2;
+const FALSE: u32 = 3;
+const GLOBAL: u32 = 4;
+const FIXED: u32 = 5;
+
+// A reference into the glue's table, released when no Value holds it.
+struct Ref {
+    id: u32,
+}
+
+/// A JavaScript value.
+#[derive(Clone)]
+pub struct Value {
+    r: &Ref,
+}
+
+/// The type of a [`Value`], as JavaScript's typeof (with null apart).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Type {
+    Undefined,
+    Null,
+    Boolean,
+    Number,
+    String,
+    Symbol,
+    Object,
+    Function,
+    BigInt,
+}
+
+fn release(id: u32) {
+    unsafe { js_release(id) };
+}
+
+fn value(id: u32) -> Value {
+    let r = &Ref { id };
+    if id >= FIXED {
+        crate::gc::add_cleanup(r, release, id);
+    }
+    Value { r }
+}
+
+/// The JavaScript global object (globalThis: window in a page).
+pub fn global() -> Value {
+    value(GLOBAL)
+}
+
+// A navi string's pointer and length for the glue.
+fn sp(s: &str) -> (u32, u32) {
+    (s.as_ptr() as usize as u32, s.len() as u32)
+}
+
+// The ids of args, in memory for the glue.
+fn ids(args: &[Value]) -> Vec<u32> {
+    let mut v: Vec<u32> = Vec::with_capacity(args.len());
+    for a in args.iter() {
+        v.push(a.r.id);
+    }
+    v
+}
+
+// A call's result, or its exception as a panic.
+fn result(r: i32, what: &str) -> Value {
+    if r >= 0 {
+        return value(r as u32);
+    }
+    let e = value((-1 - r) as u32);
+    let msg = if e.type_of() == Type::Object && e.get("message").type_of() == Type::String {
+        e.get("message").string()
+    } else {
+        e.string()
+    };
+    crate::panic::panic(`JavaScript error in ${what}: ${msg}`)
+}
+
+impl Value {
+    /// JavaScript's undefined.
+    pub fn undefined() -> Value {
+        value(UNDEFINED)
+    }
+
+    /// JavaScript's null.
+    pub fn null() -> Value {
+        value(NULL)
+    }
+
+    /// The property p (v[p]).
+    pub fn get(&self, p: &str) -> Value {
+        let (a, n) = sp(p);
+        value(unsafe { js_get(self.r.id, a, n) })
+    }
+
+    /// Sets the property p (v[p] = x).
+    pub fn set<X: Into<Value>>(&self, p: &str, x: X) {
+        let x = x.into();
+        let (a, n) = sp(p);
+        unsafe { js_set(self.r.id, a, n, x.r.id) };
+    }
+
+    /// Deletes the property p.
+    pub fn delete(&self, p: &str) {
+        let (a, n) = sp(p);
+        unsafe { js_delete(self.r.id, a, n) };
+    }
+
+    /// The element i (v[i]).
+    pub fn index(&self, i: usize) -> Value {
+        value(unsafe { js_index(self.r.id, i as u32) })
+    }
+
+    /// Sets the element i (v[i] = x).
+    pub fn set_index<X: Into<Value>>(&self, i: usize, x: X) {
+        let x = x.into();
+        unsafe { js_set_index(self.r.id, i as u32, x.r.id) };
+    }
+
+    /// Calls the method m with args (v.m(...args)).
+    ///
+    /// # Panics
+    ///
+    /// If it throws.
+    pub fn call(&self, m: &str, args: &[Value]) -> Value {
+        let a = ids(args);
+        let (p, n) = sp(m);
+        let r = unsafe { js_call(self.r.id, p, n, a.as_ptr() as usize as u32, a.len() as u32) };
+        result(r, m)
+    }
+
+    /// Calls v as a function with args (v(...args)).
+    ///
+    /// # Panics
+    ///
+    /// If it throws.
+    pub fn invoke(&self, args: &[Value]) -> Value {
+        let a = ids(args);
+        let r = unsafe { js_invoke(self.r.id, a.as_ptr() as usize as u32, a.len() as u32) };
+        result(r, "invoke")
+    }
+
+    /// Calls v as a constructor with args (new v(...args)).
+    ///
+    /// # Panics
+    ///
+    /// If it throws.
+    pub fn new(&self, args: &[Value]) -> Value {
+        let a = ids(args);
+        let r = unsafe { js_new(self.r.id, a.as_ptr() as usize as u32, a.len() as u32) };
+        result(r, "new")
+    }
+
+    /// v.length.
+    pub fn length(&self) -> usize {
+        unsafe { js_length(self.r.id) as usize }
+    }
+
+    /// The number v is.
+    pub fn float(&self) -> f64 {
+        unsafe { js_float(self.r.id) }
+    }
+
+    /// The number v is, truncated.
+    pub fn int(&self) -> i64 {
+        self.float() as i64
+    }
+
+    /// Whether v is true.
+    pub fn bool(&self) -> bool {
+        self.r.id == TRUE
+    }
+
+    /// Whether v is truthy (as `!!v`).
+    pub fn truthy(&self) -> bool {
+        unsafe { js_truthy(self.r.id) != 0 }
+    }
+
+    /// String(v): a string's text, else its conversion ("[object Object]").
+    pub fn string(&self) -> String {
+        let n = unsafe { js_string_len(self.r.id) } as usize;
+        let mut b: Vec<u8> = Vec::with_capacity(n);
+        unsafe {
+            b.set_len(n);
+            js_string_copy(b.as_mut_ptr() as usize as u32);
+        }
+        String::from_utf8(b).unwrap_or(String::new())
+    }
+
+    /// v's type.
+    pub fn type_of(&self) -> Type {
+        match unsafe { js_type(self.r.id) } {
+            0 => Type::Undefined,
+            1 => Type::Null,
+            2 => Type::Boolean,
+            3 => Type::Number,
+            4 => Type::String,
+            5 => Type::Symbol,
+            7 => Type::Function,
+            8 => Type::BigInt,
+            _ => Type::Object,
+        }
+    }
+
+    pub fn is_undefined(&self) -> bool {
+        self.type_of() == Type::Undefined
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.type_of() == Type::Null
+    }
+
+    /// Whether v is NaN.
+    pub fn is_nan(&self) -> bool {
+        self.type_of() == Type::Number && self.float().is_nan()
+    }
+
+    /// v instanceof t.
+    pub fn instance_of(&self, t: &Value) -> bool {
+        unsafe { js_instance_of(self.r.id, t.r.id) != 0 }
+    }
+
+    /// v === w.
+    pub fn equal(&self, w: &Value) -> bool {
+        unsafe { js_equal(self.r.id, w.r.id) != 0 }
+    }
+}
+
+impl From<f64> for Value {
+    fn from(x: f64) -> Value {
+        value(unsafe { js_number(x) })
+    }
+}
+
+impl From<i32> for Value {
+    fn from(x: i32) -> Value {
+        Value::from(x as f64)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(x: i64) -> Value {
+        Value::from(x as f64)
+    }
+}
+
+impl From<u32> for Value {
+    fn from(x: u32) -> Value {
+        Value::from(x as f64)
+    }
+}
+
+impl From<usize> for Value {
+    fn from(x: usize) -> Value {
+        Value::from(x as f64)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Value {
+        value(if b { TRUE } else { FALSE })
+    }
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Value {
+        let (p, n) = sp(s);
+        value(unsafe { js_string(p, n) })
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Value {
+        Value::from(s.as_str())
+    }
+}
+
+impl From<&Func> for Value {
+    fn from(f: &Func) -> Value {
+        f.value()
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.type_of() {
+            Type::String => f.write_fmt(`${self.string():?}`),
+            _ => f.write_str(self.string().as_str()),
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.string().as_str())
+    }
+}
+
+/// Copies the bytes of src (a Uint8Array or Uint8ClampedArray) to dst: how
+/// many (the shorter of the two lengths).
+pub fn copy_bytes_to_navi(dst: &mut [u8], src: &Value) -> usize {
+    unsafe {
+        js_copy_to_navi(dst.as_mut_ptr() as usize as u32, dst.len() as u32, src.r.id) as usize
+    }
+}
+
+/// Copies src to dst (a Uint8Array or Uint8ClampedArray): how many bytes.
+pub fn copy_bytes_to_js(dst: &Value, src: &[u8]) -> usize {
+    unsafe { js_copy_to_js(dst.r.id, src.as_ptr() as usize as u32, src.len() as u32) as usize }
+}
+
+// --- Functions
+// -----------------------------------------------------------------
+
+/// A navi function JavaScript can call (Go's js.Func): JS calls it with its
+/// this and arguments; its result goes back.
+///
+/// It runs on a green thread of its own while the program waits for
+/// events (an event handler, a timer's callback), else (called by JS that
+/// navi called) on the thread making that call; either way the JS call
+/// waits for it, so it must not block on something only more JS could do.
+/// It stays callable (and keeps the program from ending in a deadlock
+/// while it waits) until [`Func::release`].
+#[derive(Clone)]
+pub struct Func {
+    id: u32,
+    v: Value,
+}
+
+// (None until the first Func: an initializer allocating would run early,
+// the runtime calling std::js.)
+static mut FUNCS: Option<Vec<Option<fn(Value, Vec<Value>) -> Value>>> = None;
+static mut LIVE: usize = 0;
+
+fn funcs() -> Vec<Option<fn(Value, Vec<Value>) -> Value>> {
+    if let Some(v) = FUNCS {
+        return v;
+    }
+    let v: Vec<Option<fn(Value, Vec<Value>) -> Value>> = Vec::new();
+    FUNCS = Some(v);
+    v
+}
+
+impl Func {
+    pub fn new(f: fn(Value, Vec<Value>) -> Value) -> Func {
+        let mut fs = funcs();
+        let mut id = fs.len();
+        let mut i = 0;
+        while i < fs.len() {
+            if fs[i].is_none() {
+                id = i;
+                break;
+            }
+            i += 1;
+        }
+        if id == fs.len() {
+            fs.push(Some(f));
+        } else {
+            fs[id] = Some(f);
+        }
+        LIVE += 1;
+        crate::rt::js::set_waiters(LIVE);
+        crate::rt::js::start_events();
+        let v = value(unsafe { js_func(id as u32) });
+        Func { id: id as u32, v }
+    }
+
+    /// The JS function.
+    pub fn value(&self) -> Value {
+        self.v.clone()
+    }
+
+    /// Makes it uncallable (JS calling it then throws).
+    pub fn release(&self) {
+        let mut fs = funcs();
+        if fs[self.id as usize].is_some() {
+            fs[self.id as usize] = None;
+            LIVE -= 1;
+            crate::rt::js::set_waiters(LIVE);
+        }
+    }
+}
+
+/// Runs the Funcs of the events JS made (crate::rt::js's handler, and the
+/// glue's callback export for calls nested in a call to JS).
+pub(crate) fn handle_events() {
+    loop {
+        let f = unsafe { js_event_func() };
+        if f < 0 {
+            return;
+        }
+        let this = value(unsafe { js_event_this() });
+        let n = unsafe { js_event_nargs() };
+        let mut args: Vec<Value> = Vec::with_capacity(n as usize);
+        let mut i = 0;
+        while i < n {
+            args.push(value(unsafe { js_event_arg(i) }));
+            i += 1;
+        }
+        let r = match funcs()[f as usize] {
+            Some(g) => g(this, args),
+            None => crate::panic::panic("js: a released Func was called"),
+        };
+        unsafe { js_event_return(r.r.id) };
+    }
+}
