@@ -9,6 +9,18 @@
 
 use crate::ssa::*;
 
+/// One move of an edge: value val's bits from a register (src_reg), a slot
+/// (src_slot), or made again (both -1: val is a constant or an address) to
+/// a register or a slot.
+#[derive(Clone)]
+pub struct Move {
+    pub val: u32,
+    pub src_reg: i32,
+    pub src_slot: i32,
+    pub dst_reg: i32,
+    pub dst_slot: i32,
+}
+
 pub struct Config {
     /// Registers calls clobber, and ones they preserve (abstract numbers).
     pub caller: Vec<u8>,
@@ -25,15 +37,20 @@ pub struct Alloc {
     pub slot_ptr: Vec<bool>,
     /// The callee-saved registers used.
     pub used_callee: Vec<u8>,
-    /// By value id: the position (layout order) of each value, and the
-    /// calls' positions with the callee-saved registers holding pointers
-    /// across them (bit k: callee[k]).
+    /// By value id: the position (layout order) of each value, and for a
+    /// call the callee-saved registers holding pointers across it (bit k:
+    /// callee[k]).
     pub ord: Vec<i64>,
-    pub call_masks: Vec<(i64, u32)>,
+    pub call_mask: Vec<u32>,
+    /// By block id: the moves at its end, into the places its successor
+    /// expects (a parallel copy; phis' moves among them). Only plain blocks
+    /// have them (all critical edges are split).
+    pub edge_moves: Vec<Vec<Move>>,
     // Buffers, kept from one function to the next.
     bstart: Vec<i64>,
     bend: Vec<i64>,
     calls: Vec<i64>,
+    call_ids: Vec<u32>,
     start: Vec<i64>,
     end: Vec<i64>,
     gix: Vec<i32>,
@@ -65,10 +82,12 @@ pub fn empty() -> &mut Alloc {
         slot_ptr: Vec::new(),
         used_callee: Vec::new(),
         ord: Vec::new(),
-        call_masks: Vec::new(),
+        call_mask: Vec::new(),
+        edge_moves: Vec::new(),
         bstart: Vec::new(),
         bend: Vec::new(),
         calls: Vec::new(),
+        call_ids: Vec::new(),
         start: Vec::new(),
         end: Vec::new(),
         gix: Vec::new(),
@@ -102,6 +121,19 @@ pub fn remat(v: &Value) -> bool {
         || v.op == OP_CONSTPARAM
         || v.op == OP_VTABLE
         || v.op == OP_CLOSURECODE
+}
+
+// Whether b is an empty block on a critical edge into a block without phis.
+fn edge_block(b: &Block) -> bool {
+    if b.kind != B_PLAIN || b.values.len() > 0 || b.preds.len() != 1 || b.preds[0].succs.len() < 2 {
+        return false;
+    }
+    for v in b.succs[0].values.iter() {
+        if v.op == OP_PHI {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether the op calls (so registers calls clobber do not survive it).
@@ -143,19 +175,38 @@ pub fn allocate(f: &Func, cfg: &Config, fused: &Vec<bool>, a: &mut Alloc) {
     bend.clear();
     let mut calls = a.calls;
     calls.clear();
+    let mut call_ids = a.call_ids;
+    call_ids.clear();
     let mut p = 0i64;
     for b in f.blocks.iter() {
+        // An edge block (split off a critical edge into a block without
+        // phis: empty, no moves) takes no positions: it is where its
+        // predecessor ends.
+        if edge_block(*b) {
+            bstart.push(-1);
+            bend.push(-1);
+            continue;
+        }
         bstart.push(p);
         p += 2;
         for v in b.values.iter() {
             ord[v.id as usize] = p;
             if is_call(*v) {
                 calls.push(p);
+                call_ids.push(v.id);
             }
             p += 2;
         }
         bend.push(p);
         p += 2;
+    }
+    for b in f.blocks.iter() {
+        let i = b.id as usize;
+        if bstart[i] < 0 {
+            let e = bend[b.preds[0].id as usize];
+            bstart[i] = e;
+            bend[i] = e;
+        }
     }
     let mut start = a.start;
     start.clear();
@@ -627,8 +678,9 @@ pub fn allocate(f: &Func, cfg: &Config, fused: &Vec<bool>, a: &mut Alloc) {
             diff[lo * ncallee + k] -= 1;
         }
     }
-    let mut call_masks = a.call_masks;
-    call_masks.clear();
+    let mut call_mask = a.call_mask;
+    call_mask.clear();
+    call_mask.resize(n, 0);
     let mut run = a.run;
     run.clear();
     run.resize(ncallee, 0);
@@ -643,7 +695,53 @@ pub fn allocate(f: &Func, cfg: &Config, fused: &Vec<bool>, a: &mut Alloc) {
             }
             k += 1;
         }
-        call_masks.push((calls[c], mask));
+        call_mask[call_ids[c] as usize] = mask;
         c += 1;
+    }
+    // The phis' moves at the ends of their predecessors.
+    let mut em = a.edge_moves;
+    for ms in em.iter_mut() {
+        ms.clear();
+    }
+    while em.len() < nb {
+        em.push(Vec::new());
+    }
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        if b.kind != B_PLAIN {
+            continue;
+        }
+        let s = b.succs[0];
+        let mut pi = 0;
+        while pi < s.preds.len() {
+            if s.preds[pi].id == b.id {
+                break;
+            }
+            pi += 1;
+        }
+        for vv in s.values.iter() {
+            let v = *vv;
+            if v.op != OP_PHI {
+                break;
+            }
+            let id = v.id as usize;
+            if reg[id] < 0 && a.slot[id] < 0 {
+                continue;
+            }
+            let x = v.args[pi];
+            let xid = x.id as usize;
+            if (reg[id] >= 0 && reg[id] == reg[xid])
+                || (a.slot[id] >= 0 && a.slot[id] == a.slot[xid])
+            {
+                continue;
+            }
+            em[b.id as usize].push(Move {
+                val: x.id,
+                src_reg: reg[xid],
+                src_slot: a.slot[xid],
+                dst_reg: reg[id],
+                dst_slot: a.slot[id],
+            });
+        }
     }
 }
