@@ -957,3 +957,154 @@ pub fn dead_stores(f: &mut Func, quiet: &Vec<bool>) {
         copyelim(f);
     }
 }
+
+/// Go's shortcircuit: a phi's argument that is the branch condition of the
+/// block it comes from is known on that edge (true on the first, false on
+/// the second); and a block that only branches on a phi of constants
+/// passes those edges straight to the successor they pick. `a && b` and
+/// `a || b` so branch on a and b themselves (each compare then fuses with
+/// its branch) instead of on a bool merged from them.
+pub fn shortcircuit(f: &mut Func) {
+    // (Without the construction's copies: a block of just the phi, its
+    // uses counted right.)
+    copyelim(f);
+    deadcode(f);
+    let mut t_const: Option<&mut Value> = None;
+    let mut f_const: Option<&mut Value> = None;
+    let mut changed = false;
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        for vv in b.values.iter() {
+            let v = *vv;
+            if v.op != OP_PHI {
+                break;
+            }
+            if v.ty != T_BOOL {
+                continue;
+            }
+            let mut i = 0;
+            while i < v.args.len() {
+                let p = b.preds[i];
+                let a = v.args[i];
+                i += 1;
+                if p.kind != B_IF || p.succs[0].id == p.succs[1].id {
+                    continue;
+                }
+                let c = match p.control {
+                    Some(c) => c,
+                    None => continue,
+                };
+                if c.id != a.id {
+                    continue;
+                }
+                let truth = p.succs[0].id == b.id;
+                let k = if truth {
+                    match t_const {
+                        Some(x) => x,
+                        None => {
+                            let x = bool_const(f, true);
+                            t_const = Some(x);
+                            x
+                        }
+                    }
+                } else {
+                    match f_const {
+                        Some(x) => x,
+                        None => {
+                            let x = bool_const(f, false);
+                            f_const = Some(x);
+                            x
+                        }
+                    }
+                };
+                a.uses -= 1;
+                k.uses += 1;
+                v.args[i - 1] = k;
+                changed = true;
+            }
+        }
+    }
+    // Edges past blocks that only branch on a phi of constants.
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        bi += 1;
+        if b.kind != B_IF || b.values.len() != 1 {
+            continue;
+        }
+        let ph = b.values[0];
+        if ph.op != OP_PHI || ph.uses != 1 || b.control.unwrap().id != ph.id {
+            continue;
+        }
+        if b.succs[0].id == b.id || b.succs[1].id == b.id {
+            continue;
+        }
+        let mut i = ph.args.len();
+        while i > 0 {
+            i -= 1;
+            let a = ph.args[i];
+            if a.op != OP_CONST {
+                continue;
+            }
+            let p = b.preds[i];
+            let t = if a.aux_int != 0 {
+                b.succs[0]
+            } else {
+                b.succs[1]
+            };
+            // (Not into a block p already goes to: one edge per pair.)
+            let mut dup = false;
+            for q in t.preds.iter() {
+                if q.id == p.id {
+                    dup = true;
+                }
+            }
+            let mut idx = 0;
+            let mut n = 0;
+            let mut j = 0;
+            while j < p.succs.len() {
+                if p.succs[j].id == b.id {
+                    idx = j;
+                    n += 1;
+                }
+                j += 1;
+            }
+            if dup || n != 1 {
+                continue;
+            }
+            // t's phis get, for the new edge, what they got through b.
+            let mut tk = 0;
+            while tk < t.preds.len() && t.preds[tk].id != b.id {
+                tk += 1;
+            }
+            for vv in t.values.iter() {
+                let v = *vv;
+                if v.op != OP_PHI {
+                    break;
+                }
+                let x = v.args[tk];
+                x.uses += 1;
+                v.args.push(x);
+            }
+            t.preds.push(p);
+            p.succs[idx] = t;
+            b.preds.remove(i);
+            a.uses -= 1;
+            ph.args.remove(i);
+            changed = true;
+        }
+    }
+    if changed {
+        prune(f);
+        copyelim(f);
+    }
+}
+
+// A bool constant in the entry block.
+fn bool_const(f: &mut Func, t: bool) -> &mut Value {
+    let e = f.entry.unwrap();
+    let c = f.new_value(OP_CONST, T_BOOL, if t { 1 } else { 0 });
+    c.args.clear();
+    e.add(c);
+    c
+}
