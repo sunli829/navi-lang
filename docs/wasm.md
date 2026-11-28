@@ -1,6 +1,6 @@
 # WebAssembly 目标设计（浏览器，照 Go 的 js/wasm）
 
-目标：`navi build --target js-wasm32` 生成一个 `.wasm` 文件，配上 std 自带的胶水 JS（`navi_wasm.js`），在浏览器和 Node 里运行。语言、std 的 API 和运行时的约定都不变：GC、可增长的栈、绿色线程、channel 和 `select`、`defer`、panic 和 `catch_unwind` 照常可用。另外新增 `std::js`，对应 Go 的 `syscall/js`，用来访问 JS 的值和 DOM。
+目标：`navi build --target js-wasm32` 生成一个 `.wasm` 文件，配上 std 自带的胶水 JS（`navi_wasm.js`），在浏览器里运行。只面向浏览器，不支持 Node（不提供 Node 下的文件系统、子进程等）。语言、std 的 API 和运行时的约定都不变：GC、可增长的栈、绿色线程、channel 和 `select`、`defer`、panic 和 `catch_unwind` 照常可用。另外新增 `std::js`，对应 Go 的 `syscall/js`，用来访问 JS 的值和 DOM。
 
 整体照 Go 的 js/wasm 做（`cmd/compile/internal/wasm`、`runtime/*_wasm.*`、`syscall/js`、`lib/wasm/wasm_exec.js`）。原因是 navi 的运行时本来就是照 Go 写的：
 - 精确的栈图；
@@ -112,7 +112,7 @@ Go 在 wasm 上解决的问题，正好就是 navi 会遇到的问题。
 | 入口 | 导出 `run(argc, argv)`：初始化 g0、堆、主 G，进入 `run_loop`。没有 `gen_main` 那段原生入口代码 |
 | M 和线程 | 只有一个 M，不创建线程（`pthread_create` 的路径在 js 上不编译）。没有 sysmon |
 | 调度 | 现有的队列和窃取代码照用（只有一个本地队列）。没有可运行的 G 时：有定时器就让 JS 设 `setTimeout`，然后返回 JS；JS 回调时调用导出的 `resume()` 继续 |
-| 抢占 | 和 Go 的 wasm 一样只有协作式：在函数调用和 channel 操作处切换。纯计算的死循环会卡住页面（第 11 节的待定问题） |
+| 抢占 | 和 Go 的 wasm 一样只有协作式：在函数调用和 channel 操作处切换，循环回边不检查时间。纯计算的长循环会占住页面，直到它让出 |
 | 内存 | `mmap` 换成 `memory.grow`。arena 从 64 MiB 改为 4 MiB（Go 在 wasm 上也是 4 MiB）。内存不能还给宿主，scavenger 在 js 上什么也不做。GC 元数据原来用 `calloc` 分配，改为从 arena 里分配 |
 | GC | 标记工作者本来就是 G，单线程时在 G 停下时运行（`start_cycle` 里已有这种处理）。写屏障、标记辅助、清扫、步调控制都照旧。根：栈（在线性内存里，精确扫描）和数据段 |
 | 栈 | 初始和最大大小改小（4 GiB 的地址空间里，最大 1 GiB 太大，比如改成 256 MiB） |
@@ -126,20 +126,19 @@ Go 在 wasm 上解决的问题，正好就是 navi 会遇到的问题。
 
 wasm 模块从模块 `"navi"` 导入下面这些函数，参数和返回值都是 wasm 的 i32、i64、f64：
 
-- `write(fd, ptr, len)`：Node 里用 `fs.writeSync`；浏览器里按行缓冲，写到 `console.log` / `console.error`。
+- `write(fd, ptr, len)`：按行缓冲，写到 `console.log` / `console.error`；页面可以换成自己的输出函数（测试页把输出发回 `navi test`，第 11 节）。
 - `exit(code)`。
 - `nanotime() -> i64`（`performance.now`）、`walltime() -> (sec, nsec)`（`Date.now`）。
 - `schedule_timeout(ms) -> id`、`clear_timeout(id)`：到期后调用 `resume()`。
 - `random(ptr, len)`（`crypto.getRandomValues`）。
 - `std::js` 用的那一组：`value_get`、`value_set`、`value_index`、`value_call`、`value_invoke`、`value_new`、`value_length`、`value_prepare_string`、`value_load_string`、`value_instance_of`、`copy_bytes_to_navi`、`copy_bytes_to_js`、`finalize_ref`。这些对应 Go 的 `syscall/js.*` 导入。
 
-胶水 JS 放在 `lib/std/misc/wasm/navi_wasm.js`（对应 Go 的 `wasm_exec.js`），负责：
-- 实例化模块、传入参数和环境变量；
+胶水 JS 放在 `lib/std/misc/wasm/navi_wasm.js`（对应 Go 的 `wasm_exec.js`），只用浏览器的 API，负责：
+- 实例化模块（`WebAssembly.instantiateStreaming`），传入参数和环境变量（由页面给出）；
 - 维护 JS 值的引用表（navi 侧持有的是下标）；
-- 驱动 `run()` 和 `resume()`；
-- 在 Node 下提供命令行运行器：`node navi_wasm.js app.wasm args...`。
+- 驱动 `run()` 和 `resume()`。
 
-`navi run --target js-wasm32` 和 `navi test --target js-wasm32` 会自动用 Node 运行。
+`navi build --target js-wasm32` 输出 `.wasm`，同时把 `navi_wasm.js` 和一个最小的 `index.html` 放在旁边。
 
 用户自己的 `extern "C"` 块在 js 上变成 wasm 导入，模块名取 `#[link(wasm_import_module = "...")]`（Rust 的写法），默认是 `"env"`。导入函数的参数照 wasm 的值类型直接传。
 
@@ -203,31 +202,37 @@ doc.call("addEventListener", &[Value::from("click"), cb.value()]);
 |---|---|
 | io 的标准输出和标准错误、time、rand、env（参数和环境变量由胶水 JS 传入）、process::exit | 支持 |
 | thread（绿色线程）、sync、mpmc、select、定时器 | 支持（单线程） |
-| fs、net、process（子进程） | 先返回 `ErrorKind::Unsupported`。Go 的 js/wasm 在 Node 下用 Node 的 fs 实现了文件系统，HTTP 客户端用 fetch，见第 11 节的待定问题 |
+| fs、net、process（子进程） | 返回 `ErrorKind::Unsupported`（浏览器里没有这些）。`http::Client` 以后可以用 fetch 实现（Go 的 net/http 在 js 上就是这样），放到 W4 |
 | crypto | 用纯 navi 的实现 |
 
 `std::sys` 加 `js.navi`，和 unix、windows 并列；`net/sys`、`os` 同样处理。
 
 ## 11. 测试和 CI
 
-- **`navi test --target js-wasm32`**：编出 wasm，用 Node（20 以上）运行。
+测试直接在无头浏览器里跑，不依赖 Node：
+
+- **`navi test --target js-wasm32`**（`navi run` 同理）：
+  1. 编出 wasm；
+  2. 用 std 的 HTTP 服务端在本机的随机端口上提供 wasm、胶水 JS 和一个测试页；
+  3. 启动无头 Chrome（`--headless=new`，找不到时报错并提示用 `NAVI_BROWSER` 指定）打开测试页；
+  4. 测试页把输出和退出码 POST 回服务端，`navi test` 打印输出，然后关掉浏览器。
 - **tests/run 的测试**：用到 fs、net、子进程的，用 `#[cfg(not(target_os = "js"))]` 排除，其余都要在 wasm 上通过。这样运行时和代码生成的测试覆盖可以直接复用。
-- **CI**：在 ubuntu 上加一个 wasm 任务（装 Node），跑 tests/run 和 std 的单元测试。
-- **浏览器**：`std::js` 的 DOM 和回调在无头浏览器里测（Playwright 或 Chrome headless），放到第三阶段。
+- **CI**：在 ubuntu 上加一个 wasm 任务（GitHub 的 runner 自带 Chrome），跑 tests/run 和 std 的单元测试。
+- `std::js` 的 DOM 和回调也用同一个测试页测。
 
 ## 12. 阶段
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| W1 | 目标名和 cfg；`backend/wasm.navi`（块号分派、可恢复调用）；`wasmlink`；最小运行时（单 M、`memory.grow`、写输出、退出、时钟）；胶水 JS（Node） | hello world、fib、结构体、枚举、闭包、`defer`、panic 带栈回溯，在 Node 上输出正确 |
-| W2 | 完整运行时：GC、栈的增长和收缩、G 的切换、定时器、channel、`select`、`catch_unwind`、事件循环（`resume`） | tests/run 里不依赖 fs、net、子进程的全部在 Node 上通过；CI 加 wasm 任务 |
-| W3 | `std::js`（`Value`、`Func`、回调和事件）；浏览器里的示例页面 | 示例页面能操作 DOM、响应点击；无头浏览器测试通过 |
-| W4（可选） | Node 下的 fs（照 Go，通过 `std::js` 调用 Node 的 fs），`http::Client` 用 fetch | 对应的测试在 Node 上通过 |
+| W1 | 目标名和 cfg；`backend/wasm.navi`（块号分派、可恢复调用）；`wasmlink`；最小运行时（单 M、`memory.grow`、写输出、退出、时钟）；胶水 JS；`navi run` / `navi test` 的无头浏览器运行器 | hello world、fib、结构体、枚举、闭包、`defer`、panic 带栈回溯，在无头 Chrome 里输出正确 |
+| W2 | 完整运行时：GC、栈的增长和收缩、G 的切换、定时器、channel、`select`、`catch_unwind`、事件循环（`resume`） | tests/run 里不依赖 fs、net、子进程的全部在无头 Chrome 里通过；CI 加 wasm 任务 |
+| W3 | `std::js`（`Value`、`Func`、回调和事件）；示例页面 | 示例页面能操作 DOM、响应点击；对应的测试通过 |
+| W4（以后再定） | `http::Client` 用 fetch 实现 | 对应的测试通过 |
 | W5 | 性能和体积：不跨恢复点的代码改用结构化发射，去掉多余的块号分派；必要时做 wasm 专用的窥孔优化 | 基准测试对比 Go 的 js/wasm |
 
-## 13. 待定的问题
+## 13. 已定的选择
 
-1. **目标名**：`js-wasm32`（cfg 用 Rust 的 `wasm32`），还是照 Go 叫 `js-wasm`？
-2. **指针**：照 Go 用 8 字节指针加 32 位线性内存，还是直接用 memory64？
-3. **抢占**：照 Go 只做协作式，还是在循环回边的检查里加时间片（比如超过 10ms 让出一次），避免纯计算的循环卡住页面？
-4. **W4**（Node 的 fs、fetch 做 HTTP 客户端）做不做，什么时候做？
+1. 目标名 `js-wasm32`，cfg 是 `target_os = "js"`、`target_arch = "wasm32"`。
+2. 指针照 Go：8 字节指针，32 位线性内存。
+3. 抢占照 Go：只做协作式。
+4. 只面向浏览器，不支持 Node；测试也在无头浏览器里跑。
