@@ -1,8 +1,9 @@
 //! Inlines calls of small functions (after escape analysis and boxing):
 //! the callee's blocks are copied into the caller with its locals renamed,
 //! its types instantiated with the call's generic arguments and its
-//! positions kept if it is in the caller's file (a panic in it reports its
-//! line, as Rust's), else moved to the call site. Calls through traits,
+//! positions kept (a panic in it reports its line, as Rust's; positions in
+//! another file go in the caller's Func::ext), but a #[track_caller]
+//! function's, which are the call's. Calls through traits,
 //! closures and function values are left alone, and so are callees that create
 //! closures, register defers, use #[track_caller] or #[inline(never)], or
 //! belong to the runtime (which relies on its frames), but for its leaves
@@ -13,7 +14,10 @@ use std::collections::HashMap;
 use crate::{
     mir::*,
     resolve::{self, Def, Node},
-    syntax::{ast::Item, source::Pos},
+    syntax::{
+        ast::Item,
+        source::{File, Pos},
+    },
     types::{
         self, Type,
         collect::{Info, has_attr},
@@ -207,9 +211,12 @@ struct Copier {
     base: usize,
     block_base: usize,
     pos: Pos,
-    /// Whether the callee is in the caller's file (its positions hold) and
-    /// not #[track_caller] (whose positions are its call's).
-    same_file: bool,
+    /// The callee is #[track_caller]: its positions are the call's.
+    track: bool,
+    callee: &Func,
+    caller_file: Option<&File>,
+    /// The caller's positions in other files (shared with its Body).
+    ext: Vec<(&File, Pos)>,
 }
 
 impl Copier {
@@ -371,11 +378,29 @@ impl Copier {
 
     // A position of the callee in the caller.
     fn at(&self, pos: Pos) -> Pos {
-        if self.same_file && pos > 0 {
-            pos
-        } else {
-            self.pos
+        if self.track || pos <= 0 {
+            return self.pos;
         }
+        let (f, p) = self.callee.file_pos(pos);
+        let f = match f {
+            Some(f) => f,
+            None => return self.pos,
+        };
+        if let Some(cf) = self.caller_file {
+            if std::ptr::eq(cf, f) {
+                return p;
+            }
+        }
+        let mut ext = self.ext;
+        let mut i = 0;
+        while i < ext.len() {
+            if std::ptr::eq(ext[i].0, f) && ext[i].1 == p {
+                return EXT_POS + i as Pos;
+            }
+            i += 1;
+        }
+        ext.push((f, p));
+        EXT_POS + i as Pos
     }
 
     fn blk(&self, b: usize) -> usize {
@@ -650,6 +675,7 @@ pub fn inline_program(
             let body = &mut Body {
                 blocks: caller.blocks.clone(),
                 locals: caller.locals.clone(),
+                ext: caller.ext.clone(),
             };
             let n = body.blocks.len();
             let mut bi = 0;
@@ -669,6 +695,7 @@ pub fn inline_program(
             let b = outs[k].unwrap();
             funcs[lv[k]].blocks = b.blocks;
             funcs[lv[k]].locals = b.locals;
+            funcs[lv[k]].ext = b.ext;
             k += 1;
         }
     }
@@ -681,6 +708,7 @@ pub fn inline_program(
 struct Body {
     blocks: Vec<&mut Block>,
     locals: Vec<&mut Local>,
+    ext: Vec<(&File, Pos)>,
 }
 
 /// Replaces the call ending block bi of the body with a copy of callee.
@@ -717,11 +745,10 @@ fn inline_call(
         base: body.locals.len(),
         block_base: body.blocks.len(),
         pos,
-        same_file: !is_track_caller(d)
-            && match (caller.file, callee.file) {
-                (Some(a), Some(b)) => std::ptr::eq(a, b),
-                _ => false,
-            },
+        track: is_track_caller(d),
+        callee,
+        caller_file: caller.file,
+        ext: body.ext,
     };
     for l in callee.locals.iter() {
         body.locals.push(&mut Local {

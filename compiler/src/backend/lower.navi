@@ -95,8 +95,7 @@ struct FuncOut {
     code: Vec<u8>,
     relocs: Vec<OutReloc>,
     /// (offset in code, file, line) when recording DWARF.
-    // Offset and line, in file.
-    lines: Vec<(u64, u32)>,
+    lines: Vec<(u64, &File, u32)>,
     /// The stack map (see stack_meta), with the calls' masks.
     meta: Vec<u64>,
     file: Option<&File>,
@@ -209,9 +208,9 @@ pub struct Gen {
     closure: HashMap<String, String>,
     statics: HashMap<u32, String>,
     errs: Vec<String>,
-    /// The current function's line rows (code offset, position) and file,
-    /// recorded for DWARF.
-    cur_lines: Vec<(usize, Pos)>,
+    /// The current function's line rows (code offset, file, position in
+    /// it) and file, recorded for DWARF.
+    cur_lines: Vec<(usize, &File, Pos)>,
     cur_file: Option<&File>,
     cur_name: String,
     /// Held while lowering uses state shared by the threads: the type
@@ -796,17 +795,13 @@ impl Gen {
                 off,
                 size: out.code.len() as u64,
             });
-            if let Some(f) = out.file {
-                if out.lines.len() > 0 {
-                    let fi = self.o.file_id(&f.name);
-                    for (o, line) in out.lines.iter() {
-                        self.o.lines.push(obj::Line {
-                            off: off + *o,
-                            file: fi,
-                            line: *line,
-                        });
-                    }
-                }
+            for (o, f, line) in out.lines.iter() {
+                let fi = self.o.file_id(&f.name);
+                self.o.lines.push(obj::Line {
+                    off: off + *o,
+                    file: fi,
+                    line: *line,
+                });
             }
         }
         for r in out.relocs.iter() {
@@ -887,10 +882,8 @@ impl Gen {
             out.failed = true;
         }
         if self.dwarf {
-            if let Some(f) = self.cur_file {
-                for (o, pos) in self.cur_lines.iter() {
-                    out.lines.push((*o as u64, f.line_of(*pos)));
-                }
+            for (o, f, pos) in self.cur_lines.iter() {
+                out.lines.push((*o as u64, *f, f.line_of(*pos)));
             }
         }
         self.cur_lines = Vec::new();
@@ -986,17 +979,13 @@ impl Gen {
                 off,
                 size: c.code.len() as u64,
             });
-            if let Some(f) = self.cur_file {
-                if self.cur_lines.len() > 0 {
-                    let fi = self.o.file_id(&f.name);
-                    for (o, pos) in self.cur_lines.iter() {
-                        self.o.lines.push(obj::Line {
-                            off: off + *o as u64,
-                            file: fi,
-                            line: f.line_of(*pos),
-                        });
-                    }
-                }
+            for (o, f, pos) in self.cur_lines.iter() {
+                let fi = self.o.file_id(&f.name);
+                self.o.lines.push(obj::Line {
+                    off: off + *o as u64,
+                    file: fi,
+                    line: f.line_of(*pos),
+                });
             }
             self.cur_lines = Vec::new();
             self.cur_file = None;
@@ -1830,8 +1819,8 @@ impl Gen {
         self.cur_file = f.file;
         self.cur_name = f.name.clone();
         if self.dwarf {
-            if let Some(d) = f.def {
-                self.cur_lines.push((0, d.pos));
+            if let (Some(d), Some(fl)) = (f.def, f.file) {
+                self.cur_lines.push((0, fl, d.pos));
             }
         }
         let fg = &mut FnGen {
@@ -2835,13 +2824,18 @@ impl FnGen {
         if pos <= 0 {
             return;
         }
+        let (file, p) = self.f.file_pos(pos);
+        let fl = match file {
+            Some(fl) => fl,
+            None => return,
+        };
         let off = self.m.offset();
         let mut ls = self.g.cur_lines;
         if ls.len() > 0 && ls[ls.len() - 1].0 == off {
-            ls[ls.len() - 1] = (off, pos);
+            ls[ls.len() - 1] = (off, fl, p);
             return;
         }
-        ls.push((off, pos));
+        ls.push((off, fl, p));
     }
 
     /// Calls std::rt::native::gc_alloc(size, noscan); the pointer is left in
@@ -3060,9 +3054,9 @@ impl FnGen {
         if self.f.shim {
             self.store_caller_loc(16);
         } else {
-            match self.f.file {
-                Some(file) => self.store_file_pos(16, file, pos),
-                None => self.store_file_line(16, "<unknown>", 0, 0),
+            match self.f.file_pos(pos) {
+                (Some(file), p) => self.store_file_pos(16, file, p),
+                (None, _) => self.store_file_line(16, "<unknown>", 0, 0),
             }
         }
         self.call_runtime("panic_raw");
@@ -3127,7 +3121,8 @@ impl FnGen {
             self.m.load(8, LOC, FP, SLOT_LOC);
             return;
         }
-        let l = self.g.loc(self.f.file, pos);
+        let (lf, lp) = self.f.file_pos(pos);
+        let l = self.g.loc(lf, lp);
         self.m.adr_sym(LOC, &l);
     }
 
@@ -3509,7 +3504,8 @@ impl FnGen {
                 if self.inst.track_caller && !self.f.closure {
                     m.load(8, BASE, FP, SLOT_LOC);
                 } else {
-                    let l = self.g.loc(self.f.file, pos);
+                    let (lf, lp) = self.f.file_pos(pos);
+                    let l = self.g.loc(lf, lp);
                     m.adr_sym(BASE, &l);
                 }
                 m.addr_of(RA, FP, self.res_off);
@@ -5342,9 +5338,9 @@ impl FnGen {
                     m.store(8, l, SP, 0);
                     let ix = self.ssa_in(v.args[1], V1);
                     m.store(8, ix, SP, 8);
-                    match self.f.file {
-                        Some(file) => self.store_file_pos(16, file, v.pos),
-                        None => self.store_file_line(16, "<unknown>", 0, 0),
+                    match self.f.file_pos(v.pos) {
+                        (Some(file), p) => self.store_file_pos(16, file, p),
+                        (None, _) => self.store_file_line(16, "<unknown>", 0, 0),
                     }
                     self.call_runtime("panic_bounds");
                     m.trap();
