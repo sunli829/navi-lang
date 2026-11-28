@@ -213,10 +213,29 @@ doc.call("addEventListener", &[Value::from("click"), cb.value()]);
 | `thread`、`sync`、`mpmc`、`select` | 支持，所有 G 在一个 M 上；`available_parallelism()` 为 1 |
 | `process::exit` | 支持 |
 | `fs`、`net`（TCP、UDP、DNS）、`http` 的服务端、`tls`、`process::Command`、`io::stdin`、`env::current_dir` / `home_dir` / `temp_dir` 等 | 照常能编译，运行时返回 `ErrorKind::Unsupported`（同 Rust 的 wasm32-unknown-unknown 和 Go 的 js/wasm：跨平台的代码和库不用加 cfg 就能编译）。`stdin` 读到的是空 |
-| `http::Client` | 先返回 Unsupported；以后可以用 fetch 实现（Go 的 net/http 在 js 上就是这样），放到 W4 |
+| `http::Client` | W4 之前返回 Unsupported；W4 用 fetch 实现（10.1） |
 | `os` 的 unix、windows 扩展 | 本来就不在 js 上编译 |
 
 `std::sys` 加 `js.navi`，和 unix、windows 并列；`net/sys` 同样处理，里面的函数都返回 Unsupported。
+
+### 10.1 `http::Client` 用 fetch（W4，照 Go 的 `net/http/roundtrip_js.go`）
+
+Go 在 js/wasm 上只换了 `Transport.RoundTrip`（发一次请求、拿一次响应），`Client`、`Request`、`Response`、重定向都是同一套代码。navi 对应的是 `Client::send_once`：原生平台上它负责连接池、TLS、HTTP/1 和 HTTP/2，js 上换成 fetch 版本。
+
+- **共用**：`Client`、`ClientBuilder`、`RequestBuilder` 的 API，`execute_timeout` 的重定向循环，`Response` 和 `Body`。用户代码在浏览器里和原生平台上一样，是阻塞调用，看不到 Promise。
+- **fetch 版本的 `send_once`**：
+  1. 把 `Request` 转成 fetch 的参数：方法、头、请求体字节。
+  2. 调 `fetch`，在 std 内部等 Promise 完成，等的时候当前 G 停下。
+  3. 把状态码和头转回 `Response`。
+  4. 响应体是一个 reader（`Body` 本来就能装 reader），每次读从 `ReadableStream` 取一块；拿不到流时退回 `arrayBuffer()`。
+- **`timeout`**：用 `AbortController` 实现。
+- **浏览器的限制，照 Go 不掩盖**，写进文档：
+  - 重定向由浏览器跟随，客户端只看到最终响应；
+  - cookie 由浏览器管理；
+  - 跨域受 CORS 限制；
+  - 浏览器禁止设置的头（`Host`、`User-Agent`、`Connection` 等）不会发出去。
+- **不起作用的设置静默忽略**：`connect_timeout`、`pool_max_idle`、`add_root_certificate`、`tls_built_in_root_certs`、`danger_*`、`http1_only`、`http2_prior_knowledge`、`user_agent`。
+- **fetch 特有的选项**（mode、credentials、redirect、cache）：照 Go，用特殊请求头传入（`js.fetch:mode` 等），发请求前从头里去掉。
 
 浏览器特有的 API（localStorage、IndexedDB、Canvas、WebSocket……）不进 std，通过 `std::js` 直接调用（第 8 节）。从 WebIDL 生成带类型的绑定（像 Rust 的 web-sys）以后再考虑，不在这次的计划里。
 
@@ -240,7 +259,7 @@ doc.call("addEventListener", &[Value::from("click"), cb.value()]);
 | W1 | 目标名和 cfg；`backend/wasm.navi`（块号分派、可恢复调用）；`wasmlink`；最小运行时（单 M、`memory.grow`、写输出、退出、时钟）；胶水 JS；`navi run` / `navi test` 的无头浏览器运行器 | hello world、fib、结构体、枚举、闭包、`defer`、panic 带栈回溯，在无头 Chrome 里输出正确 |
 | W2 | 完整运行时：GC、栈的增长和收缩、G 的切换、定时器、channel、`select`、`catch_unwind`、事件循环（`resume`） | tests/run 里不依赖 fs、net、子进程的全部在无头 Chrome 里通过；CI 加 wasm 任务 |
 | W3 | `std::js`（`Value`、`Func`、回调和事件）；示例页面 | 示例页面能操作 DOM、响应点击；对应的测试通过 |
-| W4（以后再定） | `http::Client` 用 fetch 实现 | 对应的测试通过 |
+| W4 | `http::Client` 用 fetch 实现（10.1） | 测试页里对本机服务端的 GET、POST、流式响应体、超时测试通过 |
 | W5 | 性能和体积：不跨恢复点的代码改用结构化发射，去掉多余的块号分派；必要时做 wasm 专用的窥孔优化 | 基准测试对比 Go 的 js/wasm |
 
 ## 13. 已定的选择
