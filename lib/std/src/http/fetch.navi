@@ -1,0 +1,216 @@
+//! js-wasm32 (docs/wasm.md): a request over the browser's fetch, as Go's
+//! net/http roundtrip_js.go, for Client's send_once. The browser follows
+//! redirects, keeps cookies and applies CORS; headers it does not let a
+//! page set are left out; the connection settings (pool, TLS, HTTP/2) are
+//! the browser's. Headers named js.fetch:mode, js.fetch:credentials,
+//! js.fetch:redirect and js.fetch:cache set fetch's options of those names.
+
+use crate::{
+    http::{Body, Error, ErrorKind, HeaderMap, Method, Request, Response, StatusCode, Version},
+    io::{self, Read},
+    js::{self, Func, Value},
+    sync::mpmc::sync_channel,
+    time::Duration,
+    url::Url,
+};
+
+// The headers navi adds that a page may not set (the browser does).
+fn forbidden(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "host"
+        || n == "connection"
+        || n == "content-length"
+        || n == "transfer-encoding"
+        || n == "keep-alive"
+        || n == "accept-encoding"
+        || n == "te"
+        || n == "upgrade"
+}
+
+/// Waits for promise p: what it resolved to, or what it rejected with.
+pub(crate) fn wait(p: &Value) -> Result<Value, Value> {
+    let (tx, rx) = sync_channel::<Result<Value, Value>>(1);
+    let ok = Func::new(|_this: Value, a: Vec<Value>| -> Value {
+        let _ = tx.try_send(Ok(if a.len() > 0 {
+            a[0].clone()
+        } else {
+            Value::undefined()
+        }));
+        Value::undefined()
+    });
+    let bad = Func::new(|_this: Value, a: Vec<Value>| -> Value {
+        let _ = tx.try_send(Err(if a.len() > 0 {
+            a[0].clone()
+        } else {
+            Value::undefined()
+        }));
+        Value::undefined()
+    });
+    p.call("then", &[ok.value(), bad.value()]);
+    let r = rx.recv().unwrap();
+    ok.release();
+    bad.release();
+    r
+}
+
+// A JS error's message (name: message).
+fn message(e: &Value) -> String {
+    if e.type_of() == js::Type::Object {
+        let n = e.get("name");
+        let m = e.get("message");
+        if m.type_of() == js::Type::String {
+            return `${n.string()}: ${m.string()}`.to_string();
+        }
+    }
+    e.string()
+}
+
+/// The response's body: its stream's chunks, read as asked.
+struct FetchBody {
+    reader: Option<Value>,
+    buf: Vec<u8>,
+    pos: usize,
+    done: bool,
+}
+
+impl Read for FetchBody {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        while self.pos >= self.buf.len() {
+            if self.done {
+                return Ok(0);
+            }
+            let r = match &self.reader {
+                Some(r) => r.clone(),
+                None => return Ok(0),
+            };
+            let chunk = match wait(&r.call("read", &[])) {
+                Ok(c) => c,
+                Err(e) => return Err(io::Error::new(io::ErrorKind::Other, message(&e))),
+            };
+            if chunk.get("done").truthy() {
+                self.done = true;
+                return Ok(0);
+            }
+            let v = chunk.get("value");
+            let n = v.length();
+            let mut b: Vec<u8> = Vec::with_capacity(n);
+            b.resize(n, 0);
+            js::copy_bytes_to_navi(b.as_mut_slice(), &v);
+            self.buf = b;
+            self.pos = 0;
+        }
+        let n = if out.len() < self.buf.len() - self.pos {
+            out.len()
+        } else {
+            self.buf.len() - self.pos
+        };
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Sends req with fetch (the client's defaults: headers it lacks; timeout:
+/// AbortController's).
+pub(crate) fn round_trip(
+    req: &mut Request,
+    defaults: &HeaderMap,
+    timeout: Option<Duration>,
+) -> Result<Response, Error> {
+    let g = js::global();
+    let init = g.get("Object").new(&[]);
+    init.set("method", req.method.as_str());
+    let headers = g.get("Headers").new(&[]);
+    let mut put = |k: &str, v: &str| {
+        if let Some(opt) = k.strip_prefix("js.fetch:") {
+            init.set(opt, v);
+        } else if !forbidden(k) {
+            headers.call("append", &[Value::from(k), Value::from(v)]);
+        }
+    };
+    for (k, v) in defaults.iter() {
+        if !req.headers.contains_key(k.as_str()) {
+            put(k.as_str(), v.as_str());
+        }
+    }
+    for (k, v) in req.headers.iter() {
+        put(k.as_str(), v.as_str());
+    }
+    init.set("headers", headers);
+    // The body, whole (a page cannot stream one everywhere).
+    if !(req.method == Method::GET || req.method == Method::HEAD) {
+        let mut b: Vec<u8> = Vec::new();
+        if let Err(e) = req.body.read_to_end(&mut b) {
+            return Err(Error::new(ErrorKind::Builder, e.to_string()));
+        }
+        let a = g.get("Uint8Array").new(&[Value::from(b.len())]);
+        js::copy_bytes_to_js(&a, b.as_slice());
+        init.set("body", a);
+    }
+    let mut timer = Value::undefined();
+    if let Some(d) = timeout {
+        let ac = g.get("AbortController").new(&[]);
+        init.set("signal", ac.get("signal"));
+        let abort = ac.get("abort").call("bind", &[ac.clone()]);
+        timer = g.call("setTimeout", &[abort, Value::from(d.as_millis() as f64)]);
+    }
+    let url = req.url.clone();
+    let p = g.call("fetch", &[Value::from(url.as_str()), init]);
+    let r = wait(&p);
+    let resp = match r {
+        Ok(v) => v,
+        Err(e) => {
+            if !timer.is_undefined() {
+                g.call("clearTimeout", &[timer]);
+            }
+            let aborted = e.type_of() == js::Type::Object && e.get("name").string() == "AbortError";
+            let mut err = Error::new(
+                if aborted {
+                    ErrorKind::Timeout
+                } else {
+                    ErrorKind::Connect
+                },
+                message(&e),
+            );
+            err.url = Some(url);
+            return Err(err);
+        }
+    };
+    let mut out = Response::new(StatusCode(resp.get("status").int() as u16));
+    out.version = Version::HTTP_11;
+    let mut hm = HeaderMap::new();
+    let entries = g
+        .get("Array")
+        .call("from", &[resp.get("headers").call("entries", &[])]);
+    let mut i = 0;
+    while i < entries.length() {
+        let e = entries.index(i);
+        hm.append(e.index(0).string().as_str(), e.index(1).string().as_str());
+        i += 1;
+    }
+    out.headers = hm;
+    let body = resp.get("body");
+    let reader = if body.is_null() || body.is_undefined() {
+        None
+    } else {
+        Some(body.call("getReader", &[]))
+    };
+    let len = match out.headers.get("content-length") {
+        Some(s) => s.parse::<u64>().ok(),
+        None => None,
+    };
+    out.body = Body::from_reader(
+        &mut FetchBody {
+            reader,
+            buf: Vec::new(),
+            pos: 0,
+            done: false,
+        },
+        len,
+    );
+    out.url = match Url::parse(resp.get("url").string().as_str()) {
+        Ok(u) => Some(u),
+        Err(_) => Some(url),
+    };
+    Ok(out)
+}
