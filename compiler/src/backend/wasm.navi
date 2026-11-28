@@ -5,11 +5,17 @@
 //!   ones); SP, FP, the G and the registers calls pass (CTX, RET, LOC) are
 //!   globals. Frames stay in linear memory as on the other targets, so stack
 //!   maps, stack scanning, moving and unwinding are unchanged.
-//! - Every function is `(resume: i32) -> i32`. Its body is a loop around nested
-//!   blocks with a br_table on the block number: a label starts a block, a jump
-//!   sets the number and branches to the loop. A call passes the caller's PC
-//!   (function index << 16 | the block after the call) in G_RA, which the
-//!   prologue keeps in the frame as a return address.
+//! - Every function is `(resume: i32) -> i32`. Its code is in blocks (a label
+//!   or a call's return starts one); a block's number is a PC. The blocks are
+//!   in segments, which the body's dispatch enters: a loop around nested wasm
+//!   blocks with a br_table on the block number. A segment starts where the
+//!   function is entered or resumed (its start, after calls) and where jumps
+//!   from other segments land; within one, code is structured (wasm blocks for
+//!   jumps forward, loops for jumps back), so a loop calling nothing is a wasm
+//!   loop. A jump back to another segment sets the number and branches to the
+//!   dispatch. A call passes the caller's PC (function index << 16 | the block
+//!   after the call) in G_RA, which the prologue keeps in the frame as a return
+//!   address.
 //! - A call returning 1 unwinds: its caller returns 1 too, up to the run loop
 //!   (wasmlink), which then calls G_TARGET's function with its block. Context
 //!   switches, longjmp and going back to JS unwind so; a frame resumed so
@@ -85,12 +91,11 @@ const NUM_LOCALS: u32 = L_FA + 10;
 const I32: u8 = 0x7f;
 const I64: u8 = 0x7e;
 
-// Fixups in a block: the block number of a label (a padded i32.const), or
-// a branch depth to the loop (padded, plus the ifs around it).
+// Fixups in a block: the block number of a label (a padded i32.const).
 const FIX_BLOCK: u8 = 0;
-const FIX_LOOP: u8 = 1;
-// A jump's branch depth: to the end of the target's block when it comes
-// later (its code follows that end), else to the loop (label << 8 | ifs).
+// A jump's branch depth (label << 8 | the ifs around the branch): to its
+// target's wasm block or loop in the segment, to a later segment's code, or
+// to the dispatch.
 const FIX_JUMP: u8 = 2;
 
 /// A block's code: relocations and fixups at offsets into it.
@@ -104,6 +109,8 @@ pub struct Wasm {
     blks: Vec<&mut Blk>,
     labels: Vec<i64>,
     calls: Vec<u64>,
+    // Blocks entered from elsewhere but calls' returns (the dispatch's).
+    entries: Vec<usize>,
     tag: i64,
     err: String,
 }
@@ -113,9 +120,36 @@ pub fn new_machine() -> &mut Wasm {
         blks: Vec::new(),
         labels: Vec::new(),
         calls: Vec::new(),
+        entries: Vec::new(),
         tag: 0,
         err: String::new(),
     }
+}
+
+// A function that could not be compiled.
+fn failed(err: String) -> Code {
+    Code {
+        code: Vec::new(),
+        relocs: Vec::new(),
+        calls: Vec::new(),
+        err,
+        frame: -1,
+    }
+}
+
+/// How a function's blocks are emitted (see Wasm::shape).
+struct Shape {
+    /// The first block of each block's segment.
+    start: Vec<usize>,
+    /// Each block's segment.
+    seg: Vec<usize>,
+    nseg: usize,
+    /// For a loop's header, its last block (-1: none).
+    lend: Vec<i64>,
+    /// Whether a jump forward within the segment lands at the block.
+    fwd: Vec<bool>,
+    /// The innermost loop holding such a block (its header; -1: none).
+    owner: Vec<i64>,
 }
 
 // --- Encoding
@@ -785,64 +819,34 @@ impl Machine for Wasm {
         self.new_block();
         self.labels = Vec::new();
         self.calls = Vec::new();
+        self.entries = Vec::new();
         self.tag = 0;
         self.err = String::new();
     }
 
     fn finish(&mut self) -> Code {
         if self.err.len() > 0 {
-            return Code {
-                code: Vec::new(),
-                relocs: Vec::new(),
-                calls: Vec::new(),
-                err: self.err.clone(),
-                frame: -1,
-            };
+            return failed(self.err.clone());
         }
         let k = self.blks.len();
-        // Fixups.
+        // The jumps: (block, target block).
+        let mut jumps: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
         while i < k {
-            let b = self.blks[i];
-            for f in b.fixes.iter() {
-                let (at, kind, v) = *f;
-                if kind == FIX_BLOCK {
-                    let blk = self.labels[v as usize];
-                    if blk < 0 {
-                        return Code {
-                            code: Vec::new(),
-                            relocs: Vec::new(),
-                            calls: Vec::new(),
-                            err: "wasm: a label is not bound".to_string(),
-                            frame: -1,
-                        };
-                    }
-                    put_sleb_n(&mut b.code, at, blk, 5);
-                } else if kind == FIX_JUMP {
-                    let blk = self.labels[(v >> 8) as usize];
-                    let extra = v & 255;
-                    if blk < 0 {
-                        return Code {
-                            code: Vec::new(),
-                            relocs: Vec::new(),
-                            calls: Vec::new(),
-                            err: "wasm: a label is not bound".to_string(),
-                            frame: -1,
-                        };
-                    }
-                    let j = blk as usize;
-                    let depth = if j > i {
-                        (j - i - 1) as u64
-                    } else {
-                        (k - 1 - i) as u64
-                    };
-                    put_uleb_n(&mut b.code, at, depth + extra, 5);
-                } else {
-                    put_uleb_n(&mut b.code, at, (k - 1 - i) as u64 + v, 5);
+            for f in self.blks[i].fixes.iter() {
+                let (_, kind, v) = *f;
+                let l = if kind == FIX_JUMP { v >> 8 } else { v };
+                let t = self.labels[l as usize];
+                if t < 0 {
+                    return failed("wasm: a label is not bound".to_string());
+                }
+                if kind == FIX_JUMP {
+                    jumps.push((i, t as usize));
                 }
             }
             i += 1;
         }
+        let sh = self.shape(&jumps);
         let mut body: Vec<u8> = Vec::new();
         // Locals 1.. by runs of one type (0 is the parameter).
         let mut runs: Vec<(u32, u8)> = Vec::new();
@@ -862,8 +866,8 @@ impl Machine for Wasm {
             uleb(&mut body, *n as u64);
             body.push(*t);
         }
-        // local.get 0; local.set 1; the cached globals; loop; block * k;
-        // local.get 1; br_table 0 .. k-1.
+        // local.get 0; local.set 1; the cached globals; loop; block per
+        // segment; local.get 1; br_table to the segment of each block.
         body.push(0x20);
         body.push(0);
         body.push(0x21);
@@ -878,7 +882,7 @@ impl Machine for Wasm {
         body.push(0x03);
         body.push(0x40);
         i = 0;
-        while i < k {
+        while i < sh.nseg {
             body.push(0x02);
             body.push(0x40);
             i += 1;
@@ -889,18 +893,108 @@ impl Machine for Wasm {
         uleb(&mut body, k as u64);
         i = 0;
         while i < k {
-            uleb(&mut body, i as u64);
+            uleb(
+                &mut body,
+                if sh.start[i] == i {
+                    sh.seg[i] as u64
+                } else {
+                    0
+                },
+            );
             i += 1;
         }
         uleb(&mut body, 0);
-        let mut relocs: Vec<Reloc> = Vec::new();
+        // The segments: each block's code within the wasm blocks and loops
+        // open there (stack: target << 1 for a block, header << 1 | 1 for a
+        // loop).
         let mut starts: Vec<usize> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
         i = 0;
         while i < k {
-            body.push(0x0b);
+            if sh.start[i] == i {
+                if stack.len() > 0 {
+                    return failed("wasm: a segment's structure is open".to_string());
+                }
+                body.push(0x0b);
+                // Blocks for jumps to the segment's top level, the last
+                // target's outermost.
+                let mut e = i + 1;
+                while e < k && sh.start[e] != e {
+                    e += 1;
+                }
+                let mut t = e - 1;
+                while t > i {
+                    if sh.fwd[t] && sh.owner[t] < 0 {
+                        body.push(0x02);
+                        body.push(0x40);
+                        stack.push(t << 1);
+                    }
+                    t -= 1;
+                }
+            } else if sh.fwd[i] {
+                let n = stack.len();
+                if n == 0 || stack[n - 1] != i << 1 {
+                    return failed("wasm: a jump's block is not innermost".to_string());
+                }
+                body.push(0x0b);
+                stack.pop();
+            }
+            if sh.lend[i] >= 0 {
+                body.push(0x03);
+                body.push(0x40);
+                stack.push(i << 1 | 1);
+                let mut t = sh.lend[i] as usize;
+                while t > i {
+                    if sh.fwd[t] && sh.owner[t] == i as i64 {
+                        body.push(0x02);
+                        body.push(0x40);
+                        stack.push(t << 1);
+                    }
+                    t -= 1;
+                }
+            }
+            let b = self.blks[i];
+            for f in b.fixes.iter() {
+                let (at, kind, v) = *f;
+                if kind == FIX_BLOCK {
+                    put_sleb_n(&mut b.code, at, self.labels[v as usize], 5);
+                    continue;
+                }
+                let t = self.labels[(v >> 8) as usize] as usize;
+                let x = v & 255;
+                let n = stack.len();
+                let d = if sh.start[t] == sh.start[i] {
+                    let want = if t > i { t << 1 } else { t << 1 | 1 };
+                    let mut j = n;
+                    while j > 0 && stack[j - 1] != want {
+                        j -= 1;
+                    }
+                    if j == 0 {
+                        return failed("wasm: a jump's target is not open".to_string());
+                    }
+                    n - j
+                } else if t > i {
+                    n + sh.seg[t] - sh.seg[i] - 1
+                } else {
+                    n + sh.nseg - 1 - sh.seg[i]
+                };
+                put_uleb_n(&mut b.code, at, d as u64 + x, 5);
+            }
             starts.push(body.len());
-            body.extend_from_slice(self.blks[i].code.as_slice());
+            body.extend_from_slice(b.code.as_slice());
+            // Loops whose last block this is.
+            while stack.len() > 0 {
+                let top = stack[stack.len() - 1];
+                if top & 1 == 0 || sh.lend[top >> 1] != i as i64 {
+                    break;
+                }
+                body.push(0x0b);
+                stack.pop();
+            }
             i += 1;
+        }
+        if stack.len() > 0 {
+            return failed("wasm: a segment's structure is open".to_string());
         }
         body.push(0x0b); // the loop
         body.push(0x00); // unreachable
@@ -909,6 +1003,7 @@ impl Machine for Wasm {
         uleb(&mut code, body.len() as u64);
         let pre = code.len();
         code.extend_from_slice(body.as_slice());
+        let mut relocs: Vec<Reloc> = Vec::new();
         i = 0;
         while i < k {
             for r in self.blks[i].relocs.iter() {
@@ -935,6 +1030,15 @@ impl Machine for Wasm {
     // The current block's number (a PC within the function).
     fn offset(&self) -> usize {
         self.blks.len() - 1
+    }
+
+    fn entry_point(&mut self) -> usize {
+        if self.b().code.len() > 0 {
+            self.new_block();
+        }
+        let n = self.blks.len() - 1;
+        self.entries.push(n);
+        n
     }
 
     fn set_tag(&mut self, tag: i64) {
@@ -976,6 +1080,7 @@ impl Machine for Wasm {
         self.return1();
         self.op(0x0b);
         self.new_block();
+        self.entries.push(self.blks.len() - 1);
     }
 
     fn ret(&mut self) {
@@ -2001,6 +2106,112 @@ impl Machine for Wasm {
 }
 
 impl Wasm {
+    // The segments and their loops. A segment starts at the function's
+    // entry points (its start, where calls return, entry_point) and where
+    // a jump from another segment lands; a jump back within one makes a
+    // loop (to its target, from the last block jumping there). A jump into
+    // a loop other than to its header (from outside it, or into loops that
+    // overlap) makes its target start a segment too, until none does.
+    fn shape(&self, jumps: &Vec<(usize, usize)>) -> Shape {
+        let k = self.blks.len();
+        let mut head: Vec<bool> = Vec::new();
+        head.resize(k, false);
+        head[0] = true;
+        for e in self.entries.iter() {
+            head[*e] = true;
+        }
+        for c in self.calls.iter() {
+            head[(*c >> 32) as usize] = true;
+        }
+        let mut start: Vec<usize> = Vec::new();
+        start.resize(k, 0);
+        let mut lend: Vec<i64> = Vec::new();
+        lend.resize(k, -1);
+        let mut hdrs: Vec<usize> = Vec::new();
+        loop {
+            let mut i = 0;
+            while i < k {
+                start[i] = if head[i] { i } else { start[i - 1] };
+                lend[i] = -1;
+                i += 1;
+            }
+            for j in jumps.iter() {
+                let (s, t) = *j;
+                if start[s] == start[t] && t <= s && lend[t] < s as i64 {
+                    lend[t] = s as i64;
+                }
+            }
+            hdrs = Vec::new();
+            i = 0;
+            while i < k {
+                if lend[i] >= 0 {
+                    hdrs.push(i);
+                }
+                i += 1;
+            }
+            let mut changed = false;
+            for j in jumps.iter() {
+                let (s, t) = *j;
+                if head[t] {
+                    continue;
+                }
+                let mut bad = start[s] != start[t];
+                for h in hdrs.iter() {
+                    let e = lend[*h];
+                    if !bad && start[*h] == start[t] && *h < t && e >= t as i64 {
+                        bad = s < *h || s as i64 > e;
+                    }
+                }
+                if bad {
+                    head[t] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut seg: Vec<usize> = Vec::new();
+        let mut nseg = 0;
+        let mut i = 0;
+        while i < k {
+            if head[i] {
+                nseg += 1;
+            }
+            seg.push(nseg - 1);
+            i += 1;
+        }
+        let mut fwd: Vec<bool> = Vec::new();
+        fwd.resize(k, false);
+        for j in jumps.iter() {
+            let (s, t) = *j;
+            if start[s] == start[t] && t > s {
+                fwd[t] = true;
+            }
+        }
+        let mut owner: Vec<i64> = Vec::new();
+        owner.resize(k, -1);
+        i = 0;
+        while i < k {
+            if fwd[i] {
+                for h in hdrs.iter() {
+                    if start[*h] == start[i] && *h < i && lend[*h] >= i as i64 {
+                        owner[i] = *h as i64;
+                    }
+                }
+            }
+            i += 1;
+        }
+        Shape {
+            start,
+            seg,
+            nseg,
+            lend,
+            fwd,
+            owner,
+        }
+    }
+
     // dst = the high 64 bits of the unsigned 128-bit a * b (from 32-bit
     // halves).
     fn mulhi(&mut self, dst: lm::Reg, a: lm::Reg, b: lm::Reg) {
