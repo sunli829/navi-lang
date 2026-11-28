@@ -1,0 +1,1270 @@
+//! Register allocation as Go's (cmd/compile/internal/ssa/regalloc.go; see
+//! docs/ssa.md section 11). The blocks are visited in reverse postorder,
+//! each starting with the registers its most recently visited predecessor
+//! ended with. Within a block a value's arguments are put in registers just
+//! before it (a LoadReg from the value's spill when it is in none), and when
+//! no register is free the value used farthest ahead loses its. A value
+//! that lost its register is stored to a stack slot right after it is made
+//! (StoreReg); phis and arguments for which no register is left live in a
+//! slot themselves. A call frees the registers calls clobber. Afterwards
+//! each edge into a block with several predecessors (or phis) gets the
+//! moves that put the values where the block expects them (Alloc's edge
+//! moves, at the end of the plain block on the edge: critical edges are
+//! split).
+//!
+//! As the old allocator: the result never shares a register with an
+//! argument (but Copy, Retype and ZExt take the register of an argument
+//! that dies there), constants and addresses get no register, a pointer
+//! live across a call is in a callee-saved register (its bit in the call's
+//! mask) or a pointer slot.
+
+use crate::ssa::{
+    regalloc::{Alloc, Config, Move, is_call, needs_reg, remat},
+    *,
+};
+
+const INF: i32 = 1 << 30;
+
+// One value in a register at a block's end: (register, value, the value
+// holding it there: the value itself or a LoadReg of it).
+struct Held {
+    r: usize,
+    id: u32,
+    cur: u32,
+}
+
+struct Ra {
+    // Registers: ints 0..nint (callers first), then floats.
+    nint: usize,
+    ncaller: usize,
+    abs: Vec<u8>,
+    // By register: the value held (-1: free), the value holding it, pinned
+    // for the current value.
+    holds: Vec<i32>,
+    cur_of: Vec<u32>,
+    pinned: Vec<bool>,
+    used: Vec<bool>,
+    // By value (the values before allocation): its register, the value
+    // holding it, its spill (a StoreReg, or itself if it lives in a slot).
+    in_reg: Vec<i32>,
+    cur: Vec<u32>,
+    spill: Vec<i32>,
+    needs: Vec<bool>,
+    crosses: Vec<bool>,
+    // The uses ahead in the current block, earliest first (linked lists).
+    head: Vec<i32>,
+    unext: Vec<i32>,
+    udist: Vec<i32>,
+    touched: Vec<u32>,
+}
+
+impl Ra {
+    fn next_use(&self, id: u32) -> i32 {
+        let h = self.head[id as usize];
+        if h < 0 { INF } else { self.udist[h as usize] }
+    }
+
+    fn push_use(&mut self, id: u32, d: i32) {
+        let k = self.udist.len() as i32;
+        self.udist.push(d);
+        let h = self.head[id as usize];
+        if h < 0 {
+            self.touched.push(id);
+        }
+        self.unext.push(h);
+        self.head[id as usize] = k;
+    }
+
+    fn pop_use(&mut self, id: u32) {
+        let h = self.head[id as usize];
+        if h >= 0 {
+            self.head[id as usize] = self.unext[h as usize];
+        }
+    }
+
+    fn free(&mut self, r: usize) {
+        let id = self.holds[r];
+        if id >= 0 {
+            if self.in_reg[id as usize] == r as i32 {
+                self.in_reg[id as usize] = -1;
+            }
+            self.holds[r] = -1;
+        }
+    }
+
+    fn put(&mut self, r: usize, id: u32, cur: u32) {
+        self.holds[r] = id as i32;
+        self.cur_of[r] = cur;
+        self.in_reg[id as usize] = r as i32;
+        self.cur[id as usize] = cur;
+        self.used[r] = true;
+    }
+
+    fn is_float_reg(&self, r: usize) -> bool {
+        r >= self.nint
+    }
+
+    fn is_callee(&self, r: usize) -> bool {
+        r >= self.ncaller && r < self.nint
+    }
+}
+
+// The blocks in reverse postorder from the entry, then the unreachable
+// ones.
+fn rpo(f: &Func) -> Vec<usize> {
+    let nb = f.blocks.len();
+    let mut seen: Vec<bool> = Vec::new();
+    seen.resize(nb, false);
+    let mut post: Vec<usize> = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let e = f.entry.unwrap().id as usize;
+    seen[e] = true;
+    stack.push((e, 0));
+    while stack.len() > 0 {
+        let top = stack.len() - 1;
+        let (b, i) = stack[top];
+        let succs = f.blocks[b].succs;
+        if i < succs.len() {
+            stack[top] = (b, i + 1);
+            let s = succs[i].id as usize;
+            if !seen[s] {
+                seen[s] = true;
+                stack.push((s, 0));
+            }
+        } else {
+            post.push(b);
+            stack.pop();
+        }
+    }
+    let mut out: Vec<usize> = Vec::new();
+    let mut i = post.len();
+    while i > 0 {
+        i -= 1;
+        out.push(post[i]);
+    }
+    let mut b = 0;
+    while b < nb {
+        if !seen[b] {
+            out.push(b);
+        }
+        b += 1;
+    }
+    out
+}
+
+fn has_phis(b: &Block) -> bool {
+    b.values.len() > 0 && b.values[0].op == OP_PHI
+}
+
+// The live values at the end of each block with the distance from there to
+// their next use (Go's computeLive), and whether each value is live across
+// a call.
+fn liveness(
+    f: &Func,
+    order: &Vec<usize>,
+    needs: &Vec<bool>,
+    fused: &Vec<bool>,
+    crosses: &mut Vec<bool>,
+) -> Vec<Vec<(u32, i32)>> {
+    let nb = f.blocks.len();
+    let n = f.values.len();
+    let mut live: Vec<Vec<(u32, i32)>> = Vec::new();
+    let mut i = 0;
+    while i < nb {
+        live.push(Vec::new());
+        i += 1;
+    }
+    let mut dist: Vec<i32> = Vec::new();
+    dist.resize(n, INF);
+    let mut set: Vec<u32> = Vec::new();
+    let mut pd: Vec<i32> = Vec::new();
+    pd.resize(n, INF);
+    let mut changed = true;
+    let mut last = false;
+    while changed || last {
+        let marking = last;
+        last = false;
+        changed = false;
+        let mut oi = order.len();
+        while oi > 0 {
+            oi -= 1;
+            let b = f.blocks[order[oi]];
+            let len = b.values.len() as i32;
+            set.clear();
+            for e in live[b.id as usize].iter() {
+                let (id, d) = *e;
+                if dist[id as usize] == INF {
+                    set.push(id);
+                }
+                if d + len < dist[id as usize] {
+                    dist[id as usize] = d + len;
+                }
+            }
+            if b.kind == B_IF {
+                let c = b.control.unwrap();
+                if needs[c.id as usize] && !fused[c.id as usize] {
+                    if dist[c.id as usize] == INF {
+                        set.push(c.id);
+                    }
+                    if len < dist[c.id as usize] {
+                        dist[c.id as usize] = len;
+                    }
+                }
+            }
+            let mut vi = b.values.len();
+            while vi > 0 {
+                vi -= 1;
+                let v = b.values[vi];
+                dist[v.id as usize] = INF;
+                if v.op == OP_PHI {
+                    continue;
+                }
+                if marking && is_call(v) {
+                    for id in set.iter() {
+                        if dist[*id as usize] < INF {
+                            crosses[*id as usize] = true;
+                        }
+                    }
+                }
+                for a in v.args.iter() {
+                    let ai = a.id as usize;
+                    if !needs[ai] {
+                        continue;
+                    }
+                    if dist[ai] == INF {
+                        set.push(a.id);
+                    }
+                    if (vi as i32) < dist[ai] {
+                        dist[ai] = vi as i32;
+                    }
+                }
+            }
+            // Into each predecessor's end: the live values here, and the
+            // phis' arguments from it.
+            let mut k = 0;
+            while k < b.preds.len() {
+                let p = b.preds[k];
+                let pl = live[p.id as usize];
+                for e in pl.iter() {
+                    pd[e.0 as usize] = e.1;
+                }
+                let mut grew = false;
+                let mut nl = pl.clone();
+                for id in set.iter() {
+                    let d = dist[*id as usize];
+                    if d == INF {
+                        continue;
+                    }
+                    let x = *id as usize;
+                    if pd[x] == INF {
+                        nl.push((*id, d));
+                        pd[x] = d;
+                        grew = true;
+                    } else if d < pd[x] {
+                        pd[x] = d;
+                        grew = true;
+                    }
+                }
+                for v in b.values.iter() {
+                    if v.op != OP_PHI {
+                        break;
+                    }
+                    let a = v.args[k];
+                    let x = a.id as usize;
+                    if !needs[x] {
+                        continue;
+                    }
+                    if pd[x] == INF {
+                        nl.push((a.id, 0));
+                        pd[x] = 0;
+                        grew = true;
+                    } else if pd[x] > 0 {
+                        pd[x] = 0;
+                        grew = true;
+                    }
+                }
+                if grew {
+                    let mut j = 0;
+                    while j < nl.len() {
+                        nl[j] = (nl[j].0, pd[nl[j].0 as usize]);
+                        j += 1;
+                    }
+                    live[p.id as usize] = nl;
+                    changed = true;
+                }
+                for e in live[p.id as usize].iter() {
+                    pd[e.0 as usize] = INF;
+                }
+                k += 1;
+            }
+            for id in set.iter() {
+                dist[*id as usize] = INF;
+            }
+        }
+        if !changed && !marking {
+            last = true;
+        }
+    }
+    live
+}
+
+/// Allocates f's registers into a; false (f untouched) where this
+/// allocator does not apply (an edge with moves out of a block that is not
+/// plain).
+pub fn allocate(f: &mut Func, cfg: &Config, fused: &Vec<bool>, a: &mut Alloc) -> bool {
+    for b in f.blocks.iter() {
+        if b.preds.len() > 1 || has_phis(*b) {
+            for p in b.preds.iter() {
+                if p.kind != B_PLAIN {
+                    return false;
+                }
+            }
+        }
+    }
+    let n0 = f.values.len();
+    let nb = f.blocks.len();
+    let order = rpo(f);
+    let mut needs: Vec<bool> = Vec::new();
+    for v in f.values.iter() {
+        needs.push(v.op != OP_INVALID && needs_reg(*v, fused));
+    }
+    let mut crosses: Vec<bool> = Vec::new();
+    crosses.resize(n0, false);
+    let live = liveness(f, &order, &needs, fused, &mut crosses);
+    let ncaller = cfg.caller.len();
+    let nint = ncaller + cfg.callee.len();
+    let mut abs: Vec<u8> = Vec::new();
+    for r in cfg.caller.iter() {
+        abs.push(*r);
+    }
+    for r in cfg.callee.iter() {
+        abs.push(*r);
+    }
+    for r in cfg.fregs.iter() {
+        abs.push(*r);
+    }
+    let nreg = abs.len();
+    let s = &mut Ra {
+        nint,
+        ncaller,
+        abs,
+        holds: Vec::new(),
+        cur_of: Vec::new(),
+        pinned: Vec::new(),
+        used: Vec::new(),
+        in_reg: Vec::new(),
+        cur: Vec::new(),
+        spill: Vec::new(),
+        needs,
+        crosses,
+        head: Vec::new(),
+        unext: Vec::new(),
+        udist: Vec::new(),
+        touched: Vec::new(),
+    };
+    s.holds.resize(nreg, -1);
+    s.cur_of.resize(nreg, 0);
+    s.pinned.resize(nreg, false);
+    s.used.resize(nreg, false);
+    s.in_reg.resize(n0, -1);
+    s.cur.resize(n0, 0);
+    s.spill.resize(n0, -1);
+    s.head.resize(n0, -1);
+    // Outputs by value id (grown as values are made).
+    let mut reg: Vec<i32> = Vec::new();
+    reg.resize(n0, -1);
+    let mut call_mask: Vec<u32> = Vec::new();
+    call_mask.resize(n0, 0);
+    let mut done: Vec<i32> = Vec::new();
+    done.resize(nb, -1);
+    let mut start: Vec<Vec<Held>> = Vec::new();
+    let mut end: Vec<Vec<Held>> = Vec::new();
+    let mut i = 0;
+    while i < nb {
+        start.push(Vec::new());
+        end.push(Vec::new());
+        i += 1;
+    }
+    let mut live_in: Vec<bool> = Vec::new();
+    live_in.resize(n0, false);
+    let mut oi = 0;
+    while oi < order.len() {
+        let bi = order[oi];
+        let b = f.blocks[bi];
+        done[bi] = oi as i32;
+        // The uses ahead: beyond the end (live out), the control, then the
+        // values' arguments.
+        s.udist.clear();
+        s.unext.clear();
+        s.touched.clear();
+        let len = b.values.len() as i32;
+        let mut lo = live[bi].clone();
+        lo.sort_by(|x: &(u32, i32), y: &(u32, i32)| -> std::cmp::Ordering { y.1.cmp(&x.1) });
+        for e in lo.iter() {
+            s.push_use(e.0, len + e.1);
+        }
+        if b.kind == B_IF {
+            let c = b.control.unwrap();
+            if s.needs[c.id as usize] && !fused[c.id as usize] {
+                s.push_use(c.id, len);
+            }
+        }
+        let mut vi = b.values.len();
+        while vi > 0 {
+            vi -= 1;
+            let v = b.values[vi];
+            if v.op == OP_PHI {
+                continue;
+            }
+            let mut k = v.args.len();
+            while k > 0 {
+                k -= 1;
+                let x = v.args[k];
+                if (x.id as usize) < n0 && s.needs[x.id as usize] {
+                    s.push_use(x.id, vi as i32);
+                }
+            }
+        }
+        // The start: the registers of the predecessor visited last, for
+        // the values live in.
+        let mut r = 0;
+        while r < nreg {
+            s.free(r);
+            r += 1;
+        }
+        let mut prim: i32 = -1;
+        let mut best = -1;
+        let mut k = 0;
+        while k < b.preds.len() {
+            let p = b.preds[k].id as usize;
+            if done[p] >= 0 && done[p] > best && p != bi {
+                best = done[p];
+                prim = k as i32;
+            }
+            k += 1;
+        }
+        for t in s.touched.iter() {
+            live_in[*t as usize] = true;
+        }
+        if prim >= 0 {
+            let p = b.preds[prim as usize].id as usize;
+            for h in end[p].iter() {
+                if live_in[h.id as usize] && s.next_use(h.id) < INF {
+                    s.put(h.r, h.id, h.cur);
+                }
+            }
+        }
+        for t in s.touched.iter() {
+            live_in[*t as usize] = false;
+        }
+        let mut new_vals: Vec<&mut Value> = Vec::new();
+        // Phis: the register of the primary predecessor's argument if free,
+        // else any free one, else a slot.
+        for v in b.values.iter() {
+            if v.op != OP_PHI {
+                break;
+            }
+            new_vals.push(*v);
+            let id = v.id as usize;
+            if !s.needs[id] || s.next_use(v.id) == INF {
+                continue;
+            }
+            let fl = is_float(v.ty);
+            let mut want: i32 = -1;
+            if prim >= 0 {
+                let x = v.args[prim as usize];
+                let p = b.preds[prim as usize].id as usize;
+                for h in end[p].iter() {
+                    if h.id == x.id && s.holds[h.r] < 0 {
+                        want = h.r as i32;
+                    }
+                }
+            }
+            if want < 0 {
+                want = free_reg(s, fl, s.crosses[id]);
+            }
+            if want >= 0 {
+                s.put(want as usize, v.id, v.id);
+                reg[id] = want;
+            } else {
+                s.spill[id] = v.id as i32;
+            }
+        }
+        for rr in 0..nreg {
+            if s.holds[rr] >= 0 {
+                start[bi].push(Held {
+                    r: rr,
+                    id: s.holds[rr] as u32,
+                    cur: s.cur_of[rr],
+                });
+            }
+        }
+        let entry = bi == f.entry.unwrap().id as usize;
+        let mut args_prefix = entry;
+        let mut vi = 0;
+        let nv = b.values.len();
+        while vi < nv {
+            let v = b.values[vi];
+            vi += 1;
+            if v.op == OP_PHI {
+                continue;
+            }
+            // (The arguments are all set at the entry; constants, which
+            // emit nothing where they are, may come first.)
+            if args_prefix && v.op != OP_ARG && v.op != OP_INITMEM && !remat(v) {
+                args_prefix = false;
+                for rr in 0..nreg {
+                    s.pinned[rr] = false;
+                }
+            }
+            if !args_prefix {
+                for rr in 0..nreg {
+                    s.pinned[rr] = false;
+                }
+            }
+            // Arguments into registers.
+            let mut k = 0;
+            while k < v.args.len() {
+                let x = v.args[k];
+                let xi = x.id as usize;
+                if xi < n0 && s.needs[xi] {
+                    if s.in_reg[xi] < 0 {
+                        let sp = get_spill(f, s, x.id, &mut reg);
+                        let fl = is_float(x.ty);
+                        let rr = alloc_reg(f, s, fl, false, &mut reg);
+                        if rr < 0 {
+                            // No register left (x64 has few): read from the
+                            // slot, as the code generator does for a value in
+                            // one.
+                            v.args[k] = f.values[sp as usize];
+                            k += 1;
+                            continue;
+                        }
+                        let rr = rr as usize;
+                        let c = f.new_value(OP_LOADREG, x.ty, 0);
+                        c.args.clear();
+                        c.args.push(f.values[sp as usize]);
+                        c.pos = v.pos;
+                        c.block = Some(b);
+                        while reg.len() < f.values.len() {
+                            reg.push(-1);
+                        }
+                        reg[c.id as usize] = rr as i32;
+                        s.put(rr, x.id, c.id);
+                        new_vals.push(c);
+                    }
+                    let rr = s.in_reg[xi] as usize;
+                    s.pinned[rr] = true;
+                    v.args[k] = f.values[s.cur[xi] as usize];
+                }
+                k += 1;
+            }
+            // The arguments' uses here are behind.
+            k = 0;
+            while k < v.args.len() {
+                let x = v.args[k];
+                let xi = x.id as usize;
+                if xi < f.values.len() {
+                    let o = orig_of(f, x);
+                    if (o as usize) < n0 && s.needs[o as usize] {
+                        s.pop_use(o);
+                    }
+                }
+                k += 1;
+            }
+            let call = is_call(v);
+            if call {
+                // The mask: pointers in callee-saved registers needed after.
+                let mut mask = 0u32;
+                let mut rr = s.ncaller;
+                while rr < s.nint {
+                    let id = s.holds[rr];
+                    if id >= 0 && f.values[id as usize].ty == T_PTR && s.next_use(id as u32) < INF {
+                        mask = mask | 1u32 << (rr - s.ncaller) as u32;
+                    }
+                    rr += 1;
+                }
+                call_mask[v.id as usize] = mask;
+                for rr in 0..nreg {
+                    if !s.is_callee(rr) {
+                        s.free(rr);
+                    }
+                    s.pinned[rr] = false;
+                }
+            }
+            // Outputs.
+            let id = v.id as usize;
+            if v.op == OP_ADDC || v.op == OP_SUBB {
+                // Its selects' registers, written by the tuple op.
+                let mut j = vi;
+                while j < nv && b.values[j].op == OP_SELECT {
+                    let sv = b.values[j];
+                    if sv.args[0].id == v.id && s.needs[sv.id as usize] {
+                        let rr =
+                            alloc_reg(f, s, is_float(sv.ty), s.crosses[sv.id as usize], &mut reg);
+                        if rr < 0 {
+                            s.spill[sv.id as usize] = sv.id as i32;
+                        } else {
+                            let rr = rr as usize;
+                            s.put(rr, sv.id, sv.id);
+                            reg[sv.id as usize] = rr as i32;
+                            s.pinned[rr] = true;
+                        }
+                    }
+                    j += 1;
+                }
+            } else if v.op == OP_SELECT && (v.args[0].op == OP_ADDC || v.args[0].op == OP_SUBB) {
+                // (Allocated at the tuple.)
+            } else if id < n0 && s.needs[id] {
+                let fl = is_float(v.ty);
+                let mut took = false;
+                if (v.op == OP_COPY || v.op == OP_RETYPE || v.op == OP_ZEXT) && !call {
+                    let x = orig_of(f, v.args[0]);
+                    let xi = x as usize;
+                    if xi < n0 && s.needs[xi] && s.next_use(x) == INF && s.in_reg[xi] >= 0 {
+                        let rr = s.in_reg[xi] as usize;
+                        if s.is_float_reg(rr) == fl && (!s.crosses[id] || s.is_callee(rr)) {
+                            s.free(rr);
+                            s.put(rr, v.id, v.id);
+                            reg[id] = rr as i32;
+                            took = true;
+                        }
+                    }
+                }
+                if !took {
+                    let rr = if args_prefix && v.op == OP_ARG {
+                        free_reg(s, fl, s.crosses[id])
+                    } else {
+                        alloc_reg(f, s, fl, s.crosses[id], &mut reg)
+                    };
+                    if rr >= 0 {
+                        s.put(rr as usize, v.id, v.id);
+                        reg[id] = rr;
+                        if args_prefix {
+                            s.pinned[rr as usize] = true;
+                        }
+                    } else {
+                        // No register left: the value lives in a slot.
+                        s.spill[id] = v.id as i32;
+                    }
+                }
+            }
+            // Dead arguments, a dead result.
+            k = 0;
+            while k < v.args.len() {
+                let o = orig_of(f, v.args[k]);
+                if (o as usize) < n0 && s.next_use(o) == INF && s.in_reg[o as usize] >= 0 {
+                    let rr = s.in_reg[o as usize] as usize;
+                    if !(args_prefix && s.pinned[rr]) {
+                        s.free(rr);
+                    }
+                }
+                k += 1;
+            }
+            if id < n0 && s.in_reg[id] >= 0 && s.next_use(v.id) == INF && !args_prefix {
+                s.free(s.in_reg[id] as usize);
+            }
+            new_vals.push(v);
+        }
+        // A control in a register at the end.
+        if b.kind == B_IF {
+            let c = b.control.unwrap();
+            let ci = c.id as usize;
+            if ci < n0 && s.needs[ci] && !fused[ci] {
+                for rr in 0..nreg {
+                    s.pinned[rr] = false;
+                }
+                if s.in_reg[ci] < 0 {
+                    let sp = get_spill(f, s, c.id, &mut reg);
+                    let rr = alloc_reg(f, s, is_float(c.ty), false, &mut reg);
+                    if rr < 0 {
+                        b.control = Some(f.values[sp as usize]);
+                    } else {
+                        let rr = rr as usize;
+                        let lc = f.new_value(OP_LOADREG, c.ty, 0);
+                        lc.args.clear();
+                        lc.args.push(f.values[sp as usize]);
+                        lc.pos = b.pos;
+                        lc.block = Some(b);
+                        while reg.len() < f.values.len() {
+                            reg.push(-1);
+                        }
+                        reg[lc.id as usize] = rr as i32;
+                        s.put(rr, c.id, lc.id);
+                        new_vals.push(lc);
+                        b.control = Some(lc);
+                    }
+                } else {
+                    b.control = Some(f.values[s.cur[ci] as usize]);
+                }
+            }
+        }
+        for rr in 0..nreg {
+            let id = s.holds[rr];
+            if id >= 0 && s.next_use(id as u32) < INF {
+                end[bi].push(Held {
+                    r: rr,
+                    id: id as u32,
+                    cur: s.cur_of[rr],
+                });
+            }
+        }
+        b.values = new_vals;
+        for t in s.touched.iter() {
+            s.head[*t as usize] = -1;
+        }
+        oi += 1;
+    }
+    // The edges' moves.
+    let mut moves: Vec<Vec<(u32, i32, i32, i32, i32)>> = Vec::new();
+    i = 0;
+    while i < nb {
+        moves.push(Vec::new());
+        i += 1;
+    }
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        let bi = b.id as usize;
+        if b.preds.len() < 2 && !has_phis(b) {
+            continue;
+        }
+        let mut k = 0;
+        while k < b.preds.len() {
+            let p = b.preds[k];
+            let pi = p.id as usize;
+            let mut ms: Vec<(u32, i32, i32, i32, i32)> = Vec::new();
+            // (value, src reg, src spill value, dst reg, dst slot value)
+            for h in start[bi].iter() {
+                if f.values[h.id as usize].op == OP_PHI
+                    && f.values[h.id as usize].block.unwrap().id == b.id
+                {
+                    continue;
+                }
+                let mut src: i32 = -1;
+                for e in end[pi].iter() {
+                    if e.id == h.id {
+                        src = e.r as i32;
+                    }
+                }
+                if src == h.r as i32 {
+                    continue;
+                }
+                if src >= 0 {
+                    ms.push((h.id, src, -1, h.r as i32, -1));
+                } else {
+                    let sp = get_spill(f, s, h.id, &mut reg);
+                    ms.push((h.id, -1, sp, h.r as i32, -1));
+                }
+            }
+            for v in b.values.iter() {
+                if v.op != OP_PHI {
+                    break;
+                }
+                let id = v.id as usize;
+                let dr = reg[id];
+                let ds = if dr < 0 { s.spill[id] } else { -1 };
+                if dr < 0 && ds < 0 {
+                    continue;
+                }
+                let x = v.args[k];
+                let xi = x.id as usize;
+                if remat(x) || xi >= n0 || !s.needs[xi] {
+                    ms.push((x.id, -1, -1, dr, ds));
+                    continue;
+                }
+                let mut src: i32 = -1;
+                for e in end[pi].iter() {
+                    if e.id == x.id {
+                        src = e.r as i32;
+                    }
+                }
+                if src >= 0 {
+                    if src == dr {
+                        continue;
+                    }
+                    ms.push((x.id, src, -1, dr, ds));
+                } else {
+                    let sp = get_spill(f, s, x.id, &mut reg);
+                    if ds >= 0 && sp == ds {
+                        continue;
+                    }
+                    ms.push((x.id, -1, sp, dr, ds));
+                }
+            }
+            moves[pi] = ms;
+            k += 1;
+        }
+    }
+    // The spills right after their values (after a run of phis or selects).
+    let mut after: Vec<i32> = Vec::new();
+    after.resize(n0, -1);
+    let mut j = 0;
+    while j < n0 {
+        let sp = s.spill[j];
+        if sp >= 0 && sp as usize != j {
+            after[j] = sp;
+        }
+        j += 1;
+    }
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        let mut out: Vec<&mut Value> = Vec::new();
+        let mut pending: Vec<i32> = Vec::new();
+        let mut vi = 0;
+        while vi < b.values.len() {
+            let v = b.values[vi];
+            let run = v.op == OP_PHI || v.op == OP_SELECT || v.op == OP_ARG || v.op == OP_INITMEM;
+            if !run && pending.len() > 0 {
+                for p in pending.iter() {
+                    out.push(f.values[*p as usize]);
+                }
+                pending.clear();
+            }
+            out.push(v);
+            let id = v.id as usize;
+            if id < n0 && after[id] >= 0 {
+                let sv = f.values[after[id] as usize];
+                sv.block = Some(b);
+                pending.push(after[id]);
+            }
+            vi += 1;
+        }
+        for p in pending.iter() {
+            out.push(f.values[*p as usize]);
+        }
+        b.values = out;
+    }
+    // Slots: one per spill (pointers apart).
+    let n = f.values.len();
+    while reg.len() < n {
+        reg.push(-1);
+    }
+    while call_mask.len() < n {
+        call_mask.push(0);
+    }
+    let mut slot: Vec<i32> = Vec::new();
+    slot.resize(n, -1);
+    let mut slot_ptr: Vec<bool> = Vec::new();
+    j = 0;
+    while j < n0 {
+        let sp = s.spill[j];
+        if sp >= 0 {
+            slot[sp as usize] = slot_ptr.len() as i32;
+            slot_ptr.push(f.values[j].ty == T_PTR);
+        }
+        j += 1;
+    }
+    // Outputs.
+    let mut out_reg = a.reg;
+    out_reg.clear();
+    j = 0;
+    while j < n {
+        out_reg.push(if reg[j] >= 0 {
+            s.abs[reg[j] as usize] as i32
+        } else {
+            -1
+        });
+        j += 1;
+    }
+    let mut out_slot = a.slot;
+    out_slot.clear();
+    for x in slot.iter() {
+        out_slot.push(*x);
+    }
+    let mut sp_out = a.slot_ptr;
+    sp_out.clear();
+    for x in slot_ptr.iter() {
+        sp_out.push(*x);
+    }
+    let mut uc = a.used_callee;
+    uc.clear();
+    let mut rr = s.ncaller;
+    while rr < s.nint {
+        if s.used[rr] {
+            uc.push(s.abs[rr]);
+        }
+        rr += 1;
+    }
+    let mut cm = a.call_mask;
+    cm.clear();
+    for x in call_mask.iter() {
+        cm.push(*x);
+    }
+    let mut ord = a.ord;
+    ord.clear();
+    ord.resize(n, -1);
+    let mut em = a.edge_moves;
+    for e in em.iter_mut() {
+        e.clear();
+    }
+    while em.len() < nb {
+        em.push(Vec::new());
+    }
+    i = 0;
+    while i < nb {
+        for m in moves[i].iter() {
+            let (val, sr, ss, dr, ds) = *m;
+            em[i].push(Move {
+                val,
+                src_reg: if sr >= 0 {
+                    s.abs[sr as usize] as i32
+                } else {
+                    -1
+                },
+                src_slot: if ss >= 0 { slot[ss as usize] } else { -1 },
+                dst_reg: if dr >= 0 {
+                    s.abs[dr as usize] as i32
+                } else {
+                    -1
+                },
+                dst_slot: if ds >= 0 { slot[ds as usize] } else { -1 },
+            });
+        }
+        i += 1;
+    }
+    true
+}
+
+// The value a (possibly restored) argument stands for.
+fn orig_of(f: &Func, x: &Value) -> u32 {
+    if x.op == OP_STOREREG {
+        return x.args[0].id;
+    }
+    if x.op == OP_LOADREG {
+        let sp = x.args[0];
+        if sp.op == OP_STOREREG {
+            return sp.args[0].id;
+        }
+        return sp.id;
+    }
+    let _ = f;
+    x.id
+}
+
+// A free register of the class (callee-saved first if callee), or -1.
+fn free_reg(s: &Ra, fl: bool, callee: bool) -> i32 {
+    let (lo, hi) = if fl {
+        (s.nint, s.abs.len())
+    } else {
+        (0, s.nint)
+    };
+    let mut pass = 0;
+    while pass < 2 {
+        let mut r = lo;
+        while r < hi {
+            let want_callee = (pass == 0) == callee;
+            if s.holds[r] < 0 && !s.pinned[r] && (fl || s.is_callee(r) == want_callee) {
+                return r as i32;
+            }
+            r += 1;
+        }
+        if fl {
+            break;
+        }
+        pass += 1;
+    }
+    -1
+}
+
+// A register of the class: a free one, else the one whose value is used
+// farthest ahead (that value keeps a spill); -1 if all are pinned.
+fn alloc_reg(f: &mut Func, s: &mut Ra, fl: bool, callee: bool, reg: &mut Vec<i32>) -> i32 {
+    let r = free_reg(s, fl, callee);
+    if r >= 0 {
+        return r;
+    }
+    let (lo, hi) = if fl {
+        (s.nint, s.abs.len())
+    } else {
+        (0, s.nint)
+    };
+    let mut best: i32 = -1;
+    let mut far = -1;
+    let mut r = lo;
+    while r < hi {
+        if !s.pinned[r] {
+            let d = s.next_use(s.holds[r] as u32);
+            if d > far {
+                far = d;
+                best = r as i32;
+            }
+        }
+        r += 1;
+    }
+    if best < 0 {
+        return -1;
+    }
+    let b = best as usize;
+    let id = s.holds[b] as u32;
+    if s.next_use(id) < INF {
+        get_spill(f, s, id, reg);
+    }
+    s.free(b);
+    best
+}
+
+// The spill of value id (a StoreReg made now, placed after it later).
+fn get_spill(f: &mut Func, s: &mut Ra, id: u32, reg: &mut Vec<i32>) -> i32 {
+    let i = id as usize;
+    if s.spill[i] >= 0 {
+        return s.spill[i];
+    }
+    let v = f.values[i];
+    let sv = f.new_value(OP_STOREREG, v.ty, 0);
+    sv.args.clear();
+    sv.args.push(v);
+    sv.pos = v.pos;
+    while reg.len() < f.values.len() {
+        reg.push(-1);
+    }
+    s.spill[i] = sv.id as i32;
+    sv.id as i32
+}
+
+// --- Checking (-d racheck) ---------------------------------------------------
+
+// What a location holds: a value (before allocation), or none.
+const UNKNOWN: i32 = -1;
+const MIXED: i32 = -2;
+
+fn meet(a: i32, b: i32) -> i32 {
+    if a == b { a } else { MIXED }
+}
+
+/// Checks an allocation by following what each register and slot holds
+/// along the edges (after their moves): every argument must be where the
+/// allocation says it is. Returns what is wrong.
+pub fn check(f: &Func, cfg: &Config, a: &Alloc) -> Vec<String> {
+    let mut errs: Vec<String> = Vec::new();
+    let nb = f.blocks.len();
+    let nslot = a.slot_ptr.len();
+    let nl = 64 + nslot;
+    let mut caller: Vec<bool> = Vec::new();
+    caller.resize(64, false);
+    for r in cfg.caller.iter() {
+        caller[*r as usize] = true;
+    }
+    for r in cfg.fregs.iter() {
+        caller[*r as usize] = true;
+    }
+    let mut ins: Vec<Vec<i32>> = Vec::new();
+    let mut have: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < nb {
+        ins.push(Vec::new());
+        have.push(false);
+        i += 1;
+    }
+    let order = rpo(f);
+    let loc_of = |v: &Value| -> i32 {
+        let r = a.reg[v.id as usize];
+        if r >= 0 {
+            return r;
+        }
+        let s = a.slot[v.id as usize];
+        if s >= 0 {
+            return 64 + s;
+        }
+        -1
+    };
+    let mut changed = true;
+    let mut rounds = 0;
+    while changed && rounds < 50 {
+        changed = false;
+        rounds += 1;
+        let last = true;
+        for bi in order.iter() {
+            let b = f.blocks[*bi];
+            if b.id != f.entry.unwrap().id && !have[*bi] {
+                continue;
+            }
+            let mut st: Vec<i32> = if have[*bi] {
+                ins[*bi].clone()
+            } else {
+                let mut x: Vec<i32> = Vec::new();
+                x.resize(nl, UNKNOWN);
+                x
+            };
+            for v in b.values.iter() {
+                let check_arg = |x: &Value, st: &Vec<i32>, errs: &mut Vec<String>| {
+                    let o = orig_of(f, x);
+                    if remat(f.values[o as usize]) {
+                        return;
+                    }
+                    let l = loc_of(x);
+                    if l < 0 {
+                        return;
+                    }
+                    if st[l as usize] != o as i32 && last {
+                        errs.push(
+                            `${f.name}: b${b.id} v${v.id} (${op_name(v.op)}) reads v${o} from ${if l < 64 { "r" } else { "s" }}${if l < 64 { l } else { l - 64 }}, which holds ${st[l as usize]}`
+                                .to_string(),
+                        );
+                    }
+                };
+                if v.op == OP_PHI {
+                    continue;
+                }
+                if v.op != OP_STOREREG && v.op != OP_LOADREG {
+                    for x in v.args.iter() {
+                        check_arg(*x, &st, &mut errs);
+                    }
+                } else if v.op == OP_STOREREG {
+                    check_arg(v.args[0], &st, &mut errs);
+                } else {
+                    let sp = v.args[0];
+                    let l = loc_of(sp);
+                    let o = orig_of(f, v);
+                    if l >= 0 && st[l as usize] != o as i32 {
+                        errs.push(
+                            `${f.name}: b${b.id} v${v.id} LoadReg of v${o} from s${l - 64}, which holds ${st[l as usize]}`
+                                .to_string(),
+                        );
+                    }
+                }
+                if is_call(*v) {
+                    let mut r = 0;
+                    while r < 64 {
+                        if caller[r] {
+                            st[r] = UNKNOWN;
+                        }
+                        r += 1;
+                    }
+                }
+                let defs = |w: &Value, st: &mut Vec<i32>| {
+                    let l = loc_of(w);
+                    if l >= 0 {
+                        st[l as usize] = orig_of(f, w) as i32;
+                    }
+                };
+                if v.op == OP_ADDC || v.op == OP_SUBB {
+                    for w in b.values.iter() {
+                        if w.op == OP_SELECT && w.args[0].id == v.id {
+                            defs(*w, &mut st);
+                        }
+                    }
+                } else if !(v.op == OP_SELECT
+                    && (v.args[0].op == OP_ADDC || v.args[0].op == OP_SUBB))
+                {
+                    defs(*v, &mut st);
+                }
+            }
+            if b.kind == B_IF {
+                let c = b.control.unwrap();
+                let o = orig_of(f, c);
+                let l = loc_of(c);
+                if l >= 0 && !remat(f.values[o as usize]) && st[l as usize] != o as i32 {
+                    errs.push(
+                        `${f.name}: b${b.id} control v${o} not in its place (holds ${st[l as usize]})`
+                            .to_string(),
+                    );
+                }
+            }
+            // The edges: this block's moves, then the successors' phis.
+            if b.kind == B_PLAIN {
+                let ms = a.edge_moves[b.id as usize];
+                let mut vals: Vec<i32> = Vec::new();
+                for m in ms.iter() {
+                    let x = if m.src_reg >= 0 {
+                        st[m.src_reg as usize]
+                    } else if m.src_slot >= 0 {
+                        st[(64 + m.src_slot) as usize]
+                    } else {
+                        m.val as i32
+                    };
+                    if x != m.val as i32 {
+                        errs.push(
+                            `${f.name}: b${b.id} edge move of v${m.val} reads ${x}`.to_string(),
+                        );
+                    }
+                    vals.push(x);
+                }
+                let mut k = 0;
+                for m in ms.iter() {
+                    let d = if m.dst_reg >= 0 {
+                        m.dst_reg
+                    } else {
+                        64 + m.dst_slot
+                    };
+                    st[d as usize] = vals[k];
+                    k += 1;
+                }
+            }
+            for sp in b.succs.iter() {
+                let s = *sp;
+                let mut t = st.clone();
+                let mut pi = 0;
+                while pi < s.preds.len() && s.preds[pi].id != b.id {
+                    pi += 1;
+                }
+                for v in s.values.iter() {
+                    if v.op != OP_PHI {
+                        break;
+                    }
+                    let l = loc_of(*v);
+                    if l < 0 {
+                        continue;
+                    }
+                    let x = v.args[pi];
+                    if !remat(x) && t[l as usize] != x.id as i32 {
+                        errs.push(
+                            `${f.name}: b${b.id} -> b${s.id}: phi v${v.id} gets ${t[l as usize]}, not v${x.id}`
+                                .to_string(),
+                        );
+                    }
+                    t[l as usize] = v.id as i32;
+                }
+                let si = s.id as usize;
+                if !have[si] {
+                    ins[si] = t;
+                    have[si] = true;
+                    changed = true;
+                } else {
+                    let mut j = 0;
+                    while j < nl {
+                        let m2 = meet(ins[si][j], t[j]);
+                        if m2 != ins[si][j] {
+                            ins[si][j] = m2;
+                            changed = true;
+                        }
+                        j += 1;
+                    }
+                }
+            }
+        }
+        if changed {
+            errs.clear();
+        }
+    }
+    errs
+}
+
+/// The allocated function, for debugging (-d radump=name).
+pub fn dump(f: &Func, a: &Alloc) -> String {
+    let mut out = `${f.name}\n`.to_string();
+    for b in f.blocks.iter() {
+        out.push_str(&`b${b.id} ${b.kind} preds`.to_string());
+        for p in b.preds.iter() {
+            out.push_str(&` b${p.id}`.to_string());
+        }
+        out.push_str("\n");
+        for v in b.values.iter() {
+            let id = v.id as usize;
+            out.push_str(&`  v${v.id} = ${op_name(v.op)}`.to_string());
+            for x in v.args.iter() {
+                out.push_str(&` v${x.id}`.to_string());
+            }
+            out.push_str(&` : r${a.reg[id]} s${a.slot[id]}\n`.to_string());
+        }
+        if b.id as usize >= a.edge_moves.len() {
+            continue;
+        }
+        for m in a.edge_moves[b.id as usize].iter() {
+            out.push_str(
+                &`  move v${m.val}: r${m.src_reg} s${m.src_slot} -> r${m.dst_reg} s${m.dst_slot}\n`
+                    .to_string(),
+            );
+        }
+    }
+    out
+}

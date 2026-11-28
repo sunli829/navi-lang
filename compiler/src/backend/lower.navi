@@ -4178,7 +4178,7 @@ impl FnGen {
         crate::ssa::prep::split_critical(sf);
         crate::ssa::prep::fold_offsets(sf);
         crate::ssa::deadcode(sf);
-        let fused = crate::ssa::prep::fuse_compares(sf);
+        let mut fused = crate::ssa::prep::fuse_compares(sf);
         // Registers calls clobber: CTX, RET and LOC (set only right before
         // calls; their values are in the frame's fixed slots), and on arm64
         // x1-x7. (wasm: locals only, A1-A7 and S0-S8, which calls clobber
@@ -4222,7 +4222,32 @@ impl FnGen {
             callee,
             fregs,
         };
-        crate::ssa::regalloc::allocate(sf, cfg, &fused, self.g.ssa_ra);
+        // Go's allocator (docs/ssa.md 11), the linear scan where it does not
+        // apply or with -d oldregalloc.
+        let only = match crate::dflags::value("greedyonly") {
+            Some(w) => sf.name.contains(w.as_str()),
+            None => true,
+        };
+        if crate::dflags::on("oldregalloc")
+            || !only
+            || !crate::ssa::greedy::allocate(sf, cfg, &fused, self.g.ssa_ra)
+        {
+            crate::ssa::regalloc::allocate(sf, cfg, &fused, self.g.ssa_ra);
+        }
+        if let Some(w) = crate::dflags::value("radump") {
+            if sf.name == w {
+                eprintln(crate::ssa::greedy::dump(sf, self.g.ssa_ra));
+            }
+        }
+        if crate::dflags::on("racheck") {
+            for e in crate::ssa::greedy::check(sf, cfg, self.g.ssa_ra).iter() {
+                eprintln(`racheck: ${e}`);
+            }
+        }
+        // (Values the allocation made are not fused compares.)
+        while fused.len() < sf.values.len() {
+            fused.push(false);
+        }
         self.ssa_alloc = self.g.ssa_ra;
         if let Some(t) = t2 {
             crate::backend::ssagen::add_time(2, t.elapsed().as_nanos() as u64);
@@ -5110,6 +5135,28 @@ impl FnGen {
                 }
                 return;
             }
+            crate::ssa::OP_STOREREG => {
+                // A spill: the value's register to the StoreReg's slot.
+                let x = v.args[0];
+                let r = self.ssa_in(x, V1);
+                let off = self.ssa_slot_off(self.ssa_alloc.slot[v.id as usize]);
+                if crate::ssa::is_float(x.ty) {
+                    m.fstore(8, r, FP, off);
+                } else {
+                    m.store(8, r, FP, off);
+                }
+            }
+            crate::ssa::OP_LOADREG => {
+                // A restore from the slot of its argument (a StoreReg, or a
+                // phi or an argument kept in a slot).
+                let off = self.ssa_slot_off(self.ssa_alloc.slot[v.args[0].id as usize]);
+                let d = self.ssa_alloc.reg[v.id as usize] as Reg;
+                if crate::ssa::is_float(v.ty) {
+                    m.fload(8, d, FP, off);
+                } else {
+                    m.load(8, d, FP, off);
+                }
+            }
             crate::ssa::OP_MULHI => {
                 let a = self.ssa_in(v.args[0], V1);
                 let b = self.ssa_in(v.args[1], V2);
@@ -5677,6 +5724,8 @@ impl FnGen {
                     flags = v.id as i64;
                 } else if !(v.op == crate::ssa::OP_SELECT && v.args[0].id as i64 == flags)
                     && !(!x64 && keeps_flags_arm64(v))
+                    && v.op != crate::ssa::OP_LOADREG
+                    && v.op != crate::ssa::OP_STOREREG
                 {
                     flags = -1;
                 }
