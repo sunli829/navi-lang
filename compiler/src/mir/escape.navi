@@ -264,24 +264,68 @@ fn forwards(trait_name: &str) -> bool {
     }
 }
 
-/// The head of a self type that selects impls (-1: any impl may apply).
-/// Impls do not overlap, so a call whose self type has a concrete head can
-/// only reach impls with that head or blanket impls.
-fn head(t: &Type) -> i64 {
-    let k = t.kind;
-    if k == types::K_ADT {
-        return t.d().id as i64 * 32 + 31;
+/// The head of a self type that selects impls: its kind, then a
+/// reference's, pointer's, array's or slice's element's (&str, &[T]), to
+/// three levels; -1 where any type may be (a type parameter). Impls do not
+/// overlap, so a call can only reach impls whose heads meet its own.
+fn head(t: &Type) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    let mut x = t;
+    while out.len() < 3 {
+        let k = x.kind;
+        if k == types::K_ADT {
+            out.push(x.d().id as i64 * 32 + 31);
+            break;
+        }
+        if k == types::K_PARAM
+            || k == types::K_PROJ
+            || k == types::K_DYN
+            || k == types::K_OPAQUE
+            || k == types::K_INFER
+            || k == types::K_ERROR
+        {
+            out.push(-1);
+            break;
+        }
+        out.push(k as i64);
+        if k == types::K_REF || k == types::K_PTR || k == types::K_ARRAY || k == types::K_SLICE {
+            x = x.el();
+        } else {
+            break;
+        }
     }
-    if k == types::K_PARAM
-        || k == types::K_PROJ
-        || k == types::K_DYN
-        || k == types::K_OPAQUE
-        || k == types::K_INFER
-        || k == types::K_ERROR
-    {
-        return -1;
+    out
+}
+
+// Whether a call whose self type has head c may reach an impl with head i.
+fn heads_meet(i: &Vec<i64>, c: &Vec<i64>) -> bool {
+    let mut k = 0;
+    while k < i.len() && k < c.len() {
+        if i[k] < 0 || c[k] < 0 {
+            return true;
+        }
+        if i[k] != c[k] {
+            return false;
+        }
+        k += 1;
     }
-    k as i64
+    true
+}
+
+// Whether an impl with head i is the one every call with head c reaches
+// (it covers each type c may be).
+fn head_covers(i: &Vec<i64>, c: &Vec<i64>) -> bool {
+    let mut k = 0;
+    while k < i.len() {
+        if i[k] < 0 {
+            return true;
+        }
+        if k >= c.len() || c[k] != i[k] {
+            return false;
+        }
+        k += 1;
+    }
+    i.len() == c.len()
 }
 
 struct Escape {
@@ -290,7 +334,7 @@ struct Escape {
     /// summaries are its own).
     shared: Option<HashMap<u32, Summary>>,
     by_def: HashMap<u32, &mut Func>,
-    impls: HashMap<String, Vec<(&mut Func, i64)>>,
+    impls: HashMap<String, Vec<(&mut Func, Vec<i64>)>>,
     lang_of: HashMap<u32, String>,
     changed: bool,
     debug: String,
@@ -323,6 +367,27 @@ fn merge(s: &mut Summary, t: Summary) {
             s.pairs.push(*p);
         }
     }
+}
+
+// A summary of a call through a reference's shim: chain 0 (self) one level
+// deeper, and chain 1 (a comparison's other operand) if rhs.
+fn shifted(s: &Summary, rhs: bool) -> Summary {
+    let by = |k: u8| -> u8 { if k == 0 || k == 1 && rhs { 1 } else { 0 } };
+    let mut out = s.clone();
+    let mut k = 0;
+    while k < out.esc.len() {
+        if out.esc[k] != 0 {
+            out.esc[k] += by(k as u8);
+        }
+        k += 1;
+    }
+    let mut ps = Vec::new();
+    for p in s.pairs.iter() {
+        let (a, d, b, e) = *p;
+        ps.push((a, d + by(a), b, e + by(b)));
+    }
+    out.pairs = ps;
+    out
 }
 
 impl Escape {
@@ -409,12 +474,19 @@ impl Escape {
             // (and blanket ones); for a builtin impl (a shim, made later by
             // the code generator), those of the parts it calls the method of
             // (<&T as Display>::fmt calls T's); any, for a type parameter.
-            let fwd = match self.lang_of.get(&p.id) {
-                Some(n) => forwards(n.as_str()),
-                None => false,
+            let tname = match self.lang_of.get(&p.id) {
+                Some(n) => n.clone(),
+                None => String::new(),
+            };
+            let fwd = forwards(tname.as_str());
+            // (The other operand of a comparison: Rhs, or Self for Ord.)
+            let rhs = match tname.as_str() {
+                "PartialEq" | "PartialOrd" => r.args.last().map(|t: &&Type| -> &Type { *t }),
+                "Ord" => r.self_ty,
+                _ => None,
             };
             let shim = match r.self_ty {
-                Some(t) => self.merge_for(&key, t, nargs, &mut s, fwd, 0),
+                Some(t) => self.merge_for(&key, t, rhs, nargs, &mut s, fwd, 0),
                 None => {
                     self.merge_all(&key, nargs, &mut s);
                     true
@@ -438,27 +510,29 @@ impl Escape {
     }
 
     // Merges into s the summaries of key's impls a call with self type t
-    // may reach; whether it may reach a shim (an impl no source has).
+    // (and rhs, a comparison's other operand) may reach; whether it may
+    // reach a shim (an impl no source has).
     fn merge_for(
         &mut self,
         key: &String,
         t: &Type,
+        rhs: Option<&Type>,
         nargs: usize,
         s: &mut Summary,
         fwd: bool,
         depth: usize,
     ) -> bool {
         let h = head(t);
-        if h < 0 || depth > 4 {
+        if h[0] < 0 || depth > 4 {
             self.merge_all(key, nargs, s);
             return true;
         }
         let mut exact = false;
         if let Some(fs) = self.impls.get(key) {
             for (f, fh) in fs.iter() {
-                if *fh < 0 || *fh == h {
+                if heads_meet(fh, &h) {
                     merge(s, self.summary_of(*f, nargs));
-                    if *fh == h {
+                    if head_covers(fh, &h) {
                         exact = true;
                     }
                 }
@@ -473,11 +547,35 @@ impl Escape {
             return true;
         }
         let k = t.kind;
-        if k == types::K_REF || k == types::K_PTR || k == types::K_ARRAY || k == types::K_SLICE {
-            self.merge_for(key, t.el(), nargs, s, fwd, depth + 1);
+        if k == types::K_REF || k == types::K_PTR {
+            // A reference's shim calls its referent's method (and nothing
+            // else) with self dereferenced, and the other operand if it is
+            // a reference too: what that call does to level d of them is
+            // done to level d + 1 of the shim's.
+            let (r2, shift_rhs) = match rhs {
+                Some(r) if r.kind == types::K_REF || r.kind == types::K_PTR => (Some(r.el()), true),
+                _ => (rhs, false),
+            };
+            let inner = &mut empty_summary(nargs);
+            let shim = self.merge_for(key, t.el(), r2, nargs, inner, fwd, depth + 1);
+            merge(s, shifted(inner, shift_rhs));
+            return shim;
+        } else if k == types::K_ARRAY || k == types::K_SLICE {
+            // (Its elements are where it points: the same levels.)
+            let r2 = match rhs {
+                Some(r) if r.kind == types::K_ARRAY || r.kind == types::K_SLICE => Some(r.el()),
+                _ => None,
+            };
+            self.merge_for(key, t.el(), r2, nargs, s, fwd, depth + 1);
         } else if k == types::K_TUPLE {
-            for e in t.elems.iter() {
-                self.merge_for(key, *e, nargs, s, fwd, depth + 1);
+            let mut i = 0;
+            while i < t.elems.len() {
+                let r2 = match rhs {
+                    Some(r) if r.kind == types::K_TUPLE && i < r.elems.len() => Some(r.elems[i]),
+                    _ => None,
+                };
+                self.merge_for(key, t.elems[i], r2, nargs, s, fwd, depth + 1);
+                i += 1;
             }
         }
         true
@@ -1027,7 +1125,8 @@ pub fn analyze_program(
             if let Some(p) = d.parent {
                 // Trait impl methods and trait default bodies.
                 let mut trait_id: i64 = -1;
-                let mut h: i64 = -1;
+                let mut h: Vec<i64> = Vec::new();
+                h.push(-1);
                 if p.kind == resolve::DEF_TRAIT {
                     trait_id = p.id as i64;
                 }
