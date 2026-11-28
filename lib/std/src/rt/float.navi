@@ -1,7 +1,10 @@
-//! Exact float to decimal conversion for the native runtime (the
-//! interpreter uses Go's strconv). Shortest round-trip digits use the
-//! Burger-Dybvig free-format algorithm on big integers; fixed precision is
-//! rounded exactly (half to even).
+//! Exact float to decimal conversion for the native runtime, as Go's
+//! internal/strconv: shortest round-trip digits by Dragonbox, up to 18
+//! digits of fixed precision by a 128-bit power of ten (fixedFtoa), more on
+//! big integers (rounded exactly, half to even); parsing by Eisel-Lemire,
+//! else on big integers.
+
+use crate::rt::pow10::{POW10_MAX, POW10_MIN, POW10_TAB};
 
 // 110 * 32 bits holds 2^1024 * 10^700, the largest product formatted
 // (precision is capped at 700 digits).
@@ -214,6 +217,9 @@ struct Decoded {
     neg: bool,
     lower_boundary_closer: bool,
     even: bool,
+    // A subnormal (no implicit leading bit), an f32.
+    denorm: bool,
+    single: bool,
 }
 
 fn decode(x: f64, single: bool) -> Decoded {
@@ -234,6 +240,8 @@ fn decode(x: f64, single: bool) -> Decoded {
             neg,
             lower_boundary_closer: be > 1 && frac == 0,
             even: mant % 2 == 0,
+            denorm: be == 0,
+            single: true,
         };
     }
     let bits = unsafe { *(&x as *const f64 as *const u64) };
@@ -251,105 +259,53 @@ fn decode(x: f64, single: bool) -> Decoded {
         neg,
         lower_boundary_closer: be > 1 && frac == 0,
         even: mant % 2 == 0,
+        denorm: be == 0,
+        single: false,
     }
 }
 
-// Shortest digits (Burger & Dybvig). Returns the number of digits written
-// to digits and the decimal exponent k (value = 0.d1d2... * 10^k).
+// Shortest digits (Dragonbox). Returns the number of digits written to
+// digits and the decimal exponent k (value = 0.d1d2... * 10^k).
 fn shortest(dv: &Decoded, digits: &mut [u8; 40]) -> (usize, i32) {
-    let mut r: Big;
-    let mut s: Big;
-    let mut mp: Big;
-    let mut mm: Big;
-    if dv.exp >= 0 {
-        let mut be = Big::from_u64(1);
-        be.shl(dv.exp);
-        if !dv.lower_boundary_closer {
-            r = Big::from_u64(dv.mant);
-            r.shl(dv.exp + 1);
-            s = Big::from_u64(2);
-            mp = be.copy();
-            mm = be;
-        } else {
-            r = Big::from_u64(dv.mant);
-            r.shl(dv.exp + 2);
-            s = Big::from_u64(4);
-            mp = be.copy();
-            mp.shl(1);
-            mm = be;
-        }
-    } else if !dv.lower_boundary_closer {
-        r = Big::from_u64(dv.mant);
-        r.shl(1);
-        s = Big::from_u64(1);
-        s.shl(1 - dv.exp);
-        mp = Big::from_u64(1);
-        mm = Big::from_u64(1);
+    let (m, e10) = if dv.single {
+        let (m, e) = dbox32(dv.mant as u32, dv.exp, dv.denorm);
+        (m as u64, e)
     } else {
-        r = Big::from_u64(dv.mant);
-        r.shl(2);
-        s = Big::from_u64(1);
-        s.shl(2 - dv.exp);
-        mp = Big::from_u64(2);
-        mm = Big::from_u64(1);
-    }
-    // Scale so that r/s is in [0.1, 1): find k with high = r + mp.
-    let mut k: i32 = 0;
-    loop {
-        let mut high = r.copy();
-        high.add(&mp);
-        let c = high.cmp(&s);
-        if c > 0 || c == 0 && dv.even {
-            s.mul_small(10);
-            k += 1;
-        } else {
-            break;
-        }
-    }
-    loop {
-        let mut high = r.copy();
-        high.add(&mp);
-        high.mul_small(10);
-        let c = high.cmp(&s);
-        if c < 0 || c == 0 && !dv.even {
-            r.mul_small(10);
-            mp.mul_small(10);
-            mm.mul_small(10);
-            k -= 1;
-        } else {
-            break;
-        }
-    }
-    let mut n = 0;
-    loop {
-        r.mul_small(10);
-        mp.mul_small(10);
-        mm.mul_small(10);
-        let d = r.div_digit(&s);
-        let c1 = r.cmp(&mm);
-        let low = c1 < 0 || c1 == 0 && dv.even;
-        let mut high = r.copy();
-        high.add(&mp);
-        let c2 = high.cmp(&s);
-        let hi = c2 > 0 || c2 == 0 && dv.even;
-        if !low && !hi {
-            digits[n] = d;
-            n += 1;
-            continue;
-        }
-        if low && !hi {
-            digits[n] = d;
-        } else if hi && !low {
-            digits[n] = d + 1;
-        } else {
-            let mut twice = r.copy();
-            twice.shl(1);
-            digits[n] = if twice.cmp(&s) < 0 { d } else { d + 1 };
-        }
-        n += 1;
-        break;
+        dbox64(dv.mant, dv.exp, dv.denorm)
+    };
+    let mut n = put_digits(m, 0, digits);
+    let k = n as i32 + e10;
+    while n > 1 && digits[n - 1] == 0 {
+        n -= 1;
     }
     (n, k)
+}
+
+// Digit i of the nd in ds as a character ('0' outside them).
+fn digit_at(ds: &[u8; 40], nd: usize, i: i32) -> u8 {
+    if i >= 0 && i < nd as i32 {
+        b'0' + ds[i as usize]
+    } else {
+        b'0'
+    }
+}
+
+// Writes the decimal digits of v (at least width) to ds; returns how many.
+fn put_digits(v: u64, width: usize, ds: &mut [u8; 40]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut n = 0;
+    let mut x = v;
+    while x > 0 || n < width {
+        tmp[n] = (x % 10) as u8;
+        x = x / 10;
+        n += 1;
+    }
+    let mut i = 0;
+    while i < n {
+        ds[i] = tmp[n - 1 - i];
+        i += 1;
+    }
+    n
 }
 
 impl Big {
@@ -440,6 +396,42 @@ fn digits_of(q: &Big, ds: &mut [u8; 1100]) -> usize {
 
 // Writes v rounded to prec digits after the decimal point.
 fn fixed(dv: &Decoded, prec: usize, out: &mut Out) {
+    if dv.mant != 0 {
+        // Go's estimate of the digits needed (fixed_ftoa shortens them).
+        let e = dv.exp + if dv.single { 23 } else { 52 };
+        let p = prec as i32;
+        let digits = if e >= 0 {
+            1 + mul_log10_2(1 + e) + p
+        } else {
+            1 + p - mul_log10_2(-e)
+        };
+        if digits <= 18 {
+            let mut ds = [0u8; 40];
+            let (nd, dp) = if digits > 0 {
+                fixed_ftoa(dv.mant, dv.exp, digits, p, true, &mut ds)
+            } else {
+                (0, 0)
+            };
+            if dp <= 0 {
+                out.byte(b'0');
+            } else {
+                let mut i = 0;
+                while i < dp {
+                    out.byte(digit_at(&ds, nd, i));
+                    i += 1;
+                }
+            }
+            if prec > 0 {
+                out.byte(b'.');
+                let mut j = 0;
+                while j < p {
+                    out.byte(digit_at(&ds, nd, dp + j));
+                    j += 1;
+                }
+            }
+            return;
+        }
+    }
     let q = round_scaled(dv, prec as i32);
     let mut ds = [0u8; 1100];
     let n = digits_of(&q, &mut ds);
@@ -461,6 +453,29 @@ fn fixed(dv: &Decoded, prec: usize, out: &mut Out) {
 
 // Writes v in exponent form with prec digits after the decimal point.
 fn exp_prec(dv: &Decoded, prec: usize, k0: i32, upper: bool, out: &mut Out) {
+    if dv.mant != 0 && prec + 1 <= 18 {
+        let mut fs = [0u8; 40];
+        let (nd, dp) = fixed_ftoa(
+            dv.mant,
+            dv.exp,
+            prec as i32 + 1,
+            prec as i32,
+            false,
+            &mut fs,
+        );
+        out.byte(b'0' + fs[0]);
+        if prec > 0 {
+            out.byte(b'.');
+            let mut i = 1;
+            while i <= prec {
+                out.byte(if i < nd { b'0' + fs[i] } else { b'0' });
+                i += 1;
+            }
+        }
+        out.byte(if upper { b'E' } else { b'e' });
+        put_i32(out, dp - 1);
+        return;
+    }
     let mut ds = [0u8; 1100];
     let mut n = 0;
     let mut k = k0;
@@ -723,6 +738,9 @@ fn assemble(q: &mut Big, e: i32, sticky: bool, neg: bool) -> f64 {
 /// Parses a decimal float ("1.5", "-2e10", "inf", "NaN"), correctly
 /// rounded.
 pub fn parse(s: &str) -> Option<f64> {
+    if let Some(f) = parse_fast(s) {
+        return Some(f);
+    }
     let b = s.as_bytes();
     let n = b.len();
     if n == 0 {
@@ -823,4 +841,576 @@ pub fn parse(s: &str) -> Option<f64> {
     let mut qq = q;
     let sticky = !digits.is_zero();
     Some(assemble(&mut qq, -k, sticky, neg))
+}
+
+// --- Dragonbox, fixed precision and Eisel-Lemire -----------------------------
+// (Go's internal/strconv ftoadbox.go, ftoafixed.go, atofeisel.go, math.go.)
+
+struct U128 {
+    hi: u64,
+    lo: u64,
+}
+
+fn mul_hi(x: u64, y: u64) -> u64 {
+    crate::intrinsics::mul_hi(x, y)
+}
+
+// x >> n and x << n, 0 for n >= 64 (as Go's shifts).
+fn shr(x: u64, n: u32) -> u64 {
+    if n >= 64 { 0 } else { x >> n }
+}
+
+fn shl(x: u64, n: u32) -> u64 {
+    if n >= 64 { 0 } else { x << n }
+}
+
+// 10^e as (mantissa, binary exponent): 10^e = mant / 2^128 * 2^exp, for
+// POW10_MIN <= e <= POW10_MAX.
+fn pow10(e: i32) -> (U128, i32) {
+    let i = ((e - POW10_MIN) * 2) as usize;
+    (
+        U128 {
+            hi: POW10_TAB[i],
+            lo: POW10_TAB[i + 1],
+        },
+        1 + mul_log2_10(e),
+    )
+}
+
+// floor(x * log10(2)) for -1600 <= x <= 1600.
+fn mul_log10_2(x: i32) -> i32 {
+    (x * 78913) >> 18
+}
+
+// floor(x * log2(10)) for -500 <= x <= 500.
+fn mul_log2_10(x: i32) -> i32 {
+    (x * 108853) >> 15
+}
+
+// floor(e * log10(2) - log10(4/3)) for -2985 <= e <= 2936.
+fn mul_log10_2_minus_log10_4_over3(e: i32) -> i32 {
+    ((e as i64 * 631305 - 261663) >> 21) as i32
+}
+
+static POW10U64: [u64; 20] = [
+    1,
+    10,
+    100,
+    1000,
+    10000,
+    100000,
+    1000000,
+    10000000,
+    100000000,
+    1000000000,
+    10000000000,
+    100000000000,
+    1000000000000,
+    10000000000000,
+    100000000000000,
+    1000000000000000,
+    10000000000000000,
+    100000000000000000,
+    1000000000000000000,
+    10000000000000000000,
+];
+
+// The multiplicative inverse of 5^p and u64::MAX / 5^p (p = 1..22).
+static DIV5: [u64; 44] = [
+    0xcccccccccccccccd,
+    3689348814741910323,
+    0x8f5c28f5c28f5c29,
+    737869762948382064,
+    0x1cac083126e978d5,
+    147573952589676412,
+    0xd288ce703afb7e91,
+    29514790517935282,
+    0x5d4e8fb00bcbe61d,
+    5902958103587056,
+    0x790fb65668c26139,
+    1180591620717411,
+    0xe5032477ae8d46a5,
+    236118324143482,
+    0xc767074b22e90e21,
+    47223664828696,
+    0x8e47ce423a2e9c6d,
+    9444732965739,
+    0x4fa7f60d3ed61f49,
+    1888946593147,
+    0x0fee64690c913975,
+    377789318629,
+    0x3662e0e1cf503eb1,
+    75557863725,
+    0xa47a2cf9f6433fbd,
+    15111572745,
+    0x54186f653140a659,
+    3022314549,
+    0x7738164770402145,
+    604462909,
+    0xe4a4d1417cd9a041,
+    120892581,
+    0xc75429d9e5c5200d,
+    24178516,
+    0xc1773b91fac10669,
+    4835703,
+    0x26b172506559ce15,
+    967140,
+    0xd489e3a9addec2d1,
+    193428,
+    0x90e860bb892c8d5d,
+    38685,
+    0x502e79bf1b6f4f79,
+    7737,
+];
+
+// Whether x is divisible by 5^p (false for p outside 1..=22).
+fn divisible_pow5(x: u64, p: i32) -> bool {
+    if p < 1 || p > 22 {
+        return false;
+    }
+    let i = ((p - 1) * 2) as usize;
+    x.wrapping_mul(DIV5[i]) <= DIV5[i + 1]
+}
+
+const MAX_U64: u64 = 0xffffffffffffffff;
+
+// x / 10^p for the largest p with x % 10^p == 0, and p (x != 0).
+fn trim_zeros(x0: u64) -> (u64, i32) {
+    let mut x = x0;
+    let mut p = 0;
+    loop {
+        let d = x.wrapping_mul(0xc767074b22e90e21).rotate_right(8);
+        if d > MAX_U64 / 100000000 {
+            break;
+        }
+        x = d;
+        p += 8;
+    }
+    let d = x.wrapping_mul(0xd288ce703afb7e91).rotate_right(4);
+    if d <= MAX_U64 / 10000 {
+        x = d;
+        p += 4;
+    }
+    let d = x.wrapping_mul(0x8f5c28f5c28f5c29).rotate_right(2);
+    if d <= MAX_U64 / 100 {
+        x = d;
+        p += 2;
+    }
+    let d = x.wrapping_mul(0xcccccccccccccccd).rotate_right(1);
+    if d <= MAX_U64 / 10 {
+        x = d;
+        p += 1;
+    }
+    (x, p)
+}
+
+// The upper 64 bits of the 128-bit x * y.
+fn umul128_upper64(x: u64, y: u64) -> u64 {
+    mul_hi(x, y)
+}
+
+// The upper 128 bits of the 192-bit x * y.
+fn umul192_upper128(x: u64, y: &U128) -> U128 {
+    let hi = mul_hi(x, y.hi);
+    let lo = x.wrapping_mul(y.hi);
+    let t = umul128_upper64(x, y.lo);
+    let sum = lo.wrapping_add(t);
+    U128 {
+        hi: if sum < lo { hi + 1 } else { hi },
+        lo: sum,
+    }
+}
+
+// The lower 128 bits of the 192-bit x * y.
+fn umul192_lower128(x: u64, y: &U128) -> U128 {
+    let high = x.wrapping_mul(y.hi);
+    let hl_hi = mul_hi(x, y.lo);
+    let hl_lo = x.wrapping_mul(y.lo);
+    U128 {
+        hi: high.wrapping_add(hl_hi),
+        lo: hl_lo,
+    }
+}
+
+// The 192-bit x * y as (hi, mid, lo).
+fn umul192(x: u64, y: &U128) -> (u64, u64, u64) {
+    let mid1 = mul_hi(x, y.lo);
+    let lo = x.wrapping_mul(y.lo);
+    let hi = mul_hi(x, y.hi);
+    let mid2 = x.wrapping_mul(y.hi);
+    let mid = mid1.wrapping_add(mid2);
+    (if mid < mid1 { hi + 1 } else { hi }, mid, lo)
+}
+
+fn dbox_pow64(k: i32, e: i32) -> (U128, i32) {
+    let (mut phi, e1) = pow10(k);
+    if k < 0 || k > 55 {
+        phi.lo = phi.lo.wrapping_add(1);
+    }
+    (phi, e + e1 - 1)
+}
+
+fn dbox_pow32(k: i32, e: i32) -> (u64, i32) {
+    let (m, e1) = pow10(k);
+    let hi = if k < 0 || k > 27 { m.hi + 1 } else { m.hi };
+    (hi, e + e1 - 1)
+}
+
+fn dbox_delta64(phi: &U128, beta: i32) -> u32 {
+    (phi.hi >> ((63 - beta) as u32)) as u32
+}
+
+fn dbox_delta32(phi: u64, beta: i32) -> u32 {
+    (phi >> ((63 - beta) as u32)) as u32
+}
+
+fn dbox_range64(phi: &U128, beta: i32) -> (u64, u64) {
+    let sh = (11 - beta) as u32;
+    let left = (phi.hi - (phi.hi >> 54)) >> sh;
+    let right = phi.hi.wrapping_add(phi.hi >> 53) >> sh;
+    (left, right)
+}
+
+fn dbox_range32(phi: u64, beta: i32) -> (u32, u32) {
+    let sh = (40 - beta) as u32;
+    let left = ((phi - (phi >> 25)) >> sh) as u32;
+    let right = (phi.wrapping_add(phi >> 24) >> sh) as u32;
+    (left, right)
+}
+
+fn dbox_round_up64(phi: &U128, beta: i32) -> u64 {
+    ((phi.hi >> ((10 - beta) as u32)) + 1) / 2
+}
+
+fn dbox_round_up32(phi: u64, beta: i32) -> u32 {
+    (((phi >> ((39 - beta) as u32)) + 1) as u32) / 2
+}
+
+// The parity of the integer part of mant2 * phi * 2^beta and whether its
+// fraction is 0.
+fn dbox_parity64(mant2: u64, phi: &U128, beta: i32) -> (bool, bool) {
+    let r = umul192_lower128(mant2, phi);
+    let b = beta as u32;
+    let parity = (shr(r.hi, 64 - b) & 1) != 0;
+    let is_int = (shl(r.hi, b) | shr(r.lo, 64 - b)) == 0;
+    (parity, is_int)
+}
+
+fn dbox_parity32(mant2: u32, phi: u64, beta: i32) -> (bool, bool) {
+    let r = (mant2 as u64).wrapping_mul(phi);
+    let b = beta as u32;
+    let parity = (shr(r, 64 - b) & 1) != 0;
+    let is_int = (shr(r, 32 - b) as u32) == 0;
+    (parity, is_int)
+}
+
+// The shortest decimal (significand, exponent) of mant * 2^exp (an f64).
+// Where two shortest ones are equally near, the larger, as Rust's
+// (Go's rounds to the even one: Dragonbox's tie policy).
+fn dbox64(mant: u64, exp: i32, denorm: bool) -> (u64, i32) {
+    if mant == 1u64 << 52 && !denorm {
+        let k0 = -mul_log10_2_minus_log10_4_over3(exp);
+        let (phi, beta) = dbox_pow64(k0, exp);
+        let (mut xi, zi) = dbox_range64(&phi, beta);
+        if exp != 2 && exp != 3 {
+            xi += 1;
+        }
+        let q = zi / 10;
+        if xi <= q * 10 {
+            let (q2, zeros) = trim_zeros(q);
+            return (q2, -k0 + 1 + zeros);
+        }
+        let mut yru = dbox_round_up64(&phi, beta);
+        if yru < xi {
+            yru += 1;
+        }
+        return (yru, -k0);
+    }
+    // kappa = 2.
+    let k0 = -mul_log10_2(exp);
+    let (phi, beta) = dbox_pow64(2 + k0, exp);
+    let r0 = umul192_upper128((mant * 2 + 1) << (beta as u32), &phi);
+    let zi = r0.hi;
+    let exact = r0.lo == 0;
+    let mut s = zi / 1000;
+    let mut r = (zi % 1000) as u32;
+    let delta = dbox_delta64(&phi, beta);
+    if r < delta {
+        if r != 0 || !exact || mant % 2 == 0 {
+            let (s2, zeros) = trim_zeros(s);
+            return (s2, -k0 + 1 + zeros);
+        }
+        s -= 1;
+        r = 1000;
+    } else if r == delta {
+        let (parity, ex) = dbox_parity64(mant * 2 - 1, &phi, beta);
+        if parity || ex && mant % 2 == 0 {
+            let (s2, zeros) = trim_zeros(s);
+            return (s2, -k0 + 1 + zeros);
+        }
+    }
+    let d = r + 50 - delta / 2;
+    let t = d / 100;
+    let rho = d % 100;
+    let mut yru = 10 * s + t as u64;
+    if rho == 0 {
+        let (parity, ex) = dbox_parity64(mant * 2, &phi, beta);
+        if parity != ((d - 50) % 2 != 0) {
+            yru -= 1;
+        }
+        let _ = ex;
+    }
+    (yru, -k0)
+}
+
+// dbox64 for an f32.
+fn dbox32(mant: u32, exp: i32, denorm: bool) -> (u32, i32) {
+    if mant == 1u32 << 23 && !denorm {
+        let k0 = -mul_log10_2_minus_log10_4_over3(exp);
+        let (phi, beta) = dbox_pow32(k0, exp);
+        let (mut xi, zi) = dbox_range32(phi, beta);
+        if exp != 2 && exp != 3 {
+            xi += 1;
+        }
+        let q = zi / 10;
+        if xi <= q * 10 {
+            let (q2, zeros) = trim_zeros(q as u64);
+            return (q2 as u32, -k0 + 1 + zeros);
+        }
+        let mut yru = dbox_round_up32(phi, beta);
+        if yru < xi {
+            yru += 1;
+        }
+        return (yru, -k0);
+    }
+    // kappa = 1.
+    let k0 = -mul_log10_2(exp);
+    let (phi, beta) = dbox_pow32(1 + k0, exp);
+    let u = ((mant * 2 + 1) << (beta as u32)) as u64;
+    let prod = (u * (phi >> 32)) + ((u * (phi & 0xffffffff)) >> 32);
+    let zi = (prod >> 32) as u32;
+    let exact = (prod & 0xffffffff) == 0;
+    let mut s = zi / 100;
+    let mut r = zi % 100;
+    let delta = dbox_delta32(phi, beta);
+    if r < delta {
+        if r != 0 || !exact || mant % 2 == 0 {
+            let (s2, zeros) = trim_zeros(s as u64);
+            return (s2 as u32, -k0 + 1 + zeros);
+        }
+        s -= 1;
+        r = 100;
+    } else if r == delta {
+        let (parity, ex) = dbox_parity32(mant * 2 - 1, phi, beta);
+        if parity || ex && mant % 2 == 0 {
+            let (s2, zeros) = trim_zeros(s as u64);
+            return (s2 as u32, -k0 + 1 + zeros);
+        }
+    }
+    let d = r + 5 - delta / 2;
+    let t = d / 10;
+    let rho = d % 10;
+    let mut yru = 10 * s + t;
+    if rho == 0 {
+        let (parity, ex) = dbox_parity32(mant * 2, phi, beta);
+        if parity != ((d - 5) % 2 != 0) {
+            yru -= 1;
+        }
+        let _ = ex;
+    }
+    (yru, -k0)
+}
+
+// digits0 (1..=18) decimal digits of mant * 2^exp (mant > 0), rounded half
+// to even, into ds; for %f (is_f) digits0 is an overestimate and the
+// digits end prec places after the point. Returns the number of digits
+// (trailing zeros dropped) and the decimal point's place (value = 0.ds *
+// 10^dp).
+fn fixed_ftoa(
+    mant0: u64,
+    exp0: i32,
+    digits0: i32,
+    prec: i32,
+    is_f: bool,
+    ds: &mut [u8; 40],
+) -> (usize, i32) {
+    let b = mant0.leading_zeros();
+    let mant = mant0 << b;
+    let exp = exp0 - b as i32;
+    let p = (digits0 - 1) - mul_log10_2(63 + exp);
+    let (mut pow, exp2) = pow10(p);
+    if -22 <= p && p < 0 {
+        pow.lo = pow.lo.wrapping_add(1);
+    }
+    let (dm0, lo1, lo0) = umul192(mant, &pow);
+    let de = exp + exp2;
+    let mut dt: u64 = 1;
+    if 0 <= p && p <= 55 {
+        dt = if lo1 | lo0 != 0 { 1 } else { 0 };
+    } else if -22 <= p && p < 0 && divisible_pow5(mant, -p) {
+        dt = 0;
+    }
+    let shift = (-de - 1) as u32;
+    if dm0 & shl(1, shift).wrapping_sub(1) != 0 {
+        dt = 1;
+    }
+    let mut dm = shr(dm0, shift);
+    let mut dp = digits0 - p;
+    let mut digits = digits0;
+    let mut max = POW10U64[digits as usize] << 1;
+    if dm >= max {
+        if dm % 10 != 0 {
+            dt = 1;
+        }
+        dm = dm / 10;
+        dp += 1;
+    }
+    if is_f && digits != dp + prec {
+        while digits > dp + prec {
+            if dm % 10 != 0 {
+                dt = 1;
+            }
+            dm = dm / 10;
+            digits -= 1;
+        }
+        if digits <= 0 {
+            digits = 1;
+            dp += 1;
+        }
+        max = POW10U64[digits as usize] << 1;
+    }
+    dm += dm & (dt | (dm >> 1)) & 1;
+    dm = dm >> 1;
+    if dm == max >> 1 {
+        dm = POW10U64[(digits - 1) as usize];
+        dp += 1;
+    }
+    let mut nd = 0;
+    if dm != 0 {
+        nd = put_digits(dm, digits as usize, ds);
+        while nd > 0 && ds[nd - 1] == 0 {
+            nd -= 1;
+        }
+    }
+    (nd, dp)
+}
+
+// The f64 nearest man * 10^exp10, or none when Eisel-Lemire cannot tell.
+fn eisel_lemire64(man0: u64, exp10: i32, neg: bool) -> Option<f64> {
+    if man0 == 0 {
+        return Some(if neg { -0.0 } else { 0.0 });
+    }
+    if exp10 < POW10_MIN || exp10 > POW10_MAX {
+        return None;
+    }
+    let (pow, exp2) = pow10(exp10);
+    let clz = man0.leading_zeros();
+    let man = man0 << clz;
+    let mut ret_exp2 = ((exp2 + 63 + 1023) as i64 as u64).wrapping_sub(clz as u64);
+    let mut x_hi = mul_hi(man, pow.hi);
+    let mut x_lo = man.wrapping_mul(pow.hi);
+    if x_hi & 0x1ff == 0x1ff && x_lo.wrapping_add(man) < man {
+        let y_hi = mul_hi(man, pow.lo);
+        let y_lo = man.wrapping_mul(pow.lo);
+        let mut merged_hi = x_hi;
+        let merged_lo = x_lo.wrapping_add(y_hi);
+        if merged_lo < x_lo {
+            merged_hi = merged_hi.wrapping_add(1);
+        }
+        if merged_hi & 0x1ff == 0x1ff
+            && merged_lo.wrapping_add(1) == 0
+            && y_lo.wrapping_add(man) < man
+        {
+            return None;
+        }
+        x_hi = merged_hi;
+        x_lo = merged_lo;
+    }
+    let msb = x_hi >> 63;
+    let mut ret_m = x_hi >> ((msb + 9) as u32);
+    ret_exp2 = ret_exp2.wrapping_sub(1 ^ msb);
+    if x_lo == 0 && x_hi & 0x1ff == 0 && ret_m & 3 == 1 {
+        return None;
+    }
+    ret_m += ret_m & 1;
+    ret_m = ret_m >> 1;
+    if ret_m >> 53 > 0 {
+        ret_m = ret_m >> 1;
+        ret_exp2 = ret_exp2.wrapping_add(1);
+    }
+    if ret_exp2.wrapping_sub(1) >= 0x7ff - 1 {
+        return None;
+    }
+    let mut bits = (ret_exp2 << 52) | (ret_m & ((1u64 << 52) - 1));
+    if neg {
+        bits = bits | (1u64 << 63);
+    }
+    Some(unsafe { *(&bits as *const u64 as *const f64) })
+}
+
+// [+-]digits[.digits][(e|E)[+-]digits] with at most 19 significant digits,
+// by Eisel-Lemire; none for anything else (parse's big integers decide).
+fn parse_fast(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut neg = false;
+    if n > 0 && (b[0] == b'-' || b[0] == b'+') {
+        neg = b[0] == b'-';
+        i = 1;
+    }
+    let mut man: u64 = 0;
+    let mut nd = 0;
+    let mut exp10: i32 = 0;
+    let mut any = false;
+    let mut dot = false;
+    while i < n {
+        let c = b[i];
+        if c >= b'0' && c <= b'9' {
+            any = true;
+            if man != 0 || c != b'0' {
+                if nd == 19 {
+                    return None;
+                }
+                man = man * 10 + (c - b'0') as u64;
+                nd += 1;
+            }
+            if dot {
+                exp10 -= 1;
+            }
+        } else if c == b'.' && !dot {
+            dot = true;
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if !any {
+        return None;
+    }
+    if i < n && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        let mut eneg = false;
+        if i < n && (b[i] == b'-' || b[i] == b'+') {
+            eneg = b[i] == b'-';
+            i += 1;
+        }
+        let start = i;
+        let mut e: i32 = 0;
+        while i < n && b[i] >= b'0' && b[i] <= b'9' {
+            if i - start >= 5 {
+                return None;
+            }
+            e = e * 10 + (b[i] - b'0') as i32;
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        exp10 += if eneg { -e } else { e };
+    }
+    if i != n {
+        return None;
+    }
+    eisel_lemire64(man, exp10, neg)
 }
