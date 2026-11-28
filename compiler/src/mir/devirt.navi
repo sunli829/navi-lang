@@ -1,0 +1,523 @@
+//! Calls through closure values the function itself made, as Go's
+//! devirtualization of the closures it can see: the called place has one
+//! assignment that can reach it (followed through copies, struct and tuple
+//! fields and references to locals), which made a closure, so the call runs
+//! that closure's body and the inliner may copy it (Filter::next's
+//! (self.pred)(&x) once count and next are inlined into the function that
+//! made the closure, which Rust gets from monomorphized closure types).
+
+use std::collections::HashMap;
+
+use crate::{
+    mir::*,
+    resolve,
+    types::{self, Type},
+};
+
+/// A call through a closure value whose closure is known: the block ending
+/// with the call, the closure's function and where its captures are in the
+/// caller (what the closure's (*env).k is).
+pub struct Known {
+    pub block: usize,
+    pub closure: &mut Func,
+    pub env: Vec<Place>,
+}
+
+// A local and the fields below it.
+#[derive(Clone)]
+struct Path {
+    local: usize,
+    fields: Vec<usize>,
+}
+
+// A write to a local or below it: the fields down to it, whether more
+// projections follow (an element, a variant: below those fields), and the
+// statement (block, index; -1: a call's result, -2: a Box).
+struct Write {
+    fields: Vec<usize>,
+    deeper: bool,
+    block: usize,
+    stmt: i64,
+}
+
+struct Facts {
+    f: &Func,
+    writes: Vec<Vec<Write>>,
+    // Locals holding a reference to a path (assigned once).
+    alias: HashMap<usize, Path>,
+    // Per local: the paths whose address is used other than through
+    // aliases.
+    exposed: Vec<Vec<Vec<usize>>>,
+    // Blocks that may run again (in a cycle).
+    cyclic: Vec<bool>,
+}
+
+// Whether one of two field paths is a prefix of the other.
+fn overlap(a: &Vec<usize>, b: &Vec<usize>) -> bool {
+    let n = if a.len() < b.len() { a.len() } else { b.len() };
+    let mut i = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+impl Facts {
+    // The path of place p and the projections after its fields (through an
+    // alias for a dereference of one), or none (through another pointer).
+    fn norm(&self, p: &Place) -> Option<(Path, usize)> {
+        let mut path = Path {
+            local: p.local,
+            fields: Vec::new(),
+        };
+        let mut i = 0;
+        if p.proj.len() > 0 && p.proj[0].kind == P_DEREF {
+            match self.alias.get(&p.local) {
+                Some(a) => {
+                    path = a.clone();
+                    i = 1;
+                }
+                None => return None,
+            }
+        }
+        while i < p.proj.len() && p.proj[i].kind == P_FIELD {
+            path.fields.push(p.proj[i].field);
+            i += 1;
+        }
+        Some((path, p.proj.len() - i))
+    }
+
+    fn write(&mut self, p: &Place, block: usize, stmt: i64) {
+        if let Some((path, rest)) = self.norm(p) {
+            self.writes[path.local].push(Write {
+                fields: path.fields,
+                deeper: rest > 0,
+                block,
+                stmt,
+            });
+        }
+    }
+
+    fn expose(&mut self, p: &Place) {
+        match self.norm(p) {
+            Some((path, _)) => self.exposed[path.local].push(path.fields),
+            None => {}
+        }
+    }
+
+    // An operand read: a whole alias used as a value exposes its path.
+    fn use_op(&mut self, o: &Operand) {
+        if o.kind == OP_COPY && o.place.proj.len() == 0 {
+            if let Some(a) = self.alias.get(&o.place.local) {
+                let a = a.clone();
+                self.exposed[a.local].push(a.fields);
+            }
+        }
+    }
+
+    // The aliases: a local assigned once, to a reference to a path or a
+    // copy of an alias.
+    fn find_aliases(&mut self, counts: &Vec<usize>) {
+        let f = self.f;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in f.blocks.iter() {
+                for s in b.stmts.iter() {
+                    if let Stmt::Assign { place, rv } = s {
+                        if place.proj.len() > 0
+                            || counts[place.local] != 1
+                            || place.local <= f.nargs
+                            || self.alias.contains_key(&place.local)
+                        {
+                            continue;
+                        }
+                        let target = match rv {
+                            Rvalue::Ref { place: q, .. } => match self.norm(q) {
+                                Some((path, 0)) => Some(path),
+                                _ => None,
+                            },
+                            Rvalue::Use(o) => {
+                                if o.kind == OP_COPY && o.place.proj.len() == 0 {
+                                    match self.alias.get(&o.place.local) {
+                                        Some(a) => Some(a.clone()),
+                                        None => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(t) = target {
+                            self.alias.insert(place.local, t);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn scan(&mut self) {
+        let f = self.f;
+        let mut bi = 0;
+        while bi < f.blocks.len() {
+            let b = f.blocks[bi];
+            let mut si = 0;
+            while si < b.stmts.len() {
+                match &b.stmts[si] {
+                    Stmt::Assign { place, rv } => {
+                        self.write(place, bi, si as i64);
+                        match rv {
+                            Rvalue::Ref { place: q, .. } => {
+                                // (An alias's own reference is followed.)
+                                let own =
+                                    place.proj.len() == 0 && self.alias.contains_key(&place.local);
+                                if !own {
+                                    self.expose(q);
+                                }
+                            }
+                            Rvalue::Use(o) => {
+                                let own =
+                                    place.proj.len() == 0 && self.alias.contains_key(&place.local);
+                                if !own {
+                                    self.use_op(o);
+                                }
+                            }
+                            Rvalue::Bin { x, y, .. } => {
+                                self.use_op(x);
+                                self.use_op(y);
+                            }
+                            Rvalue::Un { x, .. } => self.use_op(x),
+                            Rvalue::Cast { x, .. } => self.use_op(x),
+                            Rvalue::Aggregate { ops, .. } => {
+                                for o in ops.iter() {
+                                    self.use_op(o);
+                                }
+                            }
+                            Rvalue::Unsize { x, .. } => self.use_op(x),
+                            Rvalue::MakeDyn { x, .. } => self.use_op(x),
+                            _ => {}
+                        }
+                    }
+                    Stmt::SetDiscr { place, .. } => self.write(place, bi, si as i64),
+                    Stmt::Box { local, .. } => self.writes[*local].push(Write {
+                        fields: Vec::new(),
+                        deeper: false,
+                        block: bi,
+                        stmt: -2,
+                    }),
+                    Stmt::PushDefer { fn_op, args } => {
+                        self.use_op(fn_op);
+                        for o in args.iter() {
+                            self.use_op(o);
+                        }
+                    }
+                    _ => {}
+                }
+                si += 1;
+            }
+            match &b.term {
+                Term::Call {
+                    fn_op, args, dest, ..
+                } => {
+                    self.use_op(fn_op);
+                    for o in args.iter() {
+                        self.use_op(o);
+                    }
+                    self.write(dest, bi, -1);
+                }
+                Term::Switch { x, .. } => self.use_op(x),
+                Term::Assert {
+                    cond, len, index, ..
+                } => {
+                    self.use_op(cond);
+                    self.use_op(len);
+                    self.use_op(index);
+                }
+                _ => {}
+            }
+            bi += 1;
+        }
+    }
+
+    // The closure (its function, the aggregate's operands and block) the
+    // value at path p can only be.
+    fn resolve(&self, p: &Path, depth: usize) -> Option<(&mut Func, Vec<Operand>, usize)> {
+        if depth > 16 || p.local <= self.f.nargs {
+            return None;
+        }
+        for e in self.exposed[p.local].iter() {
+            if overlap(e, &p.fields) {
+                return None;
+            }
+        }
+        let mut found: Option<&Write> = None;
+        for w in self.writes[p.local].iter() {
+            if overlap(&w.fields, &p.fields) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(w);
+            }
+        }
+        let w = found?;
+        if w.deeper || w.stmt < 0 || w.fields.len() > p.fields.len() {
+            return None;
+        }
+        let rv = match &self.f.blocks[w.block].stmts[w.stmt as usize] {
+            Stmt::Assign { rv, .. } => rv,
+            _ => return None,
+        };
+        let k = w.fields.len();
+        match rv {
+            Rvalue::Aggregate {
+                kind,
+                ty,
+                ops,
+                closure,
+                ..
+            } => {
+                if k == p.fields.len() {
+                    if *kind == AGG_CLOSURE {
+                        if let Some(cf) = closure {
+                            return Some((*cf, ops.clone(), w.block));
+                        }
+                    }
+                    return None;
+                }
+                if *kind == AGG_ADT && !is_struct(*ty) {
+                    return None;
+                }
+                if *kind != AGG_ADT && *kind != AGG_TUPLE {
+                    return None;
+                }
+                let fi = p.fields[k];
+                if fi >= ops.len() {
+                    return None;
+                }
+                self.follow(&ops[fi], &p.fields[k + 1..].to_vec(), depth)
+            }
+            Rvalue::Use(o) => self.follow(o, &p.fields[k..].to_vec(), depth),
+            _ => None,
+        }
+    }
+
+    fn follow(
+        &self,
+        o: &Operand,
+        more: &Vec<usize>,
+        depth: usize,
+    ) -> Option<(&mut Func, Vec<Operand>, usize)> {
+        if o.kind != OP_COPY {
+            return None;
+        }
+        let (mut path, rest) = self.norm(&o.place)?;
+        if rest > 0 {
+            return None;
+        }
+        for x in more.iter() {
+            path.fields.push(*x);
+        }
+        self.resolve(&path, depth + 1)
+    }
+
+    // Where a capture of the closure is when it is called: a cell made
+    // once (a Box in a block that runs at most once), or the caller's own
+    // environment (the caller a closure too).
+    fn capture(&self, o: &Operand) -> Option<Place> {
+        if o.kind != OP_COPY {
+            return None;
+        }
+        let p = &o.place;
+        if p.proj.len() == 0 {
+            if p.local <= self.f.nargs {
+                return None;
+            }
+            let ws = &self.writes[p.local];
+            if ws.len() != 1 || ws[0].stmt != -2 || self.cyclic[ws[0].block] {
+                return None;
+            }
+            return Some(p.clone());
+        }
+        if self.f.closure
+            && p.local == 1
+            && p.proj.len() == 2
+            && p.proj[0].kind == P_DEREF
+            && p.proj[1].kind == P_FIELD
+            && self.writes[1].len() == 0
+        {
+            return Some(p.clone());
+        }
+        None
+    }
+}
+
+fn is_struct(t: &Type) -> bool {
+    t.kind == types::K_ADT && t.d().kind == resolve::DEF_STRUCT
+}
+
+// Whether the closure's body uses its environment only as (*env).k.
+fn env_fields_only(cf: &Func) -> bool {
+    let ok = |p: &Place| -> bool {
+        p.local != 1
+            || (p.proj.len() >= 2 && p.proj[0].kind == P_DEREF && p.proj[1].kind == P_FIELD)
+    };
+    let op_ok = |o: &Operand| -> bool { o.kind != OP_COPY || ok(&o.place) };
+    for b in cf.blocks.iter() {
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::Assign { place, rv } => {
+                    if !ok(place) {
+                        return false;
+                    }
+                    let good = match rv {
+                        Rvalue::Use(o) => op_ok(o),
+                        Rvalue::Ref { place: q, .. } => ok(q),
+                        Rvalue::Bin { x, y, .. } => op_ok(x) && op_ok(y),
+                        Rvalue::Un { x, .. } => op_ok(x),
+                        Rvalue::Cast { x, .. } => op_ok(x),
+                        Rvalue::Aggregate { ops, .. } => ops.iter().all(|o| op_ok(o)),
+                        Rvalue::Discr(q) => ok(q),
+                        Rvalue::Len(q) => ok(q),
+                        Rvalue::Unsize { x, .. } => op_ok(x),
+                        Rvalue::MakeDyn { x, .. } => op_ok(x),
+                    };
+                    if !good {
+                        return false;
+                    }
+                }
+                Stmt::SetDiscr { place, .. } => {
+                    if !ok(place) {
+                        return false;
+                    }
+                }
+                Stmt::Box { local, .. } => {
+                    if *local == 1 {
+                        return false;
+                    }
+                }
+                Stmt::PushDefer { .. } => return false,
+                _ => {}
+            }
+        }
+        let good = match &b.term {
+            Term::Call {
+                fn_op, args, dest, ..
+            } => op_ok(fn_op) && args.iter().all(|o| op_ok(o)) && ok(dest),
+            Term::Switch { x, .. } => op_ok(x),
+            Term::Assert {
+                cond, len, index, ..
+            } => op_ok(cond) && op_ok(len) && op_ok(index),
+            _ => true,
+        };
+        if !good {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether the closure's types mean the same in the caller: it was made in
+// the same generic scope, or mentions no generic parameters.
+fn same_scope(caller: &Func, cf: &Func) -> bool {
+    let same = match (caller.owner, cf.owner) {
+        (Some(a), Some(b)) => a.id == b.id,
+        _ => false,
+    };
+    if same {
+        return true;
+    }
+    for l in cf.locals.iter() {
+        if types::lower::mentions(l.ty, types::K_PARAM, false) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The calls of f through closure values whose closure is known, with
+/// where each closure's captures are; ok says which closures may be
+/// copied.
+pub fn known_calls(f: &Func, ok: fn(&Func) -> bool) -> Vec<Known> {
+    let mut out: Vec<Known> = Vec::new();
+    let mut any = false;
+    for b in f.blocks.iter() {
+        if let Term::Call { fn_op, .. } = &b.term {
+            if fn_op.kind == OP_COPY {
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return out;
+    }
+    let n = f.locals.len();
+    let mut counts: Vec<usize> = Vec::new();
+    counts.resize(n, 0);
+    for b in f.blocks.iter() {
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::Assign { place, .. } => counts[place.local] += 1,
+                Stmt::SetDiscr { place, .. } => counts[place.local] += 1,
+                Stmt::Box { local, .. } => counts[*local] += 1,
+                _ => {}
+            }
+        }
+        if let Term::Call { dest, .. } = &b.term {
+            counts[dest.local] += 1;
+        }
+    }
+    let facts = &mut Facts {
+        f,
+        writes: Vec::new(),
+        alias: HashMap::new(),
+        exposed: Vec::new(),
+        cyclic: crate::mir::escape::loop_blocks(f),
+    };
+    let mut i = 0;
+    while i < n {
+        facts.writes.push(Vec::new());
+        facts.exposed.push(Vec::new());
+        i += 1;
+    }
+    facts.find_aliases(&counts);
+    facts.scan();
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        if let Term::Call { fn_op, .. } = &f.blocks[bi].term {
+            if fn_op.kind == OP_COPY {
+                if let Some((path, 0)) = facts.norm(&fn_op.place) {
+                    if let Some((cf, ops, _)) = facts.resolve(&path, 0) {
+                        if !std::ptr::eq(cf, f)
+                            && ok(cf)
+                            && same_scope(f, cf)
+                            && env_fields_only(cf)
+                        {
+                            let mut env: Vec<Place> = Vec::new();
+                            for o in ops.iter() {
+                                match facts.capture(o) {
+                                    Some(p) => env.push(p),
+                                    None => break,
+                                }
+                            }
+                            if env.len() == ops.len() {
+                                out.push(Known {
+                                    block: bi,
+                                    closure: cf,
+                                    env,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bi += 1;
+    }
+    out
+}

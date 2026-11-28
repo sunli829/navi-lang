@@ -102,6 +102,58 @@ pub fn build_program(
         for (_, t) in p.templates.iter() {
             all.push(*t);
         }
+        // Inlining first, then escape analysis and boxing (as Go): a value
+        // whose address an inlined call took stays in the frame.
+        if !crate::dflags::on("noinline") {
+            // Sizes are measured on cleaned-up bodies, and inlined code
+            // is cleaned up in turn.
+            crate::util::par_for(all.len(), 16, |i| {
+                crate::mir::simplify::simplify(all[i]);
+            });
+            let mut changed = crate::mir::inline::inline_program(info, &all, None);
+            or_into(
+                &mut changed,
+                &crate::mir::inline::inline_closures(info, &all, None),
+            );
+            // Builtin comparisons and clones on primitives as operations;
+            // calls inlined code made concrete (Range::next's) get a second
+            // round.
+            crate::util::par_for(all.len(), 16, |i| {
+                if crate::mir::builtin::lower_builtin_calls(all[i]) {
+                    crate::mir::simplify::simplify(all[i]);
+                }
+            });
+            // Each round inlines what the last made concrete (a default
+            // method's self.next() in it: count, then Filter::next, then
+            // its iterator's next).
+            let mut round = 1;
+            while round < MAX_INLINE_ROUNDS && !crate::dflags::on("noinline2") {
+                let mut again = crate::mir::inline::inline_program(info, &all, Some(&changed));
+                or_into(
+                    &mut again,
+                    &crate::mir::inline::inline_closures(info, &all, Some(&changed)),
+                );
+                if !again.iter().any(|c| *c) {
+                    break;
+                }
+                crate::util::par_for(all.len(), 16, |i| {
+                    if again[i] {
+                        crate::mir::builtin::lower_builtin_calls(all[i]);
+                        crate::mir::simplify::simplify(all[i]);
+                    }
+                });
+                changed = again;
+                round += 1;
+            }
+        }
+        // (-d mirdump=name: the function's MIR after inlining.)
+        if let Some(w) = crate::dflags::value("mirdump") {
+            for f in all.iter() {
+                if f.name == w {
+                    eprintln(f.to_string());
+                }
+            }
+        }
         info.ctx.par = true;
         // The functions of crates compiled separately, with their summaries.
         let mut ext_fns: Vec<(&mut Func, crate::mir::escape::Summary)> = Vec::new();
@@ -132,23 +184,6 @@ pub fn build_program(
         });
         info.ctx.par = false;
         if !crate::dflags::on("noinline") {
-            // Sizes are measured on cleaned-up bodies, and inlined code
-            // is cleaned up in turn.
-            crate::util::par_for(all.len(), 16, |i| {
-                crate::mir::simplify::simplify(all[i]);
-            });
-            let changed = crate::mir::inline::inline_program(info, &all, None);
-            // Builtin comparisons and clones on primitives as operations;
-            // calls inlined code made concrete (Range::next's) get a second
-            // round.
-            crate::util::par_for(all.len(), 16, |i| {
-                if crate::mir::builtin::lower_builtin_calls(all[i]) {
-                    crate::mir::simplify::simplify(all[i]);
-                }
-            });
-            if !crate::dflags::on("noinline2") {
-                crate::mir::inline::inline_program(info, &all, Some(&changed));
-            }
             crate::util::par_for(all.len(), 16, |i| {
                 crate::mir::builtin::lower_builtin_calls(all[i]);
                 crate::mir::simplify::simplify(all[i]);
@@ -179,6 +214,19 @@ pub fn build_program(
     }
     p
 }
+
+fn or_into(a: &mut Vec<bool>, b: &Vec<bool>) {
+    let mut i = 0;
+    while i < a.len() {
+        if b[i] {
+            a[i] = true;
+        }
+        i += 1;
+    }
+}
+
+/// Rounds of inlining (an iterator adapter chain needs one per adapter).
+const MAX_INLINE_ROUNDS: usize = 5;
 
 const RUNTIME_ROOTS: [&str; 12] = [
     "panic_raw",

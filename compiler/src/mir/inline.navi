@@ -3,8 +3,10 @@
 //! its types instantiated with the call's generic arguments and its
 //! positions kept (a panic in it reports its line, as Rust's; positions in
 //! another file go in the caller's Func::ext), but a #[track_caller]
-//! function's, which are the call's. Calls through traits,
-//! closures and function values are left alone, and so are callees that create
+//! function's, which are the call's. A trait method called on a concrete
+//! type is its impl's method or the trait's default method (with Self
+//! substituted). Calls through dyn, closures and function values are left
+//! alone, and so are callees that create
 //! closures, register defers, use #[track_caller] or #[inline(never)], or
 //! belong to the runtime (which relies on its frames), but for its leaves
 //! (functions that call nothing); runtime functions only get leaves.
@@ -31,9 +33,10 @@ use crate::{
 /// navic itself 9%, for 7% more code; more gained nothing.)
 const MAX_SIZE: usize = 16;
 const MAX_BLOCKS: usize = 5;
-/// The limits for functions marked #[inline].
-const HINT_SIZE: usize = 24;
-const HINT_BLOCKS: usize = 6;
+/// The limits for functions marked #[inline] (std's iterator adapters:
+/// Filter::next is 18 and 8).
+const HINT_SIZE: usize = 32;
+const HINT_BLOCKS: usize = 10;
 
 fn size(f: &Func) -> usize {
     let mut n = 0;
@@ -172,11 +175,6 @@ fn inlinable(f: &Func) -> bool {
     if d.kind != resolve::DEF_FN && d.kind != resolve::DEF_ASSOC_FN {
         return false;
     }
-    if let Some(p) = d.parent {
-        if p.kind == resolve::DEF_TRAIT {
-            return false;
-        }
-    }
     if never_inline(d) {
         return false;
     }
@@ -208,6 +206,10 @@ struct Copier {
     // Option: a &mut field read through &self would be read-only.
     ctx: Option<&mut types::Ctx>,
     m: ParamMap,
+    /// Self, for a trait's default method.
+    self_ty: Option<&Type>,
+    /// For a closure: where its captures are in the caller ((*env).k).
+    env: Option<Vec<Place>>,
     base: usize,
     block_base: usize,
     pos: Pos,
@@ -221,30 +223,42 @@ struct Copier {
 
 impl Copier {
     fn ty(&self, t: &Type) -> &Type {
-        if self.m.len() == 0 {
+        if self.m.len() == 0 && self.self_ty.is_none() {
             t
         } else {
-            subst(self.ctx.unwrap(), t, &self.m, None)
+            subst(self.ctx.unwrap(), t, &self.m, self.self_ty)
         }
     }
 
     fn place(&self, p: &Place) -> Place {
         let mut ps = Vec::new();
-        for x in p.proj.iter() {
-            let mut y = x.clone();
+        let mut local = p.local + self.base;
+        let mut i = 0;
+        if let Some(env) = &self.env {
+            if p.local == 1 {
+                // (devirt::known_calls checked that the environment is
+                // only used so.)
+                let e = &env[p.proj[1].field];
+                local = e.local;
+                for x in e.proj.iter() {
+                    ps.push(x.clone());
+                }
+                i = 2;
+            }
+        }
+        while i < p.proj.len() {
+            let mut y = p.proj[i].clone();
             if y.kind == P_INDEX {
                 y.index = y.index + self.base;
             }
             ps.push(y);
+            i += 1;
         }
-        Place {
-            local: p.local + self.base,
-            proj: ps,
-        }
+        Place { local, proj: ps }
     }
 
     fn cnst(&self, c: &Const) -> &Const {
-        if self.m.len() == 0 {
+        if self.m.len() == 0 && self.self_ty.is_none() {
             return c;
         }
         let n = cnst(
@@ -484,9 +498,10 @@ fn concrete(t: &Type) -> bool {
         || m(t, types::K_ERROR, false))
 }
 
-// The function a call runs and its generic arguments: a trait method on a
-// concrete type is its impl's method (v[i] is <Vec<T> as Index>::index).
-fn callee_of(info: &mut Info, t: &Term) -> Option<(&mut Def, Vec<&Type>)> {
+// The function a call runs, its generic arguments and Self (a trait's
+// default method): a trait method on a concrete type is its impl's method
+// (v[i] is <Vec<T> as Index>::index) or the trait's default.
+fn callee_of(info: &mut Info, t: &Term) -> Option<(&mut Def, Vec<&Type>, Option<&Type>)> {
     let fn_op = match t {
         Term::Call { fn_op, .. } => fn_op,
         _ => return None,
@@ -505,25 +520,30 @@ fn callee_of(info: &mut Info, t: &Term) -> Option<(&mut Def, Vec<&Type>)> {
     let d = r.def?;
     let p = match d.parent {
         Some(p) => p,
-        None => return Some((d, r.args.clone())),
+        None => return Some((d, r.args.clone(), None)),
     };
     if p.kind != resolve::DEF_TRAIT {
-        return Some((d, r.args.clone()));
+        return Some((d, r.args.clone(), None));
     }
-    let st = r.self_ty?;
+    // (Inlined generic code has projections and opaque types of concrete
+    // types: <Skip<Iter<bool>> as Iterator>::Item.)
+    let st = info.reveal_all(info.normalize(None, r.self_ty?));
     if !concrete(st) {
         return None;
     }
+    let mut args: Vec<&Type> = Vec::new();
     for a in r.args.iter() {
-        if !concrete(*a) {
+        let x = info.reveal_all(info.normalize(None, *a));
+        if !concrete(x) {
             return None;
         }
+        args.push(x);
     }
-    let inst = info.resolve_method(d, st, &r.args)?;
-    if inst.is_virtual || inst.builtin.len() > 0 || inst.self_ty.is_some() {
+    let inst = info.resolve_method(d, st, &args)?;
+    if inst.is_virtual || inst.builtin.len() > 0 {
         return None;
     }
-    Some((inst.def, inst.args.clone()))
+    Some((inst.def, inst.args.clone(), inst.self_ty))
 }
 
 // The resolved callees of the calls ending each block of each function
@@ -534,8 +554,8 @@ fn plan_calls(
     by_def: &HashMap<u32, &mut Func>,
     ok: &HashMap<u32, bool>,
     only: Option<&Vec<bool>>,
-) -> HashMap<u64, (u32, Vec<&Type>)> {
-    let mut out: HashMap<u64, (u32, Vec<&Type>)> = HashMap::new();
+) -> HashMap<u64, (u32, Vec<&Type>, Option<&Type>)> {
+    let mut out: HashMap<u64, (u32, Vec<&Type>, Option<&Type>)> = HashMap::new();
     let mut i = 0;
     while i < funcs.len() {
         if let Some(o) = only {
@@ -547,9 +567,9 @@ fn plan_calls(
         let f = funcs[i];
         let mut bi = 0;
         while bi < f.blocks.len() {
-            if let Some((d, args)) = callee_of(info, &f.blocks[bi].term) {
+            if let Some((d, args, st)) = callee_of(info, &f.blocks[bi].term) {
                 if ok.contains_key(&d.id) && by_def.contains_key(&d.id) {
-                    out.insert((i as u64) << 32 | bi as u64, (d.id, args));
+                    out.insert((i as u64) << 32 | bi as u64, (d.id, args, st));
                 }
             }
             bi += 1;
@@ -611,7 +631,7 @@ pub fn inline_program(
         skip.push(false);
         let mut bi = 0;
         while bi < caller.blocks.len() {
-            if let Some((did, _)) = calls.get(&((fi as u64) << 32 | bi as u64)) {
+            if let Some((did, _, _)) = calls.get(&((fi as u64) << 32 | bi as u64)) {
                 let callee = by_def[did];
                 if callee.id != caller.id && (!rt || leaf(callee)) {
                     if let Some(j) = index.get(&callee.id) {
@@ -680,10 +700,10 @@ pub fn inline_program(
             let n = body.blocks.len();
             let mut bi = 0;
             while bi < n {
-                if let Some((did, args)) = calls.get(&((lv[k] as u64) << 32 | bi as u64)) {
+                if let Some((did, args, st)) = calls.get(&((lv[k] as u64) << 32 | bi as u64)) {
                     let callee = by_def[did];
                     if callee.id != caller.id && (!rt || leaf(callee)) {
-                        inline_call(info, body, bi, caller, callee, args);
+                        inline_call(info, body, bi, caller, callee, args, *st, None);
                     }
                 }
                 bi += 1;
@@ -703,6 +723,102 @@ pub fn inline_program(
     changed
 }
 
+// Whether a closure's body may be copied into a function calling it
+// (devirt): as small as an #[inline] function's, no defers, no closures.
+fn closure_inlinable(cf: &Func) -> bool {
+    if cf.has_defer || cf.blocks.len() > HINT_BLOCKS || size(cf) > HINT_SIZE {
+        return false;
+    }
+    for b in cf.blocks.iter() {
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::Assign { rv, .. } => {
+                    if let Rvalue::Aggregate { closure, .. } = rv {
+                        if closure.is_some() {
+                            return false;
+                        }
+                    }
+                }
+                Stmt::PushDefer { .. } => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// Inlines the calls through closure values whose closure each function
+/// knows (crate::mir::devirt): the closures that inlining brought to where
+/// they are called (Iterator::filter's predicate in count's loop). only:
+/// the functions to look at (all if none). Returns those changed.
+pub fn inline_closures(
+    info: &mut Info,
+    funcs: &Vec<&mut Func>,
+    only: Option<&Vec<bool>>,
+) -> Vec<bool> {
+    let mut outs: Vec<Option<&mut Body>> = Vec::new();
+    let mut changed: Vec<bool> = Vec::new();
+    for _ in funcs.iter() {
+        outs.push(None);
+        changed.push(false);
+    }
+    info.ctx.par = true;
+    crate::util::par_for(funcs.len(), 16, |i| {
+        if let Some(o) = only {
+            if !o[i] {
+                return;
+            }
+        }
+        let caller = funcs[i];
+        // The runtime relies on its frames.
+        let rt = match caller.def {
+            Some(d) => in_runtime(d),
+            None => match caller.owner {
+                Some(d) => in_runtime(d),
+                None => true,
+            },
+        };
+        if rt {
+            return;
+        }
+        let ks = crate::mir::devirt::known_calls(caller, closure_inlinable);
+        if ks.len() == 0 {
+            return;
+        }
+        let body = &mut Body {
+            blocks: caller.blocks.clone(),
+            locals: caller.locals.clone(),
+            ext: caller.ext.clone(),
+        };
+        let none: Vec<&Type> = Vec::new();
+        for k in ks.iter() {
+            inline_call(
+                info,
+                body,
+                k.block,
+                caller,
+                k.closure,
+                &none,
+                None,
+                Some(k.env.clone()),
+            );
+        }
+        outs[i] = Some(body);
+    });
+    info.ctx.par = false;
+    let mut i = 0;
+    while i < funcs.len() {
+        if let Some(b) = outs[i] {
+            funcs[i].blocks = b.blocks;
+            funcs[i].locals = b.locals;
+            funcs[i].ext = b.ext;
+            changed[i] = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
 // A caller's blocks and locals while calls are inlined (the function
 // itself is left as it is: others copy it meanwhile).
 struct Body {
@@ -719,6 +835,8 @@ fn inline_call(
     caller: &Func,
     callee: &Func,
     targs: &Vec<&Type>,
+    self_ty: Option<&Type>,
+    env: Option<Vec<Place>>,
 ) {
     let call = body.blocks[bi];
     let (args, dest, target, pos) = match &call.term {
@@ -731,21 +849,26 @@ fn inline_call(
         } => (args.clone(), dest.clone(), *target, *pos),
         _ => return,
     };
-    let d = callee.def.unwrap();
     let mut m: ParamMap = HashMap::new();
-    let all = info.generics_of(d).all();
-    let mut i = 0;
-    while i < all.len() && i < targs.len() {
-        m.insert(all[i].def.id, targs[i]);
-        i += 1;
+    let mut track = false;
+    if let Some(d) = callee.def {
+        let all = info.generics_of(d).all();
+        let mut i = 0;
+        while i < all.len() && i < targs.len() {
+            m.insert(all[i].def.id, targs[i]);
+            i += 1;
+        }
+        track = is_track_caller(d);
     }
     let cp = &Copier {
         ctx: Some(info.ctx),
         m,
+        self_ty,
+        env,
         base: body.locals.len(),
         block_base: body.blocks.len(),
         pos,
-        track: is_track_caller(d),
+        track,
         callee,
         caller_file: caller.file,
         ext: body.ext,
@@ -787,6 +910,13 @@ fn inline_call(
     // (a new block: the old one may be read as a callee's).
     let mut stmts = call.stmts.clone();
     let first = if callee.closure { 2 } else { 1 };
+    // The callee's result and parameters start their lives here, in every
+    // call (escape analysis and boxing see them so).
+    let mut l = 0;
+    while l <= callee.nargs && l < callee.locals.len() {
+        stmts.push(Stmt::StorageLive(cp.base + l));
+        l += 1;
+    }
     let mut k = 0;
     while k < args.len() {
         stmts.push(Stmt::Assign {

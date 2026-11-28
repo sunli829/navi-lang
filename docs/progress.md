@@ -463,7 +463,7 @@
 原来散在各处的 `NAVI_*` 环境变量分成三类（`navi help debug` 列出全部开关）：
 
 - 影响怎么编译的改成命令行参数：`--target`（去掉 `NAVI_TARGET`；Android 是 `--target android-arm64`，代码同 linux-arm64、链接到 bionic，去掉 `NAVI_ELF_LIBC`）、`--linker cc`（原 `NAVI_LINKER=cc`），`navi test` 也认这两个，并传给并行测试的子进程。
-- 编译器的调试开关并成 `-d name[=value],...`（同 Go 的 `-gcflags=-d=...`、rustc 的 `-Z`，`compiler/src/dflags.navi`），由 main 在分发子命令前取出：`noescape`、`noinline`、`noinline2`、`nocopyprop`、`nossaopt`、`nofold`、`nofuse`、`nopoll`、`llsc`、`checkstd`、`nostrip`、`ssacheck`、`ssadump=名字`、`ssatime`、`escdebug`、`fmtdebug`、`linkmap=文件`。改变生成代码的开关进缓存的键（以前 `NAVI_NOFOLD`、`NAVI_NOFUSE` 漏了）。
+- 编译器的调试开关并成 `-d name[=value],...`（同 Go 的 `-gcflags=-d=...`、rustc 的 `-Z`，`compiler/src/dflags.navi`），由 main 在分发子命令前取出：`noescape`、`noinline`、`noinline2`、`nocopyprop`、`nossaopt`、`nofold`、`nofuse`、`nopoll`、`llsc`、`checkstd`、`nostrip`、`ssacheck`、`ssadump=名字`、`ssatime`、`mirdump=名字`、`escdebug`、`fmtdebug`、`linkmap=文件`。改变生成代码的开关进缓存的键（以前 `NAVI_NOFOLD`、`NAVI_NOFUSE` 漏了）。
 - 运行时的调试开关并成 `NAVI_DEBUG=name[=value],...`（同 Go 的 `GODEBUG`，`rt::native::debug_var`，不分配内存）：`gctrace`、`gcstw`、`gcverify`、`gcpoison`、`gcconcstacks=0`、`gcminheap=字节`、`memprof`、`noslice`、`sliceus=n`、`stackmove`、`stackcheck`、`stackcons`、`stackprot`、`noaes`。
 - 测试框架不再读 `NAVI_TEST_THREADS`、`NAVI_TEST_NOCAPTURE`（用 `--test-threads=N`、`--nocapture`）；`navi test -timeout` 以 `--timeout=时长` 传给测试程序（原来是环境变量 `NAVI_TEST_TIMEOUT`）。
 - 留作环境变量的：`NAVI_STD`、`NAVI_CACHE`、`NAVI_PKG`（同 GOROOT、GOCACHE、CARGO_HOME），程序运行时的 `NAVI_MAXPROCS`、`NAVI_GC`、`NAVI_MEMLIMIT`、`NAVI_LOG`，以及工具自己设的 `NAVI_BIN_EXE_*`、`NAVI_BOOTSTRAP`。

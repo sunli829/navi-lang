@@ -17,8 +17,9 @@
 //! closures, extern functions and unknown intrinsics escape everything.
 //!
 //! A local declared inside a loop is a new variable in every iteration; if
-//! its address is reachable from a named variable or argument (which could
-//! carry it into a later iteration), it keeps its heap cell.
+//! its address is reachable from an argument or a named variable that could
+//! carry it into a later iteration (one not declared again on every way
+//! round the loop), it keeps its heap cell.
 
 use std::collections::HashMap;
 
@@ -624,6 +625,14 @@ impl Escape {
                         let dl = loc(g, place);
                         let dv = g.deref(dl);
                         match rv {
+                            // A pointer made from an integer points to
+                            // unknown memory: integer arithmetic does not
+                            // carry what it pointed to (the runtime keeps
+                            // addresses as words: a cleanup's object).
+                            Rvalue::Cast { kind, .. } if *kind == CAST_INT_PTR => {
+                                let h = g.h;
+                                g.join(dv, h);
+                            }
                             Rvalue::Use(x)
                             | Rvalue::Cast { x, .. }
                             | Rvalue::Unsize { x, .. }
@@ -821,13 +830,14 @@ impl Escape {
             }
             bi += 1;
         }
-        // For each class: a named variable or argument whose value reaches
-        // it through pointees, and whether more than one does.
+        // For each class: the named variables and arguments whose values
+        // reach it through pointees (more than MAX_ROOTS: any).
         let nn = g.parent.len();
-        let mut root_of: Vec<i64> = Vec::new();
-        let mut multi: Vec<bool> = Vec::new();
+        let mut roots: Vec<Vec<usize>> = Vec::new();
         let mut last: Vec<i64> = Vec::new();
         let mut computed = false;
+        // Per block x: the blocks in a cycle that does not go through x.
+        let mut without: HashMap<usize, Vec<bool>> = HashMap::new();
         let mut out: Vec<bool> = Vec::new();
         i = 0;
         while i < n {
@@ -837,8 +847,7 @@ impl Escape {
                 if !computed {
                     let mut k = 0;
                     while k < nn {
-                        root_of.push(-1);
-                        multi.push(false);
+                        roots.push(Vec::new());
                         last.push(-1);
                         k += 1;
                     }
@@ -852,10 +861,8 @@ impl Escape {
                                     break;
                                 }
                                 last[c] = j as i64;
-                                if root_of[c] < 0 {
-                                    root_of[c] = j as i64;
-                                } else if root_of[c] != j as i64 {
-                                    multi[c] = true;
+                                if roots[c].len() <= MAX_ROOTS {
+                                    roots[c].push(j);
                                 }
                                 cur = g.pointee(c);
                             }
@@ -864,9 +871,28 @@ impl Escape {
                     }
                     computed = true;
                 }
-                // Reachable from another named variable or an argument?
-                if multi[r] || root_of[r] >= 0 && root_of[r] != i as i64 {
+                // Reachable from an argument, or from another named variable
+                // that lives on round the loop?
+                if roots[r].len() > MAX_ROOTS {
                     ok = false;
+                }
+                let bi = decl_block[i] as usize;
+                for jj in roots[r].iter() {
+                    let j = *jj;
+                    if !ok || j == i {
+                        continue;
+                    }
+                    if j <= f.nargs || decl_block[j] < 0 {
+                        ok = false;
+                        continue;
+                    }
+                    let bj = decl_block[j] as usize;
+                    if !without.contains_key(&bj) {
+                        without.insert(bj, cyclic_without(f, bj));
+                    }
+                    if without[&bj][bi] {
+                        ok = false;
+                    }
                 }
             }
             out.push(ok);
@@ -975,7 +1001,8 @@ fn apply(g: &mut Graph, s: &Summary, args: &Vec<Operand>, dest: &Place) {
     }
 }
 
-fn successors(t: &Term) -> Vec<usize> {
+/// The blocks a block's terminator may go to.
+pub fn successors(t: &Term) -> Vec<usize> {
     let mut out = Vec::new();
     match t {
         Term::Goto(b) => out.push(*b),
@@ -997,7 +1024,47 @@ fn successors(t: &Term) -> Vec<usize> {
 }
 
 /// Which blocks lie on a cycle of the control flow graph (Tarjan).
-fn loop_blocks(f: &Func) -> Vec<bool> {
+// The named variables reaching a class that are looked at (more: any).
+const MAX_ROOTS: usize = 8;
+
+// The blocks in a cycle of f that does not go through block x: a variable
+// declared in x is declared again on every way round the others.
+fn cyclic_without(f: &Func, x: usize) -> Vec<bool> {
+    let mut deps: Vec<Vec<usize>> = Vec::new();
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let mut ds: Vec<usize> = Vec::new();
+        if bi != x {
+            for s in successors(&f.blocks[bi].term).iter() {
+                if *s != x {
+                    ds.push(*s);
+                }
+            }
+        }
+        deps.push(ds);
+        bi += 1;
+    }
+    let mut out: Vec<bool> = Vec::new();
+    out.resize(f.blocks.len(), false);
+    for c in components(&deps).iter() {
+        if c.len() > 1 {
+            for b in c.iter() {
+                out[*b] = true;
+            }
+        } else {
+            let b = c[0];
+            for s in deps[b].iter() {
+                if *s == b {
+                    out[b] = true;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The blocks in a cycle of f.
+pub fn loop_blocks(f: &Func) -> Vec<bool> {
     let n = f.blocks.len();
     let mut succ: Vec<Vec<usize>> = Vec::new();
     for b in f.blocks.iter() {
