@@ -149,11 +149,55 @@ fn never_inline(d: &Def) -> bool {
 // Whether f calls nothing.
 fn leaf(f: &Func) -> bool {
     for b in f.blocks.iter() {
-        if let Term::Call { .. } = &b.term {
-            return false;
+        if let Term::Call { fn_op, .. } = &b.term {
+            if !plain_intrinsic(fn_op) {
+                return false;
+            }
         }
     }
     true
+}
+
+// Whether a call is to an intrinsic the backend makes an operation of
+// (arithmetic, pointers, the G register, atomics): no call, no stopping
+// point, so a runtime function using only these is still a leaf.
+fn plain_intrinsic(fn_op: &Operand) -> bool {
+    if fn_op.kind != OP_CONST {
+        return false;
+    }
+    let c = fn_op.cnst.unwrap();
+    if c.kind != C_FN {
+        return false;
+    }
+    let d = match c.fn_ref.unwrap().def {
+        Some(d) => d,
+        None => return false,
+    };
+    let attrs = match &d.node {
+        Node::Item(Item::Fn(fd)) => fd.base.attrs.clone(),
+        _ => return false,
+    };
+    if !has_attr(&attrs, "intrinsic") {
+        return false;
+    }
+    match d.name.as_str() {
+        "size_of" | "align_of" | "has_pointers" | "is_copy_clone" | "ptr_offset"
+        | "slice_from_raw" | "slice_from_raw_mut" | "str_from_raw" | "slice_len" | "slice_ptr"
+        | "str_as_bytes" | "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "mul_hi"
+        | "add_carry" | "sub_borrow" | "current_g" | "atomic_load" | "atomic_store"
+        | "atomic_add" | "atomic_cas" | "gc_marking_flag" | "type_desc" | "type_info" => true,
+        _ => false,
+    }
+}
+
+// Whether callee may be copied into a runtime function: a leaf, or marked
+// #[inline(always)].
+fn rt_inlinable(callee: &Func) -> bool {
+    leaf(callee)
+        || match callee.def {
+            Some(d) => inline_always(d),
+            None => false,
+        }
 }
 
 /// Whether f may be copied into its callers.
@@ -179,8 +223,9 @@ fn inlinable(f: &Func) -> bool {
         return false;
     }
     // The runtime relies on its frames, but not in leaves (no call at all:
-    // its word accessors and the like).
-    if in_runtime(d) && !leaf(f) {
+    // its word accessors and the like) and where it says so
+    // (#[inline(always)]).
+    if in_runtime(d) && !leaf(f) && !inline_always(d) {
         return false;
     }
     for b in f.blocks.iter() {
@@ -633,7 +678,7 @@ pub fn inline_program(
         while bi < caller.blocks.len() {
             if let Some((did, _, _)) = calls.get(&((fi as u64) << 32 | bi as u64)) {
                 let callee = by_def[did];
-                if callee.id != caller.id && (!rt || leaf(callee)) {
+                if callee.id != caller.id && (!rt || rt_inlinable(callee)) {
                     if let Some(j) = index.get(&callee.id) {
                         ds.push(*j);
                     }
@@ -702,7 +747,7 @@ pub fn inline_program(
             while bi < n {
                 if let Some((did, args, st)) = calls.get(&((lv[k] as u64) << 32 | bi as u64)) {
                     let callee = by_def[did];
-                    if callee.id != caller.id && (!rt || leaf(callee)) {
+                    if callee.id != caller.id && (!rt || rt_inlinable(callee)) {
                         inline_call(info, body, bi, caller, callee, args, *st, None);
                     }
                 }
