@@ -170,7 +170,9 @@ doc.call("addEventListener", &[Value::from("click"), cb.value()]);
 - **`Func`**：把 navi 闭包包成 JS 函数，`release()` 释放。
   - JS 调用它时，胶水 JS 设好事件，再调用 `resume()`。navi 侧有一个处理事件的 G 去运行闭包，闭包返回后 `resume()` 才返回，所以事件处理函数里可以调用 `preventDefault`。
   - 闭包里不能阻塞，否则报死锁，同 Go。
-- **等待 Promise**：`Value::await_()`（名字待定）让当前 G 停下，Promise 完成后返回 `Result<Value, Value>`。navi 有绿色线程，fetch、IndexedDB 这类异步 API 可以写成同步的样子，不用回调。Go 没有这个，用户通常自己用 channel 加回调来等。
+- **没有 Promise 的等待接口**，同 Go：navi 的并发是阻塞式的，用户用到的接口应该直接阻塞、返回结果，不接触 Promise。
+  - std 用浏览器的异步 API 实现自己的接口时（比如 W4 用 fetch 实现 `http::Client`），在内部等 Promise（`pub(crate)` 的辅助函数：当前 G 停下，Promise 完成时由 `resume()` 唤醒），对外照旧是阻塞的 `get()`。
+  - 直接用 `std::js` 调用一个返回 Promise 的 JS 函数，得到的就是一个普通的 JS 值。要等它的结果，照 Go 的写法用 `Func` 加 channel。
 - 不提供 Go 早期的 `js.Wrapper` 之类的接口。
 
 ## 9. 链接和文件格式
