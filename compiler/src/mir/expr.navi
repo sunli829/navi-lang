@@ -110,6 +110,9 @@ fn is_place_expr(x: &Expr) -> bool {
     }
 }
 
+// Serializes constant evaluation from MIR's threads (known_int_const).
+static CONST_MU: std::sync::Mutex<u8> = std::sync::Mutex::new(0);
+
 impl Builder {
     /// Lowers x to a value, applying recorded coercions.
     pub fn operand(&mut self, x: &Expr) -> Operand {
@@ -250,7 +253,15 @@ impl Builder {
                             return const_op(c);
                         }
                         resolve::DEF_CONST => {
-                            // Free constants are computed once, like statics.
+                            // An integer constant known now (consteval) is an
+                            // immediate, as its literal would be: code that
+                            // runs before statics are initialized (the
+                            // runtime's) may use it. Other free constants are
+                            // computed once, like statics.
+                            let t = self.info.consts[&d.id].ty;
+                            if let Some(v) = self.known_int_const(d, t) {
+                                return int_const(C_INT, v, t);
+                            }
                             return copy(self.static_place(d));
                         }
                         resolve::DEF_ASSOC_CONST => {
@@ -305,6 +316,40 @@ impl Builder {
         let tmp = self.temp(t);
         self.expr_into_raw(x, tmp.clone());
         copy(tmp)
+    }
+
+    // The value of integer constant d of type t if consteval knows it and
+    // it is one of t (as its static would hold it).
+    fn known_int_const(&mut self, d: &Def, t: &Type) -> Option<i64> {
+        if t.kind != types::K_INT || t.int == types::I128 || t.int == types::U128 {
+            return None;
+        }
+        let c = self.info.c?;
+        // (MIR is built on several threads; the evaluation's state is
+        // shared.)
+        CONST_MU.lock();
+        let (v, ok) = c.const_value(d);
+        CONST_MU.unlock();
+        if !ok {
+            return None;
+        }
+        let bits = match t.int {
+            types::I8 | types::U8 => 8,
+            types::I16 | types::U16 => 16,
+            types::I32 | types::U32 => 32,
+            _ => 64,
+        };
+        let signed = t.int <= types::ISIZE;
+        // (64 bits: the same bits either way.)
+        let fits = if bits == 64 {
+            true
+        } else if signed {
+            let lim = 1i64 << (bits - 1) as u32;
+            v >= -lim && v < lim
+        } else {
+            v >= 0 && v < (1i64 << bits as u32)
+        };
+        if fits { Some(v) } else { None }
     }
 
     pub fn static_place(&mut self, d: &mut Def) -> Place {
