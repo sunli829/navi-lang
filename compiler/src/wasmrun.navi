@@ -1,0 +1,274 @@
+//! Runs a js-wasm32 module (docs/wasm.md) for navi run and navi test: in a
+//! headless browser (Chrome or Chromium, else Firefox; NAVI_BROWSER names
+//! one), which loads it from a local HTTP server with the glue
+//! (lib/std/wasm/navi_wasm.js) and a page that sends the program's output
+//! and exit status back; that output is ours.
+
+use std::{
+    http::{Method, Request, Response, Server, StatusCode},
+    io::Write,
+    sync::mpmc::sync_channel,
+    time::Duration,
+};
+
+use crate::{driver, util};
+
+// The page: the program with the arguments and environment, its output
+// sent back in order (synchronous requests), then its status.
+fn page(args: &Vec<String>, env: &Vec<(String, String)>) -> String {
+    let mut a = String::new();
+    for s in args.iter() {
+        if a.len() > 0 {
+            a.push_str(", ");
+        }
+        a.push_str(js_string(s.as_str()).as_str());
+    }
+    let mut e = String::new();
+    for (k, v) in env.iter() {
+        if e.len() > 0 {
+            e.push_str(", ");
+        }
+        e.push_str(
+            `${js_string(k.as_str())}: ${js_string(v.as_str())}`
+                .to_string()
+                .as_str(),
+        );
+    }
+    `<!doctype html>
+<html><head><meta charset="utf-8"><script src="/navi_wasm.js"></script></head>
+<body><script>
+function send(path, body) {
+  const x = new XMLHttpRequest();
+  x.open("POST", path, false);
+  x.send(body);
+}
+(async () => {
+  let code = 2;
+  try {
+    const navi = new Navi({ args: [${a}], env: {${e}},
+      output: (fd, t) => send("/out/" + fd, t) });
+    const { instance } = await WebAssembly.instantiateStreaming(fetch("/app.wasm"), navi.importObject());
+    code = await navi.run(instance);
+  } catch (err) {
+    send("/out/2", "navi: " + (err && err.stack ? err.stack : err) + "\\n");
+  }
+  send("/exit/" + code, "");
+})();
+</script></body></html>
+`.to_string()
+}
+
+// s as a JS string literal.
+fn js_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '<' => out.push_str("\\u003c"),
+            _ => {
+                if (c as u32) < 0x20 {
+                    out.push_str(`\\u${c as u32:04x}`.to_string().as_str());
+                } else {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn path_sep() -> char {
+    ';'
+}
+
+#[cfg(not(target_os = "windows"))]
+fn path_sep() -> char {
+    ':'
+}
+
+// The file named name in a directory of $PATH.
+fn find_in_path(name: &str) -> Option<String> {
+    let path = std::env::var("PATH").ok()?;
+    let sep = path_sep();
+    for d in path.split(sep) {
+        let p = util::path_join(d, name);
+        if std::path::Path::new(p.as_str()).exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+// The browser to run: NAVI_BROWSER, else Chrome or Chromium, else Firefox
+// (a path, and whether it is Firefox).
+fn browser() -> Option<(String, bool)> {
+    if let Ok(b) = std::env::var("NAVI_BROWSER") {
+        let ff = b.to_lowercase().contains("firefox");
+        return Some((b, ff));
+    }
+    let chromes = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    ];
+    for c in chromes.iter() {
+        if std::path::Path::new(*c).exists() {
+            return Some((c.to_string(), false));
+        }
+    }
+    for n in [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ]
+    .iter()
+    {
+        if let Some(p) = find_in_path(*n) {
+            return Some((p, false));
+        }
+    }
+    let firefoxes = [
+        "/Applications/Firefox.app/Contents/MacOS/firefox",
+        "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+    ];
+    for f in firefoxes.iter() {
+        if std::path::Path::new(*f).exists() {
+            return Some((f.to_string(), true));
+        }
+    }
+    if let Some(p) = find_in_path("firefox") {
+        return Some((p, true));
+    }
+    None
+}
+
+/// Runs the module at wasm with args and env (timeout: nanoseconds, 0 none);
+/// its exit status (1 for a timeout or a browser that cannot run).
+pub fn run(wasm: &str, args: &Vec<String>, env: &Vec<(String, String)>, timeout_ns: u64) -> i32 {
+    let module = match std::fs::read(wasm) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln(`navi: ${wasm}: ${e}`);
+            return 1;
+        }
+    };
+    let std_dir = driver::std_crate().fs_root.clone();
+    let glue_path = util::path_join(std_dir.as_str(), "wasm/navi_wasm.js");
+    let glue = match std::fs::read(glue_path.as_str()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln(`navi: ${glue_path}: ${e}`);
+            return 1;
+        }
+    };
+    let (b, firefox) = match browser() {
+        Some(x) => x,
+        None => {
+            eprintln(
+                "navi: js-wasm32 programs run in a headless browser: none found (install Chrome, Chromium or Firefox, or set NAVI_BROWSER)",
+            );
+            return 1;
+        }
+    };
+    let html = page(args, env);
+    let server = match Server::bind("127.0.0.1:0") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(`navi: ${e}`);
+            return 1;
+        }
+    };
+    let (tx, rx) = sync_channel::<i32>(1);
+    let srv = server.clone();
+    std::thread::spawn(|| {
+        let _ = srv.serve(|req: &mut Request| -> Response {
+            let path = req.path().to_string();
+            if *req.method() == Method::GET {
+                let (body, ty) = if path == "/" {
+                    (html.as_bytes().to_vec(), "text/html; charset=utf-8")
+                } else if path == "/navi_wasm.js" {
+                    (glue.clone(), "text/javascript")
+                } else if path == "/app.wasm" {
+                    (module.clone(), "application/wasm")
+                } else {
+                    return Response::new(StatusCode::NOT_FOUND);
+                };
+                let mut r = Response::from_body(body);
+                r.headers_mut().insert("content-type", ty);
+                return r;
+            }
+            if let Some(fd) = path.strip_prefix("/out/") {
+                let body = req.bytes().unwrap_or(Vec::new());
+                if fd == "2" {
+                    let _ = std::io::stderr().write_all(body.as_slice());
+                } else {
+                    let _ = std::io::stdout().write_all(body.as_slice());
+                    let _ = std::io::stdout().flush();
+                }
+                return Response::new(StatusCode::NO_CONTENT);
+            }
+            if let Some(c) = path.strip_prefix("/exit/") {
+                let _ = tx.try_send(c.parse::<i32>().unwrap_or(2));
+                return Response::new(StatusCode::NO_CONTENT);
+            }
+            Response::new(StatusCode::NOT_FOUND)
+        });
+    });
+    let url = `http://${server.local_addr()}/`.to_string();
+    let profile = util::path_join(
+        std::env::temp_dir().to_str().unwrap_or("/tmp"),
+        `navi-browser-${std::process::id()}`.to_string().as_str(),
+    );
+    let _ = std::fs::create_dir_all(profile.as_str());
+    let mut cmd = std::process::Command::new(b.as_str());
+    if firefox {
+        cmd.arg("--headless")
+            .arg("--no-remote")
+            .arg("--profile")
+            .arg(profile.as_str());
+    } else {
+        cmd.arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--disable-extensions")
+            .arg(`--user-data-dir=${profile}`.to_string().as_str());
+    }
+    cmd.arg(url.as_str());
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln(`navi: ${b}: ${e}`);
+            server.close();
+            return 1;
+        }
+    };
+    let code = if timeout_ns > 0 {
+        match rx.recv_timeout(Duration::from_nanos(timeout_ns)) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln("navi: the program timed out in the browser");
+                1
+            }
+        }
+    } else {
+        match rx.recv() {
+            Ok(c) => c,
+            Err(_) => 1,
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    server.close();
+    let _ = std::fs::remove_dir_all(profile.as_str());
+    code
+}
