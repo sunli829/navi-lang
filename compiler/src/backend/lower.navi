@@ -2225,9 +2225,15 @@ impl FnGen {
                     bits[i / 64] = bits[i / 64] | 1u64 << (i % 64) as u32;
                 }
             };
-            set(SLOT_CTX);
-            set(SLOT_RET);
-            set(SLOT_LOC);
+            if self.keeps_ctx() {
+                set(SLOT_CTX);
+            }
+            if self.keeps_ret() {
+                set(SLOT_RET);
+            }
+            if self.keeps_loc() {
+                set(SLOT_LOC);
+            }
             set(SLOT_DEFERS);
             let n = self.f.locals.len();
             let mut i = 0;
@@ -3078,8 +3084,13 @@ impl FnGen {
             self.call_alloc(size, false);
         }
         m.load(8, BASE, FP, self.res_off);
-        m.load(8, T1, FP, SLOT_CTX);
-        m.store(8, T1, BASE, 0);
+        // The closure's dictionary: this function's (none kept: none read).
+        if self.keeps_ctx() {
+            m.load(8, T1, FP, SLOT_CTX);
+            m.store(8, T1, BASE, 0);
+        } else {
+            m.store_zero(8, BASE, 0);
+        }
         let mut i = 0;
         while i < ops.len() {
             self.store_operand(&ops[i], BASE, (8 + 8 * i) as i64);
@@ -3185,6 +3196,24 @@ impl FnGen {
     }
 
     // --- Terminators ---------------------------------------------------------
+
+    /// Whether the function reads its dictionary (CTX): a closure's
+    /// environment, or a generic group with dictionary slots.
+    fn keeps_ctx(&self) -> bool {
+        self.f.closure || self.inst.grp().nslots > 0
+    }
+
+    /// Whether the function reads its caller's location (LOC):
+    /// #[track_caller] and shims.
+    fn keeps_loc(&self) -> bool {
+        self.inst.track_caller && !self.f.closure
+    }
+
+    /// Whether the function writes a result through RET.
+    fn keeps_ret(&mut self) -> bool {
+        let rt0 = self.ltypes[0];
+        rt0.kind != types::K_NEVER && self.g.lay_of(rt0).size > 0
+    }
 
     /// Sets LOC to the location passed to a callee.
     fn pass_loc(&mut self, pos: Pos) {
@@ -4420,6 +4449,8 @@ impl FnGen {
         for sv in self.saved.iter() {
             m.store(8, sv.0, FP, sv.1);
         }
+        // CTX, RET and LOC are kept only by functions that read them
+        // (direct callers do not set the others: see ssa_call).
         if f.closure {
             // The environment (CTX) is read by the entry's Arg 1, or kept in
             // its slot.
@@ -4428,11 +4459,16 @@ impl FnGen {
             }
             m.load(8, I1, CTX, -8);
             m.store(8, I1, FP, SLOT_CTX);
-        } else {
+        } else if self.keeps_ctx() {
             m.store(8, CTX, FP, SLOT_CTX);
         }
-        m.store(8, RET, FP, SLOT_RET);
-        m.store(8, LOC, FP, SLOT_LOC);
+        if self.keeps_ret() {
+            m.store(8, RET, FP, SLOT_RET);
+        }
+        if self.keeps_loc() {
+            m.store(8, LOC, FP, SLOT_LOC);
+        }
+        // (The unwinder reads every frame's defer chain.)
         m.store_zero(8, FP, SLOT_DEFERS);
         self.ssa_carry_plan(sf, &fused);
         // The calls' tags (in emission order) index their masks.
@@ -6102,15 +6138,21 @@ impl FnGen {
                     self.ssa_ret_addr(v);
                     m.call_reg(BASE);
                 } else {
-                    self.pass_loc(pos);
+                    let ins = tt.inst.unwrap();
+                    // A direct call sets only what the callee reads (its
+                    // prologue keeps nothing else).
+                    if !direct || ins.track_caller {
+                        self.pass_loc(pos);
+                    }
                     // A result in registers: no buffer (RET 0, see OP_RETURN).
                     if v.ty == crate::ssa::T_TUPLE {
                         m.mov_imm(RET, 0);
                     } else {
                         self.ssa_ret_addr(v);
                     }
-                    let ins = tt.inst.unwrap();
-                    m.adr_sym(CTX, &ins.dict);
+                    if !direct || ins.grp().nslots > 0 || ins.func.closure {
+                        m.adr_sym(CTX, &ins.dict);
+                    }
                     // Register arguments enter at .r, stack ones at the stub.
                     let entry = if direct {
                         `${ins.grp().sym}.r`.to_string()
