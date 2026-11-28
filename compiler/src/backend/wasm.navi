@@ -1,0 +1,1951 @@
+//! WebAssembly code for js-wasm32 (docs/wasm.md, as Go's js/wasm): the
+//! Machine implementation.
+//!
+//! - The machine's registers are wasm locals (i64, f64 for the floating point
+//!   ones); SP, FP, the G and the registers calls pass (CTX, RET, LOC) are
+//!   globals. Frames stay in linear memory as on the other targets, so stack
+//!   maps, stack scanning, moving and unwinding are unchanged.
+//! - Every function is `(resume: i32) -> i32`. Its body is a loop around nested
+//!   blocks with a br_table on the block number: a label starts a block, a jump
+//!   sets the number and branches to the loop. A call passes the caller's PC
+//!   (function index << 16 | the block after the call) in G_RA, which the
+//!   prologue keeps in the frame as a return address.
+//! - A call returning 1 unwinds: its caller returns 1 too, up to the run loop
+//!   (wasmlink), which then calls G_TARGET's function with its block. Context
+//!   switches, longjmp and going back to JS unwind so; a frame resumed so
+//!   returns 0 to the run loop, which goes on with G_RA_OUT (its caller's PC).
+//!   Nothing lives in locals across a call (the register allocator gets no
+//!   callee-saved registers).
+
+use crate::{
+    backend::machine::{self as lm, CArg, Code, Label as LLabel, Machine},
+    obj::{self, Reloc},
+};
+
+// The globals (wasmlink defines them in this order, all mutable i64).
+pub const G_SP: u32 = 0;
+pub const G_FP: u32 = 1;
+pub const G_G: u32 = 2;
+pub const G_CTX: u32 = 3;
+pub const G_RET: u32 = 4;
+pub const G_LOC: u32 = 5;
+/// The PC a call passes: where the caller goes on (its return address).
+pub const G_RA: u32 = 6;
+/// Where to go on after a frame the run loop resumed returns.
+pub const G_RA_OUT: u32 = 7;
+/// A runtime routine's result (call_c of _navi_* routines).
+pub const G_RV: u32 = 8;
+/// The PC the run loop resumes after an unwinding.
+pub const G_TARGET: u32 = 9;
+/// Why the stack unwound: 0 a switch (to G_TARGET), 1 idle (back to JS).
+pub const G_REASON: u32 = 10;
+/// morestack's need (the stub's I1).
+pub const G_NEED: u32 = 11;
+/// Where _navi_idle was called (resume() goes on there).
+pub const G_IDLE_SP: u32 = 12;
+pub const G_IDLE_FP: u32 = 13;
+pub const G_IDLE_PC: u32 = 14;
+/// What _navi_idle asked JS: milliseconds to wait (-1: until an event).
+pub const G_WAIT: u32 = 15;
+/// How many prologues ran since the run loop last resumed a frame: the
+/// depth of the engine's own stack, which is small (V8: about 1 MiB).
+pub const G_DEPTH: u32 = 16;
+pub const NUM_GLOBALS: u32 = 17;
+
+/// Past this depth a prologue unwinds the engine's stack and the run loop
+/// resumes it (navi's stack, in memory, grows by copying instead).
+const MAX_DEPTH: i64 = 400;
+
+/// The collector's arenas on js (std::rt::gc's ARENA_SHIFT there): 4 MiB,
+/// as Go's on wasm. scan_heap finds a span by it.
+pub const ARENA_SHIFT: i64 = 22;
+const PAGE_SHIFT: i64 = 13;
+const ARENA_PAGES: i64 = 512;
+
+// Locals: 0 the resume parameter, 1 the block number, then the machine's
+// registers (2 + reg), then scratch ones.
+const L_RESUME: u32 = 0;
+const L_PCB: u32 = 1;
+const L_REG0: u32 = 2;
+const L_FA: u32 = L_REG0 + lm::NUM_REGS as u32;
+const L_FB: u32 = L_FA + 1;
+const L_CARRY: u32 = L_FA + 2;
+const L_T0: u32 = L_FA + 3;
+const L_T1: u32 = L_FA + 4;
+const L_T2: u32 = L_FA + 5;
+const L_T3: u32 = L_FA + 6;
+const NUM_LOCALS: u32 = L_FA + 7;
+
+// Value types.
+const I32: u8 = 0x7f;
+const I64: u8 = 0x7e;
+const F32: u8 = 0x7d;
+const F64: u8 = 0x7c;
+
+// Fixups in a block: the block number of a label (a padded i32.const), or
+// a branch depth to the loop (padded, plus the ifs around it).
+const FIX_BLOCK: u8 = 0;
+const FIX_LOOP: u8 = 1;
+
+/// A block's code: relocations and fixups at offsets into it.
+struct Blk {
+    code: Vec<u8>,
+    relocs: Vec<Reloc>,
+    fixes: Vec<(usize, u8, u64)>,
+}
+
+pub struct Wasm {
+    blks: Vec<&mut Blk>,
+    labels: Vec<i64>,
+    calls: Vec<u64>,
+    tag: i64,
+    err: String,
+}
+
+pub fn new_machine() -> &mut Wasm {
+    &mut Wasm {
+        blks: Vec::new(),
+        labels: Vec::new(),
+        calls: Vec::new(),
+        tag: 0,
+        err: String::new(),
+    }
+}
+
+// --- Encoding
+// ------------------------------------------------------------------
+
+pub fn uleb(out: &mut Vec<u8>, v: u64) {
+    let mut x = v;
+    loop {
+        let b = (x & 0x7f) as u8;
+        x = x >> 7;
+        if x == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+pub fn sleb(out: &mut Vec<u8>, v: i64) {
+    let mut x = v;
+    loop {
+        let b = (x & 0x7f) as u8;
+        x = x >> 7;
+        let done = (x == 0 && b & 0x40 == 0) || (x == -1 && b & 0x40 != 0);
+        if done {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+/// v in exactly n bytes (relocated and fixed up in place).
+pub fn put_uleb_n(out: &mut Vec<u8>, at: usize, v: u64, n: usize) {
+    let mut x = v;
+    let mut i = 0;
+    while i < n {
+        let mut b = (x & 0x7f) as u8;
+        x = x >> 7;
+        if i + 1 < n {
+            b = b | 0x80;
+        }
+        out[at + i] = b;
+        i += 1;
+    }
+}
+
+pub fn put_sleb_n(out: &mut Vec<u8>, at: usize, v: i64, n: usize) {
+    let mut x = v;
+    let mut i = 0;
+    while i < n {
+        let mut b = (x & 0x7f) as u8;
+        x = x >> 7;
+        if i + 1 < n {
+            b = b | 0x80;
+        }
+        out[at + i] = b;
+        i += 1;
+    }
+}
+
+/// The value of an n-byte signed LEB at at (a relocation's addend).
+pub fn get_sleb_n(b: &[u8], at: usize, n: usize) -> i64 {
+    let mut v = 0i64;
+    let mut i = 0;
+    while i < n {
+        v = v | ((b[at + i] & 0x7f) as i64) << (7 * i) as u32;
+        i += 1;
+    }
+    let bits = 7 * n;
+    if bits < 64 && (v >> (bits - 1) as u32) & 1 != 0 {
+        v = v | (-1i64 << bits as u32);
+    }
+    v
+}
+
+// The type of register x's local, or the global it is.
+fn global_of(x: lm::Reg) -> i64 {
+    if x == lm::SP {
+        G_SP as i64
+    } else if x == lm::FP {
+        G_FP as i64
+    } else if x == lm::GREG {
+        G_G as i64
+    } else if x == lm::CTX {
+        G_CTX as i64
+    } else if x == lm::RET {
+        G_RET as i64
+    } else if x == lm::LOC {
+        G_LOC as i64
+    } else {
+        -1
+    }
+}
+
+fn is_float(x: lm::Reg) -> bool {
+    x == lm::F0 || x == lm::F1 || x >= lm::FA1
+}
+
+// The type of local i.
+fn local_type(i: u32) -> u8 {
+    if i == L_RESUME || i == L_PCB {
+        I32
+    } else if i < L_FA {
+        if is_float((i - L_REG0) as lm::Reg) {
+            F64
+        } else {
+            I64
+        }
+    } else {
+        I64
+    }
+}
+
+impl Wasm {
+    fn b(&mut self) -> &mut Blk {
+        self.blks[self.blks.len() - 1]
+    }
+
+    fn op(&mut self, x: u8) {
+        self.b().code.push(x);
+    }
+
+    fn u(&mut self, v: u64) {
+        let mut c = self.b().code;
+        uleb(&mut c, v);
+    }
+
+    fn s(&mut self, v: i64) {
+        let mut c = self.b().code;
+        sleb(&mut c, v);
+    }
+
+    fn new_block(&mut self) {
+        self.blks.push(&mut Blk {
+            code: Vec::new(),
+            relocs: Vec::new(),
+            fixes: Vec::new(),
+        });
+    }
+
+    fn lget(&mut self, l: u32) {
+        self.op(0x20);
+        self.u(l as u64);
+    }
+
+    fn lset(&mut self, l: u32) {
+        self.op(0x21);
+        self.u(l as u64);
+    }
+
+    fn gget(&mut self, g: u32) {
+        self.op(0x23);
+        self.u(g as u64);
+    }
+
+    fn gset(&mut self, g: u32) {
+        self.op(0x24);
+        self.u(g as u64);
+    }
+
+    // Pushes register x.
+    fn get(&mut self, x: lm::Reg) {
+        let g = global_of(x);
+        if g >= 0 {
+            self.gget(g as u32);
+        } else {
+            self.lget(L_REG0 + x as u32);
+        }
+    }
+
+    // Pops into register x.
+    fn set(&mut self, x: lm::Reg) {
+        let g = global_of(x);
+        if g >= 0 {
+            self.gset(g as u32);
+        } else {
+            self.lset(L_REG0 + x as u32);
+        }
+    }
+
+    fn i64c(&mut self, v: i64) {
+        self.op(0x42);
+        self.s(v);
+    }
+
+    fn i32c(&mut self, v: i64) {
+        self.op(0x41);
+        self.s(v);
+    }
+
+    // Pushes the i32 address of x + off for a memory access, the offset
+    // given to the access (non-negative ones in its immediate).
+    fn addr(&mut self, x: lm::Reg, off: i64) -> u64 {
+        self.get(x);
+        self.wrap_off(off)
+    }
+
+    // The same for the value on the stack.
+    fn wrap_off(&mut self, off: i64) -> u64 {
+        if off >= 0 && off < 0x40000000 {
+            self.op(0xa7); // i32.wrap_i64
+            return off as u64;
+        }
+        self.i64c(off);
+        self.op(0x7c);
+        self.op(0xa7);
+        0
+    }
+
+    fn laddr(&mut self, l: u32, off: i64) -> u64 {
+        self.lget(l);
+        self.wrap_off(off)
+    }
+
+    fn gaddr(&mut self, g: u32, off: i64) -> u64 {
+        self.gget(g);
+        self.wrap_off(off)
+    }
+
+    // A memory access with its offset (alignment hint 0).
+    fn mem(&mut self, opcode: u8, off: u64) {
+        self.op(opcode);
+        self.u(0);
+        self.u(off);
+    }
+
+    fn load_op(size: i64) -> u8 {
+        match size {
+            1 => 0x31,
+            2 => 0x33,
+            4 => 0x35,
+            _ => 0x29,
+        }
+    }
+
+    fn store_op(size: i64) -> u8 {
+        match size {
+            1 => 0x3c,
+            2 => 0x3d,
+            4 => 0x3e,
+            _ => 0x37,
+        }
+    }
+
+    // Loads the word at [l + off] (an i64 local) and pops it into local d.
+    fn lload(&mut self, d: u32, l: u32, off: i64) {
+        let o = self.laddr(l, off);
+        self.mem(0x29, o);
+        self.lset(d);
+    }
+
+    // [g + off] for global g.
+    fn gload(&mut self, g: u32, off: i64) {
+        let o = self.gaddr(g, off);
+        self.mem(0x29, o);
+    }
+
+    // [g + off] = the value pushed by val.
+    fn gstore_l(&mut self, g: u32, off: i64, l: u32) {
+        let o = self.gaddr(g, off);
+        self.lget(l);
+        self.mem(0x37, o);
+    }
+
+    fn gstore_g(&mut self, g: u32, off: i64, v: u32) {
+        let o = self.gaddr(g, off);
+        self.gget(v);
+        self.mem(0x37, o);
+    }
+
+    fn gstore_c(&mut self, g: u32, off: i64, v: i64) {
+        let o = self.gaddr(g, off);
+        self.i64c(v);
+        self.mem(0x37, o);
+    }
+
+    fn gadd(&mut self, g: u32, v: i64) {
+        self.gget(g);
+        self.i64c(v);
+        self.op(0x7c);
+        self.gset(g);
+    }
+
+    // A padded field fixed up at finish.
+    fn fix(&mut self, kind: u8, v: u64) {
+        let b = self.b();
+        let at = b.code.len();
+        b.fixes.push((at, kind, v));
+        let mut i = 0;
+        while i < 5 {
+            b.code.push(0x80);
+            i += 1;
+        }
+        b.code[at + 4] = 0;
+    }
+
+    // Branches to label l (extra: the ifs around the branch).
+    fn jump_to(&mut self, l: LLabel, extra: u64) {
+        self.op(0x41); // i32.const block
+        self.fix(FIX_BLOCK, l as u64);
+        self.lset(L_PCB);
+        self.op(0x0c); // br to the loop
+        self.fix(FIX_LOOP, extra);
+    }
+
+    // If the i32 on the stack is not 0, to l.
+    fn jump_if(&mut self, l: LLabel) {
+        self.op(0x04);
+        self.op(0x40);
+        self.jump_to(l, 1);
+        self.op(0x0b);
+    }
+
+    // A relocation of kind against sym at the current offset; n bytes of
+    // field (its implicit addend v) follow.
+    fn reloc(&mut self, kind: obj::RelocKind, sym: &String, n: usize, addend: i64) {
+        let b = self.b();
+        let at = b.code.len();
+        b.relocs.push(Reloc {
+            sec: obj::TEXT,
+            off: at as u32,
+            kind,
+            sym: sym.clone(),
+        });
+        let mut i = 0;
+        while i < n {
+            b.code.push(0);
+            i += 1;
+        }
+        put_sleb_n(&mut b.code, at, addend, n);
+    }
+
+    // Pushes the condition c of the last compare (an i32).
+    fn cond(&mut self, c: lm::Cond) {
+        self.lget(L_FA);
+        self.lget(L_FB);
+        self.op(match c {
+            lm::EQ => 0x51,
+            lm::NE => 0x52,
+            lm::LT => 0x53,
+            lm::LE => 0x57,
+            lm::GT => 0x55,
+            lm::GE => 0x59,
+            lm::LTU => 0x54,
+            lm::LEU => 0x58,
+            lm::GTU => 0x56,
+            _ => 0x5a, // GEU
+        });
+    }
+
+    // G_RA = this function's PC at the block after the call (the next).
+    fn pass_ra(&mut self) {
+        self.op(0x42);
+        let next = self.blks.len() as i64;
+        self.reloc(obj::WASM_SELFPC, &"_navi_self".to_string(), 10, next);
+        self.gset(G_RA);
+    }
+
+    // After a call: unwinds if it did; the next block is where the caller
+    // goes on (its PC was passed).
+    fn after_call(&mut self) {
+        self.op(0x04);
+        self.op(0x40);
+        self.i32c(1);
+        self.op(0x0f); // return 1
+        self.op(0x0b);
+        let next = self.blks.len() as u64;
+        self.calls.push(next << 32 | (self.tag + 1) as u64);
+        self.new_block();
+    }
+
+    // Calls sym (a navi function, or a block of one: a .r entry).
+    fn call_sym(&mut self, sym: &String) {
+        self.pass_ra();
+        self.op(0x41); // i32.const the entry block
+        self.reloc(obj::WASM_CALL, sym, 5, 0);
+        self.op(0x10); // call the function
+        let mut c = self.b().code;
+        let at = c.len();
+        let mut i = 0;
+        while i < 5 {
+            c.push(0x80);
+            i += 1;
+        }
+        c[at + 4] = 0;
+        self.after_call();
+    }
+
+    // Returns 0 to the caller (or to the run loop: then on at G_RA_OUT).
+    fn return0(&mut self) {
+        self.i32c(0);
+        self.op(0x0f);
+    }
+
+    fn return1(&mut self) {
+        self.i32c(1);
+        self.op(0x0f);
+    }
+
+    // The frame: [SP - 16] = FP, [SP - 8] = G_RA; FP = SP - 16.
+    fn push_record(&mut self) {
+        self.gadd(G_SP, -16);
+        self.gstore_g(G_SP, 0, G_FP);
+        self.gstore_g(G_SP, 8, G_RA);
+    }
+
+    // FP = [SP], G_RA_OUT = [SP + 8], SP += 16.
+    fn pop_record(&mut self) {
+        self.gload(G_SP, 8);
+        self.gset(G_RA_OUT);
+        self.gload(G_SP, 0);
+        self.gset(G_FP);
+        self.gadd(G_SP, 16);
+    }
+
+    // The locals spilled around a poll: every register local.
+    fn spilled(&self) -> Vec<lm::Reg> {
+        let mut out: Vec<lm::Reg> = Vec::new();
+        let mut x = 0;
+        while x < lm::NUM_REGS {
+            let r = x as lm::Reg;
+            if global_of(r) < 0 {
+                out.push(r);
+            }
+            x += 1;
+        }
+        out
+    }
+
+    // The scan loop of scan_heap (bits: scan_heap_bits): locals T0.. hold
+    // p, the end (or the mask), the index, its length, limit, offs.
+    fn scan(&mut self, bits: bool) {
+        // Arguments at SP (C calling convention of the runtime's call_c).
+        let p = L_REG0 + lm::A1 as u32;
+        let hi = p + 1;
+        let index = p + 2;
+        let nidx = p + 3;
+        let limit = p + 4;
+        let offs = p + 5;
+        let w = p + 6;
+        let mut k = 0;
+        while k < 6 {
+            let o = self.gaddr(G_SP, 8 * k as i64);
+            self.mem(0x29, o);
+            self.lset(p + k);
+            k += 1;
+        }
+        let span = L_T0;
+        let n = L_T1;
+        let idx = L_T2;
+        let t = L_T3;
+        let lp = self.new_label();
+        let one = self.new_label();
+        let have = self.new_label();
+        let done = self.new_label();
+        let found = self.new_label();
+        self.bind(lp);
+        if bits {
+            // To the next set bit of the mask (hi), as arm64's: p moves to
+            // its word and past it, the mask as far.
+            self.lget(hi);
+            self.op(0x50);
+            self.jump_if(done);
+            self.lget(hi);
+            self.op(0x7a); // ctz
+            self.lset(t);
+            self.lget(hi);
+            self.lget(t);
+            self.op(0x88);
+            self.i64c(1);
+            self.op(0x88);
+            self.lset(hi);
+            self.lget(p);
+            self.lget(t);
+            self.i64c(3);
+            self.op(0x86);
+            self.op(0x7c);
+            self.lset(p);
+            self.lload(w, p, 0);
+            self.lget(p);
+            self.i64c(8);
+            self.op(0x7c);
+            self.lset(p);
+        } else {
+            self.lget(p);
+            self.i64c(8);
+            self.op(0x7c);
+            self.lget(hi);
+            self.op(0x56); // p + 8 > hi
+            self.jump_if(done);
+            self.lload(w, p, 0);
+            self.lget(p);
+            self.i64c(8);
+            self.op(0x7c);
+            self.lset(p);
+        }
+        // Its arena's span table.
+        self.lget(w);
+        self.i64c(ARENA_SHIFT);
+        self.op(0x88);
+        self.lset(t);
+        self.lget(t);
+        self.lget(nidx);
+        self.op(0x5a); // >= nidx
+        self.jump_if(lp);
+        self.lget(index);
+        self.lget(t);
+        self.i64c(3);
+        self.op(0x86);
+        self.op(0x7c);
+        self.lset(t);
+        self.lload(span, t, 0);
+        self.lget(span);
+        self.op(0x50);
+        self.jump_if(lp);
+        // The span of its page.
+        self.lget(w);
+        self.i64c(PAGE_SHIFT);
+        self.op(0x88);
+        self.i64c(ARENA_PAGES - 1);
+        self.op(0x83);
+        self.i64c(3);
+        self.op(0x86);
+        self.lget(span);
+        self.op(0x7c);
+        self.lset(t);
+        self.lload(span, t, 0);
+        self.lget(span);
+        self.op(0x50);
+        self.jump_if(lp);
+        // Made before limit (its seq, at offset 0).
+        self.lload(t, span, 0);
+        self.lget(t);
+        self.lget(limit);
+        self.op(0x5a);
+        self.jump_if(lp);
+        // n = [span + offs.nelems], the index of the element.
+        self.field(n, span, offs, 8);
+        self.lget(n);
+        self.i64c(1);
+        self.op(0x51);
+        self.jump_if(one);
+        self.field(t, span, offs, 0); // start
+        self.lget(w);
+        self.lget(t);
+        self.op(0x7d);
+        self.lset(idx);
+        self.field(t, span, offs, 16); // div_mul
+        self.lget(idx);
+        self.lget(t);
+        self.op(0x7e);
+        self.i64c(32);
+        self.op(0x88);
+        self.lset(idx);
+        self.jump_to(have, 0);
+        self.bind(one);
+        self.i64c(0);
+        self.lset(idx);
+        self.bind(have);
+        self.lget(idx);
+        self.lget(n);
+        self.op(0x5a);
+        self.jump_if(lp);
+        // Allocated (its byte in bits) and unmarked (in the mark bits after).
+        self.field(t, span, offs, 24); // bits
+        self.lget(t);
+        self.lget(idx);
+        self.op(0x7c);
+        let o = self.wrap_off(0);
+        self.mem(0x31, o); // i64.load8_u
+        self.op(0x50);
+        self.jump_if(lp);
+        self.lget(t);
+        self.lget(n);
+        self.op(0x7c);
+        self.lget(idx);
+        self.op(0x7c);
+        let o2 = self.wrap_off(0);
+        self.mem(0x31, o2);
+        self.i64c(0);
+        self.op(0x52);
+        self.jump_if(lp);
+        self.jump_to(found, 0);
+        self.bind(done);
+        self.i64c(0);
+        self.gset(G_RV);
+        self.gget(G_RA);
+        self.gset(G_RA_OUT);
+        self.return0();
+        self.bind(found);
+        // The address after the word.
+        self.lget(p);
+        self.gset(G_RV);
+        self.gget(G_RA);
+        self.gset(G_RA_OUT);
+        self.return0();
+    }
+
+    // dst = the word at span + the byte (shift: 0 start, 8 nelems, 16
+    // div_mul, 24 bits) of offs.
+    fn field(&mut self, dst: u32, span: u32, offs: u32, shift: i64) {
+        self.lget(span);
+        self.lget(offs);
+        self.i64c(shift);
+        self.op(0x88);
+        self.i64c(0xff);
+        self.op(0x83);
+        self.op(0x7c);
+        let o = self.wrap_off(0);
+        self.mem(0x29, o);
+        self.lset(dst);
+    }
+}
+
+impl Machine for Wasm {
+    fn begin(&mut self) {
+        self.blks = Vec::new();
+        self.new_block();
+        self.labels = Vec::new();
+        self.calls = Vec::new();
+        self.tag = 0;
+        self.err = String::new();
+    }
+
+    fn finish(&mut self) -> Code {
+        if self.err.len() > 0 {
+            return Code {
+                code: Vec::new(),
+                relocs: Vec::new(),
+                calls: Vec::new(),
+                err: self.err.clone(),
+                frame: -1,
+            };
+        }
+        let k = self.blks.len();
+        // Fixups.
+        let mut i = 0;
+        while i < k {
+            let b = self.blks[i];
+            for f in b.fixes.iter() {
+                let (at, kind, v) = *f;
+                if kind == FIX_BLOCK {
+                    let blk = self.labels[v as usize];
+                    if blk < 0 {
+                        return Code {
+                            code: Vec::new(),
+                            relocs: Vec::new(),
+                            calls: Vec::new(),
+                            err: "wasm: a label is not bound".to_string(),
+                            frame: -1,
+                        };
+                    }
+                    put_sleb_n(&mut b.code, at, blk, 5);
+                } else {
+                    put_uleb_n(&mut b.code, at, (k - 1 - i) as u64 + v, 5);
+                }
+            }
+            i += 1;
+        }
+        let mut body: Vec<u8> = Vec::new();
+        // Locals 1.. by runs of one type (0 is the parameter).
+        let mut runs: Vec<(u32, u8)> = Vec::new();
+        let mut l = 1u32;
+        while l < NUM_LOCALS {
+            let t = local_type(l);
+            let n = runs.len();
+            if n > 0 && runs[n - 1].1 == t {
+                runs[n - 1] = (runs[n - 1].0 + 1, t);
+            } else {
+                runs.push((1, t));
+            }
+            l += 1;
+        }
+        uleb(&mut body, runs.len() as u64);
+        for (n, t) in runs.iter() {
+            uleb(&mut body, *n as u64);
+            body.push(*t);
+        }
+        // local.get 0; local.set 1; loop; block * k; local.get 1;
+        // br_table 0 .. k-1.
+        body.push(0x20);
+        body.push(0);
+        body.push(0x21);
+        body.push(1);
+        body.push(0x03);
+        body.push(0x40);
+        i = 0;
+        while i < k {
+            body.push(0x02);
+            body.push(0x40);
+            i += 1;
+        }
+        body.push(0x20);
+        body.push(1);
+        body.push(0x0e);
+        uleb(&mut body, k as u64);
+        i = 0;
+        while i < k {
+            uleb(&mut body, i as u64);
+            i += 1;
+        }
+        uleb(&mut body, 0);
+        let mut relocs: Vec<Reloc> = Vec::new();
+        let mut starts: Vec<usize> = Vec::new();
+        i = 0;
+        while i < k {
+            body.push(0x0b);
+            starts.push(body.len());
+            body.extend_from_slice(self.blks[i].code.as_slice());
+            i += 1;
+        }
+        body.push(0x0b); // the loop
+        body.push(0x00); // unreachable
+        body.push(0x0b); // the function
+        let mut code: Vec<u8> = Vec::new();
+        uleb(&mut code, body.len() as u64);
+        let pre = code.len();
+        code.extend_from_slice(body.as_slice());
+        i = 0;
+        while i < k {
+            for r in self.blks[i].relocs.iter() {
+                relocs.push(Reloc {
+                    sec: r.sec,
+                    off: (pre + starts[i]) as u32 + r.off,
+                    kind: r.kind,
+                    sym: r.sym.clone(),
+                });
+            }
+            i += 1;
+        }
+        let calls = self.calls;
+        self.calls = Vec::new();
+        Code {
+            code,
+            relocs,
+            calls,
+            err: String::new(),
+            frame: -1,
+        }
+    }
+
+    // The current block's number (a PC within the function).
+    fn offset(&self) -> usize {
+        self.blks.len() - 1
+    }
+
+    fn set_tag(&mut self, tag: i64) {
+        self.tag = tag;
+    }
+
+    fn new_label(&mut self) -> LLabel {
+        self.labels.push(-1);
+        self.labels.len() - 1
+    }
+
+    fn bind(&mut self, l: LLabel) {
+        if self.b().code.len() > 0 {
+            self.new_block();
+        }
+        self.labels[l] = (self.blks.len() - 1) as i64;
+    }
+
+    fn prologue(&mut self, frame: i64) {
+        self.push_record();
+        self.gget(G_SP);
+        self.gset(G_FP);
+        self.gadd(G_SP, -frame);
+        // Too deep: on from the next block, from the run loop.
+        self.gadd(G_DEPTH, 1);
+        self.gget(G_DEPTH);
+        self.i64c(MAX_DEPTH);
+        self.op(0x55);
+        self.op(0x04);
+        self.op(0x40);
+        self.i64c(0);
+        self.gset(G_DEPTH);
+        self.op(0x42);
+        let next = self.blks.len() as i64;
+        self.reloc(obj::WASM_SELFPC, &"_navi_self".to_string(), 10, next);
+        self.gset(G_TARGET);
+        self.i64c(0);
+        self.gset(G_REASON);
+        self.return1();
+        self.op(0x0b);
+        self.new_block();
+    }
+
+    fn ret(&mut self) {
+        self.gget(G_FP);
+        self.gset(G_SP);
+        self.pop_record();
+        self.gadd(G_DEPTH, -1);
+        self.return0();
+    }
+
+    fn entry_prologue(&mut self, frame: i64) {
+        self.prologue(frame);
+    }
+
+    fn entry_return0(&mut self) {
+        self.ret();
+    }
+
+    fn entry_args(&mut self) {
+        self.err = "wasm: no C entry".to_string();
+    }
+
+    fn mov_imm(&mut self, x: lm::Reg, v: i64) {
+        self.i64c(v);
+        self.set(x);
+    }
+
+    fn mov(&mut self, dst: lm::Reg, src: lm::Reg) {
+        self.get(src);
+        self.set(dst);
+    }
+
+    fn load(&mut self, size: i64, dst: lm::Reg, base: lm::Reg, off: i64) {
+        let o = self.addr(base, off);
+        self.mem(Wasm::load_op(size), o);
+        self.set(dst);
+    }
+
+    fn store(&mut self, size: i64, src: lm::Reg, base: lm::Reg, off: i64) {
+        let o = self.addr(base, off);
+        self.get(src);
+        self.mem(Wasm::store_op(size), o);
+    }
+
+    fn store_zero(&mut self, size: i64, base: lm::Reg, off: i64) {
+        let o = self.addr(base, off);
+        self.i64c(0);
+        self.mem(Wasm::store_op(size), o);
+    }
+
+    fn addr_of(&mut self, dst: lm::Reg, base: lm::Reg, off: i64) {
+        self.get(base);
+        if off != 0 {
+            self.i64c(off);
+            self.op(0x7c);
+        }
+        self.set(dst);
+    }
+
+    fn add_imm(&mut self, x: lm::Reg, v: i64) {
+        self.addr_of(x, x, v);
+    }
+
+    fn adr_sym(&mut self, dst: lm::Reg, sym: &String) {
+        self.op(0x42);
+        self.reloc(obj::WASM_ADDR, sym, 10, 0);
+        self.set(dst);
+    }
+
+    fn mark(&mut self, kind: obj::RelocKind, sym: &String) {
+        self.reloc(kind, sym, 0, 0);
+    }
+
+    fn load_sym(&mut self, dst: lm::Reg, sym: &String) {
+        self.adr_sym(dst, sym);
+        self.load(8, dst, dst, 0);
+    }
+
+    fn sign_ext(&mut self, dst: lm::Reg, src: lm::Reg, size: i64) {
+        self.get(src);
+        match size {
+            1 => self.op(0xc2),
+            2 => self.op(0xc3),
+            4 => self.op(0xc4),
+            _ => {}
+        }
+        self.set(dst);
+    }
+
+    fn zero_ext(&mut self, dst: lm::Reg, src: lm::Reg, size: i64) {
+        self.get(src);
+        if size < 8 {
+            self.i64c((1i64 << (8 * size) as u32) - 1);
+            self.op(0x83);
+        }
+        self.set(dst);
+    }
+
+    fn arith(&mut self, op: lm::Op, dst: lm::Reg, a: lm::Reg, b: lm::Reg) {
+        if op == lm::MULHI_U {
+            self.mulhi(dst, a, b);
+            return;
+        }
+        self.get(a);
+        self.get(b);
+        self.op(match op {
+            lm::ADD => 0x7c,
+            lm::SUB => 0x7d,
+            lm::MUL => 0x7e,
+            lm::AND => 0x83,
+            lm::OR => 0x84,
+            lm::XOR => 0x85,
+            lm::SHL => 0x86,
+            lm::SHR_U => 0x88,
+            lm::SHR_S => 0x87,
+            lm::DIV_S => 0x7f,
+            lm::DIV_U => 0x80,
+            lm::REM_S => 0x81,
+            _ => 0x82, // REM_U
+        });
+        self.set(dst);
+    }
+
+    fn arith_ovf(
+        &mut self,
+        op: lm::Op,
+        signed: bool,
+        dst: lm::Reg,
+        a: lm::Reg,
+        b: lm::Reg,
+        ovf: LLabel,
+    ) {
+        // The result in T0, the overflow (an i32) from a, b and it.
+        self.get(a);
+        self.get(b);
+        self.op(match op {
+            lm::ADD => 0x7c,
+            lm::SUB => 0x7d,
+            _ => 0x7e,
+        });
+        self.lset(L_T0);
+        if op == lm::ADD {
+            if signed {
+                // ((a ^ r) & (b ^ r)) < 0
+                self.get(a);
+                self.lget(L_T0);
+                self.op(0x85);
+                self.get(b);
+                self.lget(L_T0);
+                self.op(0x85);
+                self.op(0x83);
+                self.i64c(0);
+                self.op(0x53);
+            } else {
+                self.lget(L_T0);
+                self.get(a);
+                self.op(0x54);
+            }
+        } else if op == lm::SUB {
+            if signed {
+                // ((a ^ b) & (a ^ r)) < 0
+                self.get(a);
+                self.get(b);
+                self.op(0x85);
+                self.get(a);
+                self.lget(L_T0);
+                self.op(0x85);
+                self.op(0x83);
+                self.i64c(0);
+                self.op(0x53);
+            } else {
+                self.get(a);
+                self.get(b);
+                self.op(0x54);
+            }
+        } else {
+            // a != 0 && r / a != b (signed: a == -1 overflows only for MIN,
+            // whose division by -1 would trap).
+            self.get(a);
+            self.op(0x50);
+            self.op(0x04);
+            self.op(I32);
+            self.i32c(0);
+            self.op(0x05);
+            if signed {
+                self.get(a);
+                self.i64c(-1);
+                self.op(0x51);
+                self.op(0x04);
+                self.op(I32);
+                self.get(b);
+                self.i64c(i64::MIN);
+                self.op(0x51);
+                self.op(0x05);
+                self.lget(L_T0);
+                self.get(a);
+                self.op(0x7f);
+                self.get(b);
+                self.op(0x52);
+                self.op(0x0b);
+            } else {
+                self.lget(L_T0);
+                self.get(a);
+                self.op(0x80);
+                self.get(b);
+                self.op(0x52);
+            }
+            self.op(0x0b);
+        }
+        self.op(0x04);
+        self.op(0x40);
+        self.jump_to(ovf, 1);
+        self.op(0x0b);
+        self.lget(L_T0);
+        self.set(dst);
+    }
+
+    fn mul_add(&mut self, dst: lm::Reg, a: lm::Reg, b: lm::Reg, c: lm::Reg) {
+        self.get(c);
+        self.get(a);
+        self.get(b);
+        self.op(0x7e);
+        self.op(0x7c);
+        self.set(dst);
+    }
+
+    fn fload(&mut self, size: i64, f: lm::Reg, base: lm::Reg, off: i64) {
+        let o = self.addr(base, off);
+        if size == 4 {
+            self.mem(0x2a, o);
+            self.op(0xbb);
+        } else {
+            self.mem(0x2b, o);
+        }
+        self.set(f);
+    }
+
+    fn fstore(&mut self, size: i64, f: lm::Reg, base: lm::Reg, off: i64) {
+        let o = self.addr(base, off);
+        self.get(f);
+        if size == 4 {
+            self.op(0xb6);
+            self.mem(0x38, o);
+        } else {
+            self.mem(0x39, o);
+        }
+    }
+
+    fn fmov(&mut self, dst: lm::Reg, src: lm::Reg) {
+        self.get(src);
+        self.set(dst);
+    }
+
+    fn shift_imm(&mut self, op: lm::Op, dst: lm::Reg, src: lm::Reg, n: i64) {
+        self.get(src);
+        self.i64c(n);
+        self.op(match op {
+            lm::SHL => 0x86,
+            lm::SHR_U => 0x88,
+            _ => 0x87,
+        });
+        self.set(dst);
+    }
+
+    fn add_scaled(&mut self, dst: lm::Reg, base: lm::Reg, index: lm::Reg, shift: i64) {
+        self.get(base);
+        self.get(index);
+        if shift > 0 {
+            self.i64c(shift);
+            self.op(0x86);
+        }
+        self.op(0x7c);
+        self.set(dst);
+    }
+
+    fn neg(&mut self, dst: lm::Reg, src: lm::Reg) {
+        self.i64c(0);
+        self.get(src);
+        self.op(0x7d);
+        self.set(dst);
+    }
+
+    fn not(&mut self, dst: lm::Reg, src: lm::Reg) {
+        self.get(src);
+        self.i64c(-1);
+        self.op(0x85);
+        self.set(dst);
+    }
+
+    fn cmp(&mut self, a: lm::Reg, b: lm::Reg) {
+        self.get(a);
+        self.lset(L_FA);
+        self.get(b);
+        self.lset(L_FB);
+    }
+
+    fn cmp_imm(&mut self, a: lm::Reg, v: i64) {
+        self.get(a);
+        self.lset(L_FA);
+        self.i64c(v);
+        self.lset(L_FB);
+    }
+
+    fn set_cond(&mut self, dst: lm::Reg, c: lm::Cond) {
+        self.cond(c);
+        self.op(0xad); // i64.extend_i32_u
+        self.set(dst);
+    }
+
+    fn carry_in(&mut self, c: lm::Reg, sub: bool) {
+        let _ = sub;
+        self.get(c);
+        self.lset(L_CARRY);
+    }
+
+    fn add_carry(&mut self, dst: lm::Reg, a: lm::Reg, b: lm::Reg, carried: bool, sub: bool) {
+        self.get(a);
+        self.get(b);
+        self.op(if sub { 0x7d } else { 0x7c });
+        self.lset(L_T0);
+        // T1: the carry (borrow) of a op b.
+        if sub {
+            self.get(a);
+            self.get(b);
+            self.op(0x54);
+        } else {
+            self.lget(L_T0);
+            self.get(a);
+            self.op(0x54);
+        }
+        self.op(0xad);
+        self.lset(L_T1);
+        if carried {
+            if sub {
+                // T0 < carry borrows again.
+                self.lget(L_T0);
+                self.lget(L_CARRY);
+                self.op(0x54);
+                self.op(0xad);
+                self.lget(L_T1);
+                self.op(0x84);
+                self.lset(L_T1);
+                self.lget(L_T0);
+                self.lget(L_CARRY);
+                self.op(0x7d);
+                self.lset(L_T0);
+            } else {
+                self.lget(L_T0);
+                self.lget(L_CARRY);
+                self.op(0x7c);
+                self.lset(L_T2);
+                self.lget(L_T2);
+                self.lget(L_T0);
+                self.op(0x54);
+                self.op(0xad);
+                self.lget(L_T1);
+                self.op(0x84);
+                self.lset(L_T1);
+                self.lget(L_T2);
+                self.lset(L_T0);
+            }
+        }
+        self.lget(L_T1);
+        self.lset(L_CARRY);
+        self.lget(L_T0);
+        self.set(dst);
+    }
+
+    fn carry_out(&mut self, dst: lm::Reg, sub: bool) {
+        let _ = sub;
+        self.lget(L_CARRY);
+        self.set(dst);
+    }
+
+    fn branch_if(&mut self, c: lm::Cond, l: LLabel) {
+        self.cond(c);
+        self.jump_if(l);
+    }
+
+    fn select_reg(&mut self, dst: lm::Reg, a: lm::Reg, b: lm::Reg, c: lm::Cond) {
+        self.get(a);
+        self.get(b);
+        self.cond(c);
+        self.op(0x1b);
+        self.set(dst);
+    }
+
+    fn jump(&mut self, l: LLabel) {
+        self.jump_to(l, 0);
+    }
+
+    fn branch_zero(&mut self, x: lm::Reg, l: LLabel) {
+        self.get(x);
+        self.op(0x50);
+        self.jump_if(l);
+    }
+
+    fn branch_non_zero(&mut self, x: lm::Reg, l: LLabel) {
+        self.get(x);
+        self.i64c(0);
+        self.op(0x52);
+        self.jump_if(l);
+    }
+
+    fn fmov_to(&mut self, f: lm::Reg, x: lm::Reg, f64: bool) {
+        self.get(x);
+        if f64 {
+            self.op(0xbf);
+        } else {
+            self.op(0xa7);
+            self.op(0xbe);
+            self.op(0xbb);
+        }
+        self.set(f);
+    }
+
+    fn fmov_from(&mut self, x: lm::Reg, f: lm::Reg, f64: bool) {
+        self.get(f);
+        if f64 {
+            self.op(0xbd);
+        } else {
+            self.op(0xb6);
+            self.op(0xbc);
+            self.op(0xad);
+        }
+        self.set(x);
+    }
+
+    fn farith(&mut self, op: lm::Op, dst: lm::Reg, a: lm::Reg, b: lm::Reg, f64: bool) {
+        self.get(a);
+        if !f64 {
+            self.op(0xb6);
+        }
+        self.get(b);
+        if !f64 {
+            self.op(0xb6);
+        }
+        if f64 {
+            self.op(match op {
+                lm::ADD => 0xa0,
+                lm::SUB => 0xa1,
+                lm::MUL => 0xa2,
+                _ => 0xa3,
+            });
+        } else {
+            self.op(match op {
+                lm::ADD => 0x92,
+                lm::SUB => 0x93,
+                lm::MUL => 0x94,
+                _ => 0x95,
+            });
+            self.op(0xbb);
+        }
+        self.set(dst);
+    }
+
+    fn fneg(&mut self, dst: lm::Reg, src: lm::Reg, f64: bool) {
+        let _ = f64;
+        self.get(src);
+        self.op(0x9a);
+        self.set(dst);
+    }
+
+    fn fcompare(&mut self, dst: lm::Reg, c: lm::Cond, a: lm::Reg, b: lm::Reg, f64: bool) {
+        let _ = f64;
+        self.get(a);
+        self.get(b);
+        self.op(match c {
+            lm::EQ => 0x61,
+            lm::NE => 0x62,
+            lm::LT => 0x63,
+            lm::GT => 0x64,
+            lm::LE => 0x65,
+            _ => 0x66,
+        });
+        self.op(0xad);
+        self.set(dst);
+    }
+
+    fn int_to_float(&mut self, f: lm::Reg, x: lm::Reg, signed: bool, f64: bool) {
+        self.get(x);
+        if f64 {
+            self.op(if signed { 0xb9 } else { 0xba });
+        } else {
+            self.op(if signed { 0xb4 } else { 0xb5 });
+            self.op(0xbb);
+        }
+        self.set(f);
+    }
+
+    fn float_to_int(&mut self, x: lm::Reg, f: lm::Reg, signed: bool, f64: bool) {
+        let _ = f64;
+        self.get(f);
+        self.op(0xfc);
+        self.u(if signed { 6 } else { 7 }); // i64.trunc_sat_f64_s/u
+        self.set(x);
+    }
+
+    fn float_conv(&mut self, dst: lm::Reg, src: lm::Reg, to_f64: bool) {
+        self.get(src);
+        if !to_f64 {
+            self.op(0xb6);
+            self.op(0xbb);
+        }
+        self.set(dst);
+    }
+
+    fn call(&mut self, sym: &String) {
+        self.call_sym(sym);
+    }
+
+    fn call_reg(&mut self, x: lm::Reg) {
+        self.pass_ra();
+        self.get(x);
+        self.i64c(0xffff);
+        self.op(0x83);
+        self.op(0xa7);
+        self.get(x);
+        self.i64c(16);
+        self.op(0x88);
+        self.op(0xa7);
+        self.op(0x11); // call_indirect (type 0, table 0)
+        self.u(0);
+        self.u(0);
+        self.after_call();
+    }
+
+    fn call_c(
+        &mut self,
+        sym: &str,
+        fn_reg: lm::Reg,
+        args: &Vec<CArg>,
+        float_ret: bool,
+        f64: bool,
+        sys: bool,
+        ret: i64,
+    ) {
+        let _ = sys;
+        let _ = fn_reg;
+        if sym.starts_with("_navi_") {
+            // A runtime routine of this backend: its arguments at SP, its
+            // result in G_RV.
+            self.call_sym(&sym.to_string());
+            self.gget(G_RV);
+            self.set(lm::V1);
+            return;
+        }
+        if sym.len() == 0 {
+            self.err = "wasm: calls of C function pointers are not supported".to_string();
+            return;
+        }
+        // An import: its signature after # in the symbol (wasmlink makes
+        // the type): i/I/f/F per parameter, then : and the result's.
+        let mut sig = String::new();
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i];
+            let o = self.gaddr(G_SP, 8 * i as i64);
+            if a.float {
+                if a.f64 {
+                    self.mem(0x2b, o);
+                    sig.push('F');
+                } else {
+                    self.mem(0x2a, o);
+                    sig.push('f');
+                }
+            } else if a.size == 8 {
+                self.mem(0x29, o);
+                sig.push('I');
+            } else {
+                self.mem(0x28, o); // i32.load
+                sig.push('i');
+            }
+            i += 1;
+        }
+        sig.push(':');
+        if float_ret {
+            sig.push(if f64 { 'F' } else { 'f' });
+        } else if ret == 8 {
+            sig.push('I');
+        } else if ret > 0 {
+            sig.push('i');
+        }
+        self.op(0x10);
+        let name = `${sym}#${sig}`.to_string();
+        self.reloc(obj::WASM_IMPORT, &name, 5, 0);
+        // (A padded unsigned field: its last byte without the continuation.)
+        let mut c = self.b().code;
+        let n = c.len();
+        c[n - 1] = 0;
+        let mut j = n - 5;
+        while j < n - 1 {
+            c[j] = 0x80;
+            j += 1;
+        }
+        if float_ret {
+            if f64 {
+                self.op(0xbd);
+            } else {
+                self.op(0xbc);
+                self.op(0xad);
+            }
+            self.set(lm::V1);
+        } else if ret == 8 {
+            self.set(lm::V1);
+        } else if ret > 0 {
+            self.op(0xad);
+            self.set(lm::V1);
+        }
+    }
+
+    fn c_callback(&mut self, cb: &lm::CCallback) {
+        let _ = cb;
+        self.err = "wasm: extern \"C\" functions cannot be called from C on js-wasm32".to_string();
+    }
+
+    fn trap(&mut self) {
+        self.op(0x00);
+    }
+
+    fn copy_words(&mut self, dst: lm::Reg, src: lm::Reg, n: i64) {
+        self.get(dst);
+        self.op(0xa7);
+        self.get(src);
+        self.op(0xa7);
+        self.i32c(8 * n);
+        self.op(0xfc);
+        self.u(10);
+        self.op(0);
+        self.op(0);
+        self.add_imm(dst, 8 * n);
+        self.add_imm(src, 8 * n);
+    }
+
+    // CTX = the list head. A frame of 48 (the standard slots: the defer
+    // list at FP-32 empty), the record at FP-8 and the next at FP-16.
+    fn run_defers(&mut self) {
+        self.prologue(48);
+        self.gstore_c(G_FP, -32, 0);
+        self.gstore_g(G_FP, -8, G_CTX);
+        let lp = self.new_label();
+        let done = self.new_label();
+        self.bind(lp);
+        self.gload(G_FP, -8);
+        self.lset(L_T0);
+        self.lget(L_T0);
+        self.op(0x50);
+        self.jump_if(done);
+        // The arguments (T1 bytes) and the result (T2) below SP.
+        self.lload(L_T1, L_T0, 24);
+        self.lload(L_T2, L_T0, 32);
+        self.gget(G_SP);
+        self.lget(L_T1);
+        self.lget(L_T2);
+        self.op(0x7c);
+        self.i64c(15);
+        self.op(0x7c);
+        self.i64c(-16);
+        self.op(0x83);
+        self.op(0x7d);
+        self.gset(G_SP);
+        self.gget(G_SP);
+        self.op(0xa7);
+        self.lget(L_T0);
+        self.i64c(48);
+        self.op(0x7c);
+        self.op(0xa7);
+        self.lget(L_T1);
+        self.op(0xa7);
+        self.op(0xfc);
+        self.u(10);
+        self.op(0);
+        self.op(0);
+        self.gget(G_SP);
+        self.lget(L_T1);
+        self.op(0x7c);
+        self.gset(G_RET);
+        let ol = self.laddr(L_T0, 40);
+        self.mem(0x29, ol);
+        self.gset(G_LOC);
+        let o = self.laddr(L_T0, 16);
+        self.mem(0x29, o);
+        self.gset(G_CTX);
+        let o2 = self.laddr(L_T0, 0);
+        self.mem(0x29, o2);
+        self.lset(L_T2);
+        self.gstore_l(G_FP, -16, L_T2);
+        let o3 = self.laddr(L_T0, 8);
+        self.mem(0x29, o3);
+        self.lset(L_REG0 + lm::I1 as u32);
+        self.call_reg(lm::I1);
+        // On: SP back, the next record.
+        self.gget(G_FP);
+        self.i64c(-48);
+        self.op(0x7c);
+        self.gset(G_SP);
+        self.gload(G_FP, -16);
+        self.lset(L_T0);
+        self.gstore_l(G_FP, -8, L_T0);
+        self.jump(lp);
+        self.bind(done);
+        self.ret();
+    }
+
+    // [SP] = save, [SP + 8] = load: {sp, fp, pc}. As arm64's, 80 bytes
+    // pushed on the stack left hold its callee-saved registers, the G
+    // register (x28) last at sp + 72, and are popped from the one resumed
+    // (a new G's stack has its G there).
+    fn swap_context(&mut self) {
+        self.gload(G_SP, 0);
+        self.lset(L_T0);
+        self.gload(G_SP, 8);
+        self.lset(L_T1);
+        self.gadd(G_SP, -80);
+        self.gstore_g(G_SP, 72, G_G);
+        let o = self.laddr(L_T0, 0);
+        self.gget(G_SP);
+        self.mem(0x37, o);
+        let o2 = self.laddr(L_T0, 8);
+        self.gget(G_FP);
+        self.mem(0x37, o2);
+        let o3 = self.laddr(L_T0, 16);
+        self.gget(G_RA);
+        self.mem(0x37, o3);
+        let p = self.laddr(L_T1, 0);
+        self.mem(0x29, p);
+        self.gset(G_SP);
+        let p2 = self.laddr(L_T1, 8);
+        self.mem(0x29, p2);
+        self.gset(G_FP);
+        let p3 = self.laddr(L_T1, 16);
+        self.mem(0x29, p3);
+        self.gset(G_TARGET);
+        self.gload(G_SP, 72);
+        self.gset(G_G);
+        self.gadd(G_SP, 80);
+        self.i64c(0);
+        self.gset(G_REASON);
+        self.return1();
+    }
+
+    fn scan_heap(&mut self) {
+        self.scan(false);
+    }
+
+    fn scan_heap_bits(&mut self) {
+        self.scan(true);
+    }
+
+    // Single-threaded: plain loads and stores.
+    fn atomic_cas(&mut self, old: lm::Reg, new: lm::Reg, addr: lm::Reg) {
+        let o = self.addr(addr, 0);
+        self.mem(0x29, o);
+        self.lset(L_T0);
+        self.lget(L_T0);
+        self.get(old);
+        self.op(0x51);
+        self.op(0x04);
+        self.op(0x40);
+        let o2 = self.addr(addr, 0);
+        self.get(new);
+        self.mem(0x37, o2);
+        self.op(0x0b);
+        self.lget(L_T0);
+        self.set(old);
+    }
+
+    fn atomic_add(&mut self, dst: lm::Reg, delta: lm::Reg, addr: lm::Reg) {
+        let o = self.addr(addr, 0);
+        self.mem(0x29, o);
+        self.lset(L_T0);
+        let o2 = self.addr(addr, 0);
+        self.lget(L_T0);
+        self.get(delta);
+        self.op(0x7c);
+        self.mem(0x37, o2);
+        self.lget(L_T0);
+        self.set(dst);
+    }
+
+    fn atomic_load(&mut self, dst: lm::Reg, addr: lm::Reg) {
+        self.load(8, dst, addr, 0);
+    }
+
+    fn atomic_store(&mut self, src: lm::Reg, addr: lm::Reg) {
+        self.store(8, src, addr, 0);
+    }
+
+    // As arm64's: a frame record, 256 bytes where the registers are saved
+    // (CTX as x0, RET as x8, LOC as x9, the need as x16; the rest 0), the
+    // G's nesting count, SP and need, its limit cleared; then sym's result
+    // (at sp + 240): how far the stack moved.
+    fn morestack(&mut self, sym: &str, dict: &str, loc: &str) {
+        self.push_record();
+        self.gget(G_SP);
+        self.gset(G_FP);
+        self.gadd(G_SP, -256);
+        self.gget(G_SP);
+        self.op(0xa7);
+        self.i32c(0);
+        self.i32c(256);
+        self.op(0xfc);
+        self.u(11); // memory.fill
+        self.op(0);
+        self.gstore_g(G_SP, 0, G_CTX);
+        self.gstore_g(G_SP, 64, G_RET);
+        self.gstore_g(G_SP, 72, G_LOC);
+        self.gstore_g(G_SP, 208, G_NEED);
+        let nested = self.new_label();
+        self.gload(G_G, 32);
+        self.lset(L_T0);
+        self.lget(L_T0);
+        self.i64c(1);
+        self.op(0x7c);
+        self.lset(L_T1);
+        self.gstore_l(G_G, 32, L_T1);
+        self.lget(L_T0);
+        self.i64c(0);
+        self.op(0x52);
+        self.jump_if(nested);
+        self.gstore_g(G_G, 24, G_SP);
+        self.gstore_g(G_G, 16, G_NEED);
+        self.bind(nested);
+        self.gstore_c(G_G, 0, 0);
+        self.gget(G_SP);
+        self.i64c(240);
+        self.op(0x7c);
+        self.gset(G_RET);
+        self.op(0x42);
+        self.reloc(obj::WASM_ADDR, &loc.to_string(), 10, 0);
+        self.gset(G_LOC);
+        self.op(0x42);
+        self.reloc(obj::WASM_ADDR, &dict.to_string(), 10, 0);
+        self.gset(G_CTX);
+        self.call_sym(&sym.to_string());
+        self.gload(G_G, 32);
+        self.i64c(-1);
+        self.op(0x7c);
+        self.lset(L_T0);
+        self.gstore_l(G_G, 32, L_T0);
+        self.gload(G_SP, 240);
+        self.lset(L_T0);
+        self.gget(G_SP);
+        self.lget(L_T0);
+        self.op(0x7c);
+        self.gset(G_SP);
+        self.gget(G_FP);
+        self.lget(L_T0);
+        self.op(0x7c);
+        self.gset(G_FP);
+        self.gload(G_SP, 0);
+        self.gset(G_CTX);
+        self.gload(G_SP, 64);
+        self.gset(G_RET);
+        self.gload(G_SP, 72);
+        self.gset(G_LOC);
+        self.gload(G_SP, 208);
+        self.gset(G_NEED);
+        self.gget(G_FP);
+        self.gset(G_SP);
+        self.pop_record();
+        self.return0();
+    }
+
+    // At a function's entry (before its prologue): a record of the caller's
+    // FP and the return address into it, then _navi_morestack with the
+    // need (I1).
+    fn call_morestack(&mut self) {
+        self.get(lm::I1);
+        self.gset(G_NEED);
+        self.push_record();
+        self.call_sym(&"_navi_morestack".to_string());
+        self.gload(G_SP, 8);
+        self.gset(G_RA);
+        self.gload(G_SP, 0);
+        self.gset(G_FP);
+        self.gadd(G_SP, 16);
+    }
+
+    // _navi_poll: a record of the loop's FP and the return into it, then
+    // _navi_morestack with need 0 (stop; the stack does not move).
+    fn poll_stub(&mut self) {
+        self.push_record();
+        self.i64c(0);
+        self.gset(G_NEED);
+        self.call_sym(&"_navi_morestack".to_string());
+        self.pop_record();
+        self.return0();
+    }
+
+    // The loop's registers (locals: lost if the stack unwinds) go below its
+    // SP, where the collector scans conservatively (between the poll's
+    // record and the loop's frame), and come back after.
+    fn call_poll(&mut self) {
+        let regs = self.spilled();
+        let size = ((8 * regs.len() as i64) + 15) & !15;
+        self.gadd(G_SP, -size);
+        let mut k = 0;
+        while k < regs.len() {
+            let x = regs[k];
+            let o = self.gaddr(G_SP, 8 * k as i64);
+            self.lget(L_REG0 + x as u32);
+            self.mem(if is_float(x) { 0x39 } else { 0x37 }, o);
+            k += 1;
+        }
+        self.call_sym(&"_navi_poll".to_string());
+        k = 0;
+        while k < regs.len() {
+            let x = regs[k];
+            let o = self.gaddr(G_SP, 8 * k as i64);
+            self.mem(if is_float(x) { 0x2b } else { 0x29 }, o);
+            self.lset(L_REG0 + x as u32);
+            k += 1;
+        }
+        self.gadd(G_SP, size);
+    }
+
+    // SP below the G's limit.
+    fn poll_check(&mut self, slow: LLabel) {
+        self.gget(G_SP);
+        self.gload(G_G, 0);
+        self.op(0x54);
+        self.jump_if(slow);
+    }
+
+    // No OS threads on js.
+    fn mstart(&mut self, sym: &str, dict: &str, loc: &str) {
+        let _ = sym;
+        let _ = dict;
+        let _ = loc;
+        self.trap();
+    }
+
+    // [SP] = buf: the G at 72, FP at 80, the return PC at 88, SP at 96
+    // (arm64's x28, x29, x30 and sp); returns 0.
+    fn set_jmp(&mut self) {
+        self.gload(G_SP, 0);
+        self.lset(L_T0);
+        let og = self.laddr(L_T0, 72);
+        self.gget(G_G);
+        self.mem(0x37, og);
+        let o = self.laddr(L_T0, 80);
+        self.gget(G_FP);
+        self.mem(0x37, o);
+        let o2 = self.laddr(L_T0, 88);
+        self.gget(G_RA);
+        self.mem(0x37, o2);
+        let o3 = self.laddr(L_T0, 96);
+        self.gget(G_SP);
+        self.mem(0x37, o3);
+        self.i64c(0);
+        self.gset(G_RV);
+        self.gget(G_RA);
+        self.gset(G_RA_OUT);
+        self.return0();
+    }
+
+    // [SP] = buf, [SP + 8] = the value set_jmp returns again.
+    fn long_jmp(&mut self) {
+        self.gload(G_SP, 0);
+        self.lset(L_T0);
+        self.gload(G_SP, 8);
+        self.gset(G_RV);
+        let o = self.laddr(L_T0, 80);
+        self.mem(0x29, o);
+        self.gset(G_FP);
+        let o2 = self.laddr(L_T0, 88);
+        self.mem(0x29, o2);
+        self.gset(G_TARGET);
+        let o3 = self.laddr(L_T0, 96);
+        self.mem(0x29, o3);
+        self.gset(G_SP);
+        let og = self.laddr(L_T0, 72);
+        self.mem(0x29, og);
+        self.gset(G_G);
+        self.i64c(0);
+        self.gset(G_REASON);
+        self.return1();
+    }
+
+    // _navi_idle([SP] = milliseconds): back to JS until resume().
+    fn idle(&mut self) {
+        self.gload(G_SP, 0);
+        self.gset(G_WAIT);
+        self.gget(G_SP);
+        self.gset(G_IDLE_SP);
+        self.gget(G_FP);
+        self.gset(G_IDLE_FP);
+        self.gget(G_RA);
+        self.gset(G_IDLE_PC);
+        self.i64c(1);
+        self.gset(G_REASON);
+        self.return1();
+    }
+}
+
+impl Wasm {
+    // dst = the high 64 bits of the unsigned 128-bit a * b (from 32-bit
+    // halves).
+    fn mulhi(&mut self, dst: lm::Reg, a: lm::Reg, b: lm::Reg) {
+        // T0 = a_lo * b_lo, T1 = a_hi * b_lo + (T0 >> 32), T2 = a_lo * b_hi
+        // + (T1 & mask), hi = a_hi * b_hi + (T1 >> 32) + (T2 >> 32).
+        let m = 0xffffffffi64;
+        self.get(a);
+        self.i64c(m);
+        self.op(0x83);
+        self.get(b);
+        self.i64c(m);
+        self.op(0x83);
+        self.op(0x7e);
+        self.lset(L_T0);
+        self.get(a);
+        self.i64c(32);
+        self.op(0x88);
+        self.get(b);
+        self.i64c(m);
+        self.op(0x83);
+        self.op(0x7e);
+        self.lget(L_T0);
+        self.i64c(32);
+        self.op(0x88);
+        self.op(0x7c);
+        self.lset(L_T1);
+        self.get(a);
+        self.i64c(m);
+        self.op(0x83);
+        self.get(b);
+        self.i64c(32);
+        self.op(0x88);
+        self.op(0x7e);
+        self.lget(L_T1);
+        self.i64c(m);
+        self.op(0x83);
+        self.op(0x7c);
+        self.lset(L_T2);
+        self.get(a);
+        self.i64c(32);
+        self.op(0x88);
+        self.get(b);
+        self.i64c(32);
+        self.op(0x88);
+        self.op(0x7e);
+        self.lget(L_T1);
+        self.i64c(32);
+        self.op(0x88);
+        self.op(0x7c);
+        self.lget(L_T2);
+        self.i64c(32);
+        self.op(0x88);
+        self.op(0x7c);
+        self.set(dst);
+    }
+}

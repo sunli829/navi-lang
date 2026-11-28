@@ -54,8 +54,13 @@ pub struct TargetConv {
     /// How many saved registers (S0..) the register allocator may use.
     pub num_saved: usize,
     /// Stack maps give return offsets in these units (the instruction
-    /// alignment: 4 on arm64, 1 on amd64).
+    /// alignment: 4 on arm64, 1 on amd64 and wasm, whose offsets are
+    /// block numbers).
     pub code_unit: u64,
+    /// WebAssembly (docs/wasm.md): no arguments or results in registers
+    /// (each function's are its own locals), nothing kept in registers
+    /// across calls.
+    pub wasm: bool,
 }
 
 #[derive(Clone)]
@@ -552,6 +557,9 @@ pub fn generate(
         g.gen_main();
         g.gen_run_defers();
         g.gen_sched();
+        if g.tgt.wasm {
+            g.gen_idle();
+        }
     } else {
         g.gen_crate_init();
     }
@@ -762,7 +770,13 @@ impl Gen {
         for l in out.libs.iter() {
             self.o.import_from(l.0.as_str(), l.1.as_str());
         }
-        let align = if self.o.arch == "amd64" { 16 } else { 4 };
+        let align = if self.o.arch == "amd64" {
+            16
+        } else if self.o.arch == "wasm32" {
+            1
+        } else {
+            4
+        };
         let off = self.o.define(out.sym.as_str(), obj::TEXT, align, false);
         let rsym = `${out.sym}.r`.to_string();
         self.o
@@ -946,7 +960,13 @@ impl Gen {
             self.errorf(`${sym}: ${c.err}`.to_string());
             return;
         }
-        let align = if self.o.arch == "amd64" { 16 } else { 4 };
+        let align = if self.o.arch == "amd64" {
+            16
+        } else if self.o.arch == "wasm32" {
+            1
+        } else {
+            4
+        };
         let off = self.o.define(sym, obj::TEXT, align, global);
         let rsym = `${sym}.r`.to_string();
         self.o.define_at(
@@ -1005,13 +1025,31 @@ impl Gen {
         } else {
             self.o.undefined(sym.as_str());
         }
+        // (wasm: the functions the compiler calls itself are the glue's,
+        // module navi.)
+        if self.tgt.wasm {
+            self.set_lib(sym.as_str(), "wasm:navi");
+        }
         sym
+    }
+
+    fn set_lib(&mut self, sym: &str, lib: &str) {
+        if self.worker {
+            self.flibs.push((sym.to_string(), lib.to_string()));
+        } else {
+            self.o.import_from(sym, lib);
+        }
     }
 
     /// The symbol of an extern function, declared undefined with its
     /// library.
     fn extern_def_sym(&mut self, d: &Def) -> String {
         let sym = self.extern_sym(link_name(d).as_str());
+        // (wasm: an extern block without #[link(wasm_import_module)] imports
+        // from env, as Rust's.)
+        if self.tgt.wasm && d.link.len() == 0 {
+            self.set_lib(sym.as_str(), "wasm:env");
+        }
         if d.link.len() > 0 {
             if self.worker {
                 self.flibs.push((sym.clone(), d.link.clone()));
@@ -1586,7 +1624,14 @@ impl Gen {
             ret_size = s;
         }
         let frame = (ret_size + 15) & !15;
-        m.entry_prologue(frame);
+        let wasm = self.tgt.wasm;
+        // (wasm: a navi function the run loop starts, wasmlink's run()
+        // having set SP and stored argc and argv.)
+        if wasm {
+            m.prologue(frame);
+        } else {
+            m.entry_prologue(frame);
+        }
         // The G register (callee-saved in C: kept for our caller) points to
         // a blank G record until the scheduler starts.
         m.adr_sym(I1, &"_navi_saved_greg".to_string());
@@ -1597,13 +1642,15 @@ impl Gen {
         let main_loc = self.loc_at("<main>", 0, 0);
         // Keep argc and argv for std::rt::native::set_args (called after the
         // statics are initialized).
-        m.entry_args();
-        m.load(8, V1, SP, 0);
-        m.adr_sym(I1, &"_navi_argc".to_string());
-        m.store(8, V1, I1, 0);
-        m.load(8, V1, SP, 8);
-        m.adr_sym(I1, &"_navi_argv".to_string());
-        m.store(8, V1, I1, 0);
+        if !wasm {
+            m.entry_args();
+            m.load(8, V1, SP, 0);
+            m.adr_sym(I1, &"_navi_argc".to_string());
+            m.store(8, V1, I1, 0);
+            m.load(8, V1, SP, 8);
+            m.adr_sym(I1, &"_navi_argv".to_string());
+            m.store(8, V1, I1, 0);
+        }
         // The statics of crates compiled separately first (they come before
         // this one: std's runtime among them), then this one's.
         for name in self.p.ext_inits.iter() {
@@ -1653,9 +1700,13 @@ impl Gen {
         let es = self.extern_sym("exit");
         let mut a1 = Vec::new();
         a1.push(int_arg());
-        m.call_c(es.as_str(), 0, &a1, false, false, false);
+        m.call_c(es.as_str(), 0, &a1, false, false, false, 0);
         m.trap();
-        let name = `${self.tgt.c_prefix}main`.to_string();
+        let name = if wasm {
+            "_navi_entry".to_string()
+        } else {
+            `${self.tgt.c_prefix}main`.to_string()
+        };
         self.emit_func(name.as_str(), true);
     }
 
@@ -1725,15 +1776,22 @@ impl Gen {
         a3.push(int_arg());
         a3.push(int_arg());
         a3.push(int_arg());
-        m.call_c(ws.as_str(), 0, &a3, false, false, false);
+        m.call_c(ws.as_str(), 0, &a3, false, false, false, 0);
         m.mov_imm(V1, 2);
         m.store(8, V1, SP, 0);
         let es = self.extern_sym("exit");
         let mut a1 = Vec::new();
         a1.push(int_arg());
-        m.call_c(es.as_str(), 0, &a1, false, false, false);
+        m.call_c(es.as_str(), 0, &a1, false, false, false, 0);
         m.trap();
         self.emit_func("_navi_overflow", false);
+    }
+
+    /// wasm: _navi_idle, which goes back to JS (docs/wasm.md).
+    fn gen_idle(&mut self) {
+        self.m.begin();
+        self.m.idle();
+        self.emit_func("_navi_idle", false);
     }
 
     /// Writes _navi_rundefers(CTX = list head).
@@ -3180,11 +3238,12 @@ impl FnGen {
         }
         let float_ret = dt.kind == types::K_FLOAT;
         let f64_ = float_ret && dt.f64;
+        let ret = if float_ret { 0 } else { self.size(dt) };
         if via_fn {
             self.load_scalar(fn_op, BASE);
-            m.call_c("", BASE, &cargs, float_ret, f64_, sys);
+            m.call_c("", BASE, &cargs, float_ret, f64_, sys, ret);
         } else {
-            m.call_c(sym, 0, &cargs, float_ret, f64_, sys);
+            m.call_c(sym, 0, &cargs, float_ret, f64_, sys, ret);
         }
         // A result narrower than a register: C leaves the rest undefined
         // (Windows' BOOLEAN is AL alone), extended here to the full word.
@@ -3277,7 +3336,7 @@ impl FnGen {
             }
             "abort" => {
                 let s = self.g.extern_sym("abort");
-                m.call_c(s.as_str(), 0, &Vec::new(), false, false, false);
+                m.call_c(s.as_str(), 0, &Vec::new(), false, false, false, 0);
                 m.trap();
                 return false;
             }
@@ -3335,14 +3394,14 @@ impl FnGen {
                 let mut ca = Vec::new();
                 ca.push(int_arg());
                 ca.push(int_arg());
-                m.call_c("_navi_swapctx", 0, &ca, false, false, false);
+                m.call_c("_navi_swapctx", 0, &ca, false, false, false, 0);
             }
             "save_context" => {
                 self.load_scalar(&args[0], V1);
                 m.store(8, V1, SP, 0);
                 let mut ca = Vec::new();
                 ca.push(int_arg());
-                m.call_c("_navi_setjmp", 0, &ca, false, false, false);
+                m.call_c("_navi_setjmp", 0, &ca, false, false, false, 8);
             }
             "func_table" => {
                 m.adr_sym(V1, &"_navi_ftab".to_string());
@@ -3367,6 +3426,7 @@ impl FnGen {
                     false,
                     false,
                     false,
+                    8,
                 );
             }
             "resume_context" => {
@@ -3377,7 +3437,7 @@ impl FnGen {
                 let mut ca = Vec::new();
                 ca.push(int_arg());
                 ca.push(int_arg());
-                m.call_c("_navi_longjmp", 0, &ca, false, false, false);
+                m.call_c("_navi_longjmp", 0, &ca, false, false, false, 0);
                 m.trap();
                 return false;
             }
@@ -3695,6 +3755,9 @@ impl FnGen {
     /// amd64 the scratch registers no call sequence or prologue uses).
     fn arg_regs(&self) -> Vec<Reg> {
         let mut rs: Vec<Reg> = Vec::new();
+        if self.g.tgt.wasm {
+            return rs;
+        }
         if self.g.tgt.code_unit == 4 {
             let mut k = 0;
             while k < NUM_A {
@@ -4095,7 +4158,7 @@ impl FnGen {
         caller.push(RET);
         caller.push(LOC);
         let mut k = 0;
-        while k < NUM_A && self.g.tgt.code_unit == 4 {
+        while k < NUM_A && (self.g.tgt.code_unit == 4 || self.g.tgt.wasm) {
             caller.push(A1 + k as Reg);
             k += 1;
         }
@@ -4106,7 +4169,7 @@ impl FnGen {
             k += 1;
         }
         let mut fregs: Vec<u8> = Vec::new();
-        let nf = if self.g.tgt.code_unit == 4 {
+        let nf = if self.g.tgt.code_unit == 4 || self.g.tgt.wasm {
             NUM_FA_ARM64
         } else {
             NUM_FA_AMD64
@@ -4247,7 +4310,11 @@ impl FnGen {
                 pi += 1;
             }
             let rp = self.reg_params(&ts);
-            let entry_arg = if self.g.tgt.code_unit == 4 { -16 } else { -8 };
+            let entry_arg = if self.g.tgt.code_unit == 4 || self.g.tgt.wasm {
+                -16
+            } else {
+                -8
+            };
             pi = self.first_arg();
             let mut k = 0;
             while pi <= f.nargs {
@@ -4501,7 +4568,11 @@ impl FnGen {
     fn ssa_spill_args(&mut self, store: bool) {
         let m = self.m;
         let aregs = self.arg_regs();
-        let entry_arg = if self.g.tgt.code_unit == 4 { -16 } else { -8 };
+        let entry_arg = if self.g.tgt.code_unit == 4 || self.g.tgt.wasm {
+            -16
+        } else {
+            -8
+        };
         let mut l = 0;
         while l < self.ssa_pr.len() {
             if self.ssa_pr[l] >= 0 {
@@ -5327,7 +5398,7 @@ impl FnGen {
                     variadic: false,
                     size: if f64_ { 8 } else { 4 },
                 });
-                m.call_c(sym.as_str(), 0, &cargs, true, f64_, false);
+                m.call_c(sym.as_str(), 0, &cargs, true, f64_, false, 0);
                 let d = self.ssa_dst(v, F0);
                 m.fmov_to(d, V1, f64_);
                 self.ssa_out(v, d);
@@ -5515,7 +5586,7 @@ impl FnGen {
                 uses[c.id as usize] += 1;
             }
         }
-        let x64 = self.g.tgt.code_unit != 4;
+        let x64 = self.g.tgt.code_unit != 4 && !self.g.tgt.wasm;
         for b in sf.blocks.iter() {
             let mut flags = -1i64;
             for vv in b.values.iter() {
@@ -5937,6 +6008,9 @@ impl FnGen {
     /// 16 bytes as its words in memory (the last one of 1, 2, 4 or 8
     /// bytes), each a pointer or not as its words in memory are.
     pub fn reg_words(&mut self, t: &Type) -> i64 {
+        if self.g.tgt.wasm {
+            return 0;
+        }
         let size = self.size(t);
         if size == 0 {
             return 0;

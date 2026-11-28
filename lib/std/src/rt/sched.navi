@@ -16,13 +16,22 @@
 //! waitable object): a blocked G registers on the wait lists it cares
 //! about and re-checks its condition when woken.
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "js")))]
 #[nonblocking]
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
 }
+
+// js-wasm32: the runtime's C library (docs/wasm.md).
+#[cfg(target_os = "js")]
+use crate::rt::js::{
+    calloc, free, mmap, mprotect, munmap, pthread_cond_init, pthread_cond_signal,
+    pthread_cond_wait, pthread_create, pthread_detach, pthread_key_create, pthread_mutex_init,
+    pthread_mutex_lock, pthread_mutex_trylock, pthread_mutex_unlock, pthread_setspecific, realloc,
+    sched_yield, sysconf, usleep,
+};
 
 #[cfg(target_os = "windows")]
 #[nonblocking]
@@ -36,6 +45,8 @@ const MAP_FLAGS: i32 = 0x1002;
 #[cfg(target_os = "linux")]
 const MAP_FLAGS: i32 = 0x4022;
 #[cfg(target_os = "windows")]
+const MAP_FLAGS: i32 = 0;
+#[cfg(target_os = "js")]
 const MAP_FLAGS: i32 = 0;
 
 const MAIN_STACK: usize = 67108864; // 64 MiB
@@ -1619,7 +1630,7 @@ fn case_send(c: &crate::sync::mpmc::SelectCase) -> bool {
 
 // The OS's threads and locks: pthreads, or Windows' slim reader/writer
 // locks, condition variables and CreateThread.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "js")))]
 #[nonblocking]
 extern "C" {
     fn pthread_mutex_init(m: *mut u8, attr: *const u8) -> i32;
@@ -1671,6 +1682,7 @@ extern "C" {
     fn GetSystemInfo(info: *mut u8);
 }
 
+#[cfg(not(target_os = "js"))]
 #[nonblocking]
 extern "C" {
     fn calloc(n: usize, size: usize) -> *mut u8;
@@ -1681,6 +1693,8 @@ extern "C" {
 #[cfg(target_os = "macos")]
 const SC_NPROCESSORS_ONLN: i32 = 58;
 #[cfg(target_os = "linux")]
+const SC_NPROCESSORS_ONLN: i32 = 84;
+#[cfg(target_os = "js")]
 const SC_NPROCESSORS_ONLN: i32 = 84;
 
 #[cfg(not(target_os = "windows"))]
@@ -1732,6 +1746,13 @@ unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
     *ts.add(1) = (ns % 1000000000) as i64;
     pthread_cond_timedwait_relative_np(c, m, ts as *const i64);
     free(ts as *mut u8);
+}
+
+// js: back to JS for that long (a timer calls resume()).
+#[cfg(target_os = "js")]
+unsafe fn os_cond_wait_ns(c: *mut u8, m: *mut u8, ns: u64) {
+    let _ = (c, m);
+    crate::rt::js::cond_wait_ns(ns);
 }
 
 #[cfg(target_os = "linux")]
@@ -3035,7 +3056,7 @@ fn stop_current(what: usize) {
 // thread: the C frames below the scheduler's are the thread's, so where it
 // would wait for another G the thread sleeps instead (stop_callback).
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "js")))]
 #[nonblocking]
 extern "C" {
     fn pthread_key_create(key: *mut usize, dtor: usize) -> i32;
@@ -3276,7 +3297,7 @@ pub fn start_poller() {
 // another M take over (retake, as Go hands off the P of a G in a system
 // call for 20 microseconds), and find_runnable idles one when it is back.
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "js")))]
 #[nonblocking]
 extern "C" {
     fn usleep(us: u32) -> i32;
@@ -3312,10 +3333,17 @@ fn too_many(m: *mut M) -> bool {
     busy > MAX_M + crate::rt::atomic_load(&mut NRETAKEN as *mut usize) && unsafe { !(*m).idle }
 }
 
+// js-wasm32: the program runs on one thread.
+#[cfg(target_os = "js")]
+const ONE_THREAD: bool = true;
+#[cfg(not(target_os = "js"))]
+const ONE_THREAD: bool = false;
+
 /// Starts the monitor's thread (once, with the first spawned G; the
 /// runtime lock is held).
 fn start_sysmon() {
-    if SYSMON_ON {
+    // (js-wasm32: one thread, no monitor; preemption is cooperative.)
+    if SYSMON_ON || ONE_THREAD {
         return;
     }
     SYSMON_ON = true;
@@ -4227,6 +4255,9 @@ fn find_map(pc: usize) -> (usize, usize) {
 #[cfg(target_arch = "aarch64")]
 const CODE_UNIT: usize = 4;
 #[cfg(target_arch = "x86_64")]
+const CODE_UNIT: usize = 1;
+// (wasm: the offsets are block numbers.)
+#[cfg(target_arch = "wasm32")]
 const CODE_UNIT: usize = 1;
 
 // The saved-register pointer mask of the call returning to offset ret in

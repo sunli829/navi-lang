@@ -17,6 +17,8 @@ fn target_by_id(i: i64) -> &str {
         2 => "linux-x64",
         3 => "linux-arm64",
         4 => "windows-x64",
+        // WebAssembly in browsers (docs/wasm.md).
+        5 => "js-wasm32",
         _ => "",
     }
 }
@@ -92,25 +94,36 @@ pub fn known_targets() -> String {
     out.join(", ")
 }
 
-/// The target's OS: macos, linux or windows.
+/// The target's OS: macos, linux, windows or js.
 pub fn target_os() -> String {
     let t = target_name();
     t[0..t.find('-').unwrap()].to_string()
 }
 
-/// The target's architecture as objects name it: arm64 or amd64.
+/// The target's architecture as objects name it: arm64, amd64 or wasm32.
 pub fn target_arch() -> String {
-    if target_name().ends_with("-arm64") {
+    let t = target_name();
+    if t.ends_with("-arm64") {
         "arm64".to_string()
+    } else if t.ends_with("-wasm32") {
+        "wasm32".to_string()
     } else {
         "amd64".to_string()
     }
 }
 
+/// Whether the target is WebAssembly.
+pub fn target_wasm() -> bool {
+    target_arch() == "wasm32"
+}
+
 /// The #[cfg] settings for the target.
 pub fn host_config() -> Config {
-    let arch = if target_arch() == "arm64" {
+    let a = target_arch();
+    let arch = if a == "arm64" {
         "aarch64"
+    } else if a == "wasm32" {
+        "wasm32"
     } else {
         "x86_64"
     };
@@ -671,6 +684,7 @@ fn backend(
 ) -> Result<&mut crate::obj::Object, String> {
     let os = target_os();
     let arm = target_arch() == "arm64";
+    let wasm = target_wasm();
     let tgt = crate::backend::lower::TargetConv {
         c_prefix: if os == "macos" {
             "_".to_string()
@@ -683,9 +697,26 @@ fn backend(
             "write".to_string()
         },
         os: os.clone(),
-        num_saved: if arm { 9 } else { 2 },
+        num_saved: if arm {
+            9
+        } else if wasm {
+            0
+        } else {
+            2
+        },
         code_unit: if arm { 4 } else { 1 },
+        wasm,
     };
+    if wasm {
+        // (No DWARF in modules.)
+        return crate::backend::lower::generate(
+            plan,
+            "wasm32",
+            || -> &mut dyn crate::backend::machine::Machine { crate::backend::wasm::new_machine() },
+            tgt,
+            false,
+        );
+    }
     if arm {
         // -d llsc tests linux-arm64's atomics on macOS.
         if os == "macos" && !crate::dflags::on("llsc") {
@@ -935,6 +966,12 @@ pub fn object(
     entry: &Entry,
     dwarf: bool,
 ) -> Result<Vec<u8>, String> {
+    if target_wasm() {
+        return Err(
+            "navi: js-wasm32 builds modules only (no object files): navi build --target js-wasm32"
+                .to_string(),
+        );
+    }
     let o = code(info, entry, dwarf)?;
     let os = target_os();
     if os == "macos" {
@@ -957,6 +994,15 @@ pub fn native(
 ) -> Result<(), String> {
     let use_cc = LINKER_CC;
     let os = target_os();
+    if target_wasm() {
+        let o = code(info, entry, false)?;
+        let module = crate::wasmlink::link(o)?;
+        if let Err(e) = write_new(out, module.as_slice()) {
+            return Err(`${e}`.to_string());
+        }
+        phase("link");
+        return Ok(());
+    }
     if !use_cc {
         let o = code(info, entry, dwarf)?;
         let exe = if os == "macos" {

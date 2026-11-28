@@ -23,12 +23,15 @@
 //! Span metadata, mark bits and the mark stack live outside the arena
 //! (libc calloc), so the collector itself never allocates GC memory.
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "js")))]
 #[nonblocking]
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
 }
+
+#[cfg(target_os = "js")]
+use crate::rt::js::{calloc, free, memset, mmap, munmap, realloc, sysconf};
 
 #[cfg(target_os = "linux")]
 #[nonblocking]
@@ -36,7 +39,7 @@ extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "js")))]
 #[nonblocking]
 extern "C" {
     fn sysconf(name: i32) -> i64;
@@ -49,6 +52,7 @@ extern "C" {
     fn VirtualFree(addr: *mut u8, size: usize, kind: u32) -> i32;
 }
 
+#[cfg(not(target_os = "js"))]
 #[nonblocking]
 extern "C" {
     fn memset(p: *mut u8, c: i32, n: usize) -> *mut u8;
@@ -63,6 +67,8 @@ const MAP_FLAGS: i32 = 0x1002; // MAP_ANON | MAP_PRIVATE
 const MAP_FLAGS: i32 = 0x4022; // MAP_NORESERVE | MAP_ANONYMOUS | MAP_PRIVATE
 #[cfg(target_os = "windows")]
 const MAP_FLAGS: i32 = 0;
+#[cfg(target_os = "js")]
+const MAP_FLAGS: i32 = 0;
 
 const PROT_RW: i32 = 3;
 const PAGE_SHIFT: usize = 13;
@@ -72,11 +78,28 @@ const SPAN_BYTES: usize = 65536;
 // gives the address space, found through the arena index: its entry
 // p >> ARENA_SHIFT is the span table of the arena holding p (a span or 0
 // per page) or 0. INDEX_LEN entries cover a 48-bit address space.
+#[cfg(not(target_os = "js"))]
 const ARENA_SHIFT: usize = 26;
+#[cfg(not(target_os = "js"))]
 const ARENA_BYTES: usize = 67108864;
+#[cfg(not(target_os = "js"))]
 const ARENA_PAGES: usize = 8192;
+#[cfg(not(target_os = "js"))]
 const INDEX_LEN: usize = 4194304;
+#[cfg(not(target_os = "js"))]
 const MIN_GC: usize = 33554432; // 32 MiB
+// js-wasm32: 4 MiB arenas (as Go's on wasm; the backend's scan_heap knows
+// it: crate::backend::wasm::ARENA_SHIFT) in 4 GiB of memory.
+#[cfg(target_os = "js")]
+const ARENA_SHIFT: usize = 22;
+#[cfg(target_os = "js")]
+const ARENA_BYTES: usize = 4194304;
+#[cfg(target_os = "js")]
+const ARENA_PAGES: usize = 512;
+#[cfg(target_os = "js")]
+const INDEX_LEN: usize = 1024;
+#[cfg(target_os = "js")]
+const MIN_GC: usize = 8388608; // 8 MiB
 const NCLASS: usize = 32;
 const MAX_SMALL: usize = 8192;
 
@@ -217,7 +240,7 @@ fn commit(p: usize, size: usize) {}
 
 // Reserves size bytes of address space at p, or nothing (false: something is
 // there; the address is a hint, as Go's sysReserve takes it).
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "js")))]
 fn reserve_at(p: usize, size: usize) -> bool {
     let q = unsafe { mmap(p as *mut u8, size, PROT_RW, MAP_FLAGS, -1, 0) } as usize;
     if q == p {
@@ -228,6 +251,13 @@ fn reserve_at(p: usize, size: usize) -> bool {
             munmap(q as *mut u8, size);
         }
     }
+    false
+}
+
+// (js: the memory grows from its end only.)
+#[cfg(target_os = "js")]
+fn reserve_at(p: usize, size: usize) -> bool {
+    let _ = (p, size);
     false
 }
 
@@ -284,6 +314,11 @@ fn os_page() -> usize {
     4096
 }
 
+#[cfg(target_os = "js")]
+fn os_page() -> usize {
+    8192
+}
+
 // The whole system pages inside [p, p + size): [lo, hi) (empty at the
 // end if there is none).
 fn inner_pages(p: usize, size: usize) -> (usize, usize) {
@@ -316,6 +351,14 @@ fn release_os_pages(p: usize, size: usize) {
     let q = unsafe { mmap(p as *mut u8, size, PROT_RW, MAP_FLAGS | 0x10, -1, 0) } as usize; // MAP_FIXED
     if q != p {
         out_of_memory();
+    }
+}
+
+// js: memory cannot be given back; reused pages must read as zero.
+#[cfg(target_os = "js")]
+fn release_os_pages(p: usize, size: usize) {
+    unsafe {
+        memset(p as *mut u8, 0, size);
     }
 }
 

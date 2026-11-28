@@ -1,0 +1,597 @@
+//! The linker for js-wasm32 (docs/wasm.md): turns the object model into a
+//! WebAssembly module.
+//!
+//! - TEXT holds the functions' code entries (crate::backend::wasm: a size, then
+//!   the body), one per function symbol; each is a function of the module,
+//!   numbered after the imports in text order. A symbol inside one (a .r entry)
+//!   is a block of it: its offset from the function's.
+//! - Code addresses are PCs: function index << 16 | block. Data is laid out
+//!   from 4096 up (read-only data, then the rest), then the scheduler's own
+//!   stack; the heap grows the memory past it.
+//! - The undefined symbols calls name (name#signature) are imports, from the
+//!   module their #[link(wasm_import_module)] gives ("env" else; the compiler's
+//!   own: "navi", the glue JS's).
+//! - The stack map table (_navi_ftab) gets PCs for the text offsets.
+//! - Exports: memory, run(argc, argv) and resume(), both the run loop: it calls
+//!   the function G_TARGET names until a frame returns 0 (then on at G_RA_OUT)
+//!   or the stack unwinds to go idle (then back to JS with the milliseconds to
+//!   wait: -1 until an event).
+
+use std::collections::HashMap;
+
+use crate::{
+    backend::wasm::{self as w, get_sleb_n, put_sleb_n, put_uleb_n, sleb, uleb},
+    obj::{self, Object},
+};
+
+/// Where data starts (below: 0 stays unused, so a null pointer read is
+/// noticed less late).
+const DATA_BASE: u64 = 4096;
+/// The stack of the scheduler's record (the OS thread's on other targets).
+const G0_STACK: u64 = 1 << 20;
+
+// A defined function: its symbol, where its entry is in TEXT and its body.
+struct Fun {
+    name: String,
+    off: u64,
+    end: u64,
+}
+
+fn section(out: &mut Vec<u8>, id: u8, body: &Vec<u8>) {
+    out.push(id);
+    uleb(out, body.len() as u64);
+    out.extend_from_slice(body.as_slice());
+}
+
+fn name(out: &mut Vec<u8>, s: &str) {
+    uleb(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+// The value type of a signature letter.
+fn vt(c: char) -> u8 {
+    match c {
+        'i' => 0x7f,
+        'I' => 0x7e,
+        'f' => 0x7d,
+        _ => 0x7c,
+    }
+}
+
+fn functype(out: &mut Vec<u8>, sig: &str) {
+    let (ps, rs) = match sig.split_once(':') {
+        Some(p) => p,
+        None => (sig, ""),
+    };
+    out.push(0x60);
+    uleb(out, ps.len() as u64);
+    for c in ps.chars() {
+        out.push(vt(c));
+    }
+    uleb(out, rs.len() as u64);
+    for c in rs.chars() {
+        out.push(vt(c));
+    }
+}
+
+fn set64(b: &mut Vec<u8>, at: usize, v: u64) {
+    let mut i = 0;
+    while i < 8 {
+        b[at + i] = (v >> (8 * i) as u32) as u8;
+        i += 1;
+    }
+}
+
+fn get64(b: &Vec<u8>, at: usize) -> u64 {
+    let mut v = 0u64;
+    let mut i = 0;
+    while i < 8 {
+        v = v | (b[at + i] as u64) << (8 * i) as u32;
+        i += 1;
+    }
+    v
+}
+
+fn set32(b: &mut Vec<u8>, at: usize, v: u32) {
+    let mut i = 0;
+    while i < 4 {
+        b[at + i] = (v >> (8 * i) as u32) as u8;
+        i += 1;
+    }
+}
+
+fn get32(b: &Vec<u8>, at: usize) -> u32 {
+    let mut v = 0u32;
+    let mut i = 0;
+    while i < 4 {
+        v = v | (b[at + i] as u32) << (8 * i) as u32;
+        i += 1;
+    }
+    v
+}
+
+fn align_up(v: u64, a: u64) -> u64 {
+    (v + a - 1) / a * a
+}
+
+// The value of the uleb at b[at..] and its length.
+fn read_uleb(b: &Vec<u8>, at: usize) -> (u64, usize) {
+    let mut v = 0u64;
+    let mut i = 0;
+    loop {
+        let x = b[at + i];
+        v = v | ((x & 0x7f) as u64) << (7 * i) as u32;
+        i += 1;
+        if x & 0x80 == 0 {
+            return (v, i);
+        }
+    }
+}
+
+/// Links o into a module.
+pub fn link(o: &Object) -> Result<Vec<u8>, String> {
+    let text = o.sects[obj::TEXT].clone();
+    // The functions, in text order.
+    let mut by_off: Vec<(u64, u32)> = Vec::new();
+    for sy in o.syms.iter() {
+        if sy.sec != obj::TEXT
+            || sy.name.ends_with(".r")
+            || sy.name.ends_with(".c")
+            || sy.name == "_navi_text0"
+        {
+            continue;
+        }
+        by_off.push((sy.off, sy.id));
+    }
+    by_off.sort();
+    let mut funs: Vec<&mut Fun> = Vec::new();
+    let mut fun_at: HashMap<u64, usize> = HashMap::new();
+    for (off, id) in by_off.iter() {
+        if fun_at.contains_key(off) || *off as usize >= text.len() {
+            continue;
+        }
+        let (size, n) = read_uleb(&text, *off as usize);
+        fun_at.insert(*off, funs.len());
+        funs.push(&mut Fun {
+            name: o.names[*id as usize].clone(),
+            off: *off,
+            end: *off + n as u64 + size,
+        });
+    }
+    if funs.len() >= 0xffff {
+        return Err("wasmlink: more than 65535 functions".to_string());
+    }
+    // The function a text offset is in (binary search).
+    let fun_of = |off: u64| -> i64 {
+        let mut lo = 0;
+        let mut hi = funs.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if funs[mid].off <= off {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return -1;
+        }
+        let f = funs[lo - 1];
+        if off < f.end || off == f.off {
+            (lo - 1) as i64
+        } else {
+            -1
+        }
+    };
+    // Imports: the undefined names calls use (name#signature), in order.
+    let mut imports: Vec<String> = Vec::new();
+    let mut import_ix: HashMap<String, usize> = HashMap::new();
+    for r in o.relocs.iter() {
+        if r.kind == obj::WASM_IMPORT {
+            let n = o.names[r.sym as usize].clone();
+            if !import_ix.contains_key(&n) {
+                import_ix.insert(n.clone(), imports.len());
+                imports.push(n);
+            }
+        }
+    }
+    let nimp = imports.len() as u64;
+    // Data: read-only, then constant, then writable; then the scheduler's
+    // stack.
+    let mut sect_base: Vec<u64> = Vec::new();
+    let mut at = DATA_BASE;
+    let mut s = 0;
+    while s < obj::NUM_SECTIONS {
+        if s == obj::TEXT {
+            sect_base.push(0);
+        } else {
+            at = align_up(at, 16);
+            sect_base.push(at);
+            at += o.sects[s].len() as u64;
+        }
+        s += 1;
+    }
+    let data_end = align_up(at, 16);
+    let g0_top = data_end + G0_STACK;
+    let mem_end = align_up(g0_top, 65536);
+    // Each symbol's value: an address, or a PC.
+    let mut value: Vec<i64> = Vec::new();
+    let mut known: Vec<bool> = Vec::new();
+    let mut k = 0;
+    while k < o.names.len() {
+        value.push(0);
+        known.push(false);
+        k += 1;
+    }
+    for sy in o.syms.iter() {
+        let v = if sy.sec == obj::TEXT {
+            if sy.name == "_navi_text0" {
+                0
+            } else {
+                let fi = fun_of(sy.off);
+                if fi < 0 {
+                    return Err(`wasmlink: ${sy.name} is in no function`.to_string());
+                }
+                let f = funs[fi as usize];
+                ((nimp as i64 + fi) << 16) | (sy.off - f.off) as i64
+            }
+        } else {
+            (sect_base[sy.sec] + sy.off) as i64
+        };
+        value[sy.id as usize] = v;
+        known[sy.id as usize] = true;
+    }
+    let mut sects: Vec<Vec<u8>> = Vec::new();
+    s = 0;
+    while s < obj::NUM_SECTIONS {
+        sects.push(o.sects[s].clone());
+        s += 1;
+    }
+    let mut code = text;
+    for r in o.relocs.iter() {
+        let sname = o.names[r.sym as usize].clone();
+        let at = r.off as usize;
+        if r.kind == obj::DYN_USE || r.kind == obj::DYN_SLOT {
+            continue;
+        }
+        if r.kind == obj::WASM_IMPORT {
+            put_uleb_n(&mut code, at, import_ix[&sname] as u64, 5);
+            continue;
+        }
+        if r.kind == obj::WASM_SELFPC {
+            let fi = fun_of(at as u64);
+            if fi < 0 {
+                return Err("wasmlink: a relocation in no function".to_string());
+            }
+            let add = get_sleb_n(code.as_slice(), at, 10);
+            put_sleb_n(&mut code, at, ((nimp as i64 + fi) << 16) + add, 10);
+            continue;
+        }
+        let v = if sname == "_navi_text0" {
+            0
+        } else if known[r.sym as usize] {
+            value[r.sym as usize]
+        } else {
+            return Err(`wasmlink: undefined: ${sname}`.to_string());
+        };
+        if r.kind == obj::WASM_CALL {
+            put_sleb_n(&mut code, at, v & 0xffff, 5);
+            put_uleb_n(&mut code, at + 6, (v >> 16) as u64, 5);
+        } else if r.kind == obj::WASM_ADDR {
+            let add = get_sleb_n(code.as_slice(), at, 10);
+            put_sleb_n(&mut code, at, v + add, 10);
+        } else if r.kind == obj::ABS64 && r.sec != obj::TEXT {
+            let mut b = sects[r.sec];
+            set64(&mut b, at, v as u64);
+        } else {
+            return Err(`wasmlink: unsupported relocation ${r.kind} against ${sname}`.to_string());
+        }
+    }
+    // The stack map table: PCs for text offsets.
+    if let Some(id) = o.ids.get(&"_navi_ftab".to_string()) {
+        let mut ftab_off = 0u64;
+        for sy in o.syms.iter() {
+            if sy.id == *id {
+                ftab_off = sy.off;
+            }
+        }
+        let mut dc = sects[obj::DATA_CONST];
+        let t = ftab_off as usize;
+        let n = get64(&dc, t) as usize;
+        set64(&mut dc, t + 8, 0);
+        let mut i = 0;
+        while i < n {
+            let e = t + 24 + 12 * i;
+            let fo = get32(&dc, e) as u64;
+            let fi = fun_of(fo);
+            if fi < 0 {
+                return Err("wasmlink: a stack map of no function".to_string());
+            }
+            set32(&mut dc, e, ((nimp as u32) + fi as u32) << 16);
+            set32(&mut dc, e + 4, 0x10000);
+            i += 1;
+        }
+    }
+    // Types: 0 navi functions, 1 run, 2 resume, then the imports'.
+    let mut types: Vec<String> = Vec::new();
+    types.push("i:i".to_string());
+    types.push("ii:i".to_string());
+    types.push(":i".to_string());
+    let mut type_ix: HashMap<String, usize> = HashMap::new();
+    let mut ti = 0;
+    while ti < types.len() {
+        type_ix.insert(types[ti].clone(), ti);
+        ti += 1;
+    }
+    let mut imp_type: Vec<usize> = Vec::new();
+    for n in imports.iter() {
+        let sig = match n.split_once('#') {
+            Some((_, g)) => g.to_string(),
+            None => ":".to_string(),
+        };
+        if !type_ix.contains_key(&sig) {
+            type_ix.insert(sig.clone(), types.len());
+            types.push(sig.clone());
+        }
+        imp_type.push(type_ix[&sig]);
+    }
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0]);
+    // Type section.
+    let mut b: Vec<u8> = Vec::new();
+    uleb(&mut b, types.len() as u64);
+    for t in types.iter() {
+        functype(&mut b, t.as_str());
+    }
+    section(&mut out, 1, &b);
+    // Import section.
+    b = Vec::new();
+    uleb(&mut b, imports.len() as u64);
+    let mut ii = 0;
+    while ii < imports.len() {
+        let full = imports[ii].clone();
+        let base = match full.split_once('#') {
+            Some((a, _)) => a.to_string(),
+            None => full.clone(),
+        };
+        let module = match o.libs.get(&base) {
+            Some(l) => match l.strip_prefix("wasm:") {
+                Some(m) => m.to_string(),
+                None => "env".to_string(),
+            },
+            None => "env".to_string(),
+        };
+        name(&mut b, module.as_str());
+        name(&mut b, base.as_str());
+        b.push(0x00);
+        uleb(&mut b, imp_type[ii] as u64);
+        ii += 1;
+    }
+    section(&mut out, 2, &b);
+    // Function section: the functions, then run and resume.
+    let nfun = funs.len() as u64;
+    b = Vec::new();
+    uleb(&mut b, nfun + 2);
+    k = 0;
+    while k < funs.len() {
+        uleb(&mut b, 0);
+        k += 1;
+    }
+    uleb(&mut b, 1);
+    uleb(&mut b, 2);
+    section(&mut out, 3, &b);
+    // Table: every function by its index.
+    let ntab = nimp + nfun;
+    b = Vec::new();
+    uleb(&mut b, 1);
+    b.push(0x70);
+    b.push(0x00);
+    uleb(&mut b, ntab);
+    section(&mut out, 4, &b);
+    // Memory.
+    b = Vec::new();
+    uleb(&mut b, 1);
+    b.push(0x00);
+    uleb(&mut b, mem_end / 65536);
+    section(&mut out, 5, &b);
+    // Globals: all mutable i64, 0.
+    b = Vec::new();
+    uleb(&mut b, w::NUM_GLOBALS as u64);
+    let mut gi = 0;
+    while gi < w::NUM_GLOBALS {
+        b.push(0x7e);
+        b.push(0x01);
+        b.push(0x42);
+        b.push(0x00);
+        b.push(0x0b);
+        gi += 1;
+    }
+    section(&mut out, 6, &b);
+    // Exports.
+    b = Vec::new();
+    uleb(&mut b, 3);
+    name(&mut b, "memory");
+    b.push(0x02);
+    uleb(&mut b, 0);
+    name(&mut b, "run");
+    b.push(0x00);
+    uleb(&mut b, nimp + nfun);
+    name(&mut b, "resume");
+    b.push(0x00);
+    uleb(&mut b, nimp + nfun + 1);
+    section(&mut out, 7, &b);
+    // Elements: table[i] = function i (the defined ones).
+    b = Vec::new();
+    uleb(&mut b, 1);
+    b.push(0x00);
+    b.push(0x41);
+    sleb(&mut b, nimp as i64);
+    b.push(0x0b);
+    uleb(&mut b, nfun);
+    k = 0;
+    while k < funs.len() {
+        uleb(&mut b, nimp + k as u64);
+        k += 1;
+    }
+    section(&mut out, 9, &b);
+    // Code: the functions' entries, then run's and resume's.
+    let entry = match o.ids.get(&"_navi_entry".to_string()) {
+        Some(id) => value[*id as usize],
+        None => return Err("wasmlink: no _navi_entry".to_string()),
+    };
+    let argc = match o.ids.get(&"_navi_argc".to_string()) {
+        Some(id) => value[*id as usize],
+        None => 0,
+    };
+    let argv = match o.ids.get(&"_navi_argv".to_string()) {
+        Some(id) => value[*id as usize],
+        None => 0,
+    };
+    b = Vec::new();
+    uleb(&mut b, nfun + 2);
+    for f in funs.iter() {
+        b.extend_from_slice(&code[f.off as usize..f.end as usize]);
+    }
+    let run = run_body(true, entry, argc, argv, g0_top as i64);
+    uleb(&mut b, run.len() as u64);
+    b.extend_from_slice(run.as_slice());
+    let res = run_body(false, 0, 0, 0, 0);
+    uleb(&mut b, res.len() as u64);
+    b.extend_from_slice(res.as_slice());
+    section(&mut out, 10, &b);
+    // Data: the sections from 4096.
+    b = Vec::new();
+    let mut nseg = 0;
+    s = 0;
+    while s < obj::NUM_SECTIONS {
+        if s != obj::TEXT && sects[s].len() > 0 {
+            nseg += 1;
+        }
+        s += 1;
+    }
+    uleb(&mut b, nseg);
+    s = 0;
+    while s < obj::NUM_SECTIONS {
+        if s != obj::TEXT && sects[s].len() > 0 {
+            b.push(0x00);
+            b.push(0x41);
+            sleb(&mut b, sect_base[s] as i64);
+            b.push(0x0b);
+            uleb(&mut b, sects[s].len() as u64);
+            b.extend_from_slice(sects[s].as_slice());
+        }
+        s += 1;
+    }
+    section(&mut out, 11, &b);
+    // Names: the functions' (for the browsers' stack traces).
+    b = Vec::new();
+    name(&mut b, "name");
+    let mut fnames: Vec<u8> = Vec::new();
+    uleb(&mut fnames, nfun + 2);
+    k = 0;
+    while k < funs.len() {
+        uleb(&mut fnames, nimp + k as u64);
+        name(&mut fnames, funs[k].name.as_str());
+        k += 1;
+    }
+    uleb(&mut fnames, nimp + nfun);
+    name(&mut fnames, "run");
+    uleb(&mut fnames, nimp + nfun + 1);
+    name(&mut fnames, "resume");
+    b.push(1);
+    uleb(&mut b, fnames.len() as u64);
+    b.extend_from_slice(fnames.as_slice());
+    section(&mut out, 0, &b);
+    Ok(out)
+}
+
+// The code entry of run (else resume): the start, then the run loop.
+fn run_body(run: bool, entry: i64, argc: i64, argv: i64, top: i64) -> Vec<u8> {
+    let mut c: Vec<u8> = Vec::new();
+    uleb(&mut c, 0); // no locals
+    let gset = |c: &mut Vec<u8>, g: u32| {
+        c.push(0x24);
+        uleb(c, g as u64);
+    };
+    let gget = |c: &mut Vec<u8>, g: u32| {
+        c.push(0x23);
+        uleb(c, g as u64);
+    };
+    let i64c = |c: &mut Vec<u8>, v: i64| {
+        c.push(0x42);
+        sleb(c, v);
+    };
+    if run {
+        // [argc] = argc, [argv] = argv (i64 words).
+        c.push(0x41);
+        sleb(&mut c, argc);
+        c.push(0x20);
+        c.push(0);
+        c.push(0xad);
+        c.push(0x37);
+        c.push(3);
+        c.push(0);
+        c.push(0x41);
+        sleb(&mut c, argv);
+        c.push(0x20);
+        c.push(1);
+        c.push(0xad);
+        c.push(0x37);
+        c.push(3);
+        c.push(0);
+        i64c(&mut c, top);
+        gset(&mut c, w::G_SP);
+        i64c(&mut c, 0);
+        gset(&mut c, w::G_FP);
+        i64c(&mut c, entry);
+        gset(&mut c, w::G_TARGET);
+    } else {
+        gget(&mut c, w::G_IDLE_SP);
+        gset(&mut c, w::G_SP);
+        gget(&mut c, w::G_IDLE_FP);
+        gset(&mut c, w::G_FP);
+        gget(&mut c, w::G_IDLE_PC);
+        gset(&mut c, w::G_TARGET);
+    }
+    i64c(&mut c, 0);
+    gset(&mut c, w::G_REASON);
+    // loop: status = target's function (its block); 0: on at G_RA_OUT; 1
+    // and idle: return the wait; 1: on at G_TARGET.
+    c.push(0x03);
+    c.push(0x40);
+    gget(&mut c, w::G_TARGET);
+    i64c(&mut c, 0xffff);
+    c.push(0x83);
+    c.push(0xa7);
+    gget(&mut c, w::G_TARGET);
+    i64c(&mut c, 16);
+    c.push(0x88);
+    c.push(0xa7);
+    c.push(0x11);
+    uleb(&mut c, 0);
+    uleb(&mut c, 0);
+    c.push(0x04);
+    c.push(0x40);
+    gget(&mut c, w::G_REASON);
+    c.push(0x50);
+    c.push(0x0d); // br_if 1: a switch, on at G_TARGET
+    uleb(&mut c, 1);
+    i64c(&mut c, 0);
+    gset(&mut c, w::G_REASON);
+    gget(&mut c, w::G_WAIT);
+    c.push(0xa7);
+    c.push(0x0f);
+    c.push(0x05);
+    gget(&mut c, w::G_RA_OUT);
+    gset(&mut c, w::G_TARGET);
+    c.push(0x0b);
+    // (The engine's stack is empty again.)
+    i64c(&mut c, 0);
+    gset(&mut c, w::G_DEPTH);
+    c.push(0x0c);
+    uleb(&mut c, 0);
+    c.push(0x0b);
+    c.push(0x00);
+    c.push(0x0b);
+    c
+}
