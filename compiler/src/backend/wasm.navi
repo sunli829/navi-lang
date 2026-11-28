@@ -74,7 +74,12 @@ const L_T0: u32 = L_FA + 3;
 const L_T1: u32 = L_FA + 4;
 const L_T2: u32 = L_FA + 5;
 const L_T3: u32 = L_FA + 6;
-const NUM_LOCALS: u32 = L_FA + 7;
+// SP, FP and the G as of this activation (the globals change only in its
+// calls: read again after each, and on each entry).
+const L_SP: u32 = L_FA + 7;
+const L_FP: u32 = L_FA + 8;
+const L_G: u32 = L_FA + 9;
+const NUM_LOCALS: u32 = L_FA + 10;
 
 // Value types.
 const I32: u8 = 0x7f;
@@ -84,6 +89,9 @@ const I64: u8 = 0x7e;
 // a branch depth to the loop (padded, plus the ifs around it).
 const FIX_BLOCK: u8 = 0;
 const FIX_LOOP: u8 = 1;
+// A jump's branch depth: to the end of the target's block when it comes
+// later (its code follows that end), else to the loop (label << 8 | ifs).
+const FIX_JUMP: u8 = 2;
 
 /// A block's code: relocations and fixups at offsets into it.
 struct Blk {
@@ -249,14 +257,48 @@ impl Wasm {
         self.u(l as u64);
     }
 
+    // The local caching global g (SP, FP, G), or none.
+    fn cached(g: u32) -> i64 {
+        if g == G_SP {
+            L_SP as i64
+        } else if g == G_FP {
+            L_FP as i64
+        } else if g == G_G {
+            L_G as i64
+        } else {
+            -1
+        }
+    }
+
     fn gget(&mut self, g: u32) {
+        let l = Wasm::cached(g);
+        if l >= 0 {
+            self.lget(l as u32);
+            return;
+        }
         self.op(0x23);
         self.u(g as u64);
     }
 
     fn gset(&mut self, g: u32) {
+        let l = Wasm::cached(g);
+        if l >= 0 {
+            self.op(0x22); // local.tee
+            self.u(l as u64);
+        }
         self.op(0x24);
         self.u(g as u64);
+    }
+
+    // The cached globals read again (after a call: it may have moved the
+    // stack, or switched).
+    fn reload(&mut self) {
+        let gs = [G_SP, G_FP, G_G];
+        for g in gs.iter() {
+            self.op(0x23);
+            self.u(*g as u64);
+            self.lset(Wasm::cached(*g) as u32);
+        }
     }
 
     // Pushes register x.
@@ -417,13 +459,14 @@ impl Wasm {
         b.code[at + 4] = 0;
     }
 
-    // Branches to label l (extra: the ifs around the branch).
+    // Branches to label l (extra: the ifs around the branch): forward to
+    // its block's code directly, else through the loop's dispatch.
     fn jump_to(&mut self, l: LLabel, extra: u64) {
         self.op(0x41); // i32.const block
         self.fix(FIX_BLOCK, l as u64);
         self.lset(L_PCB);
-        self.op(0x0c); // br to the loop
-        self.fix(FIX_LOOP, extra);
+        self.op(0x0c);
+        self.fix(FIX_JUMP, (l as u64) << 8 | extra);
     }
 
     // If the i32 on the stack is not 0, to l.
@@ -490,6 +533,7 @@ impl Wasm {
         let next = self.blks.len() as u64;
         self.calls.push(next << 32 | (self.tag + 1) as u64);
         self.new_block();
+        self.reload();
     }
 
     // Calls sym (a navi function, or a block of one: a .r entry).
@@ -774,6 +818,25 @@ impl Machine for Wasm {
                         };
                     }
                     put_sleb_n(&mut b.code, at, blk, 5);
+                } else if kind == FIX_JUMP {
+                    let blk = self.labels[(v >> 8) as usize];
+                    let extra = v & 255;
+                    if blk < 0 {
+                        return Code {
+                            code: Vec::new(),
+                            relocs: Vec::new(),
+                            calls: Vec::new(),
+                            err: "wasm: a label is not bound".to_string(),
+                            frame: -1,
+                        };
+                    }
+                    let j = blk as usize;
+                    let depth = if j > i {
+                        (j - i - 1) as u64
+                    } else {
+                        (k - 1 - i) as u64
+                    };
+                    put_uleb_n(&mut b.code, at, depth + extra, 5);
                 } else {
                     put_uleb_n(&mut b.code, at, (k - 1 - i) as u64 + v, 5);
                 }
@@ -799,12 +862,19 @@ impl Machine for Wasm {
             uleb(&mut body, *n as u64);
             body.push(*t);
         }
-        // local.get 0; local.set 1; loop; block * k; local.get 1;
-        // br_table 0 .. k-1.
+        // local.get 0; local.set 1; the cached globals; loop; block * k;
+        // local.get 1; br_table 0 .. k-1.
         body.push(0x20);
         body.push(0);
         body.push(0x21);
         body.push(1);
+        let gs = [G_SP, G_FP, G_G];
+        for g in gs.iter() {
+            body.push(0x23);
+            uleb(&mut body, *g as u64);
+            body.push(0x21);
+            uleb(&mut body, Wasm::cached(*g) as u64);
+        }
         body.push(0x03);
         body.push(0x40);
         i = 0;
@@ -1082,8 +1152,28 @@ impl Machine for Wasm {
                 self.op(0x54);
             }
         } else {
+            // Both 32-bit (signed: in [-2^31, 2^31)): no overflow; else
             // a != 0 && r / a != b (signed: a == -1 overflows only for MIN,
             // whose division by -1 would trap).
+            let bias = if signed { 0x80000000i64 } else { 0 };
+            self.get(a);
+            if signed {
+                self.i64c(bias);
+                self.op(0x7c);
+            }
+            self.get(b);
+            if signed {
+                self.i64c(bias);
+                self.op(0x7c);
+            }
+            self.op(0x84);
+            self.i64c(32);
+            self.op(0x88);
+            self.op(0x50);
+            self.op(0x04);
+            self.op(I32);
+            self.i32c(0);
+            self.op(0x05);
             self.get(a);
             self.op(0x50);
             self.op(0x04);
@@ -1114,6 +1204,7 @@ impl Machine for Wasm {
                 self.op(0x52);
             }
             self.op(0x0b);
+            self.op(0x0b); // (the 32-bit test's)
         }
         self.op(0x04);
         self.op(0x40);
@@ -1480,6 +1571,9 @@ impl Machine for Wasm {
             c[j] = 0x80;
             j += 1;
         }
+        // (JS may have called navi back on this G: its stack may have
+        // moved.)
+        self.reload();
         if float_ret {
             if f64 {
                 self.op(0xbd);
@@ -1863,6 +1957,31 @@ impl Machine for Wasm {
         self.i64c(0);
         self.gset(G_REASON);
         self.return1();
+    }
+
+    fn memory_copy(&mut self, dst: lm::Reg, src: lm::Reg, n: lm::Reg) {
+        self.get(dst);
+        self.op(0xa7);
+        self.get(src);
+        self.op(0xa7);
+        self.get(n);
+        self.op(0xa7);
+        self.op(0xfc);
+        self.u(10);
+        self.op(0);
+        self.op(0);
+    }
+
+    fn memory_fill(&mut self, dst: lm::Reg, val: lm::Reg, n: lm::Reg) {
+        self.get(dst);
+        self.op(0xa7);
+        self.get(val);
+        self.op(0xa7);
+        self.get(n);
+        self.op(0xa7);
+        self.op(0xfc);
+        self.u(11);
+        self.op(0);
     }
 
     // _navi_idle([SP] = milliseconds): back to JS until resume().
