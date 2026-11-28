@@ -79,8 +79,6 @@ const NUM_LOCALS: u32 = L_FA + 7;
 // Value types.
 const I32: u8 = 0x7f;
 const I64: u8 = 0x7e;
-const F32: u8 = 0x7d;
-const F64: u8 = 0x7c;
 
 // Fixups in a block: the block number of a label (a padded i32.const), or
 // a branch depth to the loop (padded, plus the ifs around it).
@@ -205,20 +203,10 @@ fn global_of(x: lm::Reg) -> i64 {
     }
 }
 
-fn is_float(x: lm::Reg) -> bool {
-    x == lm::F0 || x == lm::F1 || x >= lm::FA1
-}
-
-// The type of local i.
+// The type of local i (registers hold bits, the floating point ones too).
 fn local_type(i: u32) -> u8 {
     if i == L_RESUME || i == L_PCB {
         I32
-    } else if i < L_FA {
-        if is_float((i - L_REG0) as lm::Reg) {
-            F64
-        } else {
-            I64
-        }
     } else {
         I64
     }
@@ -289,6 +277,28 @@ impl Wasm {
         } else {
             self.lset(L_REG0 + x as u32);
         }
+    }
+
+    // Pushes floating point register x as an f64 (else an f32).
+    fn fget(&mut self, x: lm::Reg, f64: bool) {
+        self.get(x);
+        if f64 {
+            self.op(0xbf); // f64.reinterpret_i64
+        } else {
+            self.op(0xa7);
+            self.op(0xbe); // f32.reinterpret_i32
+        }
+    }
+
+    // Pops an f64 (else an f32) into floating point register x: its bits.
+    fn fset(&mut self, x: lm::Reg, f64: bool) {
+        if f64 {
+            self.op(0xbd); // i64.reinterpret_f64
+        } else {
+            self.op(0xbc); // i32.reinterpret_f32
+            self.op(0xad);
+        }
+        self.set(x);
     }
 
     fn i64c(&mut self, v: i64) {
@@ -1122,26 +1132,17 @@ impl Machine for Wasm {
         self.set(dst);
     }
 
+    // (The bits.)
     fn fload(&mut self, size: i64, f: lm::Reg, base: lm::Reg, off: i64) {
         let o = self.addr(base, off);
-        if size == 4 {
-            self.mem(0x2a, o);
-            self.op(0xbb);
-        } else {
-            self.mem(0x2b, o);
-        }
+        self.mem(if size == 4 { 0x35 } else { 0x29 }, o);
         self.set(f);
     }
 
     fn fstore(&mut self, size: i64, f: lm::Reg, base: lm::Reg, off: i64) {
         let o = self.addr(base, off);
         self.get(f);
-        if size == 4 {
-            self.op(0xb6);
-            self.mem(0x38, o);
-        } else {
-            self.mem(0x39, o);
-        }
+        self.mem(if size == 4 { 0x3e } else { 0x37 }, o);
     }
 
     fn fmov(&mut self, dst: lm::Reg, src: lm::Reg) {
@@ -1300,39 +1301,28 @@ impl Machine for Wasm {
         self.jump_if(l);
     }
 
+    // Bits between the registers (an f32's: the low 32).
     fn fmov_to(&mut self, f: lm::Reg, x: lm::Reg, f64: bool) {
         self.get(x);
-        if f64 {
-            self.op(0xbf);
-        } else {
-            self.op(0xa7);
-            self.op(0xbe);
-            self.op(0xbb);
+        if !f64 {
+            self.i64c(0xffffffff);
+            self.op(0x83);
         }
         self.set(f);
     }
 
     fn fmov_from(&mut self, x: lm::Reg, f: lm::Reg, f64: bool) {
         self.get(f);
-        if f64 {
-            self.op(0xbd);
-        } else {
-            self.op(0xb6);
-            self.op(0xbc);
-            self.op(0xad);
+        if !f64 {
+            self.i64c(0xffffffff);
+            self.op(0x83);
         }
         self.set(x);
     }
 
     fn farith(&mut self, op: lm::Op, dst: lm::Reg, a: lm::Reg, b: lm::Reg, f64: bool) {
-        self.get(a);
-        if !f64 {
-            self.op(0xb6);
-        }
-        self.get(b);
-        if !f64 {
-            self.op(0xb6);
-        }
+        self.fget(a, f64);
+        self.fget(b, f64);
         if f64 {
             self.op(match op {
                 lm::ADD => 0xa0,
@@ -1347,30 +1337,28 @@ impl Machine for Wasm {
                 lm::MUL => 0x94,
                 _ => 0x95,
             });
-            self.op(0xbb);
         }
-        self.set(dst);
+        self.fset(dst, f64);
     }
 
     fn fneg(&mut self, dst: lm::Reg, src: lm::Reg, f64: bool) {
-        let _ = f64;
-        self.get(src);
-        self.op(0x9a);
-        self.set(dst);
+        self.fget(src, f64);
+        self.op(if f64 { 0x9a } else { 0x8c });
+        self.fset(dst, f64);
     }
 
     fn fcompare(&mut self, dst: lm::Reg, c: lm::Cond, a: lm::Reg, b: lm::Reg, f64: bool) {
-        let _ = f64;
-        self.get(a);
-        self.get(b);
-        self.op(match c {
-            lm::EQ => 0x61,
-            lm::NE => 0x62,
-            lm::LT => 0x63,
-            lm::GT => 0x64,
-            lm::LE => 0x65,
-            _ => 0x66,
-        });
+        self.fget(a, f64);
+        self.fget(b, f64);
+        let k: u8 = match c {
+            lm::EQ => 0,
+            lm::NE => 1,
+            lm::LT => 2,
+            lm::GT => 3,
+            lm::LE => 4,
+            _ => 5,
+        };
+        self.op(if f64 { 0x61 + k } else { 0x5b + k });
         self.op(0xad);
         self.set(dst);
     }
@@ -1381,26 +1369,27 @@ impl Machine for Wasm {
             self.op(if signed { 0xb9 } else { 0xba });
         } else {
             self.op(if signed { 0xb4 } else { 0xb5 });
-            self.op(0xbb);
         }
-        self.set(f);
+        self.fset(f, f64);
     }
 
     fn float_to_int(&mut self, x: lm::Reg, f: lm::Reg, signed: bool, f64: bool) {
-        let _ = f64;
-        self.get(f);
+        self.fget(f, f64);
         self.op(0xfc);
-        self.u(if signed { 6 } else { 7 }); // i64.trunc_sat_f64_s/u
+        // i64.trunc_sat_f64_s/u, _f32_s/u
+        let k = if f64 {
+            if signed { 6 } else { 7 }
+        } else {
+            if signed { 4 } else { 5 }
+        };
+        self.u(k);
         self.set(x);
     }
 
     fn float_conv(&mut self, dst: lm::Reg, src: lm::Reg, to_f64: bool) {
-        self.get(src);
-        if !to_f64 {
-            self.op(0xb6);
-            self.op(0xbb);
-        }
-        self.set(dst);
+        self.fget(src, !to_f64);
+        self.op(if to_f64 { 0xbb } else { 0xb6 });
+        self.fset(dst, to_f64);
     }
 
     fn call(&mut self, sym: &String) {
@@ -1798,7 +1787,7 @@ impl Machine for Wasm {
             let x = regs[k];
             let o = self.gaddr(G_SP, 8 * k as i64);
             self.lget(L_REG0 + x as u32);
-            self.mem(if is_float(x) { 0x39 } else { 0x37 }, o);
+            self.mem(0x37, o);
             k += 1;
         }
         self.call_sym(&"_navi_poll".to_string());
@@ -1806,7 +1795,7 @@ impl Machine for Wasm {
         while k < regs.len() {
             let x = regs[k];
             let o = self.gaddr(G_SP, 8 * k as i64);
-            self.mem(if is_float(x) { 0x2b } else { 0x29 }, o);
+            self.mem(0x29, o);
             self.lset(L_REG0 + x as u32);
             k += 1;
         }
