@@ -1,0 +1,491 @@
+//! Scalar replacement of aggregates (as Go's decompose, at the MIR level):
+//! a struct or tuple local whose address is never taken and that no call
+//! writes whole becomes one local per field. r.f... is f's local; a whole
+//! assignment writes each field's; a use of the whole value reassembles it
+//! in a temporary. Repeated, nested aggregates (an iterator adapter holding
+//! another) come apart into scalars, which the SSA construction keeps in
+//! registers.
+
+use crate::{
+    mir::*,
+    types::{
+        self, Type,
+        collect::Info,
+        lower::{param_map, subst},
+    },
+};
+
+// The field types of a struct or tuple type, none for others.
+fn fields(info: &mut Info, t: &Type) -> Option<Vec<&Type>> {
+    if t.kind == types::K_TUPLE {
+        if t.elems.len() == 0 {
+            return None;
+        }
+        return Some(t.elems.clone());
+    }
+    if t.kind != types::K_ADT {
+        return None;
+    }
+    if !info.adts.contains_key(&t.d().id) {
+        return None;
+    }
+    let ai = info.adts[&t.d().id];
+    if ai.is_enum || ai.fields.len() == 0 {
+        return None;
+    }
+    let sub = param_map(Some(ai.generics), &t.args);
+    let mut out: Vec<&Type> = Vec::new();
+    for f in ai.fields.iter() {
+        // (Not normalized: generic code's projections are resolved when it
+        // is instantiated.)
+        out.push(subst(info.ctx, f.ty, &sub, None));
+    }
+    Some(out)
+}
+
+// Whether a place reaches through a pointer (so not into the local itself).
+fn through_ptr(p: &Place) -> bool {
+    for x in p.proj.iter() {
+        if x.kind == P_DEREF {
+            return true;
+        }
+    }
+    false
+}
+
+struct Split {
+    // By local: its fields' locals (empty: not split).
+    fl: Vec<Vec<usize>>,
+    kinds: Vec<AggKind>,
+}
+
+impl Split {
+    fn place(&self, p: &Place) -> Place {
+        if self.fl[p.local].len() > 0 && p.proj.len() > 0 && p.proj[0].kind == P_FIELD {
+            return Place {
+                local: self.fl[p.local][p.proj[0].field],
+                proj: p.proj[1..].to_vec(),
+            };
+        }
+        p.clone()
+    }
+
+    // An operand; a split local used whole is reassembled first.
+    fn op(&self, f: &mut Func, o: &Operand, pre: &mut Vec<Stmt>) -> Operand {
+        if o.kind != OP_COPY {
+            return o.clone();
+        }
+        let p = &o.place;
+        if self.fl[p.local].len() > 0 && p.proj.len() == 0 {
+            let t = f.locals[p.local].ty;
+            let tmp = f.locals.len();
+            f.locals.push(&mut Local {
+                ty: t,
+                name: String::new(),
+                boxed: false,
+            });
+            let mut ops: Vec<Operand> = Vec::new();
+            for x in self.fl[p.local].iter() {
+                ops.push(copy(local_place(*x)));
+            }
+            pre.push(Stmt::Assign {
+                place: local_place(tmp),
+                rv: aggregate(self.kinds[p.local], t, 0, ops),
+            });
+            return copy(local_place(tmp));
+        }
+        copy(self.place(p))
+    }
+
+    fn ops(&self, f: &mut Func, os: &Vec<Operand>, pre: &mut Vec<Stmt>) -> Vec<Operand> {
+        let mut out: Vec<Operand> = Vec::new();
+        for o in os.iter() {
+            out.push(self.op(f, o, pre));
+        }
+        out
+    }
+
+    fn rv(&self, f: &mut Func, rv: &Rvalue, pre: &mut Vec<Stmt>) -> Rvalue {
+        match rv {
+            Rvalue::Use(x) => Rvalue::Use(self.op(f, x, pre)),
+            Rvalue::Ref { is_mut, place } => Rvalue::Ref {
+                is_mut: *is_mut,
+                place: self.place(place),
+            },
+            Rvalue::Bin { op, x, y, ty, pos } => Rvalue::Bin {
+                op: *op,
+                x: self.op(f, x, pre),
+                y: self.op(f, y, pre),
+                ty: *ty,
+                pos: *pos,
+            },
+            Rvalue::Un { op, x, ty, pos } => Rvalue::Un {
+                op: *op,
+                x: self.op(f, x, pre),
+                ty: *ty,
+                pos: *pos,
+            },
+            Rvalue::Cast { kind, x, from, to } => Rvalue::Cast {
+                kind: *kind,
+                x: self.op(f, x, pre),
+                from: *from,
+                to: *to,
+            },
+            Rvalue::Aggregate {
+                kind,
+                ty,
+                variant,
+                ops,
+                closure,
+            } => Rvalue::Aggregate {
+                kind: *kind,
+                ty: *ty,
+                variant: *variant,
+                ops: self.ops(f, ops, pre),
+                closure: *closure,
+            },
+            Rvalue::Discr(p) => Rvalue::Discr(self.place(p)),
+            Rvalue::Len(p) => Rvalue::Len(self.place(p)),
+            Rvalue::Unsize { x, len, to } => Rvalue::Unsize {
+                x: self.op(f, x, pre),
+                len: *len,
+                to: *to,
+            },
+            Rvalue::MakeDyn { x, concrete, to } => Rvalue::MakeDyn {
+                x: self.op(f, x, pre),
+                concrete: *concrete,
+                to: *to,
+            },
+        }
+    }
+}
+
+// An operand: a split candidate used whole keeps whole unless it flows
+// into one (into: the split candidate assigned, else -1).
+fn whole_use(cand: &mut Vec<bool>, flows: &mut Vec<(usize, usize)>, o: &Operand, into: i64) {
+    if o.kind != OP_COPY || o.place.proj.len() != 0 || !cand[o.place.local] {
+        return;
+    }
+    if into < 0 {
+        cand[o.place.local] = false;
+    } else {
+        flows.push((into as usize, o.place.local));
+    }
+}
+
+/// Splits f's aggregate locals (rounds until none is left); whether any was.
+pub fn split(info: &mut Info, f: &mut Func) -> bool {
+    let mut any = false;
+    let mut round = 0;
+    while round < 6 && split_round(info, f) {
+        any = true;
+        round += 1;
+    }
+    any
+}
+
+fn split_round(info: &mut Info, f: &mut Func) -> bool {
+    let n = f.locals.len();
+    let mut ftys: Vec<Option<Vec<&Type>>> = Vec::new();
+    let mut cand: Vec<bool> = Vec::new();
+    let mut l = 0;
+    while l < n {
+        let lc = f.locals[l];
+        let ft = if l == 0 || l <= f.nargs || lc.boxed {
+            None
+        } else {
+            fields(info, lc.ty)
+        };
+        cand.push(ft.is_some());
+        ftys.push(ft);
+        l += 1;
+    }
+    // What keeps a local whole: its address, a whole write other than an
+    // aggregate, a copy or zero, a call's result.
+    for b in f.blocks.iter() {
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::Assign { place, rv } => {
+                    if cand[place.local] && place.proj.len() == 0 {
+                        let ok = match rv {
+                            Rvalue::Aggregate {
+                                kind,
+                                variant,
+                                closure,
+                                ..
+                            } => {
+                                (*kind == AGG_ADT || *kind == AGG_TUPLE)
+                                    && *variant == 0
+                                    && closure.is_none()
+                            }
+                            Rvalue::Use(x) => x.kind == OP_COPY || x.cnst.unwrap().kind == C_ZERO,
+                            _ => false,
+                        };
+                        if !ok {
+                            cand[place.local] = false;
+                        }
+                    }
+                    match rv {
+                        Rvalue::Ref { place: p, .. } => {
+                            if !through_ptr(p) {
+                                cand[p.local] = false;
+                            }
+                        }
+                        Rvalue::Discr(p) | Rvalue::Len(p) => {
+                            if p.proj.len() == 0 {
+                                cand[p.local] = false;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Stmt::SetDiscr { place, .. } => {
+                    if place.proj.len() == 0 {
+                        cand[place.local] = false;
+                    }
+                }
+                Stmt::Box { local, .. } => cand[*local] = false,
+                _ => {}
+            }
+        }
+        if let Term::Call { dest, .. } = &b.term {
+            if dest.proj.len() == 0 {
+                cand[dest.local] = false;
+            }
+        }
+    }
+    // A whole value must not need reassembling: used whole only as the
+    // source of a whole copy, or a field of a whole aggregate, into another
+    // split local (flows: (into, from)).
+    let mut flows: Vec<(usize, usize)> = Vec::new();
+    for b in f.blocks.iter() {
+        for s in b.stmts.iter() {
+            match s {
+                Stmt::Assign { place, rv } => {
+                    let into = if place.proj.len() == 0 && cand[place.local] {
+                        place.local as i64
+                    } else {
+                        -1
+                    };
+                    match rv {
+                        Rvalue::Use(x) => whole_use(&mut cand, &mut flows, x, into),
+                        Rvalue::Aggregate { ops, .. } => {
+                            for o in ops.iter() {
+                                whole_use(&mut cand, &mut flows, o, into);
+                            }
+                        }
+                        Rvalue::Bin { x, y, .. } => {
+                            whole_use(&mut cand, &mut flows, x, -1);
+                            whole_use(&mut cand, &mut flows, y, -1);
+                        }
+                        Rvalue::Un { x, .. }
+                        | Rvalue::Cast { x, .. }
+                        | Rvalue::Unsize { x, .. }
+                        | Rvalue::MakeDyn { x, .. } => whole_use(&mut cand, &mut flows, x, -1),
+                        _ => {}
+                    }
+                }
+                Stmt::PushDefer { fn_op, args } => {
+                    whole_use(&mut cand, &mut flows, fn_op, -1);
+                    for o in args.iter() {
+                        whole_use(&mut cand, &mut flows, o, -1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        match &b.term {
+            Term::Call { fn_op, args, .. } => {
+                whole_use(&mut cand, &mut flows, fn_op, -1);
+                for o in args.iter() {
+                    whole_use(&mut cand, &mut flows, o, -1);
+                }
+            }
+            Term::Switch { x, .. } => whole_use(&mut cand, &mut flows, x, -1),
+            Term::Assert {
+                cond, len, index, ..
+            } => {
+                whole_use(&mut cand, &mut flows, cond, -1);
+                whole_use(&mut cand, &mut flows, len, -1);
+                whole_use(&mut cand, &mut flows, index, -1);
+            }
+            _ => {}
+        }
+    }
+    let mut again = true;
+    while again {
+        again = false;
+        for fl in flows.iter() {
+            let (into, from) = *fl;
+            if !cand[into] && cand[from] {
+                cand[from] = false;
+                again = true;
+            }
+        }
+    }
+    let mut sp = &mut Split {
+        fl: Vec::new(),
+        kinds: Vec::new(),
+    };
+    let mut changed = false;
+    l = 0;
+    while l < n {
+        let mut v: Vec<usize> = Vec::new();
+        let mut kind = AGG_ADT;
+        if cand[l] {
+            let t = f.locals[l].ty;
+            if t.kind == types::K_TUPLE {
+                kind = AGG_TUPLE;
+            }
+            let name = f.locals[l].name.clone();
+            let mut i = 0;
+            for ft in ftys[l].unwrap().iter() {
+                v.push(f.locals.len());
+                f.locals.push(&mut Local {
+                    ty: *ft,
+                    name: if name.len() > 0 {
+                        `${name}.${i}`.to_string()
+                    } else {
+                        String::new()
+                    },
+                    boxed: false,
+                });
+                i += 1;
+            }
+            changed = true;
+        }
+        sp.fl.push(v);
+        sp.kinds.push(kind);
+        l += 1;
+    }
+    if !changed {
+        return false;
+    }
+    while sp.fl.len() < f.locals.len() {
+        sp.fl.push(Vec::new());
+        sp.kinds.push(AGG_ADT);
+    }
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks[bi];
+        bi += 1;
+        let mut out: Vec<Stmt> = Vec::new();
+        for s in b.stmts.iter() {
+            let mut pre: Vec<Stmt> = Vec::new();
+            match s {
+                Stmt::Assign { place, rv } => {
+                    if sp.fl[place.local].len() > 0 && place.proj.len() == 0 {
+                        // A whole write: each field's.
+                        let fs = sp.fl[place.local].clone();
+                        let ftv = ftys[place.local].unwrap();
+                        let mut i = 0;
+                        while i < fs.len() {
+                            let r = match rv {
+                                Rvalue::Aggregate { ops, .. } => {
+                                    Rvalue::Use(sp.op(f, &ops[i], &mut pre))
+                                }
+                                Rvalue::Use(x) => {
+                                    if x.kind == OP_COPY {
+                                        Rvalue::Use(copy(sp.place(&x.place.field(i))))
+                                    } else {
+                                        Rvalue::Use(const_op(cnst(C_ZERO, Some(ftv[i]))))
+                                    }
+                                }
+                                _ => Rvalue::Use(const_op(cnst(C_ZERO, Some(ftv[i])))),
+                            };
+                            pre.push(Stmt::Assign {
+                                place: local_place(fs[i]),
+                                rv: r,
+                            });
+                            i += 1;
+                        }
+                    } else {
+                        let r = sp.rv(f, rv, &mut pre);
+                        pre.push(Stmt::Assign {
+                            place: sp.place(place),
+                            rv: r,
+                        });
+                    }
+                }
+                Stmt::SetDiscr { place, variant } => {
+                    pre.push(Stmt::SetDiscr {
+                        place: sp.place(place),
+                        variant: *variant,
+                    });
+                }
+                Stmt::PushDefer { fn_op, args } => {
+                    let fo = sp.op(f, fn_op, &mut pre);
+                    let a = sp.ops(f, args, &mut pre);
+                    pre.push(Stmt::PushDefer { fn_op: fo, args: a });
+                }
+                Stmt::StorageLive(x) => {
+                    if sp.fl[*x].len() > 0 {
+                        for y in sp.fl[*x].iter() {
+                            pre.push(Stmt::StorageLive(*y));
+                        }
+                    } else {
+                        pre.push(Stmt::StorageLive(*x));
+                    }
+                }
+                _ => pre.push(s.clone()),
+            }
+            for p in pre.iter() {
+                out.push(p.clone());
+            }
+        }
+        // The terminator's operands (reassembled before it).
+        let mut pre: Vec<Stmt> = Vec::new();
+        let t = match &b.term {
+            Term::Switch {
+                x,
+                ty,
+                vals,
+                targets,
+                els,
+            } => Term::Switch {
+                x: sp.op(f, x, &mut pre),
+                ty: *ty,
+                vals: vals.clone(),
+                targets: targets.clone(),
+                els: *els,
+            },
+            Term::Call {
+                fn_op,
+                args,
+                dest,
+                target,
+                pos,
+            } => Term::Call {
+                fn_op: sp.op(f, fn_op, &mut pre),
+                args: sp.ops(f, args, &mut pre),
+                dest: sp.place(dest),
+                target: *target,
+                pos: *pos,
+            },
+            Term::Assert {
+                cond,
+                msg,
+                target,
+                pos,
+                bounds,
+                len,
+                index,
+            } => Term::Assert {
+                cond: sp.op(f, cond, &mut pre),
+                msg: msg.clone(),
+                target: *target,
+                pos: *pos,
+                bounds: *bounds,
+                len: sp.op(f, len, &mut pre),
+                index: sp.op(f, index, &mut pre),
+            },
+            other => other.clone(),
+        };
+        for p in pre.iter() {
+            out.push(p.clone());
+        }
+        b.stmts = out;
+        b.term = t;
+    }
+    true
+}

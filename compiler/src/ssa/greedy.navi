@@ -802,14 +802,107 @@ pub fn allocate(f: &mut Func, cfg: &Config, fused: &Vec<bool>, a: &mut Alloc) ->
             k += 1;
         }
     }
-    // The spills right after their values (after a run of phis or selects).
+    // Where the spills go (Go's placeSpills): the blocks that read each
+    // spill have a nearest common dominator; from there up the dominator
+    // tree, the first block the value is in a register at the start of (and
+    // no deeper in loops than the value's), else right after the value. A
+    // spill nothing reads is dropped.
+    let d = crate::ssa::dom::dominators(f);
+    let depth = loop_depths(f, d);
+    let nv = f.values.len();
+    let mut lca: Vec<i32> = Vec::new();
+    lca.resize(nv, -1);
+    let meet_b = |x: i32, y: i32| -> i32 {
+        if x < 0 {
+            return y;
+        }
+        let mut a2 = x;
+        let mut b2 = y;
+        while a2 != b2 {
+            if a2 < 0 || b2 < 0 {
+                return -1;
+            }
+            if d.order[a2 as usize] > d.order[b2 as usize] {
+                a2 = d.idom[a2 as usize];
+            } else {
+                b2 = d.idom[b2 as usize];
+            }
+        }
+        a2
+    };
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        if d.order[b.id as usize] < 0 {
+            continue;
+        }
+        for v in b.values.iter() {
+            for x in v.args.iter() {
+                if x.op == OP_STOREREG {
+                    let i = x.id as usize;
+                    lca[i] = meet_b(lca[i], b.id as i32);
+                }
+            }
+        }
+        if let Some(c) = b.control {
+            if c.op == OP_STOREREG {
+                let i = c.id as usize;
+                lca[i] = meet_b(lca[i], b.id as i32);
+            }
+        }
+        for m in moves[b.id as usize].iter() {
+            let ss = m.2;
+            if ss >= 0 && f.values[ss as usize].op == OP_STOREREG {
+                lca[ss as usize] = meet_b(lca[ss as usize], b.id as i32);
+            }
+        }
+    }
     let mut after: Vec<i32> = Vec::new();
     after.resize(n0, -1);
+    let mut at_start: Vec<Vec<i32>> = Vec::new();
+    i = 0;
+    while i < nb {
+        at_start.push(Vec::new());
+        i += 1;
+    }
     let mut j = 0;
     while j < n0 {
         let sp = s.spill[j];
         if sp >= 0 && sp as usize != j {
-            after[j] = sp;
+            let u = lca[sp as usize];
+            let v = f.values[j];
+            let db = match v.block {
+                Some(vb) => vb.id as i32,
+                None => -1,
+            };
+            if u < 0 && d.order.len() > 0 && db >= 0 && d.order[db as usize] >= 0 {
+                // Read nowhere reachable: no spill.
+                s.spill[j] = -1;
+            } else if u < 0 || db < 0 {
+                after[j] = sp;
+            } else {
+                let mut b2 = u;
+                let mut placed = false;
+                while b2 >= 0 && b2 != db {
+                    // (The value itself, in the register it was made in:
+                    // what the StoreReg reads.)
+                    let mut held = false;
+                    for h in start[b2 as usize].iter() {
+                        if h.id as usize == j && h.cur as usize == j && h.r as i32 == reg[j] {
+                            held = true;
+                        }
+                    }
+                    if held && depth[b2 as usize] <= depth[db as usize] {
+                        at_start[b2 as usize].push(sp);
+                        f.values[sp as usize].block = Some(f.blocks[b2 as usize]);
+                        placed = true;
+                        break;
+                    }
+                    b2 = d.idom[b2 as usize];
+                }
+                if !placed {
+                    after[j] = sp;
+                }
+            }
         }
         j += 1;
     }
@@ -817,10 +910,17 @@ pub fn allocate(f: &mut Func, cfg: &Config, fused: &Vec<bool>, a: &mut Alloc) ->
         let b = *bb;
         let mut out: Vec<&mut Value> = Vec::new();
         let mut pending: Vec<i32> = Vec::new();
+        let mut started = false;
         let mut vi = 0;
         while vi < b.values.len() {
             let v = b.values[vi];
             let run = v.op == OP_PHI || v.op == OP_SELECT || v.op == OP_ARG || v.op == OP_INITMEM;
+            if !run && !started {
+                started = true;
+                for p in at_start[b.id as usize].iter() {
+                    out.push(f.values[*p as usize]);
+                }
+            }
             if !run && pending.len() > 0 {
                 for p in pending.iter() {
                     out.push(f.values[*p as usize]);
@@ -835,6 +935,11 @@ pub fn allocate(f: &mut Func, cfg: &Config, fused: &Vec<bool>, a: &mut Alloc) ->
                 pending.push(after[id]);
             }
             vi += 1;
+        }
+        if !started {
+            for p in at_start[b.id as usize].iter() {
+                out.push(f.values[*p as usize]);
+            }
         }
         for p in pending.iter() {
             out.push(f.values[*p as usize]);
@@ -930,6 +1035,53 @@ pub fn allocate(f: &mut Func, cfg: &Config, fused: &Vec<bool>, a: &mut Alloc) ->
         i += 1;
     }
     true
+}
+
+// By block: how many loops hold it (the blocks reaching a back edge's
+// source without passing its header).
+fn loop_depths(f: &Func, d: &crate::ssa::dom::Dom) -> Vec<i32> {
+    let nb = f.blocks.len();
+    let mut depth: Vec<i32> = Vec::new();
+    depth.resize(nb, 0);
+    let mut mark: Vec<i64> = Vec::new();
+    mark.resize(nb, -1);
+    let mut stamp = 0i64;
+    for bb in f.blocks.iter() {
+        let b = *bb;
+        if d.order[b.id as usize] < 0 {
+            continue;
+        }
+        for hh in b.succs.iter() {
+            let h = *hh;
+            let mut x = b.id as i32;
+            while x >= 0 && x != h.id as i32 {
+                x = d.idom[x as usize];
+            }
+            if x != h.id as i32 {
+                continue;
+            }
+            stamp += 1;
+            mark[h.id as usize] = stamp;
+            depth[h.id as usize] += 1;
+            let mut work: Vec<&mut Block> = Vec::new();
+            if mark[b.id as usize] != stamp {
+                mark[b.id as usize] = stamp;
+                depth[b.id as usize] += 1;
+                work.push(b);
+            }
+            while let Some(y) = work.pop() {
+                for p in y.preds.iter() {
+                    let pi = p.id as usize;
+                    if mark[pi] != stamp && d.order[pi] >= 0 {
+                        mark[pi] = stamp;
+                        depth[pi] += 1;
+                        work.push(*p);
+                    }
+                }
+            }
+        }
+    }
+    depth
 }
 
 // The value a (possibly restored) argument stands for.
